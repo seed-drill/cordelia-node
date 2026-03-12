@@ -434,6 +434,435 @@ pub async fn identity(
     }))
 }
 
+// ── POST /api/v1/channels/dm ──────────────────────────────────
+
+pub async fn dm(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DmRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    // Decode peer's Ed25519 public key from Bech32
+    let peer_pk_bytes = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
+        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    if peer_pk_bytes == pk {
+        return Err(ApiError::BadRequest("cannot DM yourself".into()));
+    }
+
+    // Check if DM channel already exists
+    let channel_id = cordelia_storage::naming::dm_channel_id(&pk, &peer_pk_bytes);
+
+    match channels::get_by_id(&db, &channel_id) {
+        Ok(existing) => {
+            let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer_pk_bytes)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok(HttpResponse::Ok().json(DmResponse {
+                channel_id,
+                is_new: false,
+                peer_public_key: peer_bech32,
+                created_at: existing.created_at,
+            }))
+        }
+        Err(cordelia_core::CordeliaError::ChannelNotFound { .. }) => {
+            // Create DM channel with PSK
+            let new_psk = cordelia_crypto::generate_psk()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+            let ch = channels::create_dm(&db, &pk, &peer_pk_bytes, Some(&new_psk))?;
+            psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
+
+            // Create ECIES envelope wrapping PSK for peer's X25519 key
+            let peer_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk_bytes);
+            let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &new_psk)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+            // Store envelope as internal item for peer to retrieve via replication
+            let envelope_bytes = envelope.to_bytes();
+            let item_id = items::generate_item_id();
+            let published_at = Utc::now().to_rfc3339();
+            let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+            let cbor = signing::build_item_metadata_envelope(
+                &pk, &ch.channel_id, &content_hash, false, &item_id, 1, &published_at,
+            ).map_err(|e| ApiError::Internal(e.to_string()))?;
+            let signature = state.identity.sign(&cbor);
+
+            items::insert_item(&db, &items::NewItem {
+                item_id: &item_id,
+                channel_id: &ch.channel_id,
+                author_id: &pk,
+                item_type: "psk_envelope",
+                published_at: &published_at,
+                parent_id: None,
+                key_version: 1,
+                content_hash: &content_hash,
+                signature: &signature,
+                encrypted_blob: &envelope_bytes,
+            })?;
+
+            let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer_pk_bytes)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+            Ok(HttpResponse::Ok().json(DmResponse {
+                channel_id: ch.channel_id,
+                is_new: true,
+                peer_public_key: peer_bech32,
+                created_at: ch.created_at,
+            }))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ── POST /api/v1/channels/list-dms ───────────────────────────
+
+pub async fn list_dms(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let dms = channels::list_dms_for_entity(&db, &pk)?;
+    let mut result = Vec::new();
+
+    for ch in dms {
+        let peer_key = channels::dm_peer_key(&db, &ch.channel_id)
+            .unwrap_or([0u8; 32]);
+        let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer_key)
+            .unwrap_or_default();
+        let item_count = items::count_for_channel(&db, &ch.channel_id)?;
+        let activity = items::last_activity(&db, &ch.channel_id)?;
+
+        result.push(DmChannel {
+            channel_id: ch.channel_id,
+            peer_public_key: peer_bech32,
+            item_count,
+            last_activity: activity,
+            created_at: ch.created_at,
+        });
+    }
+
+    Ok(HttpResponse::Ok().json(ListDmsResponse { dms: result }))
+}
+
+// ── POST /api/v1/channels/group ──────────────────────────────
+
+pub async fn group_create(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<GroupCreateRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    if body.mode != "realtime" && body.mode != "batch" {
+        return Err(ApiError::BadRequest("mode must be 'realtime' or 'batch'".into()));
+    }
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let new_psk = cordelia_crypto::generate_psk()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let ch = channels::create_group(&db, &pk, &body.mode, Some(&new_psk))?;
+    psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
+
+    Ok(HttpResponse::Ok().json(GroupCreateResponse {
+        channel_id: ch.channel_id,
+        mode: ch.mode,
+        created_at: ch.created_at,
+    }))
+}
+
+// ── POST /api/v1/channels/group/invite ───────────────────────
+
+pub async fn group_invite(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<GroupInviteRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
+        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    // Verify channel exists and caller is owner
+    let ch = channels::get_by_id(&db, &body.channel_id)?;
+    if ch.channel_type != "group" {
+        return Err(ApiError::BadRequest("channel is not a group".into()));
+    }
+    let role = channels::get_member_role(&db, &body.channel_id, &pk)?
+        .ok_or_else(|| ApiError::Forbidden("not a member of this group".into()))?;
+    if role != "owner" {
+        return Err(ApiError::Forbidden("only owner can invite".into()));
+    }
+
+    // Add member
+    channels::add_member(&db, &body.channel_id, &peer_pk, "member")?;
+
+    // Wrap current PSK in ECIES envelope for the invitee
+    let channel_psk = psk::read_psk(&state.home_dir, &body.channel_id)?;
+    let peer_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk);
+    let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &channel_psk)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Store envelope as internal item
+    let envelope_bytes = envelope.to_bytes();
+    let item_id = items::generate_item_id();
+    let published_at = Utc::now().to_rfc3339();
+    let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+    let cbor = signing::build_item_metadata_envelope(
+        &pk, &body.channel_id, &content_hash, false, &item_id,
+        ch.key_version, &published_at,
+    ).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let signature = state.identity.sign(&cbor);
+
+    items::insert_item(&db, &items::NewItem {
+        item_id: &item_id,
+        channel_id: &body.channel_id,
+        author_id: &pk,
+        item_type: "psk_envelope",
+        published_at: &published_at,
+        parent_id: None,
+        key_version: ch.key_version,
+        content_hash: &content_hash,
+        signature: &signature,
+        encrypted_blob: &envelope_bytes,
+    })?;
+
+    let count = channels::member_count(&db, &body.channel_id)?;
+
+    Ok(HttpResponse::Ok().json(GroupInviteResponse {
+        ok: true,
+        channel_id: body.channel_id.clone(),
+        peer_public_key: body.peer_public_key.clone(),
+        member_count: count,
+    }))
+}
+
+// ── POST /api/v1/channels/group/remove ───────────────────────
+
+pub async fn group_remove(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<GroupRemoveRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
+        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    // Verify channel is a group and caller is owner
+    let ch = channels::get_by_id(&db, &body.channel_id)?;
+    if ch.channel_type != "group" {
+        return Err(ApiError::BadRequest("channel is not a group".into()));
+    }
+    let role = channels::get_member_role(&db, &body.channel_id, &pk)?
+        .ok_or_else(|| ApiError::Forbidden("not a member of this group".into()))?;
+    if role != "owner" {
+        return Err(ApiError::Forbidden("only owner can remove members".into()));
+    }
+
+    // Remove member
+    channels::remove_member(&db, &body.channel_id, &peer_pk)?;
+
+    // Rotate PSK (excluded member can no longer decrypt new items)
+    let new_psk = cordelia_crypto::generate_psk()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rotated_at = Utc::now().to_rfc3339();
+    let _new_file_version = psk::rotate_psk(
+        &state.home_dir, &body.channel_id, &new_psk, &rotated_at,
+    )?;
+    let psk_hash = cordelia_crypto::sha256(&new_psk);
+    let new_key_version = channels::increment_key_version(&db, &body.channel_id, &psk_hash)?;
+
+    // Distribute new PSK to remaining members via ECIES envelopes
+    let member_keys = channels::list_active_member_keys(&db, &body.channel_id)?;
+    for member_pk in &member_keys {
+        let member_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk);
+        let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let envelope_bytes = envelope.to_bytes();
+        let item_id = items::generate_item_id();
+        let published_at = Utc::now().to_rfc3339();
+        let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+        let cbor = signing::build_item_metadata_envelope(
+            &pk, &body.channel_id, &content_hash, false, &item_id,
+            new_key_version, &published_at,
+        ).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let signature = state.identity.sign(&cbor);
+
+        items::insert_item(&db, &items::NewItem {
+            item_id: &item_id,
+            channel_id: &body.channel_id,
+            author_id: &pk,
+            item_type: "psk_envelope",
+            published_at: &published_at,
+            parent_id: None,
+            key_version: new_key_version,
+            content_hash: &content_hash,
+            signature: &signature,
+            encrypted_blob: &envelope_bytes,
+        })?;
+    }
+
+    Ok(HttpResponse::Ok().json(GroupRemoveResponse {
+        ok: true,
+        channel_id: body.channel_id.clone(),
+        peer_public_key: body.peer_public_key.clone(),
+        key_rotated: true,
+        new_key_version,
+    }))
+}
+
+// ── POST /api/v1/channels/list-groups ────────────────────────
+
+pub async fn list_groups(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let groups = channels::list_groups_for_entity(&db, &pk)?;
+    let mut result = Vec::new();
+
+    for ch in groups {
+        let role = channels::get_member_role(&db, &ch.channel_id, &pk)?
+            .unwrap_or_default();
+        let count = channels::member_count(&db, &ch.channel_id)?;
+        let item_count = items::count_for_channel(&db, &ch.channel_id)?;
+        let activity = items::last_activity(&db, &ch.channel_id)?;
+
+        result.push(GroupChannel {
+            channel_id: ch.channel_id,
+            role,
+            mode: ch.mode,
+            member_count: count,
+            item_count,
+            last_activity: activity,
+            created_at: ch.created_at,
+        });
+    }
+
+    Ok(HttpResponse::Ok().json(ListGroupsResponse { groups: result }))
+}
+
+// ── POST /api/v1/channels/rotate-psk ─────────────────────────
+
+pub async fn rotate_psk_handler(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<RotatePskRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let channel_id = channels::resolve(&body.channel)?;
+
+    // Verify ownership
+    let role = channels::get_member_role(&db, &channel_id.0, &pk)?
+        .ok_or_else(|| ApiError::Forbidden("not a member of this channel".into()))?;
+    if role != "owner" {
+        return Err(ApiError::Forbidden("only owner can rotate PSK".into()));
+    }
+
+    // Generate new PSK
+    let new_psk = cordelia_crypto::generate_psk()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rotated_at = Utc::now().to_rfc3339();
+    let _new_file_version = psk::rotate_psk(
+        &state.home_dir, &channel_id.0, &new_psk, &rotated_at,
+    )?;
+    let psk_hash = cordelia_crypto::sha256(&new_psk);
+    let new_key_version = channels::increment_key_version(&db, &channel_id.0, &psk_hash)?;
+
+    // Distribute to all active members
+    let member_keys = channels::list_active_member_keys(&db, &channel_id.0)?;
+    for member_pk in &member_keys {
+        let member_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk);
+        let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let envelope_bytes = envelope.to_bytes();
+        let item_id = items::generate_item_id();
+        let published_at = Utc::now().to_rfc3339();
+        let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+        let cbor = signing::build_item_metadata_envelope(
+            &pk, &channel_id.0, &content_hash, false, &item_id,
+            new_key_version, &published_at,
+        ).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let signature = state.identity.sign(&cbor);
+
+        items::insert_item(&db, &items::NewItem {
+            item_id: &item_id,
+            channel_id: &channel_id.0,
+            author_id: &pk,
+            item_type: "psk_envelope",
+            published_at: &published_at,
+            parent_id: None,
+            key_version: new_key_version,
+            content_hash: &content_hash,
+            signature: &signature,
+            encrypted_blob: &envelope_bytes,
+        })?;
+    }
+
+    Ok(HttpResponse::Ok().json(RotatePskResponse {
+        ok: true,
+        channel: body.channel.clone(),
+        new_key_version,
+    }))
+}
+
+// ── POST /api/v1/channels/delete-item ────────────────────────
+
+pub async fn delete_item(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DeleteItemRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let channel_id = channels::resolve(&body.channel)?;
+
+    // Verify membership
+    if !channels::is_member(&db, &channel_id.0, &pk)? {
+        return Err(ApiError::Forbidden("not a member of this channel".into()));
+    }
+
+    let deleted = items::tombstone_item(&db, &body.item_id)?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("item '{}' not found", body.item_id)));
+    }
+
+    Ok(HttpResponse::Ok().json(DeleteItemResponse {
+        ok: true,
+        item_id: body.item_id.clone(),
+    }))
+}
+
 // ── Internal helpers ───────────────────────────────────────────────
 
 /// Decrypt an item's encrypted_blob and parse the JSON {content, metadata} envelope.

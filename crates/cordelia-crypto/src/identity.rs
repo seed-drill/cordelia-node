@@ -132,6 +132,19 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
     (scalar, pub_key)
 }
 
+/// Derive X25519 public key from an Ed25519 public key using the birational map.
+///
+/// This is the Edwards-to-Montgomery conversion: u = (1 + y) / (1 - y) mod p.
+/// Used when we have only the peer's Ed25519 public key (no seed access).
+pub fn x25519_pub_from_ed25519_pub(ed_pk: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let compressed = CompressedEdwardsY(*ed_pk);
+    match compressed.decompress() {
+        Some(point) => point.to_montgomery().to_bytes(),
+        None => [0u8; 32], // Invalid Ed25519 point
+    }
+}
+
 /// Wrap a raw 32-byte Ed25519 seed in PKCS#8 v1 DER for ring.
 ///
 /// ring doesn't accept raw seeds directly -- it requires PKCS#8 DER.

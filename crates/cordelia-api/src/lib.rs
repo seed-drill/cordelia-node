@@ -8,7 +8,6 @@ pub mod handlers;
 pub mod state;
 pub mod types;
 
-// TODO(WP5): Enrollment CLI endpoints.
 // TODO(WP8): Search endpoint.
 // TODO(WP13): CLI stats + Prometheus metrics.
 
@@ -18,12 +17,25 @@ use actix_web::web;
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1/channels")
+            // Named channels
             .route("/subscribe", web::post().to(handlers::subscribe))
             .route("/publish", web::post().to(handlers::publish))
             .route("/listen", web::post().to(handlers::listen))
             .route("/list", web::post().to(handlers::list))
             .route("/info", web::post().to(handlers::info))
             .route("/unsubscribe", web::post().to(handlers::unsubscribe))
+            // DM
+            .route("/dm", web::post().to(handlers::dm))
+            .route("/list-dms", web::post().to(handlers::list_dms))
+            // Groups
+            .route("/group", web::post().to(handlers::group_create))
+            .route("/group/invite", web::post().to(handlers::group_invite))
+            .route("/group/remove", web::post().to(handlers::group_remove))
+            .route("/list-groups", web::post().to(handlers::list_groups))
+            // Key management
+            .route("/rotate-psk", web::post().to(handlers::rotate_psk_handler))
+            .route("/delete-item", web::post().to(handlers::delete_item))
+            // Identity
             .route("/identity", web::post().to(handlers::identity)),
     );
 }

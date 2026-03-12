@@ -382,6 +382,175 @@ pub fn member_count(conn: &Connection, channel_id: &str) -> Result<i64, Cordelia
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
+/// List DM channels for an entity.
+pub fn list_dms_for_entity(
+    conn: &Connection,
+    entity_key: &[u8; 32],
+) -> Result<Vec<Channel>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.channel_id, c.channel_name, c.channel_type, c.mode, c.access,
+                    c.creator_id, c.key_version, c.psk_hash, c.created_at, c.updated_at
+             FROM channels c
+             INNER JOIN channel_members m ON c.channel_id = m.channel_id
+             WHERE m.entity_key = ?1 AND m.posture = 'active' AND c.channel_type = 'dm'
+             ORDER BY c.updated_at DESC",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![entity_key.as_slice()], |row| {
+            let creator_blob: Vec<u8> = row.get(5)?;
+            let mut creator_id = [0u8; 32];
+            if creator_blob.len() == 32 {
+                creator_id.copy_from_slice(&creator_blob);
+            }
+            Ok(Channel {
+                channel_id: row.get(0)?,
+                channel_name: row.get(1)?,
+                channel_type: row.get(2)?,
+                mode: row.get(3)?,
+                access: row.get(4)?,
+                creator_id,
+                key_version: row.get(6)?,
+                psk_hash: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut channels = Vec::new();
+    for row in rows {
+        channels.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(channels)
+}
+
+/// List group channels for an entity.
+pub fn list_groups_for_entity(
+    conn: &Connection,
+    entity_key: &[u8; 32],
+) -> Result<Vec<Channel>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.channel_id, c.channel_name, c.channel_type, c.mode, c.access,
+                    c.creator_id, c.key_version, c.psk_hash, c.created_at, c.updated_at
+             FROM channels c
+             INNER JOIN channel_members m ON c.channel_id = m.channel_id
+             WHERE m.entity_key = ?1 AND m.posture = 'active' AND c.channel_type = 'group'
+             ORDER BY c.updated_at DESC",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![entity_key.as_slice()], |row| {
+            let creator_blob: Vec<u8> = row.get(5)?;
+            let mut creator_id = [0u8; 32];
+            if creator_blob.len() == 32 {
+                creator_id.copy_from_slice(&creator_blob);
+            }
+            Ok(Channel {
+                channel_id: row.get(0)?,
+                channel_name: row.get(1)?,
+                channel_type: row.get(2)?,
+                mode: row.get(3)?,
+                access: row.get(4)?,
+                creator_id,
+                key_version: row.get(6)?,
+                psk_hash: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut channels = Vec::new();
+    for row in rows {
+        channels.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(channels)
+}
+
+/// List all active member public keys for a channel.
+pub fn list_active_member_keys(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT entity_key FROM channel_members
+             WHERE channel_id = ?1 AND posture = 'active'",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![channel_id], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        })
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut keys = Vec::new();
+    for row in rows {
+        let blob = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        if blob.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&blob);
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Increment key_version and update psk_hash after a PSK rotation.
+pub fn increment_key_version(
+    conn: &Connection,
+    channel_id: &str,
+    new_psk_hash: &[u8],
+) -> Result<i64, CordeliaError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE channels SET key_version = key_version + 1, psk_hash = ?1, updated_at = ?2
+         WHERE channel_id = ?3",
+        params![new_psk_hash, now, channel_id],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    conn.query_row(
+        "SELECT key_version FROM channels WHERE channel_id = ?1",
+        params![channel_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
+/// Look up the peer key in a DM channel (the key that isn't the local key).
+pub fn dm_peer_key(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<[u8; 32], CordeliaError> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT peer_key FROM dm_peers WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CordeliaError::ChannelNotFound {
+                channel: channel_id.to_string(),
+            },
+            other => CordeliaError::Storage(other.to_string()),
+        })?;
+
+    if blob.len() != 32 {
+        return Err(CordeliaError::Storage("dm_peers key not 32 bytes".into()));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&blob);
+    Ok(key)
+}
+
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(err, _)
         if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE

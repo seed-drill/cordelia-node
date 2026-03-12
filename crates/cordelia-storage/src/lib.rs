@@ -8,7 +8,6 @@ pub mod items;
 pub mod naming;
 pub mod psk;
 pub mod schema;
-// TODO(WP4): L2 encryption integration.
 // TODO(WP8): FTS5 search indexing.
 
 /// Storage-level errors (wraps rusqlite and IO errors).

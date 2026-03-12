@@ -432,6 +432,250 @@ async fn test_publish_internal_type_rejected() {
     assert_eq!(resp.status(), 400);
 }
 
+// ── WP4: DM/Group/Rotate/Delete tests ────────────────────────
+
+#[actix_web::test]
+async fn test_dm_create_and_list() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Generate a "peer" identity and encode as Bech32
+    let peer = NodeIdentity::generate().unwrap();
+    let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer.public_key()).unwrap();
+
+    // Create DM
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/dm")
+        .insert_header(auth_header())
+        .set_json(json!({"peer_public_key": peer_bech32}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["is_new"].as_bool().unwrap());
+    assert!(body["channel_id"].as_str().unwrap().starts_with("dm_"));
+
+    // Create DM again (idempotent)
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/dm")
+        .insert_header(auth_header())
+        .set_json(json!({"peer_public_key": peer_bech32}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(!body["is_new"].as_bool().unwrap());
+
+    // List DMs
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/list-dms")
+        .insert_header(auth_header())
+        .set_json(json!({}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let dms = body["dms"].as_array().unwrap();
+    assert_eq!(dms.len(), 1);
+    assert!(dms[0]["channel_id"].as_str().unwrap().starts_with("dm_"));
+}
+
+#[actix_web::test]
+async fn test_dm_self_rejected() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Get our own public key
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/identity")
+        .insert_header(auth_header())
+        .set_json(json!({}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let our_pk = body["ed25519_public_key"].as_str().unwrap();
+
+    // Try to DM ourselves
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/dm")
+        .insert_header(auth_header())
+        .set_json(json!({"peer_public_key": our_pk}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[actix_web::test]
+async fn test_group_lifecycle() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Create group
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/group")
+        .insert_header(auth_header())
+        .set_json(json!({"mode": "realtime"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let group_id = body["channel_id"].as_str().unwrap().to_string();
+    assert!(group_id.starts_with("grp_"));
+
+    // List groups
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/list-groups")
+        .insert_header(auth_header())
+        .set_json(json!({}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let groups = body["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["role"], "owner");
+
+    // Invite a peer
+    let peer = NodeIdentity::generate().unwrap();
+    let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer.public_key()).unwrap();
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/group/invite")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel_id": group_id,
+            "peer_public_key": peer_bech32
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["ok"].as_bool().unwrap());
+    assert_eq!(body["member_count"], 2);
+
+    // Remove peer (triggers PSK rotation)
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/group/remove")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel_id": group_id,
+            "peer_public_key": peer_bech32
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["ok"].as_bool().unwrap());
+    assert!(body["key_rotated"].as_bool().unwrap());
+    assert_eq!(body["new_key_version"], 2);
+}
+
+#[actix_web::test]
+async fn test_rotate_psk() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe to channel (creates PSK)
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "rotate-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Rotate PSK
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/rotate-psk")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "rotate-test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["ok"].as_bool().unwrap());
+    assert_eq!(body["new_key_version"], 2);
+
+    // Rotate again
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/rotate-psk")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "rotate-test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["new_key_version"], 3);
+}
+
+#[actix_web::test]
+async fn test_delete_item() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe + publish
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "delete-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "delete-test", "content": "to be deleted"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let item_id = body["item_id"].as_str().unwrap().to_string();
+
+    // Delete item
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/delete-item")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "delete-test", "item_id": item_id}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["ok"].as_bool().unwrap());
+
+    // Listen should be empty (item is tombstoned)
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/listen")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "delete-test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}
+
 #[actix_web::test]
 async fn test_publish_not_member() {
     let state = test_state();

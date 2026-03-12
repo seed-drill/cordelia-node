@@ -600,6 +600,7 @@ dependencies = [
  "bech32",
  "ciborium",
  "cordelia-core",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "rand 0.8.5",

@@ -149,6 +149,123 @@ pub struct IdentityResponse {
     pub channels_subscribed: i64,
 }
 
+// ── DM ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DmRequest {
+    pub peer_public_key: String, // Bech32 X25519 public key
+}
+
+#[derive(Serialize)]
+pub struct DmResponse {
+    pub channel_id: String,
+    pub is_new: bool,
+    pub peer_public_key: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct ListDmsResponse {
+    pub dms: Vec<DmChannel>,
+}
+
+#[derive(Serialize)]
+pub struct DmChannel {
+    pub channel_id: String,
+    pub peer_public_key: String,
+    pub item_count: i64,
+    pub last_activity: Option<String>,
+    pub created_at: String,
+}
+
+// ── Group ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct GroupCreateRequest {
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+#[derive(Serialize)]
+pub struct GroupCreateResponse {
+    pub channel_id: String,
+    pub mode: String,
+    pub created_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct GroupInviteRequest {
+    pub channel_id: String,
+    pub peer_public_key: String, // Bech32 Ed25519 public key of invitee
+}
+
+#[derive(Serialize)]
+pub struct GroupInviteResponse {
+    pub ok: bool,
+    pub channel_id: String,
+    pub peer_public_key: String,
+    pub member_count: i64,
+}
+
+#[derive(Deserialize)]
+pub struct GroupRemoveRequest {
+    pub channel_id: String,
+    pub peer_public_key: String,
+}
+
+#[derive(Serialize)]
+pub struct GroupRemoveResponse {
+    pub ok: bool,
+    pub channel_id: String,
+    pub peer_public_key: String,
+    pub key_rotated: bool,
+    pub new_key_version: i64,
+}
+
+#[derive(Serialize)]
+pub struct ListGroupsResponse {
+    pub groups: Vec<GroupChannel>,
+}
+
+#[derive(Serialize)]
+pub struct GroupChannel {
+    pub channel_id: String,
+    pub role: String,
+    pub mode: String,
+    pub member_count: i64,
+    pub item_count: i64,
+    pub last_activity: Option<String>,
+    pub created_at: String,
+}
+
+// ── Rotate PSK ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RotatePskRequest {
+    pub channel: String,
+}
+
+#[derive(Serialize)]
+pub struct RotatePskResponse {
+    pub ok: bool,
+    pub channel: String,
+    pub new_key_version: i64,
+}
+
+// ── Delete Item ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DeleteItemRequest {
+    pub channel: String,
+    pub item_id: String,
+}
+
+#[derive(Serialize)]
+pub struct DeleteItemResponse {
+    pub ok: bool,
+    pub item_id: String,
+}
+
 // ── Defaults ───────────────────────────────────────────────────────
 
 fn default_mode() -> String {
