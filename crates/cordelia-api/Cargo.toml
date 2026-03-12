@@ -1,0 +1,23 @@
+[package]
+name = "cordelia-api"
+description = "REST API endpoints, bearer token auth, Prometheus metrics, health checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cordelia-core = { workspace = true }
+cordelia-storage = { workspace = true }
+cordelia-crypto = { workspace = true }
+actix-web = { workspace = true }
+actix-rt = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

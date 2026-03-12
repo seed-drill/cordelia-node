@@ -1,0 +1,25 @@
+[package]
+name = "cordelia-network"
+description = "QUIC transport, 8 mini-protocols, governor state machine, replication engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cordelia-core = { workspace = true }
+cordelia-crypto = { workspace = true }
+cordelia-storage = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

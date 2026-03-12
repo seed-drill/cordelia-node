@@ -1,0 +1,23 @@
+[package]
+name = "cordelia-crypto"
+description = "Ed25519/X25519 identity, ECIES envelope encryption, AES-256-GCM, CBOR signing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cordelia-core = { workspace = true }
+ring = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+bech32 = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

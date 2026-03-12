@@ -1,0 +1,22 @@
+[package]
+name = "cordelia-node"
+description = "Cordelia node binary: CLI, daemon lifecycle, signal handling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cordelia"
+path = "src/main.rs"
+
+[dependencies]
+cordelia-core = { workspace = true }
+cordelia-crypto = { workspace = true }
+cordelia-storage = { workspace = true }
+cordelia-network = { workspace = true }
+cordelia-api = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

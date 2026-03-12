@@ -1,0 +1,78 @@
+[workspace]
+members = [
+    "crates/cordelia-core",
+    "crates/cordelia-crypto",
+    "crates/cordelia-storage",
+    "crates/cordelia-network",
+    "crates/cordelia-api",
+    "crates/cordelia-node",
+    "crates/cordelia-test",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/seed-drill/cordelia-node"
+authors = ["Seed Drill <hello@seeddrill.ai>"]
+
+[workspace.dependencies]
+# Internal crates
+cordelia-core = { path = "crates/cordelia-core" }
+cordelia-crypto = { path = "crates/cordelia-crypto" }
+cordelia-storage = { path = "crates/cordelia-storage" }
+cordelia-network = { path = "crates/cordelia-network" }
+cordelia-api = { path = "crates/cordelia-api" }
+cordelia-test = { path = "crates/cordelia-test" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Crypto
+ring = "0.17"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+# Encoding
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bech32 = "0.11"
+hex = "0.4"
+base64 = "0.22"
+
+# QUIC transport
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+
+# HTTP API
+actix-web = "4"
+actix-rt = "2"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+ulid = "1"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Testing
+tempfile = "3"

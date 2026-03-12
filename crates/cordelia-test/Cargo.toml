@@ -1,0 +1,16 @@
+[package]
+name = "cordelia-test"
+description = "Test harness: TestNode, TestMesh, TestNodeBuilder, assertion helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cordelia-core = { workspace = true }
+cordelia-crypto = { workspace = true }
+cordelia-storage = { workspace = true }
+cordelia-network = { workspace = true }
+cordelia-api = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
