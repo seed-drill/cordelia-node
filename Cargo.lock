@@ -587,6 +587,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
  "tracing",
@@ -637,6 +638,7 @@ dependencies = [
 name = "cordelia-node"
 version = "0.1.0"
 dependencies = [
+ "actix-web",
  "anyhow",
  "clap",
  "cordelia-api",
@@ -644,6 +646,9 @@ dependencies = [
  "cordelia-crypto",
  "cordelia-network",
  "cordelia-storage",
+ "hex",
+ "rusqlite",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

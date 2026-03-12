@@ -36,4 +36,7 @@ pub enum CordeliaError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
