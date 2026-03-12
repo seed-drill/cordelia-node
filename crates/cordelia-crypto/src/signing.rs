@@ -57,6 +57,36 @@ pub fn encode_metadata_envelope(fields: &[(&str, ciborium::Value)]) -> Result<Ve
     Ok(buf)
 }
 
+/// Build and encode the item metadata envelope for signing (ECIES spec §11.7).
+///
+/// Returns deterministic CBOR bytes ready for Ed25519 signing.
+pub fn build_item_metadata_envelope(
+    author_id: &[u8; 32],
+    channel_id: &str,
+    content_hash: &[u8; 32],
+    is_tombstone: bool,
+    item_id: &str,
+    key_version: i64,
+    published_at: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    let fields = [
+        ("author_id", ciborium::Value::Bytes(author_id.to_vec())),
+        ("channel_id", ciborium::Value::Text(channel_id.into())),
+        (
+            "content_hash",
+            ciborium::Value::Bytes(content_hash.to_vec()),
+        ),
+        ("is_tombstone", ciborium::Value::Bool(is_tombstone)),
+        ("item_id", ciborium::Value::Text(item_id.into())),
+        (
+            "key_version",
+            ciborium::Value::Integer(key_version.into()),
+        ),
+        ("published_at", ciborium::Value::Text(published_at.into())),
+    ];
+    encode_metadata_envelope(&fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

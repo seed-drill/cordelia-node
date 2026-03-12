@@ -1,0 +1,161 @@
+//! SQLite schema definitions and migrations.
+//!
+//! Spec: seed-drill/specs/data-formats.md §3, §5
+
+use rusqlite::Connection;
+
+use crate::StorageError;
+
+/// Current schema version (incremented per migration).
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Migration v1: Phase 1 initial schema.
+///
+/// All DDL from data-formats.md §3.1-§3.5.
+/// Search tables (§2 of search-indexing.md) deferred to WP8.
+const MIGRATION_V1: &str = r#"
+-- Core tables (data-formats.md §3)
+
+CREATE TABLE IF NOT EXISTS channels (
+    channel_id    TEXT PRIMARY KEY,
+    channel_name  TEXT,
+    channel_type  TEXT NOT NULL CHECK(channel_type IN ('named', 'dm', 'group')),
+    mode          TEXT NOT NULL CHECK(mode IN ('realtime', 'batch')),
+    access        TEXT NOT NULL CHECK(access IN ('open', 'invite_only')),
+    creator_id    BLOB NOT NULL,
+    key_version   INTEGER NOT NULL DEFAULT 1,
+    psk_hash      BLOB,
+    descriptor    BLOB,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_name ON channels(channel_name)
+    WHERE channel_name IS NOT NULL AND channel_type = 'named';
+
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel_id   TEXT NOT NULL REFERENCES channels(channel_id),
+    entity_key   BLOB NOT NULL,
+    role         TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member')),
+    posture      TEXT NOT NULL DEFAULT 'active' CHECK(posture IN ('active', 'removed')),
+    joined_at    TEXT NOT NULL,
+    removed_at   TEXT,
+    PRIMARY KEY (channel_id, entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_members_entity ON channel_members(entity_key);
+
+CREATE TABLE IF NOT EXISTS channel_keys (
+    channel_id     TEXT PRIMARY KEY REFERENCES channels(channel_id),
+    encrypted_psk  BLOB NOT NULL,
+    key_version    INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    item_id         TEXT PRIMARY KEY,
+    channel_id      TEXT NOT NULL REFERENCES channels(channel_id),
+    author_id       BLOB NOT NULL,
+    item_type       TEXT NOT NULL,
+    published_at    TEXT NOT NULL,
+    is_tombstone    INTEGER NOT NULL DEFAULT 0,
+    parent_id       TEXT,
+    key_version     INTEGER NOT NULL DEFAULT 1,
+    content_hash    BLOB NOT NULL,
+    signature       BLOB NOT NULL,
+    encrypted_blob  BLOB NOT NULL,
+    content_length  INTEGER NOT NULL,
+    received_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_channel_published ON items(channel_id, published_at);
+CREATE INDEX IF NOT EXISTS idx_items_channel_type      ON items(channel_id, item_type);
+CREATE INDEX IF NOT EXISTS idx_items_content_hash      ON items(content_hash);
+
+CREATE TABLE IF NOT EXISTS dm_peers (
+    channel_id   TEXT PRIMARY KEY REFERENCES channels(channel_id),
+    peer_key     BLOB NOT NULL
+);
+"#;
+
+/// Initialise the database: set pragmas and run pending migrations.
+pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+    if current < 1 {
+        tracing::info!("applying migration v1 (initial schema)");
+        conn.execute_batch(MIGRATION_V1)?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
+
+    let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    tracing::debug!(schema_version = actual, "database initialised");
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_init_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap(); // second call should be a no-op
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_tables_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(tables.contains(&"channels".to_string()));
+        assert!(tables.contains(&"channel_members".to_string()));
+        assert!(tables.contains(&"channel_keys".to_string()));
+        assert!(tables.contains(&"items".to_string()));
+        assert!(tables.contains(&"dm_peers".to_string()));
+    }
+
+    #[test]
+    fn test_channel_type_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let result = conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('test', 'invalid', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(result.is_err());
+    }
+}

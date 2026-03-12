@@ -15,6 +15,7 @@ pub use bech32::{bech32_decode, bech32_encode};
 pub use ecies::{ecies_decrypt, ecies_encrypt, hkdf_sha256, EciesEnvelope};
 pub use identity::{x25519_from_ed25519_seed, NodeIdentity};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,15 @@ pub enum CryptoError {
 
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
+}
+
+/// Generate a random 32-byte PSK using CSPRNG.
+pub fn generate_psk() -> Result<[u8; 32], CryptoError> {
+    let rng = SystemRandom::new();
+    let mut psk = [0u8; 32];
+    rng.fill(&mut psk)
+        .map_err(|_| CryptoError::EncryptionFailed("RNG failure".into()))?;
+    Ok(psk)
 }
 
 /// SHA-256 hash, returned as raw bytes.
