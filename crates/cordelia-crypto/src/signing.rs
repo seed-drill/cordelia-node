@@ -183,4 +183,42 @@ mod tests {
             panic!("expected CBOR map");
         }
     }
+
+    /// TV-C1 from ecies-envelope-encryption.md §8.6.
+    /// Cross-language: TypeScript (cbor-x) must produce identical bytes.
+    #[test]
+    fn test_tv_c1_item_metadata_envelope() {
+        let author_id = hex::decode(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        ).unwrap();
+        let content_hash = hex::decode(
+            "355e3caf62b8121affe7a3ae801b20d586968a64e231cde1c0ed7714d4c31184",
+        ).unwrap();
+
+        let cbor = build_item_metadata_envelope(
+            &author_id.try_into().unwrap(),
+            "fe028fdaf943c16ec8a1fc496818274ce7e86e921ad926f9712886fa26d309d6",
+            &content_hash.try_into().unwrap(),
+            false,
+            "ci_a1b2c3d4e5f6",
+            1,
+            "2026-03-10T19:36:00Z",
+        ).unwrap();
+
+        let expected = concat!(
+            "a7676974656d5f69646f63695f613162326333643465356636",
+            "69617574686f725f69645820d75a980182b10ab7d54bfed3c9",
+            "64073a0ee172f3daa62325af021a68f707511a6a6368616e6e",
+            "656c5f6964784066653032386664616639343363313665633861",
+            "31666334393638313832373463653765383665393231616439",
+            "3236663937313238383666613236643330396436",
+            "6b6b65795f76657273696f6e016c636f6e74656e745f686173",
+            "685820355e3caf62b8121affe7a3ae801b20d586968a64e231",
+            "cde1c0ed7714d4c311846c69735f746f6d6273746f6e65f4",
+            "6c7075626c69736865645f617474323032362d30332d313054",
+            "31393a33363a30305a",
+        );
+
+        assert_eq!(hex::encode(&cbor), expected);
+    }
 }
