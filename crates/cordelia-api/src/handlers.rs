@@ -975,6 +975,80 @@ pub async fn search_handler(
     }))
 }
 
+// ── GET /api/v1/metrics ────────────────────────────────────────────
+
+pub async fn metrics(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    let uptime = state.uptime_secs();
+    let all_channels = channels::list_for_entity(&db, &pk)?;
+    let channel_count = all_channels.len();
+
+    // Per-channel item counts (first 8 hex chars of channel_id as label)
+    let mut items_lines = String::new();
+    for ch in &all_channels {
+        let count = items::count_for_channel(&db, &ch.channel_id)?;
+        let label = channel_label(&ch.channel_id);
+        use std::fmt::Write;
+        let _ = write!(items_lines, "cordelia_items_total{{channel=\"{label}\"}} {count}\n");
+    }
+
+    // Storage bytes
+    let db_path = state.home_dir.join("cordelia.db");
+    let storage_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    let sync_errors = state.sync_error_count();
+
+    let body = format!(
+        "# HELP cordelia_uptime_seconds Node uptime\n\
+         # TYPE cordelia_uptime_seconds gauge\n\
+         cordelia_uptime_seconds {uptime:.1}\n\
+         \n\
+         # HELP cordelia_channels_subscribed Number of channels this node is subscribed to\n\
+         # TYPE cordelia_channels_subscribed gauge\n\
+         cordelia_channels_subscribed {channel_count}\n\
+         \n\
+         # HELP cordelia_items_total Total items per channel\n\
+         # TYPE cordelia_items_total gauge\n\
+         {items_lines}\
+         \n\
+         # HELP cordelia_storage_bytes Total storage used by SQLite database\n\
+         # TYPE cordelia_storage_bytes gauge\n\
+         cordelia_storage_bytes {storage_bytes}\n\
+         \n\
+         # HELP cordelia_sync_errors_total Cumulative replication sync errors\n\
+         # TYPE cordelia_sync_errors_total counter\n\
+         cordelia_sync_errors_total {sync_errors}\n\
+         \n\
+         # HELP cordelia_peers_hot Number of peers in Hot state\n\
+         # TYPE cordelia_peers_hot gauge\n\
+         cordelia_peers_hot 0\n\
+         \n\
+         # HELP cordelia_peers_warm Number of peers in Warm state\n\
+         # TYPE cordelia_peers_warm gauge\n\
+         cordelia_peers_warm 0\n"
+    );
+
+    Ok(HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(body))
+}
+
+/// Extract a privacy-safe label from a channel_id (first 8 hex chars after any prefix).
+fn channel_label(channel_id: &str) -> &str {
+    let hex_part = channel_id
+        .strip_prefix("dm_")
+        .or_else(|| channel_id.strip_prefix("grp_"))
+        .unwrap_or(channel_id);
+    &hex_part[..hex_part.len().min(8)]
+}
+
 // ── Internal helpers ───────────────────────────────────────────────
 
 /// Decrypt an item's encrypted_blob and parse the JSON {content, metadata} envelope.

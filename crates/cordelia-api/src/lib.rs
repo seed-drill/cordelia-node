@@ -8,8 +8,6 @@ pub mod handlers;
 pub mod state;
 pub mod types;
 
-// TODO(WP13): CLI stats + Prometheus metrics.
-
 use actix_web::web;
 
 /// Configure all Channels API routes on the given scope.
@@ -38,5 +36,11 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/search", web::post().to(handlers::search_handler))
             // Identity
             .route("/identity", web::post().to(handlers::identity)),
+    );
+
+    // Prometheus metrics (GET, outside /channels scope per spec §3.15)
+    cfg.route(
+        "/api/v1/metrics",
+        web::get().to(handlers::metrics),
     );
 }

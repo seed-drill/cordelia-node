@@ -5,6 +5,7 @@
 
 use actix_web::{test, web, App};
 use serde_json::json;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
 use cordelia_api::state::AppState;
@@ -22,6 +23,8 @@ fn test_state() -> web::Data<AppState> {
         identity,
         bearer_token: TEST_TOKEN.into(),
         home_dir: dir.into_path(),
+        started_at: std::time::Instant::now(),
+        sync_errors: AtomicU64::new(0),
     })
 }
 
@@ -863,4 +866,62 @@ async fn test_publish_not_member() {
     // or succeed with a valid channel_id. Since "no-member" is a valid name, resolve succeeds
     // but is_member returns false -> 403
     assert_eq!(resp.status(), 403);
+}
+
+// ── WP13: Metrics ─────────────────────────────────────────────────
+
+#[actix_web::test]
+async fn test_metrics_endpoint() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe to a channel first
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "metrics-test", "mode": "realtime", "access": "open"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // GET /api/v1/metrics
+    let req = test::TestRequest::get()
+        .uri("/api/v1/metrics")
+        .insert_header(auth_header())
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body = test::read_body(resp).await;
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(text.contains("cordelia_uptime_seconds"));
+    assert!(text.contains("cordelia_channels_subscribed 1"));
+    assert!(text.contains("cordelia_items_total"));
+    assert!(text.contains("cordelia_storage_bytes"));
+    assert!(text.contains("cordelia_sync_errors_total 0"));
+    assert!(text.contains("cordelia_peers_hot 0"));
+    assert!(text.contains("cordelia_peers_warm 0"));
+}
+
+#[actix_web::test]
+async fn test_metrics_requires_auth() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // No auth header
+    let req = test::TestRequest::get()
+        .uri("/api/v1/metrics")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401);
 }

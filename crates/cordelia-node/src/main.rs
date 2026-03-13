@@ -48,6 +48,12 @@ enum Commands {
     Start,
     /// Stop the node daemon
     Stop,
+    /// List connected peers
+    Peers,
+    /// List subscribed channels
+    Channels,
+    /// Show detailed metrics
+    Stats,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -66,6 +72,9 @@ fn main() -> anyhow::Result<()> {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
             Ok(())
         }
+        Some(Commands::Peers) => cmd_peers(),
+        Some(Commands::Channels) => cmd_channels(&cli.config),
+        Some(Commands::Stats) => cmd_stats(&cli.config),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
             println!("Encrypted pub/sub for AI agents");
@@ -321,6 +330,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         identity,
         bearer_token,
         home_dir: data_dir,
+        started_at: std::time::Instant::now(),
+        sync_errors: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Start the tokio/actix runtime
@@ -339,6 +350,95 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e))
     })
 }
+
+// ── cordelia peers ─────────────────────────────────────────────────
+
+fn cmd_peers() -> anyhow::Result<()> {
+    println!("ENTITY          STATE   LATENCY   ADDRESS");
+    println!();
+    println!("No peers connected (P2P transport not yet implemented).");
+    Ok(())
+}
+
+// ── cordelia channels ─────────────────────────────────────────────
+
+fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+    let data_dir = config.data_dir();
+
+    let identity_path = data_dir.join("identity.key");
+    if !identity_path.exists() {
+        anyhow::bail!("Node not initialised. Run `cordelia init` first.");
+    }
+
+    let identity = NodeIdentity::from_file(&identity_path)?;
+    let pk = identity.public_key();
+    let db_path = data_dir.join("cordelia.db");
+    let conn = cordelia_storage::db::open(&db_path)?;
+
+    let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
+
+    println!("{:<24} {:<10} {:>6}   {:<20} {}", "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY", "TYPE");
+    for ch in &all {
+        let name = ch.channel_name.as_deref().unwrap_or(&ch.channel_id[..ch.channel_id.len().min(16)]);
+        let count = cordelia_storage::items::count_for_channel(&conn, &ch.channel_id)?;
+        let activity = cordelia_storage::items::last_activity(&conn, &ch.channel_id)?
+            .unwrap_or_else(|| "-".into());
+
+        println!("{:<24} {:<10} {:>6}   {:<20} {}", name, ch.mode, count, activity, ch.channel_type);
+    }
+
+    if all.is_empty() {
+        println!("No channels. Subscribe with `cordelia subscribe <channel>`.");
+    }
+
+    Ok(())
+}
+
+// ── cordelia stats ────────────────────────────────────────────────
+
+fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+    let data_dir = config.data_dir();
+
+    let identity_path = data_dir.join("identity.key");
+    if !identity_path.exists() {
+        anyhow::bail!("Node not initialised. Run `cordelia init` first.");
+    }
+
+    let identity = NodeIdentity::from_file(&identity_path)?;
+    let pk = identity.public_key();
+    let db_path = data_dir.join("cordelia.db");
+    let conn = cordelia_storage::db::open(&db_path)?;
+
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
+
+    let mut total_items: i64 = 0;
+    for ch in &channels {
+        total_items += cordelia_storage::items::count_for_channel(&conn, &ch.channel_id)?;
+    }
+
+    let size_str = if db_size > 1_048_576 {
+        format!("{:.1} MB", db_size as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KB", db_size as f64 / 1024.0)
+    };
+
+    println!("Storage:        {size_str}");
+    println!("Channels:       {}", channels.len());
+    println!("Total items:    {total_items}");
+    println!("Sync errors:    0");
+    println!("Peers:          0 (P2P not yet implemented)");
+
+    Ok(())
+}
+
+// ── Tracing ───────────────────────────────────────────────────────
 
 fn init_tracing(level: &str) {
     use tracing_subscriber::EnvFilter;
