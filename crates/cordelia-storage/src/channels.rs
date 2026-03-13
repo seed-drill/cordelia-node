@@ -151,6 +151,7 @@ pub fn create_group(
     conn: &Connection,
     creator_id: &[u8; 32],
     mode: &str,
+    name: Option<&str>,
     psk: Option<&[u8; 32]>,
 ) -> Result<Channel, CordeliaError> {
     let channel_id = naming::group_channel_id();
@@ -158,9 +159,9 @@ pub fn create_group(
     let psk_hash = psk.map(|k| Sha256::digest(k).to_vec());
 
     conn.execute(
-        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, psk_hash, created_at, updated_at)
-         VALUES (?1, 'group', ?2, 'invite_only', ?3, ?4, ?5, ?6)",
-        params![channel_id, mode, creator_id.as_slice(), psk_hash, now, now],
+        "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access, creator_id, psk_hash, created_at, updated_at)
+         VALUES (?1, ?2, 'group', ?3, 'invite_only', ?4, ?5, ?6, ?7)",
+        params![channel_id, name, mode, creator_id.as_slice(), psk_hash, now, now],
     )
     .map_err(|e| CordeliaError::Storage(e.to_string()))?;
 
@@ -173,7 +174,7 @@ pub fn create_group(
 
     Ok(Channel {
         channel_id,
-        channel_name: None,
+        channel_name: name.map(String::from),
         channel_type: "group".into(),
         mode: mode.into(),
         access: "invite_only".into(),
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn test_create_group() {
         let conn = db::open_in_memory().unwrap();
-        let ch = create_group(&conn, &test_creator(), "realtime", None).unwrap();
+        let ch = create_group(&conn, &test_creator(), "realtime", None, None).unwrap();
         assert!(ch.channel_id.starts_with("grp_"));
         assert_eq!(ch.channel_type, "group");
     }

@@ -143,24 +143,26 @@ pub struct UnsubscribeResponse {
 
 #[derive(Serialize)]
 pub struct IdentityResponse {
+    pub entity_id: String,
     pub ed25519_public_key: String,
     pub x25519_public_key: String,
     pub node_id: String,
     pub channels_subscribed: i64,
+    pub peers_connected: i64,
 }
 
 // ── DM ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct DmRequest {
-    pub peer_public_key: String, // Bech32 X25519 public key
+    pub peer: String, // Bech32 Ed25519 public key
 }
 
 #[derive(Serialize)]
 pub struct DmResponse {
     pub channel_id: String,
     pub is_new: bool,
-    pub peer_public_key: String,
+    pub peer: String,
     pub created_at: String,
 }
 
@@ -172,7 +174,7 @@ pub struct ListDmsResponse {
 #[derive(Serialize)]
 pub struct DmChannel {
     pub channel_id: String,
-    pub peer_public_key: String,
+    pub peer: String,
     pub item_count: i64,
     pub last_activity: Option<String>,
     pub created_at: String,
@@ -184,41 +186,47 @@ pub struct DmChannel {
 pub struct GroupCreateRequest {
     #[serde(default = "default_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct GroupCreateResponse {
     pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub mode: String,
+    pub member_count: i64,
+    pub is_new: bool,
     pub created_at: String,
 }
 
 #[derive(Deserialize)]
 pub struct GroupInviteRequest {
     pub channel_id: String,
-    pub peer_public_key: String, // Bech32 Ed25519 public key of invitee
+    pub member: String, // Bech32 Ed25519 public key of invitee
 }
 
 #[derive(Serialize)]
 pub struct GroupInviteResponse {
     pub ok: bool,
     pub channel_id: String,
-    pub peer_public_key: String,
+    pub member: String,
     pub member_count: i64,
 }
 
 #[derive(Deserialize)]
 pub struct GroupRemoveRequest {
     pub channel_id: String,
-    pub peer_public_key: String,
+    pub member: String,
 }
 
 #[derive(Serialize)]
 pub struct GroupRemoveResponse {
     pub ok: bool,
     pub channel_id: String,
-    pub peer_public_key: String,
-    pub key_rotated: bool,
+    pub removed: String,
+    pub psk_rotated: bool,
     pub new_key_version: i64,
 }
 
@@ -250,6 +258,7 @@ pub struct RotatePskResponse {
     pub ok: bool,
     pub channel: String,
     pub new_key_version: i64,
+    pub members_notified: i64,
 }
 
 // ── Delete Item ───────────────────────────────────────────────
@@ -264,6 +273,7 @@ pub struct DeleteItemRequest {
 pub struct DeleteItemResponse {
     pub ok: bool,
     pub item_id: String,
+    pub tombstoned_at: String,
 }
 
 // ── Search ────────────────────────────────────────────────────

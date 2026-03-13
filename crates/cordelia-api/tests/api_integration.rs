@@ -455,7 +455,7 @@ async fn test_dm_create_and_list() {
     let req = test::TestRequest::post()
         .uri("/api/v1/channels/dm")
         .insert_header(auth_header())
-        .set_json(json!({"peer_public_key": peer_bech32}))
+        .set_json(json!({"peer": peer_bech32}))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
@@ -468,7 +468,7 @@ async fn test_dm_create_and_list() {
     let req = test::TestRequest::post()
         .uri("/api/v1/channels/dm")
         .insert_header(auth_header())
-        .set_json(json!({"peer_public_key": peer_bech32}))
+        .set_json(json!({"peer": peer_bech32}))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
@@ -513,7 +513,7 @@ async fn test_dm_self_rejected() {
     let req = test::TestRequest::post()
         .uri("/api/v1/channels/dm")
         .insert_header(auth_header())
-        .set_json(json!({"peer_public_key": our_pk}))
+        .set_json(json!({"peer": our_pk}))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 400);
@@ -563,7 +563,7 @@ async fn test_group_lifecycle() {
         .insert_header(auth_header())
         .set_json(json!({
             "channel_id": group_id,
-            "peer_public_key": peer_bech32
+            "member": peer_bech32
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -578,14 +578,14 @@ async fn test_group_lifecycle() {
         .insert_header(auth_header())
         .set_json(json!({
             "channel_id": group_id,
-            "peer_public_key": peer_bech32
+            "member": peer_bech32
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert!(body["ok"].as_bool().unwrap());
-    assert!(body["key_rotated"].as_bool().unwrap());
+    assert!(body["psk_rotated"].as_bool().unwrap());
     assert_eq!(body["new_key_version"], 2);
 }
 

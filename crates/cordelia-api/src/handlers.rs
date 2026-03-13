@@ -156,7 +156,7 @@ pub async fn publish(
     let channel_psk = psk::read_psk(&state.home_dir, &channel_id.0)?;
 
     // Encrypt
-    let encrypted_blob = cordelia_crypto::item_encrypt(&channel_psk, &plaintext_bytes)
+    let encrypted_blob = cordelia_crypto::item_encrypt(&channel_psk, &plaintext_bytes, channel_id.0.as_bytes())
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Generate item ID and timestamp
@@ -265,7 +265,7 @@ pub async fn listen(
     // Decrypt and verify each item
     let mut listen_items = Vec::with_capacity(result_rows.len());
     for row in result_rows {
-        let (content, metadata) = decrypt_item_content(&channel_psk, &row.encrypted_blob);
+        let (content, metadata) = decrypt_item_content(&channel_psk, &row.encrypted_blob, &channel_id.0);
         let signature_valid = verify_item_signature(row);
 
         let mut author_pk = [0u8; 32];
@@ -438,10 +438,12 @@ pub async fn identity(
     let subscribed = all.len() as i64;
 
     Ok(HttpResponse::Ok().json(IdentityResponse {
+        entity_id: String::new(), // TODO: load from config
         ed25519_public_key: ed_bech32.clone(),
         x25519_public_key: x_bech32,
         node_id: ed_bech32,
         channels_subscribed: subscribed,
+        peers_connected: 0, // Phase 1: no P2P
     }))
 }
 
@@ -455,8 +457,8 @@ pub async fn dm(
     auth::check_bearer(&req, &state)?;
 
     // Decode peer's Ed25519 public key from Bech32
-    let peer_pk_bytes = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
-        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+    let peer_pk_bytes = cordelia_crypto::bech32::decode_public_key(&body.peer)
+        .map_err(|e| ApiError::BadRequest(format!("invalid peer: {e}")))?;
 
     let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
     let pk = state.identity.public_key();
@@ -475,7 +477,7 @@ pub async fn dm(
             Ok(HttpResponse::Ok().json(DmResponse {
                 channel_id,
                 is_new: false,
-                peer_public_key: peer_bech32,
+                peer: peer_bech32,
                 created_at: existing.created_at,
             }))
         }
@@ -492,13 +494,15 @@ pub async fn dm(
             let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &new_psk)
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-            // Store envelope as internal item for peer to retrieve via replication
-            let envelope_bytes = envelope.to_bytes();
+            // Store envelope as CBOR-wrapped item (data-formats.md §4.2, key_version=0)
+            let cbor_blob = cordelia_crypto::psk_envelope::encode_psk_envelope(
+                &envelope.to_bytes(), 1, &peer_x25519,
+            ).map_err(|e| ApiError::Internal(e.to_string()))?;
             let item_id = items::generate_item_id();
             let published_at = Utc::now().to_rfc3339();
-            let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+            let content_hash = cordelia_crypto::sha256(&cbor_blob);
             let cbor = signing::build_item_metadata_envelope(
-                &pk, &ch.channel_id, &content_hash, false, &item_id, 1, &published_at,
+                &pk, &ch.channel_id, &content_hash, false, &item_id, 0, &published_at,
             ).map_err(|e| ApiError::Internal(e.to_string()))?;
             let signature = state.identity.sign(&cbor);
 
@@ -509,10 +513,10 @@ pub async fn dm(
                 item_type: "psk_envelope",
                 published_at: &published_at,
                 parent_id: None,
-                key_version: 1,
+                key_version: 0,
                 content_hash: &content_hash,
                 signature: &signature,
-                encrypted_blob: &envelope_bytes,
+                encrypted_blob: &cbor_blob,
             })?;
 
             let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer_pk_bytes)
@@ -521,7 +525,7 @@ pub async fn dm(
             Ok(HttpResponse::Ok().json(DmResponse {
                 channel_id: ch.channel_id,
                 is_new: true,
-                peer_public_key: peer_bech32,
+                peer: peer_bech32,
                 created_at: ch.created_at,
             }))
         }
@@ -553,7 +557,7 @@ pub async fn list_dms(
 
         result.push(DmChannel {
             channel_id: ch.channel_id,
-            peer_public_key: peer_bech32,
+            peer: peer_bech32,
             item_count,
             last_activity: activity,
             created_at: ch.created_at,
@@ -582,12 +586,15 @@ pub async fn group_create(
     let new_psk = cordelia_crypto::generate_psk()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let ch = channels::create_group(&db, &pk, &body.mode, Some(&new_psk))?;
+    let ch = channels::create_group(&db, &pk, &body.mode, body.name.as_deref(), Some(&new_psk))?;
     psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
 
     Ok(HttpResponse::Ok().json(GroupCreateResponse {
         channel_id: ch.channel_id,
+        name: ch.channel_name,
         mode: ch.mode,
+        member_count: 1,
+        is_new: true,
         created_at: ch.created_at,
     }))
 }
@@ -601,8 +608,8 @@ pub async fn group_invite(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
-    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
-        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.member)
+        .map_err(|e| ApiError::BadRequest(format!("invalid member: {e}")))?;
 
     let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
     let pk = state.identity.public_key();
@@ -627,14 +634,16 @@ pub async fn group_invite(
     let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &channel_psk)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Store envelope as internal item
-    let envelope_bytes = envelope.to_bytes();
+    // Store envelope as CBOR-wrapped item (data-formats.md §4.2, key_version=0)
+    let cbor_blob = cordelia_crypto::psk_envelope::encode_psk_envelope(
+        &envelope.to_bytes(), ch.key_version, &peer_x25519,
+    ).map_err(|e| ApiError::Internal(e.to_string()))?;
     let item_id = items::generate_item_id();
     let published_at = Utc::now().to_rfc3339();
-    let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+    let content_hash = cordelia_crypto::sha256(&cbor_blob);
     let cbor = signing::build_item_metadata_envelope(
         &pk, &body.channel_id, &content_hash, false, &item_id,
-        ch.key_version, &published_at,
+        0, &published_at,
     ).map_err(|e| ApiError::Internal(e.to_string()))?;
     let signature = state.identity.sign(&cbor);
 
@@ -645,10 +654,10 @@ pub async fn group_invite(
         item_type: "psk_envelope",
         published_at: &published_at,
         parent_id: None,
-        key_version: ch.key_version,
+        key_version: 0,
         content_hash: &content_hash,
         signature: &signature,
-        encrypted_blob: &envelope_bytes,
+        encrypted_blob: &cbor_blob,
     })?;
 
     let count = channels::member_count(&db, &body.channel_id)?;
@@ -656,7 +665,7 @@ pub async fn group_invite(
     Ok(HttpResponse::Ok().json(GroupInviteResponse {
         ok: true,
         channel_id: body.channel_id.clone(),
-        peer_public_key: body.peer_public_key.clone(),
+        member: body.member.clone(),
         member_count: count,
     }))
 }
@@ -670,8 +679,8 @@ pub async fn group_remove(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
-    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.peer_public_key)
-        .map_err(|e| ApiError::BadRequest(format!("invalid peer_public_key: {e}")))?;
+    let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.member)
+        .map_err(|e| ApiError::BadRequest(format!("invalid member: {e}")))?;
 
     let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
     let pk = state.identity.public_key();
@@ -707,13 +716,15 @@ pub async fn group_remove(
         let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        let envelope_bytes = envelope.to_bytes();
+        let cbor_blob = cordelia_crypto::psk_envelope::encode_psk_envelope(
+            &envelope.to_bytes(), new_key_version, &member_x25519,
+        ).map_err(|e| ApiError::Internal(e.to_string()))?;
         let item_id = items::generate_item_id();
         let published_at = Utc::now().to_rfc3339();
-        let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+        let content_hash = cordelia_crypto::sha256(&cbor_blob);
         let cbor = signing::build_item_metadata_envelope(
             &pk, &body.channel_id, &content_hash, false, &item_id,
-            new_key_version, &published_at,
+            0, &published_at,
         ).map_err(|e| ApiError::Internal(e.to_string()))?;
         let signature = state.identity.sign(&cbor);
 
@@ -724,18 +735,18 @@ pub async fn group_remove(
             item_type: "psk_envelope",
             published_at: &published_at,
             parent_id: None,
-            key_version: new_key_version,
+            key_version: 0,
             content_hash: &content_hash,
             signature: &signature,
-            encrypted_blob: &envelope_bytes,
+            encrypted_blob: &cbor_blob,
         })?;
     }
 
     Ok(HttpResponse::Ok().json(GroupRemoveResponse {
         ok: true,
         channel_id: body.channel_id.clone(),
-        peer_public_key: body.peer_public_key.clone(),
-        key_rotated: true,
+        removed: body.member.clone(),
+        psk_rotated: true,
         new_key_version,
     }))
 }
@@ -813,13 +824,15 @@ pub async fn rotate_psk_handler(
         let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        let envelope_bytes = envelope.to_bytes();
+        let cbor_blob = cordelia_crypto::psk_envelope::encode_psk_envelope(
+            &envelope.to_bytes(), new_key_version, &member_x25519,
+        ).map_err(|e| ApiError::Internal(e.to_string()))?;
         let item_id = items::generate_item_id();
         let published_at = Utc::now().to_rfc3339();
-        let content_hash = cordelia_crypto::sha256(&envelope_bytes);
+        let content_hash = cordelia_crypto::sha256(&cbor_blob);
         let cbor = signing::build_item_metadata_envelope(
             &pk, &channel_id.0, &content_hash, false, &item_id,
-            new_key_version, &published_at,
+            0, &published_at,
         ).map_err(|e| ApiError::Internal(e.to_string()))?;
         let signature = state.identity.sign(&cbor);
 
@@ -830,10 +843,10 @@ pub async fn rotate_psk_handler(
             item_type: "psk_envelope",
             published_at: &published_at,
             parent_id: None,
-            key_version: new_key_version,
+            key_version: 0,
             content_hash: &content_hash,
             signature: &signature,
-            encrypted_blob: &envelope_bytes,
+            encrypted_blob: &cbor_blob,
         })?;
     }
 
@@ -841,6 +854,7 @@ pub async fn rotate_psk_handler(
         ok: true,
         channel: body.channel.clone(),
         new_key_version,
+        members_notified: member_keys.len() as i64,
     }))
 }
 
@@ -874,6 +888,7 @@ pub async fn delete_item(
     Ok(HttpResponse::Ok().json(DeleteItemResponse {
         ok: true,
         item_id: body.item_id.clone(),
+        tombstoned_at: Utc::now().to_rfc3339(),
     }))
 }
 
@@ -942,7 +957,7 @@ pub async fn search_handler(
             .ok();
 
         if let Some(item) = row {
-            let (content, metadata) = decrypt_item_content(&channel_psk, &item.encrypted_blob);
+            let (content, metadata) = decrypt_item_content(&channel_psk, &item.encrypted_blob, &channel_id.0);
             let signature_valid = verify_item_signature(&item);
 
             let mut author_pk = [0u8; 32];
@@ -1055,8 +1070,9 @@ fn channel_label(channel_id: &str) -> &str {
 fn decrypt_item_content(
     psk: &[u8; 32],
     encrypted_blob: &[u8],
+    channel_id: &str,
 ) -> (serde_json::Value, Option<serde_json::Value>) {
-    let plaintext = match cordelia_crypto::item_decrypt(psk, encrypted_blob) {
+    let plaintext = match cordelia_crypto::item_decrypt(psk, encrypted_blob, channel_id.as_bytes()) {
         Ok(p) => p,
         Err(_) => return (serde_json::Value::Null, None),
     };

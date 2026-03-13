@@ -292,7 +292,7 @@ TOML
 PEER_INIT=$("$CORDELIA_BIN" --config "$PEER_CONFIG" init --name peer --non-interactive 2>&1)
 PEER_PK=$(echo "$PEER_INIT" | grep "Public key:" | awk '{print $NF}')
 
-RESP=$(api_post "dm" "{\"peer_public_key\":\"$PEER_PK\"}")
+RESP=$(api_post "dm" "{\"peer\":\"$PEER_PK\"}")
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 assert_eq       "dm: status 200"            "200" "$HTTP_CODE"

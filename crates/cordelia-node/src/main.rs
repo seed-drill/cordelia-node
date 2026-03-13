@@ -334,20 +334,29 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         sync_errors: std::sync::atomic::AtomicU64::new(0),
     });
 
-    // Start the tokio/actix runtime
+    // Start the tokio/actix runtime with graceful shutdown
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tracing::info!(%listen_addr, "starting HTTP server");
 
-        HttpServer::new(move || {
+        let server = HttpServer::new(move || {
             App::new()
                 .app_data(state.clone())
                 .configure(cordelia_api::configure_routes)
         })
         .bind(&listen_addr)?
-        .run()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
+        .run();
+
+        let server_handle = server.handle();
+
+        // Spawn signal handler for graceful shutdown
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received, stopping server");
+            server_handle.stop(true).await;
+        });
+
+        server.await.map_err(|e| anyhow::anyhow!(e))
     })
 }
 
@@ -436,6 +445,31 @@ fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
     println!("Peers:          0 (P2P not yet implemented)");
 
     Ok(())
+}
+
+// ── Signal handling ───────────────────────────────────────────────
+
+/// Wait for SIGINT (Ctrl+C) or SIGTERM (systemd/launchctl stop).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+
+        tokio::select! {
+            _ = ctrl_c => { tracing::info!("received SIGINT"); }
+            _ = sigterm.recv() => { tracing::info!("received SIGTERM"); }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to listen for Ctrl+C");
+        tracing::info!("received SIGINT");
+    }
 }
 
 // ── Tracing ───────────────────────────────────────────────────────

@@ -8,6 +8,7 @@ pub mod aes_gcm;
 pub mod bech32;
 pub mod ecies;
 pub mod identity;
+pub mod psk_envelope;
 pub mod signing;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};

@@ -15,8 +15,9 @@ const TAG_LEN: usize = 16;
 
 /// Encrypt plaintext with a 32-byte channel PSK.
 ///
+/// `aad` binds the ciphertext to its channel (spec §5.5: channel_id UTF-8 bytes).
 /// Returns binary: iv[12] || ciphertext[N] || auth_tag[16]
-pub fn item_encrypt(psk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn item_encrypt(psk: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let rng = SystemRandom::new();
     let mut iv = [0u8; IV_LEN];
     rng.fill(&mut iv)
@@ -29,7 +30,7 @@ pub fn item_encrypt(psk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoE
         .map_err(|_| CryptoError::EncryptionFailed("nonce error".into()))?;
 
     let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+    key.seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
         .map_err(|_| CryptoError::EncryptionFailed("AES-GCM seal failed".into()))?;
 
     // Output: iv || ciphertext || tag (tag is already appended by ring)
@@ -41,8 +42,9 @@ pub fn item_encrypt(psk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoE
 
 /// Decrypt binary blob encrypted with item_encrypt.
 ///
+/// `aad` must match the value used during encryption (channel_id UTF-8 bytes).
 /// Input format: iv[12] || ciphertext[N] || auth_tag[16]
-pub fn item_decrypt(psk: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn item_decrypt(psk: &[u8; 32], encrypted: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if encrypted.len() < IV_LEN + TAG_LEN {
         return Err(CryptoError::DecryptionFailed);
     }
@@ -58,7 +60,7 @@ pub fn item_decrypt(psk: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, CryptoE
 
     let mut in_out = ct_and_tag.to_vec();
     let plaintext = key
-        .open_in_place(nonce, Aad::empty(), &mut in_out)
+        .open_in_place(nonce, Aad::from(aad), &mut in_out)
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
     Ok(plaintext.to_vec())
@@ -68,23 +70,26 @@ pub fn item_decrypt(psk: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, CryptoE
 mod tests {
     use super::*;
 
+    const CH_A: &[u8] = b"channel-alpha";
+    const CH_B: &[u8] = b"channel-beta";
+
     #[test]
     fn test_item_round_trip() {
         let psk = [0x42u8; 32];
         let plaintext = b"hello cordelia";
 
-        let encrypted = item_encrypt(&psk, plaintext).unwrap();
+        let encrypted = item_encrypt(&psk, plaintext, CH_A).unwrap();
         assert_eq!(encrypted.len(), IV_LEN + plaintext.len() + TAG_LEN);
 
-        let decrypted = item_decrypt(&psk, &encrypted).unwrap();
+        let decrypted = item_decrypt(&psk, &encrypted, CH_A).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_unique_iv_per_encryption() {
         let psk = [0x42u8; 32];
-        let e1 = item_encrypt(&psk, b"same data").unwrap();
-        let e2 = item_encrypt(&psk, b"same data").unwrap();
+        let e1 = item_encrypt(&psk, b"same data", CH_A).unwrap();
+        let e2 = item_encrypt(&psk, b"same data", CH_A).unwrap();
 
         // IVs (first 12 bytes) should differ
         assert_ne!(&e1[..IV_LEN], &e2[..IV_LEN]);
@@ -95,30 +100,30 @@ mod tests {
         let psk1 = [0x01u8; 32];
         let psk2 = [0x02u8; 32];
 
-        let encrypted = item_encrypt(&psk1, b"secret").unwrap();
-        assert!(item_decrypt(&psk2, &encrypted).is_err());
+        let encrypted = item_encrypt(&psk1, b"secret", CH_A).unwrap();
+        assert!(item_decrypt(&psk2, &encrypted, CH_A).is_err());
     }
 
     #[test]
     fn test_tampered_ciphertext_fails() {
         let psk = [0x42u8; 32];
-        let mut encrypted = item_encrypt(&psk, b"data").unwrap();
+        let mut encrypted = item_encrypt(&psk, b"data", CH_A).unwrap();
         encrypted[IV_LEN] ^= 0xff; // tamper first byte of ciphertext
-        assert!(item_decrypt(&psk, &encrypted).is_err());
+        assert!(item_decrypt(&psk, &encrypted, CH_A).is_err());
     }
 
     #[test]
     fn test_too_short_input_fails() {
         let psk = [0x42u8; 32];
-        assert!(item_decrypt(&psk, &[0u8; 10]).is_err());
+        assert!(item_decrypt(&psk, &[0u8; 10], CH_A).is_err());
     }
 
     #[test]
     fn test_empty_plaintext() {
         let psk = [0x42u8; 32];
-        let encrypted = item_encrypt(&psk, b"").unwrap();
+        let encrypted = item_encrypt(&psk, b"", CH_A).unwrap();
         assert_eq!(encrypted.len(), IV_LEN + TAG_LEN); // 28 bytes, no ciphertext
-        let decrypted = item_decrypt(&psk, &encrypted).unwrap();
+        let decrypted = item_decrypt(&psk, &encrypted, CH_A).unwrap();
         assert!(decrypted.is_empty());
     }
 
@@ -131,9 +136,17 @@ mod tests {
         });
         let plaintext = serde_json::to_vec(&data).unwrap();
 
-        let encrypted = item_encrypt(&psk, &plaintext).unwrap();
-        let decrypted = item_decrypt(&psk, &encrypted).unwrap();
+        let encrypted = item_encrypt(&psk, &plaintext, CH_A).unwrap();
+        let decrypted = item_decrypt(&psk, &encrypted, CH_A).unwrap();
         let recovered: serde_json::Value = serde_json::from_slice(&decrypted).unwrap();
         assert_eq!(data, recovered);
+    }
+
+    #[test]
+    fn test_wrong_aad_fails() {
+        let psk = [0x42u8; 32];
+        let encrypted = item_encrypt(&psk, b"secret", CH_A).unwrap();
+        // Decrypt with different channel_id (cross-channel relocation) must fail
+        assert!(item_decrypt(&psk, &encrypted, CH_B).is_err());
     }
 }
