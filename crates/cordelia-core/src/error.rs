@@ -22,6 +22,9 @@ pub enum CordeliaError {
     #[error("item not found: {item_id}")]
     ItemNotFound { item_id: String },
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
     #[error("crypto error: {0}")]
     Crypto(String),
 

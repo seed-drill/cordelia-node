@@ -7,7 +7,7 @@ use chrono::Utc;
 
 use cordelia_crypto::bech32::{encode_public_key, HRP_X25519_PK};
 use cordelia_crypto::signing;
-use cordelia_storage::{channels, items, psk};
+use cordelia_storage::{channels, items, psk, search};
 
 use crate::auth;
 use crate::error::ApiError;
@@ -197,6 +197,17 @@ pub async fn publish(
             encrypted_blob: &encrypted_blob,
         },
     )?;
+
+    // Index for FTS5 search (extract text from plaintext content before response)
+    let searchable = search::extract_text(
+        &body.content,
+        body.metadata.as_ref(),
+        &body.item_type,
+    );
+    // Best-effort: don't fail publish if search indexing fails
+    let _ = search::index_item(
+        &db, &item_id, &channel_id.0, &body.item_type, &published_at, &searchable,
+    );
 
     // Author in Bech32
     let author_bech32 =
@@ -857,9 +868,110 @@ pub async fn delete_item(
         return Err(ApiError::NotFound(format!("item '{}' not found", body.item_id)));
     }
 
+    // Remove from search index
+    let _ = search::tombstone_search(&db, &body.item_id);
+
     Ok(HttpResponse::Ok().json(DeleteItemResponse {
         ok: true,
         item_id: body.item_id.clone(),
+    }))
+}
+
+// ── POST /api/v1/channels/search ──────────────────────────────
+
+pub async fn search_handler(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SearchRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+
+    let limit = body.limit.min(100).max(1);
+
+    let db = state.db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let pk = state.identity.public_key();
+
+    // Resolve channel
+    let channel_id = channels::resolve(&body.channel)?;
+
+    // Verify membership
+    if !channels::is_member(&db, &channel_id.0, &pk)? {
+        return Err(ApiError::Forbidden("not a member of this channel".into()));
+    }
+
+    // Execute FTS5 search
+    let type_refs = body.types.as_deref();
+    let hits = search::search_fts(
+        &db,
+        &channel_id.0,
+        &body.query,
+        limit,
+        type_refs,
+        body.since.as_deref(),
+    )?;
+
+    // Load PSK for decryption
+    let channel_psk = psk::read_psk(&state.home_dir, &channel_id.0)?;
+
+    // Fetch full items for each hit
+    let mut results = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        // Look up the stored item
+        let row = db
+            .query_row(
+                "SELECT item_id, channel_id, author_id, item_type, published_at,
+                        is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
+                 FROM items WHERE item_id = ?1",
+                rusqlite::params![hit.item_id],
+                |row| {
+                    Ok(items::StoredItem {
+                        item_id: row.get(0)?,
+                        channel_id: row.get(1)?,
+                        author_id: row.get(2)?,
+                        item_type: row.get(3)?,
+                        published_at: row.get(4)?,
+                        is_tombstone: row.get::<_, i64>(5)? != 0,
+                        parent_id: row.get(6)?,
+                        key_version: row.get(7)?,
+                        content_hash: row.get(8)?,
+                        signature: row.get(9)?,
+                        encrypted_blob: row.get(10)?,
+                    })
+                },
+            )
+            .ok();
+
+        if let Some(item) = row {
+            let (content, metadata) = decrypt_item_content(&channel_psk, &item.encrypted_blob);
+            let signature_valid = verify_item_signature(&item);
+
+            let mut author_pk = [0u8; 32];
+            if item.author_id.len() == 32 {
+                author_pk.copy_from_slice(&item.author_id);
+            }
+            let author = encode_public_key(&author_pk).unwrap_or_default();
+
+            results.push(SearchHitResponse {
+                item_id: item.item_id,
+                content,
+                metadata,
+                item_type: item.item_type,
+                parent_id: item.parent_id,
+                author,
+                published_at: item.published_at,
+                signature_valid,
+                score: hit.score,
+            });
+        }
+    }
+
+    let total = results.len();
+
+    Ok(HttpResponse::Ok().json(SearchResponse {
+        channel: body.channel.clone(),
+        results,
+        total,
+        semantic_available: false, // Phase 2
     }))
 }
 

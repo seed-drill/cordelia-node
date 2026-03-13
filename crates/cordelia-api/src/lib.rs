@@ -8,7 +8,6 @@ pub mod handlers;
 pub mod state;
 pub mod types;
 
-// TODO(WP8): Search endpoint.
 // TODO(WP13): CLI stats + Prometheus metrics.
 
 use actix_web::web;
@@ -35,6 +34,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             // Key management
             .route("/rotate-psk", web::post().to(handlers::rotate_psk_handler))
             .route("/delete-item", web::post().to(handlers::delete_item))
+            // Search
+            .route("/search", web::post().to(handlers::search_handler))
             // Identity
             .route("/identity", web::post().to(handlers::identity)),
     );

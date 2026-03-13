@@ -8,7 +8,7 @@ pub mod items;
 pub mod naming;
 pub mod psk;
 pub mod schema;
-// TODO(WP8): FTS5 search indexing.
+pub mod search;
 
 /// Storage-level errors (wraps rusqlite and IO errors).
 #[derive(Debug, thiserror::Error)]

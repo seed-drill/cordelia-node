@@ -266,6 +266,46 @@ pub struct DeleteItemResponse {
     pub item_id: String,
 }
 
+// ── Search ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SearchRequest {
+    pub channel: String,
+    pub query: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub channel: String,
+    pub results: Vec<SearchHitResponse>,
+    pub total: usize,
+    pub semantic_available: bool,
+}
+
+#[derive(Serialize)]
+pub struct SearchHitResponse {
+    pub item_id: String,
+    pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    pub item_type: String,
+    pub parent_id: Option<String>,
+    pub author: String,
+    pub published_at: String,
+    pub signature_valid: bool,
+    pub score: f64,
+}
+
+fn default_search_limit() -> u32 {
+    20
+}
+
 // ── Defaults ───────────────────────────────────────────────────────
 
 fn default_mode() -> String {

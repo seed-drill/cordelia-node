@@ -676,6 +676,170 @@ async fn test_delete_item() {
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
 }
 
+// ── WP8: Search tests ─────────────────────────────────────────
+
+#[actix_web::test]
+async fn test_search_basic() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe + publish some items
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "search-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Publish item with searchable content
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-test",
+            "content": {"text": "vector embeddings for retrieval augmented generation"},
+            "metadata": {"tags": ["rag", "vectors"]}
+        }))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Publish another item
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-test",
+            "content": {"text": "encryption patterns with AES-256-GCM"}
+        }))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Search for "vector"
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/search")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-test",
+            "query": "vector"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["semantic_available"], false);
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0]["score"].as_f64().unwrap() > 0.0);
+    // Content should be decrypted
+    assert!(results[0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("vector"));
+}
+
+#[actix_web::test]
+async fn test_search_empty_query_rejected() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "search-empty"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Search with empty query
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/search")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-empty",
+            "query": ""
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[actix_web::test]
+async fn test_search_deleted_item_excluded() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe + publish
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "search-delete"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-delete",
+            "content": {"text": "ephemeral findable content"}
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let item_id = body["item_id"].as_str().unwrap().to_string();
+
+    // Verify it's searchable
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/search")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-delete",
+            "query": "ephemeral"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["total"], 1);
+
+    // Delete it
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/delete-item")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "search-delete", "item_id": item_id}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Search again -- should be gone
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/search")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "search-delete",
+            "query": "ephemeral"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["total"], 0);
+}
+
 #[actix_web::test]
 async fn test_publish_not_member() {
     let state = test_state();

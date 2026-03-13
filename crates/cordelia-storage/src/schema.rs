@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -78,6 +78,53 @@ CREATE TABLE IF NOT EXISTS dm_peers (
 );
 "#;
 
+/// Migration v2: FTS5 search indexing (search-indexing.md §2).
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS search_content (
+    rowid         INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id       TEXT NOT NULL UNIQUE,
+    channel_id    TEXT NOT NULL,
+    item_type     TEXT NOT NULL,
+    published_at  TEXT NOT NULL,
+    is_tombstone  INTEGER NOT NULL DEFAULT 0,
+    name          TEXT NOT NULL DEFAULT '',
+    summary       TEXT NOT NULL DEFAULT '',
+    content_text  TEXT NOT NULL DEFAULT '',
+    tags_text     TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_content_channel ON search_content(channel_id);
+CREATE INDEX IF NOT EXISTS idx_search_content_item_id ON search_content(item_id);
+CREATE INDEX IF NOT EXISTS idx_search_content_type    ON search_content(channel_id, item_type);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+    name,
+    summary,
+    content_text,
+    tags_text,
+    content = 'search_content',
+    content_rowid = 'rowid',
+    tokenize = 'unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS search_fts_insert AFTER INSERT ON search_content BEGIN
+    INSERT INTO search_fts(rowid, name, summary, content_text, tags_text)
+    VALUES (NEW.rowid, NEW.name, NEW.summary, NEW.content_text, NEW.tags_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS search_fts_delete AFTER DELETE ON search_content BEGIN
+    INSERT INTO search_fts(search_fts, rowid, name, summary, content_text, tags_text)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.summary, OLD.content_text, OLD.tags_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS search_fts_update AFTER UPDATE ON search_content BEGIN
+    INSERT INTO search_fts(search_fts, rowid, name, summary, content_text, tags_text)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.summary, OLD.content_text, OLD.tags_text);
+    INSERT INTO search_fts(rowid, name, summary, content_text, tags_text)
+    VALUES (NEW.rowid, NEW.name, NEW.summary, NEW.content_text, NEW.tags_text);
+END;
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -91,6 +138,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v1 (initial schema)");
         conn.execute_batch(MIGRATION_V1)?;
         conn.pragma_update(None, "user_version", 1)?;
+    }
+
+    if current < 2 {
+        tracing::info!("applying migration v2 (FTS5 search)");
+        conn.execute_batch(MIGRATION_V2)?;
+        conn.pragma_update(None, "user_version", 2)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;

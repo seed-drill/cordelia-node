@@ -83,6 +83,7 @@ impl From<cordelia_core::CordeliaError> for ApiError {
                 Self::Conflict(format!("channel '{channel}' already exists"))
             }
             cordelia_core::CordeliaError::NotAuthorised { context } => Self::Forbidden(context),
+            cordelia_core::CordeliaError::Validation(msg) => Self::BadRequest(msg),
             cordelia_core::CordeliaError::ItemNotFound { item_id } => {
                 Self::NotFound(format!("item '{item_id}' not found"))
             }
