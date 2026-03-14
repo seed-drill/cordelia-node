@@ -16,6 +16,7 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Default P2P listen port (§2.1).
@@ -109,10 +110,17 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+    ));
+
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|e| TransportError::Tls(e.to_string()))?,
     ));
+    server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
 }
@@ -135,10 +143,17 @@ pub fn client_config(identity: &NodeIdentity) -> Result<ClientConfig, TransportE
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+    ));
+
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|e| TransportError::Tls(e.to_string()))?,
     ));
+    client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)
 }
