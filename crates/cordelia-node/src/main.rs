@@ -625,42 +625,59 @@ async fn p2p_loop(
 
                 // Push to all connected peers (skip excluded peer for relay re-push)
                 let exclude = push_item.exclude_peer;
-                for peer_id in conn_mgr.connected_peers() {
-                    if exclude.as_ref() == Some(&peer_id) {
+                let all_peers = conn_mgr.connected_peers();
+                let mut push_count = 0u32;
+                let mut skip_count = 0u32;
+                for peer_id in &all_peers {
+                    if exclude.as_ref() == Some(peer_id) {
+                        skip_count += 1;
                         continue;
                     }
-                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                    if let Some(conn) = conn_mgr.get_connection(peer_id) {
                         let conn = conn.clone();
                         let items = vec![item.clone()];
+                        let pid = peer_id.clone();
+                        push_count += 1;
+                        tracing::debug!(peer = %pid, "spawning push task");
                         // Fire and forget -- don't block the loop
                         tokio::spawn(async move {
-                            match conn.open_bi().await {
-                                Ok((mut send, mut recv)) => {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                conn.open_bi(),
+                            ).await {
+                                Ok(Ok((mut send, mut recv))) => {
                                     let mut stream = tokio::io::join(&mut recv, &mut send);
                                     match cordelia_network::item_sync::send_push(&mut stream, &items).await {
                                         Ok(ack) => {
                                             tracing::debug!(
-                                                peer = %peer_id,
+                                                peer = %pid,
                                                 stored = ack.stored,
                                                 "push delivered"
                                             );
                                         }
                                         Err(e) => {
-                                            tracing::debug!(peer = %peer_id, error = %e, "push failed");
+                                            tracing::debug!(peer = %pid, error = %e, "push send failed");
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::debug!(peer = %peer_id, error = %e, "open stream failed");
+                                Ok(Err(e)) => {
+                                    tracing::debug!(peer = %pid, error = %e, "push open_bi failed");
+                                }
+                                Err(_) => {
+                                    tracing::warn!(peer = %pid, "push open_bi timed out (10s)");
                                 }
                             }
                         });
+                    } else {
+                        tracing::warn!(peer = %peer_id, "push skipped: get_connection returned None");
                     }
                 }
                 tracing::debug!(
                     channel = %push_item.channel_id,
                     item = %push_item.item_id,
-                    peers = conn_mgr.connection_count(),
+                    total_peers = all_peers.len(),
+                    pushed = push_count,
+                    excluded = skip_count,
                     "item pushed to peers"
                 );
             }

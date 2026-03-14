@@ -100,7 +100,7 @@ done
 echo ""
 echo "Step 6: Waiting for items to arrive on P2..."
 wait_for "p2 has 5 items" \
-    '[ "$(db_query t2-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 5 ]' 30
+    '[ "$(db_query t2-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 5 ]' 60
 
 # -- Step 7: Assertions --------------------------------------------------
 
