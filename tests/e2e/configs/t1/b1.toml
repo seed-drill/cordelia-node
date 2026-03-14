@@ -10,6 +10,9 @@ data_dir = "/data/cordelia"
 [network]
 listen_addr = "0.0.0.0:9474"
 role = "bootnode"
+allow_private_addresses = true
+dns_discovery = ""
+bootnodes = []
 
 [governor]
 hot_min = 1

@@ -69,6 +69,8 @@ pub struct HandshakeResult {
     pub peer_channel_digest: [u8; 32],
     pub peer_channel_count: u16,
     pub peer_roles: Vec<String>,
+    /// Peer's advertised P2P listening port (for peer-sharing address construction).
+    pub peer_p2p_port: u16,
 }
 
 /// Compute the channel digest: SHA-256 of sorted channel IDs joined by newline.
@@ -99,6 +101,7 @@ pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     channel_ids: &[String],
     roles: &[String],
     tls_peer_node_id: &[u8; 32],
+    local_p2p_port: u16,
 ) -> Result<HandshakeResult, HandshakeError> {
     let channel_digest = compute_channel_digest(channel_ids);
 
@@ -115,6 +118,7 @@ pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         channel_digest: channel_digest.to_vec(),
         channel_count: channel_ids.len() as u16,
         roles: roles.to_vec(),
+        p2p_port: local_p2p_port,
     });
     write_frame(stream, &propose).await?;
 
@@ -138,6 +142,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     channel_ids: &[String],
     roles: &[String],
     tls_peer_node_id: &[u8; 32],
+    local_p2p_port: u16,
 ) -> Result<HandshakeResult, HandshakeError> {
     // Read protocol byte
     let proto = read_protocol_byte(stream).await?;
@@ -164,6 +169,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             channel_count: channel_ids.len() as u16,
             roles: roles.to_vec(),
             reject_reason: Some(reject_reason.reject_reason()),
+            p2p_port: local_p2p_port,
         });
         write_frame(stream, &reject).await?;
         return Err(reject_reason);
@@ -182,6 +188,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         channel_count: channel_ids.len() as u16,
         roles: roles.to_vec(),
         reject_reason: None,
+        p2p_port: local_p2p_port,
     });
     write_frame(stream, &accept).await?;
 
@@ -201,6 +208,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         peer_channel_digest: peer_digest,
         peer_channel_count: propose.channel_count,
         peer_roles: propose.roles,
+        peer_p2p_port: propose.p2p_port,
     })
 }
 
@@ -271,6 +279,7 @@ fn validate_accept(accept: &HandshakeAccept, tls_peer_node_id: &[u8; 32]) -> Res
         peer_channel_digest: peer_digest,
         peer_channel_count: accept.channel_count,
         peer_roles: accept.roles.clone(),
+        peer_p2p_port: accept.p2p_port,
     })
 }
 
@@ -326,12 +335,12 @@ mod tests {
             let roles = roles.clone();
             let channels_b = channels_b.clone();
             async move {
-                accept_handshake(&mut server, &node_b, &channels_b, &roles, &node_a).await
+                accept_handshake(&mut server, &node_b, &channels_b, &roles, &node_a, 9474).await
             }
         });
 
         let client_result = initiate_handshake(
-            &mut client, &node_a, &channels_a, &roles, &node_b,
+            &mut client, &node_a, &channels_a, &roles, &node_b, 9474,
         ).await.unwrap();
 
         assert_eq!(client_result.peer_node_id, node_b);
@@ -357,7 +366,7 @@ mod tests {
 
         // Manually send a propose with wrong magic
         let server_task = tokio::spawn(async move {
-            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
         write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
@@ -370,6 +379,7 @@ mod tests {
             channel_digest: vec![0; 32],
             channel_count: 0,
             roles: vec![],
+            p2p_port: 9474,
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
@@ -397,11 +407,11 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             // Server expects TLS peer to be wrong_id but handshake sends node_a
-            accept_handshake(&mut server, &node_b, &[], &[], &wrong_id).await
+            accept_handshake(&mut server, &node_b, &[], &[], &wrong_id, 9474).await
         });
 
         // Client sends valid propose with node_a
-        let _ = initiate_handshake(&mut client, &node_a, &[], &[], &node_b).await;
+        let _ = initiate_handshake(&mut client, &node_a, &[], &[], &node_b, 9474).await;
 
         let server_err = server_task.await.unwrap();
         assert!(matches!(server_err, Err(HandshakeError::IdentityMismatch)));
@@ -416,7 +426,7 @@ mod tests {
         let (mut client, mut server) = duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
         write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
@@ -429,6 +439,7 @@ mod tests {
             channel_digest: vec![0; 32],
             channel_count: 0,
             roles: vec![],
+            p2p_port: 9474,
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
@@ -457,7 +468,7 @@ mod tests {
         let (mut client, mut server) = duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
         write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
@@ -470,6 +481,7 @@ mod tests {
             channel_digest: vec![0; 32],
             channel_count: 0,
             roles: vec![],
+            p2p_port: 9474,
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
@@ -487,7 +499,7 @@ mod tests {
         let (mut client, mut server) = duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
         write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
@@ -500,6 +512,7 @@ mod tests {
             channel_digest: vec![0; 32],
             channel_count: 0,
             roles: vec![],
+            p2p_port: 9474,
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 

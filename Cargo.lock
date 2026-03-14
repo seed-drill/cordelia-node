@@ -691,6 +691,7 @@ dependencies = [
  "cordelia-network",
  "cordelia-storage",
  "hex",
+ "quinn",
  "rusqlite",
  "serde_json",
  "tokio",

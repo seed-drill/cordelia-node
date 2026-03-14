@@ -11,6 +11,8 @@ data_dir = "/data/cordelia"
 listen_addr = "0.0.0.0:9474"
 role = "personal"
 push_policy = "subscribers_only"
+allow_private_addresses = true
+dns_discovery = ""
 
 [[network.bootnodes]]
 addr = "172.28.0.10:9474"

@@ -356,35 +356,42 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_local = endpoint.local_addr()?;
         tracing::info!(%p2p_local, "P2P endpoint listening");
 
-        // ── Bootstrap: resolve bootnodes ───────────────────────────
-        let bootnode_addrs: Vec<String> = config
-            .network
-            .bootnodes
-            .iter()
-            .map(|b| b.addr.clone())
-            .collect();
-        let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(&bootnode_addrs);
-        tracing::info!(count = bootnodes.len(), "bootnodes resolved");
-
         // ── Connection manager ─────────────────────────────────────
         let roles = vec![config.network.role.clone()];
+        let allow_private = config.network.allow_private_addresses;
+        let is_bootnode = config.network.role == "bootnode";
         let mut conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
             vec![], // channel IDs loaded later from DB
             roles,
+            p2p_port as u16,
         );
 
-        // ── Bootstrap: connect to bootnodes ─────────────────────────
-        for bn in &bootnodes {
-            match conn_mgr.connect_to(bn.addr).await {
-                Ok(node_id) => {
-                    tracing::info!(bootnode = %bn.host, peer = %node_id, "connected to bootnode");
-                }
-                Err(e) => {
-                    tracing::warn!(bootnode = %bn.host, error = %e, "failed to connect to bootnode");
+        // ── Bootstrap: resolve and connect to bootnodes ──────────────
+        // Bootnodes skip this step (they are the bootstrap target).
+        if !is_bootnode {
+            let bootnode_addrs: Vec<String> = config
+                .network
+                .bootnodes
+                .iter()
+                .map(|b| b.addr.clone())
+                .collect();
+            let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(&bootnode_addrs);
+            tracing::info!(count = bootnodes.len(), "bootnodes resolved");
+
+            for bn in &bootnodes {
+                match conn_mgr.connect_to(bn.addr).await {
+                    Ok(node_id) => {
+                        tracing::info!(bootnode = %bn.host, peer = %node_id, "connected to bootnode");
+                    }
+                    Err(e) => {
+                        tracing::warn!(bootnode = %bn.host, error = %e, "failed to connect to bootnode");
+                    }
                 }
             }
+        } else {
+            tracing::info!("bootnode role: skipping bootstrap");
         }
 
         // Update peer counts in shared state
@@ -399,7 +406,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_shutdown = tokio::sync::watch::channel(false);
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let p2p_handle = tokio::spawn(async move {
-            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx).await;
+            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -444,8 +451,24 @@ async fn p2p_loop(
     state: web::Data<cordelia_api::state::AppState>,
     mut push_rx: tokio::sync::mpsc::UnboundedReceiver<cordelia_api::state::PushItem>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    allow_private_addresses: bool,
 ) {
-    tracing::info!("P2P loop started (accept + push)");
+    tracing::info!("P2P loop started (accept + push + peer-sharing)");
+
+    // Shared peer list: updated by p2p_loop, read by per-peer stream handlers
+    let shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(conn_mgr.known_peer_addresses()));
+
+    // Our own node identity for filtering
+    let our_node_id = cordelia_core::NodeId(
+        state.identity.public_key()
+    );
+
+    // Peer-sharing timer: discover new peers from connected peers
+    let mut peer_share_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    peer_share_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the first immediate tick
+    peer_share_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -457,18 +480,104 @@ async fn p2p_loop(
                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
 
+                        // Update shared peer list
+                        if let Ok(mut peers) = shared_peers.write() {
+                            *peers = conn_mgr.known_peer_addresses();
+                        }
+
                         // Spawn stream handler for this peer's inbound protocol streams
                         if let Some(conn) = conn_mgr.get_connection(&node_id) {
                             let conn = conn.clone();
                             let peer_id = node_id.clone();
                             let db_state = state.clone();
+                            let peers_ref = shared_peers.clone();
                             tokio::spawn(async move {
-                                handle_peer_streams(conn, peer_id, db_state).await;
+                                handle_peer_streams(conn, peer_id, db_state, peers_ref).await;
                             });
                         }
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "inbound connection failed");
+                    }
+                }
+            }
+
+            // Periodic peer-sharing: request peers from a connected peer
+            _ = peer_share_interval.tick() => {
+                let peers = conn_mgr.connected_peers();
+                if peers.is_empty() {
+                    continue;
+                }
+                // Pick first connected peer (simple; could randomize later)
+                let target = peers[0].clone();
+                if let Some(conn) = conn_mgr.get_connection(&target) {
+                    let conn = conn.clone();
+                    match conn.open_bi().await {
+                        Ok((mut send, mut recv)) => {
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+                            match cordelia_network::peer_sharing::request_peers(&mut stream, 20).await {
+                                Ok(discovered) => {
+                                    // Filter and connect to new peers
+                                    let own_addr = conn_mgr.local_addr().ok();
+                                    let valid = if allow_private_addresses {
+                                        // Skip address validation for Docker/test
+                                        discovered
+                                    } else {
+                                        cordelia_network::peer_sharing::filter_valid_addresses(
+                                            &discovered,
+                                            own_addr.as_ref(),
+                                        )
+                                    };
+
+                                    for peer_addr in &valid {
+                                        // Skip ourselves and peers we're already connected to
+                                        let peer_node_id = cordelia_core::NodeId(
+                                            peer_addr.node_id.as_slice().try_into().unwrap_or([0u8; 32])
+                                        );
+                                        if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
+                                            continue;
+                                        }
+                                        // Try to connect to first address
+                                        if let Some(addr_str) = peer_addr.addrs.first() {
+                                            if let Ok(addr) = addr_str.parse() {
+                                                match conn_mgr.connect_to(addr).await {
+                                                    Ok(new_id) => {
+                                                        let count = conn_mgr.connection_count() as u64;
+                                                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
+                                                        tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
+
+                                                            // Update shared peer list
+                                                        if let Ok(mut peers) = shared_peers.write() {
+                                                            *peers = conn_mgr.known_peer_addresses();
+                                                        }
+
+                                                        // Spawn stream handler
+                                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
+                                                            let new_conn = new_conn.clone();
+                                                            let peer_id = new_id;
+                                                            let db_state = state.clone();
+                                                            let peers_ref = shared_peers.clone();
+                                                            tokio::spawn(async move {
+                                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref).await;
+                                                            });
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(peer = %target, error = %e, "peer-share request failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(peer = %target, error = %e, "open stream for peer-share failed");
+                        }
                     }
                 }
             }
@@ -546,6 +655,7 @@ async fn handle_peer_streams(
     conn: quinn::Connection,
     peer_id: cordelia_core::NodeId,
     state: web::Data<cordelia_api::state::AppState>,
+    shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
 ) {
     loop {
         // Accept next bidirectional stream from this peer
@@ -647,6 +757,28 @@ async fn handle_peer_streams(
                         },
                     );
                     let _ = cordelia_network::codec::write_frame(&mut send, &ack).await;
+                }
+            }
+            cordelia_network::messages::Protocol::PeerSharing => {
+                // Read request, respond with current known peers
+                let msg = match cordelia_network::codec::read_frame(&mut recv).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer_id, error = %e, "peer-share read failed");
+                        continue;
+                    }
+                };
+                if let cordelia_network::messages::WireMessage::PeerShareRequest(req) = msg {
+                    let max = req.max_peers as usize;
+                    let current_peers = shared_peers.read()
+                        .map(|p| p.iter().take(max).cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let count = current_peers.len();
+                    let resp = cordelia_network::messages::WireMessage::PeerShareResponse(
+                        cordelia_network::messages::PeerShareResponse { peers: current_peers },
+                    );
+                    let _ = cordelia_network::codec::write_frame(&mut send, &resp).await;
+                    tracing::debug!(peer = %peer_id, count, "served peer-share request");
                 }
             }
             other => {

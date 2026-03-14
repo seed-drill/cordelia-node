@@ -47,6 +47,9 @@ pub struct NetworkConfig {
     pub dns_discovery: String,
     #[serde(default)]
     pub bootnodes: Vec<BootnodeConfig>,
+    /// Allow private/RFC-1918 addresses in peer sharing (for Docker/test envs).
+    #[serde(default)]
+    pub allow_private_addresses: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +160,7 @@ impl Default for NetworkConfig {
                     addr: "boot2.cordelia.seeddrill.ai:9474".into(),
                 },
             ],
+            allow_private_addresses: false,
         }
     }
 }

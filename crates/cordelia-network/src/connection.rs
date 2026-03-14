@@ -61,6 +61,8 @@ pub struct ConnectionManager {
     channel_ids: Vec<String>,
     /// Our advertised roles.
     roles: Vec<String>,
+    /// Our P2P listening port (advertised in handshake).
+    p2p_port: u16,
 }
 
 impl ConnectionManager {
@@ -69,6 +71,7 @@ impl ConnectionManager {
         endpoint: Endpoint,
         channel_ids: Vec<String>,
         roles: Vec<String>,
+        p2p_port: u16,
     ) -> Self {
         Self {
             identity,
@@ -76,6 +79,7 @@ impl ConnectionManager {
             connections: HashMap::new(),
             channel_ids,
             roles,
+            p2p_port,
         }
     }
 
@@ -152,6 +156,7 @@ impl ConnectionManager {
                 &self.channel_ids,
                 &self.roles,
                 &peer_node_id,
+                self.p2p_port,
             ),
         )
         .await
@@ -200,6 +205,7 @@ impl ConnectionManager {
                 &self.channel_ids,
                 &self.roles,
                 &peer_node_id,
+                self.p2p_port,
             ),
         )
         .await
@@ -240,6 +246,31 @@ impl ConnectionManager {
             peer.conn.close(0u32.into(), b"governor disconnect");
             debug!(peer = %node_id, "disconnected");
         }
+    }
+
+    /// Build a list of known peer addresses for peer-sharing responses.
+    /// Uses the peer's remote IP (from QUIC connection) and advertised P2P port.
+    pub fn known_peer_addresses(&self) -> Vec<crate::messages::PeerAddress> {
+        self.connections
+            .iter()
+            .filter_map(|(node_id, peer_conn)| {
+                let remote = peer_conn.conn.remote_address();
+                let listen_port = peer_conn.handshake.peer_p2p_port;
+                if listen_port == 0 {
+                    return None; // Peer didn't advertise a port
+                }
+                let listen_addr = std::net::SocketAddr::new(remote.ip(), listen_port);
+                Some(crate::messages::PeerAddress {
+                    node_id: node_id.0.to_vec(),
+                    addrs: vec![listen_addr.to_string()],
+                    last_seen: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    exclude: false,
+                })
+            })
+            .collect()
     }
 
     /// Close all connections and the endpoint.
@@ -293,6 +324,7 @@ mod tests {
             ep_a,
             vec!["ch1".into()],
             vec!["personal".into()],
+            9474,
         );
 
         let mut mgr_b = ConnectionManager::new(
@@ -300,6 +332,7 @@ mod tests {
             ep_b,
             vec!["ch2".into()],
             vec!["personal".into()],
+            9474,
         );
 
         // B accepts in background
@@ -339,8 +372,8 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![]);
-        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![]);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![], 9474);
+        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![], 9474);
 
         let accept_task = tokio::spawn(async move {
             let incoming = mgr_b.endpoint.accept().await.unwrap();
@@ -369,8 +402,8 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![]);
-        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![]);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![], 9474);
+        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![], 9474);
 
         // B accepts two connections sequentially
         let accept_task = tokio::spawn(async move {

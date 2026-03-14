@@ -142,17 +142,21 @@ pub fn resolve_all_bootnodes(config_addrs: &[String]) -> Vec<BootnodeAddr> {
         }
     }
 
-    // 2. DNS SRV
-    for bn in resolve_dns_bootnodes() {
-        if seen.insert(bn.addr) {
-            all.push(bn);
+    // 2. DNS SRV (skip if config already provided bootnodes)
+    if config_addrs.is_empty() {
+        for bn in resolve_dns_bootnodes() {
+            if seen.insert(bn.addr) {
+                all.push(bn);
+            }
         }
     }
 
-    // 3. Fallback (last resort)
-    for bn in resolve_fallback_peers() {
-        if seen.insert(bn.addr) {
-            all.push(bn);
+    // 3. Fallback (last resort, only if no config bootnodes)
+    if config_addrs.is_empty() {
+        for bn in resolve_fallback_peers() {
+            if seen.insert(bn.addr) {
+                all.push(bn);
+            }
         }
     }
 

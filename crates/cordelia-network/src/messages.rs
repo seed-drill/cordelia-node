@@ -64,6 +64,9 @@ pub struct HandshakePropose {
     pub channel_digest: Vec<u8>, // 32 bytes
     pub channel_count: u16,
     pub roles: Vec<String>,
+    /// P2P listening port, so peers know where to connect back.
+    #[serde(default)]
+    pub p2p_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +80,9 @@ pub struct HandshakeAccept {
     pub channel_count: u16,
     pub roles: Vec<String>,
     pub reject_reason: Option<String>,
+    /// P2P listening port, so peers know where to connect back.
+    #[serde(default)]
+    pub p2p_port: u16,
 }
 
 // ── Keep-Alive (0x02, §4.2) ────────────────────────────────────────

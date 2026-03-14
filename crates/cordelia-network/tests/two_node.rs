@@ -44,8 +44,8 @@ async fn test_two_node_connect_and_handshake() {
     let channels_b = vec!["ch_shared".into(), "ch_only_b".into()];
     let roles = vec!["personal".into()];
 
-    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, channels_a, roles.clone());
-    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, channels_b, roles);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, channels_a, roles.clone(), 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, channels_b, roles, 9474);
 
     // B accepts in background
     let accept_task = tokio::spawn(async move {
@@ -388,10 +388,10 @@ async fn test_two_node_reconnect_after_disconnect() {
     let b_addr = ep_b.local_addr().unwrap();
 
     let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()],
+        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
     );
     let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()],
+        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
     );
 
     // First connection
@@ -444,10 +444,10 @@ async fn test_two_node_full_lifecycle() {
 
     // Connect + handshake via ConnectionManager
     let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec!["ch_shared".into()], vec!["personal".into()],
+        id_a.clone(), ep_a, vec!["ch_shared".into()], vec!["personal".into()], 9474,
     );
     let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec!["ch_shared".into()], vec!["personal".into()],
+        id_b.clone(), ep_b, vec!["ch_shared".into()], vec!["personal".into()], 9474,
     );
 
     let accept_task = tokio::spawn(async move {

@@ -16,8 +16,8 @@ services:
       - NODE_NAME=b1
       - CORDELIA_DATA_DIR=/data/cordelia
     volumes:
-      - ./configs/t1/b1.toml:/config/config.toml:ro
-      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ../configs/t1/b1.toml:/config/config.toml:ro
+      - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
       cordelia-net:
@@ -38,9 +38,9 @@ services:
       - NODE_NAME=p1
       - CORDELIA_DATA_DIR=/data/cordelia
     volumes:
-      - ./configs/t1/p1.toml:/config/config.toml:ro
-      - ./entrypoint.sh:/entrypoint.sh:ro
-      - ./keys:/data/cordelia/channel-keys:ro
+      - ../configs/t1/p1.toml:/config/config.toml:ro
+      - ../entrypoint.sh:/entrypoint.sh:ro
+      - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
       cordelia-net:
@@ -58,9 +58,9 @@ services:
       - NODE_NAME=p2
       - CORDELIA_DATA_DIR=/data/cordelia
     volumes:
-      - ./configs/t1/p2.toml:/config/config.toml:ro
-      - ./entrypoint.sh:/entrypoint.sh:ro
-      - ./keys:/data/cordelia/channel-keys:ro
+      - ../configs/t1/p2.toml:/config/config.toml:ro
+      - ../entrypoint.sh:/entrypoint.sh:ro
+      - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
       cordelia-net:

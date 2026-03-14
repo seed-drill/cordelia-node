@@ -41,7 +41,10 @@ cleanup() {
     docker logs t1-p2 > "$E2E_DIR/logs/t1/p2.log" 2>&1 || true
     echo "Tearing down..."
     docker compose -f "$COMPOSE_FILE" -p "$PROJECT" down -v --remove-orphans 2>/dev/null || true
-    rm -rf "$E2E_DIR/keys"
+    # Keys dir may be root-owned (written by containers), so use sudo if available
+    if [ -d "$E2E_DIR/keys" ]; then
+        rm -rf "$E2E_DIR/keys" 2>/dev/null || sudo rm -rf "$E2E_DIR/keys" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -66,19 +69,22 @@ wait_for "p2 healthy" \
 
 echo ""
 echo "Step 3: Waiting for peer discovery..."
-wait_for "p1 has hot peers" \
-    '[ "$(api_get t1-p1 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
-wait_for "p2 has hot peers" \
-    '[ "$(api_get t1-p2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+# Wait for both nodes to discover each other via peer-sharing through b1.
+# Each node connects to b1 first (1 peer), then discovers the other via
+# peer-sharing (2 peers). This ensures the push pipeline can deliver directly.
+wait_for "p1 has 2 hot peers" \
+    '[ "$(api_get t1-p1 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+wait_for "p2 has 2 hot peers" \
+    '[ "$(api_get t1-p2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
 
 # ── Step 4: Subscribe to channel ────────────────────────────────────
 
 echo ""
 echo "Step 4: Subscribing to test-channel..."
 api_post t1-p1 "channels/subscribe" \
-    "{\"channel_name\": \"$CHANNEL_NAME\"}" || true
+    "{\"channel\": \"$CHANNEL_NAME\"}" || true
 api_post t1-p2 "channels/subscribe" \
-    "{\"channel_name\": \"$CHANNEL_NAME\"}" || true
+    "{\"channel\": \"$CHANNEL_NAME\"}" || true
 
 # ── Step 5: Publish items ───────────────────────────────────────────
 
@@ -86,7 +92,7 @@ echo ""
 echo "Step 5: Publishing 3 items on P1..."
 for i in 1 2 3; do
     api_post t1-p1 "channels/publish" \
-        "{\"channel_id\": \"$CHANNEL_ID\", \"content\": \"test message $i\", \"item_type\": \"message\"}"
+        "{\"channel\": \"$CHANNEL_NAME\", \"content\": \"test message $i\", \"item_type\": \"message\"}"
     sleep 0.5
 done
 
@@ -110,9 +116,9 @@ assert_item_count t1-p2 "$CHANNEL_ID" 3
 assert_channel_isolation t1-p1 "$CHANNEL_ID"
 assert_channel_isolation t1-p2 "$CHANNEL_ID"
 
-# P7: Bootstrap
-assert_hot_peers t1-p1 1
-assert_hot_peers t1-p2 1
+# P7: Bootstrap + peer discovery
+assert_hot_peers t1-p1 2
+assert_hot_peers t1-p2 2
 
 # P4: Bootnode role isolation (bonus check)
 assert_zero_items t1-b1

@@ -222,6 +222,7 @@ mod tests {
             channel_digest: vec![0xAB; 32],
             channel_count: 5,
             roles: vec!["personal".into()],
+            p2p_port: 9474,
         });
         let encoded = encode_message(&msg).unwrap();
         let decoded = decode_message(&encoded).unwrap();
@@ -328,6 +329,7 @@ mod tests {
                 channel_digest: vec![0; 32],
                 channel_count: 0,
                 roles: vec![],
+                p2p_port: 9474,
             }),
             WireMessage::HandshakeAccept(HandshakeAccept {
                 version: 1,
@@ -337,6 +339,7 @@ mod tests {
                 channel_count: 0,
                 roles: vec![],
                 reject_reason: None,
+                p2p_port: 9474,
             }),
             WireMessage::Ping(Ping { seq: 0, sent_at_ns: 0 }),
             WireMessage::Pong(Pong { seq: 0, sent_at_ns: 0, recv_at_ns: 0 }),

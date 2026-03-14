@@ -47,7 +47,8 @@ wait_for() {
 api_post() {
     local container="$1"
     local endpoint="$2"
-    local body="${3:-{}}"
+    local body
+    body="${3:-"{}"}"
     local token
     token=$(docker exec "$container" cat "$TOKEN_PATH" 2>/dev/null)
     docker exec "$container" curl -sf \
