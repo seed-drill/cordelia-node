@@ -40,11 +40,25 @@ pub enum HandshakeError {
     #[error("identity mismatch: TLS node_id does not match handshake node_id")]
     IdentityMismatch,
 
-    #[error("unexpected message type")]
-    UnexpectedMessage,
-
     #[error("timeout")]
     Timeout,
+
+    #[error("unexpected message type")]
+    UnexpectedMessage,
+}
+
+impl HandshakeError {
+    /// Safe reject_reason string for the peer (no information leakage).
+    /// Per spec §4.1.5: clock skew reject MUST NOT include local time or delta.
+    pub fn reject_reason(&self) -> String {
+        match self {
+            Self::InvalidMagic(_) => "invalid magic".to_string(),
+            Self::IncompatibleVersion => "incompatible version range".to_string(),
+            Self::ClockSkew { .. } => "clock skew".to_string(),
+            Self::IdentityMismatch => "identity mismatch".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Result of a successful handshake.
@@ -149,7 +163,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             channel_digest: channel_digest.to_vec(),
             channel_count: channel_ids.len() as u16,
             roles: roles.to_vec(),
-            reject_reason: Some(reject_reason.to_string()),
+            reject_reason: Some(reject_reason.reject_reason()),
         });
         write_frame(stream, &reject).await?;
         return Err(reject_reason);
@@ -418,12 +432,14 @@ mod tests {
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
-        // Read rejection
+        // Read rejection -- verify reject_reason doesn't leak clock delta (BV-17)
         let response = read_frame(&mut client).await.unwrap();
         match response {
             WireMessage::HandshakeAccept(a) => {
                 assert_eq!(a.version, 0);
-                assert!(a.reject_reason.is_some());
+                assert_eq!(a.reject_reason.as_deref(), Some("clock skew"));
+                // Must NOT contain the delta value or local time
+                assert!(!a.reject_reason.as_deref().unwrap().contains("600"));
             }
             _ => panic!("expected HandshakeAccept rejection"),
         }
