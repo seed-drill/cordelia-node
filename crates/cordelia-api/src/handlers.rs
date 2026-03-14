@@ -209,6 +209,23 @@ pub async fn publish(
         &db, &item_id, &channel_id.0, &body.item_type, &published_at, &searchable,
     );
 
+    // Push to P2P hot peers (non-blocking, best-effort)
+    if let Some(ref tx) = state.push_tx {
+        let _ = tx.send(crate::state::PushItem {
+            channel_id: channel_id.0.clone(),
+            item_id: item_id.clone(),
+            encrypted_blob: encrypted_blob.clone(),
+            content_hash: content_hash.to_vec(),
+            author_id: pk.to_vec(),
+            signature: signature.to_vec(),
+            key_version: channel.key_version as u32,
+            published_at: published_at.clone(),
+            item_type: body.item_type.clone(),
+            is_tombstone: false,
+            parent_id: body.parent_id.clone(),
+        });
+    }
+
     // Author in Bech32
     let author_bech32 =
         encode_public_key(&pk).map_err(|e| ApiError::Internal(e.to_string()))?;

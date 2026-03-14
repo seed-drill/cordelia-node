@@ -27,6 +27,7 @@ fn test_state() -> web::Data<AppState> {
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
+        push_tx: None,
     })
 }
 

@@ -8,6 +8,22 @@ use std::time::Instant;
 use cordelia_crypto::identity::NodeIdentity;
 use rusqlite::Connection;
 
+/// An item to be pushed to hot peers via P2P.
+#[derive(Debug, Clone)]
+pub struct PushItem {
+    pub channel_id: String,
+    pub item_id: String,
+    pub encrypted_blob: Vec<u8>,
+    pub content_hash: Vec<u8>,
+    pub author_id: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub key_version: u32,
+    pub published_at: String,
+    pub item_type: String,
+    pub is_tombstone: bool,
+    pub parent_id: Option<String>,
+}
+
 /// Shared state accessible from all request handlers.
 pub struct AppState {
     pub db: Mutex<Connection>,
@@ -22,6 +38,9 @@ pub struct AppState {
     pub peers_hot: AtomicU64,
     /// Number of peers in Warm state (updated by governor tick).
     pub peers_warm: AtomicU64,
+    /// Channel for sending items to the P2P layer for push delivery.
+    /// None if P2P is not running (e.g., in tests).
+    pub push_tx: Option<tokio::sync::mpsc::UnboundedSender<PushItem>>,
 }
 
 impl AppState {

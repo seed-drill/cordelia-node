@@ -329,6 +329,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);
+    let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = web::Data::new(cordelia_api::state::AppState {
         db: Mutex::new(conn),
@@ -339,6 +340,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         sync_errors: std::sync::atomic::AtomicU64::new(0),
         peers_hot: std::sync::atomic::AtomicU64::new(0),
         peers_warm: std::sync::atomic::AtomicU64::new(0),
+        push_tx: Some(push_tx),
     });
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -397,7 +399,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_shutdown = tokio::sync::watch::channel(false);
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let p2p_handle = tokio::spawn(async move {
-            p2p_loop(conn_mgr, p2p_state, &mut p2p_shutdown_rx).await;
+            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -434,15 +436,16 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
 // ── P2P background loop ───────────────────────────────────────────
 
-/// Background task that accepts incoming QUIC connections and manages
-/// the peer lifecycle. Communicates peer counts back to the HTTP API
-/// via AppState atomic counters.
+/// Background task that accepts incoming QUIC connections, handles
+/// outbound item pushes, and manages peer lifecycle. Communicates
+/// peer counts back to the HTTP API via AppState atomic counters.
 async fn p2p_loop(
     mut conn_mgr: cordelia_network::connection::ConnectionManager,
     state: web::Data<cordelia_api::state::AppState>,
+    mut push_rx: tokio::sync::mpsc::UnboundedReceiver<cordelia_api::state::PushItem>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) {
-    tracing::info!("P2P accept loop started");
+    tracing::info!("P2P loop started (accept + push)");
 
     loop {
         tokio::select! {
@@ -459,6 +462,62 @@ async fn p2p_loop(
                     }
                 }
             }
+
+            // Push items to hot peers
+            Some(push_item) = push_rx.recv() => {
+                let item = cordelia_network::messages::Item {
+                    item_id: push_item.item_id.clone(),
+                    channel_id: push_item.channel_id.clone(),
+                    item_type: push_item.item_type,
+                    encrypted_blob: push_item.encrypted_blob,
+                    content_hash: push_item.content_hash,
+                    content_length: 0, // computed from blob
+                    author_id: push_item.author_id,
+                    signature: push_item.signature,
+                    key_version: push_item.key_version,
+                    published_at: push_item.published_at,
+                    is_tombstone: push_item.is_tombstone,
+                    parent_id: push_item.parent_id,
+                };
+
+                // Push to all connected peers
+                for peer_id in conn_mgr.connected_peers() {
+                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                        let conn = conn.clone();
+                        let items = vec![item.clone()];
+                        // Fire and forget -- don't block the loop
+                        tokio::spawn(async move {
+                            match conn.open_bi().await {
+                                Ok((mut send, mut recv)) => {
+                                    let mut stream = tokio::io::join(&mut recv, &mut send);
+                                    match cordelia_network::item_sync::send_push(&mut stream, &items).await {
+                                        Ok(ack) => {
+                                            tracing::debug!(
+                                                peer = %peer_id,
+                                                stored = ack.stored,
+                                                "push delivered"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(peer = %peer_id, error = %e, "push failed");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(peer = %peer_id, error = %e, "open stream failed");
+                                }
+                            }
+                        });
+                    }
+                }
+                tracing::debug!(
+                    channel = %push_item.channel_id,
+                    item = %push_item.item_id,
+                    peers = conn_mgr.connection_count(),
+                    "item pushed to peers"
+                );
+            }
+
             // Shutdown signal
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
