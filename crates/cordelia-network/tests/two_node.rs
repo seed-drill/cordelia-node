@@ -131,7 +131,7 @@ async fn test_two_node_keepalive() {
     };
     assert_eq!(pong.seq, 1);
 
-    keepalive::handle_pong(&mut state, &pong);
+    assert!(keepalive::handle_pong(&mut state, &pong));
     assert!(state.rtt().is_some());
     assert!(state.rtt_ms().unwrap() < 1000); // Sub-1ms on loopback, generous for CI
 

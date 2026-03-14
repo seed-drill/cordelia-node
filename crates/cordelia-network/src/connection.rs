@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §2.3, §4.1, §4.2, §5
 
-use crate::handshake::{self, HandshakeResult};
+use crate::handshake::{self, HandshakeResult, HANDSHAKE_TIMEOUT_SECS};
 use crate::keepalive::KeepAliveState;
 use crate::transport::{extract_peer_node_id, TransportError};
 use cordelia_core::NodeId;
@@ -15,6 +15,7 @@ use rustls::pki_types::CertificateDer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -143,14 +144,19 @@ impl ConnectionManager {
 
         let mut stream = tokio::io::join(&mut recv, &mut send);
 
-        let handshake_result = handshake::initiate_handshake(
-            &mut stream,
-            &self.identity.public_key(),
-            &self.channel_ids,
-            &self.roles,
-            &peer_node_id,
+        let handshake_result = tokio::time::timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            handshake::initiate_handshake(
+                &mut stream,
+                &self.identity.public_key(),
+                &self.channel_ids,
+                &self.roles,
+                &peer_node_id,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))?
+        ?;
 
         info!(peer = %node_id, version = handshake_result.negotiated_version, "handshake complete (outbound)");
 
@@ -186,14 +192,19 @@ impl ConnectionManager {
 
         let mut stream = tokio::io::join(&mut recv, &mut send);
 
-        let handshake_result = handshake::accept_handshake(
-            &mut stream,
-            &self.identity.public_key(),
-            &self.channel_ids,
-            &self.roles,
-            &peer_node_id,
+        let handshake_result = tokio::time::timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            handshake::accept_handshake(
+                &mut stream,
+                &self.identity.public_key(),
+                &self.channel_ids,
+                &self.roles,
+                &peer_node_id,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))?
+        ?;
 
         info!(peer = %node_id, version = handshake_result.negotiated_version, "handshake complete (inbound)");
 

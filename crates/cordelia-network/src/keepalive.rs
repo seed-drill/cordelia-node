@@ -47,6 +47,8 @@ pub struct KeepAliveState {
     last_ping_sent: Option<Instant>,
     /// When we last received any message (ping or pong).
     last_activity: Instant,
+    /// Highest ping seq received from the peer (for monotonicity check).
+    last_peer_ping_seq: u64,
 }
 
 impl KeepAliveState {
@@ -57,6 +59,7 @@ impl KeepAliveState {
             last_rtt: None,
             last_ping_sent: None,
             last_activity: Instant::now(),
+            last_peer_ping_seq: 0,
         }
     }
 
@@ -132,21 +135,38 @@ pub async fn send_pong<W: AsyncWrite + Unpin>(
 }
 
 /// Process a received pong, updating state with RTT.
-pub fn handle_pong(state: &mut KeepAliveState, pong: &Pong) {
+///
+/// Out-of-order or duplicate seq values are ignored per spec §4.2
+/// (no ban -- clock issues are common).
+pub fn handle_pong(state: &mut KeepAliveState, pong: &Pong) -> bool {
+    if pong.seq <= state.last_acked_seq {
+        tracing::debug!(seq = pong.seq, last = state.last_acked_seq, "ignoring out-of-order pong");
+        return false;
+    }
+
     let now = now_ns();
     if pong.sent_at_ns < now {
         let rtt_ns = now - pong.sent_at_ns;
         state.last_rtt = Some(Duration::from_nanos(rtt_ns));
     }
-    if pong.seq > state.last_acked_seq {
-        state.last_acked_seq = pong.seq;
-    }
+    state.last_acked_seq = pong.seq;
     state.last_activity = Instant::now();
+    true
 }
 
 /// Process a received ping, updating activity timestamp.
-pub fn handle_ping(state: &mut KeepAliveState, _ping: &Ping) {
+///
+/// Validates seq is strictly increasing per spec §4.2.
+/// Out-of-order or duplicate seq values are logged and ignored.
+/// Returns true if the ping was accepted (seq is monotonic).
+pub fn handle_ping(state: &mut KeepAliveState, ping: &Ping) -> bool {
+    if ping.seq <= state.last_peer_ping_seq {
+        tracing::debug!(seq = ping.seq, last = state.last_peer_ping_seq, "ignoring out-of-order ping");
+        return false;
+    }
+    state.last_peer_ping_seq = ping.seq;
     state.last_activity = Instant::now();
+    true
 }
 
 #[cfg(test)]
@@ -182,7 +202,7 @@ mod tests {
             sent_at_ns: sent,
             recv_at_ns: sent + 2_000_000, // peer saw it 2ms later
         };
-        handle_pong(&mut state, &pong);
+        assert!(handle_pong(&mut state, &pong));
         assert!(state.rtt().is_some());
         // RTT should be approximately 5ms but CI can be slow -- just verify non-zero
         assert!(state.rtt_ms().unwrap() >= 1);
@@ -196,8 +216,45 @@ mod tests {
         state.last_activity = Instant::now() - Duration::from_secs(60);
         assert!(state.idle_duration() >= Duration::from_secs(59));
 
-        handle_ping(&mut state, &Ping { seq: 1, sent_at_ns: 100 });
+        assert!(handle_ping(&mut state, &Ping { seq: 1, sent_at_ns: 100 }));
         assert!(state.idle_duration() < Duration::from_secs(1));
+    }
+
+    // BV-08: Seq monotonicity -- out-of-order ping ignored
+    #[test]
+    fn test_ping_seq_out_of_order_ignored() {
+        let mut state = KeepAliveState::new();
+        assert!(handle_ping(&mut state, &Ping { seq: 5, sent_at_ns: 100 }));
+        assert_eq!(state.last_peer_ping_seq, 5);
+
+        // seq 3 is out of order (< 5), should be ignored
+        assert!(!handle_ping(&mut state, &Ping { seq: 3, sent_at_ns: 200 }));
+        assert_eq!(state.last_peer_ping_seq, 5); // unchanged
+
+        // seq 5 is duplicate, should be ignored
+        assert!(!handle_ping(&mut state, &Ping { seq: 5, sent_at_ns: 300 }));
+
+        // seq 6 is valid
+        assert!(handle_ping(&mut state, &Ping { seq: 6, sent_at_ns: 400 }));
+        assert_eq!(state.last_peer_ping_seq, 6);
+    }
+
+    // BV-08: Seq monotonicity -- out-of-order pong ignored
+    #[test]
+    fn test_pong_seq_out_of_order_ignored() {
+        let mut state = KeepAliveState::new();
+        let pong1 = Pong { seq: 3, sent_at_ns: now_ns() - 1_000_000, recv_at_ns: 0 };
+        assert!(handle_pong(&mut state, &pong1));
+        assert_eq!(state.last_acked_seq, 3);
+
+        // Duplicate seq 3 ignored
+        let pong_dup = Pong { seq: 3, sent_at_ns: now_ns() - 500_000, recv_at_ns: 0 };
+        assert!(!handle_pong(&mut state, &pong_dup));
+
+        // Old seq 1 ignored
+        let pong_old = Pong { seq: 1, sent_at_ns: now_ns() - 2_000_000, recv_at_ns: 0 };
+        assert!(!handle_pong(&mut state, &pong_old));
+        assert_eq!(state.last_acked_seq, 3); // unchanged
     }
 
     #[tokio::test]
@@ -230,7 +287,7 @@ mod tests {
         assert_eq!(pong.seq, 1);
 
         // Process pong
-        handle_pong(&mut state, &pong);
+        assert!(handle_pong(&mut state, &pong));
         assert!(state.rtt().is_some());
         assert_eq!(state.last_acked_seq, 1);
     }
