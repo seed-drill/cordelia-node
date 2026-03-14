@@ -390,6 +390,16 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         state.peers_hot.store(hot_count, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(peers = hot_count, "bootstrap complete");
 
+        // ── P2P background loop ─────────────────────────────────────
+        // Owns the ConnectionManager. Accepts inbound connections and
+        // updates peer counts in the shared AppState atomics.
+        let p2p_state = state.clone();
+        let p2p_shutdown = tokio::sync::watch::channel(false);
+        let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
+        let p2p_handle = tokio::spawn(async move {
+            p2p_loop(conn_mgr, p2p_state, &mut p2p_shutdown_rx).await;
+        });
+
         // ── HTTP API ───────────────────────────────────────────────
         let server = HttpServer::new(move || {
             App::new()
@@ -402,9 +412,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let server_handle = server.handle();
 
         // Spawn signal handler for graceful shutdown
+        let p2p_shutdown_tx = p2p_shutdown.0;
         tokio::spawn(async move {
             shutdown_signal().await;
             tracing::info!("shutdown signal received, stopping");
+            let _ = p2p_shutdown_tx.send(true);
             server_handle.stop(true).await;
         });
 
@@ -412,12 +424,51 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
         let result = server.await.map_err(|e| anyhow::anyhow!(e));
 
-        // Clean up P2P
-        conn_mgr.shutdown();
+        // Wait for P2P loop to finish
+        let _ = p2p_handle.await;
         tracing::info!("P2P shutdown complete");
 
         result
     })
+}
+
+// ── P2P background loop ───────────────────────────────────────────
+
+/// Background task that accepts incoming QUIC connections and manages
+/// the peer lifecycle. Communicates peer counts back to the HTTP API
+/// via AppState atomic counters.
+async fn p2p_loop(
+    mut conn_mgr: cordelia_network::connection::ConnectionManager,
+    state: web::Data<cordelia_api::state::AppState>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    tracing::info!("P2P accept loop started");
+
+    loop {
+        tokio::select! {
+            // Accept incoming connection
+            result = conn_mgr.accept_incoming() => {
+                match result {
+                    Ok(node_id) => {
+                        let count = conn_mgr.connection_count() as u64;
+                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "inbound connection failed");
+                    }
+                }
+            }
+            // Shutdown signal
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("P2P loop shutting down");
+                    conn_mgr.shutdown();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ── cordelia peers ─────────────────────────────────────────────────
