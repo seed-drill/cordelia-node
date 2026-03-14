@@ -703,14 +703,14 @@ async fn p2p_loop(
                     continue;
                 }
 
-                // Rotate sync target across peers (round-robin by tick count)
-                static SYNC_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tick = SYNC_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let target = peers[(tick as usize) % peers.len()].clone();
-                if let Some(conn) = conn_mgr.get_connection(&target) {
+                // Sync from ALL connected peers each cycle (O(1) convergence).
+                // Each peer is synced in a separate task to avoid blocking.
+                for target in &peers {
+                    if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
-                    let sync_channels = channels;
+                    let sync_channels = channels.clone();
+                    let target = target.clone();
                     tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
                     tokio::spawn(async move {
                         for ch_id in &sync_channels {
@@ -840,7 +840,8 @@ async fn p2p_loop(
                             }
                         }
                     });
-                }
+                    } // if let Some(conn)
+                } // for target in peers
             }
 
             // Shutdown signal
