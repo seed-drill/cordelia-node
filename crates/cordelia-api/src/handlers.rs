@@ -443,7 +443,7 @@ pub async fn identity(
         x25519_public_key: x_bech32,
         node_id: ed_bech32,
         channels_subscribed: subscribed,
-        peers_connected: 0, // Phase 1: no P2P
+        peers_connected: state.peers_hot.load(std::sync::atomic::Ordering::Relaxed) as i64,
     }))
 }
 
@@ -1019,6 +1019,8 @@ pub async fn metrics(
     let storage_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     let sync_errors = state.sync_error_count();
+    let peers_hot = state.peers_hot.load(std::sync::atomic::Ordering::Relaxed);
+    let peers_warm = state.peers_warm.load(std::sync::atomic::Ordering::Relaxed);
 
     let body = format!(
         "# HELP cordelia_uptime_seconds Node uptime\n\
@@ -1043,11 +1045,11 @@ pub async fn metrics(
          \n\
          # HELP cordelia_peers_hot Number of peers in Hot state\n\
          # TYPE cordelia_peers_hot gauge\n\
-         cordelia_peers_hot 0\n\
+         cordelia_peers_hot {peers_hot}\n\
          \n\
          # HELP cordelia_peers_warm Number of peers in Warm state\n\
          # TYPE cordelia_peers_warm gauge\n\
-         cordelia_peers_warm 0\n"
+         cordelia_peers_warm {peers_warm}\n"
     );
 
     Ok(HttpResponse::Ok()
@@ -1121,4 +1123,40 @@ fn verify_item_signature(item: &items::StoredItem) -> bool {
     };
 
     cordelia_crypto::identity::verify_signature(&author, &cbor, &sig)
+}
+
+// ── Health + Status ────────────────────────────────────────────────
+
+/// GET /api/v1/health -- unauthenticated, returns 200 if node is running.
+/// Used by Docker healthcheck and load balancers.
+pub async fn health() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+}
+
+/// GET /api/v1/status -- authenticated, returns node status with peer counts.
+pub async fn status(
+    state: web::Data<crate::state::AppState>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, crate::error::ApiError> {
+    crate::auth::check_bearer(&req, &state)?;
+
+    let uptime = state.uptime_secs();
+    let peers_hot = state.peers_hot.load(std::sync::atomic::Ordering::Relaxed);
+    let peers_warm = state.peers_warm.load(std::sync::atomic::Ordering::Relaxed);
+    let sync_errors = state.sync_error_count();
+
+    let db = state.db.lock().unwrap();
+    let pk = state.identity.public_key();
+    let channels = cordelia_storage::channels::list_for_entity(&db, &pk)
+        .map(|c| c.len())
+        .unwrap_or(0);
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "running",
+        "uptime_secs": uptime as u64,
+        "peers_hot": peers_hot,
+        "peers_warm": peers_warm,
+        "channels_subscribed": channels,
+        "sync_errors": sync_errors,
+    })))
 }

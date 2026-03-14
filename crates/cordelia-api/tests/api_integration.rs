@@ -25,6 +25,8 @@ fn test_state() -> web::Data<AppState> {
         home_dir: dir.into_path(),
         started_at: std::time::Instant::now(),
         sync_errors: AtomicU64::new(0),
+        peers_hot: AtomicU64::new(0),
+        peers_warm: AtomicU64::new(0),
     })
 }
 

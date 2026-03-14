@@ -18,6 +18,10 @@ pub struct AppState {
     pub started_at: Instant,
     /// Cumulative sync errors (Phase 2+, incremented by replication).
     pub sync_errors: AtomicU64,
+    /// Number of peers in Hot state (updated by governor tick).
+    pub peers_hot: AtomicU64,
+    /// Number of peers in Warm state (updated by governor tick).
+    pub peers_warm: AtomicU64,
 }
 
 impl AppState {
