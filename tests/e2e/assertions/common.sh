@@ -137,6 +137,19 @@ assert_no_psks() {
     fi
 }
 
+# Assert total items >= expected (any channel)
+assert_min_total_items() {
+    local container="$1"
+    local min_items="$2"
+    local actual
+    actual=$(db_query "$container" "SELECT COUNT(*) FROM items")
+    if [ "$actual" -ge "$min_items" ] 2>/dev/null; then
+        assert "$container has $actual stored items (>= $min_items)" 0
+    else
+        assert "$container has ${actual:-0} stored items (expected >= $min_items)" 1
+    fi
+}
+
 # Assert zero items stored (bootnode role isolation)
 assert_zero_items() {
     local container="$1"

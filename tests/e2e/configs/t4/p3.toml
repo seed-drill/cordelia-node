@@ -1,0 +1,39 @@
+# T4 Personal node 3
+[identity]
+entity_id = "p3_test"
+
+[node]
+http_port = 9473
+p2p_port = 9474
+data_dir = "/data/cordelia"
+
+[network]
+listen_addr = "0.0.0.0:9474"
+role = "personal"
+push_policy = "subscribers_only"
+allow_private_addresses = true
+dns_discovery = ""
+
+[[network.bootnodes]]
+addr = "172.28.0.10:9474"
+
+[governor]
+hot_min = 1
+hot_max = 5
+warm_min = 1
+warm_max = 5
+cold_max = 10
+tick_interval_secs = 2
+min_warm_tenure_secs = 5
+keepalive_timeout_secs = 30
+
+[replication]
+sync_interval_realtime_secs = 10
+tombstone_retention_days = 1
+max_batch_size = 50
+
+[api]
+bind_address = "127.0.0.1"
+
+[logging]
+level = "debug"
