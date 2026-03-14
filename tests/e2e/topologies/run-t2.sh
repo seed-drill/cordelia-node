@@ -111,8 +111,16 @@ echo "Step 7: Running assertions..."
 assert_item_count t2-p1 "$CHANNEL_ID" 5
 assert_item_count t2-p2 "$CHANNEL_ID" 5
 
-# P4: Role isolation -- relay stores ciphertext but has no PSKs
-assert_no_psks t2-r1
+# P4: Role isolation -- relay stores ciphertext, no user-channel PSKs
+# Note: relay has 1 PSK from personal channel created during init.
+# The assertion checks that the relay does NOT have the test-channel PSK.
+R1_TEST_PSK=$(docker exec t2-r1 sh -c \
+    "[ -f /data/cordelia/channel-keys/${CHANNEL_ID}.key ] && echo 1 || echo 0")
+if [ "$R1_TEST_PSK" -eq 0 ]; then
+    assert "r1 does not hold test-channel PSK" 0
+else
+    assert "r1 holds test-channel PSK (expected none)" 1
+fi
 assert_min_total_items t2-r1 1
 
 # P4: Role isolation -- bootnode stores nothing

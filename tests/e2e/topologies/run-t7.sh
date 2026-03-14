@@ -146,8 +146,17 @@ assert_item_count t7-p3 "$ALPHA_ID" 3
 assert_item_count t7-p3 "$BETA_ID" 3
 assert_channel_isolation t7-p3 "$ALPHA_ID" "$BETA_ID"
 
-# P4: Role isolation -- relay stores ciphertext, no PSKs
-assert_no_psks t7-r1
+# P4: Role isolation -- relay stores ciphertext, no user-channel PSKs
+# Note: relay has 1 PSK from personal channel created during init.
+R1_ALPHA_PSK=$(docker exec t7-r1 sh -c \
+    "[ -f /data/cordelia/channel-keys/${ALPHA_ID}.key ] && echo 1 || echo 0")
+R1_BETA_PSK=$(docker exec t7-r1 sh -c \
+    "[ -f /data/cordelia/channel-keys/${BETA_ID}.key ] && echo 1 || echo 0")
+if [ "$R1_ALPHA_PSK" -eq 0 ] && [ "$R1_BETA_PSK" -eq 0 ]; then
+    assert "r1 does not hold test-channel PSKs" 0
+else
+    assert "r1 holds test-channel PSK (expected none)" 1
+fi
 assert_min_total_items t7-r1 1
 
 # P4: Bootnode stores nothing
