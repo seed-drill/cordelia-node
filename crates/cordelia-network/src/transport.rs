@@ -115,6 +115,8 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
     ));
+    transport.max_concurrent_bidi_streams(1000u32.into());
+    transport.max_concurrent_uni_streams(1000u32.into());
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -148,6 +150,8 @@ pub fn client_config(identity: &NodeIdentity) -> Result<ClientConfig, TransportE
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
     ));
+    transport.max_concurrent_bidi_streams(1000u32.into());
+    transport.max_concurrent_uni_streams(1000u32.into());
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
