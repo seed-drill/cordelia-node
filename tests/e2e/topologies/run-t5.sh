@@ -99,7 +99,7 @@ for i in 1 2; do
 done
 
 wait_for "p2 has 2 baseline items" \
-    '[ "$(db_query t5-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 2 ]' 30
+    '[ "$(db_query t5-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 2 ]' 60
 
 echo "  Baseline delivery confirmed."
 

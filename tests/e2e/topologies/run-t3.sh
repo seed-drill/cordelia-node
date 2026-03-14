@@ -122,7 +122,14 @@ fi
 
 # P4: Role isolation (bonus)
 assert_zero_items t3-b1
-assert_no_psks t3-r1
+# Note: relay has 1 PSK from personal channel created during init.
+R1_TEST_PSK=$(docker exec t3-r1 sh -c \
+    "[ -f /data/cordelia/channel-keys/${CHANNEL_ID}.key ] && echo 1 || echo 0")
+if [ "$R1_TEST_PSK" -eq 0 ]; then
+    assert "r1 does not hold test-channel PSK" 0
+else
+    assert "r1 holds test-channel PSK (expected none)" 1
+fi
 
 # P3: Channel isolation (bonus)
 assert_channel_isolation t3-p1 "$CHANNEL_ID"
