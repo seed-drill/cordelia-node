@@ -71,7 +71,7 @@ services:
       cordelia-net:
         ipv4_address: 172.28.0.30
     depends_on:
-      r1:
+      b1:
         condition: service_healthy
 
   p2:
@@ -91,7 +91,7 @@ services:
       cordelia-net:
         ipv4_address: 172.28.0.31
     depends_on:
-      r1:
+      b1:
         condition: service_healthy
 
 networks:

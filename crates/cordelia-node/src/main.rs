@@ -381,12 +381,18 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             tracing::info!(count = bootnodes.len(), "bootnodes resolved");
 
             for bn in &bootnodes {
-                match conn_mgr.connect_to(bn.addr).await {
-                    Ok(node_id) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    conn_mgr.connect_to(bn.addr),
+                ).await {
+                    Ok(Ok(node_id)) => {
                         tracing::info!(bootnode = %bn.host, peer = %node_id, "connected to bootnode");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(bootnode = %bn.host, error = %e, "failed to connect to bootnode");
+                    }
+                    Err(_) => {
+                        tracing::warn!(bootnode = %bn.host, "bootnode connection timed out (10s)");
                     }
                 }
             }
@@ -874,6 +880,14 @@ async fn handle_peer_streams(
                             if !cordelia_network::item_sync::verify_content_hash(item) {
                                 tracing::warn!(item = %item.item_id, "content hash mismatch");
                                 continue;
+                            }
+
+                            // Relay: ensure channel row exists (no FK violation)
+                            if node_role == "relay" {
+                                let _ = db.execute(
+                                    "INSERT OR IGNORE INTO channels (channel_id, channel_name, role, mode, access, psk_version, created_at) VALUES (?1, '', 'relay', 'realtime', 'open', 0, datetime('now'))",
+                                    rusqlite::params![item.channel_id],
+                                );
                             }
 
                             let author: [u8; 32] = match item.author_id.as_slice().try_into() {
