@@ -211,4 +211,65 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    // T3-1 (HIGH): mode CHECK constraint
+    #[test]
+    fn test_mode_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let result = conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('test', 'named', 'invalid_mode', 'open', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(result.is_err(), "mode CHECK should reject 'invalid_mode'");
+    }
+
+    // T3-1: access CHECK constraint
+    #[test]
+    fn test_access_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let result = conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('test', 'named', 'realtime', 'invalid_access', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(result.is_err(), "access CHECK should reject 'invalid_access'");
+    }
+
+    // T3-1: role CHECK constraint
+    #[test]
+    fn test_role_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('ch1', 'named', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        ).unwrap();
+        let result = conn.execute(
+            "INSERT INTO channel_members (channel_id, entity_id, role, joined_at)
+             VALUES ('ch1', X'01', 'superadmin', '2026-01-01')",
+            [],
+        );
+        assert!(result.is_err(), "role CHECK should reject 'superadmin'");
+    }
+
+    // T3-1: verify all valid enum values are accepted
+    #[test]
+    fn test_valid_enum_values_accepted() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (i, ct) in ["named", "dm", "group"].iter().enumerate() {
+            let id = format!("ch_{i}");
+            conn.execute(
+                &format!(
+                    "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+                     VALUES ('{id}', '{ct}', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')"
+                ),
+                [],
+            ).unwrap_or_else(|e| panic!("channel_type '{ct}' should be valid: {e}"));
+        }
+    }
 }

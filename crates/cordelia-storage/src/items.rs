@@ -329,4 +329,48 @@ mod tests {
         assert!(!is_internal_type("event"));
         assert!(!is_internal_type("memory:entity"));
     }
+
+    // T3-3 (MEDIUM): Tombstone nonexistent item
+    #[test]
+    fn test_tombstone_nonexistent_item() {
+        let conn = setup();
+        let result = tombstone_item(&conn, "ci_doesnotexist");
+        assert!(matches!(result, Ok(false)));
+    }
+
+    // T3-4 (MEDIUM): Double tombstone
+    #[test]
+    fn test_double_tombstone() {
+        let conn = setup();
+        let item = test_item("ci_double_del", "2026-01-01T00:01:00Z");
+        insert_item(&conn, &item).unwrap();
+        assert!(matches!(tombstone_item(&conn, "ci_double_del"), Ok(true)));
+        assert!(matches!(tombstone_item(&conn, "ci_double_del"), Ok(false)));
+    }
+
+    // T5-2 (MEDIUM): Empty blob
+    #[test]
+    fn test_insert_empty_blob() {
+        let conn = setup();
+        let mut item = test_item("ci_empty", "2026-01-01T00:01:00Z");
+        item.encrypted_blob = &[];
+        item.content_hash = &[0; 32]; // Different hash to avoid dedup
+        // Should succeed -- storage layer doesn't enforce min size
+        assert!(insert_item(&conn, &item).is_ok());
+    }
+
+    // T5-3 (MEDIUM): Listen with limit=1
+    #[test]
+    fn test_listen_limit_one() {
+        let conn = setup();
+        let mut i1 = test_item("ci_lim1", "2026-01-01T00:01:00Z");
+        i1.content_hash = &[0x10; 32];
+        insert_item(&conn, &i1).unwrap();
+        let mut i2 = test_item("ci_lim2", "2026-01-01T00:02:00Z");
+        i2.content_hash = &[0x20; 32];
+        insert_item(&conn, &i2).unwrap();
+
+        let items = query_listen(&conn, "ch1", None, 1).unwrap();
+        assert_eq!(items.len(), 1);
+    }
 }
