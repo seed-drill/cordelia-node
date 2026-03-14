@@ -2,7 +2,16 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md
 
+pub mod bootstrap;
+pub mod channel_announce;
+pub mod codec;
+pub mod connection;
 pub mod governor;
-
-// TODO(WP3): QUIC transport + handshake.
-// TODO(WP12): Bootnode DNS discovery.
+pub mod handshake;
+pub mod item_sync;
+pub mod keepalive;
+pub mod messages;
+pub mod peer_sharing;
+pub mod psk_exchange;
+pub mod rate_limit;
+pub mod transport;

@@ -10,16 +10,20 @@ cordelia-core = { workspace = true }
 cordelia-crypto = { workspace = true }
 cordelia-storage = { workspace = true }
 quinn = { workspace = true }
+rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tracing = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

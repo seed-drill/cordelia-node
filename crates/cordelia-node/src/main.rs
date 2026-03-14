@@ -314,6 +314,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
     let http_port = config.node.http_port;
     let listen_addr = format!("{bind_addr}:{http_port}");
+    let p2p_port = config.node.p2p_port;
 
     // Set up logging
     init_tracing(&config.logging.level);
@@ -322,12 +323,16 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     println!("  Entity:    {}", config.identity.entity_id);
     println!("  Public key: {pk_bech32}");
     println!("  HTTP API:  http://{listen_addr}/api/v1/channels/");
+    println!("  P2P port:  {p2p_port}/UDP");
+    println!("  Role:      {}", config.network.role);
     println!();
 
     // Build app state
+    let identity_arc = std::sync::Arc::new(identity);
+
     let state = web::Data::new(cordelia_api::state::AppState {
         db: Mutex::new(conn),
-        identity,
+        identity: NodeIdentity::from_seed(*identity_arc.seed())?,
         bearer_token,
         home_dir: data_dir,
         started_at: std::time::Instant::now(),
@@ -337,8 +342,42 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // Start the tokio/actix runtime with graceful shutdown
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        tracing::info!(%listen_addr, "starting HTTP server");
+        tracing::info!(%listen_addr, p2p_port, "starting node");
 
+        // ── P2P transport ──────────────────────────────────────────
+        let p2p_bind: std::net::SocketAddr =
+            format!("0.0.0.0:{p2p_port}").parse().unwrap();
+        let endpoint = cordelia_network::transport::create_endpoint(&identity_arc, p2p_bind)
+            .map_err(|e| anyhow::anyhow!("P2P transport: {e}"))?;
+        let p2p_local = endpoint.local_addr()?;
+        tracing::info!(%p2p_local, "P2P endpoint listening");
+
+        // ── Bootstrap: resolve bootnodes ───────────────────────────
+        let bootnode_addrs: Vec<String> = config
+            .network
+            .bootnodes
+            .iter()
+            .map(|b| b.addr.clone())
+            .collect();
+        let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(&bootnode_addrs);
+        tracing::info!(count = bootnodes.len(), "bootnodes resolved");
+
+        // ── Connection manager ─────────────────────────────────────
+        let roles = vec![config.network.role.clone()];
+        let mut conn_mgr = cordelia_network::connection::ConnectionManager::new(
+            identity_arc.clone(),
+            endpoint,
+            vec![], // channel IDs loaded later from DB
+            roles,
+        );
+
+        // ── Accept incoming P2P connections ─────────────────────────
+        // (Spawned as background task, runs until shutdown)
+        // For Phase 1, we log incoming connections but the full accept
+        // loop with governor integration comes in the next iteration.
+        tracing::info!("P2P layer ready");
+
+        // ── HTTP API ───────────────────────────────────────────────
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(state.clone())
@@ -352,11 +391,17 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // Spawn signal handler for graceful shutdown
         tokio::spawn(async move {
             shutdown_signal().await;
-            tracing::info!("shutdown signal received, stopping server");
+            tracing::info!("shutdown signal received, stopping");
             server_handle.stop(true).await;
         });
 
-        server.await.map_err(|e| anyhow::anyhow!(e))
+        let result = server.await.map_err(|e| anyhow::anyhow!(e));
+
+        // Clean up P2P
+        conn_mgr.shutdown();
+        tracing::info!("P2P shutdown complete");
+
+        result
     })
 }
 

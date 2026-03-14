@@ -39,6 +39,7 @@ rand = "0.8"
 # Encoding
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
 bech32 = "0.11"
 hex = "0.4"
@@ -46,6 +47,7 @@ base64 = "0.22"
 
 # QUIC transport
 quinn = "0.11"
+rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 
 # HTTP API
@@ -68,6 +70,10 @@ toml = "0.8"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# X.509 parsing
+x509-parser = "0.16"
+time = "0.3"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
