@@ -1,0 +1,48 @@
+# Cordelia bootnode configuration
+# Deploy to: boot1.cordelia.seeddrill.ai / boot2.cordelia.seeddrill.ai
+# Role: discovery-only (§8.2). No item storage, no channel subscriptions.
+
+[identity]
+entity_id = ""        # Set at cordelia init
+public_key = ""       # Set at cordelia init
+
+[node]
+http_port = 9473
+p2p_port = 9474
+
+[api]
+bind_address = "127.0.0.1"
+
+[network]
+listen_addr = "0.0.0.0:9474"
+role = "bootnode"
+push_policy = "pull_only"
+dns_discovery = "_cordelia._udp.seeddrill.ai"
+
+# Bootnodes don't need to know other bootnodes
+# (they ARE the bootnodes)
+# [[network.bootnodes]]
+
+[governor]
+hot_min = 0
+hot_max = 0
+warm_min = 5
+warm_max = 50
+cold_max = 200
+churn_interval_secs = 3600
+churn_fraction = 0.1
+keepalive_timeout_secs = 90
+stale_threshold_secs = 1800
+
+[replication]
+sync_interval_realtime_secs = 0     # Bootnodes don't sync items
+sync_interval_batch_secs = 0
+
+[limits]
+max_item_bytes = 0                   # Bootnodes don't accept items
+max_inbound_connections = 500        # Higher than personal nodes
+max_connections_per_ip = 10          # More generous for NAT
+max_connections_per_subnet = 50
+
+[logging]
+level = "info"

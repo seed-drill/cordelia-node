@@ -1,0 +1,29 @@
+# Fly.io config for boot2.cordelia.seeddrill.ai
+# Deploy: fly deploy --config deploy/bootnode/fly.boot2.toml
+
+app = "cordelia-boot2"
+primary_region = "ams"  # Amsterdam
+
+[build]
+  dockerfile = "deploy/bootnode/Dockerfile"
+
+[env]
+  CORDELIA_DATA_DIR = "/data/cordelia"
+
+[[services]]
+  internal_port = 9474
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 9474
+
+[[services]]
+  internal_port = 9473
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 9473
+
+[mounts]
+  source = "cordelia_data"
+  destination = "/data/cordelia"

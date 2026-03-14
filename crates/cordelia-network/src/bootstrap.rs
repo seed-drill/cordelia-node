@@ -18,8 +18,10 @@ pub const DEFAULT_BOOTNODE_PORT: u16 = 9474;
 pub const SRV_RECORD: &str = "_cordelia._udp.seeddrill.ai";
 
 /// Fallback peer addresses (compiled into binary, rotated each release).
+/// These are last-resort addresses if bootnodes and DNS are both unreachable.
 pub const FALLBACK_PEERS: &[&str] = &[
-    // Phase 1: no fallback peers yet -- bootnodes are the only bootstrap path
+    "boot1.cordelia.seeddrill.ai:9474",
+    "boot2.cordelia.seeddrill.ai:9474",
 ];
 
 #[derive(Debug, Error)]
@@ -210,8 +212,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_peers_empty_phase1() {
+    fn test_fallback_peers_resolve() {
+        // Fallback peers use hostnames -- may or may not resolve in test env
         let resolved = resolve_fallback_peers();
-        assert!(resolved.is_empty()); // No fallbacks in Phase 1
+        // Just verify it doesn't panic; DNS may not resolve in CI
+        assert!(resolved.len() <= FALLBACK_PEERS.len());
     }
 }
