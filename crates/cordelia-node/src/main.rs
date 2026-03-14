@@ -885,7 +885,7 @@ async fn handle_peer_streams(
                             // Relay: ensure channel row exists (no FK violation)
                             if node_role == "relay" {
                                 let _ = db.execute(
-                                    "INSERT OR IGNORE INTO channels (channel_id, channel_name, role, mode, access, psk_version, created_at) VALUES (?1, '', 'relay', 'realtime', 'open', 0, datetime('now'))",
+                                    "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at) VALUES (?1, 'named', 'realtime', 'open', X'00', datetime('now'), datetime('now'))",
                                     rusqlite::params![item.channel_id],
                                 );
                             }
