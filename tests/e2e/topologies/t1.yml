@@ -1,0 +1,77 @@
+# T1: Minimal topology (2P + 1B)
+# Purpose: Two personal nodes discover each other via bootnode, publish + receive.
+# Properties tested: P1 (Delivery), P3 (Channel isolation), P7 (Bootstrap)
+#
+# Spec: seed-drill/specs/topology-e2e.md §3.2
+
+name: t1-minimal
+
+services:
+  b1:
+    image: ${CORDELIA_IMAGE:-cordelia-test:latest}
+    container_name: t1-b1
+    hostname: b1
+    cap_add: [NET_ADMIN]
+    environment:
+      - NODE_NAME=b1
+      - CORDELIA_DATA_DIR=/data/cordelia
+    volumes:
+      - ./configs/t1/b1.toml:/config/config.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    networks:
+      cordelia-net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+  p1:
+    image: ${CORDELIA_IMAGE:-cordelia-test:latest}
+    container_name: t1-p1
+    hostname: p1
+    cap_add: [NET_ADMIN]
+    environment:
+      - NODE_NAME=p1
+      - CORDELIA_DATA_DIR=/data/cordelia
+    volumes:
+      - ./configs/t1/p1.toml:/config/config.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./keys:/data/cordelia/channel-keys:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    networks:
+      cordelia-net:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      b1:
+        condition: service_healthy
+
+  p2:
+    image: ${CORDELIA_IMAGE:-cordelia-test:latest}
+    container_name: t1-p2
+    hostname: p2
+    cap_add: [NET_ADMIN]
+    environment:
+      - NODE_NAME=p2
+      - CORDELIA_DATA_DIR=/data/cordelia
+    volumes:
+      - ./configs/t1/p2.toml:/config/config.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./keys:/data/cordelia/channel-keys:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    networks:
+      cordelia-net:
+        ipv4_address: 172.28.0.31
+    depends_on:
+      b1:
+        condition: service_healthy
+
+networks:
+  cordelia-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

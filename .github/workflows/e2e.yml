@@ -1,0 +1,42 @@
+name: E2E Topology Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, cordelia-docker]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build test Docker image
+        run: |
+          docker build -t cordelia-test:latest \
+            -f tests/e2e/Dockerfile \
+            --build-arg BINARY=target/release/cordelia .
+
+      - name: Run T1 (Minimal)
+        run: ./tests/e2e/run-e2e.sh --skip-build t1
+
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: tests/e2e/logs/
+          retention-days: 7
