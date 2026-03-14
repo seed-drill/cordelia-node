@@ -513,4 +513,95 @@ mod tests {
             other => panic!("expected Ping, got {:?}", other),
         }
     }
-}
+
+    // T3-02 (HIGH): Corrupted CBOR payload
+    #[tokio::test]
+    async fn test_corrupted_cbor_payload() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0x00, 0x01, 0x02, 0x03];
+        let len = (garbage.len() as u32).to_be_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(&garbage);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_frame(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::CborDecode(_))));
+    }
+
+    // T3-03 (HIGH): Truncated frame (unexpected EOF mid-payload)
+    #[tokio::test]
+    async fn test_truncated_frame() {
+        // Length prefix claims 100 bytes, but only 50 follow
+        let len = 100u32.to_be_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(&vec![0u8; 50]); // Only half the claimed payload
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_frame(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    // T3-05 (MEDIUM): Unknown protocol byte
+    #[tokio::test]
+    async fn test_unknown_protocol_byte_rejected() {
+        let buf = vec![0x09u8]; // Unknown protocol
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_protocol_byte(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::UnknownProtocol(0x09))));
+    }
+
+    // T3-05 variant: 0xFF and 0x00
+    #[tokio::test]
+    async fn test_extreme_protocol_bytes_rejected() {
+        let mut cursor = std::io::Cursor::new(vec![0x00u8]);
+        assert!(matches!(read_protocol_byte(&mut cursor).await, Err(CodecError::UnknownProtocol(0x00))));
+
+        let mut cursor = std::io::Cursor::new(vec![0xFFu8]);
+        assert!(matches!(read_protocol_byte(&mut cursor).await, Err(CodecError::UnknownProtocol(0xFF))));
+    }
+
+    // T5-02 (MEDIUM): Message at exactly MAX_MESSAGE_BYTES (should succeed)
+    #[tokio::test]
+    async fn test_message_at_max_size_accepted() {
+        // Create a large but valid payload (just under 4MB)
+        // We can't easily create a valid 4MB CBOR WireMessage, so test raw frame
+        let payload = vec![0u8; MAX_MESSAGE_BYTES as usize];
+        let mut buf = Vec::new();
+        write_raw_frame(&mut buf, &payload).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let read_back = read_raw_frame(&mut cursor).await.unwrap();
+        assert_eq!(read_back.len(), MAX_MESSAGE_BYTES as usize);
+    }
+
+    // T3-03 variant: empty payload (0-length frame)
+    #[tokio::test]
+    async fn test_zero_length_frame() {
+        let len = 0u32.to_be_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        // 0-byte payload is valid framing but invalid CBOR
+        let result = read_frame(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::CborDecode(_))));
+    }
+
+    // EOF on protocol byte read
+    #[tokio::test]
+    async fn test_eof_on_protocol_byte() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let result = read_protocol_byte(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+
+    // EOF on length prefix read
+    #[tokio::test]
+    async fn test_eof_on_length_prefix() {
+        // Only 2 bytes when 4 are needed
+        let mut cursor = std::io::Cursor::new(vec![0u8, 0u8]);
+        let result = read_frame(&mut cursor).await;
+        assert!(matches!(result, Err(CodecError::UnexpectedEof)));
+    }
+    }

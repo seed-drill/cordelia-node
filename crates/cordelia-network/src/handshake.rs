@@ -392,4 +392,121 @@ mod tests {
         let server_err = server_task.await.unwrap();
         assert!(matches!(server_err, Err(HandshakeError::IdentityMismatch)));
     }
+
+    // T3-01 (CRITICAL): Clock skew rejection (§4.1.5)
+    #[tokio::test]
+    async fn test_handshake_clock_skew_rejected() {
+        let node_a = test_node_id();
+        let node_b = test_peer_id();
+
+        let (mut client, mut server) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+        });
+
+        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
+            magic: HANDSHAKE_MAGIC,
+            version_min: 1,
+            version_max: 1,
+            node_id: node_a.to_vec(),
+            timestamp: now_unix_secs() - 600, // 600s in the past (>300s tolerance)
+            channel_digest: vec![0; 32],
+            channel_count: 0,
+            roles: vec![],
+        });
+        write_frame(&mut client, &bad_propose).await.unwrap();
+
+        // Read rejection
+        let response = read_frame(&mut client).await.unwrap();
+        match response {
+            WireMessage::HandshakeAccept(a) => {
+                assert_eq!(a.version, 0);
+                assert!(a.reject_reason.is_some());
+            }
+            _ => panic!("expected HandshakeAccept rejection"),
+        }
+
+        let server_err = server_task.await.unwrap();
+        assert!(matches!(server_err, Err(HandshakeError::ClockSkew { .. })));
+    }
+
+    // T3-01 variant: clock skew in the future
+    #[tokio::test]
+    async fn test_handshake_clock_skew_future_rejected() {
+        let node_a = test_node_id();
+        let node_b = test_peer_id();
+
+        let (mut client, mut server) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+        });
+
+        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
+            magic: HANDSHAKE_MAGIC,
+            version_min: 1,
+            version_max: 1,
+            node_id: node_a.to_vec(),
+            timestamp: now_unix_secs() + 600, // 600s in the future
+            channel_digest: vec![0; 32],
+            channel_count: 0,
+            roles: vec![],
+        });
+        write_frame(&mut client, &bad_propose).await.unwrap();
+
+        let _ = read_frame(&mut client).await.unwrap(); // read rejection
+        let server_err = server_task.await.unwrap();
+        assert!(matches!(server_err, Err(HandshakeError::ClockSkew { .. })));
+    }
+
+    // T1-01 / T3-04 (HIGH): Version negotiation rejection (§4.1.4)
+    #[tokio::test]
+    async fn test_handshake_incompatible_version() {
+        let node_a = test_node_id();
+        let node_b = test_peer_id();
+
+        let (mut client, mut server) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            accept_handshake(&mut server, &node_b, &[], &[], &node_a).await
+        });
+
+        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
+            magic: HANDSHAKE_MAGIC,
+            version_min: 99,
+            version_max: 100, // We only support version 1
+            node_id: node_a.to_vec(),
+            timestamp: now_unix_secs(),
+            channel_digest: vec![0; 32],
+            channel_count: 0,
+            roles: vec![],
+        });
+        write_frame(&mut client, &bad_propose).await.unwrap();
+
+        let response = read_frame(&mut client).await.unwrap();
+        match response {
+            WireMessage::HandshakeAccept(a) => {
+                assert_eq!(a.version, 0);
+                assert_eq!(a.reject_reason.as_deref(), Some("incompatible version range"));
+            }
+            _ => panic!("expected HandshakeAccept rejection"),
+        }
+
+        let server_err = server_task.await.unwrap();
+        assert!(matches!(server_err, Err(HandshakeError::IncompatibleVersion)));
+    }
+
+    // T2-03 (LOW): Channel digest known vector
+    #[test]
+    fn test_channel_digest_known_vector() {
+        let ids: Vec<String> = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        let digest = compute_channel_digest(&ids);
+        // SHA-256("alpha\nbeta\ngamma")
+        let expected = Sha256::digest(b"alpha\nbeta\ngamma");
+        assert_eq!(digest, expected.as_slice());
+    }
 }

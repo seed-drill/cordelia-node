@@ -376,4 +376,78 @@ mod tests {
 
         server_task.await.unwrap();
     }
+
+    // T3-06 (MEDIUM): Wrong message type in sync protocol
+    #[tokio::test]
+    async fn test_unexpected_message_in_sync() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            let result = handle_sync_request(&mut server, |_, _, _| {
+                panic!("should not reach handler");
+            })
+            .await;
+            result
+        });
+
+        // Send a Ping where a SyncRequest is expected
+        write_protocol_byte(&mut client, Protocol::ItemSync).await.unwrap();
+        let wrong_msg = WireMessage::Ping(Ping { seq: 1, sent_at_ns: 100 });
+        write_frame(&mut client, &wrong_msg).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(matches!(result, Err(ItemSyncError::UnexpectedMessage)));
+    }
+
+    // T3-06 variant: wrong message type in push
+    #[tokio::test]
+    async fn test_unexpected_message_in_push() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            handle_push(&mut server, |_| {
+                panic!("should not reach handler");
+            })
+            .await
+        });
+
+        // Send wrong protocol byte
+        write_protocol_byte(&mut client, Protocol::KeepAlive).await.unwrap();
+        let msg = WireMessage::Ping(Ping { seq: 1, sent_at_ns: 100 });
+        write_frame(&mut client, &msg).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(matches!(result, Err(ItemSyncError::UnexpectedMessage)));
+    }
+
+    // T1-05 (MEDIUM): Content hash mismatch detection
+    #[test]
+    fn test_content_hash_mismatch_detected() {
+        let mut item = make_test_item("ci_tampered");
+        // Tamper with blob after hash was computed
+        item.encrypted_blob[0] ^= 0xFF;
+        assert!(!verify_content_hash(&item));
+    }
+
+    // T1-05: Empty items
+    #[test]
+    fn test_verify_empty_item() {
+        let empty_blob: Vec<u8> = vec![];
+        let hash = Sha256::digest(&empty_blob);
+        let item = Item {
+            item_id: "ci_empty".into(),
+            channel_id: "ch1".into(),
+            item_type: "message".into(),
+            encrypted_blob: empty_blob,
+            content_hash: hash.to_vec(),
+            content_length: 0,
+            author_id: vec![0; 32],
+            signature: vec![0; 64],
+            key_version: 1,
+            published_at: "2026-03-14T10:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+        };
+        assert!(verify_content_hash(&item));
+    }
 }

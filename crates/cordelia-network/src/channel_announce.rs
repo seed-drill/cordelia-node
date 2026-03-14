@@ -246,11 +246,24 @@ pub enum ChannelAnnounceAction {
     ListReceived(Vec<ChannelDescriptor>),
 }
 
-/// Validate a channel descriptor's signature.
+/// Validate a channel descriptor: field limits, signature.
 ///
-/// Verifies the Ed25519 signature over the CBOR-encoded descriptor fields
-/// (all fields except `signature`).
+/// Checks channel_name length (§4.4.6: max 63 chars), serialized size
+/// (§4.4.6: max 512 bytes CBOR), and Ed25519 signature.
 fn validate_descriptor(desc: &ChannelDescriptor) -> Result<(), ChannelAnnounceError> {
+    // Field size limits (§4.4.6)
+    if let Some(ref name) = desc.channel_name {
+        if name.len() > MAX_CHANNEL_NAME_LEN {
+            return Err(ChannelAnnounceError::DescriptorTooLarge(name.len()));
+        }
+    }
+
+    // Serialized size limit (§4.4.6: max 512 bytes before signature)
+    let payload = build_descriptor_signing_payload(desc);
+    if payload.len() > MAX_DESCRIPTOR_SIZE {
+        return Err(ChannelAnnounceError::DescriptorTooLarge(payload.len()));
+    }
+
     if desc.creator_id.len() != 32 || desc.signature.len() != 64 {
         return Err(ChannelAnnounceError::InvalidSignature(
             desc.channel_id.clone(),
@@ -544,5 +557,89 @@ mod tests {
         let state = ChannelAnnounceState::new(true);
         // Freshly created -- not enough tenure
         assert!(!state.has_sufficient_tenure());
+    }
+
+    // T1-04 (MEDIUM): channel_name max 63 chars (§4.4.6)
+    #[test]
+    fn test_channel_name_too_long_rejected() {
+        let id = NodeIdentity::generate().unwrap();
+        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let long_name = "a".repeat(64); // 64 chars > 63 limit
+        let desc = create_signed_descriptor(
+            &id,
+            "test_channel",
+            Some(&long_name),
+            "open",
+            "realtime",
+            &psk_hash,
+            1,
+            "2026-03-14T10:00:00Z",
+        );
+        assert!(matches!(
+            validate_descriptor(&desc),
+            Err(ChannelAnnounceError::DescriptorTooLarge(_))
+        ));
+    }
+
+    // T1-04 variant: exactly 63 chars should be accepted
+    #[test]
+    fn test_channel_name_at_limit_accepted() {
+        let id = NodeIdentity::generate().unwrap();
+        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let name = "a".repeat(63); // exactly at limit
+        let desc = create_signed_descriptor(
+            &id,
+            "test_channel",
+            Some(&name),
+            "open",
+            "realtime",
+            &psk_hash,
+            1,
+            "2026-03-14T10:00:00Z",
+        );
+        assert!(validate_descriptor(&desc).is_ok());
+    }
+
+    // T1-03 (MEDIUM): Descriptor CBOR too large
+    #[test]
+    fn test_descriptor_oversized_rejected() {
+        let id = NodeIdentity::generate().unwrap();
+        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        // Use a very long channel_id to push CBOR over 512 bytes
+        let long_id = "x".repeat(400);
+        let desc = create_signed_descriptor(
+            &id,
+            &long_id,
+            Some("research"),
+            "open",
+            "realtime",
+            &psk_hash,
+            1,
+            "2026-03-14T10:00:00Z",
+        );
+        assert!(matches!(
+            validate_descriptor(&desc),
+            Err(ChannelAnnounceError::DescriptorTooLarge(_))
+        ));
+    }
+
+    // T3-06 variant: empty channel_id
+    #[test]
+    fn test_empty_channel_id_descriptor() {
+        let id = NodeIdentity::generate().unwrap();
+        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let desc = create_signed_descriptor(
+            &id,
+            "",
+            None,
+            "open",
+            "batch",
+            &psk_hash,
+            1,
+            "2026-03-14T10:00:00Z",
+        );
+        // Empty channel_id is structurally valid (signature verifies)
+        // Policy enforcement is at the API layer, not descriptor validation
+        assert!(validate_descriptor(&desc).is_ok());
     }
 }

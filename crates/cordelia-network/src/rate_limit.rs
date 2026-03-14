@@ -329,4 +329,69 @@ mod tests {
         assert!(!tracker.would_allow(ip1));
         assert!(tracker.would_allow(ip2)); // Different subnet, still allowed
     }
+
+    // T5-01 (HIGH): Test at actual production limit values
+    #[test]
+    fn test_writes_rate_at_production_limit() {
+        let mut counter = RateCounter::new(
+            Duration::from_secs(60),
+            WRITES_PER_PEER_PER_MINUTE,
+        );
+        for _ in 0..WRITES_PER_PEER_PER_MINUTE {
+            assert!(counter.check_and_record());
+        }
+        assert!(!counter.check_and_record()); // 11th should fail
+    }
+
+    #[test]
+    fn test_syncs_rate_at_production_limit() {
+        let mut counter = RateCounter::new(
+            Duration::from_secs(60),
+            SYNCS_PER_PEER_PER_MINUTE,
+        );
+        for _ in 0..SYNCS_PER_PEER_PER_MINUTE {
+            assert!(counter.check_and_record());
+        }
+        assert!(!counter.check_and_record()); // 7th should fail
+    }
+
+    #[test]
+    fn test_peer_shares_rate_at_production_limit() {
+        let mut counter = RateCounter::new(
+            Duration::from_secs(60),
+            PEER_SHARES_PER_PEER_PER_MINUTE,
+        );
+        for _ in 0..PEER_SHARES_PER_PEER_PER_MINUTE {
+            assert!(counter.check_and_record());
+        }
+        assert!(!counter.check_and_record()); // 3rd should fail
+    }
+
+    // PeerRateLimiter: breach window resets
+    #[test]
+    fn test_peer_rate_limiter_uses_production_limits() {
+        let limiter = PeerRateLimiter::new();
+        // Verify limits match spec §9.2
+        assert_eq!(limiter.writes.max_count, WRITES_PER_PEER_PER_MINUTE);
+        assert_eq!(limiter.syncs.max_count, SYNCS_PER_PEER_PER_MINUTE);
+        assert_eq!(limiter.peer_shares.max_count, PEER_SHARES_PER_PEER_PER_MINUTE);
+    }
+
+    // T5-02: Connection tracker at zero
+    #[test]
+    fn test_connection_tracker_empty() {
+        let tracker = ConnectionTracker::new();
+        assert_eq!(tracker.total(), 0);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(tracker.would_allow(ip));
+    }
+
+    // Remove more than added (underflow protection)
+    #[test]
+    fn test_connection_tracker_remove_underflow() {
+        let mut tracker = ConnectionTracker::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        tracker.remove(ip); // Remove without adding
+        assert_eq!(tracker.total(), 0);
+    }
 }

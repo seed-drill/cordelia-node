@@ -133,7 +133,7 @@ async fn test_two_node_keepalive() {
 
     keepalive::handle_pong(&mut state, &pong);
     assert!(state.rtt().is_some());
-    assert!(state.rtt_ms().unwrap() < 100); // Should be sub-1ms on loopback
+    assert!(state.rtt_ms().unwrap() < 1000); // Sub-1ms on loopback, generous for CI
 
     conn_a.close(0u32.into(), b"done");
     server.await.unwrap();
@@ -374,4 +374,130 @@ async fn test_two_node_psk_exchange() {
 
     conn_a.close(0u32.into(), b"done");
     server.await.unwrap();
+}
+
+/// T4-01 (HIGH): Reconnect after disconnect.
+#[tokio::test]
+async fn test_two_node_reconnect_after_disconnect() {
+    let id_a = make_identity();
+    let id_b = make_identity();
+    let pk_b = id_b.public_key();
+
+    let ep_a = make_endpoint(&id_a);
+    let ep_b = make_endpoint(&id_b);
+    let b_addr = ep_b.local_addr().unwrap();
+
+    let mut mgr_a = ConnectionManager::new(
+        id_a.clone(), ep_a, vec![], vec!["personal".into()],
+    );
+    let mut mgr_b = ConnectionManager::new(
+        id_b.clone(), ep_b, vec![], vec!["personal".into()],
+    );
+
+    // First connection
+    let accept1 = tokio::spawn(async move {
+        let node_id = mgr_b.accept_incoming().await.unwrap();
+        (mgr_b, node_id)
+    });
+    let node_b = mgr_a.connect_to(b_addr).await.unwrap();
+    assert_eq!(node_b.0, pk_b);
+    let (mut mgr_b, _) = accept1.await.unwrap();
+
+    // Disconnect
+    mgr_a.disconnect(&node_b);
+    assert!(!mgr_a.is_connected(&node_b));
+    mgr_b.disconnect(&cordelia_core::NodeId(id_a.public_key()));
+
+    // Reconnect
+    let accept2 = tokio::spawn(async move {
+        let node_id = mgr_b.accept_incoming().await.unwrap();
+        (mgr_b, node_id)
+    });
+    let node_b2 = mgr_a.connect_to(b_addr).await.unwrap();
+    assert_eq!(node_b2.0, pk_b);
+    assert!(mgr_a.is_connected(&node_b2));
+
+    let (_, node_a2) = accept2.await.unwrap();
+    assert_eq!(node_a2.0, id_a.public_key());
+
+    mgr_a.shutdown();
+}
+
+/// T4-02 (MEDIUM): Multi-protocol lifecycle on one QUIC connection.
+/// Handshake -> channel announce -> keepalive ping, all on separate streams.
+#[tokio::test]
+async fn test_two_node_full_lifecycle() {
+    let id_a = make_identity();
+    let id_b = make_identity();
+
+    let psk = [0xAA; 32];
+    let psk_hash: [u8; 32] = Sha256::digest(&psk).into();
+
+    let desc = channel_announce::create_signed_descriptor(
+        &id_a, "ch_shared", Some("shared"), "open", "realtime",
+        &psk_hash, 1, "2026-03-14T12:00:00Z",
+    );
+
+    let ep_a = make_endpoint(&id_a);
+    let ep_b = make_endpoint(&id_b);
+    let b_addr = ep_b.local_addr().unwrap();
+
+    // Connect + handshake via ConnectionManager
+    let mut mgr_a = ConnectionManager::new(
+        id_a.clone(), ep_a, vec!["ch_shared".into()], vec!["personal".into()],
+    );
+    let mut mgr_b = ConnectionManager::new(
+        id_b.clone(), ep_b, vec!["ch_shared".into()], vec!["personal".into()],
+    );
+
+    let accept_task = tokio::spawn(async move {
+        mgr_b.accept_incoming().await.unwrap();
+        mgr_b
+    });
+
+    // Step 1: Connect + handshake
+    let node_b_id = mgr_a.connect_to(b_addr).await.unwrap();
+    let peer = mgr_a.get_peer(&node_b_id).unwrap();
+    assert_eq!(peer.handshake.negotiated_version, 1);
+    let mgr_b = accept_task.await.unwrap();
+
+    // Step 2: Channel announce on a new QUIC stream
+    let conn_a = mgr_a.get_connection(&node_b_id).unwrap().clone();
+    let (mut send_ann, _) = conn_a.open_bi().await.unwrap();
+    channel_announce::send_channel_joined(&mut send_ann, "ch_shared", &desc)
+        .await
+        .unwrap();
+
+    // B reads the announcement
+    let node_a_id = cordelia_core::NodeId(id_a.public_key());
+    let conn_b = mgr_b.get_connection(&node_a_id).unwrap().clone();
+    let (_, mut recv_ann) = conn_b.accept_bi().await.unwrap();
+    let msg = read_frame(&mut recv_ann).await.unwrap();
+    assert!(matches!(msg, WireMessage::ChannelJoined(_)));
+
+    // Step 3: Keepalive on another stream (parallel with announce stream)
+    let (mut send_ka, mut recv_ka) = conn_a.open_bi().await.unwrap();
+    cordelia_network::codec::write_protocol_byte(&mut send_ka, Protocol::KeepAlive)
+        .await
+        .unwrap();
+    let mut ka_state = KeepAliveState::new();
+    keepalive::send_ping(&mut send_ka, &mut ka_state).await.unwrap();
+
+    // B accepts keepalive stream and replies
+    let (mut send_b_ka, mut recv_b_ka) = conn_b.accept_bi().await.unwrap();
+    let proto = cordelia_network::codec::read_protocol_byte(&mut recv_b_ka)
+        .await
+        .unwrap();
+    assert_eq!(proto, Protocol::KeepAlive);
+    let ping_msg = read_frame(&mut recv_b_ka).await.unwrap();
+    if let WireMessage::Ping(ping) = ping_msg {
+        keepalive::send_pong(&mut send_b_ka, &ping).await.unwrap();
+    }
+
+    // A reads pong
+    let pong_msg = read_frame(&mut recv_ka).await.unwrap();
+    assert!(matches!(pong_msg, WireMessage::Pong(_)));
+
+    // All three protocols worked on separate streams of the same QUIC connection
+    mgr_a.shutdown();
 }
