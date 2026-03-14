@@ -7,7 +7,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.3
 
-use crate::codec::{read_frame, write_frame, write_protocol_byte, read_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
 use crate::messages::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

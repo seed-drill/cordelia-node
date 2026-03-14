@@ -6,7 +6,7 @@
 //!
 //! Spec: seed-drill/specs/ecies-envelope-encryption.md §4
 
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf::{self, KeyType};
 use ring::rand::{SecureRandom, SystemRandom};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -175,8 +175,8 @@ pub fn ecies_decrypt(
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
 
-    let unbound = UnboundKey::new(&AES_256_GCM, &wrapping_key)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let unbound =
+        UnboundKey::new(&AES_256_GCM, &wrapping_key).map_err(|_| CryptoError::DecryptionFailed)?;
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::try_assume_unique_for_key(&envelope.iv)
         .map_err(|_| CryptoError::DecryptionFailed)?;
@@ -199,12 +199,11 @@ mod tests {
 
     #[test]
     fn test_hkdf_sha256_tv() {
-        let shared_secret: [u8; 32] = hex::decode(
-            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let shared_secret: [u8; 32] =
+            hex::decode("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+                .unwrap()
+                .try_into()
+                .unwrap();
 
         let okm = hkdf_sha256(&shared_secret, &[], HKDF_INFO).unwrap();
 

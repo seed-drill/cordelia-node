@@ -235,7 +235,10 @@ mod tests {
              VALUES ('test', 'named', 'realtime', 'invalid_access', X'00', '2026-01-01', '2026-01-01')",
             [],
         );
-        assert!(result.is_err(), "access CHECK should reject 'invalid_access'");
+        assert!(
+            result.is_err(),
+            "access CHECK should reject 'invalid_access'"
+        );
     }
 
     // T3-1: role CHECK constraint

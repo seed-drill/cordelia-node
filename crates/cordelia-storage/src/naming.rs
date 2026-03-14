@@ -171,12 +171,18 @@ mod tests {
 
     #[test]
     fn test_canonicalize_no_change() {
-        assert_eq!(canonicalize("research-findings").unwrap(), "research-findings");
+        assert_eq!(
+            canonicalize("research-findings").unwrap(),
+            "research-findings"
+        );
     }
 
     #[test]
     fn test_canonicalize_lowercase() {
-        assert_eq!(canonicalize("Research-Findings").unwrap(), "research-findings");
+        assert_eq!(
+            canonicalize("Research-Findings").unwrap(),
+            "research-findings"
+        );
     }
 
     #[test]
@@ -299,7 +305,10 @@ mod tests {
         pk_b.copy_from_slice(&bob);
 
         let id = dm_channel_id(&pk_a, &pk_b);
-        assert_eq!(id, "dm_c56ea36e17c1c3dba0524822fb0ac3dc16ff442dd3c792f5a2989a0a77a30cd0");
+        assert_eq!(
+            id,
+            "dm_c56ea36e17c1c3dba0524822fb0ac3dc16ff442dd3c792f5a2989a0a77a30cd0"
+        );
 
         // Symmetric: dm(a,b) == dm(b,a)
         let id_reverse = dm_channel_id(&pk_b, &pk_a);
@@ -336,7 +345,9 @@ mod tests {
     #[test]
     fn test_channel_type_named() {
         assert_eq!(
-            ChannelType::from_id("fe028fdaf943c16ec8a1fc496818274ce7e86e921ad926f9712886fa26d309d6"),
+            ChannelType::from_id(
+                "fe028fdaf943c16ec8a1fc496818274ce7e86e921ad926f9712886fa26d309d6"
+            ),
             ChannelType::Named
         );
     }
@@ -344,7 +355,9 @@ mod tests {
     #[test]
     fn test_channel_type_dm() {
         assert_eq!(
-            ChannelType::from_id("dm_c56ea36e17c1c3dba0524822fb0ac3dc16ff442dd3c792f5a2989a0a77a30cd0"),
+            ChannelType::from_id(
+                "dm_c56ea36e17c1c3dba0524822fb0ac3dc16ff442dd3c792f5a2989a0a77a30cd0"
+            ),
             ChannelType::Dm
         );
     }

@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/ecies-envelope-encryption.md §5
 
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::CryptoError;
@@ -52,11 +52,9 @@ pub fn item_decrypt(psk: &[u8; 32], encrypted: &[u8], aad: &[u8]) -> Result<Vec<
     let iv = &encrypted[..IV_LEN];
     let ct_and_tag = &encrypted[IV_LEN..];
 
-    let unbound =
-        UnboundKey::new(&AES_256_GCM, psk).map_err(|_| CryptoError::DecryptionFailed)?;
+    let unbound = UnboundKey::new(&AES_256_GCM, psk).map_err(|_| CryptoError::DecryptionFailed)?;
     let key = LessSafeKey::new(unbound);
-    let nonce =
-        Nonce::try_assume_unique_for_key(iv).map_err(|_| CryptoError::DecryptionFailed)?;
+    let nonce = Nonce::try_assume_unique_for_key(iv).map_err(|_| CryptoError::DecryptionFailed)?;
 
     let mut in_out = ct_and_tag.to_vec();
     let plaintext = key

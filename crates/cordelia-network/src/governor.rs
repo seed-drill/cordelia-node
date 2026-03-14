@@ -321,8 +321,8 @@ impl Governor {
         if disconnect_count == 0 {
             return Duration::ZERO;
         }
-        let secs = DEFAULT_BACKOFF_BASE
-            .saturating_mul(1u64 << disconnect_count.min(BACKOFF_SATURATION));
+        let secs =
+            DEFAULT_BACKOFF_BASE.saturating_mul(1u64 << disconnect_count.min(BACKOFF_SATURATION));
         Duration::from_secs(secs.min(DEFAULT_BACKOFF_MAX))
     }
 
@@ -487,7 +487,10 @@ impl Governor {
         let dead_ids: Vec<NodeId> = self
             .peers
             .values()
-            .filter(|p| p.state.is_active() && now.duration_since(p.last_activity) > self.timeouts.dead_timeout)
+            .filter(|p| {
+                p.state.is_active()
+                    && now.duration_since(p.last_activity) > self.timeouts.dead_timeout
+            })
             .map(|p| p.node_id.clone())
             .collect();
 
@@ -600,9 +603,7 @@ impl Governor {
                         );
                         peer.state = PeerState::Hot;
                         peer.disconnect_count = 0;
-                        actions
-                            .transitions
-                            .push((id, "warm".into(), "hot".into()));
+                        actions.transitions.push((id, "warm".into(), "hot".into()));
                     }
                 }
             }
@@ -633,9 +634,7 @@ impl Governor {
                 );
                 peer.state = PeerState::Hot;
                 peer.disconnect_count = 0;
-                actions
-                    .transitions
-                    .push((id, "warm".into(), "hot".into()));
+                actions.transitions.push((id, "warm".into(), "hot".into()));
             }
         }
     }
@@ -672,17 +671,13 @@ impl Governor {
                     "gov: hot -> warm (excess demotion)"
                 );
                 peer.state = PeerState::Warm;
-                actions
-                    .transitions
-                    .push((id, "hot".into(), "warm".into()));
+                actions.transitions.push((id, "hot".into(), "warm".into()));
             }
         }
     }
 
     fn churn(&mut self, actions: &mut GovernorActions) {
-        if self.last_churn.elapsed()
-            < Duration::from_secs(self.targets.churn_interval_secs)
-        {
+        if self.last_churn.elapsed() < Duration::from_secs(self.targets.churn_interval_secs) {
             return;
         }
         self.last_churn = Instant::now();
@@ -841,10 +836,7 @@ mod tests {
 
     #[test]
     fn test_hot_peers_for_group() {
-        let mut gov = Governor::new(
-            GovernorTargets::default(),
-            vec!["g1".into(), "g2".into()],
-        );
+        let mut gov = Governor::new(GovernorTargets::default(), vec!["g1".into(), "g2".into()]);
 
         let id1 = make_node_id(1);
         let id2 = make_node_id(2);
@@ -1020,8 +1012,7 @@ mod tests {
         gov.peers.get_mut(&id1).unwrap().state = PeerState::Hot;
 
         // Simulate dead timeout on peer 0
-        gov.peers.get_mut(&id0).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(100);
+        gov.peers.get_mut(&id0).unwrap().last_activity = Instant::now() - Duration::from_secs(100);
 
         let actions = gov.tick();
         let peer0 = gov.peer_info(&id0).unwrap();
@@ -1044,8 +1035,7 @@ mod tests {
             warm_min: 5,
             ..Default::default()
         };
-        let mut gov =
-            Governor::with_dial_policy(targets, vec!["g1".into()], DialPolicy::All);
+        let mut gov = Governor::with_dial_policy(targets, vec!["g1".into()], DialPolicy::All);
 
         let relay_id = make_node_id(1);
         let personal_id = make_node_id(2);
@@ -1064,11 +1054,8 @@ mod tests {
             warm_min: 5,
             ..Default::default()
         };
-        let mut gov = Governor::with_dial_policy(
-            targets,
-            vec!["g1".into()],
-            DialPolicy::RelaysOnly,
-        );
+        let mut gov =
+            Governor::with_dial_policy(targets, vec!["g1".into()], DialPolicy::RelaysOnly);
 
         let relay_id = make_node_id(1);
         let personal_id = make_node_id(2);
@@ -1119,8 +1106,7 @@ mod tests {
         gov.mark_connected(&real_id);
         assert_eq!(*gov.peer_state(&real_id).unwrap(), PeerState::Warm);
 
-        let replaced =
-            gov.replace_node_id(&placeholder_id, real_id.clone(), vec!["g1".into()]);
+        let replaced = gov.replace_node_id(&placeholder_id, real_id.clone(), vec!["g1".into()]);
         assert!(replaced);
 
         let peer = gov.peer_info(&real_id).unwrap();

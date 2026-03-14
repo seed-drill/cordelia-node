@@ -3,8 +3,8 @@
 use rusqlite::Connection;
 use std::path::Path;
 
-use crate::schema;
 use crate::StorageError;
+use crate::schema;
 
 /// Open (or create) the Cordelia database and run migrations.
 pub fn open(path: &Path) -> Result<Connection, StorageError> {

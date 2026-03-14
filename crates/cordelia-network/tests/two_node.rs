@@ -6,9 +6,7 @@
 //! Spec: seed-drill/specs/network-protocol.md §2-§4
 
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_network::channel_announce::{
-    self, ChannelAnnounceState, create_signed_descriptor,
-};
+use cordelia_network::channel_announce::{self, ChannelAnnounceState, create_signed_descriptor};
 use cordelia_network::codec::read_frame;
 use cordelia_network::connection::ConnectionManager;
 use cordelia_network::item_sync;
@@ -387,12 +385,10 @@ async fn test_two_node_reconnect_after_disconnect() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-    );
+    let mut mgr_a =
+        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+    let mut mgr_b =
+        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
     // First connection
     let accept1 = tokio::spawn(async move {
@@ -434,8 +430,14 @@ async fn test_two_node_full_lifecycle() {
     let psk_hash: [u8; 32] = Sha256::digest(&psk).into();
 
     let desc = channel_announce::create_signed_descriptor(
-        &id_a, "ch_shared", Some("shared"), "open", "realtime",
-        &psk_hash, 1, "2026-03-14T12:00:00Z",
+        &id_a,
+        "ch_shared",
+        Some("shared"),
+        "open",
+        "realtime",
+        &psk_hash,
+        1,
+        "2026-03-14T12:00:00Z",
     );
 
     let ep_a = make_endpoint(&id_a);
@@ -444,10 +446,18 @@ async fn test_two_node_full_lifecycle() {
 
     // Connect + handshake via ConnectionManager
     let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec!["ch_shared".into()], vec!["personal".into()], 9474,
+        id_a.clone(),
+        ep_a,
+        vec!["ch_shared".into()],
+        vec!["personal".into()],
+        9474,
     );
     let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec!["ch_shared".into()], vec!["personal".into()], 9474,
+        id_b.clone(),
+        ep_b,
+        vec!["ch_shared".into()],
+        vec!["personal".into()],
+        9474,
     );
 
     let accept_task = tokio::spawn(async move {
@@ -481,7 +491,9 @@ async fn test_two_node_full_lifecycle() {
         .await
         .unwrap();
     let mut ka_state = KeepAliveState::new();
-    keepalive::send_ping(&mut send_ka, &mut ka_state).await.unwrap();
+    keepalive::send_ping(&mut send_ka, &mut ka_state)
+        .await
+        .unwrap();
 
     // B accepts keepalive stream and replies
     let (mut send_b_ka, mut recv_b_ka) = conn_b.accept_bi().await.unwrap();

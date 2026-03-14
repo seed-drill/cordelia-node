@@ -333,10 +333,7 @@ mod tests {
     // T5-01 (HIGH): Test at actual production limit values
     #[test]
     fn test_writes_rate_at_production_limit() {
-        let mut counter = RateCounter::new(
-            Duration::from_secs(60),
-            WRITES_PER_PEER_PER_MINUTE,
-        );
+        let mut counter = RateCounter::new(Duration::from_secs(60), WRITES_PER_PEER_PER_MINUTE);
         for _ in 0..WRITES_PER_PEER_PER_MINUTE {
             assert!(counter.check_and_record());
         }
@@ -345,10 +342,7 @@ mod tests {
 
     #[test]
     fn test_syncs_rate_at_production_limit() {
-        let mut counter = RateCounter::new(
-            Duration::from_secs(60),
-            SYNCS_PER_PEER_PER_MINUTE,
-        );
+        let mut counter = RateCounter::new(Duration::from_secs(60), SYNCS_PER_PEER_PER_MINUTE);
         for _ in 0..SYNCS_PER_PEER_PER_MINUTE {
             assert!(counter.check_and_record());
         }
@@ -357,10 +351,8 @@ mod tests {
 
     #[test]
     fn test_peer_shares_rate_at_production_limit() {
-        let mut counter = RateCounter::new(
-            Duration::from_secs(60),
-            PEER_SHARES_PER_PEER_PER_MINUTE,
-        );
+        let mut counter =
+            RateCounter::new(Duration::from_secs(60), PEER_SHARES_PER_PEER_PER_MINUTE);
         for _ in 0..PEER_SHARES_PER_PEER_PER_MINUTE {
             assert!(counter.check_and_record());
         }
@@ -374,7 +366,10 @@ mod tests {
         // Verify limits match spec §9.2
         assert_eq!(limiter.writes.max_count, WRITES_PER_PEER_PER_MINUTE);
         assert_eq!(limiter.syncs.max_count, SYNCS_PER_PEER_PER_MINUTE);
-        assert_eq!(limiter.peer_shares.max_count, PEER_SHARES_PER_PEER_PER_MINUTE);
+        assert_eq!(
+            limiter.peer_shares.max_count,
+            PEER_SHARES_PER_PEER_PER_MINUTE
+        );
     }
 
     // T5-02: Connection tracker at zero

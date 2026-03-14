@@ -6,8 +6,8 @@
 //!
 //! Spec: seed-drill/specs/ecies-envelope-encryption.md §11
 
-use crate::identity::NodeIdentity;
 use crate::CryptoError;
+use crate::identity::NodeIdentity;
 
 /// Sign a CBOR-encoded payload with the node's Ed25519 key.
 ///
@@ -19,11 +19,7 @@ pub fn sign_cbor(identity: &NodeIdentity, cbor_payload: &[u8]) -> [u8; 64] {
 }
 
 /// Verify a CBOR payload signature against a public key.
-pub fn verify_cbor(
-    public_key: &[u8; 32],
-    cbor_payload: &[u8],
-    signature: &[u8; 64],
-) -> bool {
+pub fn verify_cbor(public_key: &[u8; 32], cbor_payload: &[u8], signature: &[u8; 64]) -> bool {
     crate::identity::verify_signature(public_key, cbor_payload, signature)
 }
 
@@ -36,7 +32,9 @@ pub fn verify_cbor(
 /// Fields for item metadata envelope (ECIES spec §11.7):
 ///   author_id, channel_id, content_hash, is_tombstone,
 ///   item_id, key_version, published_at
-pub fn encode_metadata_envelope(fields: &[(&str, ciborium::Value)]) -> Result<Vec<u8>, CryptoError> {
+pub fn encode_metadata_envelope(
+    fields: &[(&str, ciborium::Value)],
+) -> Result<Vec<u8>, CryptoError> {
     // Sort keys per RFC 8949 §4.2.1: by encoded byte length, then lexicographic
     let mut sorted: Vec<_> = fields.iter().collect();
     sorted.sort_by(|a, b| {
@@ -78,10 +76,7 @@ pub fn build_item_metadata_envelope(
         ),
         ("is_tombstone", ciborium::Value::Bool(is_tombstone)),
         ("item_id", ciborium::Value::Text(item_id.into())),
-        (
-            "key_version",
-            ciborium::Value::Integer(key_version.into()),
-        ),
+        ("key_version", ciborium::Value::Integer(key_version.into())),
         ("published_at", ciborium::Value::Text(published_at.into())),
     ];
     encode_metadata_envelope(&fields)
@@ -135,7 +130,10 @@ mod tests {
     fn test_key_sort_order() {
         // RFC 8949 §4.2.1: shorter keys first, then lexicographic
         let fields = [
-            ("published_at", ciborium::Value::Text("2026-03-12T00:00:00Z".into())),
+            (
+                "published_at",
+                ciborium::Value::Text("2026-03-12T00:00:00Z".into()),
+            ),
             ("item_id", ciborium::Value::Text("ci_test".into())),
             ("author_id", ciborium::Value::Bytes(vec![0u8; 32])),
             ("channel_id", ciborium::Value::Text("abc".into())),
@@ -147,8 +145,7 @@ mod tests {
         let cbor = encode_metadata_envelope(&fields).unwrap();
 
         // Decode and verify key order
-        let decoded: ciborium::Value =
-            ciborium::from_reader(cbor.as_slice()).unwrap();
+        let decoded: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
         if let ciborium::Value::Map(entries) = decoded {
             let keys: Vec<String> = entries
                 .iter()
@@ -188,12 +185,12 @@ mod tests {
     /// Cross-language: TypeScript (cbor-x) must produce identical bytes.
     #[test]
     fn test_tv_c1_item_metadata_envelope() {
-        let author_id = hex::decode(
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
-        ).unwrap();
-        let content_hash = hex::decode(
-            "355e3caf62b8121affe7a3ae801b20d586968a64e231cde1c0ed7714d4c31184",
-        ).unwrap();
+        let author_id =
+            hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+                .unwrap();
+        let content_hash =
+            hex::decode("355e3caf62b8121affe7a3ae801b20d586968a64e231cde1c0ed7714d4c31184")
+                .unwrap();
 
         let cbor = build_item_metadata_envelope(
             &author_id.try_into().unwrap(),
@@ -203,7 +200,8 @@ mod tests {
             "ci_a1b2c3d4e5f6",
             1,
             "2026-03-10T19:36:00Z",
-        ).unwrap();
+        )
+        .unwrap();
 
         let expected = concat!(
             "a7676974656d5f69646f63695f613162326333643465356636",

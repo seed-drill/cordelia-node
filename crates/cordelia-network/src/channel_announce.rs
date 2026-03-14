@@ -209,7 +209,9 @@ pub fn handle_channel_joined(
     state.recompute_intersection(our_channels);
 
     debug!(channel = %joined.channel_id, "peer joined channel");
-    Ok(ChannelAnnounceAction::ChannelAdded(joined.channel_id.clone()))
+    Ok(ChannelAnnounceAction::ChannelAdded(
+        joined.channel_id.clone(),
+    ))
 }
 
 /// Process a ChannelLeft message.
@@ -225,10 +227,7 @@ pub fn handle_channel_left(
 }
 
 /// Process a ChannelStateHash -- check if it matches what we expect.
-pub fn check_state_hash(
-    state: &ChannelAnnounceState,
-    hash: &ChannelStateHash,
-) -> bool {
+pub fn check_state_hash(state: &ChannelAnnounceState, hash: &ChannelStateHash) -> bool {
     let peer_ids: Vec<String> = state.peer_channels.keys().cloned().collect();
     let expected_digest = compute_channel_digest(&peer_ids);
     let expected_count = peer_ids.len() as u16;
@@ -437,8 +436,8 @@ mod tests {
             descriptor: desc,
         };
 
-        let action = handle_channel_joined(&mut state, &joined, &our_channels, &HashMap::new())
-            .unwrap();
+        let action =
+            handle_channel_joined(&mut state, &joined, &our_channels, &HashMap::new()).unwrap();
         assert!(matches!(action, ChannelAnnounceAction::ChannelAdded(_)));
         assert_eq!(state.peer_channels.len(), 1);
         assert_eq!(state.shared_channels, vec!["test_channel_abc123"]);

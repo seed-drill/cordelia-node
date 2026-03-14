@@ -7,7 +7,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.1
 
-use crate::codec::{read_frame, write_frame, write_protocol_byte, read_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
 use crate::messages::*;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,9 +125,7 @@ pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     // Read accept
     let response = read_frame(stream).await?;
     match response {
-        WireMessage::HandshakeAccept(accept) => {
-            validate_accept(&accept, tls_peer_node_id)
-        }
+        WireMessage::HandshakeAccept(accept) => validate_accept(&accept, tls_peer_node_id),
         _ => Err(HandshakeError::UnexpectedMessage),
     }
 }
@@ -212,7 +210,10 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     })
 }
 
-fn validate_propose(propose: &HandshakePropose, tls_peer_node_id: &[u8; 32]) -> Result<(), HandshakeError> {
+fn validate_propose(
+    propose: &HandshakePropose,
+    tls_peer_node_id: &[u8; 32],
+) -> Result<(), HandshakeError> {
     // Magic check (§4.1.3)
     if propose.magic != HANDSHAKE_MAGIC {
         return Err(HandshakeError::InvalidMagic(propose.magic));
@@ -242,7 +243,10 @@ fn validate_propose(propose: &HandshakePropose, tls_peer_node_id: &[u8; 32]) -> 
     Ok(())
 }
 
-fn validate_accept(accept: &HandshakeAccept, tls_peer_node_id: &[u8; 32]) -> Result<HandshakeResult, HandshakeError> {
+fn validate_accept(
+    accept: &HandshakeAccept,
+    tls_peer_node_id: &[u8; 32],
+) -> Result<HandshakeResult, HandshakeError> {
     // Check for rejection
     if accept.version == 0 {
         return Err(HandshakeError::Rejected(
@@ -339,9 +343,10 @@ mod tests {
             }
         });
 
-        let client_result = initiate_handshake(
-            &mut client, &node_a, &channels_a, &roles, &node_b, 9474,
-        ).await.unwrap();
+        let client_result =
+            initiate_handshake(&mut client, &node_a, &channels_a, &roles, &node_b, 9474)
+                .await
+                .unwrap();
 
         assert_eq!(client_result.peer_node_id, node_b);
         assert_eq!(client_result.negotiated_version, PROTOCOL_VERSION);
@@ -369,7 +374,9 @@ mod tests {
             accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
-        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        write_protocol_byte(&mut client, Protocol::Handshake)
+            .await
+            .unwrap();
         let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
             magic: 0xDEADBEEF,
             version_min: 1,
@@ -429,7 +436,9 @@ mod tests {
             accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
-        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        write_protocol_byte(&mut client, Protocol::Handshake)
+            .await
+            .unwrap();
         let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
             magic: HANDSHAKE_MAGIC,
             version_min: 1,
@@ -471,7 +480,9 @@ mod tests {
             accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
-        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        write_protocol_byte(&mut client, Protocol::Handshake)
+            .await
+            .unwrap();
         let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
             magic: HANDSHAKE_MAGIC,
             version_min: 1,
@@ -502,7 +513,9 @@ mod tests {
             accept_handshake(&mut server, &node_b, &[], &[], &node_a, 9474).await
         });
 
-        write_protocol_byte(&mut client, Protocol::Handshake).await.unwrap();
+        write_protocol_byte(&mut client, Protocol::Handshake)
+            .await
+            .unwrap();
         let bad_propose = WireMessage::HandshakePropose(HandshakePropose {
             magic: HANDSHAKE_MAGIC,
             version_min: 99,
@@ -520,13 +533,19 @@ mod tests {
         match response {
             WireMessage::HandshakeAccept(a) => {
                 assert_eq!(a.version, 0);
-                assert_eq!(a.reject_reason.as_deref(), Some("incompatible version range"));
+                assert_eq!(
+                    a.reject_reason.as_deref(),
+                    Some("incompatible version range")
+                );
             }
             _ => panic!("expected HandshakeAccept rejection"),
         }
 
         let server_err = server_task.await.unwrap();
-        assert!(matches!(server_err, Err(HandshakeError::IncompatibleVersion)));
+        assert!(matches!(
+            server_err,
+            Err(HandshakeError::IncompatibleVersion)
+        ));
     }
 
     // T2-03 (LOW): Channel digest known vector

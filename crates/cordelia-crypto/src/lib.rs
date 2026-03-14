@@ -13,8 +13,8 @@ pub mod signing;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};
-pub use ecies::{ecies_decrypt, ecies_encrypt, hkdf_sha256, EciesEnvelope};
-pub use identity::{x25519_from_ed25519_seed, NodeIdentity};
+pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256};
+pub use identity::{NodeIdentity, x25519_from_ed25519_seed};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};

@@ -173,7 +173,7 @@ fn seed_to_pkcs8(seed: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
 
 /// Verify an Ed25519 signature against a public key.
 pub fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-    use ring::signature::{UnparsedPublicKey, ED25519};
+    use ring::signature::{ED25519, UnparsedPublicKey};
     let peer_pk = UnparsedPublicKey::new(&ED25519, public_key);
     peer_pk.verify(message, signature).is_ok()
 }
@@ -249,9 +249,8 @@ mod tests {
 
     #[test]
     fn test_x25519_tv1_rfc8032() {
-        let seed =
-            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-                .unwrap();
+        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .unwrap();
         let (x_priv, x_pub) = x25519_from_ed25519_seed(&seed);
 
         assert_eq!(
@@ -281,9 +280,8 @@ mod tests {
 
     #[test]
     fn test_x25519_tv3_libsodium() {
-        let seed =
-            hex::decode("421151a459faeade3d247115f94aedae42318124095afabe4d1451a559faedee")
-                .unwrap();
+        let seed = hex::decode("421151a459faeade3d247115f94aedae42318124095afabe4d1451a559faedee")
+            .unwrap();
         let (x_priv, x_pub) = x25519_from_ed25519_seed(&seed);
 
         assert_eq!(
@@ -298,9 +296,8 @@ mod tests {
 
     #[test]
     fn test_x25519_tv4_ed2curve_js() {
-        let seed =
-            hex::decode("9fc9b77445f8b077c29fe27fc581c52beb668ecd25f5bb2ba5777dee2a411e97")
-                .unwrap();
+        let seed = hex::decode("9fc9b77445f8b077c29fe27fc581c52beb668ecd25f5bb2ba5777dee2a411e97")
+            .unwrap();
         let (x_priv, x_pub) = x25519_from_ed25519_seed(&seed);
 
         assert_eq!(
@@ -361,9 +358,8 @@ mod tests {
     // T1-1: Known test vector (TV1 from spec)
     #[test]
     fn test_x25519_pub_from_ed25519_pub_tv1() {
-        let seed =
-            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-                .unwrap();
+        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .unwrap();
         let id = NodeIdentity::from_seed(seed.try_into().unwrap()).unwrap();
         let ed_pk = id.public_key();
         let x_pub = x25519_pub_from_ed25519_pub(&ed_pk);

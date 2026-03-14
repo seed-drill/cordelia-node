@@ -2,7 +2,7 @@
 //!
 //! Spec: seed-drill/specs/search-indexing.md §2-§4
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 
@@ -371,7 +371,10 @@ mod tests {
         let text = extract_text(&content, None, "memory:learning");
         assert_eq!(text.name, "Vector search patterns");
         assert_eq!(text.summary, "How to use sqlite-vec");
-        assert_eq!(text.content_text, "Full content about vector search techniques");
+        assert_eq!(
+            text.content_text,
+            "Full content about vector search techniques"
+        );
         assert_eq!(text.tags_text, "search vectors");
     }
 
@@ -423,7 +426,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_too_many_terms() {
-        let many = (0..21).map(|i| format!("term{i}")).collect::<Vec<_>>().join(" ");
+        let many = (0..21)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(sanitize_query(&many).is_err());
     }
 
@@ -465,7 +471,15 @@ mod tests {
             content_text: "Full-text search with BM25 ranking".into(),
             tags_text: "search vectors".into(),
         };
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text1).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text1,
+        )
+        .unwrap();
 
         let text2 = SearchableText {
             name: "Encryption patterns".into(),
@@ -473,7 +487,15 @@ mod tests {
             content_text: "How to encrypt data with AES-256-GCM".into(),
             tags_text: "crypto encryption".into(),
         };
-        index_item(&conn, "ci_002", "ch1", "message", "2026-01-01T00:02:00Z", &text2).unwrap();
+        index_item(
+            &conn,
+            "ci_002",
+            "ch1",
+            "message",
+            "2026-01-01T00:02:00Z",
+            &text2,
+        )
+        .unwrap();
 
         // Search for "search"
         let results = search_fts(&conn, "ch1", "search", 10, None, None).unwrap();
@@ -493,7 +515,15 @@ mod tests {
             content_text: "World".into(),
             tags_text: "".into(),
         };
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
 
         let results = search_fts(&conn, "ch1", "nonexistent", 10, None, None).unwrap();
         assert!(results.is_empty());
@@ -517,8 +547,24 @@ mod tests {
             tags_text: "".into(),
         };
 
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text).unwrap();
-        index_item(&conn, "ci_002", "ch2", "message", "2026-01-01T00:01:00Z", &text).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
+        index_item(
+            &conn,
+            "ci_002",
+            "ch2",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
 
         // Search ch1 only
         let results = search_fts(&conn, "ch1", "searchable", 10, None, None).unwrap();
@@ -536,7 +582,15 @@ mod tests {
             content_text: "findable content".into(),
             tags_text: "".into(),
         };
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
 
         // Tombstone it
         tombstone_search(&conn, "ci_001").unwrap();
@@ -556,8 +610,24 @@ mod tests {
             tags_text: "".into(),
         };
 
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text).unwrap();
-        index_item(&conn, "ci_002", "ch1", "event", "2026-01-01T00:02:00Z", &text).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
+        index_item(
+            &conn,
+            "ci_002",
+            "ch1",
+            "event",
+            "2026-01-01T00:02:00Z",
+            &text,
+        )
+        .unwrap();
 
         let types = vec!["event".to_string()];
         let results = search_fts(&conn, "ch1", "searchable", 10, Some(&types), None).unwrap();
@@ -576,12 +646,34 @@ mod tests {
             tags_text: "".into(),
         };
 
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text).unwrap();
-        index_item(&conn, "ci_002", "ch1", "message", "2026-01-02T00:01:00Z", &text).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text,
+        )
+        .unwrap();
+        index_item(
+            &conn,
+            "ci_002",
+            "ch1",
+            "message",
+            "2026-01-02T00:01:00Z",
+            &text,
+        )
+        .unwrap();
 
         let results = search_fts(
-            &conn, "ch1", "temporal", 10, None, Some("2026-01-01T12:00:00Z"),
-        ).unwrap();
+            &conn,
+            "ch1",
+            "temporal",
+            10,
+            None,
+            Some("2026-01-01T12:00:00Z"),
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].item_id, "ci_002");
     }
@@ -597,7 +689,15 @@ mod tests {
             content_text: "search search search algorithms for search".into(),
             tags_text: "search".into(),
         };
-        index_item(&conn, "ci_001", "ch1", "message", "2026-01-01T00:01:00Z", &text1).unwrap();
+        index_item(
+            &conn,
+            "ci_001",
+            "ch1",
+            "message",
+            "2026-01-01T00:01:00Z",
+            &text1,
+        )
+        .unwrap();
 
         // Item with fewer mentions
         let text2 = SearchableText {
@@ -606,7 +706,15 @@ mod tests {
             content_text: "a brief mention of search".into(),
             tags_text: "".into(),
         };
-        index_item(&conn, "ci_002", "ch1", "message", "2026-01-01T00:02:00Z", &text2).unwrap();
+        index_item(
+            &conn,
+            "ci_002",
+            "ch1",
+            "message",
+            "2026-01-01T00:02:00Z",
+            &text2,
+        )
+        .unwrap();
 
         let results = search_fts(&conn, "ch1", "search", 10, None, None).unwrap();
         assert_eq!(results.len(), 2);

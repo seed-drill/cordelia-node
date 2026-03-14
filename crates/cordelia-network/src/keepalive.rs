@@ -140,7 +140,11 @@ pub async fn send_pong<W: AsyncWrite + Unpin>(
 /// (no ban -- clock issues are common).
 pub fn handle_pong(state: &mut KeepAliveState, pong: &Pong) -> bool {
     if pong.seq <= state.last_acked_seq {
-        tracing::debug!(seq = pong.seq, last = state.last_acked_seq, "ignoring out-of-order pong");
+        tracing::debug!(
+            seq = pong.seq,
+            last = state.last_acked_seq,
+            "ignoring out-of-order pong"
+        );
         return false;
     }
 
@@ -161,7 +165,11 @@ pub fn handle_pong(state: &mut KeepAliveState, pong: &Pong) -> bool {
 /// Returns true if the ping was accepted (seq is monotonic).
 pub fn handle_ping(state: &mut KeepAliveState, ping: &Ping) -> bool {
     if ping.seq <= state.last_peer_ping_seq {
-        tracing::debug!(seq = ping.seq, last = state.last_peer_ping_seq, "ignoring out-of-order ping");
+        tracing::debug!(
+            seq = ping.seq,
+            last = state.last_peer_ping_seq,
+            "ignoring out-of-order ping"
+        );
         return false;
     }
     state.last_peer_ping_seq = ping.seq;
@@ -216,7 +224,13 @@ mod tests {
         state.last_activity = Instant::now() - Duration::from_secs(60);
         assert!(state.idle_duration() >= Duration::from_secs(59));
 
-        assert!(handle_ping(&mut state, &Ping { seq: 1, sent_at_ns: 100 }));
+        assert!(handle_ping(
+            &mut state,
+            &Ping {
+                seq: 1,
+                sent_at_ns: 100
+            }
+        ));
         assert!(state.idle_duration() < Duration::from_secs(1));
     }
 
@@ -224,18 +238,42 @@ mod tests {
     #[test]
     fn test_ping_seq_out_of_order_ignored() {
         let mut state = KeepAliveState::new();
-        assert!(handle_ping(&mut state, &Ping { seq: 5, sent_at_ns: 100 }));
+        assert!(handle_ping(
+            &mut state,
+            &Ping {
+                seq: 5,
+                sent_at_ns: 100
+            }
+        ));
         assert_eq!(state.last_peer_ping_seq, 5);
 
         // seq 3 is out of order (< 5), should be ignored
-        assert!(!handle_ping(&mut state, &Ping { seq: 3, sent_at_ns: 200 }));
+        assert!(!handle_ping(
+            &mut state,
+            &Ping {
+                seq: 3,
+                sent_at_ns: 200
+            }
+        ));
         assert_eq!(state.last_peer_ping_seq, 5); // unchanged
 
         // seq 5 is duplicate, should be ignored
-        assert!(!handle_ping(&mut state, &Ping { seq: 5, sent_at_ns: 300 }));
+        assert!(!handle_ping(
+            &mut state,
+            &Ping {
+                seq: 5,
+                sent_at_ns: 300
+            }
+        ));
 
         // seq 6 is valid
-        assert!(handle_ping(&mut state, &Ping { seq: 6, sent_at_ns: 400 }));
+        assert!(handle_ping(
+            &mut state,
+            &Ping {
+                seq: 6,
+                sent_at_ns: 400
+            }
+        ));
         assert_eq!(state.last_peer_ping_seq, 6);
     }
 
@@ -243,16 +281,28 @@ mod tests {
     #[test]
     fn test_pong_seq_out_of_order_ignored() {
         let mut state = KeepAliveState::new();
-        let pong1 = Pong { seq: 3, sent_at_ns: now_ns() - 1_000_000, recv_at_ns: 0 };
+        let pong1 = Pong {
+            seq: 3,
+            sent_at_ns: now_ns() - 1_000_000,
+            recv_at_ns: 0,
+        };
         assert!(handle_pong(&mut state, &pong1));
         assert_eq!(state.last_acked_seq, 3);
 
         // Duplicate seq 3 ignored
-        let pong_dup = Pong { seq: 3, sent_at_ns: now_ns() - 500_000, recv_at_ns: 0 };
+        let pong_dup = Pong {
+            seq: 3,
+            sent_at_ns: now_ns() - 500_000,
+            recv_at_ns: 0,
+        };
         assert!(!handle_pong(&mut state, &pong_dup));
 
         // Old seq 1 ignored
-        let pong_old = Pong { seq: 1, sent_at_ns: now_ns() - 2_000_000, recv_at_ns: 0 };
+        let pong_old = Pong {
+            seq: 1,
+            sent_at_ns: now_ns() - 2_000_000,
+            recv_at_ns: 0,
+        };
         assert!(!handle_pong(&mut state, &pong_old));
         assert_eq!(state.last_acked_seq, 3); // unchanged
     }

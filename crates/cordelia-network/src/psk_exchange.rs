@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.7
 
-use crate::codec::{read_frame, write_frame, write_protocol_byte, read_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
 use crate::messages::*;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -47,9 +47,7 @@ pub async fn request_psk<S: AsyncRead + AsyncWrite + Unpin>(
     match resp {
         WireMessage::PskResponse(r) => {
             if r.status == "denied" {
-                Err(PskExchangeError::Denied(
-                    r.reason.unwrap_or_default(),
-                ))
+                Err(PskExchangeError::Denied(r.reason.unwrap_or_default()))
             } else {
                 Ok(r)
             }
@@ -139,11 +137,9 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            handle_psk_request(&mut server, |_ch, _xpk| {
-                psk_denied(REASON_NOT_FOUND)
-            })
-            .await
-            .unwrap()
+            handle_psk_request(&mut server, |_ch, _xpk| psk_denied(REASON_NOT_FOUND))
+                .await
+                .unwrap()
         });
 
         let xpk = [0xDD; 32];
@@ -161,11 +157,9 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            handle_psk_request(&mut server, |_ch, _xpk| {
-                psk_denied(REASON_NOT_AUTHORIZED)
-            })
-            .await
-            .unwrap()
+            handle_psk_request(&mut server, |_ch, _xpk| psk_denied(REASON_NOT_AUTHORIZED))
+                .await
+                .unwrap()
         });
 
         let xpk = [0xDD; 32];

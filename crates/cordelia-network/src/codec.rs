@@ -46,8 +46,7 @@ pub enum CodecError {
 /// Encode a WireMessage to CBOR bytes.
 pub fn encode_message(msg: &WireMessage) -> Result<Vec<u8>, CodecError> {
     let mut buf = Vec::new();
-    ciborium::into_writer(msg, &mut buf)
-        .map_err(|e| CodecError::CborEncode(e.to_string()))?;
+    ciborium::into_writer(msg, &mut buf).map_err(|e| CodecError::CborEncode(e.to_string()))?;
     Ok(buf)
 }
 
@@ -77,8 +76,7 @@ pub async fn read_protocol_byte<R: AsyncRead + Unpin>(
             CodecError::Io(e)
         }
     })?;
-    crate::messages::Protocol::from_byte(buf[0])
-        .ok_or(CodecError::UnknownProtocol(buf[0]))
+    crate::messages::Protocol::from_byte(buf[0]).ok_or(CodecError::UnknownProtocol(buf[0]))
 }
 
 /// Write a length-prefixed CBOR frame.
@@ -101,9 +99,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// Read a length-prefixed CBOR frame.
 ///
 /// Returns the decoded WireMessage.
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<WireMessage, CodecError> {
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<WireMessage, CodecError> {
     // Read 4-byte length prefix
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.map_err(|e| {
@@ -149,9 +145,7 @@ pub async fn write_raw_frame<W: AsyncWrite + Unpin>(
 
 /// Read a raw frame, returning the CBOR bytes without decoding.
 /// Useful for forwarding or deferred decoding.
-pub async fn read_raw_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Vec<u8>, CodecError> {
+pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, CodecError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -284,9 +278,7 @@ mod tests {
             is_tombstone: false,
             parent_id: None,
         };
-        let msg = WireMessage::PushPayload(PushPayload {
-            items: vec![item],
-        });
+        let msg = WireMessage::PushPayload(PushPayload { items: vec![item] });
         let encoded = encode_message(&msg).unwrap();
         let decoded = decode_message(&encoded).unwrap();
         match decoded {
@@ -341,8 +333,15 @@ mod tests {
                 reject_reason: None,
                 p2p_port: 9474,
             }),
-            WireMessage::Ping(Ping { seq: 0, sent_at_ns: 0 }),
-            WireMessage::Pong(Pong { seq: 0, sent_at_ns: 0, recv_at_ns: 0 }),
+            WireMessage::Ping(Ping {
+                seq: 0,
+                sent_at_ns: 0,
+            }),
+            WireMessage::Pong(Pong {
+                seq: 0,
+                sent_at_ns: 0,
+                recv_at_ns: 0,
+            }),
             WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 }),
             WireMessage::PeerShareResponse(PeerShareResponse { peers: vec![] }),
             WireMessage::ChannelJoined(ChannelJoined {
@@ -359,7 +358,9 @@ mod tests {
                     signature: vec![0; 64],
                 },
             }),
-            WireMessage::ChannelLeft(ChannelLeft { channel_id: "test".into() }),
+            WireMessage::ChannelLeft(ChannelLeft {
+                channel_id: "test".into(),
+            }),
             WireMessage::ChannelStateHash(ChannelStateHash {
                 digest: vec![0; 32],
                 count: 0,
@@ -371,7 +372,10 @@ mod tests {
                 since: None,
                 limit: 100,
             }),
-            WireMessage::SyncResponse(SyncResponse { items: vec![], has_more: false }),
+            WireMessage::SyncResponse(SyncResponse {
+                items: vec![],
+                has_more: false,
+            }),
             WireMessage::FetchRequest(FetchRequest { item_ids: vec![] }),
             WireMessage::FetchResponse(FetchResponse { items: vec![] }),
             WireMessage::PushPayload(PushPayload { items: vec![] }),
@@ -435,12 +439,22 @@ mod tests {
     #[tokio::test]
     async fn test_protocol_byte_stream() {
         let mut buf = Vec::new();
-        write_protocol_byte(&mut buf, Protocol::Handshake).await.unwrap();
-        write_protocol_byte(&mut buf, Protocol::ItemPush).await.unwrap();
+        write_protocol_byte(&mut buf, Protocol::Handshake)
+            .await
+            .unwrap();
+        write_protocol_byte(&mut buf, Protocol::ItemPush)
+            .await
+            .unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
-        assert_eq!(read_protocol_byte(&mut cursor).await.unwrap(), Protocol::Handshake);
-        assert_eq!(read_protocol_byte(&mut cursor).await.unwrap(), Protocol::ItemPush);
+        assert_eq!(
+            read_protocol_byte(&mut cursor).await.unwrap(),
+            Protocol::Handshake
+        );
+        assert_eq!(
+            read_protocol_byte(&mut cursor).await.unwrap(),
+            Protocol::ItemPush
+        );
     }
 
     #[tokio::test]
@@ -488,12 +502,24 @@ mod tests {
         let mut buf = Vec::new();
 
         // Write protocol byte
-        write_protocol_byte(&mut buf, Protocol::KeepAlive).await.unwrap();
+        write_protocol_byte(&mut buf, Protocol::KeepAlive)
+            .await
+            .unwrap();
 
         // Write several ping/pong frames
-        let ping = WireMessage::Ping(Ping { seq: 1, sent_at_ns: 100 });
-        let pong = WireMessage::Pong(Pong { seq: 1, sent_at_ns: 100, recv_at_ns: 200 });
-        let ping2 = WireMessage::Ping(Ping { seq: 2, sent_at_ns: 300 });
+        let ping = WireMessage::Ping(Ping {
+            seq: 1,
+            sent_at_ns: 100,
+        });
+        let pong = WireMessage::Pong(Pong {
+            seq: 1,
+            sent_at_ns: 100,
+            recv_at_ns: 200,
+        });
+        let ping2 = WireMessage::Ping(Ping {
+            seq: 2,
+            sent_at_ns: 300,
+        });
 
         write_frame(&mut buf, &ping).await.unwrap();
         write_frame(&mut buf, &pong).await.unwrap();
@@ -501,7 +527,10 @@ mod tests {
 
         // Read back
         let mut cursor = std::io::Cursor::new(buf);
-        assert_eq!(read_protocol_byte(&mut cursor).await.unwrap(), Protocol::KeepAlive);
+        assert_eq!(
+            read_protocol_byte(&mut cursor).await.unwrap(),
+            Protocol::KeepAlive
+        );
 
         match read_frame(&mut cursor).await.unwrap() {
             WireMessage::Ping(p) => assert_eq!(p.seq, 1),
@@ -558,10 +587,16 @@ mod tests {
     #[tokio::test]
     async fn test_extreme_protocol_bytes_rejected() {
         let mut cursor = std::io::Cursor::new(vec![0x00u8]);
-        assert!(matches!(read_protocol_byte(&mut cursor).await, Err(CodecError::UnknownProtocol(0x00))));
+        assert!(matches!(
+            read_protocol_byte(&mut cursor).await,
+            Err(CodecError::UnknownProtocol(0x00))
+        ));
 
         let mut cursor = std::io::Cursor::new(vec![0xFFu8]);
-        assert!(matches!(read_protocol_byte(&mut cursor).await, Err(CodecError::UnknownProtocol(0xFF))));
+        assert!(matches!(
+            read_protocol_byte(&mut cursor).await,
+            Err(CodecError::UnknownProtocol(0xFF))
+        ));
     }
 
     // T5-02 (MEDIUM): Message at exactly MAX_MESSAGE_BYTES (should succeed)
@@ -607,4 +642,4 @@ mod tests {
         let result = read_frame(&mut cursor).await;
         assert!(matches!(result, Err(CodecError::UnexpectedEof)));
     }
-    }
+}

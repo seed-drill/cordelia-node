@@ -27,7 +27,9 @@ pub struct KeyRing {
 
 /// Path to a channel's PSK file.
 pub fn psk_path(home_dir: &Path, channel_id: &str) -> PathBuf {
-    home_dir.join("channel-keys").join(format!("{channel_id}.key"))
+    home_dir
+        .join("channel-keys")
+        .join(format!("{channel_id}.key"))
 }
 
 /// Read a 32-byte PSK from the filesystem.
@@ -53,8 +55,7 @@ pub fn write_psk(home_dir: &Path, channel_id: &str, psk: &[u8; 32]) -> Result<()
         std::fs::create_dir_all(parent)
             .map_err(|e| CordeliaError::Storage(format!("create PSK dir: {e}")))?;
     }
-    std::fs::write(&path, psk)
-        .map_err(|e| CordeliaError::Storage(format!("write PSK: {e}")))?;
+    std::fs::write(&path, psk).map_err(|e| CordeliaError::Storage(format!("write PSK: {e}")))?;
 
     #[cfg(unix)]
     {
@@ -83,7 +84,9 @@ pub fn has_psk(home_dir: &Path, channel_id: &str) -> bool {
 
 /// Path to a channel's key ring file.
 pub fn ring_path(home_dir: &Path, channel_id: &str) -> PathBuf {
-    home_dir.join("channel-keys").join(format!("{channel_id}.ring.json"))
+    home_dir
+        .join("channel-keys")
+        .join(format!("{channel_id}.ring.json"))
 }
 
 /// Read the key ring for a channel, or return an empty ring if none exists.

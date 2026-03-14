@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.5, §4.6
 
-use crate::codec::{read_frame, write_frame, write_protocol_byte, read_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
 use crate::messages::*;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -80,11 +80,7 @@ pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return Err(ItemSyncError::UnexpectedMessage),
     };
 
-    let (headers, has_more) = get_headers(
-        &req.channel_id,
-        req.since.as_deref(),
-        req.limit,
-    );
+    let (headers, has_more) = get_headers(&req.channel_id, req.since.as_deref(), req.limit);
 
     let resp = WireMessage::SyncResponse(SyncResponse {
         items: headers,
@@ -391,8 +387,13 @@ mod tests {
         });
 
         // Send a Ping where a SyncRequest is expected
-        write_protocol_byte(&mut client, Protocol::ItemSync).await.unwrap();
-        let wrong_msg = WireMessage::Ping(Ping { seq: 1, sent_at_ns: 100 });
+        write_protocol_byte(&mut client, Protocol::ItemSync)
+            .await
+            .unwrap();
+        let wrong_msg = WireMessage::Ping(Ping {
+            seq: 1,
+            sent_at_ns: 100,
+        });
         write_frame(&mut client, &wrong_msg).await.unwrap();
 
         let result = server_task.await.unwrap();
@@ -412,8 +413,13 @@ mod tests {
         });
 
         // Send wrong protocol byte
-        write_protocol_byte(&mut client, Protocol::KeepAlive).await.unwrap();
-        let msg = WireMessage::Ping(Ping { seq: 1, sent_at_ns: 100 });
+        write_protocol_byte(&mut client, Protocol::KeepAlive)
+            .await
+            .unwrap();
+        let msg = WireMessage::Ping(Ping {
+            seq: 1,
+            sent_at_ns: 100,
+        });
         write_frame(&mut client, &msg).await.unwrap();
 
         let result = server_task.await.unwrap();

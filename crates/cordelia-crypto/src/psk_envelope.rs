@@ -65,8 +65,8 @@ pub struct PskEnvelopeFields {
 pub fn decode_psk_envelope(cbor_bytes: &[u8]) -> Result<PskEnvelopeFields, CryptoError> {
     use ciborium::Value;
 
-    let value: Value = ciborium::from_reader(cbor_bytes)
-        .map_err(|e| CryptoError::DecryptionFailed)?;
+    let value: Value =
+        ciborium::from_reader(cbor_bytes).map_err(|e| CryptoError::DecryptionFailed)?;
 
     let map = match value {
         Value::Map(m) => m,

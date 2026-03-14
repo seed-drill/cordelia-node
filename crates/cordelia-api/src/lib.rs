@@ -39,20 +39,11 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     );
 
     // Health check (GET, unauthenticated, operations.md §8)
-    cfg.route(
-        "/api/v1/health",
-        web::get().to(handlers::health),
-    );
+    cfg.route("/api/v1/health", web::get().to(handlers::health));
 
     // Status (GET, authenticated, operations.md §8)
-    cfg.route(
-        "/api/v1/status",
-        web::get().to(handlers::status),
-    );
+    cfg.route("/api/v1/status", web::get().to(handlers::status));
 
     // Prometheus metrics (GET, outside /channels scope per spec §3.15)
-    cfg.route(
-        "/api/v1/metrics",
-        web::get().to(handlers::metrics),
-    );
+    cfg.route("/api/v1/metrics", web::get().to(handlers::metrics));
 }

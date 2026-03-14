@@ -45,18 +45,51 @@ struct ErrorDetail {
 impl ResponseError for ApiError {
     fn error_response(&self) -> HttpResponse {
         let (status, code, used, quota) = match self {
-            Self::BadRequest(_) => (actix_web::http::StatusCode::BAD_REQUEST, "bad_request", None, None),
-            Self::Unauthorized => (actix_web::http::StatusCode::UNAUTHORIZED, "unauthorized", None, None),
-            Self::Forbidden(_) => (actix_web::http::StatusCode::FORBIDDEN, "not_authorized", None, None),
-            Self::NotFound(_) => (actix_web::http::StatusCode::NOT_FOUND, "not_found", None, None),
-            Self::Conflict(_) => (actix_web::http::StatusCode::CONFLICT, "conflict", None, None),
-            Self::PayloadTooLarge { used_bytes, quota_bytes } => (
+            Self::BadRequest(_) => (
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "bad_request",
+                None,
+                None,
+            ),
+            Self::Unauthorized => (
+                actix_web::http::StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                None,
+                None,
+            ),
+            Self::Forbidden(_) => (
+                actix_web::http::StatusCode::FORBIDDEN,
+                "not_authorized",
+                None,
+                None,
+            ),
+            Self::NotFound(_) => (
+                actix_web::http::StatusCode::NOT_FOUND,
+                "not_found",
+                None,
+                None,
+            ),
+            Self::Conflict(_) => (
+                actix_web::http::StatusCode::CONFLICT,
+                "conflict",
+                None,
+                None,
+            ),
+            Self::PayloadTooLarge {
+                used_bytes,
+                quota_bytes,
+            } => (
                 actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 Some(*used_bytes),
                 Some(*quota_bytes),
             ),
-            Self::Internal(_) => (actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None, None),
+            Self::Internal(_) => (
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            ),
         };
 
         HttpResponse::build(status).json(ErrorBody {

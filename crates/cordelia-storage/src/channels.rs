@@ -3,7 +3,7 @@
 //! Spec: seed-drill/specs/channels-api.md, seed-drill/specs/data-formats.md §3.1
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use cordelia_core::{ChannelId, CordeliaError};
@@ -527,10 +527,7 @@ pub fn increment_key_version(
 }
 
 /// Look up the peer key in a DM channel (the key that isn't the local key).
-pub fn dm_peer_key(
-    conn: &Connection,
-    channel_id: &str,
-) -> Result<[u8; 32], CordeliaError> {
+pub fn dm_peer_key(conn: &Connection, channel_id: &str) -> Result<[u8; 32], CordeliaError> {
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT peer_key FROM dm_peers WHERE channel_id = ?1",
@@ -574,7 +571,15 @@ mod tests {
     #[test]
     fn test_create_named_channel() {
         let conn = db::open_in_memory().unwrap();
-        let ch = create_named(&conn, "research-findings", "realtime", "open", &test_creator(), Some(&test_psk())).unwrap();
+        let ch = create_named(
+            &conn,
+            "research-findings",
+            "realtime",
+            "open",
+            &test_creator(),
+            Some(&test_psk()),
+        )
+        .unwrap();
 
         assert_eq!(ch.channel_name.as_deref(), Some("research-findings"));
         assert_eq!(ch.channel_type, "named");
@@ -587,7 +592,15 @@ mod tests {
     #[test]
     fn test_create_named_canonicalizes() {
         let conn = db::open_in_memory().unwrap();
-        let ch = create_named(&conn, "  Research-Findings  ", "realtime", "open", &test_creator(), None).unwrap();
+        let ch = create_named(
+            &conn,
+            "  Research-Findings  ",
+            "realtime",
+            "open",
+            &test_creator(),
+            None,
+        )
+        .unwrap();
         assert_eq!(ch.channel_name.as_deref(), Some("research-findings"));
     }
 
@@ -596,14 +609,20 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         create_named(&conn, "engineering", "batch", "open", &test_creator(), None).unwrap();
         let result = create_named(&conn, "engineering", "batch", "open", &test_creator(), None);
-        assert!(matches!(result, Err(CordeliaError::ChannelAlreadyExists { .. })));
+        assert!(matches!(
+            result,
+            Err(CordeliaError::ChannelAlreadyExists { .. })
+        ));
     }
 
     #[test]
     fn test_create_named_invalid_name() {
         let conn = db::open_in_memory().unwrap();
         let result = create_named(&conn, "ab", "realtime", "open", &test_creator(), None);
-        assert!(matches!(result, Err(CordeliaError::InvalidChannelName { .. })));
+        assert!(matches!(
+            result,
+            Err(CordeliaError::InvalidChannelName { .. })
+        ));
     }
 
     #[test]

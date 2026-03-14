@@ -210,10 +210,7 @@ pub fn extract_peer_node_id(cert_chain: &[CertificateDer<'_>]) -> Result<[u8; 32
 fn sig_verify_algos() -> &'static rustls::crypto::WebPkiSupportedAlgorithms {
     use std::sync::OnceLock;
     static ALGOS: OnceLock<rustls::crypto::WebPkiSupportedAlgorithms> = OnceLock::new();
-    ALGOS.get_or_init(|| {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-    })
+    ALGOS.get_or_init(|| rustls::crypto::ring::default_provider().signature_verification_algorithms)
 }
 
 /// Server certificate verifier: accepts any self-signed Ed25519 cert

@@ -88,9 +88,7 @@ pub fn resolve_dns_bootnodes() -> Vec<BootnodeAddr> {
     // Format: "host:port" from SRV target + port
     let srv_host = format!("{SRV_RECORD}.");
 
-    match (srv_host.as_str(), DEFAULT_BOOTNODE_PORT)
-        .to_socket_addrs()
-    {
+    match (srv_host.as_str(), DEFAULT_BOOTNODE_PORT).to_socket_addrs() {
         Ok(addrs) => {
             let result: Vec<BootnodeAddr> = addrs
                 .map(|addr| BootnodeAddr {
@@ -162,9 +160,18 @@ pub fn resolve_all_bootnodes(config_addrs: &[String]) -> Vec<BootnodeAddr> {
 
     info!(
         total = all.len(),
-        config = all.iter().filter(|b| b.source == BootnodeSource::Config).count(),
-        dns = all.iter().filter(|b| b.source == BootnodeSource::DnsSrv).count(),
-        fallback = all.iter().filter(|b| b.source == BootnodeSource::Fallback).count(),
+        config = all
+            .iter()
+            .filter(|b| b.source == BootnodeSource::Config)
+            .count(),
+        dns = all
+            .iter()
+            .filter(|b| b.source == BootnodeSource::DnsSrv)
+            .count(),
+        fallback = all
+            .iter()
+            .filter(|b| b.source == BootnodeSource::Fallback)
+            .count(),
         "bootnode resolution complete"
     );
 

@@ -3,10 +3,10 @@
 //! Spins up an actix-web test server with in-memory DB and tests the full
 //! subscribe → publish → listen → list → unsubscribe flow.
 
-use actix_web::{test, web, App};
+use actix_web::{App, test, web};
 use serde_json::json;
-use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use cordelia_api::state::AppState;
 use cordelia_crypto::identity::NodeIdentity;
@@ -55,8 +55,18 @@ async fn test_identity_endpoint() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = test::read_body_json(resp).await;
-    assert!(body["ed25519_public_key"].as_str().unwrap().starts_with("cordelia_pk1"));
-    assert!(body["x25519_public_key"].as_str().unwrap().starts_with("cordelia_xpk1"));
+    assert!(
+        body["ed25519_public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("cordelia_pk1")
+    );
+    assert!(
+        body["x25519_public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("cordelia_xpk1")
+    );
     assert_eq!(body["channels_subscribed"], 0);
 }
 
@@ -199,7 +209,12 @@ async fn test_full_pubsub_flow() {
 
     let pub_body: serde_json::Value = test::read_body_json(resp).await;
     assert!(pub_body["item_id"].as_str().unwrap().starts_with("ci_"));
-    assert!(pub_body["author"].as_str().unwrap().starts_with("cordelia_pk1"));
+    assert!(
+        pub_body["author"]
+            .as_str()
+            .unwrap()
+            .starts_with("cordelia_pk1")
+    );
     assert_eq!(pub_body["item_type"], "message");
 
     // 3. Listen
@@ -744,10 +759,12 @@ async fn test_search_basic() {
     assert_eq!(results.len(), 1);
     assert!(results[0]["score"].as_f64().unwrap() > 0.0);
     // Content should be decrypted
-    assert!(results[0]["content"]["text"]
-        .as_str()
-        .unwrap()
-        .contains("vector"));
+    assert!(
+        results[0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("vector")
+    );
 }
 
 #[actix_web::test]
@@ -922,9 +939,7 @@ async fn test_metrics_requires_auth() {
     .await;
 
     // No auth header
-    let req = test::TestRequest::get()
-        .uri("/api/v1/metrics")
-        .to_request();
+    let req = test::TestRequest::get().uri("/api/v1/metrics").to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401);
 }

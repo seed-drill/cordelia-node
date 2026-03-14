@@ -2,7 +2,7 @@
 //!
 //! Spec: seed-drill/specs/data-formats.md §3.4, seed-drill/specs/channels-api.md §3.2-§3.3
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 

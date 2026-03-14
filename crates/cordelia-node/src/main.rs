@@ -4,11 +4,11 @@
 
 use std::sync::Mutex;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{App, HttpServer, web};
 use clap::Parser;
 
 use cordelia_core::config::{self, Config};
-use cordelia_crypto::bech32::{encode_public_key, HRP_X25519_PK};
+use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
 #[derive(Parser)]
@@ -170,10 +170,8 @@ fn cmd_init(
     }
 
     // 6. Create personal channel
-    let personal_channel_id =
-        cordelia_storage::naming::personal_channel_id(&pk);
-    let personal_psk_path =
-        cordelia_storage::psk::psk_path(&data_dir, &personal_channel_id);
+    let personal_channel_id = cordelia_storage::naming::personal_channel_id(&pk);
+    let personal_psk_path = cordelia_storage::psk::psk_path(&data_dir, &personal_channel_id);
     if !personal_psk_path.exists() {
         println!("Creating personal channel...");
         let psk = cordelia_crypto::generate_psk()?;
@@ -472,13 +470,12 @@ async fn p2p_loop(
         .clone();
 
     // Shared peer list: updated by p2p_loop, read by per-peer stream handlers
-    let shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(conn_mgr.known_peer_addresses()));
+    let shared_peers: std::sync::Arc<
+        std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>,
+    > = std::sync::Arc::new(std::sync::RwLock::new(conn_mgr.known_peer_addresses()));
 
     // Our own node identity for filtering
-    let our_node_id = cordelia_core::NodeId(
-        state.identity.public_key()
-    );
+    let our_node_id = cordelia_core::NodeId(state.identity.public_key());
 
     // Peer-sharing timer: discover new peers from connected peers
     let mut peer_share_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1054,7 +1051,9 @@ async fn handle_peer_streams(
 
                     // Handle optional FetchRequest on same stream
                     if let Ok(fetch_msg) = cordelia_network::codec::read_frame(&mut recv).await {
-                        if let cordelia_network::messages::WireMessage::FetchRequest(freq) = fetch_msg {
+                        if let cordelia_network::messages::WireMessage::FetchRequest(freq) =
+                            fetch_msg
+                        {
                             let fetch_items = {
                                 let db = match state.db.lock() {
                                     Ok(db) => db,
@@ -1106,12 +1105,15 @@ async fn handle_peer_streams(
                 };
                 if let cordelia_network::messages::WireMessage::PeerShareRequest(req) = msg {
                     let max = req.max_peers as usize;
-                    let current_peers = shared_peers.read()
+                    let current_peers = shared_peers
+                        .read()
                         .map(|p| p.iter().take(max).cloned().collect::<Vec<_>>())
                         .unwrap_or_default();
                     let count = current_peers.len();
                     let resp = cordelia_network::messages::WireMessage::PeerShareResponse(
-                        cordelia_network::messages::PeerShareResponse { peers: current_peers },
+                        cordelia_network::messages::PeerShareResponse {
+                            peers: current_peers,
+                        },
                     );
                     let _ = cordelia_network::codec::write_frame(&mut send, &resp).await;
                     tracing::debug!(peer = %peer_id, count, "served peer-share request");
@@ -1153,14 +1155,23 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
 
     let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
 
-    println!("{:<24} {:<10} {:>6}   {:<20} {}", "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY", "TYPE");
+    println!(
+        "{:<24} {:<10} {:>6}   {:<20} {}",
+        "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY", "TYPE"
+    );
     for ch in &all {
-        let name = ch.channel_name.as_deref().unwrap_or(&ch.channel_id[..ch.channel_id.len().min(16)]);
+        let name = ch
+            .channel_name
+            .as_deref()
+            .unwrap_or(&ch.channel_id[..ch.channel_id.len().min(16)]);
         let count = cordelia_storage::items::count_for_channel(&conn, &ch.channel_id)?;
         let activity = cordelia_storage::items::last_activity(&conn, &ch.channel_id)?
             .unwrap_or_else(|| "-".into());
 
-        println!("{:<24} {:<10} {:>6}   {:<20} {}", name, ch.mode, count, activity, ch.channel_type);
+        println!(
+            "{:<24} {:<10} {:>6}   {:<20} {}",
+            name, ch.mode, count, activity, ch.channel_type
+        );
     }
 
     if all.is_empty() {
@@ -1219,9 +1230,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
 
         tokio::select! {
             _ = ctrl_c => { tracing::info!("received SIGINT"); }

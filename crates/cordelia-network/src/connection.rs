@@ -5,9 +5,9 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §2.3, §4.1, §4.2, §5
 
-use crate::handshake::{self, HandshakeResult, HANDSHAKE_TIMEOUT_SECS};
+use crate::handshake::{self, HANDSHAKE_TIMEOUT_SECS, HandshakeResult};
 use crate::keepalive::KeepAliveState;
-use crate::transport::{extract_peer_node_id, TransportError};
+use crate::transport::{TransportError, extract_peer_node_id};
 use cordelia_core::NodeId;
 use cordelia_crypto::identity::NodeIdentity;
 use quinn::{Connection, Endpoint};
@@ -119,10 +119,7 @@ impl ConnectionManager {
     }
 
     /// Connect to a peer at the given address, perform handshake.
-    pub async fn connect_to(
-        &mut self,
-        addr: SocketAddr,
-    ) -> Result<NodeId, ConnectionError> {
+    pub async fn connect_to(&mut self, addr: SocketAddr) -> Result<NodeId, ConnectionError> {
         // Establish QUIC connection
         let conn = self
             .endpoint
@@ -160,8 +157,7 @@ impl ConnectionManager {
             ),
         )
         .await
-        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))?
-        ?;
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
 
         info!(peer = %node_id, version = handshake_result.negotiated_version, "handshake complete (outbound)");
 
@@ -177,10 +173,7 @@ impl ConnectionManager {
     }
 
     /// Accept an incoming QUIC connection and perform handshake.
-    pub async fn accept_connection(
-        &mut self,
-        conn: Connection,
-    ) -> Result<NodeId, ConnectionError> {
+    pub async fn accept_connection(&mut self, conn: Connection) -> Result<NodeId, ConnectionError> {
         let peer_node_id = extract_node_id_from_conn(&conn)?;
         let node_id = NodeId(peer_node_id);
 
@@ -209,8 +202,7 @@ impl ConnectionManager {
             ),
         )
         .await
-        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))?
-        ?;
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
 
         info!(peer = %node_id, version = handshake_result.negotiated_version, "handshake complete (inbound)");
 
