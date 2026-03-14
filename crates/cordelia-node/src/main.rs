@@ -337,6 +337,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         home_dir: data_dir,
         started_at: std::time::Instant::now(),
         sync_errors: std::sync::atomic::AtomicU64::new(0),
+        peers_hot: std::sync::atomic::AtomicU64::new(0),
+        peers_warm: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -371,11 +373,22 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             roles,
         );
 
-        // ── Accept incoming P2P connections ─────────────────────────
-        // (Spawned as background task, runs until shutdown)
-        // For Phase 1, we log incoming connections but the full accept
-        // loop with governor integration comes in the next iteration.
-        tracing::info!("P2P layer ready");
+        // ── Bootstrap: connect to bootnodes ─────────────────────────
+        for bn in &bootnodes {
+            match conn_mgr.connect_to(bn.addr).await {
+                Ok(node_id) => {
+                    tracing::info!(bootnode = %bn.host, peer = %node_id, "connected to bootnode");
+                }
+                Err(e) => {
+                    tracing::warn!(bootnode = %bn.host, error = %e, "failed to connect to bootnode");
+                }
+            }
+        }
+
+        // Update peer counts in shared state
+        let hot_count = conn_mgr.connection_count() as u64;
+        state.peers_hot.store(hot_count, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(peers = hot_count, "bootstrap complete");
 
         // ── HTTP API ───────────────────────────────────────────────
         let server = HttpServer::new(move || {
@@ -394,6 +407,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             tracing::info!("shutdown signal received, stopping");
             server_handle.stop(true).await;
         });
+
+        tracing::info!("P2P layer ready, accepting connections");
 
         let result = server.await.map_err(|e| anyhow::anyhow!(e));
 
