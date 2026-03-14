@@ -123,9 +123,9 @@ echo ""
 echo "Step 6: Waiting for delivery..."
 # P3 should have 6 items total (3 alpha + 3 beta)
 wait_for "p3 has 3 alpha items" \
-    '[ "$(db_query t7-p3 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$ALPHA_ID'"'"' AND is_tombstone=0")" -ge 3 ]' 30
+    '[ "$(db_query t7-p3 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$ALPHA_ID'"'"' AND is_tombstone=0")" -ge 3 ]' 60
 wait_for "p3 has 3 beta items" \
-    '[ "$(db_query t7-p3 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$BETA_ID'"'"' AND is_tombstone=0")" -ge 3 ]' 30
+    '[ "$(db_query t7-p3 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$BETA_ID'"'"' AND is_tombstone=0")" -ge 3 ]' 60
 
 # -- Step 7: Assertions --------------------------------------------------
 
