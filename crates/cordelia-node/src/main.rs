@@ -530,77 +530,72 @@ async fn p2p_loop(
                 if peers.is_empty() {
                     continue;
                 }
-                // Pick first connected peer (simple; could randomize later)
                 let target = peers[0].clone();
                 if let Some(conn) = conn_mgr.get_connection(&target) {
                     let conn = conn.clone();
-                    match conn.open_bi().await {
-                        Ok((mut send, mut recv)) => {
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            match cordelia_network::peer_sharing::request_peers(&mut stream, 20).await {
-                                Ok(discovered) => {
-                                    // Filter and connect to new peers
-                                    let own_addr = conn_mgr.local_addr().ok();
-                                    let valid = if allow_private_addresses {
-                                        // Skip address validation for Docker/test
-                                        discovered
-                                    } else {
-                                        cordelia_network::peer_sharing::filter_valid_addresses(
-                                            &discovered,
-                                            own_addr.as_ref(),
-                                        )
-                                    };
-
-                                    for peer_addr in &valid {
-                                        // Skip ourselves and peers we're already connected to
-                                        let peer_node_id = cordelia_core::NodeId(
-                                            peer_addr.node_id.as_slice().try_into().unwrap_or([0u8; 32])
-                                        );
-                                        if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
-                                            continue;
+                    // Open stream with 5s timeout (spec: debug-telemetry.md §5)
+                    let (mut send, mut recv) = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5), conn.open_bi(),
+                    ).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => { tracing::debug!(peer = %target, error = %e, "peer-share open_bi failed"); continue; }
+                        Err(_) => { tracing::debug!(peer = %target, "peer-share open_bi timed out (5s)"); continue; }
+                    };
+                    let mut stream = tokio::io::join(&mut recv, &mut send);
+                    // Request peers with 5s timeout
+                    let discovered = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        cordelia_network::peer_sharing::request_peers(&mut stream, 20),
+                    ).await {
+                        Ok(Ok(d)) => d,
+                        Ok(Err(e)) => { tracing::debug!(peer = %target, error = %e, "peer-share request failed"); continue; }
+                        Err(_) => { tracing::debug!(peer = %target, "peer-share request timed out (5s)"); continue; }
+                    };
+                    drop(stream); drop(send); drop(recv); // close stream promptly
+                    // Filter and connect to new peers
+                    let own_addr = conn_mgr.local_addr().ok();
+                    let valid = if allow_private_addresses {
+                        discovered
+                    } else {
+                        cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
+                    };
+                    for peer_addr in &valid {
+                        let peer_node_id = cordelia_core::NodeId(
+                            peer_addr.node_id.as_slice().try_into().unwrap_or([0u8; 32])
+                        );
+                        if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
+                            continue;
+                        }
+                        if let Some(addr_str) = peer_addr.addrs.first() {
+                            if let Ok(addr) = addr_str.parse() {
+                                // 10s timeout per peer-share connect (spec: debug-telemetry.md §5)
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    conn_mgr.connect_to(addr),
+                                ).await {
+                                    Ok(Ok(new_id)) => {
+                                        let count = conn_mgr.connection_count() as u64;
+                                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
+                                        if let Ok(mut peers) = shared_peers.write() {
+                                            *peers = conn_mgr.known_peer_addresses();
                                         }
-                                        // Try to connect to first address
-                                        if let Some(addr_str) = peer_addr.addrs.first() {
-                                            if let Ok(addr) = addr_str.parse() {
-                                                match conn_mgr.connect_to(addr).await {
-                                                    Ok(new_id) => {
-                                                        let count = conn_mgr.connection_count() as u64;
-                                                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
-                                                        tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
-
-                                                            // Update shared peer list
-                                                        if let Ok(mut peers) = shared_peers.write() {
-                                                            *peers = conn_mgr.known_peer_addresses();
-                                                        }
-
-                                                        // Spawn stream handler
-                                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
-                                                            let new_conn = new_conn.clone();
-                                                            let peer_id = new_id;
-                                                            let db_state = state.clone();
-                                                            let peers_ref = shared_peers.clone();
-                                                            let role = node_role.clone();
-                                                            let ptx = relay_push_tx.clone();
-                                                            tokio::spawn(async move {
-                                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
-                                                            });
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed");
-                                                    }
-                                                }
-                                            }
+                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
+                                            let new_conn = new_conn.clone();
+                                            let peer_id = new_id;
+                                            let db_state = state.clone();
+                                            let peers_ref = shared_peers.clone();
+                                            let role = node_role.clone();
+                                            let ptx = relay_push_tx.clone();
+                                            tokio::spawn(async move {
+                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
+                                            });
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(peer = %target, error = %e, "peer-share request failed");
+                                    Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
+                                    Err(_) => { tracing::warn!(addr = %addr_str, "peer-share connect timed out (10s)"); }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::debug!(peer = %target, error = %e, "open stream for peer-share failed");
                         }
                     }
                 }
@@ -638,7 +633,8 @@ async fn p2p_loop(
                         let items = vec![item.clone()];
                         let pid = peer_id.clone();
                         push_count += 1;
-                        tracing::debug!(peer = %pid, "spawning push task");
+                        let iid = push_item.item_id.clone();
+                        tracing::debug!(peer = %pid, item = %iid, "spawning push task");
                         // Fire and forget -- don't block the loop
                         tokio::spawn(async move {
                             match tokio::time::timeout(
@@ -715,26 +711,38 @@ async fn p2p_loop(
                     let conn = conn.clone();
                     let sync_state = state.clone();
                     let sync_channels = channels;
+                    tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
                     tokio::spawn(async move {
                         for ch_id in &sync_channels {
-                            // Open a new stream for each channel sync
-                            let (mut send, mut recv) = match conn.open_bi().await {
-                                Ok(s) => s,
-                                Err(_) => break,
+                            // Open a new stream for each channel sync (10s timeout)
+                            let (mut send, mut recv) = match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                conn.open_bi(),
+                            ).await {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync open_bi failed"); break; }
+                                Err(_) => { tracing::warn!(peer = %target, channel = %ch_id, "sync open_bi timed out (10s)"); break; }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
 
-                            // Send sync request
-                            let resp = match cordelia_network::item_sync::send_sync_request(
-                                &mut stream, ch_id, None, 100,
+                            // Send sync request (15s timeout per spec)
+                            tracing::debug!(peer = %target, channel = %ch_id, "sync request sent");
+                            let resp = match tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, 100),
                             ).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::debug!(channel = %ch_id, error = %e, "sync request failed");
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed");
+                                    continue;
+                                }
+                                Err(_) => {
+                                    tracing::warn!(peer = %target, channel = %ch_id, "sync request timed out (15s)");
                                     continue;
                                 }
                             };
 
+                            tracing::debug!(peer = %target, channel = %ch_id, headers = resp.items.len(), "sync response received");
                             if resp.items.is_empty() {
                                 continue;
                             }
@@ -769,12 +777,17 @@ async fn p2p_loop(
                                 continue;
                             }
 
-                            let items = match cordelia_network::item_sync::read_fetch_response(
-                                &mut recv,
+                            let items = match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                cordelia_network::item_sync::read_fetch_response(&mut recv),
                             ).await {
-                                Ok(items) => items,
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "fetch response failed");
+                                Ok(Ok(items)) => items,
+                                Ok(Err(e)) => {
+                                    tracing::debug!(peer = %target, error = %e, "fetch response failed");
+                                    continue;
+                                }
+                                Err(_) => {
+                                    tracing::warn!(peer = %target, channel = %ch_id, "fetch response timed out (30s)");
                                     continue;
                                 }
                             };
