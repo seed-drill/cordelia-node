@@ -156,11 +156,13 @@ echo "  Partition healed."
 
 echo ""
 echo "Step 10: Waiting for convergence..."
-# Both nodes should have all 7 items after anti-entropy sync
+# Convergence budget: QUIC idle timeout (60s) to detect dead connections
+# + peer-share reconnection (5-10s) + pull-sync cycle (10s) = ~80s.
+# Use 120s to be safe.
 wait_for "p1 has 7 items" \
-    '[ "$(db_query t5-p1 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 7 ]' 60
+    '[ "$(db_query t5-p1 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 7 ]' 120
 wait_for "p2 has 7 items" \
-    '[ "$(db_query t5-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 7 ]' 60
+    '[ "$(db_query t5-p2 "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 7 ]' 120
 
 # -- Step 11: Assertions -------------------------------------------------
 
