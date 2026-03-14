@@ -634,6 +634,7 @@ async fn p2p_loop(
                         tracing::debug!(peer = %pid, item = %iid, "spawning push task");
                         // Fire and forget -- don't block the loop
                         tokio::spawn(async move {
+                            tracing::debug!(peer = %pid, item = %iid, "push open_bi started");
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(10),
                                 conn.open_bi(),
@@ -864,15 +865,25 @@ async fn handle_peer_streams(
     node_role: String,
     push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
 ) {
+    let mut stream_count: u64 = 0;
     loop {
         // Accept next bidirectional stream from this peer
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
-            Err(_) => {
-                tracing::debug!(peer = %peer_id, "peer connection closed");
+            Err(e) => {
+                let reason = match &e {
+                    quinn::ConnectionError::TimedOut => "idle_timeout",
+                    quinn::ConnectionError::Reset => "reset",
+                    quinn::ConnectionError::ApplicationClosed(_) => "shutdown",
+                    quinn::ConnectionError::LocallyClosed => "local_close",
+                    _ => "error",
+                };
+                tracing::info!(peer = %peer_id, reason, streams = stream_count, error = %e, "peer connection closed");
                 break;
             }
         };
+
+        stream_count += 1;
 
         // Read protocol byte to determine handler
         let protocol = match cordelia_network::codec::read_protocol_byte(&mut recv).await {
@@ -882,6 +893,15 @@ async fn handle_peer_streams(
                 continue;
             }
         };
+
+        let proto_name = match protocol {
+            cordelia_network::messages::Protocol::ItemPush => "item_push",
+            cordelia_network::messages::Protocol::ItemSync => "item_sync",
+            cordelia_network::messages::Protocol::PeerSharing => "peer_share",
+            _ => "other",
+        };
+        tracing::debug!(peer = %peer_id, protocol = proto_name, stream = stream_count, "stream opened (inbound)");
+        let stream_start = std::time::Instant::now();
 
         match protocol {
             cordelia_network::messages::Protocol::ItemPush => {
@@ -1123,6 +1143,14 @@ async fn handle_peer_streams(
                 tracing::debug!(peer = %peer_id, protocol = ?other, "ignoring unhandled protocol");
             }
         }
+        // Stream close logging (all protocol handlers)
+        tracing::debug!(
+            peer = %peer_id, protocol = proto_name, stream = stream_count,
+            duration_ms = stream_start.elapsed().as_millis() as u64,
+            "stream closed"
+        );
+        drop(send);
+        drop(recv);
     }
 }
 
