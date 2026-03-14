@@ -705,8 +705,10 @@ async fn p2p_loop(
                     continue;
                 }
 
-                // Pick a random peer to sync with
-                let target = peers[0].clone();
+                // Rotate sync target across peers (round-robin by tick count)
+                static SYNC_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tick = SYNC_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let target = peers[(tick as usize) % peers.len()].clone();
                 if let Some(conn) = conn_mgr.get_connection(&target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
