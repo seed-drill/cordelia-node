@@ -405,8 +405,9 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_state = state.clone();
         let p2p_shutdown = tokio::sync::watch::channel(false);
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
+        let role_for_p2p = config.network.role.clone();
         let p2p_handle = tokio::spawn(async move {
-            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private).await;
+            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -452,8 +453,17 @@ async fn p2p_loop(
     mut push_rx: tokio::sync::mpsc::UnboundedReceiver<cordelia_api::state::PushItem>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     allow_private_addresses: bool,
+    node_role: String,
 ) {
-    tracing::info!("P2P loop started (accept + push + peer-sharing)");
+    tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
+
+    // Create a push sender for handle_peer_streams (relay re-push)
+    // We re-use the state's push_tx for this
+    let relay_push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem> = state
+        .push_tx
+        .as_ref()
+        .expect("push_tx must be set when P2P is running")
+        .clone();
 
     // Shared peer list: updated by p2p_loop, read by per-peer stream handlers
     let shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>> =
@@ -467,8 +477,12 @@ async fn p2p_loop(
     // Peer-sharing timer: discover new peers from connected peers
     let mut peer_share_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     peer_share_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the first immediate tick
-    peer_share_interval.tick().await;
+    peer_share_interval.tick().await; // skip first immediate tick
+
+    // Pull-sync timer: anti-entropy, fetch missing items from peers
+    let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sync_interval.tick().await; // skip first immediate tick
 
     loop {
         tokio::select! {
@@ -491,8 +505,10 @@ async fn p2p_loop(
                             let peer_id = node_id.clone();
                             let db_state = state.clone();
                             let peers_ref = shared_peers.clone();
+                            let role = node_role.clone();
+                            let ptx = relay_push_tx.clone();
                             tokio::spawn(async move {
-                                handle_peer_streams(conn, peer_id, db_state, peers_ref).await;
+                                handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx).await;
                             });
                         }
                     }
@@ -557,8 +573,10 @@ async fn p2p_loop(
                                                             let peer_id = new_id;
                                                             let db_state = state.clone();
                                                             let peers_ref = shared_peers.clone();
+                                                            let role = node_role.clone();
+                                                            let ptx = relay_push_tx.clone();
                                                             tokio::spawn(async move {
-                                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref).await;
+                                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
                                                             });
                                                         }
                                                     }
@@ -599,8 +617,12 @@ async fn p2p_loop(
                     parent_id: push_item.parent_id,
                 };
 
-                // Push to all connected peers
+                // Push to all connected peers (skip excluded peer for relay re-push)
+                let exclude = push_item.exclude_peer;
                 for peer_id in conn_mgr.connected_peers() {
+                    if exclude.as_ref() == Some(&peer_id) {
+                        continue;
+                    }
                     if let Some(conn) = conn_mgr.get_connection(&peer_id) {
                         let conn = conn.clone();
                         let items = vec![item.clone()];
@@ -637,6 +659,154 @@ async fn p2p_loop(
                 );
             }
 
+            // Periodic pull-sync: fetch missing items from connected peers
+            _ = sync_interval.tick() => {
+                if node_role == "bootnode" {
+                    continue; // bootnodes don't store/sync items
+                }
+                let peers = conn_mgr.connected_peers();
+                if peers.is_empty() {
+                    continue;
+                }
+                // Get channels we're subscribed to
+                let channels: Vec<String> = {
+                    let db = match state.db.lock() {
+                        Ok(db) => db,
+                        Err(_) => continue,
+                    };
+                    let pk = state.identity.public_key();
+                    cordelia_storage::channels::list_for_entity(&db, &pk)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| c.channel_id)
+                        .collect()
+                };
+
+                if channels.is_empty() {
+                    continue;
+                }
+
+                // Pick a random peer to sync with
+                let target = peers[0].clone();
+                if let Some(conn) = conn_mgr.get_connection(&target) {
+                    let conn = conn.clone();
+                    let sync_state = state.clone();
+                    let sync_channels = channels;
+                    tokio::spawn(async move {
+                        for ch_id in &sync_channels {
+                            // Open a new stream for each channel sync
+                            let (mut send, mut recv) = match conn.open_bi().await {
+                                Ok(s) => s,
+                                Err(_) => break,
+                            };
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+
+                            // Send sync request
+                            let resp = match cordelia_network::item_sync::send_sync_request(
+                                &mut stream, ch_id, None, 100,
+                            ).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::debug!(channel = %ch_id, error = %e, "sync request failed");
+                                    continue;
+                                }
+                            };
+
+                            if resp.items.is_empty() {
+                                continue;
+                            }
+
+                            // Compare with local DB to find missing items
+                            let known = {
+                                let db = match sync_state.db.lock() {
+                                    Ok(db) => db,
+                                    Err(_) => continue,
+                                };
+                                let stored = cordelia_storage::items::query_listen(
+                                    &db, ch_id, None, 1000,
+                                ).unwrap_or_default();
+                                stored.into_iter()
+                                    .map(|si| (si.item_id, (si.content_hash, si.published_at)))
+                                    .collect::<std::collections::HashMap<_, _>>()
+                            };
+
+                            let fetch_ids = cordelia_network::item_sync::compute_fetch_list(
+                                &resp.items, &known,
+                            );
+
+                            if fetch_ids.is_empty() {
+                                continue;
+                            }
+
+                            // Fetch missing items
+                            if let Err(e) = cordelia_network::item_sync::send_fetch_request(
+                                &mut send, &fetch_ids,
+                            ).await {
+                                tracing::debug!(error = %e, "fetch request failed");
+                                continue;
+                            }
+
+                            let items = match cordelia_network::item_sync::read_fetch_response(
+                                &mut recv,
+                            ).await {
+                                Ok(items) => items,
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "fetch response failed");
+                                    continue;
+                                }
+                            };
+
+                            // Store fetched items
+                            let mut stored_count = 0u32;
+                            {
+                                let db = match sync_state.db.lock() {
+                                    Ok(db) => db,
+                                    Err(_) => continue,
+                                };
+                                for item in &items {
+                                    if !cordelia_network::item_sync::verify_content_hash(item) {
+                                        continue;
+                                    }
+                                    let author: [u8; 32] = match item.author_id.as_slice().try_into() {
+                                        Ok(a) => a, Err(_) => continue,
+                                    };
+                                    let hash: [u8; 32] = match item.content_hash.as_slice().try_into() {
+                                        Ok(h) => h, Err(_) => continue,
+                                    };
+                                    let sig: [u8; 64] = match item.signature.as_slice().try_into() {
+                                        Ok(s) => s, Err(_) => continue,
+                                    };
+                                    let new_item = cordelia_storage::items::NewItem {
+                                        item_id: &item.item_id,
+                                        channel_id: &item.channel_id,
+                                        author_id: &author,
+                                        item_type: &item.item_type,
+                                        published_at: &item.published_at,
+                                        parent_id: item.parent_id.as_deref(),
+                                        key_version: item.key_version as i64,
+                                        content_hash: &hash,
+                                        signature: &sig,
+                                        encrypted_blob: &item.encrypted_blob,
+                                    };
+                                    if let Ok(true) = cordelia_storage::items::insert_item(&db, &new_item) {
+                                        stored_count += 1;
+                                    }
+                                }
+                            } // db lock dropped
+
+                            if stored_count > 0 {
+                                tracing::info!(
+                                    channel = %ch_id,
+                                    fetched = fetch_ids.len(),
+                                    stored = stored_count,
+                                    "pull-sync complete"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+
             // Shutdown signal
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -656,6 +826,8 @@ async fn handle_peer_streams(
     peer_id: cordelia_core::NodeId,
     state: web::Data<cordelia_api::state::AppState>,
     shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
+    node_role: String,
+    push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
 ) {
     loop {
         // Accept next bidirectional stream from this peer
@@ -747,6 +919,31 @@ async fn handle_peer_streams(
                         "processed inbound push"
                     );
 
+                    // Relay re-push: if we're a relay, forward to other peers
+                    if node_role == "relay" && stored > 0 {
+                        for item in &payload.items {
+                            let _ = push_tx.send(cordelia_api::state::PushItem {
+                                channel_id: item.channel_id.clone(),
+                                item_id: item.item_id.clone(),
+                                encrypted_blob: item.encrypted_blob.clone(),
+                                content_hash: item.content_hash.clone(),
+                                author_id: item.author_id.clone(),
+                                signature: item.signature.clone(),
+                                key_version: item.key_version,
+                                published_at: item.published_at.clone(),
+                                item_type: item.item_type.clone(),
+                                is_tombstone: item.is_tombstone,
+                                parent_id: item.parent_id.clone(),
+                                exclude_peer: Some(peer_id.clone()), // don't push back to sender
+                            });
+                        }
+                        tracing::debug!(
+                            peer = %peer_id,
+                            stored,
+                            "relay re-push queued"
+                        );
+                    }
+
                     // Send ack (safe to await now, db lock is released)
                     let ack = cordelia_network::messages::WireMessage::PushAck(
                         cordelia_network::messages::PushAck {
@@ -757,6 +954,99 @@ async fn handle_peer_streams(
                         },
                     );
                     let _ = cordelia_network::codec::write_frame(&mut send, &ack).await;
+                }
+            }
+            cordelia_network::messages::Protocol::ItemSync => {
+                // Handle sync request: return item headers from our DB
+                let msg = match cordelia_network::codec::read_frame(&mut recv).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer_id, error = %e, "sync request read failed");
+                        continue;
+                    }
+                };
+                if let cordelia_network::messages::WireMessage::SyncRequest(req) = msg {
+                    let (headers, has_more) = {
+                        let db = match state.db.lock() {
+                            Ok(db) => db,
+                            Err(_) => continue,
+                        };
+                        let items = cordelia_storage::items::query_listen(
+                            &db,
+                            &req.channel_id,
+                            req.since.as_deref(),
+                            req.limit,
+                        )
+                        .unwrap_or_default();
+                        let has_more = items.len() as u32 >= req.limit;
+                        let headers: Vec<cordelia_network::messages::ItemHeader> = items
+                            .iter()
+                            .map(|si| cordelia_network::messages::ItemHeader {
+                                item_id: si.item_id.clone(),
+                                channel_id: si.channel_id.clone(),
+                                item_type: si.item_type.clone(),
+                                content_hash: si.content_hash.clone(),
+                                author_id: si.author_id.clone(),
+                                signature: si.signature.clone(),
+                                key_version: si.key_version as u32,
+                                published_at: si.published_at.clone(),
+                                is_tombstone: si.is_tombstone,
+                                parent_id: si.parent_id.clone(),
+                            })
+                            .collect();
+                        (headers, has_more)
+                    }; // db lock dropped
+
+                    let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                        cordelia_network::messages::SyncResponse {
+                            items: headers,
+                            has_more,
+                        },
+                    );
+                    let _ = cordelia_network::codec::write_frame(&mut send, &resp).await;
+                    tracing::debug!(peer = %peer_id, channel = %req.channel_id, "served sync request");
+
+                    // Handle optional FetchRequest on same stream
+                    if let Ok(fetch_msg) = cordelia_network::codec::read_frame(&mut recv).await {
+                        if let cordelia_network::messages::WireMessage::FetchRequest(freq) = fetch_msg {
+                            let fetch_items = {
+                                let db = match state.db.lock() {
+                                    Ok(db) => db,
+                                    Err(_) => continue,
+                                };
+                                let items = cordelia_storage::items::query_listen(
+                                    &db,
+                                    &req.channel_id,
+                                    None,
+                                    1000,
+                                )
+                                .unwrap_or_default();
+                                items
+                                    .into_iter()
+                                    .filter(|si| freq.item_ids.contains(&si.item_id))
+                                    .map(|si| cordelia_network::messages::Item {
+                                        item_id: si.item_id,
+                                        channel_id: si.channel_id,
+                                        item_type: si.item_type,
+                                        encrypted_blob: si.encrypted_blob,
+                                        content_hash: si.content_hash,
+                                        content_length: 0,
+                                        author_id: si.author_id,
+                                        signature: si.signature,
+                                        key_version: si.key_version as u32,
+                                        published_at: si.published_at,
+                                        is_tombstone: si.is_tombstone,
+                                        parent_id: si.parent_id,
+                                    })
+                                    .collect::<Vec<_>>()
+                            }; // db lock dropped
+                            let fresp = cordelia_network::messages::WireMessage::FetchResponse(
+                                cordelia_network::messages::FetchResponse { items: fetch_items },
+                            );
+                            let _ = cordelia_network::codec::write_frame(&mut send, &fresp).await;
+                            tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
+                        }
+                    }
                 }
             }
             cordelia_network::messages::Protocol::PeerSharing => {

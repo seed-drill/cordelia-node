@@ -22,6 +22,8 @@ pub struct PushItem {
     pub item_type: String,
     pub is_tombstone: bool,
     pub parent_id: Option<String>,
+    /// If set, don't push back to this peer (relay re-push loop prevention).
+    pub exclude_peer: Option<cordelia_core::NodeId>,
 }
 
 /// Shared state accessible from all request handlers.
