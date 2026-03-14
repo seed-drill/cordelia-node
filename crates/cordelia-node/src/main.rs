@@ -456,6 +456,16 @@ async fn p2p_loop(
                         let count = conn_mgr.connection_count() as u64;
                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
+
+                        // Spawn stream handler for this peer's inbound protocol streams
+                        if let Some(conn) = conn_mgr.get_connection(&node_id) {
+                            let conn = conn.clone();
+                            let peer_id = node_id.clone();
+                            let db_state = state.clone();
+                            tokio::spawn(async move {
+                                handle_peer_streams(conn, peer_id, db_state).await;
+                            });
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "inbound connection failed");
@@ -525,6 +535,122 @@ async fn p2p_loop(
                     conn_mgr.shutdown();
                     break;
                 }
+            }
+        }
+    }
+}
+
+/// Handle inbound protocol streams from a connected peer.
+/// Runs until the connection closes.
+async fn handle_peer_streams(
+    conn: quinn::Connection,
+    peer_id: cordelia_core::NodeId,
+    state: web::Data<cordelia_api::state::AppState>,
+) {
+    loop {
+        // Accept next bidirectional stream from this peer
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(streams) => streams,
+            Err(_) => {
+                tracing::debug!(peer = %peer_id, "peer connection closed");
+                break;
+            }
+        };
+
+        // Read protocol byte to determine handler
+        let protocol = match cordelia_network::codec::read_protocol_byte(&mut recv).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(peer = %peer_id, error = %e, "failed to read protocol byte");
+                continue;
+            }
+        };
+
+        match protocol {
+            cordelia_network::messages::Protocol::ItemPush => {
+                // Read push payload
+                let msg = match cordelia_network::codec::read_frame(&mut recv).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
+                        continue;
+                    }
+                };
+
+                if let cordelia_network::messages::WireMessage::PushPayload(payload) = msg {
+                    let mut stored = 0u32;
+                    let mut dedup = 0u32;
+
+                    // Scope the DB lock so it's dropped before the await
+                    {
+                        let db = match state.db.lock() {
+                            Ok(db) => db,
+                            Err(_) => continue,
+                        };
+
+                        for item in &payload.items {
+                            if !cordelia_network::item_sync::verify_content_hash(item) {
+                                tracing::warn!(item = %item.item_id, "content hash mismatch");
+                                continue;
+                            }
+
+                            let author: [u8; 32] = match item.author_id.as_slice().try_into() {
+                                Ok(a) => a,
+                                Err(_) => continue,
+                            };
+                            let hash: [u8; 32] = match item.content_hash.as_slice().try_into() {
+                                Ok(h) => h,
+                                Err(_) => continue,
+                            };
+                            let sig: [u8; 64] = match item.signature.as_slice().try_into() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+
+                            let new_item = cordelia_storage::items::NewItem {
+                                item_id: &item.item_id,
+                                channel_id: &item.channel_id,
+                                author_id: &author,
+                                item_type: &item.item_type,
+                                published_at: &item.published_at,
+                                parent_id: item.parent_id.as_deref(),
+                                key_version: item.key_version as i64,
+                                content_hash: &hash,
+                                signature: &sig,
+                                encrypted_blob: &item.encrypted_blob,
+                            };
+
+                            match cordelia_storage::items::insert_item(&db, &new_item) {
+                                Ok(true) => stored += 1,
+                                Ok(false) => dedup += 1,
+                                Err(e) => {
+                                    tracing::debug!(item = %item.item_id, error = %e, "store failed");
+                                }
+                            }
+                        }
+                    } // db lock dropped here
+
+                    tracing::debug!(
+                        peer = %peer_id,
+                        stored, dedup,
+                        items = payload.items.len(),
+                        "processed inbound push"
+                    );
+
+                    // Send ack (safe to await now, db lock is released)
+                    let ack = cordelia_network::messages::WireMessage::PushAck(
+                        cordelia_network::messages::PushAck {
+                            stored,
+                            dedup_dropped: dedup,
+                            policy_rejected: 0,
+                            verification_failed: 0,
+                        },
+                    );
+                    let _ = cordelia_network::codec::write_frame(&mut send, &ack).await;
+                }
+            }
+            other => {
+                tracing::debug!(peer = %peer_id, protocol = ?other, "ignoring unhandled protocol");
             }
         }
     }

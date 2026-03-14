@@ -16,6 +16,7 @@ cordelia-storage = { workspace = true }
 cordelia-network = { workspace = true }
 cordelia-api = { workspace = true }
 tokio = { workspace = true }
+quinn = { workspace = true }
 actix-web = { workspace = true }
 rusqlite = { workspace = true }
 clap = { workspace = true }
