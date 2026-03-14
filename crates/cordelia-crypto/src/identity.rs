@@ -347,4 +347,73 @@ mod tests {
             "4546babdb9482396c167af11d21953bfa49eb9f630c45de93ee4d3b9ef059576"
         );
     }
+
+    // T1-1 (HIGH): x25519_pub_from_ed25519_pub round-trip
+    #[test]
+    fn test_x25519_pub_from_ed25519_pub_matches_seed_derivation() {
+        let id = NodeIdentity::generate().unwrap();
+        let ed_pk = id.public_key();
+        let x_pub_from_seed = id.x25519_public_key();
+        let x_pub_from_birational = x25519_pub_from_ed25519_pub(&ed_pk);
+        assert_eq!(x_pub_from_seed, x_pub_from_birational);
+    }
+
+    // T1-1: Known test vector (TV1 from spec)
+    #[test]
+    fn test_x25519_pub_from_ed25519_pub_tv1() {
+        let seed =
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap();
+        let id = NodeIdentity::from_seed(seed.try_into().unwrap()).unwrap();
+        let ed_pk = id.public_key();
+        let x_pub = x25519_pub_from_ed25519_pub(&ed_pk);
+        assert_eq!(
+            hex::encode(x_pub),
+            "d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e"
+        );
+    }
+
+    // T3-5 (LOW): Arbitrary bytes produce a result without panicking
+    #[test]
+    fn test_x25519_pub_from_ed25519_pub_arbitrary_input() {
+        // Any 32-byte input should produce a 32-byte output (no panic)
+        // -- either a valid X25519 key or [0u8; 32] for invalid points
+        for byte in [0x00, 0x42, 0xFF] {
+            let input = [byte; 32];
+            let result = x25519_pub_from_ed25519_pub(&input);
+            assert_eq!(result.len(), 32);
+        }
+    }
+
+    // T3-4 (MEDIUM): Identity file wrong size
+    #[test]
+    fn test_identity_from_file_wrong_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_identity.key");
+        std::fs::write(&path, &[0u8; 16]).unwrap(); // 16 bytes, not 32
+        let result = NodeIdentity::from_file(&path);
+        assert!(result.is_err());
+    }
+
+    // T8-4 (LOW): File permissions on Unix
+    #[cfg(unix)]
+    #[test]
+    fn test_load_or_create_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        NodeIdentity::load_or_create(&path).unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    // T8-3 (LOW): generate_psk produces unique 32-byte values
+    #[test]
+    fn test_generate_psk() {
+        let psk1 = crate::generate_psk().unwrap();
+        let psk2 = crate::generate_psk().unwrap();
+        assert_eq!(psk1.len(), 32);
+        assert_eq!(psk2.len(), 32);
+        assert_ne!(psk1, psk2);
+    }
 }

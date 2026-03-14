@@ -345,4 +345,73 @@ mod tests {
         envelope.auth_tag[0] ^= 0xff;
         assert!(ecies_decrypt(&sk, &envelope).is_err());
     }
+
+    // T3-2 (MEDIUM): Tampered ephemeral public key
+    #[test]
+    fn test_ecies_tampered_ephemeral_pk_fails() {
+        let rng = SystemRandom::new();
+        let mut sk = [0u8; 32];
+        rng.fill(&mut sk).unwrap();
+        let pk = *PublicKey::from(&StaticSecret::from(sk)).as_bytes();
+
+        let mut envelope = ecies_encrypt(&pk, b"secret data").unwrap();
+        envelope.ephemeral_pk[0] ^= 0xff;
+        assert!(ecies_decrypt(&sk, &envelope).is_err());
+    }
+
+    // T3-3 (MEDIUM): Tampered IV
+    #[test]
+    fn test_ecies_tampered_iv_fails() {
+        let rng = SystemRandom::new();
+        let mut sk = [0u8; 32];
+        rng.fill(&mut sk).unwrap();
+        let pk = *PublicKey::from(&StaticSecret::from(sk)).as_bytes();
+
+        let mut envelope = ecies_encrypt(&pk, b"secret data").unwrap();
+        envelope.iv[0] ^= 0xff;
+        assert!(ecies_decrypt(&sk, &envelope).is_err());
+    }
+
+    // T3-1 (MEDIUM): from_bytes wrong size
+    #[test]
+    fn test_ecies_from_bytes_wrong_size() {
+        let short = vec![0u8; 91]; // 92 expected for 32-byte plaintext
+        assert!(EciesEnvelope::from_bytes(&short, 32).is_err());
+
+        let long = vec![0u8; 93];
+        assert!(EciesEnvelope::from_bytes(&long, 32).is_err());
+    }
+
+    // T5-2 (MEDIUM): Variable plaintext sizes
+    #[test]
+    fn test_ecies_variable_plaintext_sizes() {
+        let rng = SystemRandom::new();
+        let mut sk = [0u8; 32];
+        rng.fill(&mut sk).unwrap();
+        let pk = *PublicKey::from(&StaticSecret::from(sk)).as_bytes();
+
+        for size in [1, 16, 64, 256] {
+            let plaintext = vec![0xAA; size];
+            let envelope = ecies_encrypt(&pk, &plaintext).unwrap();
+            let decrypted = ecies_decrypt(&sk, &envelope).unwrap();
+            assert_eq!(decrypted, plaintext, "failed for size {size}");
+        }
+    }
+
+    // T8-1 (MEDIUM): Wrong key returns specific error variant
+    #[test]
+    fn test_ecies_wrong_key_returns_decryption_failed() {
+        let rng = SystemRandom::new();
+        let mut sk1 = [0u8; 32];
+        let mut sk2 = [0u8; 32];
+        rng.fill(&mut sk1).unwrap();
+        rng.fill(&mut sk2).unwrap();
+        let pk1 = *PublicKey::from(&StaticSecret::from(sk1)).as_bytes();
+
+        let envelope = ecies_encrypt(&pk1, b"secret").unwrap();
+        match ecies_decrypt(&sk2, &envelope) {
+            Err(CryptoError::DecryptionFailed) => {} // expected
+            other => panic!("expected DecryptionFailed, got {:?}", other),
+        }
+    }
 }

@@ -90,4 +90,34 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
+
+    // T4-1 (HIGH): Full PSK distribution flow -- identity -> ECIES -> item encrypt/decrypt
+    #[test]
+    fn test_full_psk_distribution_flow() {
+        // Sender creates a channel with a PSK
+        let sender = NodeIdentity::generate().unwrap();
+        let recipient = NodeIdentity::generate().unwrap();
+        let psk = generate_psk().unwrap();
+
+        // Sender encrypts PSK for recipient using ECIES
+        let recipient_xpk = recipient.x25519_public_key();
+        let envelope = ecies_encrypt(&recipient_xpk, &psk).unwrap();
+
+        // Simulate wire transfer: serialize to bytes and back
+        let wire_bytes = envelope.to_bytes();
+        let received = EciesEnvelope::from_bytes(&wire_bytes, 32).unwrap();
+
+        // Recipient decrypts PSK
+        let recipient_xsk = recipient.x25519_private_key();
+        let recovered_psk_vec = ecies_decrypt(&recipient_xsk, &received).unwrap();
+        let recovered_psk: [u8; 32] = recovered_psk_vec.try_into().unwrap();
+        assert_eq!(recovered_psk, psk);
+
+        // Both sides can now encrypt/decrypt items with the shared PSK
+        let plaintext = b"hello from sender";
+        let aad = b"test_channel_abc";
+        let ciphertext = item_encrypt(&psk, plaintext, aad).unwrap();
+        let decrypted = item_decrypt(&recovered_psk, &ciphertext, aad).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
 }
