@@ -39,6 +39,7 @@ pub struct GovernorTargets {
     pub warm_max: usize,
     pub cold_max: usize,
     pub churn_interval_secs: u64,
+    pub churn_jitter_secs: u64,
     pub churn_fraction: f64,
 }
 
@@ -51,6 +52,7 @@ impl Default for GovernorTargets {
             warm_max: 50,
             cold_max: 100,
             churn_interval_secs: 3600,
+            churn_jitter_secs: 300,
             churn_fraction: 0.2,
         }
     }
@@ -66,6 +68,7 @@ impl GovernorTargets {
             warm_max: cfg.warm_max as usize,
             cold_max: cfg.cold_max as usize,
             churn_interval_secs: cfg.churn_interval_secs as u64,
+            churn_jitter_secs: cfg.churn_jitter_secs as u64,
             churn_fraction: cfg.churn_fraction,
         }
     }
@@ -560,11 +563,14 @@ impl Governor {
             .peers
             .values()
             .filter(|p| {
-                matches!(p.state, PeerState::Cold) && self.is_dialable(p) && {
-                    let backoff = Self::reconnect_backoff(p.disconnect_count);
-                    p.last_disconnected
-                        .is_none_or(|t| now.duration_since(t) >= backoff)
-                }
+                matches!(p.state, PeerState::Cold)
+                    && self.is_dialable(p)
+                    && p.disconnect_count < BACKOFF_SATURATION // max_connection_retries
+                    && {
+                        let backoff = Self::reconnect_backoff(p.disconnect_count);
+                        p.last_disconnected
+                            .is_none_or(|t| now.duration_since(t) >= backoff)
+                    }
             })
             .map(|p| (p.node_id.clone(), p.has_group_overlap(&self.our_groups)))
             .collect();
@@ -680,7 +686,15 @@ impl Governor {
     }
 
     fn churn(&mut self, actions: &mut GovernorActions) {
-        if self.last_churn.elapsed() < Duration::from_secs(self.targets.churn_interval_secs) {
+        // Add deterministic jitter to prevent correlated churn across nodes
+        let jitter = if self.targets.churn_jitter_secs > 0 {
+            let seed = self.last_churn.elapsed().as_nanos() as u64;
+            seed % self.targets.churn_jitter_secs
+        } else {
+            0
+        };
+        let interval = self.targets.churn_interval_secs + jitter;
+        if self.last_churn.elapsed() < Duration::from_secs(interval) {
             return;
         }
         self.last_churn = Instant::now();
@@ -726,6 +740,31 @@ impl Governor {
 
         for id in cold_ids {
             actions.connect.push(id);
+        }
+
+        // Hot-tier churn: demote 1 random hot peer, promote 1 random warm (§5.4 step 6)
+        let (hot, _, _, _) = self.counts();
+        if hot > self.targets.hot_min {
+            // Pick a random non-trusted hot peer to demote
+            let hot_peers: Vec<NodeId> = self
+                .peers
+                .values()
+                .filter(|p| p.state == PeerState::Hot)
+                .map(|p| p.node_id.clone())
+                .collect();
+            if !hot_peers.is_empty() {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as usize;
+                let victim = &hot_peers[seed % hot_peers.len()];
+                if let Some(peer) = self.peers.get_mut(victim) {
+                    tracing::info!(peer = %victim, "gov: churn hot -> warm");
+                    peer.state = PeerState::Warm;
+                    peer.demoted_at = Some(Instant::now());
+                    actions.transitions.push((victim.clone(), "hot".into(), "warm".into()));
+                }
+            }
         }
     }
 

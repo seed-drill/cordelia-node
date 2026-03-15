@@ -507,8 +507,12 @@ async fn p2p_loop(
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await; // skip first immediate tick
 
-    // Governor event channel: spawned tasks report items_delivered back
-    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<(cordelia_core::NodeId, u64)>();
+    // Governor event channel: spawned tasks report events back to governor
+    enum GovEvent {
+        ItemsDelivered(cordelia_core::NodeId, u64),
+        Activity(cordelia_core::NodeId),
+    }
+    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
     loop {
         tokio::select! {
@@ -868,7 +872,7 @@ async fn p2p_loop(
                                     stored = stored_count,
                                     "pull-sync complete"
                                 );
-                                let _ = gtx.send((target.clone(), stored_count as u64));
+                                let _ = gtx.send(GovEvent::ItemsDelivered(target.clone(), stored_count as u64));
                             }
                         }
                     });
@@ -878,15 +882,28 @@ async fn p2p_loop(
 
             // Governor tick: peer promotion/demotion/churn (§5.4)
             _ = gov_interval.tick() => {
-                // Drain governor event channel: items_delivered feedback from sync tasks
-                while let Ok((peer_id, count)) = gov_rx.try_recv() {
-                    governor.record_items_delivered(&peer_id, count);
+                // Drain governor event channel
+                while let Ok(event) = gov_rx.try_recv() {
+                    match event {
+                        GovEvent::ItemsDelivered(peer_id, count) => {
+                            governor.record_items_delivered(&peer_id, count);
+                        }
+                        GovEvent::Activity(peer_id) => {
+                            governor.record_activity(&peer_id, None);
+                        }
+                    }
                 }
-                // Sync governor with connection manager: detect disconnected peers
+                // Sync governor with connection manager
                 let connected = conn_mgr.connected_peers();
-                for peer_id in governor.hot_peers() {
-                    if !connected.contains(&peer_id) {
-                        governor.mark_disconnected(&peer_id);
+                // Mark all connected peers as active (alive)
+                for peer_id in &connected {
+                    governor.record_activity(peer_id, None);
+                }
+                // Detect disconnected peers (governor knows, conn_mgr doesn't)
+                let gov_active: Vec<_> = governor.hot_peers();
+                for peer_id in &gov_active {
+                    if !connected.contains(peer_id) {
+                        governor.mark_disconnected(peer_id);
                     }
                 }
                 // Update hot/warm peer counts in shared state
