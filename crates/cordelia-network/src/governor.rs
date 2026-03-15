@@ -264,18 +264,27 @@ impl Governor {
         }
     }
 
-    /// Mark peer as connected (Warm state).
+    /// Mark peer as connected. Promotes to Hot immediately if there's room
+    /// (hot_count < hot_max), otherwise Warm. This ensures newly connected
+    /// peers participate in push/sync without waiting for the next tick.
     pub fn mark_connected(&mut self, node_id: &NodeId) {
+        let hot_count = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot)
+            .count();
         if let Some(peer) = self.peers.get_mut(node_id) {
             if peer.state == PeerState::Cold {
-                tracing::debug!(
-                    peer = %node_id,
-                    disconnect_count = peer.disconnect_count,
-                    "gov: cold -> warm (connected)"
-                );
-                peer.state = PeerState::Warm;
                 peer.connected_since = Some(Instant::now());
                 peer.last_activity = Instant::now();
+                if hot_count < self.targets.hot_max {
+                    tracing::info!(peer = %node_id, "gov: cold -> hot (immediate, room in hot set)");
+                    peer.state = PeerState::Hot;
+                    peer.disconnect_count = 0; // reset backoff on promotion
+                } else {
+                    tracing::debug!(peer = %node_id, "gov: cold -> warm (hot set full)");
+                    peer.state = PeerState::Warm;
+                }
             }
         }
     }
@@ -816,14 +825,13 @@ mod tests {
             gov.mark_connected(&id);
         }
 
+        // With hot_max=20, all 5 are immediately promoted to Hot
         let (hot, warm, _, _) = gov.counts();
-        assert_eq!(hot, 0);
-        assert_eq!(warm, 5);
+        assert_eq!(hot, 5);
+        assert_eq!(warm, 0);
 
-        let actions = gov.tick();
-        let (hot, _, _, _) = gov.counts();
-        assert!(hot >= 2, "should have promoted to hot");
-        assert!(!actions.transitions.is_empty());
+        // Tick has no promotions needed (all already hot)
+        let _actions = gov.tick();
     }
 
     #[test]
@@ -903,21 +911,21 @@ mod tests {
         assert_eq!(*gov.peer_state(&id).unwrap(), PeerState::Cold);
         assert_eq!(gov.peer_info(&id).unwrap().disconnect_count, 0);
 
-        // Warm peer: back to Cold with tracking
+        // Connected peer (Hot, room available): back to Cold with tracking
         gov.mark_connected(&id);
-        assert_eq!(*gov.peer_state(&id).unwrap(), PeerState::Warm);
+        assert_eq!(*gov.peer_state(&id).unwrap(), PeerState::Hot); // immediate promotion
         gov.mark_disconnected(&id);
         assert_eq!(*gov.peer_state(&id).unwrap(), PeerState::Cold);
         assert!(gov.peer_info(&id).unwrap().connected_since.is_none());
         assert_eq!(gov.peer_info(&id).unwrap().disconnect_count, 1);
         assert!(gov.peer_info(&id).unwrap().last_disconnected.is_some());
 
-        // Hot peer: back to Cold, increment count
+        // Reconnect Hot peer: dc reset to 0 on connect, then back to Cold (dc=1)
         gov.mark_connected(&id);
-        gov.peers.get_mut(&id).unwrap().state = PeerState::Hot;
+        assert_eq!(gov.peer_info(&id).unwrap().disconnect_count, 0); // reset on promotion
         gov.mark_disconnected(&id);
         assert_eq!(*gov.peer_state(&id).unwrap(), PeerState::Cold);
-        assert_eq!(gov.peer_info(&id).unwrap().disconnect_count, 2);
+        assert_eq!(gov.peer_info(&id).unwrap().disconnect_count, 1);
     }
 
     #[test]
@@ -986,17 +994,15 @@ mod tests {
         };
         let mut gov = Governor::new(targets, vec!["g1".into()]);
 
+        // mark_connected promotes to Hot immediately (dc=0)
         let id = make_node_id(1);
         gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
         gov.mark_connected(&id);
-        gov.peers.get_mut(&id).unwrap().disconnect_count = 3;
-
-        let _actions = gov.tick();
         let peer = gov.peer_info(&id).unwrap();
         assert_eq!(peer.state, PeerState::Hot);
         assert_eq!(
             peer.disconnect_count, 0,
-            "hot promotion should reset backoff"
+            "immediate hot promotion should reset backoff"
         );
     }
 
@@ -1113,13 +1119,13 @@ mod tests {
 
         gov.add_peer(real_id.clone(), make_addr(), vec!["g1".into()]);
         gov.mark_connected(&real_id);
-        assert_eq!(*gov.peer_state(&real_id).unwrap(), PeerState::Warm);
+        assert_eq!(*gov.peer_state(&real_id).unwrap(), PeerState::Hot); // immediate promotion
 
         let replaced = gov.replace_node_id(&placeholder_id, real_id.clone(), vec!["g1".into()]);
         assert!(replaced);
 
         let peer = gov.peer_info(&real_id).unwrap();
-        assert_eq!(peer.state, PeerState::Warm);
+        assert_eq!(peer.state, PeerState::Hot); // keeps Hot state
         assert!(peer.is_relay);
         assert!(gov.peer_info(&placeholder_id).is_none());
     }
