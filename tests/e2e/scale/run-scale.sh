@@ -25,7 +25,7 @@ if [ ! -f "$COMPOSE" ]; then
 fi
 
 # Count personal nodes
-PERSONAL=$(grep -c "role = \"personal\"" "$OUT_DIR/configs/"*.toml)
+PERSONAL=$(grep -rl "role = \"personal\"" "$OUT_DIR/configs/" | wc -l | tr -d ' ')
 echo "Personal nodes: $PERSONAL"
 
 # Generate PSK
