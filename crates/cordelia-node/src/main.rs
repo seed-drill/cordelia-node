@@ -514,6 +514,9 @@ async fn p2p_loop(
     }
     let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
+    // Delivery feedback channel: handle_peer_streams reports items stored via push
+    let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(cordelia_core::NodeId, u64)>();
+
     loop {
         tokio::select! {
             // Accept incoming connection
@@ -541,8 +544,9 @@ async fn p2p_loop(
                             let peers_ref = shared_peers.clone();
                             let role = node_role.clone();
                             let ptx = relay_push_tx.clone();
+                            let dtx = delivery_tx.clone();
                             tokio::spawn(async move {
-                                handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx).await;
+                                handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
                             });
                         }
                     }
@@ -617,8 +621,9 @@ async fn p2p_loop(
                                             let peers_ref = shared_peers.clone();
                                             let role = node_role.clone();
                                             let ptx = relay_push_tx.clone();
+                                            let dtx = delivery_tx.clone();
                                             tokio::spawn(async move {
-                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
+                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
                                             });
                                         }
                                     }
@@ -882,7 +887,7 @@ async fn p2p_loop(
 
             // Governor tick: peer promotion/demotion/churn (§5.4)
             _ = gov_interval.tick() => {
-                // Drain governor event channel
+                // Drain governor event channels
                 while let Ok(event) = gov_rx.try_recv() {
                     match event {
                         GovEvent::ItemsDelivered(peer_id, count) => {
@@ -892,6 +897,10 @@ async fn p2p_loop(
                             governor.record_activity(&peer_id, None);
                         }
                     }
+                }
+                // Drain push delivery feedback from handle_peer_streams
+                while let Ok((peer_id, count)) = delivery_rx.try_recv() {
+                    governor.record_items_delivered(&peer_id, count);
                 }
                 // Sync governor with connection manager
                 let connected = conn_mgr.connected_peers();
@@ -939,8 +948,9 @@ async fn p2p_loop(
                                             let peers_ref = shared_peers.clone();
                                             let role = node_role.clone();
                                             let ptx = relay_push_tx.clone();
+                                            let dtx = delivery_tx.clone();
                                             tokio::spawn(async move {
-                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
+                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
                                             });
                                         }
                                     }
@@ -983,6 +993,7 @@ async fn handle_peer_streams(
     shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: String,
     push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
+    delivery_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_core::NodeId, u64)>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -1100,6 +1111,11 @@ async fn handle_peer_streams(
                         items = payload.items.len(),
                         "processed inbound push"
                     );
+
+                    // Report items delivered to governor for scoring
+                    if stored > 0 {
+                        let _ = delivery_tx.send((peer_id.clone(), stored as u64));
+                    }
 
                     // Relay re-push: if we're a relay, forward to other peers
                     if node_role == "relay" && stored > 0 {
