@@ -178,15 +178,20 @@ impl ConnectionManager {
         let node_id = NodeId(peer_node_id);
 
         if self.connections.contains_key(&node_id) {
+            tracing::warn!(peer = %node_id, remote = %conn.remote_address(), "rejecting duplicate connection (already connected)");
             conn.close(0u32.into(), b"duplicate");
             return Err(ConnectionError::AlreadyConnected(node_id));
         }
 
         // Accept handshake on the first bidirectional stream
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+        tracing::debug!(peer = %node_id, "accept: waiting for handshake stream (accept_bi)");
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(peer = %node_id, error = %e, "accept: accept_bi failed");
+                return Err(ConnectionError::Quinn(e.to_string()));
+            }
+        };
 
         let mut stream = tokio::io::join(&mut recv, &mut send);
 
@@ -226,9 +231,25 @@ impl ConnectionManager {
             .accept()
             .await
             .ok_or_else(|| ConnectionError::Quinn("endpoint closed".into()))?;
-        let conn = incoming
-            .await
-            .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+        let remote = incoming.remote_address();
+        tracing::debug!(remote = %remote, "QUIC incoming connection received");
+        let conn = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed (before app layer)");
+                return Err(ConnectionError::Quinn(e.to_string()));
+            }
+        };
+        let peer_node_id_result = extract_node_id_from_conn(&conn);
+        match &peer_node_id_result {
+            Ok(pk) => {
+                let node_id = NodeId(*pk);
+                tracing::debug!(remote = %remote, peer = %node_id, "QUIC connection established, starting app handshake");
+            }
+            Err(e) => {
+                tracing::warn!(remote = %remote, error = %e, "failed to extract node_id from TLS cert");
+            }
+        }
         self.accept_connection(conn).await
     }
 
