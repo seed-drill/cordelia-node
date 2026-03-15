@@ -233,11 +233,19 @@ impl ConnectionManager {
             .ok_or_else(|| ConnectionError::Quinn("endpoint closed".into()))?;
         let remote = incoming.remote_address();
         tracing::debug!(remote = %remote, "QUIC incoming connection received");
-        let conn = match incoming.await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed (before app layer)");
+        // QUIC handshake with 10s timeout -- prevents blocking the select loop
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(10),
+            incoming,
+        ).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed");
                 return Err(ConnectionError::Quinn(e.to_string()));
+            }
+            Err(_) => {
+                tracing::warn!(remote = %remote, "QUIC incoming handshake timed out (10s)");
+                return Err(ConnectionError::Quinn("incoming handshake timeout".into()));
             }
         };
         let peer_node_id_result = extract_node_id_from_conn(&conn);
