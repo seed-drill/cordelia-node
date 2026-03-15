@@ -119,7 +119,7 @@ done
 # Generate personal node configs
 for i in $(seq 0 $((PERSONAL - 1))); do
     name="p$((i + 1))"
-    # Each personal node connects to first bootnode
+    # Each personal node connects to first bootnode + first relay
     cat > "$CONFIG_DIR/${name}.toml" << TOML
 [identity]
 entity_id = "${name}_test"
@@ -138,6 +138,9 @@ dns_discovery = ""
 
 [[network.bootnodes]]
 addr = "${bootnode_ips[0]}:9474"
+
+[[network.bootnodes]]
+addr = "172.28.0.20:9474"
 
 [governor]
 hot_min = 10
