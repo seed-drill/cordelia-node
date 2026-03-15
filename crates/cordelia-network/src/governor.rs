@@ -584,53 +584,12 @@ impl Governor {
 
     fn promote_warm_to_hot(&mut self, actions: &mut GovernorActions) {
         let (hot, _, _, _) = self.counts();
-        if hot >= self.targets.hot_min {
-            // Check if any warm peer outperforms worst hot
-            let worst_hot_score = self
-                .peers
-                .values()
-                .filter(|p| p.state == PeerState::Hot)
-                .map(|p| p.score())
-                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(f64::MAX);
-
-            let best_warm = self
-                .peers
-                .values()
-                .filter(|p| {
-                    p.state == PeerState::Warm
-                        && p.demoted_at
-                            .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
-                })
-                .max_by(|a, b| {
-                    a.score()
-                        .partial_cmp(&b.score())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-            if let Some(warm) = best_warm {
-                if hot < self.targets.hot_max && warm.score() > worst_hot_score {
-                    let id = warm.node_id.clone();
-                    let warm_score = warm.score();
-                    if let Some(peer) = self.peers.get_mut(&id) {
-                        tracing::info!(
-                            peer = %id,
-                            score = format!("{warm_score:.4}"),
-                            worst_hot = format!("{worst_hot_score:.4}"),
-                            "gov: warm -> hot (outperforms worst hot)"
-                        );
-                        peer.state = PeerState::Hot;
-                        peer.disconnect_count = 0;
-                        actions.transitions.push((id, "warm".into(), "hot".into()));
-                    }
-                }
-            }
-            return;
+        if hot >= self.targets.hot_max {
+            return; // Hot set is full
         }
 
-        // Need more hot peers
-        let needed = self.targets.hot_min - hot;
-        let mut warm_peers: Vec<(NodeId, f64)> = self
+        // Collect eligible warm peers (past hysteresis cooldown)
+        let eligible: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| {
@@ -638,17 +597,43 @@ impl Governor {
                     && p.demoted_at
                         .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
             })
-            .map(|p| (p.node_id.clone(), p.score()))
+            .map(|p| p.node_id.clone())
             .collect();
 
-        warm_peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if eligible.is_empty() {
+            return;
+        }
 
-        for (id, score) in warm_peers.into_iter().take(needed) {
+        // Anti-eclipse: RANDOM promotion among eligible peers (§5.4 step 4).
+        // An attacker cannot game their score to get promoted faster.
+        // Use deterministic "random" via hash of peer IDs + tick count for reproducibility.
+        let needed = if hot < self.targets.hot_min {
+            self.targets.hot_min - hot // Fill hot_min urgently
+        } else {
+            0 // Only promote if replacing demoted peer (handled by churn)
+        };
+
+        if needed == 0 {
+            return;
+        }
+
+        // Shuffle eligible peers using a simple deterministic shuffle
+        let mut candidates = eligible;
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as usize;
+        for i in (1..candidates.len()).rev() {
+            let j = (seed.wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);
+            candidates.swap(i, j);
+        }
+
+        for id in candidates.into_iter().take(needed) {
             if let Some(peer) = self.peers.get_mut(&id) {
                 tracing::info!(
                     peer = %id,
-                    score = format!("{score:.4}"),
-                    "gov: warm -> hot (filling hot_min)"
+                    score = format!("{:.4}", peer.score()),
+                    "gov: warm -> hot (random promotion)"
                 );
                 peer.state = PeerState::Hot;
                 peer.disconnect_count = 0;

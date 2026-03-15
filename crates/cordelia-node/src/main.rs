@@ -411,7 +411,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let role_for_p2p = config.network.role.clone();
         let p2p_handle = tokio::spawn(async move {
-            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p).await;
+            p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone()).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -458,6 +458,7 @@ async fn p2p_loop(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     allow_private_addresses: bool,
     node_role: String,
+    gov_config: cordelia_core::config::GovernorConfig,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -478,16 +479,10 @@ async fn p2p_loop(
     let our_node_id = cordelia_core::NodeId(state.identity.public_key());
 
     // Governor: manages Hot/Warm/Cold peer lifecycle (§5)
-    let gov_targets = cordelia_network::governor::GovernorTargets {
-        hot_min: 1,
-        hot_max: 20,
-        warm_min: 1,
-        warm_max: 50,
-        cold_max: 100,
-        churn_interval_secs: 3600,
-        churn_fraction: 0.2,
-    };
-    let mut governor = cordelia_network::governor::Governor::new(gov_targets, vec![]);
+    let gov_targets = cordelia_network::governor::GovernorTargets::from_config(&gov_config);
+    let gov_timeouts = cordelia_network::governor::GovernorTimeouts::from_config(&gov_config);
+    let mut governor = cordelia_network::governor::Governor::new(gov_targets, vec![])
+        .with_timeouts(gov_timeouts);
 
     // Register any peers from bootstrap as connected
     for peer_id in conn_mgr.connected_peers() {

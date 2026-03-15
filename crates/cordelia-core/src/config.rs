@@ -67,12 +67,15 @@ pub struct GovernorConfig {
     pub cold_max: u32,
     pub tick_interval_secs: u32,
     pub churn_interval_secs: u32,
+    pub churn_jitter_secs: u32,
     pub churn_fraction: f64,
     pub min_warm_tenure_secs: u32,
     pub hysteresis_secs: u32,
     pub keepalive_timeout_secs: u32,
     pub stale_threshold_secs: u32,
     pub ema_alpha: f64,
+    pub max_connection_retries: u32,
+    pub clear_failure_delay_secs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,15 +175,18 @@ impl Default for GovernorConfig {
             hot_max: 20,
             warm_min: 10,
             warm_max: 50,
-            cold_max: 100,
+            cold_max: 200,
             tick_interval_secs: 10,
             churn_interval_secs: 3600,
+            churn_jitter_secs: 300,
             churn_fraction: 0.2,
             min_warm_tenure_secs: 300,
             hysteresis_secs: 90,
             keepalive_timeout_secs: 90,
             stale_threshold_secs: 1800,
             ema_alpha: 0.1,
+            max_connection_retries: 5,
+            clear_failure_delay_secs: 120,
         }
     }
 }
