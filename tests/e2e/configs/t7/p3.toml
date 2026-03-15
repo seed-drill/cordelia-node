@@ -21,7 +21,7 @@ addr = "172.28.0.10:9474"
 addr = "172.28.0.20:9474"
 
 [governor]
-hot_min = 1
+hot_min = 5
 hot_max = 5
 warm_min = 1
 warm_max = 5

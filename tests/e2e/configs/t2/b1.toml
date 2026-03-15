@@ -15,7 +15,7 @@ dns_discovery = ""
 bootnodes = []
 
 [governor]
-hot_min = 1
+hot_min = 10
 hot_max = 10
 warm_min = 1
 warm_max = 10
