@@ -916,8 +916,9 @@ async fn p2p_loop(
                     }
                 }
                 // Update hot/warm peer counts in shared state
-                let (hot, warm, cold, banned) = governor.counts();
+                let (hot, warm, cold, _banned) = governor.counts();
                 state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
+                state.peers_warm.store(warm as u64, std::sync::atomic::Ordering::Relaxed);
 
                 let actions = governor.tick();
                 if !actions.transitions.is_empty() {

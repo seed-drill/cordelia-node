@@ -110,6 +110,7 @@ pub struct PeerInfo {
     pub node_id: NodeId,
     pub addrs: Vec<String>,
     pub state: PeerState,
+    pub state_changed_at: Instant,
     pub groups: Vec<String>,
     pub rtt_ms: Option<f64>,
     pub last_activity: Instant,
@@ -128,6 +129,7 @@ impl PeerInfo {
             node_id,
             addrs,
             state: PeerState::Cold,
+            state_changed_at: Instant::now(),
             groups,
             rtt_ms: None,
             last_activity: Instant::now(),
@@ -138,6 +140,17 @@ impl PeerInfo {
             last_disconnected: None,
             is_relay: false,
         }
+    }
+
+    /// Transition to a new state, updating state_changed_at.
+    pub fn set_state(&mut self, new_state: PeerState) {
+        self.state = new_state;
+        self.state_changed_at = Instant::now();
+    }
+
+    /// Check how long the peer has been in its current state.
+    pub fn state_tenure(&self) -> Duration {
+        self.state_changed_at.elapsed()
     }
 
     /// Performance score: items delivered per second, weighted by RTT.
@@ -283,12 +296,12 @@ impl Governor {
                 if hot_count < self.targets.hot_min {
                     // Bootstrap: urgently need hot peers, bypass tenure guard
                     tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
-                    peer.state = PeerState::Hot;
+                    peer.set_state(PeerState::Hot);
                     peer.disconnect_count = 0;
                 } else {
                     // Steady state: new peers start as Warm, must earn Hot via tenure
                     tracing::debug!(peer = %node_id, "gov: cold -> warm (tenure required)");
-                    peer.state = PeerState::Warm;
+                    peer.set_state(PeerState::Warm);
                 }
             }
         }
@@ -299,7 +312,7 @@ impl Governor {
         if let Some(peer) = self.peers.get_mut(node_id) {
             if peer.state.is_active() {
                 let from = peer.state.name();
-                peer.state = PeerState::Cold;
+                peer.set_state(PeerState::Cold);
                 peer.connected_since = None;
                 peer.disconnect_count += 1;
                 peer.last_disconnected = Some(Instant::now());
@@ -388,11 +401,11 @@ impl Governor {
                 ban_duration_secs = duration.as_secs(),
                 "gov: peer banned"
             );
-            peer.state = PeerState::Banned {
+            peer.set_state(PeerState::Banned {
                 until: Instant::now() + duration,
                 reason,
                 escalation,
-            };
+            });
             peer.connected_since = None;
         }
     }
@@ -496,7 +509,7 @@ impl Governor {
                         "gov: ban expired, returning to cold"
                     );
                     let from = peer.state.name().to_string();
-                    peer.state = PeerState::Cold;
+                    peer.set_state(PeerState::Cold);
                     actions
                         .transitions
                         .push((peer.node_id.clone(), from, "cold".into()));
@@ -528,7 +541,7 @@ impl Governor {
                             inactive_secs,
                             "gov: reaping dead hot peer -> warm"
                         );
-                        peer.state = PeerState::Warm;
+                        peer.set_state(PeerState::Warm);
                         peer.connected_since = None;
                         peer.demoted_at = Some(Instant::now());
                         actions.transitions.push((id, from, "warm".into()));
@@ -539,7 +552,7 @@ impl Governor {
                             inactive_secs,
                             "gov: reaping dead warm peer -> cold (disconnect)"
                         );
-                        peer.state = PeerState::Cold;
+                        peer.set_state(PeerState::Cold);
                         peer.connected_since = None;
                         actions.disconnect.push(id.clone());
                         actions.transitions.push((id, from, "cold".into()));
@@ -643,7 +656,7 @@ impl Governor {
                     score = format!("{:.4}", peer.score()),
                     "gov: warm -> hot (random promotion)"
                 );
-                peer.state = PeerState::Hot;
+                peer.set_state(PeerState::Hot);
                 peer.disconnect_count = 0;
                 actions.transitions.push((id, "warm".into(), "hot".into()));
             }
@@ -681,7 +694,7 @@ impl Governor {
                     is_stale,
                     "gov: hot -> warm (excess demotion)"
                 );
-                peer.state = PeerState::Warm;
+                peer.set_state(PeerState::Warm);
                 actions.transitions.push((id, "hot".into(), "warm".into()));
             }
         }
@@ -722,7 +735,7 @@ impl Governor {
         for id in &warm_ids {
             if let Some(peer) = self.peers.get_mut(id) {
                 tracing::debug!(peer = %id, "gov: churn warm -> cold");
-                peer.state = PeerState::Cold;
+                peer.set_state(PeerState::Cold);
                 peer.connected_since = None;
                 actions.disconnect.push(id.clone());
                 actions
@@ -762,7 +775,7 @@ impl Governor {
                 let victim = &hot_peers[seed % hot_peers.len()];
                 if let Some(peer) = self.peers.get_mut(victim) {
                     tracing::info!(peer = %victim, "gov: churn hot -> warm");
-                    peer.state = PeerState::Warm;
+                    peer.set_state(PeerState::Warm);
                     peer.demoted_at = Some(Instant::now());
                     actions.transitions.push((victim.clone(), "hot".into(), "warm".into()));
                 }
