@@ -512,6 +512,9 @@ async fn p2p_loop(
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await; // skip first immediate tick
 
+    // Governor event channel: spawned tasks report items_delivered back
+    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<(cordelia_core::NodeId, u64)>();
+
     loop {
         tokio::select! {
             // Accept incoming connection
@@ -743,6 +746,7 @@ async fn p2p_loop(
                     let sync_state = state.clone();
                     let sync_channels = channels.clone();
                     let target = target.clone();
+                    let gtx = gov_tx.clone();
                     tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
                     tokio::spawn(async move {
                         for ch_id in &sync_channels {
@@ -869,6 +873,7 @@ async fn p2p_loop(
                                     stored = stored_count,
                                     "pull-sync complete"
                                 );
+                                let _ = gtx.send((target.clone(), stored_count as u64));
                             }
                         }
                     });
@@ -878,8 +883,22 @@ async fn p2p_loop(
 
             // Governor tick: peer promotion/demotion/churn (§5.4)
             _ = gov_interval.tick() => {
-                let actions = governor.tick();
+                // Drain governor event channel: items_delivered feedback from sync tasks
+                while let Ok((peer_id, count)) = gov_rx.try_recv() {
+                    governor.record_items_delivered(&peer_id, count);
+                }
+                // Sync governor with connection manager: detect disconnected peers
+                let connected = conn_mgr.connected_peers();
+                for peer_id in governor.hot_peers() {
+                    if !connected.contains(&peer_id) {
+                        governor.mark_disconnected(&peer_id);
+                    }
+                }
+                // Update hot/warm peer counts in shared state
                 let (hot, warm, cold, banned) = governor.counts();
+                state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
+
+                let actions = governor.tick();
                 if !actions.transitions.is_empty() {
                     for (node_id, from, to) in &actions.transitions {
                         tracing::info!(peer = %node_id, from, to, "gov: state transition");
@@ -888,8 +907,46 @@ async fn p2p_loop(
                 // Disconnect peers the governor wants removed
                 for node_id in &actions.disconnect {
                     conn_mgr.disconnect(node_id);
-                    state.peers_hot.store(conn_mgr.connection_count() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Connect peers the governor wants promoted (Cold->Warm)
+                for node_id in &actions.connect {
+                    if let Some(peer) = governor.peer_info(node_id) {
+                        if let Some(addr_str) = peer.addrs.first() {
+                            if let Ok(addr) = addr_str.parse() {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    conn_mgr.connect_to(addr),
+                                ).await {
+                                    Ok(Ok(new_id)) => {
+                                        governor.mark_connected(&new_id);
+                                        tracing::info!(peer = %new_id, "gov: connected (promotion)");
+                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
+                                            let new_conn = new_conn.clone();
+                                            let peer_id = new_id;
+                                            let db_state = state.clone();
+                                            let peers_ref = shared_peers.clone();
+                                            let role = node_role.clone();
+                                            let ptx = relay_push_tx.clone();
+                                            tokio::spawn(async move {
+                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx).await;
+                                            });
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        governor.mark_dial_failed(node_id);
+                                        tracing::debug!(peer = %node_id, error = %e, "gov: connect failed");
+                                    }
+                                    Err(_) => {
+                                        governor.mark_dial_failed(node_id);
+                                        tracing::debug!(peer = %node_id, "gov: connect timed out (10s)");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let (hot, warm, cold, banned) = governor.counts();
+                state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(hot, warm, cold, banned, "gov: tick complete");
             }
 
