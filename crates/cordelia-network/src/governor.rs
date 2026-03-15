@@ -280,12 +280,14 @@ impl Governor {
             if peer.state == PeerState::Cold {
                 peer.connected_since = Some(Instant::now());
                 peer.last_activity = Instant::now();
-                if hot_count < self.targets.hot_max {
-                    tracing::info!(peer = %node_id, "gov: cold -> hot (immediate, room in hot set)");
+                if hot_count < self.targets.hot_min {
+                    // Bootstrap: urgently need hot peers, bypass tenure guard
+                    tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
                     peer.state = PeerState::Hot;
-                    peer.disconnect_count = 0; // reset backoff on promotion
+                    peer.disconnect_count = 0;
                 } else {
-                    tracing::debug!(peer = %node_id, "gov: cold -> warm (hot set full)");
+                    // Steady state: new peers start as Warm, must earn Hot via tenure
+                    tracing::debug!(peer = %node_id, "gov: cold -> warm (tenure required)");
                     peer.state = PeerState::Warm;
                 }
             }
@@ -849,12 +851,13 @@ mod tests {
             gov.mark_connected(&id);
         }
 
-        // With hot_max=20, all 5 are immediately promoted to Hot
+        // First hot_min (2) promoted to Hot immediately, rest are Warm
         let (hot, warm, _, _) = gov.counts();
-        assert_eq!(hot, 5);
-        assert_eq!(warm, 0);
+        assert_eq!(hot, 2); // hot_min = 2
+        assert_eq!(warm, 3);
 
-        // Tick has no promotions needed (all already hot)
+        // Tick promotes more warm to hot (random selection, filling hot_min)
+        // hot_min already met, so no further promotions unless churn/demotion
         let _actions = gov.tick();
     }
 
