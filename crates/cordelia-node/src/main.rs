@@ -477,15 +477,40 @@ async fn p2p_loop(
     // Our own node identity for filtering
     let our_node_id = cordelia_core::NodeId(state.identity.public_key());
 
+    // Governor: manages Hot/Warm/Cold peer lifecycle (§5)
+    let gov_targets = cordelia_network::governor::GovernorTargets {
+        hot_min: 1,
+        hot_max: 20,
+        warm_min: 1,
+        warm_max: 50,
+        cold_max: 100,
+        churn_interval_secs: 3600,
+        churn_fraction: 0.2,
+    };
+    let mut governor = cordelia_network::governor::Governor::new(gov_targets, vec![]);
+
+    // Register any peers from bootstrap as connected
+    for peer_id in conn_mgr.connected_peers() {
+        governor.add_peer(peer_id.clone(), vec![], vec![]);
+        governor.mark_connected(&peer_id);
+    }
+    // Immediately promote all connected peers to Hot (small network bootstrap)
+    governor.tick();
+
     // Peer-sharing timer: discover new peers from connected peers
     let mut peer_share_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     peer_share_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     peer_share_interval.tick().await; // skip first immediate tick
 
-    // Pull-sync timer: anti-entropy, fetch missing items from peers
+    // Pull-sync timer: anti-entropy, fetch missing items from hot peers (§4.5)
     let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await; // skip first immediate tick
+
+    // Governor tick timer: peer promotion/demotion (§5.4)
+    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    gov_interval.tick().await; // skip first immediate tick
 
     loop {
         tokio::select! {
@@ -496,6 +521,10 @@ async fn p2p_loop(
                         let count = conn_mgr.connection_count() as u64;
                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
+
+                        // Register with governor
+                        governor.add_peer(node_id.clone(), vec![], vec![]);
+                        governor.mark_connected(&node_id);
 
                         // Update shared peer list
                         if let Ok(mut peers) = shared_peers.write() {
@@ -574,6 +603,8 @@ async fn p2p_loop(
                                         let count = conn_mgr.connection_count() as u64;
                                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                                         tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
+                                        governor.add_peer(new_id.clone(), vec![], vec![]);
+                                        governor.mark_connected(&new_id);
                                         if let Ok(mut peers) = shared_peers.write() {
                                             *peers = conn_mgr.known_peer_addresses();
                                         }
@@ -615,9 +646,9 @@ async fn p2p_loop(
                     parent_id: push_item.parent_id,
                 };
 
-                // Push to all connected peers (skip excluded peer for relay re-push)
+                // Push to HOT peers only (§4.6, BV-25). Skip excluded peer for relay re-push.
                 let exclude = push_item.exclude_peer;
-                let all_peers = conn_mgr.connected_peers();
+                let all_peers = governor.hot_peers();
                 let mut push_count = 0u32;
                 let mut skip_count = 0u32;
                 for peer_id in &all_peers {
@@ -703,9 +734,10 @@ async fn p2p_loop(
                     continue;
                 }
 
-                // Sync from ALL connected peers each cycle (O(1) convergence).
-                // Each peer is synced in a separate task to avoid blocking.
-                for target in &peers {
+                // Sync from HOT peers only (§4.5, BV-25). O(hot_max) per cycle.
+                let hot = governor.hot_peers();
+                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
+                for target in &hot {
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
@@ -842,6 +874,23 @@ async fn p2p_loop(
                     });
                     } // if let Some(conn)
                 } // for target in peers
+            }
+
+            // Governor tick: peer promotion/demotion/churn (§5.4)
+            _ = gov_interval.tick() => {
+                let actions = governor.tick();
+                let (hot, warm, cold, banned) = governor.counts();
+                if !actions.transitions.is_empty() {
+                    for (node_id, from, to) in &actions.transitions {
+                        tracing::info!(peer = %node_id, from, to, "gov: state transition");
+                    }
+                }
+                // Disconnect peers the governor wants removed
+                for node_id in &actions.disconnect {
+                    conn_mgr.disconnect(node_id);
+                    state.peers_hot.store(conn_mgr.connection_count() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                tracing::debug!(hot, warm, cold, banned, "gov: tick complete");
             }
 
             // Shutdown signal

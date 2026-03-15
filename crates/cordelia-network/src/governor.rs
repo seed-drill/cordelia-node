@@ -409,6 +409,15 @@ impl Governor {
         self.peers.get(node_id)
     }
 
+    /// Get all hot peer NodeIds.
+    pub fn hot_peers(&self) -> Vec<NodeId> {
+        self.peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot)
+            .map(|p| p.node_id.clone())
+            .collect()
+    }
+
     /// Get all hot peers for a specific group.
     pub fn hot_peers_for_group(&self, group_id: &str) -> Vec<&PeerInfo> {
         self.peers
