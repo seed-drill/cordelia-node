@@ -977,7 +977,7 @@ async fn p2p_loop(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!("P2P loop shutting down");
-                    conn_mgr.shutdown();
+                    conn_mgr.shutdown_and_wait().await;
                     break;
                 }
             }

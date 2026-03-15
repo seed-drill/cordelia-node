@@ -274,6 +274,14 @@ impl ConnectionManager {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
+    /// Shutdown and wait for the endpoint to become idle (all connections closed).
+    /// This ensures the UDP socket is released before the process exits.
+    pub async fn shutdown_and_wait(&mut self) {
+        self.shutdown();
+        self.endpoint.wait_idle().await;
+        tracing::info!("endpoint idle, socket released");
+    }
+
     /// Get the local endpoint address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
