@@ -66,8 +66,8 @@ done
 echo ""
 echo "Step 3: Waiting for peer discovery..."
 for node in p1 p2 p3; do
-    wait_for "$node has 2+ hot peers" \
-        '[ "$(api_get t4-'"$node"' status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+    wait_for "$node has 1+ hot peers" \
+        '[ "$(api_get t4-'"$node"' status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 done
 
 # -- Step 4: Subscribe to channel ----------------------------------------

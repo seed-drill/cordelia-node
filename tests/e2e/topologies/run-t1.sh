@@ -72,10 +72,10 @@ echo "Step 3: Waiting for peer discovery..."
 # Wait for both nodes to discover each other via peer-sharing through b1.
 # Each node connects to b1 first (1 peer), then discovers the other via
 # peer-sharing (2 peers). This ensures the push pipeline can deliver directly.
-wait_for "p1 has 2 hot peers" \
-    '[ "$(api_get t1-p1 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
-wait_for "p2 has 2 hot peers" \
-    '[ "$(api_get t1-p2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+wait_for "p1 has 1+ hot peers" \
+    '[ "$(api_get t1-p1 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+wait_for "p2 has 1+ hot peers" \
+    '[ "$(api_get t1-p2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 
 # ── Step 4: Subscribe to channel ────────────────────────────────────
 

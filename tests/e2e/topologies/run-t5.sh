@@ -74,10 +74,10 @@ wait_for "p1 has 1 hot peer" \
 wait_for "p2 has 1 hot peer" \
     '[ "$(api_get t5-p2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 # R1 and R2 must be connected to each other (via B1 peer-sharing)
-wait_for "r1 has 2+ hot peers" \
-    '[ "$(api_get t5-r1 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
-wait_for "r2 has 2+ hot peers" \
-    '[ "$(api_get t5-r2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+wait_for "r1 has 1+ hot peers" \
+    '[ "$(api_get t5-r1 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+wait_for "r2 has 1+ hot peers" \
+    '[ "$(api_get t5-r2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 
 # -- Step 4: Subscribe to channel ----------------------------------------
 

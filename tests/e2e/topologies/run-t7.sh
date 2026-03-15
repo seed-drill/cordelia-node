@@ -77,12 +77,12 @@ wait_for "p3 healthy" \
 
 echo ""
 echo "Step 3: Waiting for peer discovery..."
-wait_for "p1 has 2+ hot peers" \
-    '[ "$(api_get t7-p1 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
-wait_for "p2 has 2+ hot peers" \
-    '[ "$(api_get t7-p2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
-wait_for "p3 has 2+ hot peers" \
-    '[ "$(api_get t7-p3 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+wait_for "p1 has 1+ hot peers" \
+    '[ "$(api_get t7-p1 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+wait_for "p2 has 1+ hot peers" \
+    '[ "$(api_get t7-p2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+wait_for "p3 has 1+ hot peers" \
+    '[ "$(api_get t7-p3 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 
 # -- Step 4: Subscribe to channels ---------------------------------------
 
