@@ -10,6 +10,22 @@ TESTS="${@:-t1 t2 t3 t4 t5 t6 t7}"
 PASS=0
 FAIL=0
 
+# Pre-flight: verify Docker image is fresh (not stale from previous build)
+# Cordelia lesson: spent hours debugging "missing feature" that was a stale image.
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+BINARY="$REPO_DIR/target/x86_64-unknown-linux-musl/release/cordelia"
+if [ -f "$BINARY" ]; then
+    BINARY_TIME=$(stat -c %Y "$BINARY" 2>/dev/null || stat -f %m "$BINARY" 2>/dev/null || echo 0)
+    IMAGE_TIME=$(docker inspect cordelia-test:latest --format '{{.Created}}' 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null || echo 0)
+    if [ "$BINARY_TIME" -gt "$IMAGE_TIME" ] 2>/dev/null; then
+        echo "WARNING: Binary is newer than Docker image. Rebuilding..."
+        bash "$REPO_DIR/tests/e2e/build-image.sh" || {
+            echo "ERROR: Image rebuild failed. Aborting."
+            exit 1
+        }
+    fi
+fi
+
 # Flush kernel conntrack table between runs to prevent stale UDP flow
 # entries from interfering with QUIC connections (BV-23).
 # Requires: sudo apt-get install conntrack
