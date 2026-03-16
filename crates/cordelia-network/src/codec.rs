@@ -668,4 +668,81 @@ mod tests {
             panic!("wrong message type");
         }
     }
+
+    // T12-2: CBOR deterministic encoding edge cases
+    #[test]
+    fn test_cbor_encode_decode_stability() {
+        // Encode the same message twice -- should produce identical bytes
+        let msg = WireMessage::Ping(Ping {
+            seq: 42,
+            sent_at_ns: 1234567890,
+        });
+        let enc1 = encode_message(&msg).unwrap();
+        let enc2 = encode_message(&msg).unwrap();
+        assert_eq!(enc1, enc2, "CBOR encoding should be deterministic");
+    }
+
+    #[test]
+    fn test_cbor_large_integer_roundtrip() {
+        // Test with u64::MAX -- CBOR must encode as 8-byte unsigned
+        let msg = WireMessage::Ping(Ping {
+            seq: u64::MAX,
+            sent_at_ns: u64::MAX,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        if let WireMessage::Ping(p) = decoded {
+            assert_eq!(p.seq, u64::MAX);
+            assert_eq!(p.sent_at_ns, u64::MAX);
+        } else {
+            panic!("wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_cbor_empty_vectors_roundtrip() {
+        // Edge: empty channel_digest, empty roles, empty node_id
+        let msg = WireMessage::HandshakePropose(HandshakePropose {
+            magic: HANDSHAKE_MAGIC,
+            version_min: 1,
+            version_max: 1,
+            timestamp: 0,
+            channel_digest: vec![],
+            channel_count: 0,
+            node_id: vec![],
+            roles: vec![],
+            p2p_port: 0,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        if let WireMessage::HandshakePropose(h) = decoded {
+            assert!(h.channel_digest.is_empty());
+            assert!(h.node_id.is_empty());
+            assert!(h.roles.is_empty());
+            assert_eq!(h.p2p_port, 0);
+        } else {
+            panic!("wrong message type");
+        }
+    }
+
+    // T13-1: PSK type is [u8; 32] in Rust -- 0-byte PSK impossible at compile time.
+    // Instead test edge: PskResponse with None envelope (denied response).
+    #[test]
+    fn test_cbor_psk_denied_response_roundtrip() {
+        let msg = WireMessage::PskResponse(PskResponse {
+            status: "denied".into(),
+            reason: Some("not authorized".into()),
+            ecies_envelope: None,
+            key_version: None,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        if let WireMessage::PskResponse(r) = decoded {
+            assert_eq!(r.status, "denied");
+            assert!(r.ecies_envelope.is_none());
+            assert!(r.key_version.is_none());
+        } else {
+            panic!("wrong message type");
+        }
+    }
 }
