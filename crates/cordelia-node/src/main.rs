@@ -473,7 +473,11 @@ async fn p2p_loop(
             // Step 1: Extract peer roles from handshake
             let is_relay = $conn_mgr
                 .get_peer(&node_id)
-                .map(|pc| pc.handshake.peer_roles.contains(&"relay".to_string()))
+                .map(|pc| {
+                    let roles = &pc.handshake.peer_roles;
+                    tracing::debug!(peer = %node_id, ?roles, "post_connect: peer roles");
+                    roles.contains(&"relay".to_string())
+                })
                 .unwrap_or(false);
             // Step 2: Add to governor
             $governor.add_peer(node_id.clone(), vec![], vec![]);
