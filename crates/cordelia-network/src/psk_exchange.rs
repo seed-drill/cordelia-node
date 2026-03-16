@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.7
 
-use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame};
 use crate::messages::*;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -35,15 +35,11 @@ pub async fn request_psk<S: AsyncRead + AsyncWrite + Unpin>(
     channel_id: &str,
     subscriber_xpk: &[u8; 32],
 ) -> Result<PskResponse, PskExchangeError> {
-    write_protocol_byte(stream, Protocol::PskExchange).await?;
-
     let req = WireMessage::PskRequest(PskRequest {
         channel_id: channel_id.to_string(),
         subscriber_xpk: subscriber_xpk.to_vec(),
     });
-    write_frame(stream, &req).await?;
-
-    let resp = read_frame(stream).await?;
+    let resp = crate::codec::send_request(stream, Protocol::PskExchange, &req).await?;
     match resp {
         WireMessage::PskResponse(r) => {
             if r.status == "denied" {

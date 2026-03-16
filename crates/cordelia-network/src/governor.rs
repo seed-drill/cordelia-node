@@ -17,8 +17,33 @@ const DEFAULT_BACKOFF_BASE: u64 = 30;
 const DEFAULT_BACKOFF_MAX: u64 = 900;
 /// Saturation count: backoff stops doubling after this many disconnects.
 const BACKOFF_SATURATION: u32 = 5;
-/// Default ban duration (seconds).
-const DEFAULT_BAN_SECS: u64 = 300;
+/// Default ban base duration (seconds) -- used for Transient tier.
+const DEFAULT_BAN_SECS: u64 = 900;
+/// Anti-Sybil: minimum time in Warm before eligible for Hot promotion (§5.4, parameter-rationale.md §3).
+/// Bypassed when hot < hot_min (bootstrap urgency).
+const MIN_WARM_TENURE_SECS: u64 = 300;
+
+/// Ban tier per spec §5.6 (parameter-rationale.md §3).
+/// Determines base duration; escalation multiplies exponentially.
+#[derive(Debug, Clone, Copy)]
+pub enum BanTier {
+    /// Rate limit breach, protocol violation: 900s base
+    Transient,
+    /// Identity/PSK fraud: 3600s base
+    Identity,
+    /// Systematic abuse: 28800s (8h) base
+    Systematic,
+}
+
+impl BanTier {
+    pub fn base_secs(&self) -> u64 {
+        match self {
+            BanTier::Transient => 900,
+            BanTier::Identity => 3600,
+            BanTier::Systematic => 28800,
+        }
+    }
+}
 
 /// Dial policy controls which peers the governor will attempt to connect to.
 #[derive(Debug, Clone)]
@@ -47,12 +72,13 @@ pub struct GovernorTargets {
 impl Default for GovernorTargets {
     fn default() -> Self {
         Self {
+            // Personal node defaults (demand-model.md §3.2, parameter-rationale.md §3)
             hot_min: 2,
-            hot_max: 20,
+            hot_max: 2,
             hot_min_relays: 1,
-            warm_min: 10,
-            warm_max: 50,
-            cold_max: 100,
+            warm_min: 3,
+            warm_max: 10,
+            cold_max: 50,
             churn_interval_secs: 3600,
             churn_jitter_secs: 300,
             churn_fraction: 0.2,
@@ -124,6 +150,12 @@ pub struct PeerInfo {
     pub last_disconnected: Option<Instant>,
     /// Whether this peer is a relay/bootnode (eligible for dial under restricted policies).
     pub is_relay: bool,
+    /// Items this peer relayed to us (contribution tracking, §16.1).
+    pub items_relayed: u64,
+    /// Items we requested from this peer via sync (contribution tracking, §16.1).
+    pub items_requested: u64,
+    /// Exponential moving average of peer score (alpha=0.3).
+    pub score_ema: f64,
 }
 
 impl PeerInfo {
@@ -142,6 +174,9 @@ impl PeerInfo {
             disconnect_count: 0,
             last_disconnected: None,
             is_relay: false,
+            items_relayed: 0,
+            items_requested: 0,
+            score_ema: 0.0,
         }
     }
 
@@ -156,7 +191,8 @@ impl PeerInfo {
         self.state_changed_at.elapsed()
     }
 
-    /// Performance score: items delivered per second, weighted by RTT.
+    /// Performance score: (throughput * rtt_factor * contribution_factor).
+    /// contribution_factor only applies to relay peers (§5.5).
     pub fn score(&self) -> f64 {
         let elapsed = self
             .connected_since
@@ -167,7 +203,23 @@ impl PeerInfo {
         let throughput = self.items_delivered as f64 / elapsed;
         let rtt_factor = self.rtt_ms.map(|r| 1.0 / (1.0 + r / 100.0)).unwrap_or(0.5);
 
-        throughput * rtt_factor
+        // Contribution factor: penalise relays that don't relay items (§5.5)
+        let contribution_factor = if self.is_relay {
+            let ratio = self.items_relayed as f64
+                / (self.items_requested.max(1) as f64);
+            ratio.clamp(0.1, 2.0)
+        } else {
+            1.0
+        };
+
+        throughput * rtt_factor * contribution_factor
+    }
+
+    /// Update the exponential moving average score (alpha = 0.3).
+    pub fn update_ema(&mut self) {
+        const ALPHA: f64 = 0.3;
+        let current = self.score();
+        self.score_ema = ALPHA * current + (1.0 - ALPHA) * self.score_ema;
     }
 
     /// Whether this peer has any groups in common with the given set.
@@ -283,6 +335,13 @@ impl Governor {
         }
     }
 
+    /// Record items that a peer relayed to us (contribution tracking, §16.1).
+    pub fn record_items_relayed(&mut self, node_id: &NodeId, count: u64) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.items_relayed += count;
+        }
+    }
+
     /// Mark peer as connected. Promotes to Hot immediately if there's room
     /// (hot_count < hot_max), otherwise Warm. This ensures newly connected
     /// peers participate in push/sync without waiting for the next tick.
@@ -388,14 +447,17 @@ impl Governor {
     }
 
     /// Ban a peer for protocol violation.
-    pub fn ban_peer(&mut self, node_id: &NodeId, reason: String) {
+    pub fn ban_peer(&mut self, node_id: &NodeId, reason: String, tier: BanTier) {
         if let Some(peer) = self.peers.get_mut(node_id) {
             let from = peer.state.name();
             let escalation = match &peer.state {
                 PeerState::Banned { escalation, .. } => escalation + 1,
                 _ => 1,
             };
-            let duration = self.timeouts.ban_duration * escalation;
+            // Exponential escalation: base * 2^(escalation-1), capped at 7 days
+            let base = Duration::from_secs(tier.base_secs());
+            let multiplier = 1u32.checked_shl(escalation.saturating_sub(1)).unwrap_or(u32::MAX);
+            let duration = (base * multiplier).min(Duration::from_secs(7 * 86400));
             tracing::warn!(
                 peer = %node_id,
                 from,
@@ -448,11 +510,16 @@ impl Governor {
             .collect()
     }
 
-    /// Get all hot peers for a specific group.
-    pub fn hot_peers_for_group(&self, group_id: &str) -> Vec<&PeerInfo> {
+    /// Get hot peers relevant for a channel (relays + peers with matching group).
+    /// Relays always receive all items (they serve all channels).
+    pub fn hot_peers_for_channel(&self, channel_id: &str) -> Vec<NodeId> {
         self.peers
             .values()
-            .filter(|p| p.state == PeerState::Hot && p.groups.contains(&group_id.to_string()))
+            .filter(|p| {
+                p.state == PeerState::Hot
+                    && (p.is_relay || p.groups.contains(&channel_id.to_string()))
+            })
+            .map(|p| p.node_id.clone())
             .collect()
     }
 
@@ -632,14 +699,30 @@ impl Governor {
 
         // Anti-eclipse: RANDOM promotion among eligible peers (§5.4 step 4).
         // An attacker cannot game their score to get promoted faster.
-        // Use deterministic "random" via hash of peer IDs + tick count for reproducibility.
-        let needed = if hot < self.targets.hot_min {
-            self.targets.hot_min - hot // Fill hot_min urgently
+        let urgent = hot < self.targets.hot_min;
+        let needed = if urgent {
+            self.targets.hot_min - hot // Fill hot_min urgently (bypass tenure)
         } else {
             0 // Only promote if replacing demoted peer (handled by churn)
         };
 
         if needed == 0 {
+            return;
+        }
+
+        // Filter by min_warm_tenure unless in urgent mode (§5.4, parameter-rationale.md §3)
+        let min_tenure = Duration::from_secs(MIN_WARM_TENURE_SECS);
+        let eligible: Vec<NodeId> = if urgent {
+            eligible // Bypass tenure for bootstrap urgency
+        } else {
+            eligible.into_iter()
+                .filter(|id| {
+                    self.peers.get(id)
+                        .is_some_and(|p| p.state_tenure() >= min_tenure)
+                })
+                .collect()
+        };
+        if eligible.is_empty() {
             return;
         }
 
@@ -661,10 +744,9 @@ impl Governor {
                     score = format!("{:.4}", peer.score()),
                     "gov: warm -> hot (random promotion)"
                 );
-                peer.set_state(PeerState::Hot);
                 peer.disconnect_count = 0;
-                actions.transitions.push((id, "warm".into(), "hot".into()));
             }
+            self.transition_peer(&id, PeerState::Hot, actions, "warm", "hot");
         }
     }
 
@@ -696,19 +778,16 @@ impl Governor {
             .collect();
 
         for id in warm_relays.into_iter().take(needed) {
+            tracing::info!(
+                peer = %id,
+                hot_relays,
+                target = self.targets.hot_min_relays,
+                "gov: warm relay -> hot (ensure relay connectivity)"
+            );
             if let Some(peer) = self.peers.get_mut(&id) {
-                tracing::info!(
-                    peer = %id,
-                    hot_relays,
-                    target = self.targets.hot_min_relays,
-                    "gov: warm relay -> hot (ensure relay connectivity)"
-                );
-                peer.set_state(PeerState::Hot);
                 peer.disconnect_count = 0;
-                actions
-                    .transitions
-                    .push((id, "warm".into(), "hot".into()));
             }
+            self.transition_peer(&id, PeerState::Hot, actions, "warm", "hot");
         }
     }
 
@@ -736,16 +815,13 @@ impl Governor {
         });
 
         for (id, score, is_stale) in hot_peers.into_iter().take(excess) {
-            if let Some(peer) = self.peers.get_mut(&id) {
-                tracing::info!(
-                    peer = %id,
-                    score = format!("{score:.4}"),
-                    is_stale,
-                    "gov: hot -> warm (excess demotion)"
-                );
-                peer.set_state(PeerState::Warm);
-                actions.transitions.push((id, "hot".into(), "warm".into()));
-            }
+            tracing::info!(
+                peer = %id,
+                score = format!("{score:.4}"),
+                is_stale,
+                "gov: hot -> warm (excess demotion)"
+            );
+            self.transition_peer(&id, PeerState::Warm, actions, "hot", "warm");
         }
     }
 
@@ -763,13 +839,18 @@ impl Governor {
         }
         self.last_churn = Instant::now();
 
+        self.churn_warm(actions);
+        self.churn_hot(actions);
+    }
+
+    /// Warm-tier churn: demote random warm peers to cold, promote cold replacements.
+    fn churn_warm(&mut self, actions: &mut GovernorActions) {
         let (_, warm, cold, _) = self.counts();
         let churn_count = (warm as f64 * self.targets.churn_fraction).ceil() as usize;
 
-        // Warm churn: swap warm with cold (skip if no warm or no cold peers)
         if churn_count == 0 || cold == 0 {
-            // Skip warm churn but still run hot churn below
-        } else {
+            return;
+        }
 
         tracing::info!(warm, cold, churn_count, "gov: periodic churn cycle");
 
@@ -806,32 +887,39 @@ impl Governor {
         for id in cold_ids {
             actions.connect.push(id);
         }
+    }
 
-        } // end warm churn else block
-
-        // Hot-tier churn: demote 1 random hot peer, promote 1 random warm (§5.4 step 6)
+    /// Hot-tier churn: demote 1 random hot peer to warm (SS5.4 step 6).
+    fn churn_hot(&mut self, actions: &mut GovernorActions) {
         let (hot, _, _, _) = self.counts();
-        if hot > self.targets.hot_min {
-            // Pick a random non-trusted hot peer to demote
-            let hot_peers: Vec<NodeId> = self
-                .peers
-                .values()
-                .filter(|p| p.state == PeerState::Hot)
-                .map(|p| p.node_id.clone())
-                .collect();
-            if !hot_peers.is_empty() {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as usize;
-                let victim = &hot_peers[seed % hot_peers.len()];
-                if let Some(peer) = self.peers.get_mut(victim) {
-                    tracing::info!(peer = %victim, "gov: churn hot -> warm");
-                    peer.set_state(PeerState::Warm);
-                    peer.demoted_at = Some(Instant::now());
-                    actions.transitions.push((victim.clone(), "hot".into(), "warm".into()));
-                }
-            }
+        if hot <= self.targets.hot_min {
+            return;
+        }
+
+        // Pick a random non-trusted hot peer to demote
+        let hot_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot)
+            .map(|p| p.node_id.clone())
+            .collect();
+
+        if hot_peers.is_empty() {
+            return;
+        }
+
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as usize;
+        let victim = &hot_peers[seed % hot_peers.len()];
+        if let Some(peer) = self.peers.get_mut(victim) {
+            tracing::info!(peer = %victim, "gov: churn hot -> warm");
+            peer.set_state(PeerState::Warm);
+            peer.demoted_at = Some(Instant::now());
+            actions
+                .transitions
+                .push((victim.clone(), "hot".into(), "warm".into()));
         }
     }
 
@@ -867,6 +955,24 @@ impl Governor {
     pub fn all_peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.values()
     }
+
+    /// Transition a peer to a new state and record the transition.
+    /// Used where the pattern is: get_mut -> set_state -> push transition.
+    fn transition_peer(
+        &mut self,
+        node_id: &NodeId,
+        new_state: PeerState,
+        actions: &mut GovernorActions,
+        from_name: &str,
+        to_name: &str,
+    ) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.set_state(new_state);
+            actions
+                .transitions
+                .push((node_id.clone(), from_name.into(), to_name.into()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -883,6 +989,34 @@ mod tests {
         vec!["127.0.0.1:9474".into()]
     }
 
+    /// Test-only: get all hot peers for a specific group.
+    impl Governor {
+        fn hot_peers_for_group(&self, group_id: &str) -> Vec<&PeerInfo> {
+            self.peers
+                .values()
+                .filter(|p| p.state == PeerState::Hot && p.groups.contains(&group_id.to_string()))
+                .collect()
+        }
+    }
+
+    /// Setup a governor with given targets and N peers, all added to group "g1".
+    fn setup_gov(hot_min: usize, hot_max: usize, peer_count: u8) -> (Governor, Vec<NodeId>) {
+        let targets = GovernorTargets {
+            hot_min,
+            hot_max,
+            ..GovernorTargets::default()
+        };
+        let mut gov = Governor::new(targets, vec!["g1".into()]);
+        let ids: Vec<NodeId> = (0..peer_count)
+            .map(|i| {
+                let id = make_node_id(i);
+                gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
+                id
+            })
+            .collect();
+        (gov, ids)
+    }
+
     #[test]
     fn test_add_peer() {
         let mut gov = Governor::new(GovernorTargets::default(), vec!["g1".into()]);
@@ -892,10 +1026,7 @@ mod tests {
 
     #[test]
     fn test_promote_to_warm() {
-        let mut gov = Governor::new(GovernorTargets::default(), vec!["g1".into()]);
-        for i in 0..15 {
-            gov.add_peer(make_node_id(i), make_addr(), vec!["g1".into()]);
-        }
+        let (mut gov, _ids) = setup_gov(2, 2, 15);
 
         let actions = gov.tick();
         assert!(!actions.connect.is_empty());
@@ -903,17 +1034,9 @@ mod tests {
 
     #[test]
     fn test_promote_warm_to_hot() {
-        let targets = GovernorTargets {
-            hot_min: 2,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec!["g1".into()]);
-
-        for i in 0..5 {
-            let id = make_node_id(i);
-            gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
-            gov.mark_connected(&id);
+        let (mut gov, ids) = setup_gov(2, 2, 5);
+        for id in &ids {
+            gov.mark_connected(id);
         }
 
         // First hot_min (2) promoted to Hot immediately, rest are Warm
@@ -932,11 +1055,11 @@ mod tests {
         let id = make_node_id(1);
         gov.add_peer(id.clone(), make_addr(), vec![]);
 
-        gov.ban_peer(&id, "protocol violation".into());
+        gov.ban_peer(&id, "protocol violation".into(), BanTier::Transient);
         assert!(gov.peer_state(&id).unwrap().is_banned());
 
         // Escalation
-        gov.ban_peer(&id, "repeat offense".into());
+        gov.ban_peer(&id, "repeat offense".into(), BanTier::Transient);
         match gov.peer_state(&id).unwrap() {
             PeerState::Banned { escalation, .. } => assert_eq!(*escalation, 2),
             _ => panic!("should be banned"),
@@ -1079,16 +1202,10 @@ mod tests {
 
     #[test]
     fn test_hot_promotion_resets_disconnect_count() {
-        let targets = GovernorTargets {
-            hot_min: 1,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec!["g1".into()]);
+        let (mut gov, ids) = setup_gov(1, 1, 1);
+        let id = ids[0].clone();
 
         // mark_connected promotes to Hot immediately (dc=0)
-        let id = make_node_id(1);
-        gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
         gov.mark_connected(&id);
         let peer = gov.peer_info(&id).unwrap();
         assert_eq!(peer.state, PeerState::Hot);
@@ -1100,20 +1217,12 @@ mod tests {
 
     #[test]
     fn test_no_oscillation_after_reap() {
-        let targets = GovernorTargets {
-            hot_min: 2,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec!["g1".into()]);
+        let (mut gov, ids) = setup_gov(2, 2, 3);
+        let id0 = ids[0].clone();
+        let id1 = ids[1].clone();
 
-        let id0 = make_node_id(0);
-        let id1 = make_node_id(1);
-        let id2 = make_node_id(2);
-
-        for id in [id0.clone(), id1.clone(), id2.clone()] {
-            gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
-            gov.mark_connected(&id);
+        for id in &ids {
+            gov.mark_connected(id);
         }
         gov.peers.get_mut(&id0).unwrap().state = PeerState::Hot;
         gov.peers.get_mut(&id1).unwrap().state = PeerState::Hot;
@@ -1236,15 +1345,8 @@ mod tests {
 
     #[test]
     fn test_reap_then_promote_after_cooldown() {
-        let targets = GovernorTargets {
-            hot_min: 1,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec!["g1".into()]);
-
-        let id = make_node_id(1);
-        gov.add_peer(id.clone(), make_addr(), vec!["g1".into()]);
+        let (mut gov, ids) = setup_gov(1, 1, 1);
+        let id = ids[0].clone();
         gov.mark_connected(&id);
 
         gov.peers.get_mut(&id).unwrap().demoted_at =
@@ -1420,19 +1522,10 @@ mod tests {
 
     #[test]
     fn test_hot_peers_returns_only_hot() {
-        let targets = GovernorTargets {
-            hot_min: 2,
-            hot_max: 5,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec![]);
-
+        let (mut gov, ids) = setup_gov(2, 5, 5);
         // 2 hot, 3 warm
-        for i in 0..5 {
-            let id = make_node_id(i);
-            gov.add_peer(id.clone(), make_addr(), vec![]);
-            gov.mark_connected(&id);
+        for id in &ids {
+            gov.mark_connected(id);
         }
 
         let hot = gov.hot_peers();
@@ -1444,20 +1537,13 @@ mod tests {
 
     #[test]
     fn test_state_changed_at_updated_on_transition() {
-        let targets = GovernorTargets {
-            hot_min: 1,
-            warm_min: 0,
-            ..Default::default()
-        };
-        let mut gov = Governor::new(targets, vec![]);
-
-        let id = make_node_id(1);
-        gov.add_peer(id.clone(), make_addr(), vec![]);
-        let created_at = gov.peer_info(&id).unwrap().state_changed_at;
+        let (mut gov, ids) = setup_gov(1, 1, 1);
+        let id = &ids[0];
+        let created_at = gov.peer_info(id).unwrap().state_changed_at;
 
         std::thread::sleep(Duration::from_millis(10));
-        gov.mark_connected(&id);
-        let connected_at = gov.peer_info(&id).unwrap().state_changed_at;
+        gov.mark_connected(id);
+        let connected_at = gov.peer_info(id).unwrap().state_changed_at;
 
         assert!(
             connected_at > created_at,

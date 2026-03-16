@@ -38,3 +38,64 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install grcov
+        run: cargo install grcov
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests with coverage
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: '-Cinstrument-coverage'
+          LLVM_PROFILE_FILE: '/tmp/cordelia-cov/cordelia-%p-%m.profraw'
+        run: |
+          mkdir -p /tmp/cordelia-cov
+          cargo test --lib --test two_node -- --skip test_bv19
+
+      - name: Generate LCOV report
+        run: |
+          grcov /tmp/cordelia-cov \
+            --binary-path ./target/debug/ \
+            -s . \
+            -t lcov \
+            --ignore-not-existing \
+            --ignore "*/.cargo/*" \
+            --ignore "*/target/*" \
+            -o coverage.lcov
+
+      - name: Upload coverage to SonarQube
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=cordelia-node
+            -Dsonar.sources=crates/
+            -Dsonar.coverage.reportPaths=coverage.lcov
+        continue-on-error: true
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.lcov

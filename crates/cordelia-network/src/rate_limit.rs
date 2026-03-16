@@ -34,9 +34,11 @@ pub const BAN_WINDOW: Duration = Duration::from_secs(600);
 
 // ── Size limits (§9.3) ────────────────────────────────────────────
 
-pub const MAX_ITEM_BYTES: usize = 1_048_576; // 1 MB
-pub const MAX_MESSAGE_BYTES: u32 = 4_194_304; // 4 MB
+/// Max encrypted item size: 256KB (demand-model.md §2.3, parameter-rationale.md §4).
+pub const MAX_ITEM_BYTES: usize = 256 * 1024;
+/// Max batch fetch size: 100 items per request (demand-model.md §3.1).
 pub const MAX_BATCH_SIZE: usize = 100;
+// Note: MAX_MESSAGE_BYTES lives in codec.rs (4MB, the wire frame limit).
 
 // ── Backpressure queue capacities (§9.4) ───────────────────────────
 

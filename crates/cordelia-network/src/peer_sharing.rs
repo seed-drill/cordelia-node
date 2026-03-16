@@ -7,7 +7,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.3
 
-use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame};
 use crate::messages::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -34,12 +34,8 @@ pub async fn request_peers<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_peers: u16,
 ) -> Result<Vec<PeerAddress>, PeerSharingError> {
-    write_protocol_byte(stream, Protocol::PeerSharing).await?;
-
     let req = WireMessage::PeerShareRequest(PeerShareRequest { max_peers });
-    write_frame(stream, &req).await?;
-
-    let resp = read_frame(stream).await?;
+    let resp = crate::codec::send_request(stream, Protocol::PeerSharing, &req).await?;
     match resp {
         WireMessage::PeerShareResponse(r) => Ok(r.peers),
         _ => Err(PeerSharingError::UnexpectedMessage),

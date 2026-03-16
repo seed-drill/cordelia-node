@@ -5,7 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §4.5, §4.6
 
-use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
+use crate::codec::{read_frame, read_protocol_byte, write_frame};
 use crate::messages::*;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -48,16 +48,12 @@ pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     since: Option<&str>,
     limit: u32,
 ) -> Result<SyncResponse, ItemSyncError> {
-    write_protocol_byte(stream, Protocol::ItemSync).await?;
-
     let req = WireMessage::SyncRequest(SyncRequest {
         channel_id: channel_id.to_string(),
         since: since.map(|s| s.to_string()),
         limit,
     });
-    write_frame(stream, &req).await?;
-
-    let resp = read_frame(stream).await?;
+    let resp = crate::codec::send_request(stream, Protocol::ItemSync, &req).await?;
     match resp {
         WireMessage::SyncResponse(sr) => Ok(sr),
         _ => Err(ItemSyncError::UnexpectedMessage),
@@ -139,14 +135,10 @@ pub async fn send_push<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     items: &[Item],
 ) -> Result<PushAck, ItemSyncError> {
-    write_protocol_byte(stream, Protocol::ItemPush).await?;
-
     let payload = WireMessage::PushPayload(PushPayload {
         items: items.to_vec(),
     });
-    write_frame(stream, &payload).await?;
-
-    let resp = read_frame(stream).await?;
+    let resp = crate::codec::send_request(stream, Protocol::ItemPush, &payload).await?;
     match resp {
         WireMessage::PushAck(ack) => Ok(ack),
         _ => Err(ItemSyncError::UnexpectedMessage),
@@ -215,6 +207,7 @@ pub fn compute_fetch_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::write_protocol_byte;
     use std::collections::HashMap;
 
     fn make_test_item(id: &str) -> Item {

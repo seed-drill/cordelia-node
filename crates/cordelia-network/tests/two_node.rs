@@ -585,22 +585,24 @@ async fn test_chaos_disconnect_during_sync() {
     let (mut send, mut recv) = conn_a.open_bi().await.unwrap();
     let mut stream = tokio::io::join(&mut recv, &mut send);
 
-    // Send sync request
-    item_sync::send_sync_request(&mut stream, "test-channel", None, 100)
-        .await
-        .unwrap();
+    // Send sync request -- write the request bytes only (don't wait for response)
+    cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await.unwrap();
+    let req = cordelia_network::messages::WireMessage::SyncRequest(
+        cordelia_network::messages::SyncRequest {
+            channel_id: "test-channel".to_string(),
+            since: None,
+            limit: 100,
+        },
+    );
+    cordelia_network::codec::write_frame(&mut send, &req).await.unwrap();
 
     // B crashes before responding -- kill B's connection
     let node_a_id = cordelia_core::NodeId(id_a.public_key());
     mgr_b.get_connection(&node_a_id).unwrap().close(0u32.into(), b"chaos");
 
-    // A tries to read response -- should get error, not hang
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        cordelia_network::codec::read_frame(&mut recv),
-    ).await;
-    assert!(result.is_ok(), "read should not hang after peer disconnects");
-    assert!(result.unwrap().is_err(), "read should return error for closed connection");
+    // A tries to read response -- should get error (ReadTimeout or connection error), not hang
+    let result = cordelia_network::codec::read_frame(&mut recv).await;
+    assert!(result.is_err(), "read should return error after peer crashes");
 
     mgr_a.shutdown();
 }
