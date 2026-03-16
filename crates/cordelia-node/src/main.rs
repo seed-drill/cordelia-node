@@ -462,6 +462,52 @@ async fn p2p_loop(
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
+    // Canonical post-connection sequence (connection-lifecycle.md §1.2).
+    // ALL connection paths MUST call this macro after successful connection.
+    // Steps: 1. Extract roles, 2. Add to governor, 3. Mark relay, 4. Mark connected,
+    //        5. Update peer list, 6. Update counters, 7. Spawn stream handler.
+    macro_rules! post_connect {
+        ($node_id:expr, $conn_mgr:expr, $governor:expr, $shared_peers:expr,
+         $state:expr, $node_role:expr, $relay_push_tx:expr, $delivery_tx:expr) => {{
+            let node_id = $node_id;
+            // Step 1: Extract peer roles from handshake
+            let is_relay = $conn_mgr
+                .get_peer(&node_id)
+                .map(|pc| pc.handshake.peer_roles.contains(&"relay".to_string()))
+                .unwrap_or(false);
+            // Step 2: Add to governor
+            $governor.add_peer(node_id.clone(), vec![], vec![]);
+            // Step 3: Mark relay role
+            if is_relay {
+                $governor.set_peer_relay(&node_id, true);
+                tracing::debug!(peer = %node_id, "peer identified as relay");
+            }
+            // Step 4: Mark connected (triggers Hot/Warm promotion)
+            $governor.mark_connected(&node_id);
+            // Step 5: Update shared peer list
+            if let Ok(mut peers) = $shared_peers.write() {
+                *peers = $conn_mgr.known_peer_addresses();
+            }
+            // Step 6: Update counters
+            let (hot, warm, _, _) = $governor.counts();
+            $state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
+            $state.peers_warm.store(warm as u64, std::sync::atomic::Ordering::Relaxed);
+            // Step 7: Spawn stream handler
+            if let Some(conn) = $conn_mgr.get_connection(&node_id) {
+                let conn = conn.clone();
+                let peer_id = node_id.clone();
+                let db_state = $state.clone();
+                let peers_ref = $shared_peers.clone();
+                let role = $node_role.clone();
+                let ptx = $relay_push_tx.clone();
+                let dtx = $delivery_tx.clone();
+                tokio::spawn(async move {
+                    handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
+                });
+            }
+        }};
+    }
+
     // Create a push sender for handle_peer_streams (relay re-push)
     // We re-use the state's push_tx for this
     let relay_push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem> = state
@@ -484,12 +530,14 @@ async fn p2p_loop(
     let mut governor = cordelia_network::governor::Governor::new(gov_targets, vec![])
         .with_timeouts(gov_timeouts);
 
-    // Register any peers from bootstrap as connected
+    // Delivery feedback channel (needed by post_connect! macro for stream handlers)
+    let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(cordelia_core::NodeId, u64)>();
+
+    // Register bootstrap peers using canonical sequence (connection-lifecycle.md §1.2)
     for peer_id in conn_mgr.connected_peers() {
-        governor.add_peer(peer_id.clone(), vec![], vec![]);
-        governor.mark_connected(&peer_id);
+        post_connect!(peer_id, conn_mgr, governor, shared_peers,
+                      state, node_role, relay_push_tx, delivery_tx);
     }
-    // Immediately promote all connected peers to Hot (small network bootstrap)
     governor.tick();
 
     // Peer-sharing timer: discover new peers from connected peers
@@ -514,9 +562,6 @@ async fn p2p_loop(
     }
     let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
-    // Delivery feedback channel: handle_peer_streams reports items stored via push
-    let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(cordelia_core::NodeId, u64)>();
-
     loop {
         tokio::select! {
             // Accept incoming connection
@@ -526,34 +571,8 @@ async fn p2p_loop(
                         let count = conn_mgr.connection_count() as u64;
                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
-
-                        // Register with governor + detect relay role
-                        governor.add_peer(node_id.clone(), vec![], vec![]);
-                        if let Some(pc) = conn_mgr.get_peer(&node_id) {
-                            if pc.handshake.peer_roles.contains(&"relay".to_string()) {
-                                governor.set_peer_relay(&node_id, true);
-                            }
-                        }
-                        governor.mark_connected(&node_id);
-
-                        // Update shared peer list
-                        if let Ok(mut peers) = shared_peers.write() {
-                            *peers = conn_mgr.known_peer_addresses();
-                        }
-
-                        // Spawn stream handler for this peer's inbound protocol streams
-                        if let Some(conn) = conn_mgr.get_connection(&node_id) {
-                            let conn = conn.clone();
-                            let peer_id = node_id.clone();
-                            let db_state = state.clone();
-                            let peers_ref = shared_peers.clone();
-                            let role = node_role.clone();
-                            let ptx = relay_push_tx.clone();
-                            let dtx = delivery_tx.clone();
-                            tokio::spawn(async move {
-                                handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
-                            });
-                        }
+                        post_connect!(node_id, conn_mgr, governor, shared_peers,
+                                      state, node_role, relay_push_tx, delivery_tx);
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "inbound connection failed");
@@ -611,31 +630,9 @@ async fn p2p_loop(
                                     conn_mgr.connect_to(addr),
                                 ).await {
                                     Ok(Ok(new_id)) => {
-                                        let count = conn_mgr.connection_count() as u64;
-                                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
-                                        governor.add_peer(new_id.clone(), vec![], vec![]);
-                                        if let Some(pc) = conn_mgr.get_peer(&new_id) {
-                                            if pc.handshake.peer_roles.contains(&"relay".to_string()) {
-                                                governor.set_peer_relay(&new_id, true);
-                                            }
-                                        }
-                                        governor.mark_connected(&new_id);
-                                        if let Ok(mut peers) = shared_peers.write() {
-                                            *peers = conn_mgr.known_peer_addresses();
-                                        }
-                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
-                                            let new_conn = new_conn.clone();
-                                            let peer_id = new_id;
-                                            let db_state = state.clone();
-                                            let peers_ref = shared_peers.clone();
-                                            let role = node_role.clone();
-                                            let ptx = relay_push_tx.clone();
-                                            let dtx = delivery_tx.clone();
-                                            tokio::spawn(async move {
-                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
-                                            });
-                                        }
+                                        tracing::info!(peer = %new_id, peers = conn_mgr.connection_count(), "connected via peer-sharing");
+                                        post_connect!(new_id, conn_mgr, governor, shared_peers,
+                                                      state, node_role, relay_push_tx, delivery_tx);
                                     }
                                     Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
                                     Err(_) => { tracing::warn!(addr = %addr_str, "peer-share connect timed out (10s)"); }
@@ -950,20 +947,9 @@ async fn p2p_loop(
                                     conn_mgr.connect_to(addr),
                                 ).await {
                                     Ok(Ok(new_id)) => {
-                                        governor.mark_connected(&new_id);
                                         tracing::info!(peer = %new_id, "gov: connected (promotion)");
-                                        if let Some(new_conn) = conn_mgr.get_connection(&new_id) {
-                                            let new_conn = new_conn.clone();
-                                            let peer_id = new_id;
-                                            let db_state = state.clone();
-                                            let peers_ref = shared_peers.clone();
-                                            let role = node_role.clone();
-                                            let ptx = relay_push_tx.clone();
-                                            let dtx = delivery_tx.clone();
-                                            tokio::spawn(async move {
-                                                handle_peer_streams(new_conn, peer_id, db_state, peers_ref, role, ptx, dtx).await;
-                                            });
-                                        }
+                                        post_connect!(new_id, conn_mgr, governor, shared_peers,
+                                                      state, node_role, relay_push_tx, delivery_tx);
                                     }
                                     Ok(Err(e)) => {
                                         governor.mark_dial_failed(node_id);
