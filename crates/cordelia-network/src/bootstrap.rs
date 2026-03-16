@@ -113,14 +113,14 @@ pub fn resolve_dns_bootnodes() -> Vec<BootnodeAddr> {
 pub fn resolve_fallback_peers() -> Vec<BootnodeAddr> {
     let mut resolved = Vec::new();
     for addr_str in FALLBACK_PEERS {
-        if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
-                resolved.push(BootnodeAddr {
-                    host: addr_str.to_string(),
-                    addr,
-                    source: BootnodeSource::Fallback,
-                });
-            }
+        if let Ok(mut addrs) = addr_str.to_socket_addrs()
+            && let Some(addr) = addrs.next()
+        {
+            resolved.push(BootnodeAddr {
+                host: addr_str.to_string(),
+                addr,
+                source: BootnodeSource::Fallback,
+            });
         }
     }
     resolved

@@ -228,7 +228,7 @@ impl rustls::client::danger::ServerCertVerifier for CordeliaServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        extract_peer_node_id(&[end_entity.clone()])
+        extract_peer_node_id(std::slice::from_ref(end_entity))
             .map_err(|e| rustls::Error::General(e.to_string()))?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
@@ -272,7 +272,7 @@ impl rustls::server::danger::ClientCertVerifier for CordeliaClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        extract_peer_node_id(&[end_entity.clone()])
+        extract_peer_node_id(std::slice::from_ref(end_entity))
             .map_err(|e| rustls::Error::General(e.to_string()))?;
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }

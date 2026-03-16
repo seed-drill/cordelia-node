@@ -478,8 +478,8 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
 
     println!(
-        "{:<24} {:<10} {:>6}   {:<20} {}",
-        "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY", "TYPE"
+        "{:<24} {:<10} {:>6}   {:<20} TYPE",
+        "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY"
     );
     for ch in &all {
         let name = ch

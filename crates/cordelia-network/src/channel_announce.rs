@@ -189,18 +189,18 @@ pub fn handle_channel_joined(
     validate_descriptor(&joined.descriptor)?;
 
     // Check for creator conflict
-    if let Some(existing) = known_descriptors.get(&joined.channel_id) {
-        if existing.creator_id != joined.descriptor.creator_id {
-            warn!(
-                channel = %joined.channel_id,
-                "creator conflict: dropping descriptor from different creator"
-            );
-            return Err(ChannelAnnounceError::CreatorConflict {
-                channel_id: joined.channel_id.clone(),
-                expected: hex::encode(&existing.creator_id),
-                got: hex::encode(&joined.descriptor.creator_id),
-            });
-        }
+    if let Some(existing) = known_descriptors.get(&joined.channel_id)
+        && existing.creator_id != joined.descriptor.creator_id
+    {
+        warn!(
+            channel = %joined.channel_id,
+            "creator conflict: dropping descriptor from different creator"
+        );
+        return Err(ChannelAnnounceError::CreatorConflict {
+            channel_id: joined.channel_id.clone(),
+            expected: hex::encode(&existing.creator_id),
+            got: hex::encode(&joined.descriptor.creator_id),
+        });
     }
 
     state
@@ -251,10 +251,10 @@ pub enum ChannelAnnounceAction {
 /// (§4.4.6: max 512 bytes CBOR), and Ed25519 signature.
 fn validate_descriptor(desc: &ChannelDescriptor) -> Result<(), ChannelAnnounceError> {
     // Field size limits (§4.4.6)
-    if let Some(ref name) = desc.channel_name {
-        if name.len() > MAX_CHANNEL_NAME_LEN {
-            return Err(ChannelAnnounceError::DescriptorTooLarge(name.len()));
-        }
+    if let Some(ref name) = desc.channel_name
+        && name.len() > MAX_CHANNEL_NAME_LEN
+    {
+        return Err(ChannelAnnounceError::DescriptorTooLarge(name.len()));
     }
 
     // Serialized size limit (§4.4.6: max 512 bytes before signature)
@@ -344,6 +344,7 @@ pub fn build_descriptor_signing_payload(desc: &ChannelDescriptor) -> Vec<u8> {
 }
 
 /// Create and sign a channel descriptor.
+#[allow(clippy::too_many_arguments)]
 pub fn create_signed_descriptor(
     identity: &cordelia_crypto::identity::NodeIdentity,
     channel_id: &str,
@@ -381,7 +382,7 @@ mod tests {
 
     fn make_test_descriptor(identity: &NodeIdentity) -> ChannelDescriptor {
         let psk = [0xAA; 32];
-        let psk_hash: [u8; 32] = Sha256::digest(&psk).into();
+        let psk_hash: [u8; 32] = Sha256::digest(psk).into();
         create_signed_descriptor(
             identity,
             "test_channel_abc123",
@@ -562,7 +563,7 @@ mod tests {
     #[test]
     fn test_channel_name_too_long_rejected() {
         let id = NodeIdentity::generate().unwrap();
-        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let psk_hash: [u8; 32] = Sha256::digest([0xAA; 32]).into();
         let long_name = "a".repeat(64); // 64 chars > 63 limit
         let desc = create_signed_descriptor(
             &id,
@@ -584,7 +585,7 @@ mod tests {
     #[test]
     fn test_channel_name_at_limit_accepted() {
         let id = NodeIdentity::generate().unwrap();
-        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let psk_hash: [u8; 32] = Sha256::digest([0xAA; 32]).into();
         let name = "a".repeat(63); // exactly at limit
         let desc = create_signed_descriptor(
             &id,
@@ -603,7 +604,7 @@ mod tests {
     #[test]
     fn test_descriptor_oversized_rejected() {
         let id = NodeIdentity::generate().unwrap();
-        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let psk_hash: [u8; 32] = Sha256::digest([0xAA; 32]).into();
         // Use a very long channel_id to push CBOR over 512 bytes
         let long_id = "x".repeat(400);
         let desc = create_signed_descriptor(
@@ -626,7 +627,7 @@ mod tests {
     #[test]
     fn test_empty_channel_id_descriptor() {
         let id = NodeIdentity::generate().unwrap();
-        let psk_hash: [u8; 32] = Sha256::digest(&[0xAA; 32]).into();
+        let psk_hash: [u8; 32] = Sha256::digest([0xAA; 32]).into();
         let desc = create_signed_descriptor(
             &id,
             "",

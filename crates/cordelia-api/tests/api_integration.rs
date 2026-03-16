@@ -22,7 +22,7 @@ fn test_state() -> web::Data<AppState> {
         db: Mutex::new(conn),
         identity,
         bearer_token: TEST_TOKEN.into(),
-        home_dir: dir.into_path(),
+        home_dir: dir.keep(),
         started_at: std::time::Instant::now(),
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),

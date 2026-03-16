@@ -386,7 +386,7 @@ mod tests {
     fn test_identity_from_file_wrong_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_identity.key");
-        std::fs::write(&path, &[0u8; 16]).unwrap(); // 16 bytes, not 32
+        std::fs::write(&path, [0u8; 16]).unwrap(); // 16 bytes, not 32
         let result = NodeIdentity::from_file(&path);
         assert!(result.is_err());
     }

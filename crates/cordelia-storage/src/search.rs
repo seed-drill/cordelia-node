@@ -33,29 +33,28 @@ pub fn extract_text(
     item_type: &str,
 ) -> SearchableText {
     // Memory items: memory:entity, memory:learning, memory:session
-    if item_type.starts_with("memory:") {
-        if let Some(obj) = content.as_object() {
-            if obj.contains_key("name") {
-                return SearchableText {
-                    name: obj
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    summary: obj
-                        .get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    content_text: obj
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    tags_text: extract_tags_from_value(content.get("tags")),
-                };
-            }
-        }
+    if item_type.starts_with("memory:")
+        && let Some(obj) = content.as_object()
+        && obj.contains_key("name")
+    {
+        return SearchableText {
+            name: obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            summary: obj
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            content_text: obj
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tags_text: extract_tags_from_value(content.get("tags")),
+        };
     }
 
     // Structured content with "text" field
@@ -167,7 +166,7 @@ pub fn sanitize_query(query: &str) -> Result<String, CordeliaError> {
         if let Some(pos) = term.find('*') {
             let prefix = &term[..pos];
             // Strip leading quotes/parens
-            let clean_prefix = prefix.trim_start_matches(|c: char| c == '"' || c == '(');
+            let clean_prefix = prefix.trim_start_matches(['"', '(']);
             if clean_prefix.len() < 3 {
                 return Err(CordeliaError::Validation(
                     "prefix queries require at least 3 characters before *".into(),
@@ -276,15 +275,15 @@ pub fn search_fts(
                 .ok();
 
             if let Some((item_type, published_at)) = row {
-                if let Some(type_filter) = types {
-                    if !type_filter.iter().any(|t| t == &item_type) {
-                        continue;
-                    }
+                if let Some(type_filter) = types
+                    && !type_filter.iter().any(|t| t == &item_type)
+                {
+                    continue;
                 }
-                if let Some(since_val) = since {
-                    if published_at.as_str() <= since_val {
-                        continue;
-                    }
+                if let Some(since_val) = since
+                    && published_at.as_str() <= since_val
+                {
+                    continue;
                 }
                 filtered.push((item_id.clone(), *rank));
             }

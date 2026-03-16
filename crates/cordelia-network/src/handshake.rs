@@ -226,11 +226,7 @@ fn validate_propose(
 
     // Timestamp validation (§4.1.5)
     let now = now_unix_secs();
-    let delta = if propose.timestamp > now {
-        propose.timestamp - now
-    } else {
-        now - propose.timestamp
-    };
+    let delta = propose.timestamp.abs_diff(now);
     if delta > MAX_CLOCK_SKEW_SECS {
         return Err(HandshakeError::ClockSkew { delta });
     }
@@ -261,11 +257,7 @@ fn validate_accept(
 
     // Timestamp validation (§4.1.5)
     let now = now_unix_secs();
-    let delta = if accept.timestamp > now {
-        accept.timestamp - now
-    } else {
-        now - accept.timestamp
-    };
+    let delta = accept.timestamp.abs_diff(now);
     if delta > MAX_CLOCK_SKEW_SECS {
         return Err(HandshakeError::ClockSkew { delta });
     }

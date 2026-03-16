@@ -114,6 +114,12 @@ pub struct PeerRateLimiter {
     pub first_breach: Option<Instant>,
 }
 
+impl Default for PeerRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerRateLimiter {
     pub fn new() -> Self {
         let minute = Duration::from_secs(60);

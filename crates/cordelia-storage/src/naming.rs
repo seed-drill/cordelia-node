@@ -385,11 +385,11 @@ mod tests {
         // The validator enforces ASCII-only (a-z, 0-9, hyphen), so multibyte
         // Unicode names are rejected at the character check before length matters.
         // 31 '\u{00E9}' chars = 62 bytes (under 63 byte limit) but invalid chars.
-        let name: String = std::iter::repeat('\u{00E9}').take(31).collect();
+        let name: String = std::iter::repeat_n('\u{00E9}', 31).collect();
         assert!(validate_channel_name(&name).is_err());
 
         // 32 '\u{00E9}' chars = 64 bytes (over 63 byte limit) -- also rejected.
-        let name_over: String = std::iter::repeat('\u{00E9}').take(32).collect();
+        let name_over: String = std::iter::repeat_n('\u{00E9}', 32).collect();
         assert!(validate_channel_name(&name_over).is_err());
     }
 }

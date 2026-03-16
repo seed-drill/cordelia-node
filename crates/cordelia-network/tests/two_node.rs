@@ -144,7 +144,7 @@ async fn test_two_node_channel_announce() {
     let id_b = make_identity();
 
     let psk = [0xAA; 32];
-    let psk_hash: [u8; 32] = Sha256::digest(&psk).into();
+    let psk_hash: [u8; 32] = Sha256::digest(psk).into();
 
     // Create descriptors
     let desc_shared = create_signed_descriptor(
@@ -427,7 +427,7 @@ async fn test_two_node_full_lifecycle() {
     let id_b = make_identity();
 
     let psk = [0xAA; 32];
-    let psk_hash: [u8; 32] = Sha256::digest(&psk).into();
+    let psk_hash: [u8; 32] = Sha256::digest(psk).into();
 
     let desc = channel_announce::create_signed_descriptor(
         &id_a,
@@ -583,7 +583,7 @@ async fn test_chaos_disconnect_during_sync() {
     // A opens a sync stream
     let conn_a = mgr_a.get_connection(&node_b_id).unwrap().clone();
     let (mut send, mut recv) = conn_a.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let _stream = tokio::io::join(&mut recv, &mut send);
 
     // Send sync request -- write the request bytes only (don't wait for response)
     cordelia_network::codec::write_protocol_byte(
@@ -710,7 +710,7 @@ async fn test_incoming_handshake_timeout() {
 
     // Now open a raw QUIC connection (no app handshake) from A's endpoint
     // This simulates a rogue peer that connects but never opens the handshake stream
-    let conn_a = mgr_a
+    let _conn_a = mgr_a
         .get_connection(&cordelia_core::NodeId(id_b.public_key()))
         .unwrap()
         .clone();

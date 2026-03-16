@@ -350,42 +350,42 @@ impl Governor {
             .values()
             .filter(|p| p.state == PeerState::Hot)
             .count();
-        if let Some(peer) = self.peers.get_mut(node_id) {
-            if peer.state == PeerState::Cold {
-                peer.connected_since = Some(Instant::now());
-                peer.last_activity = Instant::now();
-                if hot_count < self.targets.hot_min {
-                    // Bootstrap: urgently need hot peers, bypass tenure guard
-                    tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
-                    peer.set_state(PeerState::Hot);
-                    peer.disconnect_count = 0;
-                } else {
-                    // Steady state: new peers start as Warm, must earn Hot via tenure
-                    tracing::debug!(peer = %node_id, "gov: cold -> warm (tenure required)");
-                    peer.set_state(PeerState::Warm);
-                }
+        if let Some(peer) = self.peers.get_mut(node_id)
+            && peer.state == PeerState::Cold
+        {
+            peer.connected_since = Some(Instant::now());
+            peer.last_activity = Instant::now();
+            if hot_count < self.targets.hot_min {
+                // Bootstrap: urgently need hot peers, bypass tenure guard
+                tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
+                peer.set_state(PeerState::Hot);
+                peer.disconnect_count = 0;
+            } else {
+                // Steady state: new peers start as Warm, must earn Hot via tenure
+                tracing::debug!(peer = %node_id, "gov: cold -> warm (tenure required)");
+                peer.set_state(PeerState::Warm);
             }
         }
     }
 
     /// Mark peer as disconnected (back to Cold) with reconnect backoff.
     pub fn mark_disconnected(&mut self, node_id: &NodeId) {
-        if let Some(peer) = self.peers.get_mut(node_id) {
-            if peer.state.is_active() {
-                let from = peer.state.name();
-                peer.set_state(PeerState::Cold);
-                peer.connected_since = None;
-                peer.disconnect_count += 1;
-                peer.last_disconnected = Some(Instant::now());
-                let backoff = Self::reconnect_backoff(peer.disconnect_count);
-                tracing::info!(
-                    peer = %node_id,
-                    from,
-                    disconnect_count = peer.disconnect_count,
-                    backoff_secs = backoff.as_secs(),
-                    "gov: peer disconnected, backoff active"
-                );
-            }
+        if let Some(peer) = self.peers.get_mut(node_id)
+            && peer.state.is_active()
+        {
+            let from = peer.state.name();
+            peer.set_state(PeerState::Cold);
+            peer.connected_since = None;
+            peer.disconnect_count += 1;
+            peer.last_disconnected = Some(Instant::now());
+            let backoff = Self::reconnect_backoff(peer.disconnect_count);
+            tracing::info!(
+                peer = %node_id,
+                from,
+                disconnect_count = peer.disconnect_count,
+                backoff_secs = backoff.as_secs(),
+                "gov: peer disconnected, backoff active"
+            );
         }
     }
 
@@ -417,22 +417,22 @@ impl Governor {
     /// Replace a peer's node ID (e.g. after TLS handshake reveals real identity).
     pub fn replace_node_id(&mut self, old: &NodeId, new: NodeId, groups: Vec<String>) -> bool {
         // Check if the target already exists in a connected state
-        if let Some(existing) = self.peers.get(&new) {
-            if existing.state.is_active() {
-                if let Some(old_peer) = self.peers.remove(old) {
-                    if old_peer.is_relay {
-                        if let Some(target) = self.peers.get_mut(&new) {
-                            target.is_relay = true;
-                        }
-                    }
-                    tracing::debug!(
-                        peer = %new,
-                        old = %old,
-                        "gov: placeholder removed (target already active)"
-                    );
+        if let Some(existing) = self.peers.get(&new)
+            && existing.state.is_active()
+        {
+            if let Some(old_peer) = self.peers.remove(old) {
+                if old_peer.is_relay
+                    && let Some(target) = self.peers.get_mut(&new)
+                {
+                    target.is_relay = true;
                 }
-                return true;
+                tracing::debug!(
+                    peer = %new,
+                    old = %old,
+                    "gov: placeholder removed (target already active)"
+                );
             }
+            return true;
         }
 
         if let Some(mut peer) = self.peers.remove(old) {
@@ -573,20 +573,19 @@ impl Governor {
                 reason,
                 escalation,
             } = &peer.state
+                && now >= *until
             {
-                if now >= *until {
-                    tracing::info!(
-                        peer = %peer.node_id,
-                        reason = reason.as_str(),
-                        escalation,
-                        "gov: ban expired, returning to cold"
-                    );
-                    let from = peer.state.name().to_string();
-                    peer.set_state(PeerState::Cold);
-                    actions
-                        .transitions
-                        .push((peer.node_id.clone(), from, "cold".into()));
-                }
+                tracing::info!(
+                    peer = %peer.node_id,
+                    reason = reason.as_str(),
+                    escalation,
+                    "gov: ban expired, returning to cold"
+                );
+                let from = peer.state.name().to_string();
+                peer.set_state(PeerState::Cold);
+                actions
+                    .transitions
+                    .push((peer.node_id.clone(), from, "cold".into()));
             }
         }
     }

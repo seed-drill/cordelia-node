@@ -51,6 +51,12 @@ pub struct KeepAliveState {
     last_peer_ping_seq: u64,
 }
 
+impl Default for KeepAliveState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeepAliveState {
     pub fn new() -> Self {
         Self {

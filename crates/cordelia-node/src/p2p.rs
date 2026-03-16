@@ -81,6 +81,7 @@ pub fn store_item(
 
 /// Canonical post-connection sequence (connection-lifecycle.md §1.2).
 /// ALL connection paths MUST call this after successful connection.
+#[allow(clippy::too_many_arguments)]
 pub fn post_connect(
     node_id: &NodeId,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
@@ -289,7 +290,6 @@ pub async fn p2p_loop(
                         Ok(d) => d,
                         Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share request failed"); continue; }
                     };
-                    drop(stream); drop(send); drop(recv);
                     let own_addr = conn_mgr.local_addr().ok();
                     let valid = if allow_private_addresses {
                         discovered
@@ -303,8 +303,8 @@ pub async fn p2p_loop(
                         if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
                             continue;
                         }
-                        if let Some(addr_str) = peer_addr.addrs.first() {
-                            if let Ok(addr) = addr_str.parse() {
+                        if let Some(addr_str) = peer_addr.addrs.first()
+                            && let Ok(addr) = addr_str.parse() {
                                 match tokio::time::timeout(
                                     cordelia_network::codec::STREAM_TIMEOUT,
                                     conn_mgr.connect_to(addr),
@@ -320,7 +320,6 @@ pub async fn p2p_loop(
                                     Err(_) => { tracing::warn!(addr = %addr_str, "peer-share connect timed out (10s)"); }
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -511,9 +510,9 @@ pub async fn p2p_loop(
                     conn_mgr.disconnect(node_id);
                 }
                 for node_id in &actions.connect {
-                    if let Some(peer) = governor.peer_info(node_id) {
-                        if let Some(addr_str) = peer.addrs.first() {
-                            if let Ok(addr) = addr_str.parse() {
+                    if let Some(peer) = governor.peer_info(node_id)
+                        && let Some(addr_str) = peer.addrs.first()
+                            && let Ok(addr) = addr_str.parse() {
                                 match tokio::time::timeout(
                                     cordelia_network::codec::STREAM_TIMEOUT,
                                     conn_mgr.connect_to(addr),
@@ -535,8 +534,6 @@ pub async fn p2p_loop(
                                     }
                                 }
                             }
-                        }
-                    }
                 }
                 let (hot, warm, cold, banned) = governor.counts();
                 state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
@@ -577,6 +574,7 @@ pub async fn p2p_loop(
 
 /// Handle inbound protocol streams from a connected peer.
 /// Runs until the connection closes.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_peer_streams(
     conn: quinn::Connection,
     peer_id: NodeId,
@@ -631,9 +629,7 @@ pub async fn handle_peer_streams(
         // Per-peer rate limit check (§9.2)
         {
             let mut rates = peer_rates.lock().unwrap_or_else(|e| e.into_inner());
-            let limiter = rates
-                .entry(peer_id.clone())
-                .or_insert_with(cordelia_network::rate_limit::PeerRateLimiter::new);
+            let limiter = rates.entry(peer_id.clone()).or_default();
             let allowed = match protocol {
                 cordelia_network::messages::Protocol::ItemPush => limiter.writes.check_and_record(),
                 cordelia_network::messages::Protocol::ItemSync => limiter.syncs.check_and_record(),
@@ -783,7 +779,7 @@ async fn handle_inbound_sync(
     recv: &mut quinn::RecvStream,
     peer_id: &NodeId,
     state: &web::Data<cordelia_api::state::AppState>,
-    node_role: &str,
+    _node_role: &str,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -840,39 +836,39 @@ async fn handle_inbound_sync(
     tracing::debug!(peer = %peer_id, channel = %req.channel_id, "served sync request");
 
     // Optional fetch phase: peer may request full items
-    if let Ok(fetch_msg) = cordelia_network::codec::read_frame(recv).await {
-        if let cordelia_network::messages::WireMessage::FetchRequest(freq) = fetch_msg {
-            let fetch_items = {
-                let db = match state.db.lock() {
-                    Ok(db) => db,
-                    Err(_) => return,
-                };
-                cordelia_storage::items::query_listen(&db, &req.channel_id, None, 1000)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|si| freq.item_ids.contains(&si.item_id))
-                    .map(|si| cordelia_network::messages::Item {
-                        item_id: si.item_id,
-                        channel_id: si.channel_id,
-                        item_type: si.item_type,
-                        content_length: si.encrypted_blob.len() as u32,
-                        encrypted_blob: si.encrypted_blob,
-                        content_hash: si.content_hash,
-                        author_id: si.author_id,
-                        signature: si.signature,
-                        key_version: si.key_version as u32,
-                        published_at: si.published_at,
-                        is_tombstone: si.is_tombstone,
-                        parent_id: si.parent_id,
-                    })
-                    .collect::<Vec<_>>()
+    if let Ok(fetch_msg) = cordelia_network::codec::read_frame(recv).await
+        && let cordelia_network::messages::WireMessage::FetchRequest(freq) = fetch_msg
+    {
+        let fetch_items = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => return,
             };
-            let fresp = cordelia_network::messages::WireMessage::FetchResponse(
-                cordelia_network::messages::FetchResponse { items: fetch_items },
-            );
-            let _ = cordelia_network::codec::write_frame(send, &fresp).await;
-            tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
-        }
+            cordelia_storage::items::query_listen(&db, &req.channel_id, None, 1000)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|si| freq.item_ids.contains(&si.item_id))
+                .map(|si| cordelia_network::messages::Item {
+                    item_id: si.item_id,
+                    channel_id: si.channel_id,
+                    item_type: si.item_type,
+                    content_length: si.encrypted_blob.len() as u32,
+                    encrypted_blob: si.encrypted_blob,
+                    content_hash: si.content_hash,
+                    author_id: si.author_id,
+                    signature: si.signature,
+                    key_version: si.key_version as u32,
+                    published_at: si.published_at,
+                    is_tombstone: si.is_tombstone,
+                    parent_id: si.parent_id,
+                })
+                .collect::<Vec<_>>()
+        };
+        let fresp = cordelia_network::messages::WireMessage::FetchResponse(
+            cordelia_network::messages::FetchResponse { items: fetch_items },
+        );
+        let _ = cordelia_network::codec::write_frame(send, &fresp).await;
+        tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
     }
 }
 

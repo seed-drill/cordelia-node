@@ -260,7 +260,7 @@ pub async fn listen(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
-    let limit = body.limit.min(MAX_LISTEN_LIMIT).max(1);
+    let limit = body.limit.clamp(1, MAX_LISTEN_LIMIT);
 
     let db = state
         .db
@@ -1007,7 +1007,7 @@ pub async fn search_handler(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
-    let limit = body.limit.min(100).max(1);
+    let limit = body.limit.clamp(1, 100);
 
     let db = state
         .db
@@ -1124,9 +1124,9 @@ pub async fn metrics(
         let count = items::count_for_channel(&db, &ch.channel_id)?;
         let label = channel_label(&ch.channel_id);
         use std::fmt::Write;
-        let _ = write!(
+        let _ = writeln!(
             items_lines,
-            "cordelia_items_total{{channel=\"{label}\"}} {count}\n"
+            "cordelia_items_total{{channel=\"{label}\"}} {count}"
         );
     }
 

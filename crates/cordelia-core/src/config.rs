@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::CordeliaError;
 
 /// Top-level configuration (mirrors config.toml structure).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub identity: IdentityConfig,
@@ -22,7 +22,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IdentityConfig {
     pub entity_id: String,
@@ -114,29 +114,7 @@ pub struct LoggingConfig {
 
 // ── Defaults (configuration.md §3) ─────────────────────────────────
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            identity: IdentityConfig::default(),
-            node: NodeConfig::default(),
-            network: NetworkConfig::default(),
-            governor: GovernorConfig::default(),
-            replication: ReplicationConfig::default(),
-            limits: LimitsConfig::default(),
-            api: ApiConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
-
-impl Default for IdentityConfig {
-    fn default() -> Self {
-        Self {
-            entity_id: String::new(),
-            public_key: String::new(),
-        }
-    }
-}
+// Config and IdentityConfig use #[derive(Default)] -- all fields have Default impls.
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -261,15 +239,15 @@ impl Config {
 
     /// Apply environment variable overrides (configuration.md §4).
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("CORDELIA_HTTP_PORT") {
-            if let Ok(port) = v.parse() {
-                self.node.http_port = port;
-            }
+        if let Ok(v) = std::env::var("CORDELIA_HTTP_PORT")
+            && let Ok(port) = v.parse()
+        {
+            self.node.http_port = port;
         }
-        if let Ok(v) = std::env::var("CORDELIA_P2P_PORT") {
-            if let Ok(port) = v.parse() {
-                self.node.p2p_port = port;
-            }
+        if let Ok(v) = std::env::var("CORDELIA_P2P_PORT")
+            && let Ok(port) = v.parse()
+        {
+            self.node.p2p_port = port;
         }
         if let Ok(v) = std::env::var("CORDELIA_DATA_DIR") {
             self.node.data_dir = v;
@@ -308,15 +286,15 @@ impl Config {
 
 /// Expand `~` to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
-    if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
+    if path == "~"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(path)
 }

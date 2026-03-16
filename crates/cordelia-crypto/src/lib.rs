@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn test_full_psk_distribution_flow() {
         // Sender creates a channel with a PSK
-        let sender = NodeIdentity::generate().unwrap();
+        let _sender = NodeIdentity::generate().unwrap();
         let recipient = NodeIdentity::generate().unwrap();
         let psk = generate_psk().unwrap();
 

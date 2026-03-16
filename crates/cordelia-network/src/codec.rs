@@ -221,14 +221,14 @@ mod tests {
     fn test_ping_encode_decode() {
         let msg = WireMessage::Ping(Ping {
             seq: 42,
-            sent_at_ns: 1710100000_000_000_000,
+            sent_at_ns: 1_710_100_000_000_000_000,
         });
         let encoded = encode_message(&msg).unwrap();
         let decoded = decode_message(&encoded).unwrap();
         match decoded {
             WireMessage::Ping(p) => {
                 assert_eq!(p.seq, 42);
-                assert_eq!(p.sent_at_ns, 1710100000_000_000_000);
+                assert_eq!(p.sent_at_ns, 1_710_100_000_000_000_000);
             }
             other => panic!("expected Ping, got {:?}", other),
         }
@@ -447,7 +447,7 @@ mod tests {
     async fn test_frame_roundtrip() {
         let msg = WireMessage::Ping(Ping {
             seq: 99,
-            sent_at_ns: 1710100000_000_000_000,
+            sent_at_ns: 1_710_100_000_000_000_000,
         });
 
         let mut buf = Vec::new();
@@ -583,7 +583,7 @@ mod tests {
         let len = 100u32.to_be_bytes();
         let mut buf = Vec::new();
         buf.extend_from_slice(&len);
-        buf.extend_from_slice(&vec![0u8; 50]);
+        buf.extend_from_slice(&[0u8; 50]);
 
         let mut cursor = std::io::Cursor::new(buf);
         let result = read_frame(&mut cursor).await;

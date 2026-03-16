@@ -66,7 +66,7 @@ pub fn decode_psk_envelope(cbor_bytes: &[u8]) -> Result<PskEnvelopeFields, Crypt
     use ciborium::Value;
 
     let value: Value =
-        ciborium::from_reader(cbor_bytes).map_err(|e| CryptoError::DecryptionFailed)?;
+        ciborium::from_reader(cbor_bytes).map_err(|_e| CryptoError::DecryptionFailed)?;
 
     let map = match value {
         Value::Map(m) => m,
@@ -90,12 +90,12 @@ pub fn decode_psk_envelope(cbor_bytes: &[u8]) -> Result<PskEnvelopeFields, Crypt
                 }
             }
             Value::Text(s) if s == "recipient_xpk" => {
-                if let Value::Bytes(b) = v {
-                    if b.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(b);
-                        recipient_xpk = Some(arr);
-                    }
+                if let Value::Bytes(b) = v
+                    && b.len() == 32
+                {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(b);
+                    recipient_xpk = Some(arr);
                 }
             }
             _ => {}

@@ -372,11 +372,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            let result = handle_sync_request(&mut server, |_, _, _| {
+            handle_sync_request(&mut server, |_, _, _| {
                 panic!("should not reach handler");
             })
-            .await;
-            result
+            .await
         });
 
         // Send a Ping where a SyncRequest is expected

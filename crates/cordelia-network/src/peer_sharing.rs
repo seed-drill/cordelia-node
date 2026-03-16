@@ -83,10 +83,10 @@ pub fn is_valid_peer_address(addr: &str, own_addr: Option<&SocketAddr>) -> bool 
     }
 
     // Reject our own address
-    if let Some(own) = own_addr {
-        if &parsed == own {
-            return false;
-        }
+    if let Some(own) = own_addr
+        && &parsed == own
+    {
+        return false;
     }
 
     match parsed.ip() {
