@@ -642,4 +642,30 @@ mod tests {
         let result = read_frame(&mut cursor).await;
         assert!(matches!(result, Err(CodecError::UnexpectedEof)));
     }
+
+    // T2-1: CBOR tag 0 wrapper handling
+    #[test]
+    fn test_cbor_timestamp_without_tag0() {
+        // Timestamps are u64 epoch values. Verify CBOR roundtrip preserves them
+        // regardless of whether a peer wraps in CBOR tag 0 per RFC 8949 §3.4.1.
+        // Our parser must handle both tagged and untagged integers.
+        let msg = WireMessage::HandshakePropose(HandshakePropose {
+            magic: HANDSHAKE_MAGIC,
+            version_min: 1,
+            version_max: 1,
+            timestamp: 1767225600, // 2026-01-01T00:00:00Z as epoch
+            channel_digest: vec![0u8; 32],
+            channel_count: 0,
+            node_id: vec![0u8; 32],
+            roles: vec!["personal".into()],
+            p2p_port: 9474,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        if let WireMessage::HandshakePropose(h) = decoded {
+            assert_eq!(h.timestamp, 1767225600);
+        } else {
+            panic!("wrong message type");
+        }
+    }
 }

@@ -377,4 +377,19 @@ mod tests {
             ChannelType::Protocol
         );
     }
+
+    // T13-4: Unicode channel names at byte limit
+    #[test]
+    fn test_unicode_channel_name_at_byte_limit() {
+        // UTF-8 multibyte chars: '\u{00E9}' is 2 bytes per char.
+        // The validator enforces ASCII-only (a-z, 0-9, hyphen), so multibyte
+        // Unicode names are rejected at the character check before length matters.
+        // 31 '\u{00E9}' chars = 62 bytes (under 63 byte limit) but invalid chars.
+        let name: String = std::iter::repeat('\u{00E9}').take(31).collect();
+        assert!(validate_channel_name(&name).is_err());
+
+        // 32 '\u{00E9}' chars = 64 bytes (over 63 byte limit) -- also rejected.
+        let name_over: String = std::iter::repeat('\u{00E9}').take(32).collect();
+        assert!(validate_channel_name(&name_over).is_err());
+    }
 }
