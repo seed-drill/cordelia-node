@@ -718,6 +718,46 @@ async fn test_incoming_handshake_timeout() {
     mgr_a.shutdown();
 }
 
+/// T1-1: BV-19 regression. Verify QUIC connection survives 35s idle
+/// (longer than the old default 30s idle timeout). With keep_alive_interval=15s
+/// the connection should survive indefinitely.
+/// This test takes ~35s to run -- marked #[ignore] for normal test runs.
+/// Run with: cargo test --test two_node -- --ignored
+#[tokio::test]
+#[ignore]
+async fn test_bv19_connection_survives_35s_idle() {
+    let id_a = make_identity();
+    let id_b = make_identity();
+
+    let ep_a = make_endpoint(&id_a);
+    let ep_b = make_endpoint(&id_b);
+    let b_addr = ep_b.local_addr().unwrap();
+
+    // B accepts and holds the connection open
+    let server = tokio::spawn(async move {
+        let incoming = ep_b.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        // Wait 35s -- longer than old default idle timeout of 30s
+        tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+        // Connection should still be alive (keepalive PINGs every 15s prevent idle close)
+        let alive = conn.close_reason().is_none();
+        conn.close(0u32.into(), b"done");
+        ep_b.close(0u32.into(), b"done");
+        alive
+    });
+
+    let conn_a = ep_a.connect(b_addr, "cordelia").unwrap().await.unwrap();
+    // Client also waits 35s
+    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+    let client_alive = conn_a.close_reason().is_none();
+    conn_a.close(0u32.into(), b"done");
+    ep_a.close(0u32.into(), b"done");
+
+    let server_alive = server.await.unwrap();
+    assert!(server_alive, "server connection should survive 35s idle with keepalive");
+    assert!(client_alive, "client connection should survive 35s idle with keepalive");
+}
+
 /// T11-2: Shutdown sequence. Verify shutdown_and_wait() completes
 /// and the endpoint is properly closed.
 #[tokio::test]
