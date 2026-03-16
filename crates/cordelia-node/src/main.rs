@@ -475,10 +475,13 @@ async fn p2p_loop(
                 .get_peer(&node_id)
                 .map(|pc| {
                     let roles = &pc.handshake.peer_roles;
-                    tracing::debug!(peer = %node_id, ?roles, "post_connect: peer roles");
+                    tracing::info!(peer = %node_id, roles = ?roles, "post_connect: checking peer roles");
                     roles.contains(&"relay".to_string())
                 })
-                .unwrap_or(false);
+                .unwrap_or_else(|| {
+                    tracing::warn!(peer = %node_id, "post_connect: get_peer returned None");
+                    false
+                });
             // Step 2: Add to governor
             $governor.add_peer(node_id.clone(), vec![], vec![]);
             // Step 3: Mark relay role
