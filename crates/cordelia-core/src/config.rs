@@ -62,6 +62,7 @@ pub struct BootnodeConfig {
 pub struct GovernorConfig {
     pub hot_min: u32,
     pub hot_max: u32,
+    pub hot_min_relays: u32,
     pub warm_min: u32,
     pub warm_max: u32,
     pub cold_max: u32,
@@ -173,6 +174,7 @@ impl Default for GovernorConfig {
         Self {
             hot_min: 2,
             hot_max: 20,
+            hot_min_relays: 1,
             warm_min: 10,
             warm_max: 50,
             cold_max: 200,

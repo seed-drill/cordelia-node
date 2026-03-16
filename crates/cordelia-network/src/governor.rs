@@ -35,6 +35,7 @@ pub enum DialPolicy {
 pub struct GovernorTargets {
     pub hot_min: usize,
     pub hot_max: usize,
+    pub hot_min_relays: usize,
     pub warm_min: usize,
     pub warm_max: usize,
     pub cold_max: usize,
@@ -48,6 +49,7 @@ impl Default for GovernorTargets {
         Self {
             hot_min: 2,
             hot_max: 20,
+            hot_min_relays: 1,
             warm_min: 10,
             warm_max: 50,
             cold_max: 100,
@@ -64,6 +66,7 @@ impl GovernorTargets {
         Self {
             hot_min: cfg.hot_min as usize,
             hot_max: cfg.hot_max as usize,
+            hot_min_relays: cfg.hot_min_relays as usize,
             warm_min: cfg.warm_min as usize,
             warm_max: cfg.warm_max as usize,
             cold_max: cfg.cold_max as usize,
@@ -482,6 +485,8 @@ impl Governor {
         self.promote_cold_to_warm(&mut actions);
         // 4. Promote Warm -> Hot if needed
         self.promote_warm_to_hot(&mut actions);
+        // 4a. Ensure relay connectivity (§5.4 step 4a)
+        self.ensure_relay_connectivity(&mut actions);
         // 5. Demote excess Hot -> Warm
         self.demote_excess_hot(&mut actions);
         // 6. Periodic churn
@@ -659,6 +664,50 @@ impl Governor {
                 peer.set_state(PeerState::Hot);
                 peer.disconnect_count = 0;
                 actions.transitions.push((id, "warm".into(), "hot".into()));
+            }
+        }
+    }
+
+    /// Step 4a: Ensure at least hot_min_relays relay peers are in the Hot set.
+    /// If not enough relays are Hot, promote a random warm relay (bypassing tenure).
+    fn ensure_relay_connectivity(&mut self, actions: &mut GovernorActions) {
+        if self.targets.hot_min_relays == 0 {
+            return;
+        }
+
+        let hot_relays = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && p.is_relay)
+            .count();
+
+        if hot_relays >= self.targets.hot_min_relays {
+            return;
+        }
+
+        let needed = self.targets.hot_min_relays - hot_relays;
+
+        // Find warm relay peers (bypass tenure guard -- relay connectivity is urgent)
+        let warm_relays: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Warm && p.is_relay)
+            .map(|p| p.node_id.clone())
+            .collect();
+
+        for id in warm_relays.into_iter().take(needed) {
+            if let Some(peer) = self.peers.get_mut(&id) {
+                tracing::info!(
+                    peer = %id,
+                    hot_relays,
+                    target = self.targets.hot_min_relays,
+                    "gov: warm relay -> hot (ensure relay connectivity)"
+                );
+                peer.set_state(PeerState::Hot);
+                peer.disconnect_count = 0;
+                actions
+                    .transitions
+                    .push((id, "warm".into(), "hot".into()));
             }
         }
     }
@@ -1475,5 +1524,53 @@ mod tests {
         // hot_max=2 with 3 hot peers -> demote worst. Stale peer should go first.
         let (hot, _, _, _) = gov.counts();
         assert!(hot <= 2, "should have demoted excess hot peer");
+    }
+
+    // Step 4a: hot_min_relays ensures relay backbone connectivity
+    #[test]
+    fn test_ensure_relay_connectivity() {
+        let targets = GovernorTargets {
+            hot_min: 2,
+            hot_max: 10,
+            hot_min_relays: 1,
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // 2 hot personal peers (satisfies hot_min)
+        for i in 0..2 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+        }
+        // 1 warm relay peer
+        let relay_id = make_node_id(10);
+        gov.add_peer(relay_id.clone(), make_addr(), vec![]);
+        gov.mark_connected(&relay_id);
+        gov.set_peer_relay(&relay_id, true);
+
+        // Before tick: 2 hot (personal), 1 warm (relay)
+        let (hot, warm, _, _) = gov.counts();
+        assert_eq!(hot, 2);
+        assert_eq!(warm, 1);
+        let hot_relays = gov.hot_peers().iter()
+            .filter(|id| gov.peer_info(id).map(|p| p.is_relay).unwrap_or(false))
+            .count();
+        assert_eq!(hot_relays, 0, "no relays in hot set yet");
+
+        // Tick should promote relay to Hot via step 4a
+        let actions = gov.tick();
+        let hot_relays_after = gov.hot_peers().iter()
+            .filter(|id| gov.peer_info(id).map(|p| p.is_relay).unwrap_or(false))
+            .count();
+        assert_eq!(hot_relays_after, 1, "relay should be promoted to Hot by step 4a");
+        let (hot, _, _, _) = gov.counts();
+        assert_eq!(hot, 3, "should now have 3 hot peers (2 personal + 1 relay)");
+
+        // Verify transition was recorded
+        let relay_promoted = actions.transitions.iter()
+            .any(|(id, _, to)| *id == relay_id && to == "hot");
+        assert!(relay_promoted, "relay promotion should be in transitions");
     }
 }

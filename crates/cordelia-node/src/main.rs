@@ -527,8 +527,13 @@ async fn p2p_loop(
                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                         tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
 
-                        // Register with governor
+                        // Register with governor + detect relay role
                         governor.add_peer(node_id.clone(), vec![], vec![]);
+                        if let Some(pc) = conn_mgr.get_peer(&node_id) {
+                            if pc.handshake.peer_roles.contains(&"relay".to_string()) {
+                                governor.set_peer_relay(&node_id, true);
+                            }
+                        }
                         governor.mark_connected(&node_id);
 
                         // Update shared peer list
@@ -610,6 +615,11 @@ async fn p2p_loop(
                                         state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
                                         tracing::info!(peer = %new_id, peers = count, "connected via peer-sharing");
                                         governor.add_peer(new_id.clone(), vec![], vec![]);
+                                        if let Some(pc) = conn_mgr.get_peer(&new_id) {
+                                            if pc.handshake.peer_roles.contains(&"relay".to_string()) {
+                                                governor.set_peer_relay(&new_id, true);
+                                            }
+                                        }
                                         governor.mark_connected(&new_id);
                                         if let Ok(mut peers) = shared_peers.write() {
                                             *peers = conn_mgr.known_peer_addresses();
