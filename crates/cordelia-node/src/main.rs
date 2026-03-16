@@ -484,7 +484,7 @@ async fn p2p_loop(
             // Step 3: Mark relay role
             if is_relay {
                 $governor.set_peer_relay(&node_id, true);
-                tracing::debug!(peer = %node_id, "peer identified as relay");
+                tracing::info!(peer = %node_id, "peer identified as relay");
             }
             // Step 4: Mark connected (triggers Hot/Warm promotion)
             $governor.mark_connected(&node_id);
