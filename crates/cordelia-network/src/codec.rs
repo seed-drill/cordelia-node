@@ -752,7 +752,9 @@ mod tests {
         // so just write the response after the request
         let mut buf = Vec::new();
         // Simulate client writing: protocol byte + request frame
-        write_protocol_byte(&mut buf, Protocol::PeerSharing).await.unwrap();
+        write_protocol_byte(&mut buf, Protocol::PeerSharing)
+            .await
+            .unwrap();
         write_frame(&mut buf, &req).await.unwrap();
         // Simulate server appending: response frame
         write_frame(&mut buf, &resp).await.unwrap();

@@ -529,9 +529,8 @@ async fn test_chaos_disconnect_during_handshake() {
 
     // B starts accepting
     let accept_task = tokio::spawn(async move {
-        let mut mgr_b = ConnectionManager::new(
-            id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-        );
+        let mut mgr_b =
+            ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
         // Accept should return an error (peer dropped during handshake)
         let result = mgr_b.accept_incoming().await;
         (result, mgr_b)
@@ -545,13 +544,16 @@ async fn test_chaos_disconnect_during_handshake() {
     ep_a.close(0u32.into(), b"chaos");
 
     // B should handle this gracefully (error, not hang)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        accept_task,
-    ).await;
-    assert!(result.is_ok(), "accept should not hang after peer drops mid-handshake");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), accept_task).await;
+    assert!(
+        result.is_ok(),
+        "accept should not hang after peer drops mid-handshake"
+    );
     let (accept_result, _mgr_b) = result.unwrap().unwrap();
-    assert!(accept_result.is_err(), "accept should return error for dropped peer");
+    assert!(
+        accept_result.is_err(),
+        "accept should return error for dropped peer"
+    );
 }
 
 /// T14-5b: Disconnect mid-item-sync. Verify the sync requester handles
@@ -565,12 +567,10 @@ async fn test_chaos_disconnect_during_sync() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-    );
+    let mut mgr_a =
+        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+    let mut mgr_b =
+        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
     let accept_task = tokio::spawn(async move {
         mgr_b.accept_incoming().await.unwrap();
@@ -586,7 +586,12 @@ async fn test_chaos_disconnect_during_sync() {
     let mut stream = tokio::io::join(&mut recv, &mut send);
 
     // Send sync request -- write the request bytes only (don't wait for response)
-    cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await.unwrap();
+    cordelia_network::codec::write_protocol_byte(
+        &mut send,
+        cordelia_network::messages::Protocol::ItemSync,
+    )
+    .await
+    .unwrap();
     let req = cordelia_network::messages::WireMessage::SyncRequest(
         cordelia_network::messages::SyncRequest {
             channel_id: "test-channel".to_string(),
@@ -594,15 +599,23 @@ async fn test_chaos_disconnect_during_sync() {
             limit: 100,
         },
     );
-    cordelia_network::codec::write_frame(&mut send, &req).await.unwrap();
+    cordelia_network::codec::write_frame(&mut send, &req)
+        .await
+        .unwrap();
 
     // B crashes before responding -- kill B's connection
     let node_a_id = cordelia_core::NodeId(id_a.public_key());
-    mgr_b.get_connection(&node_a_id).unwrap().close(0u32.into(), b"chaos");
+    mgr_b
+        .get_connection(&node_a_id)
+        .unwrap()
+        .close(0u32.into(), b"chaos");
 
     // A tries to read response -- should get error (ReadTimeout or connection error), not hang
     let result = cordelia_network::codec::read_frame(&mut recv).await;
-    assert!(result.is_err(), "read should return error after peer crashes");
+    assert!(
+        result.is_err(),
+        "read should return error after peer crashes"
+    );
 
     mgr_a.shutdown();
 }
@@ -618,12 +631,10 @@ async fn test_stress_concurrent_streams() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-    );
+    let mut mgr_a =
+        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+    let mut mgr_b =
+        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
     let accept_task = tokio::spawn(async move {
         mgr_b.accept_incoming().await.unwrap();
@@ -640,10 +651,7 @@ async fn test_stress_concurrent_streams() {
     for i in 0u32..50 {
         let c = conn.clone();
         handles.push(tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                c.open_bi(),
-            ).await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), c.open_bi()).await;
             match result {
                 Ok(Ok((mut send, _recv))) => {
                     // Write a small payload and close
@@ -683,22 +691,18 @@ async fn test_incoming_handshake_timeout() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-    );
+    let mut mgr_a =
+        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+    let mut mgr_b =
+        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
     // A connects normally (QUIC + app handshake)
     let accept_task = tokio::spawn(async move {
         mgr_b.accept_incoming().await.unwrap();
         // Now B has one connection. Next accept_incoming will wait for a new
         // connection that never completes app handshake.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            mgr_b.accept_incoming(),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), mgr_b.accept_incoming()).await;
         (result, mgr_b)
     });
 
@@ -706,8 +710,10 @@ async fn test_incoming_handshake_timeout() {
 
     // Now open a raw QUIC connection (no app handshake) from A's endpoint
     // This simulates a rogue peer that connects but never opens the handshake stream
-    let conn_a = mgr_a.get_connection(&cordelia_core::NodeId(id_b.public_key()))
-        .unwrap().clone();
+    let conn_a = mgr_a
+        .get_connection(&cordelia_core::NodeId(id_b.public_key()))
+        .unwrap()
+        .clone();
     // A already has a connection to B. B's second accept_incoming will either:
     // 1. Accept a new QUIC connection (none incoming) and hang on endpoint.accept()
     // 2. Or timeout on the outer 15s wrapper
@@ -715,7 +721,10 @@ async fn test_incoming_handshake_timeout() {
 
     let (result, _mgr_b) = accept_task.await.unwrap();
     // The outer timeout should fire (15s) because no second connection arrives
-    assert!(result.is_err(), "accept should timeout when no new peer connects");
+    assert!(
+        result.is_err(),
+        "accept should timeout when no new peer connects"
+    );
 
     mgr_a.shutdown();
 }
@@ -756,8 +765,14 @@ async fn test_bv19_connection_survives_35s_idle() {
     ep_a.close(0u32.into(), b"done");
 
     let server_alive = server.await.unwrap();
-    assert!(server_alive, "server connection should survive 35s idle with keepalive");
-    assert!(client_alive, "client connection should survive 35s idle with keepalive");
+    assert!(
+        server_alive,
+        "server connection should survive 35s idle with keepalive"
+    );
+    assert!(
+        client_alive,
+        "client connection should survive 35s idle with keepalive"
+    );
 }
 
 /// T11-2: Shutdown sequence. Verify shutdown_and_wait() completes
@@ -771,12 +786,10 @@ async fn test_shutdown_and_wait() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474,
-    );
+    let mut mgr_a =
+        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+    let mut mgr_b =
+        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
     let accept_task = tokio::spawn(async move {
         mgr_b.accept_incoming().await.unwrap();
@@ -798,6 +811,12 @@ async fn test_shutdown_and_wait() {
     let result_a = tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_a).await;
     let result_b = tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_b).await;
 
-    assert!(result_a.is_ok(), "shutdown_and_wait A should complete within 5s");
-    assert!(result_b.is_ok(), "shutdown_and_wait B should complete within 5s");
+    assert!(
+        result_a.is_ok(),
+        "shutdown_and_wait A should complete within 5s"
+    );
+    assert!(
+        result_b.is_ok(),
+        "shutdown_and_wait B should complete within 5s"
+    );
 }

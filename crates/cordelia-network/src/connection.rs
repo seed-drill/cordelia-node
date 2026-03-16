@@ -234,10 +234,7 @@ impl ConnectionManager {
         let remote = incoming.remote_address();
         tracing::debug!(remote = %remote, "QUIC incoming connection received");
         // QUIC handshake with 10s timeout -- prevents blocking the select loop
-        let conn = match tokio::time::timeout(
-            Duration::from_secs(10),
-            incoming,
-        ).await {
+        let conn = match tokio::time::timeout(Duration::from_secs(10), incoming).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed");

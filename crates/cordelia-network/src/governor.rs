@@ -205,8 +205,7 @@ impl PeerInfo {
 
         // Contribution factor: penalise relays that don't relay items (§5.5)
         let contribution_factor = if self.is_relay {
-            let ratio = self.items_relayed as f64
-                / (self.items_requested.max(1) as f64);
+            let ratio = self.items_relayed as f64 / (self.items_requested.max(1) as f64);
             ratio.clamp(0.1, 2.0)
         } else {
             1.0
@@ -456,7 +455,9 @@ impl Governor {
             };
             // Exponential escalation: base * 2^(escalation-1), capped at 7 days
             let base = Duration::from_secs(tier.base_secs());
-            let multiplier = 1u32.checked_shl(escalation.saturating_sub(1)).unwrap_or(u32::MAX);
+            let multiplier = 1u32
+                .checked_shl(escalation.saturating_sub(1))
+                .unwrap_or(u32::MAX);
             let duration = (base * multiplier).min(Duration::from_secs(7 * 86400));
             tracing::warn!(
                 peer = %node_id,
@@ -715,9 +716,11 @@ impl Governor {
         let eligible: Vec<NodeId> = if urgent {
             eligible // Bypass tenure for bootstrap urgency
         } else {
-            eligible.into_iter()
+            eligible
+                .into_iter()
                 .filter(|id| {
-                    self.peers.get(id)
+                    self.peers
+                        .get(id)
                         .is_some_and(|p| p.state_tenure() >= min_tenure)
                 })
                 .collect()
@@ -1461,11 +1464,10 @@ mod tests {
             warm_min: 0,
             ..Default::default()
         };
-        let mut gov =
-            Governor::new(targets, vec![]).with_timeouts(GovernorTimeouts {
-                dead_timeout: Duration::from_secs(5),
-                ..Default::default()
-            });
+        let mut gov = Governor::new(targets, vec![]).with_timeouts(GovernorTimeouts {
+            dead_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
 
         let id = make_node_id(1);
         gov.add_peer(id.clone(), make_addr(), vec![]);
@@ -1473,8 +1475,7 @@ mod tests {
         assert_eq!(gov.peer_info(&id).unwrap().state, PeerState::Hot);
 
         // Simulate no activity for 10s (> dead_timeout of 5s)
-        gov.peers.get_mut(&id).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(10);
+        gov.peers.get_mut(&id).unwrap().last_activity = Instant::now() - Duration::from_secs(10);
 
         let actions = gov.tick();
         let peer = gov.peer_info(&id).unwrap();
@@ -1640,22 +1641,31 @@ mod tests {
         let (hot, warm, _, _) = gov.counts();
         assert_eq!(hot, 2);
         assert_eq!(warm, 1);
-        let hot_relays = gov.hot_peers().iter()
+        let hot_relays = gov
+            .hot_peers()
+            .iter()
             .filter(|id| gov.peer_info(id).map(|p| p.is_relay).unwrap_or(false))
             .count();
         assert_eq!(hot_relays, 0, "no relays in hot set yet");
 
         // Tick should promote relay to Hot via step 4a
         let actions = gov.tick();
-        let hot_relays_after = gov.hot_peers().iter()
+        let hot_relays_after = gov
+            .hot_peers()
+            .iter()
             .filter(|id| gov.peer_info(id).map(|p| p.is_relay).unwrap_or(false))
             .count();
-        assert_eq!(hot_relays_after, 1, "relay should be promoted to Hot by step 4a");
+        assert_eq!(
+            hot_relays_after, 1,
+            "relay should be promoted to Hot by step 4a"
+        );
         let (hot, _, _, _) = gov.counts();
         assert_eq!(hot, 3, "should now have 3 hot peers (2 personal + 1 relay)");
 
         // Verify transition was recorded
-        let relay_promoted = actions.transitions.iter()
+        let relay_promoted = actions
+            .transitions
+            .iter()
             .any(|(id, _, to)| *id == relay_id && to == "hot");
         assert!(relay_promoted, "relay promotion should be in transitions");
     }

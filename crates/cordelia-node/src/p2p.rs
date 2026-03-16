@@ -17,12 +17,7 @@ pub enum GovEvent {
 async fn open_bi(
     conn: &quinn::Connection,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-    match tokio::time::timeout(
-        cordelia_network::codec::STREAM_TIMEOUT,
-        conn.open_bi(),
-    )
-    .await
-    {
+    match tokio::time::timeout(cordelia_network::codec::STREAM_TIMEOUT, conn.open_bi()).await {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(format!("open_bi failed: {e}")),
         Err(_) => Err("open_bi timed out".into()),
@@ -90,19 +85,17 @@ pub fn post_connect(
     node_id: &NodeId,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
     governor: &mut cordelia_network::governor::Governor,
-    shared_peers: &std::sync::Arc<
-        std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>,
-    >,
+    shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     state: &web::Data<cordelia_api::state::AppState>,
     node_role: &str,
     relay_push_tx: &tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     peer_rates: &std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>>,
+        std::sync::Mutex<
+            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
+        >,
     >,
-    peer_states: &std::sync::Arc<
-        std::sync::RwLock<std::collections::HashMap<NodeId, u8>>,
-    >,
+    peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
 ) {
     // Step 1: Extract peer roles from handshake
     let is_relay = conn_mgr
@@ -155,7 +148,10 @@ pub fn post_connect(
         let rates = peer_rates.clone();
         let states = peer_states.clone();
         tokio::spawn(async move {
-            handle_peer_streams(conn, peer_id, db_state, peers_ref, role, ptx, dtx, rates, states).await;
+            handle_peer_streams(
+                conn, peer_id, db_state, peers_ref, role, ptx, dtx, rates, states,
+            )
+            .await;
         });
     }
 }
@@ -190,33 +186,41 @@ pub async fn p2p_loop(
     // Governor
     let gov_targets = cordelia_network::governor::GovernorTargets::from_config(&gov_config);
     let gov_timeouts = cordelia_network::governor::GovernorTimeouts::from_config(&gov_config);
-    let mut governor = cordelia_network::governor::Governor::new(gov_targets, vec![])
-        .with_timeouts(gov_timeouts);
+    let mut governor =
+        cordelia_network::governor::Governor::new(gov_targets, vec![]).with_timeouts(gov_timeouts);
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
     let mut conn_tracker = cordelia_network::rate_limit::ConnectionTracker::new();
 
     // Per-peer rate limiters, shared with handle_peer_streams tasks
     let peer_rates: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>>,
+        std::sync::Mutex<
+            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
+        >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Shared peer state map for protocol gating (connection-lifecycle.md §2.2 Option A).
     // Governor tick updates this; handle_peer_streams reads it to gate protocols by state.
     // 0=Cold, 1=Warm, 2=Hot
-    let peer_states: std::sync::Arc<
-        std::sync::RwLock<std::collections::HashMap<NodeId, u8>>,
-    > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
     // Delivery feedback channel
-    let (delivery_tx, mut delivery_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
+    let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
         post_connect(
-            &peer_id, &conn_mgr, &mut governor, &shared_peers,
-            &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
+            &peer_id,
+            &conn_mgr,
+            &mut governor,
+            &shared_peers,
+            &state,
+            &node_role,
+            &relay_push_tx,
+            &delivery_tx,
+            &peer_rates,
+            &peer_states,
         );
     }
     governor.tick();
@@ -582,11 +586,11 @@ pub async fn handle_peer_streams(
     push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
     delivery_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     peer_rates: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>>,
+        std::sync::Mutex<
+            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
+        >,
     >,
-    peer_states: std::sync::Arc<
-        std::sync::RwLock<std::collections::HashMap<NodeId, u8>>,
-    >,
+    peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -627,12 +631,15 @@ pub async fn handle_peer_streams(
         // Per-peer rate limit check (§9.2)
         {
             let mut rates = peer_rates.lock().unwrap_or_else(|e| e.into_inner());
-            let limiter = rates.entry(peer_id.clone())
+            let limiter = rates
+                .entry(peer_id.clone())
                 .or_insert_with(cordelia_network::rate_limit::PeerRateLimiter::new);
             let allowed = match protocol {
                 cordelia_network::messages::Protocol::ItemPush => limiter.writes.check_and_record(),
                 cordelia_network::messages::Protocol::ItemSync => limiter.syncs.check_and_record(),
-                cordelia_network::messages::Protocol::PeerSharing => limiter.peer_shares.check_and_record(),
+                cordelia_network::messages::Protocol::PeerSharing => {
+                    limiter.peer_shares.check_and_record()
+                }
                 _ => true,
             };
             if !allowed {
@@ -647,20 +654,32 @@ pub async fn handle_peer_streams(
         }
 
         // Protocol gating by peer state (connection-lifecycle.md §2.1)
-        let peer_state = peer_states.read()
+        let peer_state = peer_states
+            .read()
             .ok()
             .and_then(|s| s.get(&peer_id).copied())
             .unwrap_or(1); // default Warm if not yet synced
         let is_hot = peer_state == 2;
 
         match protocol {
-            cordelia_network::messages::Protocol::ItemPush |
-            cordelia_network::messages::Protocol::ItemSync if !is_hot => {
+            cordelia_network::messages::Protocol::ItemPush
+            | cordelia_network::messages::Protocol::ItemSync
+                if !is_hot =>
+            {
                 tracing::debug!(peer = %peer_id, protocol = proto_name, "rejected: data protocol from non-hot peer");
                 continue;
             }
             cordelia_network::messages::Protocol::ItemPush => {
-                handle_inbound_push(&mut send, &mut recv, &peer_id, &state, &node_role, &push_tx, &delivery_tx).await;
+                handle_inbound_push(
+                    &mut send,
+                    &mut recv,
+                    &peer_id,
+                    &state,
+                    &node_role,
+                    &push_tx,
+                    &delivery_tx,
+                )
+                .await;
             }
             cordelia_network::messages::Protocol::ItemSync => {
                 handle_inbound_sync(&mut send, &mut recv, &peer_id, &state, &node_role).await;
@@ -749,14 +768,13 @@ async fn handle_inbound_push(
         tracing::debug!(peer = %peer_id, stored, "relay re-push queued");
     }
 
-    let ack = cordelia_network::messages::WireMessage::PushAck(
-        cordelia_network::messages::PushAck {
+    let ack =
+        cordelia_network::messages::WireMessage::PushAck(cordelia_network::messages::PushAck {
             stored,
             dedup_dropped: dedup,
             policy_rejected: 0,
             verification_failed: 0,
-        },
-    );
+        });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
 }
 
@@ -786,20 +804,37 @@ async fn handle_inbound_sync(
             Ok(db) => db,
             Err(_) => return,
         };
-        let items = cordelia_storage::items::query_listen(&db, &req.channel_id, req.since.as_deref(), req.limit).unwrap_or_default();
+        let items = cordelia_storage::items::query_listen(
+            &db,
+            &req.channel_id,
+            req.since.as_deref(),
+            req.limit,
+        )
+        .unwrap_or_default();
         let has_more = items.len() as u32 >= req.limit;
-        let headers: Vec<cordelia_network::messages::ItemHeader> = items.iter().map(|si| cordelia_network::messages::ItemHeader {
-            item_id: si.item_id.clone(), channel_id: si.channel_id.clone(),
-            item_type: si.item_type.clone(), content_hash: si.content_hash.clone(),
-            author_id: si.author_id.clone(), signature: si.signature.clone(),
-            key_version: si.key_version as u32, published_at: si.published_at.clone(),
-            is_tombstone: si.is_tombstone, parent_id: si.parent_id.clone(),
-        }).collect();
+        let headers: Vec<cordelia_network::messages::ItemHeader> = items
+            .iter()
+            .map(|si| cordelia_network::messages::ItemHeader {
+                item_id: si.item_id.clone(),
+                channel_id: si.channel_id.clone(),
+                item_type: si.item_type.clone(),
+                content_hash: si.content_hash.clone(),
+                author_id: si.author_id.clone(),
+                signature: si.signature.clone(),
+                key_version: si.key_version as u32,
+                published_at: si.published_at.clone(),
+                is_tombstone: si.is_tombstone,
+                parent_id: si.parent_id.clone(),
+            })
+            .collect();
         (headers, has_more)
     };
 
     let resp = cordelia_network::messages::WireMessage::SyncResponse(
-        cordelia_network::messages::SyncResponse { items: headers, has_more },
+        cordelia_network::messages::SyncResponse {
+            items: headers,
+            has_more,
+        },
     );
     let _ = cordelia_network::codec::write_frame(send, &resp).await;
     tracing::debug!(peer = %peer_id, channel = %req.channel_id, "served sync request");
@@ -817,13 +852,20 @@ async fn handle_inbound_sync(
                     .into_iter()
                     .filter(|si| freq.item_ids.contains(&si.item_id))
                     .map(|si| cordelia_network::messages::Item {
-                        item_id: si.item_id, channel_id: si.channel_id,
-                        item_type: si.item_type, content_length: si.encrypted_blob.len() as u32,
-                        encrypted_blob: si.encrypted_blob, content_hash: si.content_hash,
-                        author_id: si.author_id, signature: si.signature,
-                        key_version: si.key_version as u32, published_at: si.published_at,
-                        is_tombstone: si.is_tombstone, parent_id: si.parent_id,
-                    }).collect::<Vec<_>>()
+                        item_id: si.item_id,
+                        channel_id: si.channel_id,
+                        item_type: si.item_type,
+                        content_length: si.encrypted_blob.len() as u32,
+                        encrypted_blob: si.encrypted_blob,
+                        content_hash: si.content_hash,
+                        author_id: si.author_id,
+                        signature: si.signature,
+                        key_version: si.key_version as u32,
+                        published_at: si.published_at,
+                        is_tombstone: si.is_tombstone,
+                        parent_id: si.parent_id,
+                    })
+                    .collect::<Vec<_>>()
             };
             let fresp = cordelia_network::messages::WireMessage::FetchResponse(
                 cordelia_network::messages::FetchResponse { items: fetch_items },
@@ -850,12 +892,15 @@ async fn handle_inbound_peer_share(
 
     if let cordelia_network::messages::WireMessage::PeerShareRequest(req) = msg {
         let max = req.max_peers as usize;
-        let current_peers = shared_peers.read()
+        let current_peers = shared_peers
+            .read()
             .map(|p| p.iter().take(max).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let count = current_peers.len();
         let resp = cordelia_network::messages::WireMessage::PeerShareResponse(
-            cordelia_network::messages::PeerShareResponse { peers: current_peers },
+            cordelia_network::messages::PeerShareResponse {
+                peers: current_peers,
+            },
         );
         let _ = cordelia_network::codec::write_frame(send, &resp).await;
         tracing::debug!(peer = %peer_id, count, "served peer-share request");
