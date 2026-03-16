@@ -717,9 +717,10 @@ impl Governor {
         let (_, warm, cold, _) = self.counts();
         let churn_count = (warm as f64 * self.targets.churn_fraction).ceil() as usize;
 
+        // Warm churn: swap warm with cold (skip if no warm or no cold peers)
         if churn_count == 0 || cold == 0 {
-            return;
-        }
+            // Skip warm churn but still run hot churn below
+        } else {
 
         tracing::info!(warm, cold, churn_count, "gov: periodic churn cycle");
 
@@ -756,6 +757,8 @@ impl Governor {
         for id in cold_ids {
             actions.connect.push(id);
         }
+
+        } // end warm churn else block
 
         // Hot-tier churn: demote 1 random hot peer, promote 1 random warm (§5.4 step 6)
         let (hot, _, _, _) = self.counts();
@@ -1201,5 +1204,241 @@ mod tests {
         let _actions = gov.tick();
         let peer = gov.peer_info(&id).unwrap();
         assert_eq!(peer.state, PeerState::Hot);
+    }
+
+    // ── Governor tick cycle tests (T4-1) ──────────────────────────────
+
+    #[test]
+    fn test_tick_churn_swaps_warm_with_cold() {
+        let targets = GovernorTargets {
+            hot_min: 2,
+            hot_max: 5,
+            warm_min: 0,
+            cold_max: 100,
+            churn_interval_secs: 0, // churn every tick
+            churn_jitter_secs: 0,
+            churn_fraction: 1.0, // swap all warm
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // 2 hot peers (mark_connected with hot < hot_min)
+        for i in 0..2 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+        }
+        // 3 warm peers (mark_connected after hot_min reached)
+        for i in 2..5 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+        }
+        // 3 cold peers (never connected)
+        for i in 5..8 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+        }
+
+        let (hot, warm, cold, _) = gov.counts();
+        assert_eq!(hot, 2);
+        assert_eq!(warm, 3);
+        assert_eq!(cold, 3);
+
+        // Force churn by setting last_churn in the past
+        gov.last_churn = Instant::now() - Duration::from_secs(3700);
+        let actions = gov.tick();
+
+        // Churn should swap warm peers to cold and request cold connects
+        assert!(
+            !actions.connect.is_empty() || !actions.transitions.is_empty(),
+            "churn should produce state changes"
+        );
+    }
+
+    #[test]
+    fn test_tick_hot_churn_demotes_one_hot() {
+        let targets = GovernorTargets {
+            hot_min: 2,
+            hot_max: 5,
+            warm_min: 0,
+            cold_max: 100,
+            churn_interval_secs: 0,
+            churn_jitter_secs: 0,
+            churn_fraction: 0.5,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // Add 4 peers and force all to Hot manually
+        for i in 0..4 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+            gov.peers.get_mut(&id).unwrap().set_state(PeerState::Hot);
+        }
+
+        let (hot, _, _, _) = gov.counts();
+        assert_eq!(hot, 4, "should have 4 hot peers before churn");
+
+        gov.last_churn = Instant::now() - Duration::from_secs(3700);
+        let actions = gov.tick();
+
+        let (hot_after, warm_after, _, _) = gov.counts();
+        // Hot churn should demote 1 (hot > hot_min)
+        assert!(
+            hot_after <= 3,
+            "hot churn should demote at least 1 hot peer, got hot={hot_after}"
+        );
+        assert!(
+            warm_after >= 1,
+            "demoted hot peer should be warm, got warm={warm_after}"
+        );
+        // Verify transition was recorded
+        let hot_to_warm = actions
+            .transitions
+            .iter()
+            .filter(|(_, from, to)| from == "hot" && to == "warm")
+            .count();
+        assert!(hot_to_warm >= 1, "should record hot->warm transition");
+    }
+
+    #[test]
+    fn test_tick_dead_detection_demotes_inactive() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov =
+            Governor::new(targets, vec![]).with_timeouts(GovernorTimeouts {
+                dead_timeout: Duration::from_secs(5),
+                ..Default::default()
+            });
+
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec![]);
+        gov.mark_connected(&id);
+        assert_eq!(gov.peer_info(&id).unwrap().state, PeerState::Hot);
+
+        // Simulate no activity for 10s (> dead_timeout of 5s)
+        gov.peers.get_mut(&id).unwrap().last_activity =
+            Instant::now() - Duration::from_secs(10);
+
+        let actions = gov.tick();
+        let peer = gov.peer_info(&id).unwrap();
+        assert!(
+            peer.state != PeerState::Hot,
+            "inactive peer should be demoted from Hot"
+        );
+        assert!(!actions.transitions.is_empty());
+    }
+
+    #[test]
+    fn test_immediate_promotion_gated_by_hot_min() {
+        // BV-25 regression: only hot_min peers get immediate Hot,
+        // rest must go through tenure guard
+        let targets = GovernorTargets {
+            hot_min: 2,
+            hot_max: 10,
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // First 2 connections: immediate Hot (hot < hot_min)
+        for i in 0..2 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+            assert_eq!(
+                gov.peer_info(&id).unwrap().state,
+                PeerState::Hot,
+                "peer {i} should be Hot (bootstrap)"
+            );
+        }
+
+        // 3rd connection: Warm only (hot >= hot_min)
+        let id3 = make_node_id(3);
+        gov.add_peer(id3.clone(), make_addr(), vec![]);
+        gov.mark_connected(&id3);
+        assert_eq!(
+            gov.peer_info(&id3).unwrap().state,
+            PeerState::Warm,
+            "3rd peer should be Warm (tenure required)"
+        );
+    }
+
+    #[test]
+    fn test_hot_peers_returns_only_hot() {
+        let targets = GovernorTargets {
+            hot_min: 2,
+            hot_max: 5,
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // 2 hot, 3 warm
+        for i in 0..5 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+        }
+
+        let hot = gov.hot_peers();
+        assert_eq!(hot.len(), 2, "hot_peers() should return only Hot peers");
+        let (h, w, _, _) = gov.counts();
+        assert_eq!(h, 2);
+        assert_eq!(w, 3);
+    }
+
+    #[test]
+    fn test_state_changed_at_updated_on_transition() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec![]);
+        let created_at = gov.peer_info(&id).unwrap().state_changed_at;
+
+        std::thread::sleep(Duration::from_millis(10));
+        gov.mark_connected(&id);
+        let connected_at = gov.peer_info(&id).unwrap().state_changed_at;
+
+        assert!(
+            connected_at > created_at,
+            "state_changed_at should update on Cold->Hot transition"
+        );
+    }
+
+    #[test]
+    fn test_failure_count_blocks_promotion() {
+        // Peers with 5+ consecutive failures should not be promoted
+        let targets = GovernorTargets {
+            hot_min: 1,
+            warm_min: 5,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec![]);
+
+        // Simulate 5 failures
+        for _ in 0..5 {
+            gov.mark_dial_failed(&id);
+        }
+
+        let actions = gov.tick();
+        // The peer should NOT be in the connect list (failure limit reached)
+        assert!(
+            !actions.connect.contains(&id),
+            "peer with 5 failures should not be promoted"
+        );
     }
 }

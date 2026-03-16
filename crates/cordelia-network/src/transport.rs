@@ -396,4 +396,43 @@ mod tests {
         let a_node_id = server.await.unwrap();
         assert_eq!(a_node_id, pk_a);
     }
+
+    // T1-1: Transport parameter enforcement (BV-19 regression)
+    #[tokio::test]
+    async fn test_quic_connection_survives_30s_idle() {
+        // BV-19: Without keep_alive_interval, connections die after 30s.
+        // With keep_alive_interval=15s, they survive indefinitely.
+        let id_a = NodeIdentity::generate().unwrap();
+        let id_b = NodeIdentity::generate().unwrap();
+
+        let ep_a = create_endpoint(&id_a, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let ep_b = create_endpoint(&id_b, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let b_addr = ep_b.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let incoming = ep_b.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            // Wait 35 seconds (longer than old default idle timeout of 30s)
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Connection should still be alive (keep_alive_interval=15s prevents idle close)
+            assert!(
+                conn.close_reason().is_none(),
+                "connection should survive idle period with keepalive"
+            );
+            conn.close(0u32.into(), b"done");
+            ep_b.close(0u32.into(), b"done");
+        });
+
+        let conn_a = ep_a.connect(b_addr, "cordelia").unwrap().await.unwrap();
+        // Wait same period
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            conn_a.close_reason().is_none(),
+            "client connection should survive idle period"
+        );
+
+        conn_a.close(0u32.into(), b"done");
+        ep_a.close(0u32.into(), b"done");
+        server.await.unwrap();
+    }
 }

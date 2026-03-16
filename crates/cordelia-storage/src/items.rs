@@ -373,4 +373,39 @@ mod tests {
         let items = query_listen(&conn, "ch1", None, 1).unwrap();
         assert_eq!(items.len(), 1);
     }
+
+    // T9-1: Relay auto-creation of channel rows (BV-21 regression)
+    #[test]
+    fn test_insert_item_fails_without_channel_row() {
+        let conn = db::open_in_memory().unwrap();
+        // Do NOT create a channel row -- simulate relay scenario before BV-21 fix
+        let mut item = test_item("ci_relay_01", "2026-01-01T00:01:00Z");
+        item.channel_id = "unknown_channel";
+        let result = insert_item(&conn, &item);
+        // Should fail with FK constraint (no channel row)
+        assert!(
+            result.is_err(),
+            "insert_item without channel row should fail with FK constraint"
+        );
+    }
+
+    #[test]
+    fn test_insert_item_succeeds_with_relay_auto_created_channel() {
+        let conn = db::open_in_memory().unwrap();
+        // Simulate relay auto-creation (BV-21 fix: INSERT OR IGNORE)
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at) VALUES (?1, 'named', 'realtime', 'open', X'00', datetime('now'), datetime('now'))",
+            rusqlite::params!["relay_channel"],
+        )
+        .unwrap();
+
+        let mut item = test_item("ci_relay_02", "2026-01-01T00:01:00Z");
+        item.channel_id = "relay_channel";
+        let result = insert_item(&conn, &item);
+        assert!(
+            result.is_ok(),
+            "insert after relay auto-creation should succeed"
+        );
+        assert!(result.unwrap(), "item should be newly inserted");
+    }
 }
