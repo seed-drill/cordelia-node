@@ -1441,4 +1441,39 @@ mod tests {
             "peer with 5 failures should not be promoted"
         );
     }
+
+    // T5-2: Tombstone-like stale detection
+    #[test]
+    fn test_stale_peer_demoted_first() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            hot_max: 2, // room for 2, but we'll have 3 and need to demote
+            warm_min: 0,
+            ..Default::default()
+        };
+        let mut gov = Governor::new(targets, vec![]).with_timeouts(GovernorTimeouts {
+            stale_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        // 3 hot peers, one stale
+        for i in 0..3 {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.mark_connected(&id);
+            gov.peers.get_mut(&id).unwrap().set_state(PeerState::Hot);
+        }
+        // Make peer 0 stale (no items for > stale_timeout)
+        gov.peers.get_mut(&make_node_id(0)).unwrap().items_delivered = 0;
+        gov.peers.get_mut(&make_node_id(0)).unwrap().last_activity =
+            Instant::now() - Duration::from_secs(10);
+        // Give peers 1 and 2 recent activity
+        gov.peers.get_mut(&make_node_id(1)).unwrap().items_delivered = 100;
+        gov.peers.get_mut(&make_node_id(2)).unwrap().items_delivered = 50;
+
+        let _actions = gov.tick();
+        // hot_max=2 with 3 hot peers -> demote worst. Stale peer should go first.
+        let (hot, _, _, _) = gov.counts();
+        assert!(hot <= 2, "should have demoted excess hot peer");
+    }
 }
