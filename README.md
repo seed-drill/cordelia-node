@@ -63,7 +63,7 @@ All endpoints are `POST /api/v1/channels/*` with bearer token auth.
 | `/delete-item` | Tombstone an item |
 | `/identity` | Node public keys and stats |
 
-Full spec: [channels-api.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/channels-api.md)
+Full spec: [channels-api.md](docs/specs/channels-api.md)
 
 ## Architecture
 
@@ -91,14 +91,18 @@ Rust workspace with 7 crates:
 
 ## Specs
 
-All specifications: [seed-drill/specs/](https://github.com/seed-drill/strategy-and-planning/tree/main/specs)
+All specifications live in [docs/specs/](docs/specs/).
+ADRs in [docs/decisions/](docs/decisions/).
+Reference material in [docs/reference/](docs/reference/).
 
 Key specs:
-- [channels-api.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/channels-api.md) -- REST API
-- [data-formats.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/data-formats.md) -- SQLite schema, item format
-- [ecies-encryption.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/ecies-encryption.md) -- Cryptographic primitives
-- [search-indexing.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/search-indexing.md) -- FTS5 + semantic search
-- [network-protocol.md](https://github.com/seed-drill/strategy-and-planning/blob/main/specs/network-protocol.md) -- QUIC transport, mini-protocols
+- [channels-api.md](docs/specs/channels-api.md) -- REST API
+- [data-formats.md](docs/specs/data-formats.md) -- SQLite schema, item format
+- [ecies-envelope-encryption.md](docs/specs/ecies-envelope-encryption.md) -- Cryptographic primitives
+- [search-indexing.md](docs/specs/search-indexing.md) -- FTS5 + semantic search
+- [network-protocol.md](docs/specs/network-protocol.md) -- QUIC transport, mini-protocols
+- [demand-model.md](docs/specs/demand-model.md) -- Agent personas, parameter derivations
+- [parameter-rationale.md](docs/specs/parameter-rationale.md) -- Every configurable value explained
 
 ## License
 
