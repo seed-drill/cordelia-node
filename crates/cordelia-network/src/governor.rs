@@ -6,8 +6,8 @@
 //! Port: cordelia-core/crates/cordelia-governor (~1235 LOC)
 //! Changes: NodeId = [u8; 32], Multiaddr -> String, ERA_0 -> GovernorConfig.
 
-use cordelia_core::protocol;
 use cordelia_core::NodeId;
+use cordelia_core::protocol;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -398,8 +398,8 @@ impl Governor {
         if disconnect_count == 0 {
             return Duration::ZERO;
         }
-        let secs =
-            protocol::BACKOFF_BASE_SECS.saturating_mul(1u64 << disconnect_count.min(protocol::BACKOFF_SATURATION));
+        let secs = protocol::BACKOFF_BASE_SECS
+            .saturating_mul(1u64 << disconnect_count.min(protocol::BACKOFF_SATURATION));
         Duration::from_secs(secs.min(protocol::BACKOFF_MAX_SECS))
     }
 
@@ -1742,13 +1742,15 @@ mod tests {
         gov.add_peer(id.clone(), make_addr(), vec![]);
 
         // Set last_activity to the past so we can detect the update
-        gov.peers.get_mut(&id).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(60);
+        gov.peers.get_mut(&id).unwrap().last_activity = Instant::now() - Duration::from_secs(60);
         let before = gov.peer_info(&id).unwrap().last_activity;
 
         gov.record_activity(&id, Some(15.0));
         let after = gov.peer_info(&id).unwrap();
-        assert!(after.last_activity > before, "last_activity should be updated");
+        assert!(
+            after.last_activity > before,
+            "last_activity should be updated"
+        );
         assert_eq!(after.rtt_ms, Some(15.0));
 
         // Record with None rtt: rtt_ms stays at 15.0
@@ -1763,8 +1765,7 @@ mod tests {
         gov.add_peer(id.clone(), make_addr(), vec![]);
 
         // Items delivered: increments count and updates last_activity
-        gov.peers.get_mut(&id).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(60);
+        gov.peers.get_mut(&id).unwrap().last_activity = Instant::now() - Duration::from_secs(60);
         let before = gov.peer_info(&id).unwrap().last_activity;
 
         gov.record_items_delivered(&id, 10);
@@ -1875,10 +1876,7 @@ mod tests {
                 // Duration should be capped at 7 days (checked_shl overflows at shift >= 32)
                 let max_until = Instant::now() + seven_days + Duration::from_secs(1);
                 let min_until = Instant::now() + seven_days - Duration::from_secs(1);
-                assert!(
-                    *until <= max_until,
-                    "ban duration must be capped at 7 days"
-                );
+                assert!(*until <= max_until, "ban duration must be capped at 7 days");
                 assert!(
                     *until >= min_until,
                     "ban duration should be ~7 days at this escalation"
@@ -1951,10 +1949,7 @@ mod tests {
             .transitions
             .iter()
             .any(|(_, from, to)| from == "warm" && to == "cold");
-        assert!(
-            !warm_to_cold,
-            "no warm->cold churn when cold==0"
-        );
+        assert!(!warm_to_cold, "no warm->cold churn when cold==0");
     }
 
     #[test]
@@ -1991,10 +1986,7 @@ mod tests {
             .transitions
             .iter()
             .any(|(_, from, to)| from == "hot" && to == "warm");
-        assert!(
-            !hot_to_warm,
-            "no hot->warm churn when hot <= hot_min"
-        );
+        assert!(!hot_to_warm, "no hot->warm churn when hot <= hot_min");
     }
 
     #[test]

@@ -16,8 +16,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Peer-sharing request interval (sourced from protocol.rs).
-pub const PEER_SHARE_INTERVAL: Duration =
-    Duration::from_secs(protocol::PEER_SHARE_INTERVAL_SECS);
+pub const PEER_SHARE_INTERVAL: Duration = Duration::from_secs(protocol::PEER_SHARE_INTERVAL_SECS);
 
 /// Default max_peers per request (sourced from protocol.rs).
 pub const DEFAULT_MAX_PEERS: u16 = protocol::DEFAULT_MAX_PEERS_SHARE;

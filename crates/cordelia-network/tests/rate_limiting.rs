@@ -6,8 +6,8 @@
 //! Spec: docs/specs/network-protocol.md §9, docs/specs/parameter-rationale.md §4-§6
 
 use cordelia_network::rate_limit::{
-    ConnectionTracker, PeerRateLimiter, MAX_CONNECTIONS_PER_IP, MAX_CONNECTIONS_PER_SUBNET,
-    MAX_INBOUND_CONNECTIONS, PEER_SHARES_PER_PEER_PER_MINUTE, SYNCS_PER_PEER_PER_MINUTE,
+    ConnectionTracker, MAX_CONNECTIONS_PER_IP, MAX_CONNECTIONS_PER_SUBNET, MAX_INBOUND_CONNECTIONS,
+    PEER_SHARES_PER_PEER_PER_MINUTE, PeerRateLimiter, SYNCS_PER_PEER_PER_MINUTE,
     WRITES_PER_PEER_PER_MINUTE,
 };
 use std::net::IpAddr;

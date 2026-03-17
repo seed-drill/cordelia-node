@@ -243,8 +243,7 @@ pub async fn p2p_loop(
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await;
 
-    let mut gov_interval =
-        tokio::time::interval(std::time::Duration::from_secs(P2P_GOV_TICK_SECS));
+    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(P2P_GOV_TICK_SECS));
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 

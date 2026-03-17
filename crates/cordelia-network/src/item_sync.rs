@@ -18,8 +18,7 @@ pub const REALTIME_SYNC_INTERVAL: Duration =
     Duration::from_secs(protocol::REALTIME_SYNC_INTERVAL_SECS);
 
 /// Sync interval for batch channels (sourced from protocol.rs).
-pub const BATCH_SYNC_INTERVAL: Duration =
-    Duration::from_secs(protocol::BATCH_SYNC_INTERVAL_SECS);
+pub const BATCH_SYNC_INTERVAL: Duration = Duration::from_secs(protocol::BATCH_SYNC_INTERVAL_SECS);
 
 /// Default sync limit (max headers per response, sourced from protocol.rs).
 pub const DEFAULT_SYNC_LIMIT: u32 = protocol::DEFAULT_SYNC_LIMIT;

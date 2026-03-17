@@ -26,8 +26,7 @@ pub const RECONCILIATION_INTERVAL: Duration =
     Duration::from_secs(protocol::CHANNEL_RECONCILIATION_INTERVAL_SECS);
 
 /// Responder stagger offset (§4.4.2, sourced from protocol.rs).
-pub const RESPONDER_OFFSET: Duration =
-    Duration::from_secs(protocol::CHANNEL_RESPONDER_OFFSET_SECS);
+pub const RESPONDER_OFFSET: Duration = Duration::from_secs(protocol::CHANNEL_RESPONDER_OFFSET_SECS);
 
 /// Minimum warm tenure before responding to ChannelListRequest (§4.4.5, sourced from protocol.rs).
 pub const MIN_WARM_TENURE: Duration = Duration::from_secs(protocol::MIN_WARM_TENURE_SECS);

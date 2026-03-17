@@ -111,9 +111,12 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(protocol::QUIC_KEEPALIVE_INTERVAL_SECS)));
+    transport.keep_alive_interval(Some(Duration::from_secs(
+        protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
+    )));
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS)).unwrap(),
+        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
+            .unwrap(),
     ));
     transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
     transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
@@ -146,9 +149,12 @@ pub fn client_config(identity: &NodeIdentity) -> Result<ClientConfig, TransportE
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(protocol::QUIC_KEEPALIVE_INTERVAL_SECS)));
+    transport.keep_alive_interval(Some(Duration::from_secs(
+        protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
+    )));
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS)).unwrap(),
+        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
+            .unwrap(),
     ));
     transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
     transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());

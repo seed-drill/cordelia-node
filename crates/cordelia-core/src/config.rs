@@ -311,7 +311,10 @@ mod tests {
         assert_eq!(config.api.bind_address, "127.0.0.1");
         assert_eq!(config.logging.level, "info");
         // D2 fix: max_item_bytes = 256KB (was 1MB)
-        assert_eq!(config.limits.max_item_bytes, protocol::MAX_ITEM_BYTES as u64);
+        assert_eq!(
+            config.limits.max_item_bytes,
+            protocol::MAX_ITEM_BYTES as u64
+        );
         // D4 fix: hot_max = 2 (was 20)
         assert_eq!(config.governor.hot_max, protocol::HOT_MAX);
         // D5 fix: warm_min = 3 (was 10), warm_max = 10 (was 50)
