@@ -1833,10 +1833,12 @@ mod tests {
         assert!(current_score > 0.0);
 
         // First update: ema = 0.1 * score + 0.9 * 0 = 0.1 * score
+        // Tolerance is 1e-6: score() uses elapsed time internally, so the value
+        // drifts slightly between the reference call and update_ema().
         peer.update_ema();
         let expected_1 = protocol::EMA_ALPHA * current_score;
         assert!(
-            (peer.score_ema - expected_1).abs() < 1e-10,
+            (peer.score_ema - expected_1).abs() < 1e-6,
             "first EMA should be alpha*score, got {} expected {}",
             peer.score_ema,
             expected_1
