@@ -77,7 +77,7 @@ the MUST-FIX gaps.
 | # | Spec Section | Issue | Discovered |
 |---|-------------|-------|------------|
 | S1 | ss16.1 + connection-lifecycle ss1.2 | Relay contribution tracking: spec defines `items_relayed` field but does not specify which component increments it or the data flow path. Three options exist (handle_peer_streams via gov_tx, p2p_loop inferring from delivery_rx + node_role, separate tracking channel). Implementor must guess. Suggest: add "Relay tracking wiring" step to connection-lifecycle ss1.2 or a "Data flow" subsection to ss16.1. | Session 92 |
-| S2 | debug-telemetry ss5 + connection-lifecycle ss4.2 | Per-stream timeout values not specified. debug-telemetry says "every await MUST have a timeout" but doesn't specify per-protocol values. connection-lifecycle ss4.2 only mentions QUIC idle timeout (60s). Implementation used: protocol_byte=5s, push=10s, sync=10s, fetch=30s, peer_share=5s. These should be in parameter-rationale.md. | Session 92 |
+| S2 | debug-telemetry ss5 + connection-lifecycle ss4.2 | Per-stream timeout values not specified. debug-telemetry says "every await MUST have a timeout" but doesn't specify per-protocol values. connection-lifecycle ss4.2 only mentions QUIC idle timeout (60s). Implementation used: protocol_byte=5s, push=10s, sync=10s, fetch=30s, peer_share=5s. These should be in parameter-rationale.md. | Session 92. **FIXED (session 99):** S2 description was aspirational -- code uses ONE timeout (codec STREAM_TIMEOUT=10s) for all stream ops, not per-protocol values. Per-protocol timeouts removed from network-protocol.md §12 config table. STREAM_TIMEOUT documented in parameter-rationale.md §6. network-behaviour.md §2.2 fetch timeout corrected 30s->10s. |
 
 ---
 

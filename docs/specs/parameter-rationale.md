@@ -289,6 +289,42 @@ allows diversity while preventing subnet-level attacks.
 
 ---
 
-*Spec version: 1.0*
+## 6. Stream Timeout
+
+### STREAM_TIMEOUT = 10s
+
+**Rationale:** One timeout for all stream read/write operations at the codec layer.
+Every `read_frame()` and `write_frame()` call in `protocol.rs` is wrapped in
+`tokio::time::timeout(STREAM_TIMEOUT, ...)`. This is the single enforcement point
+for all protocol operations: push, sync, fetch, peer-sharing, and the initial
+protocol byte read.
+
+**Why one timeout, not per-protocol:** Minimise diversity. Per-protocol timeouts
+(e.g., 5s for peer-sharing, 30s for fetch) add configuration surface without
+meaningful benefit. A peer that can't complete any operation in 10s is either
+overloaded or malicious -- the correct response is the same regardless of protocol.
+One timeout at one layer means one thing to reason about and one thing to test.
+
+**Why 10s:** Generous for LAN operations (~1ms RTT) and sufficient for WAN at
+broadband speeds. At 10s timeout with MAX_MESSAGE_BYTES=1MB, the minimum sustained
+throughput required is ~800Kbps -- well within any broadband connection. The same
+value is used for `incoming_handshake_timeout` (§1), providing consistency.
+
+**If you increase to 30s:** Stalled streams (crashed peer, network black hole)
+block the stream handler for 30s before cleanup. With multiple concurrent streams,
+this delays detection and wastes resources.
+
+**If you decrease to 3s:** May reject legitimate operations on high-latency WAN
+links (e.g., 500ms RTT × multiple round trips for a large fetch response).
+
+**Reference:** The implementation previously had no per-stream timeouts (BV-23
+fixed the handshake case only). Session 92 added STREAM_TIMEOUT to all stream
+operations after `test_chaos_disconnect_during_sync` exposed a 60s hang on
+peer crash (QUIC idle timeout was the only backstop).
+
+---
+
+*Spec version: 1.1*
 *Created: 2026-03-16*
-*Cross-refs: network-protocol.md §9, §12; network-behaviour.md §5*
+*Updated: 2026-03-17*
+*Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*

@@ -1488,10 +1488,8 @@ api_addr = "127.0.0.1:9473"               # REST API listen address (loopback on
 role = "personal"                           # "personal" | "bootnode" | "relay" | "keeper"
 push_policy = "subscribers_only"           # "subscribers_only" | "pull_only" (personal nodes only, §8.1.1)
 bootstrap_timeout_secs = 10              # Per-bootnode connection timeout during bootstrap
-sync_request_timeout_secs = 15         # Per-channel sync request/response timeout
-fetch_response_timeout_secs = 30       # Fetch response timeout (large item batches)
-push_timeout_secs = 10                 # Per-peer push open_bi + send timeout
-peer_share_timeout_secs = 5            # Peer-sharing request/response timeout
+# All stream I/O uses STREAM_TIMEOUT (10s) at the codec layer.
+# One timeout, one layer. See parameter-rationale.md §6 and protocol.rs.
 
 [[network.bootnodes]]
 addr = "boot1.cordelia.seeddrill.ai:9474"

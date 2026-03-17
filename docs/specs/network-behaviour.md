@@ -132,7 +132,7 @@ If push fails, items arrive via pull-sync:
 | Wrong protocol byte | CodecError::UnknownProtocol | Reset stream with error 0x02. Continue accepting streams. | Immediate |
 | Item signature invalid | verify_content_hash returns false | Reject item. Log WARN. Count as violation toward ban. | Immediate |
 | Sync response empty | SyncResponse.items = [] | Normal (peer has nothing new). Try next peer on next cycle. | Immediate |
-| Fetch response timeout (30s) | tokio::time::timeout | Log WARN, skip channel for this cycle. Retry next cycle. | 30s |
+| Stream timeout (10s) | tokio::time::timeout(STREAM_TIMEOUT) at codec layer | Log WARN, skip operation. Retry next cycle. Applies to all stream reads/writes (push, sync, fetch, peer-sharing). See parameter-rationale.md §6. | 10s |
 
 ### 2.3 Resource Errors
 
