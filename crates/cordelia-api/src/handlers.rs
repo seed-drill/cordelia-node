@@ -14,8 +14,10 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::types::*;
 
-const MAX_CONTENT_BYTES: usize = 1_048_576; // 1 MB
-const MAX_LISTEN_LIMIT: u32 = 500;
+/// Max item size: 256 KB (parameter-rationale.md §4, sourced from protocol.rs).
+const MAX_CONTENT_BYTES: usize = cordelia_core::protocol::MAX_ITEM_BYTES;
+/// Max listen query limit (channels-api.md §3, sourced from protocol.rs).
+const MAX_LISTEN_LIMIT: u32 = cordelia_core::protocol::MAX_LISTEN_LIMIT;
 
 // ── POST /api/v1/channels/subscribe ────────────────────────────────
 

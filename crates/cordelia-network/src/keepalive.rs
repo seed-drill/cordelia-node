@@ -9,18 +9,19 @@
 
 use crate::codec::write_frame;
 use crate::messages::*;
+use cordelia_core::protocol;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 
-/// Ping interval (§4.2).
-pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Ping interval (§4.2, sourced from protocol.rs).
+pub const PING_INTERVAL: Duration = Duration::from_secs(protocol::PING_INTERVAL_SECS);
 
 /// Number of missed pings before peer is considered dead.
-pub const DEAD_THRESHOLD: u64 = 3;
+pub const DEAD_THRESHOLD: u64 = protocol::DEAD_THRESHOLD;
 
 /// Dead timeout = PING_INTERVAL * DEAD_THRESHOLD.
-pub const DEAD_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DEAD_TIMEOUT: Duration = Duration::from_secs(protocol::DEAD_TIMEOUT_SECS);
 
 #[derive(Debug, Error)]
 pub enum KeepAliveError {

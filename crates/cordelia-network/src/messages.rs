@@ -46,11 +46,11 @@ impl Protocol {
 
 // ── Handshake (0x01, §4.1) ─────────────────────────────────────────
 
-/// Magic number for handshake validation.
-pub const HANDSHAKE_MAGIC: u32 = 0xC0DE_11A1;
+/// Magic number for handshake validation (sourced from protocol.rs).
+pub use cordelia_core::protocol::HANDSHAKE_MAGIC;
 
-/// Current protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Current protocol version (sourced from protocol.rs).
+pub use cordelia_core::protocol::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakePropose {

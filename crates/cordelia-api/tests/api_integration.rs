@@ -888,6 +888,86 @@ async fn test_publish_not_member() {
     assert_eq!(resp.status(), 403);
 }
 
+// ── Size limit enforcement (parameter-rationale.md §4) ────────────
+
+/// T5-11 (HIGH): Publish rejects items exceeding MAX_ITEM_BYTES (256KB).
+#[actix_web::test]
+async fn test_publish_oversized_item_rejected() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe first
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "size-limit-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // Create content that exceeds 256KB (262,144 bytes) when serialized.
+    // The handler serializes {"content": ..., "metadata": ...} and checks length.
+    let oversized_content = "X".repeat(270_000);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "size-limit-test",
+            "content": oversized_content
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized item should return 413 Payload Too Large"
+    );
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["error"]["code"], "payload_too_large");
+    assert!(body["error"]["used_bytes"].as_u64().unwrap() > 262_144);
+    assert_eq!(body["error"]["quota_bytes"], 262_144);
+}
+
+/// T5-12: Publish just under MAX_ITEM_BYTES succeeds.
+#[actix_web::test]
+async fn test_publish_just_under_size_limit_succeeds() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Subscribe
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "size-ok-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    // 250KB string: safely under 256KB even with JSON envelope overhead
+    let content = "Y".repeat(250_000);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "size-ok-test",
+            "content": content
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "item under 256KB limit should succeed");
+}
+
 // ── WP13: Metrics ─────────────────────────────────────────────────
 
 #[actix_web::test]

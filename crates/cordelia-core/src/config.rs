@@ -112,17 +112,19 @@ pub struct LoggingConfig {
     pub output: String,
 }
 
-// ── Defaults (configuration.md §3) ─────────────────────────────────
+// ── Defaults (configuration.md §3, sourced from protocol.rs) ───────
+
+use crate::protocol;
 
 // Config and IdentityConfig use #[derive(Default)] -- all fields have Default impls.
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            http_port: 9473,
-            p2p_port: 9474,
+            http_port: protocol::HTTP_PORT,
+            p2p_port: protocol::P2P_PORT,
             data_dir: "~/.cordelia".into(),
-            max_storage_bytes: 1_073_741_824, // 1 GB
+            max_storage_bytes: protocol::MAX_STORAGE_BYTES,
         }
     }
 }
@@ -130,18 +132,16 @@ impl Default for NodeConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9474".into(),
+            listen_addr: format!("0.0.0.0:{}", protocol::P2P_PORT),
             role: "personal".into(),
             push_policy: "subscribers_only".into(),
-            dns_discovery: "_cordelia._udp.seeddrill.ai".into(),
-            bootnodes: vec![
-                BootnodeConfig {
-                    addr: "boot1.cordelia.seeddrill.ai:9474".into(),
-                },
-                BootnodeConfig {
-                    addr: "boot2.cordelia.seeddrill.ai:9474".into(),
-                },
-            ],
+            dns_discovery: protocol::SRV_RECORD.into(),
+            bootnodes: protocol::FALLBACK_PEERS
+                .iter()
+                .map(|addr| BootnodeConfig {
+                    addr: (*addr).into(),
+                })
+                .collect(),
             allow_private_addresses: false,
         }
     }
@@ -150,23 +150,23 @@ impl Default for NetworkConfig {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            hot_min: 2,
-            hot_max: 20,
-            hot_min_relays: 1,
-            warm_min: 10,
-            warm_max: 50,
-            cold_max: 200,
-            tick_interval_secs: 10,
-            churn_interval_secs: 3600,
-            churn_jitter_secs: 300,
-            churn_fraction: 0.2,
-            min_warm_tenure_secs: 300,
-            hysteresis_secs: 90,
-            keepalive_timeout_secs: 90,
-            stale_threshold_secs: 1800,
-            ema_alpha: 0.1,
-            max_connection_retries: 5,
-            clear_failure_delay_secs: 120,
+            hot_min: protocol::HOT_MIN,
+            hot_max: protocol::HOT_MAX,
+            hot_min_relays: protocol::HOT_MIN_RELAYS,
+            warm_min: protocol::WARM_MIN,
+            warm_max: protocol::WARM_MAX,
+            cold_max: protocol::COLD_MAX,
+            tick_interval_secs: protocol::TICK_INTERVAL_SECS as u32,
+            churn_interval_secs: protocol::CHURN_INTERVAL_SECS as u32,
+            churn_jitter_secs: protocol::CHURN_JITTER_SECS as u32,
+            churn_fraction: protocol::CHURN_FRACTION,
+            min_warm_tenure_secs: protocol::MIN_WARM_TENURE_SECS as u32,
+            hysteresis_secs: protocol::HYSTERESIS_SECS as u32,
+            keepalive_timeout_secs: protocol::DEAD_TIMEOUT_SECS as u32,
+            stale_threshold_secs: protocol::STALE_THRESHOLD_SECS as u32,
+            ema_alpha: protocol::EMA_ALPHA,
+            max_connection_retries: protocol::MAX_CONNECTION_RETRIES,
+            clear_failure_delay_secs: protocol::CLEAR_FAILURE_DELAY_SECS as u32,
         }
     }
 }
@@ -174,10 +174,10 @@ impl Default for GovernorConfig {
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
-            sync_interval_realtime_secs: 60,
-            sync_interval_batch_secs: 900,
-            tombstone_retention_days: 7,
-            max_batch_size: 100,
+            sync_interval_realtime_secs: protocol::REALTIME_SYNC_INTERVAL_SECS as u32,
+            sync_interval_batch_secs: protocol::BATCH_SYNC_INTERVAL_SECS as u32,
+            tombstone_retention_days: protocol::TOMBSTONE_RETENTION_DAYS,
+            max_batch_size: protocol::MAX_BATCH_SIZE as u32,
         }
     }
 }
@@ -185,10 +185,10 @@ impl Default for ReplicationConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_inbound_connections: 200,
-            max_connections_per_ip: 5,
-            max_item_bytes: 1_048_576, // 1 MB
-            writes_per_channel_per_minute: 100,
+            max_inbound_connections: protocol::MAX_INBOUND_CONNECTIONS as u32,
+            max_connections_per_ip: protocol::MAX_CONNECTIONS_PER_IP as u32,
+            max_item_bytes: protocol::MAX_ITEM_BYTES as u64,
+            writes_per_channel_per_minute: protocol::WRITES_PER_CHANNEL_PER_MINUTE,
         }
     }
 }
@@ -306,10 +306,19 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.node.http_port, 9473);
-        assert_eq!(config.node.p2p_port, 9474);
+        assert_eq!(config.node.http_port, protocol::HTTP_PORT);
+        assert_eq!(config.node.p2p_port, protocol::P2P_PORT);
         assert_eq!(config.api.bind_address, "127.0.0.1");
         assert_eq!(config.logging.level, "info");
+        // D2 fix: max_item_bytes = 256KB (was 1MB)
+        assert_eq!(config.limits.max_item_bytes, protocol::MAX_ITEM_BYTES as u64);
+        // D4 fix: hot_max = 2 (was 20)
+        assert_eq!(config.governor.hot_max, protocol::HOT_MAX);
+        // D5 fix: warm_min = 3 (was 10), warm_max = 10 (was 50)
+        assert_eq!(config.governor.warm_min, protocol::WARM_MIN);
+        assert_eq!(config.governor.warm_max, protocol::WARM_MAX);
+        // D6 fix: cold_max = 50 (was 200)
+        assert_eq!(config.governor.cold_max, protocol::COLD_MAX);
     }
 
     #[test]
@@ -317,7 +326,7 @@ mod tests {
         let config = Config::default();
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.node.http_port, 9473);
+        assert_eq!(parsed.node.http_port, protocol::HTTP_PORT);
     }
 
     #[test]
@@ -328,13 +337,13 @@ http_port = 8080
 "#;
         let config: Config = toml::from_str(partial).unwrap();
         assert_eq!(config.node.http_port, 8080);
-        assert_eq!(config.node.p2p_port, 9474); // default preserved
+        assert_eq!(config.node.p2p_port, protocol::P2P_PORT); // default preserved
     }
 
     #[test]
     fn test_load_nonexistent_returns_default() {
         let config = Config::load(Path::new("/nonexistent/config.toml")).unwrap();
-        assert_eq!(config.node.http_port, 9473);
+        assert_eq!(config.node.http_port, protocol::HTTP_PORT);
     }
 
     #[test]

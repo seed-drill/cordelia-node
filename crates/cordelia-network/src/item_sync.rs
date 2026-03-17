@@ -7,22 +7,25 @@
 
 use crate::codec::{read_frame, read_protocol_byte, write_frame};
 use crate::messages::*;
+use cordelia_core::protocol;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Sync interval for realtime channels (safety net).
-pub const REALTIME_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// Sync interval for realtime channels (safety net, sourced from protocol.rs).
+pub const REALTIME_SYNC_INTERVAL: Duration =
+    Duration::from_secs(protocol::REALTIME_SYNC_INTERVAL_SECS);
 
-/// Sync interval for batch channels.
-pub const BATCH_SYNC_INTERVAL: Duration = Duration::from_secs(900);
+/// Sync interval for batch channels (sourced from protocol.rs).
+pub const BATCH_SYNC_INTERVAL: Duration =
+    Duration::from_secs(protocol::BATCH_SYNC_INTERVAL_SECS);
 
-/// Default sync limit (max headers per response).
-pub const DEFAULT_SYNC_LIMIT: u32 = 100;
+/// Default sync limit (max headers per response, sourced from protocol.rs).
+pub const DEFAULT_SYNC_LIMIT: u32 = protocol::DEFAULT_SYNC_LIMIT;
 
-/// Max items per fetch request.
-pub const MAX_FETCH_ITEMS: usize = 100;
+/// Max items per fetch request (sourced from protocol.rs).
+pub const MAX_FETCH_ITEMS: usize = protocol::MAX_FETCH_ITEMS;
 
 #[derive(Debug, Error)]
 pub enum ItemSyncError {

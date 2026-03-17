@@ -9,16 +9,18 @@
 
 use crate::codec::{read_frame, read_protocol_byte, write_frame};
 use crate::messages::*;
+use cordelia_core::protocol;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Peer-sharing request interval.
-pub const PEER_SHARE_INTERVAL: Duration = Duration::from_secs(300);
+/// Peer-sharing request interval (sourced from protocol.rs).
+pub const PEER_SHARE_INTERVAL: Duration =
+    Duration::from_secs(protocol::PEER_SHARE_INTERVAL_SECS);
 
-/// Default max_peers per request.
-pub const DEFAULT_MAX_PEERS: u16 = 20;
+/// Default max_peers per request (sourced from protocol.rs).
+pub const DEFAULT_MAX_PEERS: u16 = protocol::DEFAULT_MAX_PEERS_SHARE;
 
 #[derive(Debug, Error)]
 pub enum PeerSharingError {

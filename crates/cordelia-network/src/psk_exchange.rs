@@ -22,10 +22,10 @@ pub enum PskExchangeError {
     Denied(String),
 }
 
-/// PSK denial reasons (§4.7).
-pub const REASON_NOT_FOUND: &str = "not_found";
-pub const REASON_NOT_AUTHORIZED: &str = "not_authorized";
-pub const REASON_NOT_AVAILABLE: &str = "not_available";
+/// PSK denial reasons (§4.7, sourced from protocol.rs).
+pub const REASON_NOT_FOUND: &str = cordelia_core::protocol::REASON_NOT_FOUND;
+pub const REASON_NOT_AUTHORIZED: &str = cordelia_core::protocol::REASON_NOT_AUTHORIZED;
+pub const REASON_NOT_AVAILABLE: &str = cordelia_core::protocol::REASON_NOT_AVAILABLE;
 
 /// Request a PSK from a peer (subscriber side).
 ///

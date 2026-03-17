@@ -226,16 +226,25 @@ pub async fn p2p_loop(
     }
     governor.tick();
 
-    // Timers
-    let mut peer_share_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    // P2P loop timers -- these are CHECK intervals, not the protocol intervals.
+    // The p2p loop checks frequently (5-10s) and then decides whether to act
+    // based on the protocol intervals (e.g., 300s for peer sharing).
+    const P2P_PEER_SHARE_CHECK_SECS: u64 = 5;
+    const P2P_SYNC_CHECK_SECS: u64 = 10;
+    const P2P_GOV_TICK_SECS: u64 = 10;
+
+    let mut peer_share_interval =
+        tokio::time::interval(std::time::Duration::from_secs(P2P_PEER_SHARE_CHECK_SECS));
     peer_share_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     peer_share_interval.tick().await;
 
-    let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut sync_interval =
+        tokio::time::interval(std::time::Duration::from_secs(P2P_SYNC_CHECK_SECS));
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await;
 
-    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut gov_interval =
+        tokio::time::interval(std::time::Duration::from_secs(P2P_GOV_TICK_SECS));
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 
@@ -286,7 +295,7 @@ pub async fn p2p_loop(
                         Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share open_bi"); continue; }
                     };
                     let mut stream = tokio::io::join(&mut recv, &mut send);
-                    let discovered = match cordelia_network::peer_sharing::request_peers(&mut stream, 20).await {
+                    let discovered = match cordelia_network::peer_sharing::request_peers(&mut stream, cordelia_core::protocol::DEFAULT_MAX_PEERS_SHARE).await {
                         Ok(d) => d,
                         Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share request failed"); continue; }
                     };
@@ -421,7 +430,7 @@ pub async fn p2p_loop(
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
                             tracing::debug!(peer = %target, channel = %ch_id, "sync request sent");
-                            let resp = match cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, 100).await {
+                            let resp = match cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
                                 Ok(r) => r,
                                 Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); continue; }
                             };
@@ -433,7 +442,7 @@ pub async fn p2p_loop(
                                     Ok(db) => db,
                                     Err(_) => continue,
                                 };
-                                let stored = cordelia_storage::items::query_listen(&db, ch_id, None, 1000).unwrap_or_default();
+                                let stored = cordelia_storage::items::query_listen(&db, ch_id, None, cordelia_core::protocol::MAX_LISTEN_LIMIT).unwrap_or_default();
                                 stored.into_iter()
                                     .map(|si| (si.item_id, (si.content_hash, si.published_at)))
                                     .collect::<std::collections::HashMap<_, _>>()

@@ -17,19 +17,21 @@
 //! Spec: seed-drill/specs/network-protocol.md §3
 
 use crate::messages::{Protocol, WireMessage};
+use cordelia_core::protocol;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Maximum message size: 4 MB (§3.1).
-pub const MAX_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
+/// Maximum message size: 1 MB (parameter-rationale.md §5.2).
+pub const MAX_MESSAGE_BYTES: u32 = protocol::MAX_MESSAGE_BYTES;
 
 /// Standard timeout for all stream operations (reads and writes).
 /// One value, used everywhere. If a single read or write takes longer
 /// than this, the peer is considered unresponsive.
-pub const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const STREAM_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(protocol::STREAM_TIMEOUT_SECS);
 
 /// Application error code for unknown protocol byte (§3.3).
-pub const ERR_UNKNOWN_PROTOCOL: u32 = 0x02;
+pub const ERR_UNKNOWN_PROTOCOL: u32 = protocol::ERR_UNKNOWN_PROTOCOL;
 
 #[derive(Debug, Error)]
 pub enum CodecError {

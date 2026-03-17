@@ -5,49 +5,49 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §9
 
+use cordelia_core::protocol;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-// ── Connection limits (§9.1) ───────────────────────────────────────
+// ── Connection limits (§9.1, sourced from protocol.rs) ─────────────
 
-/// Default connection limits.
-pub const MAX_INBOUND_CONNECTIONS: usize = 200;
-pub const MAX_CONNECTIONS_PER_IP: usize = 5;
-pub const MAX_CONNECTIONS_PER_SUBNET: usize = 20;
-pub const MAX_CONCURRENT_STREAMS: usize = 64;
+pub const MAX_INBOUND_CONNECTIONS: usize = protocol::MAX_INBOUND_CONNECTIONS;
+pub const MAX_CONNECTIONS_PER_IP: usize = protocol::MAX_CONNECTIONS_PER_IP;
+pub const MAX_CONNECTIONS_PER_SUBNET: usize = protocol::MAX_CONNECTIONS_PER_SUBNET;
+pub const MAX_CONCURRENT_STREAMS: usize = protocol::MAX_CONCURRENT_STREAMS;
 
 /// QUIC application error code for capacity rejection.
-pub const ERR_CAPACITY: u32 = 0x01;
+pub const ERR_CAPACITY: u32 = protocol::ERR_CAPACITY;
 
-// ── Message rate limits (§9.2) ─────────────────────────────────────
+// ── Message rate limits (§9.2, sourced from protocol.rs) ───────────
 
-pub const WRITES_PER_PEER_PER_MINUTE: u32 = 10;
-pub const WRITES_PER_CHANNEL_PER_MINUTE: u32 = 100;
-pub const SYNCS_PER_PEER_PER_MINUTE: u32 = 6;
-pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 = 2;
+pub const WRITES_PER_PEER_PER_MINUTE: u32 = protocol::WRITES_PER_PEER_PER_MINUTE;
+pub const WRITES_PER_CHANNEL_PER_MINUTE: u32 = protocol::WRITES_PER_CHANNEL_PER_MINUTE;
+pub const SYNCS_PER_PEER_PER_MINUTE: u32 = protocol::SYNCS_PER_PEER_PER_MINUTE;
+pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 = protocol::PEER_SHARES_PER_PEER_PER_MINUTE;
 
 /// Number of rate limit breaches before ban.
-pub const BAN_THRESHOLD: u32 = 3;
+pub const BAN_THRESHOLD: u32 = protocol::BAN_THRESHOLD;
 /// Window for counting breaches.
-pub const BAN_WINDOW: Duration = Duration::from_secs(600);
+pub const BAN_WINDOW: Duration = Duration::from_secs(protocol::BAN_WINDOW_SECS);
 
-// ── Size limits (§9.3) ────────────────────────────────────────────
+// ── Size limits (§9.3, sourced from protocol.rs) ───────────────────
 
 /// Max encrypted item size: 256KB (demand-model.md §2.3, parameter-rationale.md §4).
-pub const MAX_ITEM_BYTES: usize = 256 * 1024;
+pub const MAX_ITEM_BYTES: usize = protocol::MAX_ITEM_BYTES;
 /// Max batch fetch size: 100 items per request (demand-model.md §3.1).
-pub const MAX_BATCH_SIZE: usize = 100;
-// Note: MAX_MESSAGE_BYTES lives in codec.rs (4MB, the wire frame limit).
+pub const MAX_BATCH_SIZE: usize = protocol::MAX_BATCH_SIZE;
+// Note: MAX_MESSAGE_BYTES lives in codec.rs (1MB, the wire frame limit).
 
-// ── Backpressure queue capacities (§9.4) ───────────────────────────
+// ── Backpressure queue capacities (§9.4, sourced from protocol.rs) ──
 
-pub const QUEUE_HANDSHAKE: usize = 16;
-pub const QUEUE_KEEPALIVE: usize = 256;
-pub const QUEUE_PEER_SHARING: usize = 32;
-pub const QUEUE_CHANNEL_ANNOUNCE: usize = 64;
-pub const QUEUE_ITEM_SYNC: usize = 64;
-pub const QUEUE_ITEM_PUSH: usize = 128;
+pub const QUEUE_HANDSHAKE: usize = protocol::QUEUE_HANDSHAKE;
+pub const QUEUE_KEEPALIVE: usize = protocol::QUEUE_KEEPALIVE;
+pub const QUEUE_PEER_SHARING: usize = protocol::QUEUE_PEER_SHARING;
+pub const QUEUE_CHANNEL_ANNOUNCE: usize = protocol::QUEUE_CHANNEL_ANNOUNCE;
+pub const QUEUE_ITEM_SYNC: usize = protocol::QUEUE_ITEM_SYNC;
+pub const QUEUE_ITEM_PUSH: usize = protocol::QUEUE_ITEM_PUSH;
 
 // ── Sliding window rate counter ────────────────────────────────────
 
@@ -122,7 +122,7 @@ impl Default for PeerRateLimiter {
 
 impl PeerRateLimiter {
     pub fn new() -> Self {
-        let minute = Duration::from_secs(60);
+        let minute = Duration::from_secs(protocol::RATE_WINDOW_SECS);
         Self {
             writes: RateCounter::new(minute, WRITES_PER_PEER_PER_MINUTE),
             syncs: RateCounter::new(minute, SYNCS_PER_PEER_PER_MINUTE),

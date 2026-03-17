@@ -13,6 +13,7 @@
 use crate::codec::write_frame;
 use crate::handshake::compute_channel_digest;
 use crate::messages::*;
+use cordelia_core::protocol;
 use cordelia_crypto::identity::verify_signature;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -20,20 +21,22 @@ use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 
-/// Reconciliation interval (§4.4.2).
-pub const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(300);
+/// Reconciliation interval (§4.4.2, sourced from protocol.rs).
+pub const RECONCILIATION_INTERVAL: Duration =
+    Duration::from_secs(protocol::CHANNEL_RECONCILIATION_INTERVAL_SECS);
 
-/// Responder stagger offset (§4.4.2).
-pub const RESPONDER_OFFSET: Duration = Duration::from_secs(150);
+/// Responder stagger offset (§4.4.2, sourced from protocol.rs).
+pub const RESPONDER_OFFSET: Duration =
+    Duration::from_secs(protocol::CHANNEL_RESPONDER_OFFSET_SECS);
 
-/// Minimum warm tenure before responding to ChannelListRequest (§4.4.5).
-pub const MIN_WARM_TENURE: Duration = Duration::from_secs(300);
+/// Minimum warm tenure before responding to ChannelListRequest (§4.4.5, sourced from protocol.rs).
+pub const MIN_WARM_TENURE: Duration = Duration::from_secs(protocol::MIN_WARM_TENURE_SECS);
 
-/// Maximum serialized descriptor size (§4.4.6).
-pub const MAX_DESCRIPTOR_SIZE: usize = 512;
+/// Maximum serialized descriptor size (§4.4.6, sourced from protocol.rs).
+pub const MAX_DESCRIPTOR_SIZE: usize = protocol::MAX_DESCRIPTOR_SIZE;
 
-/// Maximum channel name length (§4.4.6).
-pub const MAX_CHANNEL_NAME_LEN: usize = 63;
+/// Maximum channel name length (§4.4.6, sourced from protocol.rs).
+pub const MAX_CHANNEL_NAME_LEN: usize = protocol::MAX_CHANNEL_NAME_LEN;
 
 #[derive(Debug, Error)]
 pub enum ChannelAnnounceError {

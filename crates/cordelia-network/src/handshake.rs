@@ -9,16 +9,17 @@
 
 use crate::codec::{read_frame, read_protocol_byte, write_frame, write_protocol_byte};
 use crate::messages::*;
+use cordelia_core::protocol;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Maximum clock skew tolerance (seconds, §4.1.5).
-const MAX_CLOCK_SKEW_SECS: u64 = 300;
+/// Maximum clock skew tolerance (seconds, §4.1.5, sourced from protocol.rs).
+const MAX_CLOCK_SKEW_SECS: u64 = protocol::MAX_CLOCK_SKEW_SECS;
 
-/// Handshake timeout (seconds, §4.1.3).
-pub const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Handshake timeout (seconds, §4.1.3, sourced from protocol.rs).
+pub const HANDSHAKE_TIMEOUT_SECS: u64 = protocol::HANDSHAKE_TIMEOUT_SECS;
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {

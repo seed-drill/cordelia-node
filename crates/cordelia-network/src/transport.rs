@@ -10,6 +10,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §2
 
+use cordelia_core::protocol;
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
@@ -19,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Default P2P listen port (§2.1).
-pub const DEFAULT_P2P_PORT: u16 = 9474;
+/// Default P2P listen port (§2.1, sourced from protocol.rs).
+pub const DEFAULT_P2P_PORT: u16 = protocol::P2P_PORT;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -64,10 +65,9 @@ pub fn generate_self_signed_cert(
         .distinguished_name
         .push(rcgen::DnType::CommonName, bech32_pk);
 
-    // 1-year validity
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now;
-    params.not_after = now + time::Duration::days(365);
+    params.not_after = now + time::Duration::days(protocol::TLS_CERT_VALIDITY_DAYS);
 
     let cert = params
         .self_signed(&key_pair)
@@ -111,12 +111,12 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.keep_alive_interval(Some(Duration::from_secs(protocol::QUIC_KEEPALIVE_INTERVAL_SECS)));
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS)).unwrap(),
     ));
-    transport.max_concurrent_bidi_streams(1000u32.into());
-    transport.max_concurrent_uni_streams(1000u32.into());
+    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -146,12 +146,12 @@ pub fn client_config(identity: &NodeIdentity) -> Result<ClientConfig, TransportE
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.keep_alive_interval(Some(Duration::from_secs(protocol::QUIC_KEEPALIVE_INTERVAL_SECS)));
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS)).unwrap(),
     ));
-    transport.max_concurrent_bidi_streams(1000u32.into());
-    transport.max_concurrent_uni_streams(1000u32.into());
+    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)

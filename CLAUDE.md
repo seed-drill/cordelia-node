@@ -50,23 +50,27 @@ Start here when working on a module:
 | Topology/E2E | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
-## Key Parameters (from spec + code)
+## Key Parameters (from protocol.rs)
 
-These are the canonical values. If code disagrees with spec, the spec wins.
+All protocol constants live in `crates/cordelia-core/src/protocol.rs` -- the single source of truth.
+Do not add new protocol constants outside `protocol.rs`. All other modules derive from it.
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| `STREAM_TIMEOUT` | 10s | `cordelia-network/src/codec.rs` -- ONE timeout for all reads/writes |
-| `MAX_ITEM_BYTES` | 256KB | `cordelia-network/src/rate_limit.rs` |
-| `keep_alive_interval` | 15s | QUIC transport keepalive |
-| `max_idle_timeout` | 60s | QUIC connection idle timeout |
-| `ping_interval` | 30s | Application-level keepalive |
-| `keepalive_timeout` | 90s | 3 missed pings = dead |
-| `hot_max` | 2 (personal) / 50 (relay) | Governor |
-| `warm_max` | 10 (personal) | Governor |
-| `min_warm_tenure` | 300s | Anti-Sybil: warm before hot promotion |
-| `churn_interval` | 3600s + 0-300s jitter | Anti-eclipse rotation |
-| `max_connections_per_ip` | 5 | Rate limiting |
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §5.3 |
+| `MAX_MESSAGE_BYTES` | 1MB | parameter-rationale.md §5.2 |
+| `MAX_ITEM_BYTES` | 256KB | parameter-rationale.md §4 |
+| `QUIC_KEEPALIVE_INTERVAL_SECS` | 15s | network-protocol.md §2.1 |
+| `QUIC_MAX_IDLE_TIMEOUT_SECS` | 60s | network-protocol.md §2.1 |
+| `PING_INTERVAL_SECS` | 30s | network-protocol.md §4.2 |
+| `DEAD_TIMEOUT_SECS` | 90s | network-protocol.md §4.2 |
+| `HOT_MAX` | 2 (personal) | parameter-rationale.md §3 |
+| `WARM_MAX` | 10 (personal) | parameter-rationale.md §3 |
+| `COLD_MAX` | 50 (personal) | parameter-rationale.md §3 |
+| `MIN_WARM_TENURE_SECS` | 300s | parameter-rationale.md §3 |
+| `CHURN_INTERVAL_SECS` | 3600s | parameter-rationale.md §3 |
+| `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
+| `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
 
 ## Running Tests
 
@@ -110,3 +114,4 @@ grcov . --binary-path ./target/debug/deps -s . -t lcov --branch \
 - Do not put specs in seed-drill. All Cordelia specs live here in docs/specs/.
 - Do not add new timeout values without updating parameter-rationale.md.
 - Do not change governor defaults without checking demand-model.md derivations.
+- Do not add new protocol constants outside `protocol.rs`. All modules derive from it.
