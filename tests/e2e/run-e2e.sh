@@ -42,14 +42,14 @@ echo ""
 # ── Build ────────────────────────────────────────────────────────────
 
 if [ "$SKIP_BUILD" = false ]; then
-    echo "Building cordelia binary (release)..."
+    echo "Building cordelia binary (release, musl)..."
     cd "$REPO_ROOT"
-    cargo build --release 2>&1 | tail -3
+    cargo build --release --target x86_64-unknown-linux-musl --bin cordelia 2>&1 | tail -3
 
     echo "Building Docker image..."
-    docker build -t "$IMAGE_NAME" \
+    DOCKER_BUILDKIT=0 docker build --no-cache -t "$IMAGE_NAME" \
         -f tests/e2e/Dockerfile \
-        --build-arg BINARY=target/release/cordelia \
+        --build-arg BINARY=target/x86_64-unknown-linux-musl/release/cordelia \
         . 2>&1 | tail -3
     echo "Image built: $IMAGE_NAME"
     echo ""
