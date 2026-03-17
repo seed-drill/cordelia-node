@@ -7,22 +7,19 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §10
 
+use cordelia_core::protocol;
 use std::net::{SocketAddr, ToSocketAddrs};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// Default bootnode port.
-pub const DEFAULT_BOOTNODE_PORT: u16 = 9474;
+/// Default bootnode port (sourced from protocol.rs).
+pub const DEFAULT_BOOTNODE_PORT: u16 = protocol::P2P_PORT;
 
-/// DNS SRV record name for bootnode discovery.
-pub const SRV_RECORD: &str = "_cordelia._udp.seeddrill.ai";
+/// DNS SRV record name for bootnode discovery (sourced from protocol.rs).
+pub const SRV_RECORD: &str = protocol::SRV_RECORD;
 
-/// Fallback peer addresses (compiled into binary, rotated each release).
-/// These are last-resort addresses if bootnodes and DNS are both unreachable.
-pub const FALLBACK_PEERS: &[&str] = &[
-    "boot1.cordelia.seeddrill.ai:9474",
-    "boot2.cordelia.seeddrill.ai:9474",
-];
+/// Fallback peer addresses (compiled into binary, sourced from protocol.rs).
+pub const FALLBACK_PEERS: &[&str] = protocol::FALLBACK_PEERS;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -228,5 +225,100 @@ mod tests {
         let resolved = resolve_fallback_peers();
         // Just verify it doesn't panic; DNS may not resolve in CI
         assert!(resolved.len() <= FALLBACK_PEERS.len());
+    }
+
+    // ── Coverage tests: bootstrap 70% -> 85% ────────────────────────────
+
+    #[test]
+    fn test_resolve_all_empty_config_uses_dns_and_fallback() {
+        // Empty config_addrs triggers DNS SRV + fallback branches (lines 141-156)
+        let resolved = resolve_all_bootnodes(&[]);
+        // DNS will likely fail in test env, fallback may or may not resolve.
+        // Key assertion: the function doesn't panic and all results have correct sources.
+        for bn in &resolved {
+            assert!(
+                bn.source == BootnodeSource::DnsSrv || bn.source == BootnodeSource::Fallback,
+                "empty config should only produce DNS/fallback sources, got {:?}",
+                bn.source
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_all_config_prevents_dns_and_fallback() {
+        // Non-empty config_addrs skips DNS + fallback branches
+        let addrs = vec!["127.0.0.1:9474".to_string()];
+        let resolved = resolve_all_bootnodes(&addrs);
+        for bn in &resolved {
+            assert_eq!(
+                bn.source,
+                BootnodeSource::Config,
+                "non-empty config should only produce Config sources"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_config_empty_list() {
+        let resolved = resolve_config_bootnodes(&[]);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_config_multiple_mixed() {
+        let addrs = vec![
+            "127.0.0.1:9474".to_string(),
+            "not-valid".to_string(),
+            "127.0.0.2:9475".to_string(),
+        ];
+        let resolved = resolve_config_bootnodes(&addrs);
+        assert_eq!(resolved.len(), 2, "only valid addresses should resolve");
+        assert_eq!(resolved[0].addr, "127.0.0.1:9474".parse().unwrap());
+        assert_eq!(resolved[1].addr, "127.0.0.2:9475".parse().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_config_hostname() {
+        // localhost should resolve in most environments
+        let addrs = vec!["localhost:9474".to_string()];
+        let resolved = resolve_config_bootnodes(&addrs);
+        if !resolved.is_empty() {
+            assert_eq!(resolved[0].host, "localhost:9474");
+            assert_eq!(resolved[0].source, BootnodeSource::Config);
+            assert_eq!(resolved[0].addr.port(), 9474);
+        }
+        // May fail in some CI envs -- not asserting non-empty
+    }
+
+    #[test]
+    fn test_bootstrap_error_display() {
+        let dns_err = BootstrapError::DnsError("lookup failed".into());
+        assert!(dns_err.to_string().contains("lookup failed"));
+
+        let no_boot = BootstrapError::NoBootnodes;
+        assert!(no_boot.to_string().contains("no bootnode"));
+
+        let io_err = BootstrapError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(io_err.to_string().contains("refused"));
+    }
+
+    #[test]
+    fn test_bootnode_addr_fields() {
+        let addr: SocketAddr = "127.0.0.1:9474".parse().unwrap();
+        let bn = BootnodeAddr {
+            host: "test-host".into(),
+            addr,
+            source: BootnodeSource::DnsSrv,
+        };
+        assert_eq!(bn.host, "test-host");
+        assert_eq!(bn.addr.port(), 9474);
+        assert_eq!(bn.source, BootnodeSource::DnsSrv);
+
+        // Debug is derived
+        let debug = format!("{:?}", bn);
+        assert!(debug.contains("test-host"));
     }
 }

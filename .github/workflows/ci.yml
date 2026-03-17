@@ -81,17 +81,12 @@ jobs:
             --ignore "*/target/*" \
             -o coverage.lcov
 
-      - name: Upload coverage to SonarQube
+      - name: Upload coverage to SonarCloud
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: SonarSource/sonarqube-scan-action@v5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        with:
-          args: >
-            -Dsonar.projectKey=cordelia-node
-            -Dsonar.sources=crates/
-            -Dsonar.coverage.reportPaths=coverage.lcov
         continue-on-error: true
 
       - name: Upload coverage artifact

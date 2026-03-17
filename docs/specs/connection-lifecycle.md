@@ -184,16 +184,23 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
                 stream.reset(APP_ERROR_UNKNOWN_PROTOCOL)
 ```
 
+**Implementation note (session 92):** State gating is enforced in `p2p.rs`
+`handle_peer_streams`. ItemPush and ItemSync are rejected from non-Hot peers
+(data protocols require full trust). PeerSharing is allowed on Warm + Hot.
+KeepAlive and ChannelAnnounce are allowed on all active states. This closes
+spec-alignment-audit gap #12 (ss8.1-8.4: protocol-per-state gating).
+
 ### 2.2 State Query Mechanism
 
 The governor is owned by the p2p_loop. `handle_peer_streams` runs in a spawned
 task and cannot borrow the governor. The state query MUST use one of:
 
-**Option A (recommended):** Shared atomic state per peer.
+**Option A (implemented):** Shared state map per peer.
 ```rust
-// In p2p_loop: update peer state atomics on each governor tick
-peer_states: Arc<DashMap<NodeId, PeerState>>
-// handle_peer_streams reads from the map
+// In p2p_loop: governor tick updates the map
+peer_states: Arc<RwLock<HashMap<NodeId, u8>>>  // 0=Cold, 1=Warm, 2=Hot
+// handle_peer_streams reads from the map before dispatching
+let peer_state = peer_states.read().and_then(|s| s.get(&peer_id).copied()).unwrap_or(1);
 ```
 
 **Option B:** Channel-based query.
@@ -204,7 +211,7 @@ state_query_tx.send((peer_id, tx));
 let state = rx.await;
 ```
 
-**Option C (simplest for Phase 1):** Mark peer state on the connection itself.
+**Option C:** Mark peer state on the connection itself.
 ```rust
 // Store state in PeerConnection, update on governor tick
 peer_conn.governor_state: Arc<AtomicU8>  // 0=Cold, 1=Warm, 2=Hot
