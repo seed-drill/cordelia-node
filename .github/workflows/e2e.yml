@@ -36,9 +36,11 @@ jobs:
 
       - name: Build test Docker image
         run: |
+          cp target/x86_64-unknown-linux-musl/release/cordelia cordelia-bin
           DOCKER_BUILDKIT=0 docker build --no-cache -t cordelia-test:latest \
             -f tests/e2e/Dockerfile \
-            --build-arg BINARY=target/x86_64-unknown-linux-musl/release/cordelia .
+            --build-arg BINARY=cordelia-bin .
+          rm -f cordelia-bin
 
       - name: T1 - Minimal (2P + 1B)
         run: ./tests/e2e/run-e2e.sh --skip-build t1

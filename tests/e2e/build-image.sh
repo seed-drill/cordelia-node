@@ -30,11 +30,13 @@ docker builder prune -af >/dev/null 2>&1 || true
 docker image prune -af >/dev/null 2>&1 || true
 
 echo "Building Docker image (classic builder, no cache)..."
+cp target/x86_64-unknown-linux-musl/release/cordelia cordelia-bin
 DOCKER_BUILDKIT=0 docker build --no-cache \
     -t cordelia-test:latest \
     -f tests/e2e/Dockerfile \
-    --build-arg BINARY=target/x86_64-unknown-linux-musl/release/cordelia \
+    --build-arg BINARY=cordelia-bin \
     .
+rm -f cordelia-bin
 
 echo "Verifying image..."
 docker run --rm --entrypoint ldd cordelia-test:latest /usr/local/bin/cordelia

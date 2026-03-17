@@ -47,10 +47,12 @@ if [ "$SKIP_BUILD" = false ]; then
     cargo build --release --target x86_64-unknown-linux-musl --bin cordelia 2>&1 | tail -3
 
     echo "Building Docker image..."
+    cp target/x86_64-unknown-linux-musl/release/cordelia cordelia-bin
     DOCKER_BUILDKIT=0 docker build --no-cache -t "$IMAGE_NAME" \
         -f tests/e2e/Dockerfile \
-        --build-arg BINARY=target/x86_64-unknown-linux-musl/release/cordelia \
+        --build-arg BINARY=cordelia-bin \
         . 2>&1 | tail -3
+    rm -f cordelia-bin
     echo "Image built: $IMAGE_NAME"
     echo ""
 fi
