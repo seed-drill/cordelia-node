@@ -18,20 +18,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clean previous run artifacts
+        run: |
+          sudo rm -rf tests/e2e/keys/ tests/e2e/logs/ tests/e2e/scale/keys/ 2>/dev/null || true
+          for t in t1 t2 t3 t4 t5 t6 t7; do
+            docker compose -f "tests/e2e/topologies/${t}.yml" down --volumes 2>/dev/null || true
+          done
+          docker image rm cordelia-test:latest 2>/dev/null || true
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Build release binary (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin cordelia
 
       - name: Build test Docker image
         run: |
-          docker build -t cordelia-test:latest \
+          DOCKER_BUILDKIT=0 docker build --no-cache -t cordelia-test:latest \
             -f tests/e2e/Dockerfile \
-            --build-arg BINARY=target/release/cordelia .
+            --build-arg BINARY=target/x86_64-unknown-linux-musl/release/cordelia .
 
-      - name: Run T1 (Minimal)
+      - name: T1 - Minimal (2P + 1B)
         run: ./tests/e2e/run-e2e.sh --skip-build t1
+
+      - name: T2 - Relay Path (2P + 1R + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t2
+
+      - name: T3 - Pull-Only (2P + 1R + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t3
+
+      - name: T4 - Multi-Relay (3P + 2R + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t4
+
+      - name: T5 - Partition/Heal (2P + 2R + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t5
+
+      - name: T6 - Bootnode Loss (3P + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t6
+
+      - name: T7 - Channel Isolation (3P + 1R + 1B)
+        run: ./tests/e2e/run-e2e.sh --skip-build t7
 
       - name: Collect logs on failure
         if: failure()

@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+
+# Previous E2E run data (often root-owned, causes context errors)
+tests/e2e/keys/
+tests/e2e/logs/
+tests/e2e/scale/keys/
+tests/e2e/scale/s*/
+
+# Not needed in image
+docs/
+.git/
+*.md
+sonar-project.properties

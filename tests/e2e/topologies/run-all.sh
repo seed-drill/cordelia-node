@@ -10,6 +10,15 @@ TESTS="${@:-t1 t2 t3 t4 t5 t6 t7}"
 PASS=0
 FAIL=0
 
+E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Clean root-owned artifacts from previous runs (containers write as root)
+echo "Cleaning previous run artifacts..."
+sudo rm -rf "$E2E_DIR/keys" "$E2E_DIR/logs" "$E2E_DIR/scale/keys" 2>/dev/null || true
+for t in $TESTS; do
+    docker compose -f "$SCRIPT_DIR/${t}.yml" down --volumes 2>/dev/null || true
+done
+
 # Pre-flight: verify Docker image is fresh (not stale from previous build)
 # Cordelia lesson: spent hours debugging "missing feature" that was a stale image.
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
