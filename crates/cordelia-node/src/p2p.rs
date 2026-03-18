@@ -137,6 +137,21 @@ pub fn post_connect(
         .peers_warm
         .store(warm as u64, std::sync::atomic::Ordering::Relaxed);
 
+    // Step 6b: Sync peer states for protocol gating (§2.1)
+    // Without this, push handler rejects items from peers promoted during
+    // bootstrap/accept (before first governor tick syncs peer_states).
+    if let Ok(mut states) = peer_states.write() {
+        for peer in governor.all_peers() {
+            let state_byte = match peer.state {
+                cordelia_network::governor::PeerState::Cold => 0u8,
+                cordelia_network::governor::PeerState::Warm => 1,
+                cordelia_network::governor::PeerState::Hot => 2,
+                cordelia_network::governor::PeerState::Banned { .. } => 0,
+            };
+            states.insert(peer.node_id.clone(), state_byte);
+        }
+    }
+
     // Step 7: Spawn stream handler
     if let Some(conn) = conn_mgr.get_connection(node_id) {
         let conn = conn.clone();
