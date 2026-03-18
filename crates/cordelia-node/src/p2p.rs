@@ -287,6 +287,10 @@ pub async fn p2p_loop(
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
 
+    // Peer-share rotation counter: ensures we try different addresses each cycle
+    // instead of always hitting the first (possibly unreachable) address.
+    let mut peer_share_rotation: usize = 0;
+
     loop {
         tokio::select! {
             // ── Accept incoming connection ─────────────────────────────
@@ -341,21 +345,21 @@ pub async fn p2p_loop(
                     } else {
                         cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
                     };
-                    // Try at most 1 peer-share connect per cycle with a short
-                    // timeout. Avoids blocking the select loop for N*10s when
-                    // zone-isolated nodes can't reach cross-zone addresses.
-                    let mut attempted = false;
-                    for peer_addr in &valid {
-                        if attempted { break; }
-                        let peer_node_id = NodeId(
-                            peer_addr.node_id.as_slice().try_into().unwrap_or([0u8; 32])
-                        );
-                        if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
-                            continue;
-                        }
-                        if let Some(addr_str) = peer_addr.addrs.first()
-                            && let Ok(addr) = addr_str.parse() {
-                                attempted = true;
+                    // Try 1 candidate per cycle (2s timeout). Rotate through
+                    // candidates so zone-isolated nodes don't always hit the
+                    // same unreachable address.
+                    let candidates: Vec<_> = valid.iter()
+                        .filter(|pa| {
+                            let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                            nid != our_node_id && !conn_mgr.is_connected(&nid)
+                        })
+                        .collect();
+                    if !candidates.is_empty() {
+                        let idx = peer_share_rotation % candidates.len();
+                        peer_share_rotation = peer_share_rotation.wrapping_add(1);
+                        let peer_addr = candidates[idx];
+                        if let Some(addr_str) = peer_addr.addrs.first() {
+                            if let Ok(addr) = addr_str.parse() {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(2),
                                     conn_mgr.connect_to(addr),
@@ -370,6 +374,7 @@ pub async fn p2p_loop(
                                     Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
                                     Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out (2s)"); }
                                 }
+                            }
                         }
                     }
                 }
