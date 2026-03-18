@@ -69,6 +69,12 @@ for node in p1 p2 p3; do
     wait_for "$node has 1+ hot peers" \
         '[ "$(api_get t4-'"$node"' status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 done
+# Zone model: relays must promote personal nodes to hot before items flow.
+# R1 serves home-1 (P1) + home-2 (P2), R2 serves enterprise (P3).
+wait_for "r1 has 3+ hot peers" \
+    '[ "$(api_get t4-r1 status | jq -r ".peers_hot // 0")" -ge 3 ]' 30
+wait_for "r2 has 2+ hot peers" \
+    '[ "$(api_get t4-r2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
 
 # -- Step 4: Subscribe to channel ----------------------------------------
 
