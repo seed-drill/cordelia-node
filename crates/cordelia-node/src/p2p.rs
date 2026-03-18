@@ -287,7 +287,7 @@ pub async fn p2p_loop(
     // P2P loop timers. Peer-share and sync run at their protocol intervals
     // (from protocol.rs). Governor tick uses the config value.
     const P2P_PEER_SHARE_CHECK_SECS: u64 = 5; // How often to check for connect candidates
-    const P2P_SYNC_CHECK_SECS: u64 = 10;
+    let p2p_sync_check_secs = cordelia_core::protocol::REALTIME_SYNC_INTERVAL_SECS;
 
     let p2p_gov_tick_secs = gov_config.tick_interval_secs as u64;
 
@@ -297,7 +297,7 @@ pub async fn p2p_loop(
     peer_share_interval.tick().await;
 
     let mut sync_interval =
-        tokio::time::interval(std::time::Duration::from_secs(P2P_SYNC_CHECK_SECS));
+        tokio::time::interval(std::time::Duration::from_secs(p2p_sync_check_secs));
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await;
 

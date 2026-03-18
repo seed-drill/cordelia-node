@@ -16,8 +16,9 @@
 //! STREAM_TIMEOUT_SECS ──> HANDSHAKE_TIMEOUT_SECS
 //!
 //! TICK_INTERVAL_SECS ──> RATE_WINDOW_SECS ──> BAN_WINDOW_SECS
-//!                    \                    \──> REALTIME_SYNC_INTERVAL_SECS
 //!                     \──> SYNCS_PER_PEER_PER_MINUTE
+//!
+//! REPUSH_INTERVAL_SECS ──> REALTIME_SYNC_INTERVAL_SECS (2x repush)
 //!
 //! PING_INTERVAL_SECS ──> DEAD_TIMEOUT_SECS ──> HYSTERESIS_SECS
 //!                    \──> BACKOFF_BASE_SECS
@@ -368,9 +369,10 @@ pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 = RATE_LIMIT_HEADROOM * (RATE_WIN
 // ── Intervals ────────────────────────────────────────────────────────
 
 /// Realtime channel sync interval in seconds (network-protocol.md §4.5).
-/// Derived: sync once per rate window. Ensures at least 1 sync
-/// opportunity per rate-limit sliding window.
-pub const REALTIME_SYNC_INTERVAL_SECS: u64 = RATE_WINDOW_SECS;
+/// Derived: 2x REPUSH_INTERVAL_SECS. Pull-sync is the primary delivery
+/// mechanism for personal nodes. Interval gives relays time to propagate
+/// items via single-hop repush before personal nodes pull.
+pub const REALTIME_SYNC_INTERVAL_SECS: u64 = 2 * REPUSH_INTERVAL_SECS;
 
 /// Batch channel sync interval in seconds (network-protocol.md §4.5).
 /// Derived: same as transient ban duration. Batch channels tolerate
@@ -707,7 +709,7 @@ mod tests {
     // Intervals (network-protocol.md §4)
     #[test]
     fn test_realtime_sync_interval_network_protocol_4_5() {
-        assert_eq!(REALTIME_SYNC_INTERVAL_SECS, 60);
+        assert_eq!(REALTIME_SYNC_INTERVAL_SECS, 10);
     }
 
     #[test]
@@ -854,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_derived_realtime_sync_interval() {
-        assert_eq!(REALTIME_SYNC_INTERVAL_SECS, RATE_WINDOW_SECS);
+        assert_eq!(REALTIME_SYNC_INTERVAL_SECS, 2 * REPUSH_INTERVAL_SECS);
     }
 
     #[test]
