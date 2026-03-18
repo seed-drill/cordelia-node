@@ -99,9 +99,11 @@ done
 
 echo ""
 echo "Step 6: Waiting for items to arrive..."
+# Zone model: items traverse P1->R1->internet->R2->P3 (multi-hop).
+# Pull-sync fallback adds sync_interval_realtime_secs latency per hop.
 for node in p2 p3; do
     wait_for "$node has 5 items" \
-        '[ "$(db_query t4-'"$node"' "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 5 ]' 30
+        '[ "$(db_query t4-'"$node"' "SELECT COUNT(*) FROM items WHERE channel_id='"'"'$CHANNEL_ID'"'"' AND is_tombstone=0")" -ge 5 ]' 60
 done
 
 # -- Step 7: Assertions --------------------------------------------------
