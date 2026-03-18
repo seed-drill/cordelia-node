@@ -110,7 +110,7 @@ dns_discovery = ""
 ${bootnode_entries}
 
 [governor]
-hot_min = 10
+hot_min = $((RELAYS + BOOTNODES - 1))
 hot_max = ${RELAY_HOT_MAX}
 warm_min = 10
 warm_max = $((RELAY_HOT_MAX + 50))
