@@ -28,9 +28,9 @@ fn validate_channel_name(name: &str) -> Result<(), CordeliaError> {
             reason: format!("too short ({len} chars, minimum 3)"),
         });
     }
-    if len > 63 {
+    if len > cordelia_core::protocol::MAX_CHANNEL_NAME_LEN {
         return Err(CordeliaError::InvalidChannelName {
-            reason: format!("too long ({len} chars, maximum 63)"),
+            reason: format!("too long ({len} chars, maximum {})", cordelia_core::protocol::MAX_CHANNEL_NAME_LEN),
         });
     }
 

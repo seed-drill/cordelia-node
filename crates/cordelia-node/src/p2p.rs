@@ -241,12 +241,11 @@ pub async fn p2p_loop(
     }
     governor.tick();
 
-    // P2P loop timers -- these are CHECK intervals, not the protocol intervals.
-    // The p2p loop checks frequently (5-10s) and then decides whether to act
-    // based on the protocol intervals (e.g., 300s for peer sharing).
-    const P2P_PEER_SHARE_CHECK_SECS: u64 = 5;
+    // P2P loop timers. Peer-share and sync run at their protocol intervals
+    // (from protocol.rs). Governor tick uses the config value.
+    const P2P_PEER_SHARE_CHECK_SECS: u64 = 5; // How often to check for connect candidates
     const P2P_SYNC_CHECK_SECS: u64 = 10;
-    const P2P_GOV_TICK_SECS: u64 = 10;
+    let p2p_gov_tick_secs = gov_config.tick_interval_secs as u64;
 
     let mut peer_share_interval =
         tokio::time::interval(std::time::Duration::from_secs(P2P_PEER_SHARE_CHECK_SECS));
@@ -258,7 +257,7 @@ pub async fn p2p_loop(
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await;
 
-    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(P2P_GOV_TICK_SECS));
+    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(p2p_gov_tick_secs));
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 
@@ -287,9 +286,20 @@ pub async fn p2p_loop(
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
 
-    // Peer-share rotation counter: ensures we try different addresses each cycle
-    // instead of always hitting the first (possibly unreachable) address.
+    // Peer-share rotation counter: ensures we try different connect candidates
+    // each cycle instead of always hitting the first (possibly unreachable) address.
     let mut peer_share_rotation: usize = 0;
+
+    // Peer-share target rotation + per-peer cooldown: spreads requests across
+    // connected peers and respects the rate limit (PEER_SHARES_PER_PEER_PER_MINUTE).
+    // Cooldown = RATE_WINDOW / PEER_SHARES_PER_PEER = 60/2 = 30s per peer.
+    let mut peer_share_target_idx: usize = 0;
+    let mut peer_share_last_request: std::collections::HashMap<NodeId, std::time::Instant> =
+        std::collections::HashMap::new();
+    let peer_share_cooldown = std::time::Duration::from_secs(
+        cordelia_core::protocol::RATE_WINDOW_SECS
+            / cordelia_core::protocol::PEER_SHARES_PER_PEER_PER_MINUTE as u64,
+    );
 
     loop {
         tokio::select! {
@@ -324,10 +334,36 @@ pub async fn p2p_loop(
             }
 
             // ── Peer-sharing ──────────────────────────────────────────
+            // Two concerns: (a) request addresses from a peer, (b) connect
+            // to a discovered candidate. We check every 5s but only REQUEST
+            // from peers whose cooldown has expired (RATE_WINDOW/SHARES_PER_MIN
+            // = 30s per peer). Connect attempts use cached results.
             _ = peer_share_interval.tick() => {
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
-                let target = peers[0].clone();
+
+                // Rotate target: find next peer whose cooldown has expired
+                let now = std::time::Instant::now();
+                let mut target = None;
+                for offset in 0..peers.len() {
+                    let idx = (peer_share_target_idx + offset) % peers.len();
+                    let candidate = &peers[idx];
+                    let elapsed = peer_share_last_request
+                        .get(candidate)
+                        .map(|t| now.duration_since(*t))
+                        .unwrap_or(peer_share_cooldown); // First request: no cooldown
+                    if elapsed >= peer_share_cooldown {
+                        target = Some(candidate.clone());
+                        peer_share_target_idx = idx + 1;
+                        break;
+                    }
+                }
+                let target = match target {
+                    Some(t) => t,
+                    None => continue, // All peers on cooldown
+                };
+                peer_share_last_request.insert(target.clone(), now);
+
                 if let Some(conn) = conn_mgr.get_connection(&target) {
                     let conn = conn.clone();
                     let (mut send, mut recv) = match open_bi(&conn).await {

@@ -382,7 +382,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
             for bn in &bootnodes {
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
                     conn_mgr.connect_to(bn.addr),
                 ).await {
                     Ok(Ok(node_id)) => {

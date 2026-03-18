@@ -190,12 +190,14 @@ impl PeerInfo {
             .max(1.0);
 
         let throughput = self.items_delivered as f64 / elapsed;
-        let rtt_factor = self.rtt_ms.map(|r| 1.0 / (1.0 + r / 100.0)).unwrap_or(0.5);
+        let rtt_factor = self.rtt_ms
+            .map(|r| 1.0 / (1.0 + r / protocol::SCORE_RTT_DENOMINATOR_MS))
+            .unwrap_or(protocol::SCORE_RTT_DEFAULT_FACTOR);
 
         // Contribution factor: penalise relays that don't relay items (§5.5)
         let contribution_factor = if self.is_relay {
             let ratio = self.items_relayed as f64 / (self.items_requested.max(1) as f64);
-            ratio.clamp(0.1, 2.0)
+            ratio.clamp(protocol::SCORE_CONTRIBUTION_MIN, protocol::SCORE_CONTRIBUTION_MAX)
         } else {
             1.0
         };
@@ -447,7 +449,7 @@ impl Governor {
             let multiplier = 1u32
                 .checked_shl(escalation.saturating_sub(1))
                 .unwrap_or(u32::MAX);
-            let duration = (base * multiplier).min(Duration::from_secs(7 * 86400));
+            let duration = (base * multiplier).min(Duration::from_secs(protocol::BAN_ESCALATION_CAP_SECS));
             tracing::warn!(
                 peer = %node_id,
                 from,
@@ -1861,7 +1863,7 @@ mod tests {
         let id = make_node_id(1);
         gov.add_peer(id.clone(), make_addr(), vec![]);
 
-        let seven_days = Duration::from_secs(7 * 86400);
+        let seven_days = Duration::from_secs(protocol::BAN_ESCALATION_CAP_SECS);
 
         // Ban 35 times: triggers both the .min(7 days) cap and checked_shl overflow
         for _ in 0..35 {
