@@ -306,6 +306,23 @@ pub fn list_for_entity(
     Ok(channels)
 }
 
+/// List distinct channel IDs that have stored items.
+/// Used by relay nodes for pull-sync: relays aren't channel members
+/// but need to sync channels they've received items for.
+pub fn list_stored_channel_ids(conn: &Connection) -> Result<Vec<String>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT channel_id FROM items")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(ids)
+}
+
 /// Add a member to a channel.
 pub fn add_member(
     conn: &Connection,

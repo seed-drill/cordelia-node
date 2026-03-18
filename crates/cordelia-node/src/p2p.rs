@@ -795,7 +795,10 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Pull-sync from hot peers ──────────────────────────────
+            // ── Pull-sync from hot peers (§4.5) ─────────────────────
+            // "The node MUST sync from all hot peers each cycle."
+            // Relays use stored channel IDs (they aren't channel members).
+            // Personal nodes use list_for_entity (subscribed channels).
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
                 let peers = conn_mgr.connected_peers();
@@ -805,35 +808,32 @@ pub async fn p2p_loop(
                         Ok(db) => db,
                         Err(_) => continue,
                     };
-                    let pk = state.identity.public_key();
-                    cordelia_storage::channels::list_for_entity(&db, &pk)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| c.channel_id)
-                        .collect()
+                    if node_role == "relay" {
+                        cordelia_storage::channels::list_stored_channel_ids(&db)
+                            .unwrap_or_default()
+                    } else {
+                        let pk = state.identity.public_key();
+                        cordelia_storage::channels::list_for_entity(&db, &pk)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|c| c.channel_id)
+                            .collect()
+                    }
                 };
                 if channels.is_empty() { continue; }
 
-                tracing::debug!(total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
-                // Sync per-channel: only query peers that serve each channel
-                // (relays via is_relay flag, personal nodes via channel-announce groups)
-                let mut synced_peers: std::collections::HashSet<(NodeId, String)> = std::collections::HashSet::new();
-                for ch_id in &channels {
-                    let ch_peers = governor.hot_peers_for_channel(ch_id);
-                    for target in &ch_peers {
-                        if !synced_peers.insert((target.clone(), ch_id.clone())) {
-                            continue; // already syncing this peer+channel
-                        }
+                let hot = governor.hot_peers();
+                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
+                for target in &hot {
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
-                    let sync_ch = ch_id.clone();
+                    let sync_channels = channels.clone();
                     let target = target.clone();
                     let gtx = gov_tx.clone();
                     let role = node_role.clone();
-                    tracing::debug!(peer = %target, channel = %sync_ch, "pull-sync starting");
+                    tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
                     tokio::spawn(async move {
-                        let sync_channels = vec![sync_ch];
                         for ch_id in &sync_channels {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
@@ -888,7 +888,6 @@ pub async fn p2p_loop(
                             }
                         }
                     });
-                    }
                     }
                 }
             }
