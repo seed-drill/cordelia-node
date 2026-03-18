@@ -347,7 +347,8 @@ pub async fn p2p_loop(
                                     }
                                     Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
                                     Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out (2s)"); }
-                            }
+                                }
+                        }
                     }
                 }
             }
