@@ -286,13 +286,13 @@ pub async fn p2p_loop(
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
 
-    // Peer-share rotation counter: ensures we try different connect candidates
-    // each cycle instead of always hitting the first (possibly unreachable) address.
+    // Peer-share has two independent concerns:
+    // (a) Request addresses from peers (subject to per-peer cooldown for rate limits)
+    // (b) Connect to discovered candidates (every cycle from cached addresses)
+    //
+    // Address cache persists between cycles so connects continue even when
+    // all peers are on cooldown (critical during early mesh formation with few peers).
     let mut peer_share_rotation: usize = 0;
-
-    // Peer-share target rotation + per-peer cooldown: spreads requests across
-    // connected peers and respects the rate limit (PEER_SHARES_PER_PEER_PER_MINUTE).
-    // Cooldown = RATE_WINDOW / PEER_SHARES_PER_PEER = 60/2 = 30s per peer.
     let mut peer_share_target_idx: usize = 0;
     let mut peer_share_last_request: std::collections::HashMap<NodeId, std::time::Instant> =
         std::collections::HashMap::new();
@@ -300,6 +300,7 @@ pub async fn p2p_loop(
         cordelia_core::protocol::RATE_WINDOW_SECS
             / cordelia_core::protocol::PEER_SHARES_PER_PEER_PER_MINUTE as u64,
     );
+    let mut peer_share_cache: Vec<cordelia_network::messages::PeerAddress> = Vec::new();
 
     loop {
         tokio::select! {
@@ -334,15 +335,15 @@ pub async fn p2p_loop(
             }
 
             // ── Peer-sharing ──────────────────────────────────────────
-            // Two concerns: (a) request addresses from a peer, (b) connect
-            // to a discovered candidate. We check every 5s but only REQUEST
-            // from peers whose cooldown has expired (RATE_WINDOW/SHARES_PER_MIN
-            // = 30s per peer). Connect attempts use cached results.
+            // (a) Request addresses from a peer whose cooldown has expired
+            //     and merge into the persistent cache.
+            // (b) Try to connect to 1 candidate from the cache (every cycle,
+            //     even when all peers are on cooldown).
             _ = peer_share_interval.tick() => {
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
-                // Rotate target: find next peer whose cooldown has expired
+                // (a) Discovery: find a peer whose cooldown has expired
                 let now = std::time::Instant::now();
                 let mut target = None;
                 for offset in 0..peers.len() {
@@ -351,65 +352,66 @@ pub async fn p2p_loop(
                     let elapsed = peer_share_last_request
                         .get(candidate)
                         .map(|t| now.duration_since(*t))
-                        .unwrap_or(peer_share_cooldown); // First request: no cooldown
+                        .unwrap_or(peer_share_cooldown);
                     if elapsed >= peer_share_cooldown {
                         target = Some(candidate.clone());
                         peer_share_target_idx = idx + 1;
                         break;
                     }
                 }
-                let target = match target {
-                    Some(t) => t,
-                    None => continue, // All peers on cooldown
-                };
-                peer_share_last_request.insert(target.clone(), now);
-
-                if let Some(conn) = conn_mgr.get_connection(&target) {
-                    let conn = conn.clone();
-                    let (mut send, mut recv) = match open_bi(&conn).await {
-                        Ok(s) => s,
-                        Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share open_bi"); continue; }
-                    };
-                    let mut stream = tokio::io::join(&mut recv, &mut send);
-                    let discovered = match cordelia_network::peer_sharing::request_peers(&mut stream, cordelia_core::protocol::DEFAULT_MAX_PEERS_SHARE).await {
-                        Ok(d) => d,
-                        Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share request failed"); continue; }
-                    };
-                    let own_addr = conn_mgr.local_addr().ok();
-                    let valid = if allow_private_addresses {
-                        discovered
-                    } else {
-                        cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
-                    };
-                    // Try 1 candidate per cycle (2s timeout). Rotate through
-                    // candidates so zone-isolated nodes don't always hit the
-                    // same unreachable address.
-                    let candidates: Vec<_> = valid.iter()
-                        .filter(|pa| {
-                            let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
-                            nid != our_node_id && !conn_mgr.is_connected(&nid)
-                        })
-                        .collect();
-                    if !candidates.is_empty() {
-                        let idx = peer_share_rotation % candidates.len();
-                        peer_share_rotation = peer_share_rotation.wrapping_add(1);
-                        let peer_addr = candidates[idx];
-                        if let Some(addr_str) = peer_addr.addrs.first() {
-                            if let Ok(addr) = addr_str.parse() {
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(2),
-                                    conn_mgr.connect_to(addr),
-                                ).await {
-                                    Ok(Ok(new_id)) => {
-                                        tracing::info!(peer = %new_id, peers = conn_mgr.connection_count(), "connected via peer-sharing");
-                                        post_connect(
-                                            &new_id, &conn_mgr, &mut governor, &shared_peers,
-                                            &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
-                                        );
+                if let Some(target) = target {
+                    peer_share_last_request.insert(target.clone(), now);
+                    if let Some(conn) = conn_mgr.get_connection(&target) {
+                        let conn = conn.clone();
+                        if let Ok((mut send, mut recv)) = open_bi(&conn).await {
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+                            if let Ok(discovered) = cordelia_network::peer_sharing::request_peers(
+                                &mut stream, cordelia_core::protocol::DEFAULT_MAX_PEERS_SHARE,
+                            ).await {
+                                let own_addr = conn_mgr.local_addr().ok();
+                                let valid = if allow_private_addresses {
+                                    discovered
+                                } else {
+                                    cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
+                                };
+                                // Merge into cache (deduplicate by node_id)
+                                for pa in valid {
+                                    let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                                    if nid != our_node_id && !peer_share_cache.iter().any(|c| c.node_id == pa.node_id) {
+                                        peer_share_cache.push(pa);
                                     }
-                                    Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
-                                    Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out (2s)"); }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // (b) Connect: try 1 candidate from cache (every cycle)
+                let candidates: Vec<_> = peer_share_cache.iter()
+                    .filter(|pa| {
+                        let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                        nid != our_node_id && !conn_mgr.is_connected(&nid)
+                    })
+                    .collect();
+                if !candidates.is_empty() {
+                    let idx = peer_share_rotation % candidates.len();
+                    peer_share_rotation = peer_share_rotation.wrapping_add(1);
+                    let peer_addr = candidates[idx];
+                    if let Some(addr_str) = peer_addr.addrs.first() {
+                        if let Ok(addr) = addr_str.parse() {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                conn_mgr.connect_to(addr),
+                            ).await {
+                                Ok(Ok(new_id)) => {
+                                    tracing::info!(peer = %new_id, peers = conn_mgr.connection_count(), "connected via peer-sharing");
+                                    post_connect(
+                                        &new_id, &conn_mgr, &mut governor, &shared_peers,
+                                        &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
+                                    );
+                                }
+                                Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
+                                Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out (2s)"); }
                             }
                         }
                     }
