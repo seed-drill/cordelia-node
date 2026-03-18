@@ -1,23 +1,23 @@
 #!/bin/bash
 # Generate Docker Compose + configs for S2 relay mesh convergence test.
-# Usage: generate-s2.sh [relays]
+# Usage: generate-s2.sh [relays] [personal_per_zone]
 #
-# Topology: 2B + R relays + R personal = 2+2R containers, R+1 networks
-# Each relay on internet + its own home zone. 1 personal node per zone.
-# Isolates relay mesh behaviour from zone fan-out effects.
+# Topology: 2B + R relays + R*PPZ personal = 2+R+R*PPZ containers, R+1 networks
+# Each relay on internet + its own home zone. PPZ personal nodes per zone.
 #
 # Relay hot_max = R + 5 (must fit all other relays + bootnodes).
 #
 # IP scheme per zone (172.28.{zone}.0/24):
 #   .10-.11  bootnodes
 #   .20      relay (1 per zone)
-#   .30      personal (1 per zone)
+#   .30-.xx  personal nodes (PPZ per zone)
 
 set -euo pipefail
 
 RELAYS=${1:-20}
+PERSONAL_PER_ZONE=${2:-1}
 BOOTNODES=2
-PERSONAL=$RELAYS  # 1 personal per zone
+PERSONAL=$((RELAYS * PERSONAL_PER_ZONE))
 CONTAINER_COUNT=$((BOOTNODES + RELAYS + PERSONAL))
 NUM_ZONES=$RELAYS
 
@@ -31,8 +31,8 @@ CONFIG_DIR="$OUT_DIR/configs"
 
 mkdir -p "$CONFIG_DIR"
 
-echo "Generating S2-${RELAYS}: ${BOOTNODES}B + ${RELAYS}R + ${PERSONAL}P = ${CONTAINER_COUNT} nodes"
-echo "  Zones: $NUM_ZONES (1 personal/zone, 1 relay/zone)"
+echo "Generating S2-${RELAYS}: ${BOOTNODES}B + ${RELAYS}R + ${PERSONAL}P (${PERSONAL_PER_ZONE}/zone) = ${CONTAINER_COUNT} nodes"
+echo "  Zones: $NUM_ZONES (${PERSONAL_PER_ZONE} personal/zone, 1 relay/zone)"
 echo "  Networks: 1 internet + $NUM_ZONES home zones"
 echo "  Relay hot_max: $RELAY_HOT_MAX"
 
@@ -139,14 +139,17 @@ level = "info"
 TOML
 done
 
-# Personal nodes: 1 per zone, bootstrap from zone bootnode + relay
+# Personal nodes: PPZ per zone, bootstrap from zone bootnode + relay
+PERSONAL_IDX=0
 for z in $(seq 1 "$NUM_ZONES"); do
-    name="p${z}"
     relay_zone_ip="172.28.${z}.20"
     bootnode_zone_ip="172.28.${z}.10"
+    for pi in $(seq 1 "$PERSONAL_PER_ZONE"); do
+    PERSONAL_IDX=$((PERSONAL_IDX + 1))
+    name="p${PERSONAL_IDX}"
 
     cat > "$CONFIG_DIR/${name}.toml" << TOML
-# S2 personal node (home-${z})
+# S2 personal node (home-${z}, slot ${pi})
 [identity]
 entity_id = "${name}_test"
 
@@ -189,6 +192,7 @@ bind_address = "127.0.0.1"
 [logging]
 level = "info"
 TOML
+    done
 done
 
 # ── Docker Compose ───────────────────────────────────────────────────
@@ -272,10 +276,13 @@ for i in $(seq 0 $((RELAYS - 1))); do
 YAML
 done
 
-# Personal nodes -- 1 per zone, keys mounted
+# Personal nodes -- PPZ per zone, keys mounted
+PERSONAL_IDX=0
 for z in $(seq 1 "$NUM_ZONES"); do
-    name="p${z}"
-    ip="172.28.${z}.30"
+    for pi in $(seq 1 "$PERSONAL_PER_ZONE"); do
+    PERSONAL_IDX=$((PERSONAL_IDX + 1))
+    name="p${PERSONAL_IDX}"
+    ip="172.28.${z}.$((29 + pi))"
 
     cat >> "$COMPOSE" << YAML
   ${name}:
@@ -300,6 +307,7 @@ for z in $(seq 1 "$NUM_ZONES"); do
         condition: service_healthy
 
 YAML
+    done
 done
 
 # Networks
