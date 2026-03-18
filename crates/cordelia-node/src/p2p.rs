@@ -246,16 +246,11 @@ pub async fn p2p_loop(
     const P2P_PEER_SHARE_CHECK_SECS: u64 = 5; // How often to check for connect candidates
     const P2P_SYNC_CHECK_SECS: u64 = 10;
 
-    // Peer-share connect tuning (implementation-level, not wire-protocol).
-    // CONNECT_TIMEOUT: short ceiling for speculative connects from cache.
-    //   Typical connects complete in <100ms; 2s handles slow cross-region links.
-    // CONNECTS_PER_CYCLE: max outbound connect attempts per check cycle.
-    //   floor(CHECK_SECS / TIMEOUT) = 2, but 3 is safe because connects
-    //   rarely hit the timeout and MissedTickBehavior::Delay absorbs overrun.
-    //   Prevents the "slow tail" where relays with 15+ peers stall waiting
-    //   for the last few connections at 1-per-cycle.
+    // Peer-share connect timeout: short ceiling for speculative connects.
+    // Typical connects complete in <100ms; 2s handles slow cross-region links.
+    // Sequential (not spawned), so only 1 per cycle to keep the select loop
+    // responsive for inbound connections and governor ticks.
     const P2P_PEER_SHARE_CONNECT_TIMEOUT_SECS: u64 = 2;
-    const P2P_PEER_SHARE_CONNECTS_PER_CYCLE: usize = 3;
     let p2p_gov_tick_secs = gov_config.tick_interval_secs as u64;
 
     let mut peer_share_interval =
@@ -397,17 +392,16 @@ pub async fn p2p_loop(
                     }
                 }
 
-                // (b) Connect: try up to N candidates from cache (every cycle).
-                // Rebuilds candidate list after each successful connect since
-                // is_connected changes.
-                for _ in 0..P2P_PEER_SHARE_CONNECTS_PER_CYCLE {
-                    let candidates: Vec<_> = peer_share_cache.iter()
-                        .filter(|pa| {
-                            let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
-                            nid != our_node_id && !conn_mgr.is_connected(&nid)
-                        })
-                        .collect();
-                    if candidates.is_empty() { break; }
+                // (b) Connect: pick 1 candidate from cache and connect (every cycle).
+                // Sequential connect blocks the select loop, so we limit to 1
+                // per cycle to keep inbound processing and governor ticks responsive.
+                let candidates: Vec<_> = peer_share_cache.iter()
+                    .filter(|pa| {
+                        let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                        nid != our_node_id && !conn_mgr.is_connected(&nid)
+                    })
+                    .collect();
+                if !candidates.is_empty() {
                     let idx = peer_share_rotation % candidates.len();
                     peer_share_rotation = peer_share_rotation.wrapping_add(1);
                     let peer_addr = candidates[idx];
