@@ -1,8 +1,13 @@
 # T2: Relay Path (2P + 1B + 1R)
+# Networks: internet, home-1, home-2 (zone-based model)
+# B1/R1: multi-homed (internet + all home zones)
+# P1: home-1 only, P2: home-2 only
+#
 # Purpose: Items flow through a relay. Validates store-and-forward + role isolation.
+# P1 cannot reach P2 directly (different zones). Items must flow via R1.
 # Properties tested: P1 (Delivery), P4 (Role isolation), P5 (Loop termination)
 #
-# Spec: seed-drill/specs/topology-e2e.md §3.3
+# Spec: cordelia-node/docs/specs/topology-e2e.md §3.3
 
 name: t2-relay-path
 
@@ -20,8 +25,12 @@ services:
       - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
+      internet:
         ipv4_address: 172.28.0.10
+      home-1:
+        ipv4_address: 172.28.1.10
+      home-2:
+        ipv4_address: 172.28.2.10
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
       interval: 5s
@@ -42,8 +51,12 @@ services:
       - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
+      internet:
         ipv4_address: 172.28.0.20
+      home-1:
+        ipv4_address: 172.28.1.20
+      home-2:
+        ipv4_address: 172.28.2.20
     depends_on:
       b1:
         condition: service_healthy
@@ -68,8 +81,8 @@ services:
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
-        ipv4_address: 172.28.0.30
+      home-1:
+        ipv4_address: 172.28.1.30
     depends_on:
       b1:
         condition: service_healthy
@@ -88,15 +101,25 @@ services:
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
-        ipv4_address: 172.28.0.31
+      home-2:
+        ipv4_address: 172.28.2.30
     depends_on:
       b1:
         condition: service_healthy
 
 networks:
-  cordelia-net:
+  internet:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.0.0/24
+  home-1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  home-2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24

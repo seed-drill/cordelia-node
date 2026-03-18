@@ -1,8 +1,13 @@
 # T4: Multi-Relay (3P + 1B + 2R)
+# Networks: internet, home-1, home-2, enterprise (zone-based model)
+# B1: all networks. R1: internet + home-1 + home-2. R2: internet + enterprise.
+# P1: home-1 only, P2: home-2 only, P3: enterprise only
+#
 # Purpose: Fan-out across multiple relays without duplication or loops.
+# R1 serves home zones, R2 is the enterprise edge relay.
 # Properties tested: P1 (Delivery), P5 (Loop termination)
 #
-# Spec: seed-drill/specs/topology-e2e.md §3.5
+# Spec: cordelia-node/docs/specs/topology-e2e.md §3.5
 
 name: t4-multi-relay
 
@@ -20,8 +25,14 @@ services:
       - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
+      internet:
         ipv4_address: 172.28.0.10
+      home-1:
+        ipv4_address: 172.28.1.10
+      home-2:
+        ipv4_address: 172.28.2.10
+      enterprise:
+        ipv4_address: 172.28.4.10
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
       interval: 5s
@@ -42,8 +53,12 @@ services:
       - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
+      internet:
         ipv4_address: 172.28.0.20
+      home-1:
+        ipv4_address: 172.28.1.20
+      home-2:
+        ipv4_address: 172.28.2.20
     depends_on:
       b1:
         condition: service_healthy
@@ -67,8 +82,10 @@ services:
       - ../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
+      internet:
         ipv4_address: 172.28.0.21
+      enterprise:
+        ipv4_address: 172.28.4.20
     depends_on:
       b1:
         condition: service_healthy
@@ -93,8 +110,8 @@ services:
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
-        ipv4_address: 172.28.0.30
+      home-1:
+        ipv4_address: 172.28.1.30
     depends_on:
       b1:
         condition: service_healthy
@@ -113,8 +130,8 @@ services:
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
-        ipv4_address: 172.28.0.31
+      home-2:
+        ipv4_address: 172.28.2.30
     depends_on:
       b1:
         condition: service_healthy
@@ -133,15 +150,30 @@ services:
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     networks:
-      cordelia-net:
-        ipv4_address: 172.28.0.32
+      enterprise:
+        ipv4_address: 172.28.4.30
     depends_on:
       b1:
         condition: service_healthy
 
 networks:
-  cordelia-net:
+  internet:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.0.0/24
+  home-1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  home-2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
+  enterprise:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.4.0/24
