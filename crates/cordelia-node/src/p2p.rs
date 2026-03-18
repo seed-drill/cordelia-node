@@ -288,9 +288,8 @@ pub async fn p2p_loop(
 
     // Relay re-push flush timer: batch + de-dupe items before forwarding.
     // Prevents push storms at scale (see parameter-rationale.md §7).
-    const REPUSH_INTERVAL_SECS: u64 = 5;
     let mut repush_interval =
-        tokio::time::interval(std::time::Duration::from_secs(REPUSH_INTERVAL_SECS));
+        tokio::time::interval(std::time::Duration::from_secs(cordelia_core::protocol::REPUSH_INTERVAL_SECS));
     repush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     repush_interval.tick().await;
 

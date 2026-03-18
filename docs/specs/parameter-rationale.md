@@ -216,6 +216,27 @@ long, wasting push bandwidth.
 
 ## 4. Protocol Rate Limits
 
+### 3x Headroom Principle (RATE_LIMIT_HEADROOM = 3)
+
+**Principle:** All per-peer rate limits are set to **3x the expected legitimate rate**.
+This provides burst tolerance (reconnect catch-up, rapid publish after partitioning)
+while catching sustained abuse (4x+ over a sliding window = clearly malicious).
+
+Every rate limit is derived from the expected rate of the protocol it protects,
+multiplied by the headroom constant. No magic numbers.
+
+| Protocol | Expected rate | Limit (3x) | Derivation |
+|----------|--------------|------------|------------|
+| Writes | 12/min (60/REPUSH_INTERVAL) | 36/min | `3 × (60 / 5)` |
+| Syncs | 6/min (RATE_WINDOW/TICK) | 18/min | `3 × (60 / 10)` |
+| Peer-shares | 2/min (RATE_WINDOW/PING) | 6/min | `3 × (60 / 30)` |
+
+**If you increase to 5x:** More burst tolerance but a wider window for sustained abuse.
+An attacker can send 5x normal traffic before triggering any response.
+
+**If you decrease to 2x:** Tight. A legitimate relay processing a burst from multiple
+sources may trigger false positives. 2x leaves no room for timing variance.
+
 ### clock_skew_tolerance = 300s (5 minutes)
 
 **Rationale:** Maximum allowed clock difference between two nodes during
