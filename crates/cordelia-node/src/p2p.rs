@@ -100,6 +100,7 @@ pub fn post_connect(
         >,
     >,
     peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     // Step 1: Extract peer roles from handshake
@@ -156,6 +157,15 @@ pub fn post_connect(
         }
     }
 
+    // Step 6c: Sync relay peer set for single-hop re-push (§7.2)
+    if let Ok(mut relays) = peer_relays.write() {
+        for peer in governor.all_peers() {
+            if peer.is_relay {
+                relays.insert(peer.node_id.clone());
+            }
+        }
+    }
+
     // Step 7: Send channel announcements if peer promoted to Hot and we're not a relay
     // (relays are receive-only for channel-announce per §4.4)
     let peer_is_hot = governor
@@ -185,10 +195,11 @@ pub fn post_connect(
         let dtx = delivery_tx.clone();
         let rates = peer_rates.clone();
         let states = peer_states.clone();
+        let relays = peer_relays.clone();
         let gtx = gov_tx.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, gtx,
+                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx,
             )
             .await;
         });
@@ -243,6 +254,11 @@ pub async fn p2p_loop(
     let peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
+    // Shared set of relay peer IDs. Used by handle_inbound_push for single-hop
+    // re-push check (§7.2: only re-push items from non-relay senders).
+    let peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
@@ -262,6 +278,7 @@ pub async fn p2p_loop(
             &delivery_tx,
             &peer_rates,
             &peer_states,
+            &peer_relays,
             &gov_tx,
         );
     }
@@ -311,9 +328,18 @@ pub async fn p2p_loop(
     retry_interval.tick().await;
 
     // Relay re-push flush timer: batch + de-dupe items before forwarding.
-    // Prevents push storms at scale (see parameter-rationale.md §7).
+    // Jittered start so relays don't all flush simultaneously (§7.2).
+    let repush_base = cordelia_core::protocol::REPUSH_INTERVAL_SECS;
+    let repush_jitter = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        our_node_id.0.hash(&mut h);
+        (h.finish() % (repush_base * 1000)) as u64 // ms jitter within interval
+    };
+    let repush_start = std::time::Duration::from_millis(repush_jitter);
+    tokio::time::sleep(repush_start).await;
     let mut repush_interval =
-        tokio::time::interval(std::time::Duration::from_secs(cordelia_core::protocol::REPUSH_INTERVAL_SECS));
+        tokio::time::interval(std::time::Duration::from_secs(repush_base));
     repush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     repush_interval.tick().await;
 
@@ -422,7 +448,7 @@ pub async fn p2p_loop(
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
-                                    &gov_tx,
+                                    &peer_relays, &gov_tx,
                                 );
                             }
                             Err(e) => {
@@ -546,17 +572,20 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Push items to hot peers (batched) ─────────────────────
-            // Drain all pending items, group by target peer, send one
-            // push stream per peer. Reduces stream count from N×P to P,
-            // staying well within per-peer rate limits during relay fan-out.
+            // ── Push items to hot relay peers (batched, §7.1) ─────────
+            // Originator push: personal/keeper writes go to hot relay peers
+            // only. Relays handle distribution. Non-relay peers pull (§4.5).
             Some(first_push) = push_rx.recv() => {
                 let mut all_pushes = vec![first_push];
                 while let Ok(more) = push_rx.try_recv() {
                     all_pushes.push(more);
                 }
 
-                // Build per-peer item batches (respecting each item's exclude_peer)
+                // Target: hot relay peers only (§8.2.1)
+                let relay_targets: Vec<NodeId> = governor.hot_peers().into_iter()
+                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+                    .collect();
+
                 let mut peer_batches: std::collections::HashMap<
                     NodeId,
                     Vec<cordelia_network::messages::Item>,
@@ -564,7 +593,6 @@ pub async fn p2p_loop(
 
                 let item_count = all_pushes.len();
                 for push_item in all_pushes {
-                    let channel_id = push_item.channel_id.clone();
                     let exclude = push_item.exclude_peer;
                     let item = cordelia_network::messages::Item {
                         item_id: push_item.item_id,
@@ -581,8 +609,7 @@ pub async fn p2p_loop(
                         parent_id: push_item.parent_id,
                     };
 
-                    let hot_peers = governor.hot_peers_for_channel(&channel_id);
-                    for peer_id in &hot_peers {
+                    for peer_id in &relay_targets {
                         if exclude.as_ref() == Some(peer_id) {
                             continue;
                         }
@@ -729,14 +756,17 @@ pub async fn p2p_loop(
                 }
                 if pending.is_empty() { continue; }
 
-                // Build per-peer batches (one stream per peer)
+                // Build per-peer batches -- relay peers only (§7.2: single-hop,
+                // relay-to-relay broadcast). Exclude the sender of each item.
+                let relay_peers: Vec<NodeId> = governor.hot_peers().into_iter()
+                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+                    .collect();
                 let mut peer_batches: std::collections::HashMap<
                     NodeId,
                     Vec<cordelia_network::messages::Item>,
                 > = std::collections::HashMap::new();
                 for (_, (item, source)) in &pending {
-                    let hot_peers = governor.hot_peers_for_channel(&item.channel_id);
-                    for peer_id in &hot_peers {
+                    for peer_id in &relay_peers {
                         if peer_id == source { continue; }
                         peer_batches
                             .entry(peer_id.clone())
@@ -994,6 +1024,16 @@ pub async fn p2p_loop(
                     }
                 }
 
+                // Sync relay peer set for single-hop re-push check (§7.2)
+                if let Ok(mut relays) = peer_relays.write() {
+                    relays.clear();
+                    for peer in governor.all_peers() {
+                        if peer.is_relay {
+                            relays.insert(peer.node_id.clone());
+                        }
+                    }
+                }
+
                 tracing::debug!(hot, warm, cold, banned, "gov: tick complete");
             }
 
@@ -1031,6 +1071,7 @@ pub async fn handle_peer_streams(
         >,
     >,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     let mut stream_count: u64 = 0;
@@ -1119,6 +1160,7 @@ pub async fn handle_peer_streams(
                     &node_role,
                     &repush_tx,
                     &delivery_tx,
+                    &peer_relays,
                 )
                 .await;
             }
@@ -1154,6 +1196,7 @@ async fn handle_inbound_push(
     node_role: &str,
     repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
+    peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -1168,6 +1211,8 @@ async fn handle_inbound_push(
         _ => return,
     };
 
+    // Track which items are newly stored (for selective re-push)
+    let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
     let (stored, dedup) = {
         let db = match state.db.lock() {
             Ok(db) => db,
@@ -1177,7 +1222,10 @@ async fn handle_inbound_push(
         let mut dedup = 0u32;
         for item in &payload.items {
             match store_item(&db, item, node_role) {
-                Ok(true) => stored += 1,
+                Ok(true) => {
+                    stored += 1;
+                    newly_stored.push(item.clone());
+                }
                 Ok(false) => dedup += 1,
                 Err(_) => {}
             }
@@ -1191,14 +1239,22 @@ async fn handle_inbound_push(
         let _ = delivery_tx.send((peer_id.clone(), stored as u64));
     }
 
-    // Relay re-push: queue items for timer-based batched flush.
-    // Items are de-duped by item_id and sent in one stream per peer
-    // every REPUSH_INTERVAL_SECS, preventing push storms at scale.
-    if node_role == "relay" && stored > 0 {
-        for item in &payload.items {
-            let _ = repush_tx.send((item.clone(), peer_id.clone()));
+    // Relay single-hop re-push (§7.2):
+    // - Only re-push items received from non-relay peers (first hop only)
+    // - Only queue items that were newly stored (not duplicates)
+    // - Repush flush targets relay peers only
+    if node_role == "relay" && !newly_stored.is_empty() {
+        let sender_is_relay = peer_relays
+            .read()
+            .ok()
+            .map(|r| r.contains(peer_id))
+            .unwrap_or(false);
+        if !sender_is_relay {
+            for item in &newly_stored {
+                let _ = repush_tx.send((item.clone(), peer_id.clone()));
+            }
+            tracing::debug!(peer = %peer_id, queued = newly_stored.len(), "relay repush queued (single-hop)");
         }
-        tracing::debug!(peer = %peer_id, stored, "relay repush queued");
     }
 
     let ack =
