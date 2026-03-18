@@ -245,6 +245,17 @@ pub async fn p2p_loop(
     // (from protocol.rs). Governor tick uses the config value.
     const P2P_PEER_SHARE_CHECK_SECS: u64 = 5; // How often to check for connect candidates
     const P2P_SYNC_CHECK_SECS: u64 = 10;
+
+    // Peer-share connect tuning (implementation-level, not wire-protocol).
+    // CONNECT_TIMEOUT: short ceiling for speculative connects from cache.
+    //   Typical connects complete in <100ms; 2s handles slow cross-region links.
+    // CONNECTS_PER_CYCLE: max outbound connect attempts per check cycle.
+    //   floor(CHECK_SECS / TIMEOUT) = 2, but 3 is safe because connects
+    //   rarely hit the timeout and MissedTickBehavior::Delay absorbs overrun.
+    //   Prevents the "slow tail" where relays with 15+ peers stall waiting
+    //   for the last few connections at 1-per-cycle.
+    const P2P_PEER_SHARE_CONNECT_TIMEOUT_SECS: u64 = 2;
+    const P2P_PEER_SHARE_CONNECTS_PER_CYCLE: usize = 3;
     let p2p_gov_tick_secs = gov_config.tick_interval_secs as u64;
 
     let mut peer_share_interval =
@@ -386,21 +397,24 @@ pub async fn p2p_loop(
                     }
                 }
 
-                // (b) Connect: try 1 candidate from cache (every cycle)
-                let candidates: Vec<_> = peer_share_cache.iter()
-                    .filter(|pa| {
-                        let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
-                        nid != our_node_id && !conn_mgr.is_connected(&nid)
-                    })
-                    .collect();
-                if !candidates.is_empty() {
+                // (b) Connect: try up to N candidates from cache (every cycle).
+                // Rebuilds candidate list after each successful connect since
+                // is_connected changes.
+                for _ in 0..P2P_PEER_SHARE_CONNECTS_PER_CYCLE {
+                    let candidates: Vec<_> = peer_share_cache.iter()
+                        .filter(|pa| {
+                            let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                            nid != our_node_id && !conn_mgr.is_connected(&nid)
+                        })
+                        .collect();
+                    if candidates.is_empty() { break; }
                     let idx = peer_share_rotation % candidates.len();
                     peer_share_rotation = peer_share_rotation.wrapping_add(1);
                     let peer_addr = candidates[idx];
                     if let Some(addr_str) = peer_addr.addrs.first() {
                         if let Ok(addr) = addr_str.parse() {
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
+                                std::time::Duration::from_secs(P2P_PEER_SHARE_CONNECT_TIMEOUT_SECS),
                                 conn_mgr.connect_to(addr),
                             ).await {
                                 Ok(Ok(new_id)) => {
@@ -411,7 +425,7 @@ pub async fn p2p_loop(
                                     );
                                 }
                                 Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
-                                Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out (2s)"); }
+                                Err(_) => { tracing::debug!(addr = %addr_str, "peer-share connect timed out ({}s)", P2P_PEER_SHARE_CONNECT_TIMEOUT_SECS); }
                             }
                         }
                     }
