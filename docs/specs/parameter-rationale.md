@@ -324,7 +324,53 @@ peer crash (QUIC idle timeout was the only backstop).
 
 ---
 
-*Spec version: 1.1*
+## 7. P2P Select Loop Parameters
+
+### MAX_IN_FLIGHT = 10
+
+**Rationale:** Maximum concurrent outbound connect attempts (spawned tasks).
+Caps resource usage and prevents accidental DoS against many peers
+simultaneously. 10 concurrent QUIC handshakes is ~10 sockets + 10 TLS
+sessions -- negligible on relay hardware, meaningful on personal devices.
+
+**If you increase to 50:** Burst of 50 simultaneous handshakes on startup.
+May trigger rate limits on destination peers. Acceptable for relays.
+
+**If you decrease to 3:** Bootstrap slows proportionally. 21 peers at 3
+concurrent = 7 waves, ~35s minimum mesh formation at R=20.
+
+### CONNECTS_PER_CYCLE = 3
+
+**Rationale:** Maximum outbound connect attempts per peer-share tick (5s)
+during **post-bootstrap steady state**. Rate-limits gossip-discovered
+connections to prevent an attacker from rapidly cycling peers through the
+connect pipeline. 3 per 5s = 36/min, well below any resource concern but
+slow enough that Sybil peers can't dominate the connection set.
+
+**Bootstrap exception:** When `hot < hot_min`, all candidates come from
+trusted bootnodes or their immediate peer-share responses. During this
+phase, CONNECTS_PER_CYCLE is replaced by MAX_IN_FLIGHT -- connect as fast
+as concurrency allows. This is safe because:
+
+1. Bootstrap peers are from **configured, trusted bootnodes** (operator-defined).
+2. The governor's urgent mode already bypasses `min_warm_tenure` for the
+   same reason (trusted source, need fast mesh formation).
+3. Post-bootstrap, churn and scoring handle quality control for all peers
+   regardless of how they were initially promoted.
+4. Cardano follows the same model: topology-configured peers are immediately
+   trusted; discovered peers go through the mini-protocol pipeline.
+
+**Derivation:** At R=20, a relay needs 21 hot peers. With MAX_IN_FLIGHT=10
+during bootstrap, two waves complete in ~10s. Post-bootstrap, 3 per 5s keeps
+the gossip exploration rate bounded. The transition from bootstrap to steady
+state is automatic: once `hot >= hot_min`, the rate drops to CONNECTS_PER_CYCLE.
+
+**If you increase to 10:** Faster gossip exploration but more aggressive
+outbound traffic. May be appropriate for relays in large meshes.
+
+---
+
+*Spec version: 1.2*
 *Created: 2026-03-16*
-*Updated: 2026-03-17*
+*Updated: 2026-03-18*
 *Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*

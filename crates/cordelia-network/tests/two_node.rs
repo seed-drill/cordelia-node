@@ -8,7 +8,7 @@
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_network::channel_announce::{self, ChannelAnnounceState, create_signed_descriptor};
 use cordelia_network::codec::read_frame;
-use cordelia_network::connection::ConnectionManager;
+use cordelia_network::connection::{self, ConnectionManager};
 use cordelia_network::item_sync;
 use cordelia_network::keepalive::{self, KeepAliveState};
 use cordelia_network::messages::*;
@@ -46,9 +46,11 @@ async fn test_two_node_connect_and_handshake() {
     let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, channels_b, roles, 9474);
 
     // B accepts in background
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
     let accept_task = tokio::spawn(async move {
-        let node_id = mgr_b.accept_incoming().await.unwrap();
-        (mgr_b, node_id)
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
 
     // A connects to B
@@ -59,7 +61,8 @@ async fn test_two_node_connect_and_handshake() {
     assert_eq!(peer_a.handshake.negotiated_version, 1);
     assert_eq!(peer_a.handshake.peer_roles, vec!["personal"]);
 
-    let (mgr_b, node_a_id) = accept_task.await.unwrap();
+    let outcome = accept_task.await.unwrap();
+    let node_a_id = mgr_b.register(outcome).unwrap();
     assert_eq!(node_a_id.0, pk_a);
 
     let peer_b = mgr_b.get_peer(&node_a_id).unwrap();
@@ -390,14 +393,20 @@ async fn test_two_node_reconnect_after_disconnect() {
     let mut mgr_b =
         ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
+
     // First connection
+    let ep1 = ep_b_accept.clone();
+    let ctx1 = ctx_b.clone();
     let accept1 = tokio::spawn(async move {
-        let node_id = mgr_b.accept_incoming().await.unwrap();
-        (mgr_b, node_id)
+        let incoming = ep1.accept().await.unwrap();
+        connection::inbound_accept(&ctx1, incoming).await.unwrap()
     });
     let node_b = mgr_a.connect_to(b_addr).await.unwrap();
     assert_eq!(node_b.0, pk_b);
-    let (mut mgr_b, _) = accept1.await.unwrap();
+    let outcome1 = accept1.await.unwrap();
+    mgr_b.register(outcome1).unwrap();
 
     // Disconnect
     mgr_a.disconnect(&node_b);
@@ -406,14 +415,15 @@ async fn test_two_node_reconnect_after_disconnect() {
 
     // Reconnect
     let accept2 = tokio::spawn(async move {
-        let node_id = mgr_b.accept_incoming().await.unwrap();
-        (mgr_b, node_id)
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
     let node_b2 = mgr_a.connect_to(b_addr).await.unwrap();
     assert_eq!(node_b2.0, pk_b);
     assert!(mgr_a.is_connected(&node_b2));
 
-    let (_, node_a2) = accept2.await.unwrap();
+    let outcome2 = accept2.await.unwrap();
+    let node_a2 = mgr_b.register(outcome2).unwrap();
     assert_eq!(node_a2.0, id_a.public_key());
 
     mgr_a.shutdown();
@@ -460,16 +470,19 @@ async fn test_two_node_full_lifecycle() {
         9474,
     );
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
     let accept_task = tokio::spawn(async move {
-        mgr_b.accept_incoming().await.unwrap();
-        mgr_b
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
 
     // Step 1: Connect + handshake
     let node_b_id = mgr_a.connect_to(b_addr).await.unwrap();
     let peer = mgr_a.get_peer(&node_b_id).unwrap();
     assert_eq!(peer.handshake.negotiated_version, 1);
-    let mgr_b = accept_task.await.unwrap();
+    let outcome = accept_task.await.unwrap();
+    mgr_b.register(outcome).unwrap();
 
     // Step 2: Channel announce on a new QUIC stream
     let conn_a = mgr_a.get_connection(&node_b_id).unwrap().clone();
@@ -527,13 +540,18 @@ async fn test_chaos_disconnect_during_handshake() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    // B starts accepting
+    // B starts accepting -- construct a ConnectContext manually (no mgr needed for error case)
+    let ctx_b = connection::ConnectContext {
+        endpoint: ep_b.clone(),
+        public_key: id_b.public_key(),
+        channel_ids: vec![],
+        roles: vec!["personal".into()],
+        p2p_port: 9474,
+    };
     let accept_task = tokio::spawn(async move {
-        let mut mgr_b =
-            ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+        let incoming = ep_b.accept().await.unwrap();
         // Accept should return an error (peer dropped during handshake)
-        let result = mgr_b.accept_incoming().await;
-        (result, mgr_b)
+        connection::inbound_accept(&ctx_b, incoming).await
     });
 
     // A connects at QUIC level but drops before completing app handshake
@@ -549,7 +567,7 @@ async fn test_chaos_disconnect_during_handshake() {
         result.is_ok(),
         "accept should not hang after peer drops mid-handshake"
     );
-    let (accept_result, _mgr_b) = result.unwrap().unwrap();
+    let accept_result = result.unwrap().unwrap();
     assert!(
         accept_result.is_err(),
         "accept should return error for dropped peer"
@@ -572,13 +590,16 @@ async fn test_chaos_disconnect_during_sync() {
     let mut mgr_b =
         ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
     let accept_task = tokio::spawn(async move {
-        mgr_b.accept_incoming().await.unwrap();
-        mgr_b
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
 
     let node_b_id = mgr_a.connect_to(b_addr).await.unwrap();
-    let mgr_b = accept_task.await.unwrap();
+    let outcome = accept_task.await.unwrap();
+    mgr_b.register(outcome).unwrap();
 
     // A opens a sync stream
     let conn_a = mgr_a.get_connection(&node_b_id).unwrap().clone();
@@ -636,13 +657,16 @@ async fn test_stress_concurrent_streams() {
     let mut mgr_b =
         ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
     let accept_task = tokio::spawn(async move {
-        mgr_b.accept_incoming().await.unwrap();
-        mgr_b
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
 
     let node_b_id = mgr_a.connect_to(b_addr).await.unwrap();
-    let _mgr_b = accept_task.await.unwrap();
+    let outcome = accept_task.await.unwrap();
+    mgr_b.register(outcome).unwrap();
 
     let conn = mgr_a.get_connection(&node_b_id).unwrap().clone();
 
@@ -680,7 +704,7 @@ async fn test_stress_concurrent_streams() {
 }
 
 /// T3-1: Incoming handshake timeout (BV-23 regression).
-/// Verify that accept_incoming with a stalled peer doesn't block forever.
+/// Verify that inbound_accept with a stalled peer doesn't block forever.
 /// The internal 10s timeout on incoming.await should prevent the hang.
 #[tokio::test]
 async fn test_incoming_handshake_timeout() {
@@ -696,14 +720,22 @@ async fn test_incoming_handshake_timeout() {
     let mut mgr_b =
         ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
+
     // A connects normally (QUIC + app handshake)
     let accept_task = tokio::spawn(async move {
-        mgr_b.accept_incoming().await.unwrap();
-        // Now B has one connection. Next accept_incoming will wait for a new
-        // connection that never completes app handshake.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(15), mgr_b.accept_incoming()).await;
-        (result, mgr_b)
+        // First accept succeeds
+        let incoming = ep_b_accept.accept().await.unwrap();
+        let outcome = connection::inbound_accept(&ctx_b, incoming).await.unwrap();
+        // Now B has one connection. Next accept will wait for a new
+        // connection that never arrives.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            ep_b_accept.accept(),
+        )
+        .await;
+        (outcome, result)
     });
 
     let _node_b = mgr_a.connect_to(b_addr).await.unwrap();
@@ -714,12 +746,13 @@ async fn test_incoming_handshake_timeout() {
         .get_connection(&cordelia_core::NodeId(id_b.public_key()))
         .unwrap()
         .clone();
-    // A already has a connection to B. B's second accept_incoming will either:
+    // A already has a connection to B. B's second accept will either:
     // 1. Accept a new QUIC connection (none incoming) and hang on endpoint.accept()
     // 2. Or timeout on the outer 15s wrapper
     // Either way it should NOT hang forever.
 
-    let (result, _mgr_b) = accept_task.await.unwrap();
+    let (outcome, result) = accept_task.await.unwrap();
+    mgr_b.register(outcome).unwrap();
     // The outer timeout should fire (15s) because no second connection arrives
     assert!(
         result.is_err(),
@@ -791,13 +824,16 @@ async fn test_shutdown_and_wait() {
     let mut mgr_b =
         ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
 
+    let ep_b_accept = mgr_b.endpoint();
+    let ctx_b = mgr_b.connect_context();
     let accept_task = tokio::spawn(async move {
-        mgr_b.accept_incoming().await.unwrap();
-        mgr_b
+        let incoming = ep_b_accept.accept().await.unwrap();
+        connection::inbound_accept(&ctx_b, incoming).await.unwrap()
     });
 
     let _node_b_id = mgr_a.connect_to(b_addr).await.unwrap();
-    let mut mgr_b = accept_task.await.unwrap();
+    let outcome = accept_task.await.unwrap();
+    mgr_b.register(outcome).unwrap();
 
     // Both sides shutdown with wait_idle
     let shutdown_a = tokio::spawn(async move {
