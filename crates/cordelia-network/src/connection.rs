@@ -252,6 +252,13 @@ impl ConnectionManager {
                 if listen_port == 0 {
                     return None; // Peer didn't advertise a port
                 }
+                // Only share relay and bootnode addresses (§8.1: personal nodes
+                // are outbound-only, sharing their addresses causes unwanted
+                // inbound connections from other personal nodes).
+                let roles = &peer_conn.handshake.peer_roles;
+                if !roles.iter().any(|r| r == "relay" || r == "bootnode") {
+                    return None;
+                }
                 let listen_addr = std::net::SocketAddr::new(remote.ip(), listen_port);
                 Some(crate::messages::PeerAddress {
                     node_id: node_id.0.to_vec(),

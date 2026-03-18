@@ -201,6 +201,7 @@ pub async fn p2p_loop(
     mut conn_mgr: cordelia_network::connection::ConnectionManager,
     state: web::Data<cordelia_api::state::AppState>,
     mut push_rx: tokio::sync::mpsc::UnboundedReceiver<cordelia_api::state::PushItem>,
+    mut announce_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     allow_private_addresses: bool,
     node_role: String,
@@ -383,6 +384,14 @@ pub async fn p2p_loop(
 
                         if direction == Direction::Outbound {
                             in_flight.remove(&addr);
+                        }
+
+                        // Personal nodes are outbound-only (§8.1, §2.1).
+                        // Reject all inbound connections.
+                        if direction == Direction::Inbound && node_role == "personal" {
+                            tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
+                            outcome.conn.close(0u32.into(), b"outbound-only");
+                            continue;
                         }
 
                         // Connection tracker check (inbound only, §3.1)
@@ -759,6 +768,29 @@ pub async fn p2p_loop(
                                 Err(e) => tracing::debug!(peer = %pid, items = count, error = %e, "repush failed"),
                             }
                         });
+                    }
+                }
+            }
+
+            // ── Channel-announce on local subscribe ──────────────────
+            // API subscribe handler sends channel_id here; we announce
+            // to all hot peers so they add us to their push routing.
+            Some(_channel_id) = announce_rx.recv() => {
+                // Drain all pending announces (batch subscribes)
+                while let Ok(_) = announce_rx.try_recv() {}
+                // Send full channel list to all hot peers (simpler than
+                // incremental per-channel -- reconnect-safe too)
+                if node_role != "relay" {
+                    for peer_id in governor.hot_peers() {
+                        if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                            let conn = conn.clone();
+                            let announce_state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                                    tracing::debug!(error = %e, "channel announcements failed on subscribe");
+                                }
+                            });
+                        }
                     }
                 }
             }
