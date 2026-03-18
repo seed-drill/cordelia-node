@@ -36,10 +36,17 @@ echo "  Zones: $NUM_ZONES (1 personal/zone, 1 relay/zone)"
 echo "  Networks: 1 internet + $NUM_ZONES home zones"
 echo "  Relay hot_max: $RELAY_HOT_MAX"
 
-# Bootnode IPs on internet
+# Internet network: 172.29.0.0/16 with each relay in its own /24.
+# This ensures the per-subnet connection limit (MAX_CONNECTIONS_PER_SUBNET=20)
+# doesn't block mesh formation when R > 18, matching production topology
+# where relays sit in different subnets.
+#   Bootnodes: 172.29.0.{10,11}  (both in 172.29.0.0/24)
+#   Relay i:   172.29.{i}.20     (each in its own /24)
+# Home zones stay at 172.28.{z}.0/24.
+
 bootnode_ips_internet=()
 for i in $(seq 0 $((BOOTNODES - 1))); do
-    bootnode_ips_internet+=("172.28.0.$((10 + i))")
+    bootnode_ips_internet+=("172.29.0.$((10 + i))")
 done
 
 # ── Node configs ─────────────────────────────────────────────────────
@@ -197,7 +204,7 @@ YAML
 # Bootnodes -- on internet + all home zones
 for i in $(seq 0 $((BOOTNODES - 1))); do
     name="b$((i + 1))"
-    internet_ip="172.28.0.$((10 + i))"
+    internet_ip="172.29.0.$((10 + i))"
 
     networks_block="    networks:
       internet:
@@ -236,7 +243,7 @@ done
 # Relays -- on internet + own home zone
 for i in $(seq 0 $((RELAYS - 1))); do
     name="r$((i + 1))"
-    internet_ip="172.28.0.$((20 + i))"
+    internet_ip="172.29.$((i + 1)).20"
     zone_num=$((i + 1))
 
     cat >> "$COMPOSE" << YAML
@@ -302,7 +309,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.28.0.0/24
+        - subnet: 172.29.0.0/16
 YAML
 
 for z in $(seq 1 "$NUM_ZONES"); do
