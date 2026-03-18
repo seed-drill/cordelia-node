@@ -12,6 +12,8 @@ use cordelia_network::connection::Direction;
 /// Governor events sent from spawned tasks back to the p2p_loop.
 pub enum GovEvent {
     ItemsDelivered(NodeId, u64),
+    ChannelAnnounced(NodeId, String),
+    ChannelWithdrawn(NodeId, String),
 }
 
 /// Open a bidirectional QUIC stream with a standard 10s timeout.
@@ -98,6 +100,7 @@ pub fn post_connect(
         >,
     >,
     peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     // Step 1: Extract peer roles from handshake
     let is_relay = conn_mgr
@@ -153,7 +156,25 @@ pub fn post_connect(
         }
     }
 
-    // Step 7: Spawn stream handler
+    // Step 7: Send channel announcements if peer promoted to Hot and we're not a relay
+    // (relays are receive-only for channel-announce per §4.4)
+    let peer_is_hot = governor
+        .peer_info(node_id)
+        .map(|p| p.state == cordelia_network::governor::PeerState::Hot)
+        .unwrap_or(false);
+    if peer_is_hot && node_role != "relay" {
+        if let Some(conn) = conn_mgr.get_connection(node_id) {
+            let conn = conn.clone();
+            let announce_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                    tracing::debug!(error = %e, "channel announcements failed on connect");
+                }
+            });
+        }
+    }
+
+    // Step 8: Spawn stream handler
     if let Some(conn) = conn_mgr.get_connection(node_id) {
         let conn = conn.clone();
         let peer_id = node_id.clone();
@@ -164,9 +185,10 @@ pub fn post_connect(
         let dtx = delivery_tx.clone();
         let rates = peer_rates.clone();
         let states = peer_states.clone();
+        let gtx = gov_tx.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states,
+                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, gtx,
             )
             .await;
         });
@@ -223,6 +245,9 @@ pub async fn p2p_loop(
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
+    // Governor event channel (created before bootstrap so post_connect can pass it)
+    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
+
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
         post_connect(
@@ -236,6 +261,7 @@ pub async fn p2p_loop(
             &delivery_tx,
             &peer_rates,
             &peer_states,
+            &gov_tx,
         );
     }
     governor.tick();
@@ -260,9 +286,6 @@ pub async fn p2p_loop(
     let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(p2p_gov_tick_secs));
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
-
-    // Governor event channel
-    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
     // Push retry queue: sender-side retry with exponential backoff.
     // Spawned push tasks report failures via retry_fail_tx. The select loop
@@ -390,6 +413,7 @@ pub async fn p2p_loop(
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
+                                    &gov_tx,
                                 );
                             }
                             Err(e) => {
@@ -758,18 +782,26 @@ pub async fn p2p_loop(
                 };
                 if channels.is_empty() { continue; }
 
-                let hot = governor.hot_peers();
-                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
-                for target in &hot {
+                tracing::debug!(total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
+                // Sync per-channel: only query peers that serve each channel
+                // (relays via is_relay flag, personal nodes via channel-announce groups)
+                let mut synced_peers: std::collections::HashSet<(NodeId, String)> = std::collections::HashSet::new();
+                for ch_id in &channels {
+                    let ch_peers = governor.hot_peers_for_channel(ch_id);
+                    for target in &ch_peers {
+                        if !synced_peers.insert((target.clone(), ch_id.clone())) {
+                            continue; // already syncing this peer+channel
+                        }
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
-                    let sync_channels = channels.clone();
+                    let sync_ch = ch_id.clone();
                     let target = target.clone();
                     let gtx = gov_tx.clone();
                     let role = node_role.clone();
-                    tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
+                    tracing::debug!(peer = %target, channel = %sync_ch, "pull-sync starting");
                     tokio::spawn(async move {
+                        let sync_channels = vec![sync_ch];
                         for ch_id in &sync_channels {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
@@ -825,14 +857,27 @@ pub async fn p2p_loop(
                         }
                     });
                     }
+                    }
                 }
             }
 
             // ── Governor tick ─────────────────────────────────────────
             _ = gov_interval.tick() => {
                 // Drain event channels
-                while let Ok(GovEvent::ItemsDelivered(peer_id, count)) = gov_rx.try_recv() {
-                    governor.record_items_delivered(&peer_id, count);
+                while let Ok(event) = gov_rx.try_recv() {
+                    match event {
+                        GovEvent::ItemsDelivered(peer_id, count) => {
+                            governor.record_items_delivered(&peer_id, count);
+                        }
+                        GovEvent::ChannelAnnounced(peer_id, channel_id) => {
+                            governor.add_peer_channel(&peer_id, &channel_id);
+                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: added peer channel");
+                        }
+                        GovEvent::ChannelWithdrawn(peer_id, channel_id) => {
+                            governor.remove_peer_channel(&peer_id, &channel_id);
+                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: removed peer channel");
+                        }
+                    }
                 }
                 while let Ok((peer_id, count)) = delivery_rx.try_recv() {
                     governor.record_items_delivered(&peer_id, count);
@@ -860,6 +905,19 @@ pub async fn p2p_loop(
                 if !actions.transitions.is_empty() {
                     for (node_id, from, to) in &actions.transitions {
                         tracing::info!(peer = %node_id, from, to, "gov: state transition");
+
+                        // Send channel announcements on warm->hot promotion (non-relay only, §4.4)
+                        if from == "warm" && to == "hot" && node_role != "relay" {
+                            if let Some(conn) = conn_mgr.get_connection(node_id) {
+                                let conn = conn.clone();
+                                let announce_state = state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                                        tracing::debug!(error = %e, "channel announcements failed on promotion");
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
                 for node_id in &actions.disconnect {
@@ -942,6 +1000,7 @@ pub async fn handle_peer_streams(
         >,
     >,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -974,6 +1033,7 @@ pub async fn handle_peer_streams(
             cordelia_network::messages::Protocol::ItemPush => "item_push",
             cordelia_network::messages::Protocol::ItemSync => "item_sync",
             cordelia_network::messages::Protocol::PeerSharing => "peer_share",
+            cordelia_network::messages::Protocol::ChannelAnnounce => "channel_announce",
             _ => "other",
         };
         tracing::debug!(peer = %peer_id, protocol = proto_name, stream = stream_count, "stream opened (inbound)");
@@ -1013,6 +1073,7 @@ pub async fn handle_peer_streams(
         match protocol {
             cordelia_network::messages::Protocol::ItemPush
             | cordelia_network::messages::Protocol::ItemSync
+            | cordelia_network::messages::Protocol::ChannelAnnounce
                 if !is_hot =>
             {
                 tracing::debug!(peer = %peer_id, protocol = proto_name, "rejected: data protocol from non-hot peer");
@@ -1036,6 +1097,9 @@ pub async fn handle_peer_streams(
             cordelia_network::messages::Protocol::PeerSharing => {
                 // Allowed on Warm + Hot (§2.1)
                 handle_inbound_peer_share(&mut send, &mut recv, &peer_id, &shared_peers).await;
+            }
+            cordelia_network::messages::Protocol::ChannelAnnounce => {
+                handle_inbound_channel_announce(&mut recv, &peer_id, &gov_tx).await;
             }
             other => {
                 tracing::debug!(peer = %peer_id, protocol = ?other, "ignoring unhandled protocol");
@@ -1243,4 +1307,112 @@ async fn handle_inbound_peer_share(
         let _ = cordelia_network::codec::write_frame(send, &resp).await;
         tracing::debug!(peer = %peer_id, count, "served peer-share request");
     }
+}
+
+/// Handle inbound ChannelAnnounce (0x04) stream.
+/// Reads frames until EOF/error, dispatches ChannelJoined/ChannelLeft to governor.
+async fn handle_inbound_channel_announce(
+    recv: &mut quinn::RecvStream,
+    peer_id: &NodeId,
+    gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
+) {
+    loop {
+        let msg = match cordelia_network::codec::read_frame(recv).await {
+            Ok(m) => m,
+            Err(_) => break, // EOF or error -- stream done
+        };
+        match msg {
+            cordelia_network::messages::WireMessage::ChannelJoined(joined) => {
+                if let Err(e) =
+                    cordelia_network::channel_announce::validate_descriptor(&joined.descriptor)
+                {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        channel = %joined.channel_id,
+                        error = %e,
+                        "channel-announce: invalid descriptor"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    peer = %peer_id,
+                    channel = %joined.channel_id,
+                    "peer announced channel"
+                );
+                let _ = gov_tx.send(GovEvent::ChannelAnnounced(
+                    peer_id.clone(),
+                    joined.channel_id,
+                ));
+            }
+            cordelia_network::messages::WireMessage::ChannelLeft(left) => {
+                tracing::info!(
+                    peer = %peer_id,
+                    channel = %left.channel_id,
+                    "peer withdrew channel"
+                );
+                let _ = gov_tx.send(GovEvent::ChannelWithdrawn(
+                    peer_id.clone(),
+                    left.channel_id,
+                ));
+            }
+            _ => {
+                tracing::debug!(peer = %peer_id, "channel-announce: unexpected message type");
+                break;
+            }
+        }
+    }
+}
+
+/// Send ChannelJoined announcements for all our subscribed channels.
+/// Opens a 0x04 stream and sends one ChannelJoined per channel.
+async fn send_channel_announcements(
+    conn: &quinn::Connection,
+    state: &web::Data<cordelia_api::state::AppState>,
+) -> Result<(), String> {
+    let channels = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| format!("db lock: {e}"))?;
+        let pk = state.identity.public_key();
+        cordelia_storage::channels::list_for_entity(&db, &pk).unwrap_or_default()
+    };
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let (mut send, _recv) = open_bi(conn).await?;
+
+    // Write protocol byte for ChannelAnnounce (0x04)
+    send.write_all(&[cordelia_network::messages::Protocol::ChannelAnnounce as u8])
+        .await
+        .map_err(|e| format!("write protocol byte: {e}"))?;
+
+    for ch in &channels {
+        let psk_hash: [u8; 32] = ch
+            .psk_hash
+            .as_ref()
+            .and_then(|h| h.as_slice().try_into().ok())
+            .unwrap_or([0u8; 32]);
+        let descriptor = cordelia_network::channel_announce::create_signed_descriptor(
+            &state.identity,
+            &ch.channel_id,
+            ch.channel_name.as_deref(),
+            &ch.access,
+            &ch.mode,
+            &psk_hash,
+            ch.key_version as u32,
+            &ch.created_at,
+        );
+        if let Err(e) =
+            cordelia_network::channel_announce::send_channel_joined(&mut send, &ch.channel_id, &descriptor).await
+        {
+            tracing::debug!(channel = %ch.channel_id, error = %e, "channel announce send failed");
+            break;
+        }
+    }
+
+    let _ = send.finish();
+    tracing::debug!(channels = channels.len(), "sent channel announcements");
+    Ok(())
 }

@@ -504,6 +504,25 @@ impl Governor {
 
     /// Get hot peers relevant for a channel (relays + peers with matching group).
     /// Relays always receive all items (they serve all channels).
+    /// Add a channel to a peer's group set (idempotent).
+    /// Used when a peer sends ChannelAnnounce (0x04) with ChannelJoined.
+    pub fn add_peer_channel(&mut self, node_id: &NodeId, channel_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            let ch = channel_id.to_string();
+            if !peer.groups.contains(&ch) {
+                peer.groups.push(ch);
+            }
+        }
+    }
+
+    /// Remove a channel from a peer's group set.
+    /// Used when a peer sends ChannelAnnounce (0x04) with ChannelLeft.
+    pub fn remove_peer_channel(&mut self, node_id: &NodeId, channel_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.groups.retain(|g| g != channel_id);
+        }
+    }
+
     pub fn hot_peers_for_channel(&self, channel_id: &str) -> Vec<NodeId> {
         self.peers
             .values()
@@ -2015,5 +2034,66 @@ mod tests {
             "no overlap with g4"
         );
         assert!(!peer.has_group_overlap(&[]), "no overlap with empty set");
+    }
+
+    #[test]
+    fn test_add_peer_channel_idempotent() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&id).unwrap().state = PeerState::Hot;
+
+        gov.add_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch1".to_string()]);
+
+        // Idempotent: adding again doesn't duplicate
+        gov.add_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch1".to_string()]);
+
+        gov.add_peer_channel(&id, "ch2");
+        assert_eq!(gov.peer_info(&id).unwrap().groups.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_peer_channel() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec!["ch1".into(), "ch2".into()]);
+        gov.peers.get_mut(&id).unwrap().state = PeerState::Hot;
+
+        gov.remove_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch2".to_string()]);
+
+        // Removing non-existent channel is a no-op
+        gov.remove_peer_channel(&id, "ch99");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch2".to_string()]);
+    }
+
+    #[test]
+    fn test_add_peer_channel_affects_hot_peers_for_channel() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+
+        let relay_id = make_node_id(1);
+        gov.add_peer(relay_id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&relay_id).unwrap().state = PeerState::Hot;
+        gov.peers.get_mut(&relay_id).unwrap().is_relay = true;
+
+        let personal_id = make_node_id(2);
+        gov.add_peer(personal_id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&personal_id).unwrap().state = PeerState::Hot;
+
+        // Before add: only relay serves ch1
+        assert_eq!(gov.hot_peers_for_channel("ch1").len(), 1);
+
+        // After add: relay + personal serve ch1
+        gov.add_peer_channel(&personal_id, "ch1");
+        let ch1_peers = gov.hot_peers_for_channel("ch1");
+        assert_eq!(ch1_peers.len(), 2);
+        assert!(ch1_peers.contains(&relay_id));
+        assert!(ch1_peers.contains(&personal_id));
+
+        // After remove: back to relay only
+        gov.remove_peer_channel(&personal_id, "ch1");
+        assert_eq!(gov.hot_peers_for_channel("ch1").len(), 1);
     }
 }
