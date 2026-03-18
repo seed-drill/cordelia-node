@@ -69,12 +69,13 @@ for node in p1 p2 p3; do
     wait_for "$node has 1+ hot peers" \
         '[ "$(api_get t4-'"$node"' status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 done
-# Zone model: relays must promote personal nodes to hot before items flow.
-# R1 serves home-1 (P1) + home-2 (P2), R2 serves enterprise (P3).
-wait_for "r1 has 3+ hot peers" \
-    '[ "$(api_get t4-r1 status | jq -r ".peers_hot // 0")" -ge 3 ]' 30
-wait_for "r2 has 2+ hot peers" \
-    '[ "$(api_get t4-r2 status | jq -r ".peers_hot // 0")" -ge 2 ]' 30
+# Zone model: relays must form mesh AND promote personal nodes before items flow.
+# R1 needs: B1 + P1 + P2 + R2 = 4 hot. R2 needs: B1 + P3 + R1 = 3 hot.
+# R1<->R2 discovery happens via peer-sharing from B1 (takes a few cycles).
+wait_for "r1 has 4+ hot peers (b1+p1+p2+r2)" \
+    '[ "$(api_get t4-r1 status | jq -r ".peers_hot // 0")" -ge 4 ]' 60
+wait_for "r2 has 3+ hot peers (b1+p3+r1)" \
+    '[ "$(api_get t4-r2 status | jq -r ".peers_hot // 0")" -ge 3 ]' 60
 
 # -- Step 4: Subscribe to channel ----------------------------------------
 
