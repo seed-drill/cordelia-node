@@ -265,6 +265,28 @@ pub async fn p2p_loop(
     // Governor event channel
     let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
+    // Push retry queue: sender-side retry with exponential backoff.
+    // Spawned push tasks report failures via retry_fail_tx. The select loop
+    // drains failures into retry_queue and re-attempts on a 2s timer.
+    // Max 3 retries (2s, 4s, 8s backoff). After that, pull-sync is the safety net.
+    // Silent drop on receiver side stays -- no NACK (DoS amplification vector).
+    const PUSH_RETRY_MAX: u8 = 3;
+    struct RetryEntry {
+        item: cordelia_network::messages::Item,
+        peer_id: NodeId,
+        channel_id: String,
+        exclude_peer: Option<NodeId>,
+        attempt: u8,
+        retry_at: tokio::time::Instant,
+    }
+    let (retry_fail_tx, mut retry_fail_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RetryEntry>();
+    let mut retry_queue: Vec<RetryEntry> = Vec::new();
+    let mut retry_interval =
+        tokio::time::interval(std::time::Duration::from_secs(2));
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retry_interval.tick().await;
+
     loop {
         tokio::select! {
             // ── Accept incoming connection ─────────────────────────────
@@ -386,16 +408,35 @@ pub async fn p2p_loop(
                         let pid = peer_id.clone();
                         push_count += 1;
                         let iid = push_item.item_id.clone();
+                        let rtx = retry_fail_tx.clone();
+                        let retry_item = item.clone();
+                        let retry_ch = push_item.channel_id.clone();
+                        let retry_ex = exclude.clone();
                         tracing::debug!(peer = %pid, item = %iid, "spawning push task");
                         tokio::spawn(async move {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
-                                Err(e) => { tracing::debug!(peer = %pid, error = %e, "push open_bi"); return; }
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, error = %e, "push open_bi, queuing retry");
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt: 0,
+                                        retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                    });
+                                    return;
+                                }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
                             match cordelia_network::item_sync::send_push(&mut stream, &items).await {
                                 Ok(ack) => tracing::debug!(peer = %pid, stored = ack.stored, "push delivered"),
-                                Err(e) => tracing::debug!(peer = %pid, error = %e, "push send failed"),
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, error = %e, "push send failed, queuing retry");
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt: 0,
+                                        retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                    });
+                                }
                             }
                         });
                     } else {
@@ -410,6 +451,78 @@ pub async fn p2p_loop(
                     excluded = skip_count,
                     "item pushed to peers"
                 );
+            }
+
+            // ── Push retry processing ─────────────────────────────────
+            _ = retry_interval.tick() => {
+                // Drain failure reports into retry queue
+                while let Ok(entry) = retry_fail_rx.try_recv() {
+                    retry_queue.push(entry);
+                }
+                if retry_queue.is_empty() { continue; }
+
+                let now = tokio::time::Instant::now();
+                let mut remaining = Vec::new();
+                for entry in retry_queue.drain(..) {
+                    if entry.retry_at > now {
+                        remaining.push(entry);
+                        continue;
+                    }
+                    if entry.attempt >= PUSH_RETRY_MAX {
+                        tracing::warn!(
+                            peer = %entry.peer_id, channel = %entry.channel_id,
+                            attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
+                        );
+                        continue;
+                    }
+                    // Only retry if peer is still hot
+                    if !governor.hot_peers().contains(&entry.peer_id) {
+                        tracing::debug!(
+                            peer = %entry.peer_id, "push retry skipped: peer no longer hot"
+                        );
+                        continue;
+                    }
+                    if let Some(conn) = conn_mgr.get_connection(&entry.peer_id) {
+                        let conn = conn.clone();
+                        let items = vec![entry.item.clone()];
+                        let pid = entry.peer_id.clone();
+                        let attempt = entry.attempt + 1;
+                        let rtx = retry_fail_tx.clone();
+                        let retry_item = entry.item;
+                        let retry_ch = entry.channel_id;
+                        let retry_ex = entry.exclude_peer;
+                        tracing::debug!(peer = %pid, attempt, "push retry");
+                        tokio::spawn(async move {
+                            let (mut send, mut recv) = match open_bi(&conn).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
+                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt,
+                                        retry_at: tokio::time::Instant::now() + backoff,
+                                    });
+                                    return;
+                                }
+                            };
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
+                                Ok(ack) => tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered"),
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
+                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt,
+                                        retry_at: tokio::time::Instant::now() + backoff,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                retry_queue = remaining;
             }
 
             // ── Pull-sync from hot peers ──────────────────────────────
