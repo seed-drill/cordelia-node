@@ -504,11 +504,7 @@ def phase_subscribe(topo, cfg: dict, db: MetricsDB):
 
     for container in targets:
         api_post(container, "channels/subscribe", {
-            "channel_name": channel_name,
-            "channel_id": channel_id,
-            "psk": psk,
-            "delivery_mode": "realtime",
-            "scope": "network",
+            "channel": channel_name,
         })
         db.event("subscribe", "subscribe", container)
 
@@ -539,6 +535,7 @@ def phase_publish(topo, cfg: dict, db: MetricsDB, channel_id: str, psk: str):
           f"{f' at {rate_per_sec}/s' if rate_per_sec else ''}...")
 
     # Resolve publisher names to container names
+    channel_name = cfg["experiment"]["channel_name"]
     prefix = topo.prefix
     total = 0
     for pub_name in publishers:
@@ -549,9 +546,10 @@ def phase_publish(topo, cfg: dict, db: MetricsDB, channel_id: str, psk: str):
             container = f"{prefix}-{pub_name}"
 
         for i in range(items_per):
-            content = os.urandom(item_size).hex()
+            # API takes channel name (not ID), content as string
+            content = f"{pub_name} item {i+1} " + os.urandom(item_size).hex()
             result = api_post(container, "channels/publish", {
-                "channel_id": channel_id,
+                "channel": channel_name,
                 "item_type": "message",
                 "content": content,
             })
@@ -604,9 +602,10 @@ def phase_stress_publish(topo, cfg: dict, db: MetricsDB,
         else:
             container = f"{prefix}-{pub_name}"
 
-        content = os.urandom(item_size).hex()
+        channel_name = cfg["experiment"]["channel_name"]
+        content = f"stress {pub_name} item {published} " + os.urandom(item_size).hex()
         result = api_post(container, "channels/publish", {
-            "channel_id": channel_id,
+            "channel": channel_name,
             "item_type": "message",
             "content": content,
         })
