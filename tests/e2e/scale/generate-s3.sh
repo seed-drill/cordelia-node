@@ -204,10 +204,11 @@ cat >> "$COMPOSE" << EOF
       internet:
         ipv4_address: 172.29.0.10
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9473/api/v1/status"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
 
 EOF
 
@@ -228,10 +229,11 @@ for i in $(seq 0 $((RELAYS - 1))); do
       b1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9473/api/v1/status"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
 
 EOF
 done
@@ -258,10 +260,11 @@ for i in $(seq 0 $((LEADS - 1))); do
       b1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9473/api/v1/status"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
 
 EOF
 done
@@ -290,10 +293,11 @@ for l in $(seq 0 $((LEADS - 1))); do
       lead-${l}:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9473/api/v1/status"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
 
 EOF
     done
