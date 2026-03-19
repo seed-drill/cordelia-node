@@ -74,20 +74,18 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 
 ## Running Tests
 
+See **[TESTING.md](TESTING.md)** for the full testing guide: pre-flight checks, Docker cleanup,
+build steps, all test suites (unit, integration, S2/S3 scale), known-good baselines,
+common failure modes, and post-test verification.
+
+Quick reference:
 ```bash
-# All tests
+# All unit + integration tests
 cargo test --all
 
 # Specific crate
 cargo test -p cordelia-network
 cargo test -p cordelia-crypto
-
-# With coverage (requires llvm-tools-preview + grcov)
-CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' \
-  LLVM_PROFILE_FILE='coverage/cargo-test-%p-%m.profraw' \
-  cargo test --all
-grcov . --binary-path ./target/debug/deps -s . -t lcov --branch \
-  --ignore-not-existing --ignore '../*' -o coverage/lcov.info
 ```
 
 ## Engineering Principles
@@ -100,6 +98,47 @@ grcov . --binary-path ./target/debug/deps -s . -t lcov --branch \
 
 3. **Spec is source of truth**: Parameter values derive from `demand-model.md`
    personas. If you change a value, update the spec and the rationale.
+
+## Branch and Merge Workflow
+
+Feature work goes on branches (`feat/X`). Merge to main only after E2E passes.
+
+1. **Branch from main**: `git checkout -b feat/my-feature`
+2. **Small, tested commits**: Each commit independently testable. Never bundle code + test harness changes.
+3. **Test after each meaningful change**: Run `cargo test --all` locally, run S2 R=20 on cordelia-test for P2P changes.
+4. **Tag known-good states**: After S2/S3 passes, tag: `git tag s2-passing-<commit-short>`
+5. **PR to main**: Only after E2E passes on the branch. Squash merge preserves clean history.
+6. **Protocol changes get their own branch**: Wire format changes (codec, sync protocol) are never mixed with feature work.
+
+## E2E Testing on cordelia-test VM
+
+```bash
+ssh rezi@cordelia-test
+export PATH=$HOME/.cargo/bin:$PATH
+cd ~/actions-runner/_work/cordelia-node/cordelia-node
+
+# Clean state (ALWAYS do this before testing)
+docker rm -f $(docker ps -aq) 2>/dev/null
+docker network prune -f 2>/dev/null
+docker volume prune -af 2>/dev/null
+sudo rm -rf tests/e2e/scale/s2-* tests/e2e/scale/s3-* tests/e2e/logs tests/e2e/scale/keys
+
+# Build + image
+cargo build --release --target x86_64-unknown-linux-musl --bin cordelia
+cp target/x86_64-unknown-linux-musl/release/cordelia cordelia-bin
+DOCKER_BUILDKIT=0 docker build --no-cache -t cordelia-test:latest \
+  -f tests/e2e/Dockerfile --build-arg BINARY=cordelia-bin .
+rm cordelia-bin
+
+# S2 (relay mesh convergence)
+bash tests/e2e/scale/run-s2.sh 20        # R=20, 42 containers
+bash tests/e2e/scale/run-s2.sh 50        # R=50, 102 containers
+
+# S3 (PAN swarm)
+bash tests/e2e/scale/run-s3.sh 4         # 2 leads + 8 swarm, 13 containers
+```
+
+Note: root-owned key files from Docker need `sudo rm -rf` to clean.
 
 ## Related Repos
 

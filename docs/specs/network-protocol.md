@@ -534,7 +534,7 @@ SyncChannelListResponse {
 
 Phase 0 runs on every relay sync cycle, on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
 
-Phase 1-4 (per-channel sync, unchanged):
+Phase 1-4 (per-channel sync):
 1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync
 2. Responder returns `SyncResponse` with item headers since the cursor
 3. Initiator compares headers to local storage:
@@ -543,6 +543,10 @@ Phase 1-4 (per-channel sync, unchanged):
    - Known item_id, same content_hash → skip (already have it)
    - is_tombstone → mark local item as deleted
 4. Initiator fetches missing items via Item-Fetch (piggybacked on sync stream)
+5. Repeat steps 1-4 for each remaining channel on the same stream
+6. Initiator sends FIN (closes write half) to signal end of batch
+
+**Batched sync:** All channels are synced on a single QUIC stream per peer. The initiator writes the protocol byte once, optionally performs Phase 0, then loops SyncRequest/FetchRequest pairs for each channel. The responder loops correspondingly: after serving a SyncResponse + optional FetchResponse, it reads the next frame. A SyncRequest means another channel follows; EOF (FIN) means the batch is complete. This is backward-compatible: old clients that close after one channel cause the responder to read EOF and exit the loop naturally. Scope-rejected channels receive an empty SyncResponse and do not abort the stream.
 
 **Item-Fetch (on same stream, after SyncResponse):**
 
@@ -1376,12 +1380,14 @@ Beyond limits: new connections receive QUIC `CONNECTION_CLOSE` with application 
 
 | Limit | Default | Action on exceed |
 |-------|---------|-----------------|
-| Writes per peer per minute | 10 | Reject with `PushAck.policy_rejected++` |
+| Writes per peer per minute | 36 | Reject with `PushAck.policy_rejected++` |
 | Writes per channel per minute | 100 | Drop, log warning |
-| Sync requests per peer per minute | 6 | Ignore excess, log |
-| Peer-share requests per peer per minute | 2 | Ignore excess |
+| Sync streams per peer per minute | 18 | Ignore excess, log |
+| Peer-share requests per peer per minute | 6 | Ignore excess |
 
 Exceeding rate limits 3 times in 10 minutes → ban (§5.6).
+
+**Sync streams vs sync requests:** Rate limiting counts sync *streams* (one QUIC stream per peer per cycle), not individual channel SyncRequests within a batched stream. A node with N subscribed channels opens one stream and sends N SyncRequests on it -- this counts as one sync stream for rate limiting purposes. All limits follow the 3x headroom principle: `limit = 3 * expected_legitimate_rate` (see `protocol.rs` derivations).
 
 ### 9.3 Size Limits
 

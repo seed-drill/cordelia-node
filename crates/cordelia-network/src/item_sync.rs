@@ -89,6 +89,30 @@ pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// Send a SyncRequest on an already-opened sync stream (protocol byte already written).
+///
+/// Used in batched sync (§4.5): multiple channels on one stream.
+/// The caller writes the protocol byte once before the first call.
+pub async fn send_sync_request_raw<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    send: &mut W,
+    recv: &mut R,
+    channel_id: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Result<SyncResponse, ItemSyncError> {
+    let req = WireMessage::SyncRequest(SyncRequest {
+        channel_id: channel_id.to_string(),
+        since: since.map(|s| s.to_string()),
+        limit,
+    });
+    write_frame(send, &req).await?;
+    let resp = read_frame(recv).await?;
+    match resp {
+        WireMessage::SyncResponse(sr) => Ok(sr),
+        _ => Err(ItemSyncError::UnexpectedMessage),
+    }
+}
+
 /// Handle a sync request (responder side).
 pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
@@ -476,5 +500,47 @@ mod tests {
             parent_id: None,
         };
         assert!(verify_content_hash(&item));
+    }
+
+    #[tokio::test]
+    async fn test_batched_sync_two_channels() {
+        // Simulate batched sync: two SyncRequests on one stream (no protocol byte per request).
+        // Server reads two requests sequentially, client sends via send_sync_request_raw.
+        let (client_w, mut server_r) = tokio::io::duplex(16384);
+        let (mut server_w, client_r) = tokio::io::duplex(16384);
+        let mut client_w = client_w;
+        let mut client_r = client_r;
+
+        let server_task = tokio::spawn(async move {
+            // Serve two sync requests in a loop
+            for expected_ch in &["ch1", "ch2"] {
+                let msg = read_frame(&mut server_r).await.unwrap();
+                let req = match msg {
+                    WireMessage::SyncRequest(r) => r,
+                    _ => panic!("expected SyncRequest"),
+                };
+                assert_eq!(req.channel_id, *expected_ch);
+                let resp = WireMessage::SyncResponse(SyncResponse {
+                    items: vec![make_test_header(&format!("item_{expected_ch}"))],
+                    has_more: false,
+                });
+                write_frame(&mut server_w, &resp).await.unwrap();
+            }
+        });
+
+        // Client sends two channels via send_sync_request_raw (no protocol byte)
+        let r1 = send_sync_request_raw(&mut client_w, &mut client_r, "ch1", None, 50)
+            .await
+            .unwrap();
+        assert_eq!(r1.items.len(), 1);
+        assert_eq!(r1.items[0].item_id, "item_ch1");
+
+        let r2 = send_sync_request_raw(&mut client_w, &mut client_r, "ch2", None, 50)
+            .await
+            .unwrap();
+        assert_eq!(r2.items.len(), 1);
+        assert_eq!(r2.items[0].item_id, "item_ch2");
+
+        server_task.await.unwrap();
     }
 }
