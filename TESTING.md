@@ -31,7 +31,7 @@ cargo test -p cordelia-network test_batched_sync_two_channels
 cargo test -p cordelia-network -- --nocapture
 ```
 
-**Current baseline:** 466 tests (314 Rust unit/integration + SDK + E2E smoke).
+**Current baseline:** 467 tests (315 Rust unit/integration + SDK + E2E smoke).
 All must pass before any E2E testing.
 
 ## E2E Testing on cordelia-test VM
