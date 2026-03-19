@@ -493,10 +493,10 @@ def phase_subscribe(topo, cfg: dict, db: MetricsDB):
     db.event("subscribe", "phase_start")
     print(f"\nPhase 2: Subscribing {len(targets)} nodes...")
 
-    # Generate PSK key material
-    key_dir = SCALE_DIR / "keys"
-    key_dir.mkdir(exist_ok=True)
-    psk_file = key_dir / f"{channel_id}.psk"
+    # Generate PSK key material (use harness logs dir, not scale/keys which is root-owned)
+    log_dir = E2E_DIR / "logs" / "keys"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    psk_file = log_dir / f"{channel_id}.psk"
     if not psk_file.exists():
         psk = os.urandom(32).hex()
         psk_file.write_text(psk)
