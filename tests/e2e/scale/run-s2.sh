@@ -22,6 +22,17 @@
 
 set -euo pipefail
 
+NO_TEARDOWN=false
+for arg in "$@"; do
+    if [ "$arg" = "--no-teardown" ]; then
+        NO_TEARDOWN=true
+    fi
+done
+# Strip --no-teardown from positional args
+ARGS=()
+for arg in "$@"; do [ "$arg" != "--no-teardown" ] && ARGS+=("$arg"); done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
 RELAYS=${1:-20}
 PUBLISHERS=${2:-5}
 PERSONAL_PER_ZONE=${3:-1}
@@ -111,10 +122,15 @@ cleanup() {
         name=$(docker inspect --format '{{.Name}}' "$c" | sed 's/^\///')
         docker logs "$c" > "$LOG_DIR/${name}.log" 2>&1 || true
     done
-    echo "Tearing down..."
-    docker compose -f "$COMPOSE" -p "$PROJECT" down -v --remove-orphans 2>/dev/null || true
-    if [ -d "$KEY_DIR" ]; then
-        rm -rf "$KEY_DIR" 2>/dev/null || sudo rm -rf "$KEY_DIR" 2>/dev/null || true
+    if [ "$NO_TEARDOWN" = true ]; then
+        echo "Containers left running (--no-teardown). Use diagnose-s2.sh or:"
+        echo "  docker compose -f $COMPOSE -p $PROJECT down -v --remove-orphans"
+    else
+        echo "Tearing down..."
+        docker compose -f "$COMPOSE" -p "$PROJECT" down -v --remove-orphans 2>/dev/null || true
+        if [ -d "$KEY_DIR" ]; then
+            rm -rf "$KEY_DIR" 2>/dev/null || sudo rm -rf "$KEY_DIR" 2>/dev/null || true
+        fi
     fi
 }
 trap cleanup EXIT
