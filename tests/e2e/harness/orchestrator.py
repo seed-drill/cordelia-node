@@ -848,6 +848,10 @@ def run_scenario(scenario_path: Path, db_path: str = None,
     topo = make_topology(cfg)
     collection = cfg.get("collection", {})
 
+    # Clean BEFORE creating db (cleanup deletes logs dir)
+    if clean:
+        docker_cleanup()
+
     run_id = str(uuid.uuid4())[:8]
     if not db_path:
         log_dir = E2E_DIR / "logs" / topo.name
@@ -862,7 +866,7 @@ def run_scenario(scenario_path: Path, db_path: str = None,
     print(f"Database: {db_path}")
     print(f"Topology: {topo.topo_type} | {topo.container_count} containers")
 
-    if clean:
+    if False:  # cleanup already done above
         docker_cleanup()
 
     ok = True
