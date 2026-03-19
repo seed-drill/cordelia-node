@@ -996,18 +996,20 @@ pub async fn p2p_loop(
                     let role = node_role.clone();
                     let do_phase0 = is_relay;
                     tokio::spawn(async move {
+                        // Batched sync (§4.5): one stream per peer, all channels.
+                        // Open one (send, recv) pair, write protocol byte once.
+                        let (mut send, mut recv) = match open_bi(&conn).await {
+                            Ok(s) => s,
+                            Err(e) => { tracing::debug!(peer = %target, error = %e, "sync open_bi failed"); return; }
+                        };
+                        if let Err(e) = cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await {
+                            tracing::debug!(peer = %target, error = %e, "sync protocol byte failed");
+                            return;
+                        }
+
                         // Phase 0: relay channel discovery (§4.5)
                         // Ask peer "what channels do you have?", merge with local.
                         let sync_channels = if do_phase0 {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => { tracing::debug!(peer = %target, error = %e, "phase0 open_bi failed"); return; }
-                            };
-                            // Write protocol byte
-                            if let Err(e) = cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await {
-                                tracing::debug!(peer = %target, error = %e, "phase0 protocol byte failed");
-                                return;
-                            }
                             let discovered = match cordelia_network::item_sync::send_channel_list_request(&mut send, &mut recv).await {
                                 Ok(resp) => resp.channel_ids,
                                 Err(e) => {
@@ -1031,22 +1033,19 @@ pub async fn p2p_loop(
                         if sync_channels.is_empty() { return; }
                         tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
 
+                        // Loop channels on single stream using send_sync_request_raw
+                        let mut total_stored: u64 = 0;
                         for ch_id in &sync_channels {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync open_bi"); break; }
-                            };
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            let resp = match cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
+                            let resp = match cordelia_network::item_sync::send_sync_request_raw(&mut send, &mut recv, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
                                 Ok(r) => r,
-                                Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); continue; }
+                                Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); break; }
                             };
                             if resp.items.is_empty() { continue; }
 
                             let known = {
                                 let db = match sync_state.db.lock() {
                                     Ok(db) => db,
-                                    Err(_) => continue,
+                                    Err(_) => break,
                                 };
                                 let stored = cordelia_storage::items::query_listen(&db, ch_id, None, cordelia_core::protocol::MAX_LISTEN_LIMIT).unwrap_or_default();
                                 stored.into_iter()
@@ -1057,19 +1056,19 @@ pub async fn p2p_loop(
                             if fetch_ids.is_empty() { continue; }
 
                             if let Err(e) = cordelia_network::item_sync::send_fetch_request(&mut send, &fetch_ids).await {
-                                tracing::debug!(error = %e, "fetch request failed");
-                                continue;
+                                tracing::debug!(peer = %target, error = %e, "fetch request failed");
+                                break; // Stream corrupted
                             }
                             let items = match cordelia_network::item_sync::read_fetch_response(&mut recv).await {
                                 Ok(items) => items,
-                                Err(e) => { tracing::debug!(peer = %target, error = %e, "fetch response failed"); continue; }
+                                Err(e) => { tracing::debug!(peer = %target, error = %e, "fetch response failed"); break; }
                             };
 
                             let mut stored_count = 0u32;
                             {
                                 let db = match sync_state.db.lock() {
                                     Ok(db) => db,
-                                    Err(_) => continue,
+                                    Err(_) => break,
                                 };
                                 for item in &items {
                                     if let Ok(true) = store_item(&db, item, &role) {
@@ -1078,9 +1077,15 @@ pub async fn p2p_loop(
                                 }
                             }
                             if stored_count > 0 {
-                                tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync complete");
-                                let _ = gtx.send(GovEvent::ItemsDelivered(target.clone(), stored_count as u64));
+                                tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync channel complete");
+                                total_stored += stored_count as u64;
                             }
+                        }
+                        // FIN: signal end of batch to server
+                        let _ = send.finish();
+                        // One GovEvent per peer (not per channel)
+                        if total_stored > 0 {
+                            let _ = gtx.send(GovEvent::ItemsDelivered(target.clone(), total_stored));
                         }
                     });
                     }
