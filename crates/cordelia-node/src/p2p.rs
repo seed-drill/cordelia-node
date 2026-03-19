@@ -102,6 +102,7 @@ pub fn post_connect(
     peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
     peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
+    swarm_members: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
 ) {
     // Step 1: Extract peer roles from handshake
     let (is_relay, is_bootnode) = conn_mgr
@@ -205,9 +206,10 @@ pub fn post_connect(
         let states = peer_states.clone();
         let relays = peer_relays.clone();
         let gtx = gov_tx.clone();
+        let sm = swarm_members.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx,
+                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx, sm,
             )
             .await;
         });
@@ -278,6 +280,11 @@ pub async fn p2p_loop(
     let peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
 
+    // Verified swarm members (§8.2.2). Peers whose NodeId matches an HKDF-derived
+    // child key from the lead's seed. Populated on inbound verification.
+    let swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
@@ -299,6 +306,7 @@ pub async fn p2p_loop(
             &peer_states,
             &peer_relays,
             &gov_tx,
+            &swarm_members,
         );
     }
     governor.tick();
@@ -431,18 +439,9 @@ pub async fn p2p_loop(
                             in_flight.remove(&addr);
                         }
 
-                        // Personal nodes are outbound-only (§8.2), except from
-                        // trusted_peers (§8.2.2 Personal Area Network).
-                        if direction == Direction::Inbound && node_role == "personal" {
-                            if !trusted_peer_ids.contains(&outcome.node_id) {
-                                tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
-                                outcome.conn.close(0u32.into(), b"outbound-only");
-                                continue;
-                            }
-                            tracing::info!(peer = %outcome.node_id, "accepted inbound from trusted peer (PAN §8.2.2)");
-                        }
-
-                        // Connection tracker check (inbound only, §3.1)
+                        // Connection tracker check FIRST (inbound only, §3.1).
+                        // Must run before HKDF verification to prevent attackers
+                        // from bypassing per-IP limits to force CPU-expensive derivations.
                         if direction == Direction::Inbound {
                             let ip = outcome.conn.remote_address().ip();
                             if !conn_tracker.would_allow(ip) {
@@ -451,6 +450,46 @@ pub async fn p2p_loop(
                                 continue;
                             }
                             conn_tracker.add(ip);
+                        }
+
+                        // Personal nodes are outbound-only (§8.2), except from
+                        // trusted_peers or verified swarm children (§8.2.2 PAN).
+                        if direction == Direction::Inbound && node_role == "personal" {
+                            let is_trusted = trusted_peer_ids.contains(&outcome.node_id);
+                            // Check swarm_members cache first (avoids re-deriving on reconnect)
+                            let already_verified = swarm_members.read().ok()
+                                .map(|m| m.contains(&outcome.node_id))
+                                .unwrap_or(false);
+                            let is_swarm_child = if !is_trusted && !already_verified {
+                                // On-demand HKDF verification. CPU-bound (~2.5ms worst case),
+                                // run on blocking thread to avoid stalling the select loop.
+                                let seed = *state.identity.seed();
+                                let peer_pk = outcome.node_id.0;
+                                let verified = tokio::task::block_in_place(|| {
+                                    cordelia_crypto::verify_swarm_child(&seed, &peer_pk, 256)
+                                });
+                                match verified {
+                                    Some(idx) => {
+                                        tracing::info!(peer = %outcome.node_id, index = idx, "verified swarm child via HKDF (PAN §8.2.2)");
+                                        if let Ok(mut members) = swarm_members.write() {
+                                            members.insert(outcome.node_id.clone());
+                                        }
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            } else {
+                                already_verified
+                            };
+
+                            if !is_trusted && !is_swarm_child {
+                                tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
+                                outcome.conn.close(0u32.into(), b"outbound-only");
+                                continue;
+                            }
+                            if is_trusted {
+                                tracing::info!(peer = %outcome.node_id, "accepted inbound from trusted peer (PAN §8.2.2)");
+                            }
                         }
 
                         if direction == Direction::Outbound {
@@ -470,7 +509,7 @@ pub async fn p2p_loop(
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
-                                    &peer_relays, &gov_tx,
+                                    &peer_relays, &gov_tx, &swarm_members,
                                 );
                             }
                             Err(e) => {
@@ -597,11 +636,23 @@ pub async fn p2p_loop(
             // ── Push items to hot relay peers (batched, §7.1) ─────────
             // Originator push: personal/keeper writes go to hot relay peers
             // only. Relays handle distribution. Non-relay peers pull (§4.5).
+            // Scope-aware: skip items for local-scope channels (§8.2.2).
             Some(first_push) = push_rx.recv() => {
                 let mut all_pushes = vec![first_push];
                 while let Ok(more) = push_rx.try_recv() {
                     all_pushes.push(more);
                 }
+
+                // Filter out local-scope items (§8.2.2: never forward to relay mesh)
+                {
+                    let db = state.db.lock();
+                    if let Ok(db) = db {
+                        all_pushes.retain(|p| {
+                            !cordelia_storage::channels::is_local_scope(&db, &p.channel_id).unwrap_or(false)
+                        });
+                    }
+                }
+                if all_pushes.is_empty() { continue; }
 
                 // Target: hot relay peers only (§8.2.1)
                 let relay_targets: Vec<NodeId> = governor.hot_peers().into_iter()
@@ -778,6 +829,17 @@ pub async fn p2p_loop(
                 }
                 if pending.is_empty() { continue; }
 
+                // Filter out local-scope items (§8.2.2: never leave the PAN)
+                {
+                    let db = state.db.lock();
+                    if let Ok(db) = db {
+                        pending.retain(|_, (item, _)| {
+                            !cordelia_storage::channels::is_local_scope(&db, &item.channel_id).unwrap_or(false)
+                        });
+                    }
+                }
+                if pending.is_empty() { continue; }
+
                 // Build per-peer batches -- relay peers only (§7.2: single-hop,
                 // relay-to-relay broadcast). Exclude the sender of each item.
                 let relay_peers: Vec<NodeId> = governor.hot_peers().into_iter()
@@ -875,7 +937,10 @@ pub async fn p2p_loop(
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
-                // Personal nodes: get subscribed channels, skip if empty
+                // Personal nodes: get ALL subscribed channels (including local).
+                // Scope filtering happens on the serving side (§8.2.2):
+                // handle_inbound_sync rejects local-scope requests from non-swarm peers.
+                // Swarm nodes need to sync local channels from their lead.
                 let local_channels: Vec<String> = {
                     let db = match state.db.lock() {
                         Ok(db) => db,
@@ -1034,6 +1099,10 @@ pub async fn p2p_loop(
                 for peer_id in &gov_active {
                     if !connected.contains(peer_id) {
                         governor.mark_disconnected(peer_id);
+                        // Clean up swarm member tracking on disconnect (§8.2.2)
+                        if let Ok(mut members) = swarm_members.write() {
+                            members.remove(peer_id);
+                        }
                     }
                 }
                 let (hot, warm, _cold, _banned) = governor.counts();
@@ -1185,6 +1254,7 @@ pub async fn handle_peer_streams(
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
     peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
+    swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -1277,7 +1347,8 @@ pub async fn handle_peer_streams(
                 .await;
             }
             cordelia_network::messages::Protocol::ItemSync => {
-                handle_inbound_sync(&mut send, &mut recv, &peer_id, &state, &node_role).await;
+                let is_swarm_peer = swarm_members.read().ok().map(|m| m.contains(&peer_id)).unwrap_or(false);
+                handle_inbound_sync(&mut send, &mut recv, &peer_id, &state, &node_role, is_swarm_peer).await;
             }
             cordelia_network::messages::Protocol::PeerSharing => {
                 // Allowed on Warm + Hot (§2.1)
@@ -1385,6 +1456,7 @@ async fn handle_inbound_sync(
     peer_id: &NodeId,
     state: &web::Data<cordelia_api::state::AppState>,
     _node_role: &str,
+    is_swarm_peer: bool,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -1404,7 +1476,14 @@ async fn handle_inbound_sync(
                     Ok(db) => db,
                     Err(_) => return,
                 };
-                cordelia_storage::channels::list_stored_channel_ids(&db).unwrap_or_default()
+                let mut ids = cordelia_storage::channels::list_stored_channel_ids(&db).unwrap_or_default();
+                // Hide local-scope channels from non-swarm peers (§8.2.2)
+                if !is_swarm_peer {
+                    ids.retain(|ch_id| {
+                        !cordelia_storage::channels::is_local_scope(&db, ch_id).unwrap_or(false)
+                    });
+                }
+                ids
             };
             tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
             let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
@@ -1422,6 +1501,25 @@ async fn handle_inbound_sync(
         cordelia_network::messages::WireMessage::SyncRequest(r) => r,
         _ => return,
     };
+
+    // Scope check: don't serve local-scope channel items to non-swarm peers (§8.2.2)
+    if !is_swarm_peer {
+        let is_local = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => return,
+            };
+            cordelia_storage::channels::is_local_scope(&db, &req.channel_id).unwrap_or(false)
+        };
+        if is_local {
+            tracing::debug!(peer = %peer_id, channel = %req.channel_id, "rejecting sync for local-scope channel from non-swarm peer");
+            let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                cordelia_network::messages::SyncResponse { items: vec![], has_more: false },
+            );
+            let _ = cordelia_network::codec::write_frame(send, &resp).await;
+            return;
+        }
+    }
 
     // Build sync response headers
     let (headers, has_more) = {
@@ -1619,7 +1717,8 @@ async fn send_channel_announcements(
             .lock()
             .map_err(|e| format!("db lock: {e}"))?;
         let pk = state.identity.public_key();
-        cordelia_storage::channels::list_for_entity(&db, &pk).unwrap_or_default()
+        // Only announce network-scope channels (§8.2.2: local channels never leave PAN)
+        cordelia_storage::channels::list_network_channels(&db, &pk).unwrap_or_default()
     };
     if channels.is_empty() {
         return Ok(());

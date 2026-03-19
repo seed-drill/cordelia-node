@@ -122,6 +122,14 @@ pub fn protocol_channel_psk(channel_name: &str) -> [u8; 32] {
     psk
 }
 
+/// Derive the persistent swarm channel ID for a lead entity.
+///
+/// `channel_id = "cordelia:swarm:<lead_entity_id>"`
+/// This is a protocol-prefixed channel, not subject to RFC 1035 validation.
+pub fn swarm_channel_id(lead_entity_id: &str) -> String {
+    format!("cordelia:swarm:{lead_entity_id}")
+}
+
 /// Determine channel type from an ID string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelType {
@@ -376,6 +384,22 @@ mod tests {
             ChannelType::from_id("cordelia:directory"),
             ChannelType::Protocol
         );
+    }
+
+    // ================================================================
+    // Swarm channel naming (§8.2.2)
+    // ================================================================
+
+    #[test]
+    fn test_swarm_channel_id_format() {
+        let id = swarm_channel_id("lead_a1b2");
+        assert_eq!(id, "cordelia:swarm:lead_a1b2");
+    }
+
+    #[test]
+    fn test_swarm_channel_id_is_protocol_type() {
+        let id = swarm_channel_id("lead_a1b2");
+        assert_eq!(ChannelType::from_id(&id), ChannelType::Protocol);
     }
 
     // T13-4: Unicode channel names at byte limit

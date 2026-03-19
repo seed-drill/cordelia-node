@@ -58,6 +58,20 @@ enum Commands {
     Stats,
     /// Print public key from identity.key (for PAN trusted_peers config)
     Pubkey,
+    /// Initialise a swarm child node (derive identity from lead, create channels)
+    SwarmInit {
+        /// HKDF derivation index for this child's identity
+        #[arg(long)]
+        index: u32,
+
+        /// Path to the lead node's identity.key
+        #[arg(long)]
+        lead_identity: String,
+
+        /// Entity ID of the lead node (for swarm channel naming)
+        #[arg(long)]
+        lead_entity_id: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -80,6 +94,11 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats) => cmd_stats(&cli.config),
         Some(Commands::Pubkey) => cmd_pubkey(&cli.config),
+        Some(Commands::SwarmInit {
+            index,
+            lead_identity,
+            lead_entity_id,
+        }) => cmd_swarm_init(&cli.config, index, &lead_identity, &lead_entity_id),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
             println!("Encrypted pub/sub for AI agents");
@@ -305,6 +324,34 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // Open database
     let db_path = data_dir.join("cordelia.db");
     let conn = cordelia_storage::db::open(&db_path)?;
+
+    // Auto-create persistent swarm channel for lead nodes (§8.2.2).
+    // Only personal nodes can be swarm leads (not bootnodes or relays).
+    if config.swarm.swarm_index.is_none() && config.network.role == "personal" {
+        let entity_id = &config.identity.entity_id;
+        if !entity_id.is_empty() {
+            let swarm_ch_id = cordelia_storage::naming::swarm_channel_id(entity_id);
+            let now = chrono::Utc::now().to_rfc3339();
+            let pk = identity.public_key();
+            // Generate PSK and store it alongside the channel
+            let swarm_psk = cordelia_crypto::generate_psk()?;
+            let swarm_psk_hash = cordelia_crypto::sha256(&swarm_psk);
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
+                 VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
+                rusqlite::params![swarm_ch_id, pk.as_slice(), swarm_psk_hash.as_slice(), now, now],
+            );
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
+                 VALUES (?1, ?2, 'owner', ?3)",
+                rusqlite::params![swarm_ch_id, pk.as_slice(), now],
+            );
+            // Save PSK using standard psk module (handles path encoding + 0600 permissions)
+            if !cordelia_storage::psk::has_psk(&data_dir, &swarm_ch_id) {
+                let _ = cordelia_storage::psk::write_psk(&data_dir, &swarm_ch_id, &swarm_psk);
+            }
+        }
+    }
 
     // Validate bind address is loopback
     let bind_addr = &config.api.bind_address;
@@ -561,6 +608,111 @@ fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
     println!("Total items:    {total_items}");
     println!("Sync errors:    0");
     println!("Peers:          0 (P2P not yet implemented)");
+
+    Ok(())
+}
+
+// ── cordelia swarm-init ────────────────────────────────────────────
+
+fn cmd_swarm_init(
+    config_path: &str,
+    index: u32,
+    lead_identity_path: &str,
+    lead_entity_id: &str,
+) -> anyhow::Result<()> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+    let data_dir = config.data_dir();
+
+    // Load lead identity and derive child
+    let lead_path = config::expand_tilde(lead_identity_path);
+    let lead = NodeIdentity::from_file(&lead_path)?;
+    let child = lead.derive_child(index)?;
+
+    let child_pk = child.public_key();
+    let child_pk_bech32 = encode_public_key(&child_pk)?;
+    let child_suffix = child.entity_id_suffix();
+    let entity_id = format!("swarm{index}_{child_suffix}");
+
+    // Write child identity
+    std::fs::create_dir_all(&data_dir)?;
+    let identity_path = data_dir.join("identity.key");
+    if identity_path.exists() {
+        anyhow::bail!(
+            "Identity already exists at {}. Use --force with `cordelia init` to overwrite.",
+            identity_path.display()
+        );
+    }
+    std::fs::write(&identity_path, child.seed())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Generate node token
+    let token = cordelia_crypto::generate_psk()?;
+    let token_hex = hex::encode(token);
+    let token_path = data_dir.join("node-token");
+    std::fs::write(&token_path, &token_hex)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Create database
+    let db_path = data_dir.join("cordelia.db");
+    let conn = cordelia_storage::db::open(&db_path)?;
+
+    // Create channel-keys directory
+    std::fs::create_dir_all(data_dir.join("channel-keys"))?;
+
+    // Create persistent swarm channel
+    let swarm_ch_id = cordelia_storage::naming::swarm_channel_id(lead_entity_id);
+    let psk = cordelia_crypto::generate_psk()?;
+    let psk_hash = cordelia_crypto::sha256(&psk);
+    let now = chrono::Utc::now().to_rfc3339();
+    // Insert as protocol-type channel (scope=network)
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
+         VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
+        rusqlite::params![swarm_ch_id, child_pk.as_slice(), psk_hash.as_slice(), now, now],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
+         VALUES (?1, ?2, 'owner', ?3)",
+        rusqlite::params![swarm_ch_id, child_pk.as_slice(), now],
+    );
+
+    // Save PSK using the standard psk module (handles path encoding + 0600 permissions)
+    cordelia_storage::psk::write_psk(&data_dir, &swarm_ch_id, &psk)?;
+
+    // Create default ephemeral local channel
+    let local_ch_id = format!("cordelia:local:{}", uuid::Uuid::new_v4());
+    let local_psk = cordelia_crypto::generate_psk()?;
+    cordelia_storage::channels::create_local(&conn, &local_ch_id, &child_pk, Some(&local_psk))?;
+
+    // Save local PSK
+    cordelia_storage::psk::write_psk(&data_dir, &local_ch_id, &local_psk)?;
+
+    // Update config with swarm fields
+    config.identity.entity_id = entity_id.clone();
+    config.identity.public_key = child_pk_bech32.clone();
+    config.swarm.swarm_index = Some(index);
+    config.swarm.lead_identity_path = Some(lead_identity_path.to_string());
+    config.swarm.lead_entity_id = Some(lead_entity_id.to_string());
+    config.save(&config_file)?;
+
+    println!("Swarm node initialised:");
+    println!("  Entity:           {entity_id}");
+    println!("  Public key:       {child_pk_bech32}");
+    println!("  Derivation index: {index}");
+    println!("  Lead entity:      {lead_entity_id}");
+    println!("  Swarm channel:    {swarm_ch_id}");
+    println!("  Local channel:    {local_ch_id}");
+    println!("  Data directory:   {}", data_dir.display());
 
     Ok(())
 }

@@ -20,6 +20,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    pub swarm: SwarmConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,6 +125,21 @@ pub struct LoggingConfig {
     pub level: String,
     pub format: String,
     pub output: String,
+}
+
+/// Swarm / Personal Area Network configuration (§8.2.2).
+///
+/// Set by `cordelia swarm-init` for child nodes. Lead nodes leave this empty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmConfig {
+    /// HKDF derivation index for this swarm node's identity.
+    /// None means this is not a swarm child node.
+    pub swarm_index: Option<u32>,
+    /// Path to the lead node's identity.key (used for derivation verification).
+    pub lead_identity_path: Option<String>,
+    /// Entity ID of the lead node (used for persistent swarm channel name).
+    pub lead_entity_id: Option<String>,
 }
 
 // ── Defaults (configuration.md §3, sourced from protocol.rs) ───────
@@ -279,6 +295,17 @@ impl Config {
         if let Ok(v) = std::env::var("CORDELIA_BIND_ADDRESS") {
             self.api.bind_address = v;
         }
+        if let Ok(v) = std::env::var("CORDELIA_SWARM_INDEX")
+            && let Ok(idx) = v.parse()
+        {
+            self.swarm.swarm_index = Some(idx);
+        }
+        if let Ok(v) = std::env::var("CORDELIA_LEAD_IDENTITY_PATH") {
+            self.swarm.lead_identity_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("CORDELIA_LEAD_ENTITY_ID") {
+            self.swarm.lead_entity_id = Some(v);
+        }
     }
 
     /// Resolve the data directory, expanding tilde.
@@ -362,6 +389,50 @@ http_port = 8080
     fn test_load_nonexistent_returns_default() {
         let config = Config::load(Path::new("/nonexistent/config.toml")).unwrap();
         assert_eq!(config.node.http_port, protocol::HTTP_PORT);
+    }
+
+    #[test]
+    fn test_swarm_config_defaults_to_none() {
+        let config = Config::default();
+        assert!(config.swarm.swarm_index.is_none());
+        assert!(config.swarm.lead_identity_path.is_none());
+        assert!(config.swarm.lead_entity_id.is_none());
+    }
+
+    #[test]
+    fn test_swarm_config_round_trip() {
+        let partial = r#"
+[swarm]
+swarm_index = 7
+lead_identity_path = "/tmp/lead/identity.key"
+lead_entity_id = "lead_a1b2"
+"#;
+        let config: Config = toml::from_str(partial).unwrap();
+        assert_eq!(config.swarm.swarm_index, Some(7));
+        assert_eq!(config.swarm.lead_identity_path.as_deref(), Some("/tmp/lead/identity.key"));
+        assert_eq!(config.swarm.lead_entity_id.as_deref(), Some("lead_a1b2"));
+
+        // Round-trip
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.swarm.swarm_index, Some(7));
+    }
+
+    #[test]
+    fn test_swarm_config_env_override() {
+        let mut config = Config::default();
+        // SAFETY: test-only, single-threaded test
+        unsafe {
+            std::env::set_var("CORDELIA_SWARM_INDEX", "3");
+            std::env::set_var("CORDELIA_LEAD_ENTITY_ID", "lead_test");
+        }
+        config.apply_env_overrides();
+        assert_eq!(config.swarm.swarm_index, Some(3));
+        assert_eq!(config.swarm.lead_entity_id.as_deref(), Some("lead_test"));
+        unsafe {
+            std::env::remove_var("CORDELIA_SWARM_INDEX");
+            std::env::remove_var("CORDELIA_LEAD_ENTITY_ID");
+        }
     }
 
     #[test]

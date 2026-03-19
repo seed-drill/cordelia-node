@@ -18,9 +18,26 @@ fi
 
 CONFIG="$CORDELIA_DATA_DIR/config.toml"
 
+# Pre-seeded identity: if /keys/lead.identity.key exists and this is a lead
+# (not a swarm child), copy it to the data dir so `cordelia init` uses it.
+if [ -f "/keys/lead.identity.key" ] && [ -z "${CORDELIA_SWARM_INDEX:-}" ]; then
+    if [ ! -f "$CORDELIA_DATA_DIR/identity.key" ]; then
+        cp /keys/lead.identity.key "$CORDELIA_DATA_DIR/identity.key"
+        chmod 600 "$CORDELIA_DATA_DIR/identity.key"
+    fi
+fi
+
 # Initialise if no identity exists
 if [ ! -f "$CORDELIA_DATA_DIR/identity.key" ]; then
-    cordelia --config "$CONFIG" init --name "$NODE_NAME" --non-interactive
+    # Swarm nodes use swarm-init with derived identity (§8.2.2)
+    if [ -n "${CORDELIA_SWARM_INDEX:-}" ] && [ -n "${CORDELIA_LEAD_IDENTITY:-}" ] && [ -n "${CORDELIA_LEAD_ENTITY_ID:-}" ]; then
+        cordelia --config "$CONFIG" swarm-init \
+            --index "$CORDELIA_SWARM_INDEX" \
+            --lead-identity "$CORDELIA_LEAD_IDENTITY" \
+            --lead-entity-id "$CORDELIA_LEAD_ENTITY_ID"
+    else
+        cordelia --config "$CONFIG" init --name "$NODE_NAME" --non-interactive
+    fi
 fi
 
 # Start node (--config is a top-level arg, must precede subcommand)

@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -125,6 +125,12 @@ CREATE TRIGGER IF NOT EXISTS search_fts_update AFTER UPDATE ON search_content BE
 END;
 "#;
 
+/// Migration v3: Channel scope for PAN ephemeral local channels (§8.2.2).
+const MIGRATION_V3: &str = r#"
+ALTER TABLE channels ADD COLUMN scope TEXT NOT NULL DEFAULT 'network'
+    CHECK(scope IN ('network', 'local'));
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -144,6 +150,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v2 (FTS5 search)");
         conn.execute_batch(MIGRATION_V2)?;
         conn.pragma_update(None, "user_version", 2)?;
+    }
+
+    if current < 3 {
+        tracing::info!("applying migration v3 (channel scope)");
+        conn.execute_batch(MIGRATION_V3)?;
+        conn.pragma_update(None, "user_version", 3)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -257,6 +269,35 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "role CHECK should reject 'superadmin'");
+    }
+
+    #[test]
+    fn test_scope_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let result = conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, scope, creator_id, created_at, updated_at)
+             VALUES ('test_scope', 'named', 'realtime', 'open', 'invalid_scope', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(result.is_err(), "scope CHECK should reject 'invalid_scope'");
+    }
+
+    #[test]
+    fn test_scope_default_is_network() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('test_default_scope', 'named', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        ).unwrap();
+        let scope: String = conn.query_row(
+            "SELECT scope FROM channels WHERE channel_id = 'test_default_scope'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(scope, "network");
     }
 
     // T3-1: verify all valid enum values are accepted

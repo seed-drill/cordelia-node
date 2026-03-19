@@ -1200,28 +1200,53 @@ Personal nodes support a configurable `push_policy` that controls outbound item 
 
 #### 8.2.2 Personal Area Network (Agent Swarm)
 
-An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" personal node that connects to the relay mesh, with swarm member nodes connecting only to the lead. The lead acts as a local relay for the swarm: stores items, serves pull-sync, and handles relay connectivity. Swarm nodes never touch the public network.
+An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" personal node that connects to the relay mesh, with swarm member nodes connecting only to the lead. The lead acts as a local gateway for the swarm: stores items, serves pull-sync, and handles relay connectivity. Swarm nodes never touch the public network.
 
 **Topology:** `swarm_node -> lead_node -> relay -> relay_mesh`
 
-**Lead as gateway:** The lead runs `role = relay` but is deployed alongside its swarm, not as public infrastructure. It acts as a local proxy: accepts inbound from swarm nodes, serves Item-Sync, and maintains a single upstream connection to the relay mesh. The lead:
-- Accepts inbound from swarm nodes (relay role accepts all inbound)
-- Serves Item-Sync pull requests and Channel-Announce to swarm nodes
-- Pushes items from swarm nodes to the relay mesh via its upstream relay connection
-- Can gate, filter, or throttle forwarding in future (rate limit per sub-agent, restrict channel access, audit)
+**Identity model -- HD derivation:** Swarm node identities are derived from the lead's seed using HKDF-SHA256:
 
-**Identity model:** Swarm nodes generate their own Ed25519 identities. They are distinct entities from the network's perspective. Channel access is via PSK: swarm nodes mount the lead's PSK key files to encrypt/decrypt items on shared channels. The lead distributes PSKs to swarm nodes via the local filesystem (mounted volume), not via the P2P PSK-Exchange protocol.
+```
+child_seed = HKDF-SHA256(lead_seed, salt="", info="cordelia-swarm-v1/{index}")
+child_keypair = Ed25519::from_seed(child_seed)
+```
+
+Each swarm node has its own Ed25519 keypair, cryptographically traceable to the lead. The index is a u32, allowing on-demand derivation with no artificial cap.
+
+**Lead role:** The lead runs `role = personal` with swarm relay capability. It does NOT participate in the relay mesh as a relay node. Instead, it:
+- Accepts inbound ONLY from verified child keys (derived from its own seed)
+- Pushes items from swarm nodes to the relay mesh via its upstream relay connection
+- Serves Item-Sync pull requests to swarm nodes
+- Forwards network-scoped items between the relay mesh and the swarm
+
+**Trust model -- on-demand verification:** When a peer connects inbound, the lead verifies membership by computing `derive_child_public_key(i)` for i=0..255 and checking against the connecting peer's NodeId. Verified peers are added to a `swarm_members` set. No pre-computed limit, no config-based allowlist -- the lead's own seed is the trust anchor.
+
+**PSK distribution:** Swarm nodes receive PSKs via the PSK-Exchange protocol (0x07). This works for both same-machine and distributed swarms. Filesystem mount is an optional optimisation that pre-populates the key file, but PSK-Exchange is the canonical mechanism.
+
+**Channels:**
+
+| Type | Channel ID | Scope | Forwarded to relay mesh? |
+|------|-----------|-------|--------------------------|
+| Persistent swarm | `cordelia:swarm:<lead_entity_id>` | `network` | Yes -- durable shared memory |
+| Ephemeral local | Created per session | `local` | No -- scratchpad, never leaves PAN |
+
+- **Persistent:** `cordelia:swarm:<lead_entity_id>` -- created once, replicated to relay mesh. Durable shared memory for the swarm.
+- **Ephemeral local:** Channels with `scope = "local"` are created per session, NEVER forwarded to the relay mesh. One default ephemeral channel on init, swarm nodes can create more. Since local channels never leave the PAN, they impose no load on the relay mesh.
+
+**Scope-aware push filtering:** The push path and relay re-push MUST skip items for local-scope channels. The lead MUST NOT serve local-scope items to non-swarm peers via Item-Sync.
 
 **Configuration:**
 
 | Node | role | hot_max | bootnodes | Notes |
 |------|------|---------|-----------|-------|
-| Lead | relay | N+2 | Zone relay + bootnode | N swarm slots + upstream relay slots |
-| Swarm | personal | 1 | Lead address only | Single connection to lead |
+| Lead | personal | 2 (default) | Zone relay + bootnode | Upstream relay + swarm children accepted inbound |
+| Swarm | personal | 1 | Lead address only | Single connection to lead, derived identity |
 
-**No new role needed.** The lead runs as a relay (accepts inbound, serves sync, repushes). Swarm nodes run as personal (outbound-only, pull-sync). The lead bootstraps from the zone relay like a personal node would, but participates in the relay mesh as a leaf relay.
-
-**Future (Phase 3+): HD key derivation.** If per-agent attribution is needed (which agent wrote which item), the lead can derive child keys from its seed (BIP-32 style). Each swarm node gets a unique identity provably owned by the lead. The lead then acts as an authorisation gateway, deciding which child keys may access which channels.
+**Swarm init:** `cordelia swarm-init --index N --lead-identity PATH --lead-entity-id ID`:
+1. Reads lead seed, derives child identity via HKDF at the given index
+2. Writes child `identity.key`
+3. Creates persistent swarm channel + default ephemeral local channel
+4. Sets swarm config fields (`swarm_index`, `lead_identity_path`, `lead_entity_id`)
 
 **Use cases:**
 - AI agent orchestration: one daemon per machine, sub-agents share memory via the lead

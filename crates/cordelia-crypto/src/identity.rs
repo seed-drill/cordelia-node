@@ -110,6 +110,49 @@ impl NodeIdentity {
     pub fn x25519_public_key(&self) -> [u8; 32] {
         x25519_from_ed25519_seed(&self.seed).1
     }
+
+    /// Derive a child identity for a swarm member at the given index.
+    ///
+    /// Uses HKDF-SHA256: `child_seed = HKDF(lead_seed, "", "cordelia-swarm-v1/{index}")`.
+    /// The child has its own Ed25519 keypair, cryptographically traceable to the lead.
+    pub fn derive_child(&self, index: u32) -> Result<NodeIdentity, CryptoError> {
+        let child_seed = derive_child_seed(&self.seed, index)?;
+        Self::from_seed(child_seed)
+    }
+
+    /// Derive only the public key for a child at the given index.
+    ///
+    /// Useful for verifying inbound connections without constructing
+    /// the full child identity (avoids storing the child's private key).
+    pub fn derive_child_public_key(&self, index: u32) -> Result<[u8; 32], CryptoError> {
+        let child_seed = derive_child_seed(&self.seed, index)?;
+        let child = Self::from_seed(child_seed)?;
+        Ok(child.public_key())
+    }
+}
+
+/// Derive a child seed from a lead seed at the given index via HKDF-SHA256.
+fn derive_child_seed(lead_seed: &[u8; 32], index: u32) -> Result<[u8; 32], CryptoError> {
+    let info = format!("cordelia-swarm-v1/{index}");
+    crate::hkdf_sha256(lead_seed, &[], info.as_bytes())
+}
+
+/// Verify if a public key is a valid swarm child of this lead identity.
+///
+/// Iterates HKDF derivation 0..max_check, comparing each derived public key
+/// against `peer_pk`. Returns the matching index, or None if not a child.
+/// Worst case ~2.5ms for max_check=256.
+pub fn verify_swarm_child(lead_seed: &[u8; 32], peer_pk: &[u8; 32], max_check: u32) -> Option<u32> {
+    for i in 0..max_check {
+        if let Ok(child_seed) = derive_child_seed(lead_seed, i) {
+            if let Ok(child) = NodeIdentity::from_seed(child_seed) {
+                if child.public_key() == *peer_pk {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Derive X25519 keypair from a raw Ed25519 seed.
@@ -401,6 +444,71 @@ mod tests {
         NodeIdentity::load_or_create(&path).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    // ========================================================================
+    // HD child derivation (§8.2.2 PAN / Agent Swarm)
+    // ========================================================================
+
+    #[test]
+    fn test_derive_child_deterministic() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child_a = lead.derive_child(0).unwrap();
+        let child_b = lead.derive_child(0).unwrap();
+        assert_eq!(child_a.public_key(), child_b.public_key());
+        assert_eq!(child_a.seed(), child_b.seed());
+    }
+
+    #[test]
+    fn test_derive_child_unique_per_index() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child_0 = lead.derive_child(0).unwrap();
+        let child_1 = lead.derive_child(1).unwrap();
+        assert_ne!(child_0.public_key(), child_1.public_key());
+        assert_ne!(child_0.seed(), child_1.seed());
+    }
+
+    #[test]
+    fn test_derive_child_differs_from_lead() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child = lead.derive_child(0).unwrap();
+        assert_ne!(child.public_key(), lead.public_key());
+        assert_ne!(child.seed(), lead.seed());
+    }
+
+    #[test]
+    fn test_derive_child_public_key_matches() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child = lead.derive_child(7).unwrap();
+        let derived_pk = lead.derive_child_public_key(7).unwrap();
+        assert_eq!(child.public_key(), derived_pk);
+    }
+
+    #[test]
+    fn test_verify_swarm_child_finds_match() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child = lead.derive_child(5).unwrap();
+        let result = verify_swarm_child(lead.seed(), &child.public_key(), 256);
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn test_verify_swarm_child_rejects_non_child() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let stranger = NodeIdentity::generate().unwrap();
+        let result = verify_swarm_child(lead.seed(), &stranger.public_key(), 256);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_derive_child_can_sign() {
+        let lead = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let child = lead.derive_child(42).unwrap();
+        let msg = b"swarm message";
+        let sig = child.sign(msg);
+        assert!(verify_signature(&child.public_key(), msg, &sig));
+        // Lead cannot verify child's signature with its own key
+        assert!(!verify_signature(&lead.public_key(), msg, &sig));
     }
 
     // T8-3 (LOW): generate_psk produces unique 32-byte values
