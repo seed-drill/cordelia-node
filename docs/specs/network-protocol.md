@@ -1198,9 +1198,45 @@ Personal nodes support a configurable `push_policy` that controls outbound item 
 
 **Trade-off:** Personal nodes receive items via pull-sync with latency bounded by `sync_interval` (10s for realtime, 900s for batch). This is acceptable for AI agent memory workloads where sub-second latency is not required.
 
+#### 8.2.2 Personal Area Network (Agent Swarm)
+
+An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" personal node that connects to the relay mesh, with swarm member nodes connecting only to the lead. The lead acts as a local relay for the swarm: stores items, serves pull-sync, and handles relay connectivity. Swarm nodes never touch the public network.
+
+**Topology:** `swarm_node -> lead_node -> relay -> relay_mesh`
+
+**Configuration:**
+
+| Node | role | hot_max | dial_policy | trusted_peers | Notes |
+|------|------|---------|-------------|---------------|-------|
+| Lead | personal | N+2 | relays_only | -- | N swarm nodes + 2 relay slots |
+| Swarm | personal | 1 | trusted_only | [lead] | Single connection to lead |
+
+**No new role needed.** The existing governor and dial_policy machinery handles swarm topology:
+- Lead runs `hot_min_relays = 1` to maintain relay connectivity
+- Swarm nodes use `dial_policy = "trusted_only"` with the lead's address
+- Swarm nodes pull-sync from the lead, which pull-syncs from relays
+- Lead serves inbound Item-Sync from swarm nodes (all nodes serve inbound sync)
+
+**Inbound connection exception:** Personal nodes reject inbound connections (§8.2), **except** from peers listed in `trusted_peers`. This allows swarm nodes to connect to the lead while maintaining the outbound-only posture for all other traffic.
+
+**Use cases:**
+- AI agent orchestration: one daemon per machine, sub-agents share memory via the lead
+- Team environments: shared office node acts as local relay for team members' agents
+- Development: test swarms without deploying relay infrastructure
+
 ### 8.3 Bootnode
 
-Lightweight discovery node. Its sole function is peer introduction -- Handshake and Peer-Sharing only. Once a node discovers relays and peers via a bootnode, gossip takes over and the bootnode connection can be released.
+Lightweight discovery node. Its sole function is peer introduction -- Handshake and Peer-Sharing only. Once a node discovers relays and peers via a bootnode, gossip takes over and the bootnode connection MUST be released.
+
+**Bootnode connection lifecycle:**
+1. Node connects to bootnode(s) during bootstrap
+2. Requests peer-share addresses (discovers relay addresses)
+3. Connects to discovered relays
+4. Once `hot_min_relays` relay connections are established, releases bootnode connection
+5. Governor MUST NOT promote bootnode peers to Hot (they don't participate in data exchange)
+6. Bootnode connections occupy Warm slots only, used for peer-sharing, evicted once relays are available
+
+**Why eviction matters:** Personal nodes have `hot_max=2`. If bootnodes occupy hot slots, no room remains for relays. The node can discover relay addresses via peer-share but never connect because hot is full. Keeping bootnodes out of the hot set ensures hot slots are reserved for data-carrying peers (relays, keepers, or trusted personal nodes).
 
 - Publicly addressable (static IP or DNS)
 - Accepts inbound QUIC connections

@@ -137,8 +137,10 @@ pub struct PeerInfo {
     pub demoted_at: Option<Instant>,
     pub disconnect_count: u32,
     pub last_disconnected: Option<Instant>,
-    /// Whether this peer is a relay/bootnode (eligible for dial under restricted policies).
+    /// Whether this peer is a relay (eligible for dial under restricted policies).
     pub is_relay: bool,
+    /// Whether this peer is a bootnode (discovery-only, never promoted to Hot, §8.3).
+    pub is_bootnode: bool,
     /// Items this peer relayed to us (contribution tracking, §16.1).
     pub items_relayed: u64,
     /// Items we requested from this peer via sync (contribution tracking, §16.1).
@@ -163,6 +165,7 @@ impl PeerInfo {
             disconnect_count: 0,
             last_disconnected: None,
             is_relay: false,
+            is_bootnode: false,
             items_relayed: 0,
             items_requested: 0,
             score_ema: 0.0,
@@ -346,7 +349,12 @@ impl Governor {
         {
             peer.connected_since = Some(Instant::now());
             peer.last_activity = Instant::now();
-            if hot_count < self.targets.hot_min {
+            // Bootnodes are discovery-only: always Warm, never Hot (§8.3).
+            // They don't participate in data exchange and must not occupy hot slots.
+            if peer.is_bootnode {
+                tracing::info!(peer = %node_id, "gov: cold -> warm (bootnode, discovery-only)");
+                peer.set_state(PeerState::Warm);
+            } else if hot_count < self.targets.hot_min {
                 // Bootstrap: urgently need hot peers, bypass tenure guard
                 tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
                 peer.set_state(PeerState::Hot);
@@ -471,6 +479,13 @@ impl Governor {
     pub fn set_peer_relay(&mut self, node_id: &NodeId, is_relay: bool) {
         if let Some(peer) = self.peers.get_mut(node_id) {
             peer.is_relay = is_relay;
+        }
+    }
+
+    /// Mark a peer as a bootnode (discovery-only, never Hot, §8.3).
+    pub fn set_peer_bootnode(&mut self, node_id: &NodeId, is_bootnode: bool) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.is_bootnode = is_bootnode;
         }
     }
 
@@ -691,12 +706,13 @@ impl Governor {
             return; // Hot set is full
         }
 
-        // Collect eligible warm peers (past hysteresis cooldown)
+        // Collect eligible warm peers (past hysteresis cooldown, not bootnodes)
         let eligible: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| {
                 p.state == PeerState::Warm
+                    && !p.is_bootnode
                     && p.demoted_at
                         .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
             })

@@ -104,16 +104,19 @@ pub fn post_connect(
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     // Step 1: Extract peer roles from handshake
-    let is_relay = conn_mgr
+    let (is_relay, is_bootnode) = conn_mgr
         .get_peer(node_id)
         .map(|pc| {
             let roles = &pc.handshake.peer_roles;
             tracing::info!(peer = %node_id, roles = ?roles, "post_connect: checking peer roles");
-            roles.contains(&"relay".to_string())
+            (
+                roles.contains(&"relay".to_string()),
+                roles.contains(&"bootnode".to_string()),
+            )
         })
         .unwrap_or_else(|| {
             tracing::warn!(peer = %node_id, "post_connect: get_peer returned None");
-            false
+            (false, false)
         });
 
     // Step 2: Add to governor
@@ -124,8 +127,13 @@ pub fn post_connect(
         governor.set_peer_relay(node_id, true);
         tracing::info!(peer = %node_id, "peer identified as relay");
     }
+    // Mark bootnode role (prevents Hot promotion, §8.3)
+    if is_bootnode {
+        governor.set_peer_bootnode(node_id, true);
+        tracing::info!(peer = %node_id, "peer identified as bootnode");
+    }
 
-    // Step 4: Mark connected (triggers Hot/Warm promotion)
+    // Step 4: Mark connected (triggers Hot/Warm promotion -- bootnodes stay Warm)
     governor.mark_connected(node_id);
 
     // Step 5: Update shared peer list
@@ -412,9 +420,10 @@ pub async fn p2p_loop(
                             in_flight.remove(&addr);
                         }
 
-                        // Personal nodes are outbound-only (§8.1, §2.1).
-                        // Reject all inbound connections.
+                        // Personal nodes are outbound-only (§8.2), except from
+                        // trusted_peers (§8.2.2 Personal Area Network).
                         if direction == Direction::Inbound && node_role == "personal" {
+                            // TODO: check trusted_peers config for PAN exception
                             tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
                             outcome.conn.close(0u32.into(), b"outbound-only");
                             continue;
