@@ -929,7 +929,8 @@ def main():
     results = {}
     for scenario_arg in args.scenarios:
         scenario_path = Path(scenario_arg)
-        if not scenario_path.is_absolute():
+        if not scenario_path.is_absolute() and not scenario_path.exists():
+            # Try relative to harness dir (e.g. "scenarios/s2-r20.toml")
             scenario_path = SCRIPT_DIR / scenario_path
 
         if not scenario_path.exists():
