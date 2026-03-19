@@ -29,18 +29,28 @@ if [ -f "/keys/lead.identity.key" ] && [ -z "${CORDELIA_SWARM_INDEX:-}" ]; then
     fi
 fi
 
-# Initialise node (creates DB, token, config, channels).
-# cordelia init handles existing identity.key gracefully (loads it, skips keygen).
-if [ -n "${CORDELIA_SWARM_INDEX:-}" ] && [ -n "${CORDELIA_LEAD_IDENTITY:-}" ] && [ -n "${CORDELIA_LEAD_ENTITY_ID:-}" ]; then
-    # Swarm nodes use swarm-init with derived identity (§8.2.2)
-    if [ ! -f "$CORDELIA_DATA_DIR/identity.key" ]; then
+# Initialise if no identity exists.
+# Pre-seeded leads already have identity.key (copied above) but still need
+# init to create DB, token, config. cordelia init handles existing identity
+# gracefully (loads it, skips keygen).
+NEEDS_INIT=false
+if [ ! -f "$CORDELIA_DATA_DIR/identity.key" ]; then
+    NEEDS_INIT=true
+elif [ ! -f "$CORDELIA_DATA_DIR/cordelia.db" ]; then
+    # Pre-seeded identity but no DB yet (lead with mounted key)
+    NEEDS_INIT=true
+fi
+
+if [ "$NEEDS_INIT" = true ]; then
+    if [ -n "${CORDELIA_SWARM_INDEX:-}" ] && [ -n "${CORDELIA_LEAD_IDENTITY:-}" ] && [ -n "${CORDELIA_LEAD_ENTITY_ID:-}" ]; then
+        # Swarm nodes use swarm-init with derived identity (§8.2.2)
         cordelia --config "$CONFIG" swarm-init \
             --index "$CORDELIA_SWARM_INDEX" \
             --lead-identity "$CORDELIA_LEAD_IDENTITY" \
             --lead-entity-id "$CORDELIA_LEAD_ENTITY_ID"
+    else
+        cordelia --config "$CONFIG" init --name "$NODE_NAME" --non-interactive
     fi
-else
-    cordelia --config "$CONFIG" init --name "$NODE_NAME" --non-interactive
 fi
 
 # Start node (--config is a top-level arg, must precede subcommand)
