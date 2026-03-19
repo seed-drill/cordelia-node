@@ -307,7 +307,9 @@ PeerAddress {
 
 **Rationale:** In the pre-pivot design, gossiping group lists let any node map the full network's channel membership. Removing channel lists from peer-sharing closes this metadata leak. Peers discover shared channels via Channel-Announce (§4.4), which is point-to-point, not broadcast.
 
-**Peer selection for sharing:** Prefer peers with:
+**Peer selection for sharing:** The responder MUST shuffle the peer list before returning it. Each requester receives a random subset in a random order. This prevents all bootstrapping nodes from connecting to the same relays, distributing load across the relay mesh.
+
+Additional preferences (applied before shuffle):
 1. Recent activity (last_seen within 1 hour)
 2. Diverse IP subnets (avoid returning peers on the same /24)
 3. Exclude banned peers

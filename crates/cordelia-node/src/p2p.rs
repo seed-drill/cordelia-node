@@ -784,18 +784,37 @@ pub async fn p2p_loop(
                         let conn = conn.clone();
                         let pid = peer_id;
                         let count = items.len();
+                        let rtx = retry_fail_tx.clone();
                         tokio::spawn(async move {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
                                 Err(e) => {
                                     tracing::debug!(peer = %pid, items = count, error = %e, "repush open_bi failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
                                     return;
                                 }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
                             match cordelia_network::item_sync::send_push(&mut stream, &items).await {
                                 Ok(ack) => tracing::debug!(peer = %pid, items = count, stored = ack.stored, "repush delivered"),
-                                Err(e) => tracing::debug!(peer = %pid, items = count, error = %e, "repush failed"),
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, items = count, error = %e, "repush failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
+                                }
                             }
                         });
                     }
@@ -1444,7 +1463,28 @@ async fn handle_inbound_peer_share(
         let max = req.max_peers as usize;
         let current_peers = shared_peers
             .read()
-            .map(|p| p.iter().take(max).cloned().collect::<Vec<_>>())
+            .map(|p| {
+                // Shuffle before returning (§4.3): each requester gets a random
+                // subset in a random order, distributing load across the relay mesh.
+                let mut peers: Vec<_> = p.clone();
+                // Mix nanos + peer_id for per-request entropy
+                let seed = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .hash(&mut h);
+                    peer_id.0.hash(&mut h);
+                    h.finish() as usize
+                };
+                for i in (1..peers.len()).rev() {
+                    let j = (seed.wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);
+                    peers.swap(i, j);
+                }
+                peers.into_iter().take(max).collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let count = current_peers.len();
         let resp = cordelia_network::messages::WireMessage::PeerShareResponse(
