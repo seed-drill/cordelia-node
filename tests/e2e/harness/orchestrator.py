@@ -187,7 +187,8 @@ class S2Topology:
         self.bootnodes = topo.get("bootnodes", 2)
         self.personal = self.relays * self.ppz
         self.container_count = self.bootnodes + self.relays + self.personal
-        self.prefix = self.name
+        # Container prefix matches generate-s2.sh: "s2-{R}" (e.g. s2-20)
+        self.prefix = f"s2-{self.relays}"
 
     def relay_containers(self) -> list[str]:
         return [f"{self.prefix}-r{i}" for i in range(1, self.relays + 1)]
