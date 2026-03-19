@@ -89,30 +89,6 @@ pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Send a SyncRequest on an already-opened sync stream (protocol byte already written).
-///
-/// Used in batched sync (§4.5): multiple channels on one stream.
-/// The caller is responsible for writing the protocol byte once before the first call.
-pub async fn send_sync_request_raw(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
-    channel_id: &str,
-    since: Option<&str>,
-    limit: u32,
-) -> Result<SyncResponse, ItemSyncError> {
-    let req = WireMessage::SyncRequest(SyncRequest {
-        channel_id: channel_id.to_string(),
-        since: since.map(|s| s.to_string()),
-        limit,
-    });
-    write_frame(send, &req).await?;
-    let resp = read_frame(recv).await?;
-    match resp {
-        WireMessage::SyncResponse(sr) => Ok(sr),
-        _ => Err(ItemSyncError::UnexpectedMessage),
-    }
-}
-
 /// Handle a sync request (responder side).
 pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
