@@ -786,11 +786,7 @@ def phase_assertions(topo, cfg: dict, db: MetricsDB,
         # Check HKDF verification in lead logs
         for i in range(topo.leads):
             container = topo.lead_containers()[i]
-            logs = docker_exec(container,
-                               'sh -c "cat /proc/1/fd/2 2>/dev/null || echo \"\""',
-                               timeout=5)
-            # Alternative: docker logs
-            result = run(f"docker logs {container} 2>&1", check=False, timeout=10)
+            result = run(f"docker logs {container} 2>&1", check=False, timeout=15)
             logs = result.stdout if result.returncode == 0 else ""
             hkdf_count = logs.count("verified swarm child via HKDF")
             assert_check(
