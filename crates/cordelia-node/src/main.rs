@@ -414,11 +414,24 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_shutdown = tokio::sync::watch::channel(false);
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let role_for_p2p = config.network.role.clone();
+        // Parse trusted peers for PAN (§8.2.2)
+        let trusted_peer_ids: Vec<cordelia_core::NodeId> = config.network.trusted_peers.iter()
+            .filter_map(|tp| {
+                cordelia_crypto::bech32::decode_public_key(&tp.public_key)
+                    .map(cordelia_core::NodeId)
+                    .map_err(|e| tracing::warn!(key = %tp.public_key, error = %e, "invalid trusted_peer key"))
+                    .ok()
+            })
+            .collect();
+        if !trusted_peer_ids.is_empty() {
+            tracing::info!(count = trusted_peer_ids.len(), "trusted peers configured (PAN §8.2.2)");
+        }
+
         let p2p_handle = tokio::spawn(async move {
             let bootstrap_addrs: Vec<std::net::SocketAddr> = config.network.bootnodes.iter()
                 .filter_map(|b| b.addr.parse().ok())
                 .collect();
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), bootstrap_addrs).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), bootstrap_addrs, trusted_peer_ids).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────

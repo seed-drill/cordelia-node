@@ -47,6 +47,11 @@ pub struct NetworkConfig {
     pub dns_discovery: String,
     #[serde(default)]
     pub bootnodes: Vec<BootnodeConfig>,
+    /// Trusted peers for Personal Area Network (§8.2.2).
+    /// Swarm nodes use dial_policy=trusted_only and connect only to these peers.
+    /// Lead nodes accept inbound from these peers (exception to outbound-only).
+    #[serde(default)]
+    pub trusted_peers: Vec<TrustedPeerConfig>,
     /// Allow private/RFC-1918 addresses in peer sharing (for Docker/test envs).
     #[serde(default)]
     pub allow_private_addresses: bool,
@@ -55,6 +60,15 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootnodeConfig {
     pub addr: String,
+}
+
+/// Trusted peer for Personal Area Network (§8.2.2).
+/// Swarm nodes connect only to trusted peers. Lead nodes accept
+/// inbound from trusted peers (exception to outbound-only rule).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedPeerConfig {
+    /// Ed25519 public key in Bech32 format (cordelia_pk1...).
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +156,7 @@ impl Default for NetworkConfig {
                     addr: (*addr).into(),
                 })
                 .collect(),
+            trusted_peers: Vec::new(),
             allow_private_addresses: false,
         }
     }

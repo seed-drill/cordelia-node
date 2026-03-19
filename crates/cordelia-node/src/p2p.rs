@@ -226,6 +226,7 @@ pub async fn p2p_loop(
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
     bootstrap_addrs: Vec<std::net::SocketAddr>,
+    trusted_peer_ids: Vec<NodeId>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -241,11 +242,20 @@ pub async fn p2p_loop(
 
     let our_node_id = NodeId(state.identity.public_key());
 
-    // Governor
+    // Governor -- with dial policy based on trusted_peers config (§8.2.2)
     let gov_targets = cordelia_network::governor::GovernorTargets::from_config(&gov_config);
     let gov_timeouts = cordelia_network::governor::GovernorTimeouts::from_config(&gov_config);
+    let dial_policy = if !trusted_peer_ids.is_empty() && node_role == "personal" {
+        // Swarm node: only dial trusted peers (lead node)
+        cordelia_network::governor::DialPolicy::TrustedOnly(trusted_peer_ids.clone())
+    } else if node_role == "personal" {
+        cordelia_network::governor::DialPolicy::RelaysOnly
+    } else {
+        cordelia_network::governor::DialPolicy::All
+    };
     let mut governor =
-        cordelia_network::governor::Governor::new(gov_targets, vec![]).with_timeouts(gov_timeouts);
+        cordelia_network::governor::Governor::with_dial_policy(gov_targets, vec![], dial_policy)
+            .with_timeouts(gov_timeouts);
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
     let mut conn_tracker = cordelia_network::rate_limit::ConnectionTracker::new();
@@ -424,10 +434,12 @@ pub async fn p2p_loop(
                         // Personal nodes are outbound-only (§8.2), except from
                         // trusted_peers (§8.2.2 Personal Area Network).
                         if direction == Direction::Inbound && node_role == "personal" {
-                            // TODO: check trusted_peers config for PAN exception
-                            tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
-                            outcome.conn.close(0u32.into(), b"outbound-only");
-                            continue;
+                            if !trusted_peer_ids.contains(&outcome.node_id) {
+                                tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
+                                outcome.conn.close(0u32.into(), b"outbound-only");
+                                continue;
+                            }
+                            tracing::info!(peer = %outcome.node_id, "accepted inbound from trusted peer (PAN §8.2.2)");
                         }
 
                         // Connection tracker check (inbound only, §3.1)
