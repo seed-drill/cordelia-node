@@ -147,8 +147,8 @@ echo "Phase 3: Testing network channel propagation..."
 
 # Write from swarm-0-0
 WRITER=$(container_name "swarm-0-0")
-api_post "$WRITER" "channels/${TEST_CHANNEL}/items" \
-    '{"content": "s3-network-test-item", "item_type": "text"}' > /dev/null 2>&1
+api_post "$WRITER" "channels/${TEST_CHANNEL}/publish" \
+    "{\"content\": \"s3-network-test-item\", \"item_type\": \"text\"}" > /dev/null 2>&1 || true
 
 echo "  Published item from swarm-0-0 to ${TEST_CHANNEL}"
 echo "  Waiting for propagation (30s)..."
@@ -190,8 +190,8 @@ if [ "${LOCAL_COUNT:-0}" -ge 1 ]; then
         "SELECT channel_id FROM channels WHERE scope='local' LIMIT 1")
     echo "  Found local channel: $LOCAL_CH"
 
-    # Write to local channel from swarm-0-0
-    api_post "$SWARM_CN" "channels/raw/${LOCAL_CH}/items" \
+    # Write to local channel from swarm-0-0 (use channel_id directly)
+    api_post "$SWARM_CN" "channels/${LOCAL_CH}/publish" \
         '{"content": "local-only-item", "item_type": "text"}' > /dev/null 2>&1 || true
 
     sleep 15  # Wait for any propagation
