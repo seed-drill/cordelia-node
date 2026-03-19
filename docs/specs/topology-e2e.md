@@ -90,26 +90,73 @@ The Dockerfile includes a build-time `ldd` check that fails the build if the bin
 - `curl` + `jq`: health checks, metrics queries, REST API assertions
 - `ca-certificates`: TLS root certificates
 
-### 2.3 Network Model
+### 2.3 Zone-Based Network Model
 
-Each topology uses a Docker bridge network. Partitions are simulated using `iptables` rules inside containers (requires `--cap-add=NET_ADMIN`).
+Topologies use multiple Docker bridge networks to simulate production deployment zones. Personal nodes sit behind NAT on isolated home networks and can only reach relays/bootnodes, not each other directly. This prevents peer-sharing from bypassing relay-mediated traffic (which caused T2 to fail on flat networks).
+
+#### 2.3.1 Production Deployment Mapping
+
+| Production | Docker Zone | Model |
+|------------|-------------|-------|
+| Home personal node behind NAT | `home-N` network (isolated) | Can only reach B1/R1 on its own zone |
+| Enterprise node behind firewall | `enterprise` network (isolated) | Edge relay bridges enterprise <-> internet |
+| Relay (internet-facing) | `internet` + assigned zone networks | Multi-homed, bridges zones |
+| Bootnode (internet-facing) | `internet` + all zone networks | Multi-homed, discovery only |
+
+#### 2.3.2 IP Addressing Scheme
+
+Each zone gets its own /24 within 172.28.0.0/16:
+
+| Network | Subnet | Residents |
+|---------|--------|-----------|
+| `internet` | `172.28.0.0/24` | Bootnodes (.10+), Relays (.20+) |
+| `home-1` | `172.28.1.0/24` | P1 (.30), B1 (.10), R1 (.20) |
+| `home-2` | `172.28.2.0/24` | P2 (.30), B1 (.10), R1 (.20) |
+| `home-3` | `172.28.3.0/24` | P3 (.30), B1 (.10), R1 (.20) |
+| `enterprise` | `172.28.4.0/24` | P3 (.30), B1 (.10), R2 (.20) |
+
+Within each /24: `.10-.19` bootnodes, `.20-.29` relays, `.30-.79` personal nodes.
+
+#### 2.3.3 Multi-Homed Rules
+
+- **Bootnodes**: on `internet` + every home/enterprise network (public discovery service)
+- **Relays**: on `internet` + assigned home/enterprise networks (bridge between zones)
+- **Personal nodes**: on their own home/enterprise network ONLY
+
+When B1 shares P2's address (172.28.2.30) with P1 via peer-sharing, P1 cannot reach 172.28.2.0/24 because P1 is only on home-1 (172.28.1.0/24). The dial fails silently. Items flow through the relay. This is the desired behaviour with zero code changes to Cordelia.
+
+#### 2.3.4 Flat Network Topologies
+
+T1 (Minimal) and T6 (Bootnode Loss) remain on a single flat `cordelia-net` (172.28.0.0/24). These test direct peer-to-peer discovery and replication without relays, where zone isolation is not relevant.
+
+#### 2.3.5 Example (T2 zone model)
 
 ```yaml
 networks:
-  cordelia-net:
+  internet:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.0.0/24
+  home-1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  home-2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
 ```
 
-Nodes receive static IPs within the subnet for deterministic addressing:
+Nodes receive static IPs within their zone for deterministic addressing:
 
-| Role | IP Range | Example |
-|------|----------|---------|
-| Bootnodes | 172.28.0.10-19 | `172.28.0.10` |
-| Relays | 172.28.0.20-29 | `172.28.0.20`, `172.28.0.21` |
-| Personal nodes | 172.28.0.30-49 | `172.28.0.30`, `172.28.0.31`, `172.28.0.32` |
+| Role | Internet IP | Zone IP | Example |
+|------|------------|---------|---------|
+| Bootnodes | 172.28.0.10-19 | 172.28.{zone}.10-19 | B1: 172.28.0.10 (internet), 172.28.1.10 (home-1) |
+| Relays | 172.28.0.20-29 | 172.28.{zone}.20-29 | R1: 172.28.0.20 (internet), 172.28.1.20 (home-1) |
+| Personal nodes | -- | 172.28.{zone}.30-79 | P1: 172.28.1.30 (home-1 only) |
 
 #### 2.3.1 Known Limitations
 
@@ -388,31 +435,32 @@ This bypasses the ECIES PSK-Exchange protocol, which is tested separately in uni
 
 **Purpose**: Items flow through a relay. Validates store-and-forward, relay re-push, and role isolation (relay stores ciphertext, never holds PSKs).
 
+**Zone model**: `internet`, `home-1`, `home-2`. P1 and P2 are zone-isolated -- they cannot reach each other directly. All item traffic must flow through R1.
+
 **Topology**:
 ```
-[P1] ---- [R1] ---- [P2]
-             |
-           [B1]
+home-1           internet          home-2
+[P1] ---- [R1] ---- [B1] ---- [R1] ---- [P2]
 ```
 
 **Node configuration**:
 
-| Node | Role | push_policy | Channels | IP |
-|------|------|-------------|----------|-----|
-| `p1` | personal | subscribers_only | `test-channel` | 172.28.0.30 |
-| `p2` | personal | subscribers_only | `test-channel` | 172.28.0.31 |
-| `r1` | relay | -- | (all, transparent) | 172.28.0.20 |
-| `b1` | bootnode | -- | -- | 172.28.0.10 |
+| Node | Role | push_policy | Channels | Zone(s) | Zone IP(s) |
+|------|------|-------------|----------|---------|------------|
+| `b1` | bootnode | -- | -- | internet, home-1, home-2 | .0.10, .1.10, .2.10 |
+| `r1` | relay | -- | (all, transparent) | internet, home-1, home-2 | .0.20, .1.20, .2.20 |
+| `p1` | personal | subscribers_only | `test-channel` | home-1 only | .1.30 |
+| `p2` | personal | subscribers_only | `test-channel` | home-2 only | .2.30 |
 
-**P1 and P2 are configured with `hot_max = 1`** so they connect to the relay rather than each other directly. The relay is listed as an additional bootnode in both P1 and P2 configs (per configuration.md SS2.2, `[[network.bootnodes]]` is the canonical mechanism for advertising peers):
+Personal nodes bootstrap via zone-local B1 and R1 addresses:
 
 ```toml
-# List relay as bootnode so personal nodes discover it first
+# P1 config -- bootnodes on home-1 zone
 [[network.bootnodes]]
-addr = "172.28.0.10:9474"
+addr = "172.28.1.10:9474"
 
 [[network.bootnodes]]
-addr = "172.28.0.20:9474"
+addr = "172.28.1.20:9474"
 ```
 
 **Test sequence**:
@@ -430,21 +478,22 @@ addr = "172.28.0.20:9474"
 
 **Purpose**: A `pull_only` node receives items exclusively via Item-Sync, never via Item-Push. Validates anti-entropy as the sole delivery mechanism.
 
+**Zone model**: Same as T2 (`internet`, `home-1`, `home-2`). P2 pulls from R1 via zone-local address.
+
 **Topology**:
 ```
-[P1 subscribers_only] ---- [R1] ---- [P2 pull_only]
-                             |
-                           [B1]
+home-1                  internet                  home-2
+[P1 subscribers_only] ---- [R1] ---- [B1] ---- [R1] ---- [P2 pull_only]
 ```
 
 **Node configuration**:
 
-| Node | Role | push_policy | Channels | IP |
-|------|------|-------------|----------|-----|
-| `p1` | personal | subscribers_only | `test-channel` | 172.28.0.30 |
-| `p2` | personal | pull_only | `test-channel` | 172.28.0.31 |
-| `r1` | relay | -- | (all) | 172.28.0.20 |
-| `b1` | bootnode | -- | -- | 172.28.0.10 |
+| Node | Role | push_policy | Channels | Zone(s) | Zone IP(s) |
+|------|------|-------------|----------|---------|------------|
+| `b1` | bootnode | -- | -- | internet, home-1, home-2 | .0.10, .1.10, .2.10 |
+| `r1` | relay | -- | (all) | internet, home-1, home-2 | .0.20, .1.20, .2.20 |
+| `p1` | personal | subscribers_only | `test-channel` | home-1 only | .1.30 |
+| `p2` | personal | pull_only | `test-channel` | home-2 only | .2.30 |
 
 **Test configuration**: `sync_interval_realtime_secs = 10` on P2 (fast pull for testing).
 
@@ -462,27 +511,28 @@ addr = "172.28.0.20:9474"
 
 **Purpose**: Fan-out across multiple relays. Validates that items reach all personal nodes without duplication and that relay re-push does not create infinite loops.
 
+**Zone model**: `internet`, `home-1`, `home-2`, `enterprise`. R1 serves home zones, R2 is the enterprise edge relay.
+
 **Topology**:
 ```
-[P1] ---- [R1] ---- [P2]
-  \         |         /
-   \       [B1]     /
-    \       |      /
-     ---- [R2] ----
-             |
-           [P3]
+home-1          internet          home-2
+[P1] ---- [R1] ---- [B1] ---- [R1] ---- [P2]
+                      |
+                    [R2]
+                      |
+                    [P3]           enterprise
 ```
 
 **Node configuration**:
 
-| Node | Role | Channels | IP |
-|------|------|----------|-----|
-| `p1` | personal | `test-channel` | 172.28.0.30 |
-| `p2` | personal | `test-channel` | 172.28.0.31 |
-| `p3` | personal | `test-channel` | 172.28.0.32 |
-| `r1` | relay | (all) | 172.28.0.20 |
-| `r2` | relay | (all) | 172.28.0.21 |
-| `b1` | bootnode | -- | 172.28.0.10 |
+| Node | Role | Channels | Zone(s) | Zone IP(s) |
+|------|------|----------|---------|------------|
+| `b1` | bootnode | -- | all (internet, home-1, home-2, enterprise) | .0.10, .1.10, .2.10, .4.10 |
+| `r1` | relay | (all) | internet, home-1, home-2 | .0.20, .1.20, .2.20 |
+| `r2` | relay | (all) | internet, enterprise | .0.21, .4.20 |
+| `p1` | personal | `test-channel` | home-1 only | .1.30 |
+| `p2` | personal | `test-channel` | home-2 only | .2.30 |
+| `p3` | personal | `test-channel` | enterprise only | .4.30 |
 
 **Test sequence**:
 1. Bring up all 6 nodes, wait for bootstrap
@@ -497,22 +547,33 @@ addr = "172.28.0.20:9474"
 
 **Purpose**: Network partition splits the topology. Items published during partition are eventually delivered after heal. Validates convergence (P6).
 
+**Zone model**: `internet`, `home-1`, `home-2`. B1 is internet-only. P1/P2 bootstrap via their local relay (B1 is unreachable from home zones). Partition is between R1 and R2 on the internet network.
+
 **Topology (pre-partition)**:
 ```
-[P1] ---- [R1] ---- [R2] ---- [P2]
-                 |
-               [B1]
+home-1          internet          home-2
+[P1] ---- [R1] ---- [B1] ---- [R2] ---- [P2]
 ```
 
-**Partition**: Drop all traffic between R1 and R2 (simulates a network split isolating P1+R1 from P2+R2).
+**Node configuration**:
+
+| Node | Role | Zone(s) | Zone IP(s) |
+|------|------|---------|------------|
+| `b1` | bootnode | internet only | .0.10 |
+| `r1` | relay | internet, home-1 | .0.20, .1.20 |
+| `r2` | relay | internet, home-2 | .0.21, .2.20 |
+| `p1` | personal | home-1 only | .1.30 |
+| `p2` | personal | home-2 only | .2.30 |
+
+**Partition**: Drop all traffic between R1 and R2 on the internet network (the only network they share). Personal nodes remain connected to their local relay.
 
 **Partition method**:
 ```bash
-# On R1: drop all packets to/from R2
+# On R1: drop all packets to/from R2 (internet IP 172.28.0.21)
 docker exec t5-r1 iptables -A INPUT -s 172.28.0.21 -j DROP
 docker exec t5-r1 iptables -A OUTPUT -d 172.28.0.21 -j DROP
 
-# On R2: drop all packets to/from R1
+# On R2: drop all packets to/from R1 (internet IP 172.28.0.20)
 docker exec t5-r2 iptables -A INPUT -s 172.28.0.20 -j DROP
 docker exec t5-r2 iptables -A OUTPUT -d 172.28.0.20 -j DROP
 ```
@@ -571,24 +632,26 @@ docker exec t5-r2 iptables -D OUTPUT -d 172.28.0.20 -j DROP
 
 **Purpose**: Items published to channel A never appear on nodes subscribed only to channel B. The relay stores items for both channels but does not leak between them.
 
+**Zone model**: `internet`, `home-1`, `home-2`, `home-3`. Each personal node is zone-isolated; all traffic flows through R1.
+
 **Topology**:
 ```
-[P1: ch-alpha] ---- [R1] ---- [P2: ch-beta]
+home-1                internet               home-2
+[P1: ch-alpha] ---- [R1] ---- [B1] ---- [R1] ---- [P2: ch-beta]
                       |
-                    [B1]
-                      |
-              [P3: ch-alpha, ch-beta]
+                    [R1] ---- [P3: ch-alpha, ch-beta]
+                    home-3
 ```
 
 **Node configuration**:
 
-| Node | Channels | IP |
-|------|----------|-----|
-| `p1` | `ch-alpha` only | 172.28.0.30 |
-| `p2` | `ch-beta` only | 172.28.0.31 |
-| `p3` | `ch-alpha`, `ch-beta` | 172.28.0.32 |
-| `r1` | (all, transparent relay) | 172.28.0.20 |
-| `b1` | -- | 172.28.0.10 |
+| Node | Channels | Zone(s) | Zone IP(s) |
+|------|----------|---------|------------|
+| `b1` | -- | all (internet, home-1, home-2, home-3) | .0.10, .1.10, .2.10, .3.10 |
+| `r1` | (all, transparent relay) | all | .0.20, .1.20, .2.20, .3.20 |
+| `p1` | `ch-alpha` only | home-1 only | .1.30 |
+| `p2` | `ch-beta` only | home-2 only | .2.30 |
+| `p3` | `ch-alpha`, `ch-beta` | home-3 only | .3.30 |
 
 **Test sequence**:
 1. Bring up all 5 nodes, wait for bootstrap
@@ -1246,7 +1309,55 @@ Phase 1 release target: all factors > 90%.
 
 ---
 
-## 12. References
+## 12. Scale Testing
+
+### 12.1 Neighborhood Model
+
+At scale (100+ nodes), one Docker network per personal node risks hitting kernel iptables limits. Instead, personal nodes are grouped into **neighborhoods** (zones) of configurable size, each served by 1+ relays.
+
+### 12.2 Generator
+
+```bash
+# Usage: generate-scale.sh <total> [bootnodes] [relays] [zone_size]
+bash tests/e2e/scale/generate-scale.sh 500 2 10 50
+```
+
+Parameters for `500 2 10 50`:
+- 488 personal nodes / 50 per zone = 10 zones
+- 10 relays (1 per zone, round-robin), each on internet + its assigned home zone
+- 2 bootnodes on internet + all 10 home zones
+- 12 Docker networks total (1 internet + 10 homes + 1 spare)
+
+### 12.3 Scale IP Scheme
+
+| Network | Subnet | Contents |
+|---------|--------|----------|
+| `internet` | `172.28.0.0/24` | B1-B2 (.10-.11), R1-R10 (.20-.29) |
+| `home-1` | `172.28.1.0/24` | P1-P50 (.30-.79), R1 (.20), B1 (.10) |
+| `home-2` | `172.28.2.0/24` | P51-P100 (.30-.79), R2 (.20), B1 (.10) |
+| ... | ... | ... |
+| `home-10` | `172.28.10.0/24` | P451-P488 (.30-.67), R10 (.20), B1 (.10) |
+
+Each /24 holds up to 50 personal nodes (.30-.79). With 256 available third-octets, maximum ~12,800 personal nodes.
+
+### 12.4 Memory Budget (32GB VM)
+
+| Component | Estimate |
+|-----------|----------|
+| 500 containers * ~30MB RSS | ~15 GB |
+| 12 Docker networks | negligible |
+| Kernel + Docker daemon | ~2 GB |
+| OS + buffers | ~5 GB |
+| Headroom | ~10 GB |
+
+### 12.5 Convergence Timeout
+
+- <= 100 nodes: 300s (60 polls * 5s)
+- \> 100 nodes: 450s (90 polls * 5s) to accommodate multi-hop relay latency
+
+---
+
+## 13. References
 
 | Document | Sections Referenced |
 |----------|-------------------|

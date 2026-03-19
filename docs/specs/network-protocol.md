@@ -307,10 +307,14 @@ PeerAddress {
 
 **Rationale:** In the pre-pivot design, gossiping group lists let any node map the full network's channel membership. Removing channel lists from peer-sharing closes this metadata leak. Peers discover shared channels via Channel-Announce (§4.4), which is point-to-point, not broadcast.
 
-**Peer selection for sharing:** Prefer peers with:
+**Peer selection for sharing:** The responder MUST shuffle the peer list before returning it. Each requester receives a random subset in a random order. This prevents all bootstrapping nodes from connecting to the same relays, distributing load across the relay mesh.
+
+Additional preferences (applied before shuffle):
 1. Recent activity (last_seen within 1 hour)
 2. Diverse IP subnets (avoid returning peers on the same /24)
 3. Exclude banned peers
+
+**Address filtering on share:** The node MUST only share addresses of relay and bootnode peers. Personal node addresses are never shared (§8.2: personal nodes are outbound-only and should not receive unsolicited inbound connections).
 
 **Address validation on receive:** Before adding received addresses to the cold peer table, the node MUST filter out:
 - RFC 1918 private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
@@ -325,11 +329,9 @@ Outbound connections to peer-shared addresses SHOULD be rate-limited to 1/second
 
 Event-driven announcements with periodic reconciliation. This replaces the pre-pivot GroupExchange protocol.
 
-**Dual purpose:** Channel-Announce serves both (a) channel membership discovery between peers and (b) **relay routing table construction** (§7.2). When a relay receives ChannelJoined/ChannelLeft from a hot peer, it updates its routing table (`Map<channel_id, Set<NodeId>>`). Relay re-push uses this table to forward items only to non-relay peers interested in the item's channel. This makes Channel-Announce the routing protocol for the relay mesh.
+**Purpose:** Channel-Announce serves channel membership discovery between peers and governor scoring (§5.5). When a relay receives ChannelJoined/ChannelLeft from a hot peer, it tracks channel interest for metrics, relay affinity scoring, and future optimisation. Channel-Announce is **informational** -- it is NOT used for push routing decisions. Relay re-push targets all hot relay peers (broadcast, §7.2); personal nodes and keepers receive items via pull-sync (§4.5).
 
-**Relay participation:** Relays are **receive-only** for Channel-Announce. They listen to peers' announcements to build the routing table but do NOT send `ChannelJoined` for channels they carry. This prevents metadata amplification across the relay mesh. Relay-to-relay item forwarding uses broadcast (§7.2), not channel-aware routing.
-
-**Phase 1:** The routing table is built but not consumed (relays broadcast to all hot peers). Phase 2: channel-aware routing activates, using the routing table for relay-to-personal-node push filtering.
+**Relay participation:** Relays are **receive-only** for Channel-Announce. They listen to peers' announcements but do NOT send `ChannelJoined` for channels they carry. This prevents metadata amplification across the relay mesh.
 
 **Stream direction:** QUIC connections support bidirectional stream creation. Either side (initiator or responder) can open new streams at any time. This is critical for secret keeper connectivity (§8.5): the keeper initiates the connection to its relay, but the relay opens streams to push items back to the keeper.
 
@@ -519,6 +521,20 @@ Note: `author_id` is raw bytes(32) on the wire for compactness. The signed metad
 ```
 
 **Sync flow:**
+
+Phase 0 (relay channel discovery): Before per-channel sync, relay nodes send a `SyncChannelListRequest` to learn which channels the peer has items for. The responder returns `SyncChannelListResponse` with its stored channel IDs. The initiator merges these into its `relay_learned_channels` set for this and future sync cycles. This solves the bootstrap problem: a relay with 0 items can discover channels from its peers, then sync items for those channels.
+
+```
+SyncChannelListRequest {}           // "What channels do you have?"
+
+SyncChannelListResponse {
+    channel_ids: [string]           // Channels the responder has stored items for
+}
+```
+
+Phase 0 runs on every relay sync cycle, on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
+
+Phase 1-4 (per-channel sync, unchanged):
 1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync
 2. Responder returns `SyncResponse` with item headers since the cursor
 3. Initiator compares headers to local storage:
@@ -559,12 +575,16 @@ Item {
 
 | Mode | SDK name | Sync interval | Push on write? |
 |------|----------|---------------|----------------|
-| Realtime | `realtime` | 60s (safety net) | Yes (Item-Push) |
+| Realtime | `realtime` | 10s (primary delivery for personal/keeper) | Yes (to hot relays only) |
 | Batch | `batch` | 900s (15 min) | No |
+
+**Pull-sync is the primary delivery mechanism for personal nodes and secret keepers.** Relays push items to other relays (single-hop, §7.2), but personal nodes and keepers receive items exclusively via pull-sync. This makes personal nodes responsible for fetching what they need, eliminates relay-side routing state, and bounds relay complexity to store-and-forward.
 
 **Sync targets: Hot peers only (§5.1, §5.4.2).** Item-Sync runs exclusively on Hot peers. Warm peers maintain connections for keepalive and peer-sharing but do NOT participate in data exchange. Bootnode peers (§8.2) are never sync targets -- they do not store or replicate items.
 
 **Peer selection for pull-sync:** The node MUST sync from all **hot** peers each cycle (governor state = Hot, §5). Each peer sync is independent and MAY run concurrently (separate tasks). This ensures O(hot_max) sync cost per cycle, bounded by the governor's hot peer set regardless of total network size.
+
+**Channel source for pull-sync:** Personal nodes sync their subscribed channels (`list_for_entity`). Relay nodes sync `relay_learned_channels`: the union of channels they have stored items for (`SELECT DISTINCT channel_id FROM items`) and channels discovered from peers via Phase 0 channel discovery (`SyncChannelListResponse`). This breaks the bootstrap dependency: a relay with 0 items discovers channels from peers, then syncs items for those channels. The `relay_learned_channels` set is maintained in memory and rebuilt each sync cycle from stored items + peer responses.
 
 The governor (§5) manages which peers are hot:
 - Peers that deliver items the node didn't have are scored higher (§5.5)
@@ -623,11 +643,16 @@ PushAck {
 ```
 
 **When Item-Push fires:**
-- On local write to a realtime channel: push to all hot peers sharing the channel, plus all hot relay peers. Respects `push_policy` (§8.1.1).
-- Relay re-push: if a relay (§8.3) stores an item (`stored > 0`), it re-pushes to all hot peers except the sender. Bootnodes (§8.2) do NOT re-push -- they are discovery-only.
+- On local write to a realtime channel: push to hot relay peers only. The originator (personal node or keeper) pushes to its hot relays; relays handle distribution. Non-relay peers receive items via Item-Sync pull (§4.5). Respects `push_policy` (§8.1.1).
+- Relay re-push (single-hop): if a relay stores an item received from a **non-relay** peer (`stored > 0`), it re-pushes to all **hot relay peers** except the sender. Items received from other relays are stored but NOT re-pushed (single-hop, no cascade). Bootnodes (§8.2) do NOT re-push -- they are discovery-only.
 - Bootnode nodes never initiate or relay Item-Push. They participate only in Handshake, Peer-Sharing, and Keep-Alive.
+- Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5), not via relay push. This eliminates relay-side routing state and Channel-Announce dependency for push routing.
 
-**Loop prevention:** Duplicate items (same `content_hash` + `item_id` already stored) yield `stored: 0`, stopping the re-push chain.
+**Single-hop relay push:** Only the relay that receives an item from its originator (personal node or keeper) re-pushes to the relay mesh. Intermediate relays that receive via re-push store the item but do NOT re-push. This bounds amplification to O(R) per item (one push per relay), not O(R²). Pull-sync (§4.5) is the safety net for any items missed during re-push.
+
+**Loop prevention:** Single-hop re-push eliminates cascading by design. Additionally, duplicate items (same `content_hash` + `item_id` already stored) yield `stored: 0`, preventing re-push even if the single-hop check were bypassed.
+
+**Re-push item filtering:** The relay MUST only queue items that were **newly stored** (`store_item` returned true) for re-push. Items that were deduplicated or already present MUST NOT be queued, even if other items in the same batch were new.
 
 **Signature verification:** Before storing a pushed item, the receiver MUST verify the `signature` against the `author_id` and metadata envelope (ECIES spec §11.7). Reject items with invalid signatures.
 
@@ -991,7 +1016,7 @@ When a node receives a pushed or synced item:
 3. **Dedup**: Same `item_id` + same `content_hash` → skip (idempotent).
 4. **Conflict resolution**: Same `item_id`, different `content_hash` → last-writer-wins by `published_at`. Deterministic tiebreak compares the hex-encoded `content_hash` strings lexicographically (character-by-character, using ASCII ordering: 0-9, a-f). The item with the lexicographically smaller `content_hash` wins. This ensures all replicas converge to the same item regardless of receive order.
 5. **Store**: Write encrypted blob to SQLite. Never decrypt at the P2P layer.
-6. **Relay re-push**: If this node is a relay and `stored > 0`, re-push to all hot peers except sender.
+6. **Relay re-push (single-hop)**: If this node is a relay AND the sender is a non-relay peer AND `stored > 0`, re-push newly stored items to all hot **relay** peers except sender. Items received from other relays are NOT re-pushed.
 7. **Log**: Record in access log (author_id, channel_id, item_id, action, timestamp).
 
 ### 6.3 Tombstones
@@ -1047,7 +1072,7 @@ accept IF channel_id IN relay_subscribed_channels
          OR channel_id IN relay_learned_channels
 ```
 
-Phase 1 relays are transparent: they accept all channels. The `relay_learned_channels` set grows as relays observe items flowing through them. Future phases add explicit allowlists.
+Phase 1 relays are transparent: they accept all channels. The `relay_learned_channels` set grows from two sources: (a) channels observed in stored items (`SELECT DISTINCT channel_id FROM items`) and (b) channels discovered from peers via sync Phase 0 (`SyncChannelListResponse`, §4.5). Future phases add explicit allowlists.
 
 Bootnodes (§8.2) never reach Gate 2 -- they do not participate in item replication.
 
@@ -1063,43 +1088,40 @@ Strict membership check. The channel must be explicitly subscribed on the destin
 
 ### 7.2 Relay Re-Push
 
-When a relay (§8.4) stores an item (`PushAck.stored > 0`), it re-pushes to hot peers that have **announced interest** in the item's channel_id via Channel-Announce (§4.4). Bootnode peers (§8.3) and the original sender are excluded.
+When a relay stores an item received from a **non-relay** peer (personal node or secret keeper) and `stored > 0`, it re-pushes to all **hot relay peers** except the sender. This is single-hop: items received from other relays are stored but NOT re-pushed.
 
-**Channel-aware routing:** The relay maintains a routing table built from Channel-Announce messages received from personal nodes and secret keepers: `Map<channel_id, Set<NodeId>>`. Relays themselves are **receive-only** for Channel-Announce -- they listen to peers' announcements to build the routing table but do NOT send `ChannelJoined` for channels they carry. This prevents metadata amplification across the relay mesh.
+**Single-hop design:** Only the first relay (that receives from the originator) re-pushes. This bounds amplification to O(R) per item. Pull-sync (§4.5) provides eventual consistency for any items missed during re-push. The relay mesh converges within one pull-sync interval (10s for realtime channels).
 
-On receiving an item for channel X, the relay applies two forwarding rules:
-1. **To other relays (hot relay peers):** ALWAYS forward (broadcast). Relay-to-relay push is never channel-filtered. This ensures the relay mesh propagates all items regardless of local interest, maintaining the anti-censorship property.
-2. **To personal nodes and keepers (hot non-relay peers):** Forward only if the peer is in the routing table for channel X (channel-filtered). This is the bandwidth optimisation.
+**Push targets: relay peers only.** Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5). The relay does not maintain per-channel routing tables for push delivery. This eliminates Channel-Announce as a routing dependency and makes relays stateless store-and-forward nodes.
 
-This is NOT content filtering -- the relay never inspects the encrypted payload. It routes by channel_id (plaintext header) to non-relay peers that have explicitly asked for that channel. Any peer can announce interest in any channel. The relay makes no policy decision on what is allowed.
+**Channel-Announce role (informational):** Channel-Announce (§4.4) remains implemented for governor scoring and relay affinity (§5.5). Relays receive announcements from peers and track channel interest for metrics and future optimisation, but do NOT use Channel-Announce data for push routing decisions.
 
 **Anti-censorship principle:** Relays MUST be agnostic to content. They store and forward ciphertext without knowing what's inside. Channel-aware routing is an efficiency optimisation (don't send data to peers that didn't ask for it), not a censorship mechanism. Content sovereignty resides at the edge: personal nodes and secret keepers choose what channels to subscribe to. Relays MUST NOT refuse to forward based on channel_id, content patterns, or originator identity.
 
-**Lazy storage:** The relay SHOULD only store items for channels that at least one of its hot peers has announced interest in. Items for channels with no local interest are forwarded to other relays (if they have announced interest) but not persisted. This reduces relay storage from O(all_channels) to O(locally_interesting_channels).
+**Lazy storage (future):** The relay SHOULD only store items for channels that at least one of its hot peers has announced interest in. Items for channels with no local interest are forwarded to other relays but not persisted. This reduces relay storage from O(all_channels) to O(locally_interesting_channels). Phase 1: relays store everything (transparent).
 
 **Relay affinity:** The governor (§5.4) SHOULD prefer promoting relays that carry the node's subscribed channels. When a personal node's governor evaluates warm relay peers for promotion to Hot, it SHOULD prefer relays that have announced interest in the personal node's channels. This naturally clusters related nodes on the same relays without explicit sharding, providing self-organising channel locality.
 
-**Loop prevention:** Re-pushed items that are already stored yield `stored: 0`, terminating the chain. Convergence: each relay stores the item at most once, re-pushes at most once.
+**Loop prevention:** Single-hop re-push eliminates cascading by design. Additionally, dedup (`stored: 0` for known items) prevents re-push even if the single-hop check were bypassed. Convergence: each relay stores the item at most once, the originator's relay re-pushes at most once.
 
-**Amplification bound:** For a channel with I interested relays (not total relays R), one item generates at most I store operations and I × fan_out push messages. With channel-aware routing, the amplification is bounded by the channel's relay footprint, not the total network size.
+**Amplification bound:** Single-hop re-push generates exactly R-1 push messages per item (one to each relay peer except sender). This is O(R), independent of network topology or channel count.
 
-| Scale | Channels | Total Relays | Broadcast cost/item | Channel-routed cost/item |
-|-------|----------|-------------|--------------------|-----------------------|
-| Small (<1K nodes) | 100 | 7 | 350 pushes | ~350 (same, all relays carry all) |
-| Medium (<100K nodes) | 10,000 | 100 | 5,000 pushes | ~500 pushes (10 interested relays/channel) |
-| Large (>100K nodes) | 100,000 | 1,000 | 50,000 pushes | ~500 pushes (channel affinity clustering) |
+| Scale | Total Relays | Cost/item (single-hop) |
+|-------|-------------|----------------------|
+| Small (<1K nodes) | 7 | 6 pushes |
+| Medium (<100K nodes) | 100 | 99 pushes |
+| Large (>100K nodes) | 1,000 | 999 pushes |
 
-**Concurrency:** The relay MUST push to all interested peers present in the routing table at the time the push handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this push cycle; the peer will receive the item via the next Item-Sync pull (§4.5). The relay SHOULD log at DEBUG level for each peer it pushes to and each peer it skips (with reason).
-
-**Phase 1 simplification:** Relays are transparent -- store everything, push to all hot peers. Channel-aware routing activates when Channel-Announce data is available (Phase 2). The broadcast model is acceptable for <1000 nodes and <100 channels.
+**Concurrency:** The relay MUST push to all hot relay peers present at the time the re-push handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this push cycle; the peer will receive the item via the next Item-Sync pull (§4.5).
 
 ### 7.3 Channel Intersection
 
-`channel_intersection(peer)` determines which channels a peer and this node have in common. Computed from Channel-Announce data (§4.4).
+`channel_intersection(peer)` determines which channels a peer and this node have in common. Computed from Channel-Announce data (§4.4) and sync Phase 0 discovery (§4.5).
 
 ```
 local_channels = subscribed_channels
     UNION relay_learned_channels (if this node is a relay)
+    // relay_learned_channels = stored items channels + sync Phase 0 discovered channels
 
 channel_intersection(peer) = peer.channels INTERSECT local_channels
     (bootnode peers excluded -- they have no channel state)
@@ -1120,16 +1142,17 @@ Phase 1 defines four node roles. Each role determines which mini-protocols the n
 
 | Capability | Personal | Bootnode | Relay | Keeper |
 |-----------|----------|----------|-------|--------|
-| Accepts inbound QUIC | No (unless configured) | Yes | Yes | Yes |
+| Accepts inbound QUIC | No (outbound-only) | Yes | Yes | Yes |
 | Handshake (0x01) | Yes | Yes | Yes | Yes |
 | Keep-Alive (0x02) | Yes | Yes | Yes | Yes |
 | Peer-Sharing (0x03) | Yes | Yes (primary function) | Yes | Yes |
-| Channel-Announce (0x04) | Yes | No | Yes | Yes |
-| Item-Sync (0x05) | Yes | No | Yes | Yes |
-| Item-Push (0x06) | Yes (respects push_policy) | No | Yes (re-push) | Yes |
+| Channel-Announce (0x04) | Yes (send) | No | Yes (receive-only) | Yes (send) |
+| Item-Sync (0x05) | Yes (pull, primary delivery) | No | Yes (serve + pull) | Yes (pull, primary delivery) |
+| Item-Push (0x06) | Originator push to relays only | No | Single-hop re-push to relays | Originator push to relays only |
 | PSK-Exchange (0x07) | Yes (if holds PSK) | No | No | Yes |
 | Stores items | Own channels only | No | Ciphertext (store-and-forward) | Yes (can decrypt anchored) |
 | Holds PSKs | Own channels | Never | Never | Anchored channels |
+| Receives items via | Pull-sync (§4.5) | Never | Push + pull-sync | Pull-sync (§4.5) |
 | Phase | 1 | 1 | 1 | 2+ |
 
 ### 8.1 Network Topology
@@ -1155,8 +1178,10 @@ The user's local node. Runs as a daemon on the user's machine. Its job is reliab
 - Small hot set: 1-2 relays + a few personal peers. Selection prefers lowest RTT (indicator of network colocation/quality)
 - Never accepts inbound connections from the public internet (unless explicitly configured)
 - MAY specify preferred peers (e.g., within the same org) via `[[network.trusted_peers]]`
-- Pushes items to hot peers sharing the same channel (Gate 1, §7.1), subject to `push_policy`
-- `dial_policy = "all"`
+- Pushes items to hot relay peers only on local write (originator push). Never pushes to other personal nodes.
+- Receives items from peers exclusively via Item-Sync pull (§4.5), every 10s for realtime channels.
+- Makes outbound connections only (§2.1). Rejects all inbound QUIC connections.
+- `dial_policy = "relays_only"`
 
 **Governor profile:** `hot_min=2, hot_max=2, hot_min_relays=1, warm_min=3, warm_max=10, cold_max=50`
 
@@ -1166,16 +1191,52 @@ Personal nodes support a configurable `push_policy` that controls outbound item 
 
 | Policy | Behaviour | Use case |
 |--------|-----------|----------|
-| `subscribers_only` (default) | Push to hot peers sharing the channel + hot relay peers | Normal operation. Peer-to-peer replication. |
+| `relay_only` (default) | Push to hot relay peers on local write. Receive via pull-sync. | Normal operation. Minimal outbound traffic. |
 | `pull_only` | Never initiate Item-Push. Only serve items via Item-Sync when requested. | Enterprise-constrained networks, bandwidth-sensitive environments. |
 
-**Why `pull_only` matters:** Without this option, a personal node on a busy channel pushes items to every hot peer sharing that channel. On a channel with 50 subscribers, this creates significant outbound traffic from the user's machine -- the same pattern that caused Skype's supernode routing to overwhelm enterprise networks. `pull_only` makes the node a pure consumer: it pulls items on its own schedule via Item-Sync and never generates unsolicited outbound traffic beyond Keep-Alive and Channel-Announce.
+**Design rationale:** Personal nodes push only to their hot relays (1-2 peers). The relay mesh handles distribution to other relays (single-hop re-push, §7.2). Other personal nodes and keepers receive items by pulling from their own hot relays. This makes personal nodes lightweight: they push O(1) streams on write and pull O(hot_max) streams per sync cycle. No routing tables, no Channel-Announce dependency for push routing.
 
-**Trade-off:** `pull_only` nodes receive items with higher latency (bounded by `sync_interval_realtime_secs`, default 60s) since they rely on polling rather than push. They also do not contribute to item propagation.
+**Trade-off:** Personal nodes receive items via pull-sync with latency bounded by `sync_interval` (10s for realtime, 900s for batch). This is acceptable for AI agent memory workloads where sub-second latency is not required.
+
+#### 8.2.2 Personal Area Network (Agent Swarm)
+
+An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" personal node that connects to the relay mesh, with swarm member nodes connecting only to the lead. The lead acts as a local relay for the swarm: stores items, serves pull-sync, and handles relay connectivity. Swarm nodes never touch the public network.
+
+**Topology:** `swarm_node -> lead_node -> relay -> relay_mesh`
+
+**Configuration:**
+
+| Node | role | hot_max | dial_policy | trusted_peers | Notes |
+|------|------|---------|-------------|---------------|-------|
+| Lead | personal | N+2 | relays_only | -- | N swarm nodes + 2 relay slots |
+| Swarm | personal | 1 | trusted_only | [lead] | Single connection to lead |
+
+**No new role needed.** The existing governor and dial_policy machinery handles swarm topology:
+- Lead runs `hot_min_relays = 1` to maintain relay connectivity
+- Swarm nodes use `dial_policy = "trusted_only"` with the lead's address
+- Swarm nodes pull-sync from the lead, which pull-syncs from relays
+- Lead serves inbound Item-Sync from swarm nodes (all nodes serve inbound sync)
+
+**Inbound connection exception:** Personal nodes reject inbound connections (§8.2), **except** from peers listed in `trusted_peers`. This allows swarm nodes to connect to the lead while maintaining the outbound-only posture for all other traffic.
+
+**Use cases:**
+- AI agent orchestration: one daemon per machine, sub-agents share memory via the lead
+- Team environments: shared office node acts as local relay for team members' agents
+- Development: test swarms without deploying relay infrastructure
 
 ### 8.3 Bootnode
 
-Lightweight discovery node. Its sole function is peer introduction -- Handshake and Peer-Sharing only. Once a node discovers relays and peers via a bootnode, gossip takes over and the bootnode connection can be released.
+Lightweight discovery node. Its sole function is peer introduction -- Handshake and Peer-Sharing only. Once a node discovers relays and peers via a bootnode, gossip takes over and the bootnode connection MUST be released.
+
+**Bootnode connection lifecycle:**
+1. Node connects to bootnode(s) during bootstrap
+2. Requests peer-share addresses (discovers relay addresses)
+3. Connects to discovered relays
+4. Once `hot_min_relays` relay connections are established, releases bootnode connection
+5. Governor MUST NOT promote bootnode peers to Hot (they don't participate in data exchange)
+6. Bootnode connections occupy Warm slots only, used for peer-sharing, evicted once relays are available
+
+**Why eviction matters:** Personal nodes have `hot_max=2`. If bootnodes occupy hot slots, no room remains for relays. The node can discover relay addresses via peer-share but never connect because hot is full. Keeping bootnodes out of the hot set ensures hot slots are reserved for data-carrying peers (relays, keepers, or trusted personal nodes).
 
 - Publicly addressable (static IP or DNS)
 - Accepts inbound QUIC connections
@@ -1200,7 +1261,8 @@ Infrastructure node forming the network backbone. Relays store-and-forward encry
 - Accepts inbound QUIC connections from personal nodes, other relays, bootnodes, and secret keepers
 - Participates in all mini-protocols except PSK-Exchange (never holds PSKs)
 - Stores encrypted items as ciphertext only (see data-formats.md §3.1, Relay auto-creation)
-- Re-pushes items to all hot peers except sender (§7.2)
+- Re-pushes items to hot **relay** peers only, single-hop from originator (§7.2)
+- Serves items to personal nodes and keepers via Item-Sync pull requests
 - **Highly connected to other relays** -- the relay mesh is the network backbone
 - Expected to be permanently available with demanding resource requirements
 - Never reveals secret keeper addresses in Peer-Sharing responses

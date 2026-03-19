@@ -1,4 +1,4 @@
-# T2 Personal node 1
+# T2 Personal node 1 (home-1 zone)
 [identity]
 entity_id = "p1_test"
 
@@ -14,11 +14,12 @@ push_policy = "subscribers_only"
 allow_private_addresses = true
 dns_discovery = ""
 
+# Bootnodes: B1 + R1 on home-1 zone
 [[network.bootnodes]]
-addr = "172.28.0.10:9474"
+addr = "172.28.1.10:9474"
 
 [[network.bootnodes]]
-addr = "172.28.0.20:9474"
+addr = "172.28.1.20:9474"
 
 [governor]
 hot_min = 5

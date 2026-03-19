@@ -216,6 +216,27 @@ long, wasting push bandwidth.
 
 ## 4. Protocol Rate Limits
 
+### 3x Headroom Principle (RATE_LIMIT_HEADROOM = 3)
+
+**Principle:** All per-peer rate limits are set to **3x the expected legitimate rate**.
+This provides burst tolerance (reconnect catch-up, rapid publish after partitioning)
+while catching sustained abuse (4x+ over a sliding window = clearly malicious).
+
+Every rate limit is derived from the expected rate of the protocol it protects,
+multiplied by the headroom constant. No magic numbers.
+
+| Protocol | Expected rate | Limit (3x) | Derivation |
+|----------|--------------|------------|------------|
+| Writes | 12/min (60/REPUSH_INTERVAL) | 36/min | `3 × (60 / 5)` |
+| Syncs | 6/min (RATE_WINDOW/TICK) | 18/min | `3 × (60 / 10)` |
+| Peer-shares | 2/min (RATE_WINDOW/PING) | 6/min | `3 × (60 / 30)` |
+
+**If you increase to 5x:** More burst tolerance but a wider window for sustained abuse.
+An attacker can send 5x normal traffic before triggering any response.
+
+**If you decrease to 2x:** Tight. A legitimate relay processing a burst from multiple
+sources may trigger false positives. 2x leaves no room for timing variance.
+
 ### clock_skew_tolerance = 300s (5 minutes)
 
 **Rationale:** Maximum allowed clock difference between two nodes during
@@ -324,7 +345,53 @@ peer crash (QUIC idle timeout was the only backstop).
 
 ---
 
-*Spec version: 1.1*
+## 7. P2P Select Loop Parameters
+
+### MAX_IN_FLIGHT = 10
+
+**Rationale:** Maximum concurrent outbound connect attempts (spawned tasks).
+Caps resource usage and prevents accidental DoS against many peers
+simultaneously. 10 concurrent QUIC handshakes is ~10 sockets + 10 TLS
+sessions -- negligible on relay hardware, meaningful on personal devices.
+
+**If you increase to 50:** Burst of 50 simultaneous handshakes on startup.
+May trigger rate limits on destination peers. Acceptable for relays.
+
+**If you decrease to 3:** Bootstrap slows proportionally. 21 peers at 3
+concurrent = 7 waves, ~35s minimum mesh formation at R=20.
+
+### CONNECTS_PER_CYCLE = 3
+
+**Rationale:** Maximum outbound connect attempts per peer-share tick (5s)
+during **post-bootstrap steady state**. Rate-limits gossip-discovered
+connections to prevent an attacker from rapidly cycling peers through the
+connect pipeline. 3 per 5s = 36/min, well below any resource concern but
+slow enough that Sybil peers can't dominate the connection set.
+
+**Bootstrap exception:** When `hot < hot_min`, all candidates come from
+trusted bootnodes or their immediate peer-share responses. During this
+phase, CONNECTS_PER_CYCLE is replaced by MAX_IN_FLIGHT -- connect as fast
+as concurrency allows. This is safe because:
+
+1. Bootstrap peers are from **configured, trusted bootnodes** (operator-defined).
+2. The governor's urgent mode already bypasses `min_warm_tenure` for the
+   same reason (trusted source, need fast mesh formation).
+3. Post-bootstrap, churn and scoring handle quality control for all peers
+   regardless of how they were initially promoted.
+4. Cardano follows the same model: topology-configured peers are immediately
+   trusted; discovered peers go through the mini-protocol pipeline.
+
+**Derivation:** At R=20, a relay needs 21 hot peers. With MAX_IN_FLIGHT=10
+during bootstrap, two waves complete in ~10s. Post-bootstrap, 3 per 5s keeps
+the gossip exploration rate bounded. The transition from bootstrap to steady
+state is automatic: once `hot >= hot_min`, the rate drops to CONNECTS_PER_CYCLE.
+
+**If you increase to 10:** Faster gossip exploration but more aggressive
+outbound traffic. May be appropriate for relays in large meshes.
+
+---
+
+*Spec version: 1.2*
 *Created: 2026-03-16*
-*Updated: 2026-03-17*
+*Updated: 2026-03-18*
 *Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*

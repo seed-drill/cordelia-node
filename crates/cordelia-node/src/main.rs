@@ -330,6 +330,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);
     let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (announce_tx, announce_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = web::Data::new(cordelia_api::state::AppState {
         db: Mutex::new(conn),
@@ -341,6 +342,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         peers_hot: std::sync::atomic::AtomicU64::new(0),
         peers_warm: std::sync::atomic::AtomicU64::new(0),
         push_tx: Some(push_tx),
+        announce_tx: Some(announce_tx),
     });
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -382,7 +384,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
             for bn in &bootnodes {
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
                     conn_mgr.connect_to(bn.addr),
                 ).await {
                     Ok(Ok(node_id)) => {
@@ -413,7 +415,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let role_for_p2p = config.network.role.clone();
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone()).await;
+            let bootstrap_addrs: Vec<std::net::SocketAddr> = config.network.bootnodes.iter()
+                .filter_map(|b| b.addr.parse().ok())
+                .collect();
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), bootstrap_addrs).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────

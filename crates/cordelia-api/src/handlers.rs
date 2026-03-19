@@ -75,6 +75,11 @@ pub async fn subscribe(
             let now = Utc::now().to_rfc3339();
             channels::add_member(&db, &channel_id, &pk, "member")?;
 
+            // Notify P2P layer to send channel-announce to hot peers
+            if let Some(ref tx) = state.announce_tx {
+                let _ = tx.send(channel_id.clone());
+            }
+
             Ok(HttpResponse::Ok().json(SubscribeResponse {
                 channel: canonical,
                 channel_id,
@@ -102,6 +107,11 @@ pub async fn subscribe(
 
             // Store PSK to filesystem
             psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
+
+            // Notify P2P layer to send channel-announce to hot peers
+            if let Some(ref tx) = state.announce_tx {
+                let _ = tx.send(ch.channel_id.clone());
+            }
 
             Ok(HttpResponse::Ok().json(SubscribeResponse {
                 channel: canonical,

@@ -1,4 +1,4 @@
-# T5 Personal node 2 (right partition, connects to R2 only)
+# T5 Personal node 2 (home-2 zone, connects to R2 only)
 [identity]
 entity_id = "p2_test"
 
@@ -14,8 +14,9 @@ push_policy = "subscribers_only"
 allow_private_addresses = true
 dns_discovery = ""
 
+# Bootstrap via R2 on home-2 zone (B1 is internet-only, unreachable)
 [[network.bootnodes]]
-addr = "172.28.0.21:9474"
+addr = "172.28.2.20:9474"
 
 [governor]
 hot_min = 1

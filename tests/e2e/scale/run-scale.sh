@@ -98,8 +98,15 @@ done
 # Wait for convergence
 echo ""
 echo "Step 5: Waiting for convergence..."
+# Increase convergence budget for large topologies (multi-hop relay latency)
+if [ "$TOTAL" -gt 100 ]; then
+    MAX_ATTEMPTS=90  # 90 * 5s = 450s
+else
+    MAX_ATTEMPTS=60  # 60 * 5s = 300s
+fi
+
 CONVERGED=0
-for attempt in $(seq 1 60); do
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
     TOTAL_WITH_ITEMS=0
     for i in $(seq 1 "$PERSONAL"); do
         COUNT=$(db_query "s${TOTAL}-p${i}" \

@@ -137,8 +137,10 @@ pub struct PeerInfo {
     pub demoted_at: Option<Instant>,
     pub disconnect_count: u32,
     pub last_disconnected: Option<Instant>,
-    /// Whether this peer is a relay/bootnode (eligible for dial under restricted policies).
+    /// Whether this peer is a relay (eligible for dial under restricted policies).
     pub is_relay: bool,
+    /// Whether this peer is a bootnode (discovery-only, never promoted to Hot, §8.3).
+    pub is_bootnode: bool,
     /// Items this peer relayed to us (contribution tracking, §16.1).
     pub items_relayed: u64,
     /// Items we requested from this peer via sync (contribution tracking, §16.1).
@@ -163,6 +165,7 @@ impl PeerInfo {
             disconnect_count: 0,
             last_disconnected: None,
             is_relay: false,
+            is_bootnode: false,
             items_relayed: 0,
             items_requested: 0,
             score_ema: 0.0,
@@ -190,12 +193,14 @@ impl PeerInfo {
             .max(1.0);
 
         let throughput = self.items_delivered as f64 / elapsed;
-        let rtt_factor = self.rtt_ms.map(|r| 1.0 / (1.0 + r / 100.0)).unwrap_or(0.5);
+        let rtt_factor = self.rtt_ms
+            .map(|r| 1.0 / (1.0 + r / protocol::SCORE_RTT_DENOMINATOR_MS))
+            .unwrap_or(protocol::SCORE_RTT_DEFAULT_FACTOR);
 
         // Contribution factor: penalise relays that don't relay items (§5.5)
         let contribution_factor = if self.is_relay {
             let ratio = self.items_relayed as f64 / (self.items_requested.max(1) as f64);
-            ratio.clamp(0.1, 2.0)
+            ratio.clamp(protocol::SCORE_CONTRIBUTION_MIN, protocol::SCORE_CONTRIBUTION_MAX)
         } else {
             1.0
         };
@@ -344,7 +349,12 @@ impl Governor {
         {
             peer.connected_since = Some(Instant::now());
             peer.last_activity = Instant::now();
-            if hot_count < self.targets.hot_min {
+            // Bootnodes are discovery-only: always Warm, never Hot (§8.3).
+            // They don't participate in data exchange and must not occupy hot slots.
+            if peer.is_bootnode {
+                tracing::info!(peer = %node_id, "gov: cold -> warm (bootnode, discovery-only)");
+                peer.set_state(PeerState::Warm);
+            } else if hot_count < self.targets.hot_min {
                 // Bootstrap: urgently need hot peers, bypass tenure guard
                 tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
                 peer.set_state(PeerState::Hot);
@@ -447,7 +457,7 @@ impl Governor {
             let multiplier = 1u32
                 .checked_shl(escalation.saturating_sub(1))
                 .unwrap_or(u32::MAX);
-            let duration = (base * multiplier).min(Duration::from_secs(7 * 86400));
+            let duration = (base * multiplier).min(Duration::from_secs(protocol::BAN_ESCALATION_CAP_SECS));
             tracing::warn!(
                 peer = %node_id,
                 from,
@@ -469,6 +479,13 @@ impl Governor {
     pub fn set_peer_relay(&mut self, node_id: &NodeId, is_relay: bool) {
         if let Some(peer) = self.peers.get_mut(node_id) {
             peer.is_relay = is_relay;
+        }
+    }
+
+    /// Mark a peer as a bootnode (discovery-only, never Hot, §8.3).
+    pub fn set_peer_bootnode(&mut self, node_id: &NodeId, is_bootnode: bool) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.is_bootnode = is_bootnode;
         }
     }
 
@@ -502,6 +519,25 @@ impl Governor {
 
     /// Get hot peers relevant for a channel (relays + peers with matching group).
     /// Relays always receive all items (they serve all channels).
+    /// Add a channel to a peer's group set (idempotent).
+    /// Used when a peer sends ChannelAnnounce (0x04) with ChannelJoined.
+    pub fn add_peer_channel(&mut self, node_id: &NodeId, channel_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            let ch = channel_id.to_string();
+            if !peer.groups.contains(&ch) {
+                peer.groups.push(ch);
+            }
+        }
+    }
+
+    /// Remove a channel from a peer's group set.
+    /// Used when a peer sends ChannelAnnounce (0x04) with ChannelLeft.
+    pub fn remove_peer_channel(&mut self, node_id: &NodeId, channel_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.groups.retain(|g| g != channel_id);
+        }
+    }
+
     pub fn hot_peers_for_channel(&self, channel_id: &str) -> Vec<NodeId> {
         self.peers
             .values()
@@ -670,12 +706,13 @@ impl Governor {
             return; // Hot set is full
         }
 
-        // Collect eligible warm peers (past hysteresis cooldown)
+        // Collect eligible warm peers (past hysteresis cooldown, not bootnodes)
         let eligible: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| {
                 p.state == PeerState::Warm
+                    && !p.is_bootnode
                     && p.demoted_at
                         .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
             })
@@ -1861,7 +1898,7 @@ mod tests {
         let id = make_node_id(1);
         gov.add_peer(id.clone(), make_addr(), vec![]);
 
-        let seven_days = Duration::from_secs(7 * 86400);
+        let seven_days = Duration::from_secs(protocol::BAN_ESCALATION_CAP_SECS);
 
         // Ban 35 times: triggers both the .min(7 days) cap and checked_shl overflow
         for _ in 0..35 {
@@ -2013,5 +2050,66 @@ mod tests {
             "no overlap with g4"
         );
         assert!(!peer.has_group_overlap(&[]), "no overlap with empty set");
+    }
+
+    #[test]
+    fn test_add_peer_channel_idempotent() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&id).unwrap().state = PeerState::Hot;
+
+        gov.add_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch1".to_string()]);
+
+        // Idempotent: adding again doesn't duplicate
+        gov.add_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch1".to_string()]);
+
+        gov.add_peer_channel(&id, "ch2");
+        assert_eq!(gov.peer_info(&id).unwrap().groups.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_peer_channel() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+        let id = make_node_id(1);
+        gov.add_peer(id.clone(), make_addr(), vec!["ch1".into(), "ch2".into()]);
+        gov.peers.get_mut(&id).unwrap().state = PeerState::Hot;
+
+        gov.remove_peer_channel(&id, "ch1");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch2".to_string()]);
+
+        // Removing non-existent channel is a no-op
+        gov.remove_peer_channel(&id, "ch99");
+        assert_eq!(gov.peer_info(&id).unwrap().groups, vec!["ch2".to_string()]);
+    }
+
+    #[test]
+    fn test_add_peer_channel_affects_hot_peers_for_channel() {
+        let mut gov = Governor::new(GovernorTargets::default(), vec![]);
+
+        let relay_id = make_node_id(1);
+        gov.add_peer(relay_id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&relay_id).unwrap().state = PeerState::Hot;
+        gov.peers.get_mut(&relay_id).unwrap().is_relay = true;
+
+        let personal_id = make_node_id(2);
+        gov.add_peer(personal_id.clone(), make_addr(), vec![]);
+        gov.peers.get_mut(&personal_id).unwrap().state = PeerState::Hot;
+
+        // Before add: only relay serves ch1
+        assert_eq!(gov.hot_peers_for_channel("ch1").len(), 1);
+
+        // After add: relay + personal serve ch1
+        gov.add_peer_channel(&personal_id, "ch1");
+        let ch1_peers = gov.hot_peers_for_channel("ch1");
+        assert_eq!(ch1_peers.len(), 2);
+        assert!(ch1_peers.contains(&relay_id));
+        assert!(ch1_peers.contains(&personal_id));
+
+        // After remove: back to relay only
+        gov.remove_peer_channel(&personal_id, "ch1");
+        assert_eq!(gov.hot_peers_for_channel("ch1").len(), 1);
     }
 }

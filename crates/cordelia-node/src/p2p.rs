@@ -7,10 +7,13 @@
 
 use actix_web::web;
 use cordelia_core::NodeId;
+use cordelia_network::connection::Direction;
 
 /// Governor events sent from spawned tasks back to the p2p_loop.
 pub enum GovEvent {
     ItemsDelivered(NodeId, u64),
+    ChannelAnnounced(NodeId, String),
+    ChannelWithdrawn(NodeId, String),
 }
 
 /// Open a bidirectional QUIC stream with a standard 10s timeout.
@@ -89,7 +92,7 @@ pub fn post_connect(
     shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     state: &web::Data<cordelia_api::state::AppState>,
     node_role: &str,
-    relay_push_tx: &tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
+    repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     peer_rates: &std::sync::Arc<
         std::sync::Mutex<
@@ -97,18 +100,23 @@ pub fn post_connect(
         >,
     >,
     peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     // Step 1: Extract peer roles from handshake
-    let is_relay = conn_mgr
+    let (is_relay, is_bootnode) = conn_mgr
         .get_peer(node_id)
         .map(|pc| {
             let roles = &pc.handshake.peer_roles;
             tracing::info!(peer = %node_id, roles = ?roles, "post_connect: checking peer roles");
-            roles.contains(&"relay".to_string())
+            (
+                roles.contains(&"relay".to_string()),
+                roles.contains(&"bootnode".to_string()),
+            )
         })
         .unwrap_or_else(|| {
             tracing::warn!(peer = %node_id, "post_connect: get_peer returned None");
-            false
+            (false, false)
         });
 
     // Step 2: Add to governor
@@ -119,8 +127,13 @@ pub fn post_connect(
         governor.set_peer_relay(node_id, true);
         tracing::info!(peer = %node_id, "peer identified as relay");
     }
+    // Mark bootnode role (prevents Hot promotion, §8.3)
+    if is_bootnode {
+        governor.set_peer_bootnode(node_id, true);
+        tracing::info!(peer = %node_id, "peer identified as bootnode");
+    }
 
-    // Step 4: Mark connected (triggers Hot/Warm promotion)
+    // Step 4: Mark connected (triggers Hot/Warm promotion -- bootnodes stay Warm)
     governor.mark_connected(node_id);
 
     // Step 5: Update shared peer list
@@ -137,20 +150,64 @@ pub fn post_connect(
         .peers_warm
         .store(warm as u64, std::sync::atomic::Ordering::Relaxed);
 
-    // Step 7: Spawn stream handler
+    // Step 6b: Sync peer states for protocol gating (§2.1)
+    // Without this, push handler rejects items from peers promoted during
+    // bootstrap/accept (before first governor tick syncs peer_states).
+    if let Ok(mut states) = peer_states.write() {
+        for peer in governor.all_peers() {
+            let state_byte = match peer.state {
+                cordelia_network::governor::PeerState::Cold => 0u8,
+                cordelia_network::governor::PeerState::Warm => 1,
+                cordelia_network::governor::PeerState::Hot => 2,
+                cordelia_network::governor::PeerState::Banned { .. } => 0,
+            };
+            states.insert(peer.node_id.clone(), state_byte);
+        }
+    }
+
+    // Step 6c: Sync relay peer set for single-hop re-push (§7.2)
+    if let Ok(mut relays) = peer_relays.write() {
+        for peer in governor.all_peers() {
+            if peer.is_relay {
+                relays.insert(peer.node_id.clone());
+            }
+        }
+    }
+
+    // Step 7: Send channel announcements if peer promoted to Hot and we're not a relay
+    // (relays are receive-only for channel-announce per §4.4)
+    let peer_is_hot = governor
+        .peer_info(node_id)
+        .map(|p| p.state == cordelia_network::governor::PeerState::Hot)
+        .unwrap_or(false);
+    if peer_is_hot && node_role != "relay" {
+        if let Some(conn) = conn_mgr.get_connection(node_id) {
+            let conn = conn.clone();
+            let announce_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                    tracing::debug!(error = %e, "channel announcements failed on connect");
+                }
+            });
+        }
+    }
+
+    // Step 8: Spawn stream handler
     if let Some(conn) = conn_mgr.get_connection(node_id) {
         let conn = conn.clone();
         let peer_id = node_id.clone();
         let db_state = state.clone();
         let peers_ref = shared_peers.clone();
         let role = node_role.to_string();
-        let ptx = relay_push_tx.clone();
+        let rtx = repush_tx.clone();
         let dtx = delivery_tx.clone();
         let rates = peer_rates.clone();
         let states = peer_states.clone();
+        let relays = peer_relays.clone();
+        let gtx = gov_tx.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, ptx, dtx, rates, states,
+                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx,
             )
             .await;
         });
@@ -163,19 +220,19 @@ pub async fn p2p_loop(
     mut conn_mgr: cordelia_network::connection::ConnectionManager,
     state: web::Data<cordelia_api::state::AppState>,
     mut push_rx: tokio::sync::mpsc::UnboundedReceiver<cordelia_api::state::PushItem>,
+    mut announce_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     allow_private_addresses: bool,
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
+    bootstrap_addrs: Vec<std::net::SocketAddr>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
-    // Create a push sender for handle_peer_streams (relay re-push)
-    let relay_push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem> = state
-        .push_tx
-        .as_ref()
-        .expect("push_tx must be set when P2P is running")
-        .clone();
+    // Relay re-push channel: items queued here by handle_inbound_push,
+    // flushed in batches (de-duped by item_id) every REPUSH_INTERVAL_SECS.
+    let (repush_tx, mut repush_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(cordelia_network::messages::Item, NodeId)>();
 
     // Shared peer list
     let shared_peers: std::sync::Arc<
@@ -206,8 +263,16 @@ pub async fn p2p_loop(
     let peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
+    // Shared set of relay peer IDs. Used by handle_inbound_push for single-hop
+    // re-push check (§7.2: only re-push items from non-relay senders).
+    let peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
+
+    // Governor event channel (created before bootstrap so post_connect can pass it)
+    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
@@ -218,20 +283,22 @@ pub async fn p2p_loop(
             &shared_peers,
             &state,
             &node_role,
-            &relay_push_tx,
+            &repush_tx,
             &delivery_tx,
             &peer_rates,
             &peer_states,
+            &peer_relays,
+            &gov_tx,
         );
     }
     governor.tick();
 
-    // P2P loop timers -- these are CHECK intervals, not the protocol intervals.
-    // The p2p loop checks frequently (5-10s) and then decides whether to act
-    // based on the protocol intervals (e.g., 300s for peer sharing).
-    const P2P_PEER_SHARE_CHECK_SECS: u64 = 5;
-    const P2P_SYNC_CHECK_SECS: u64 = 10;
-    const P2P_GOV_TICK_SECS: u64 = 10;
+    // P2P loop timers. Peer-share and sync run at their protocol intervals
+    // (from protocol.rs). Governor tick uses the config value.
+    const P2P_PEER_SHARE_CHECK_SECS: u64 = 5; // How often to check for connect candidates
+    let p2p_sync_check_secs = cordelia_core::protocol::REALTIME_SYNC_INTERVAL_SECS;
+
+    let p2p_gov_tick_secs = gov_config.tick_interval_secs as u64;
 
     let mut peer_share_interval =
         tokio::time::interval(std::time::Duration::from_secs(P2P_PEER_SHARE_CHECK_SECS));
@@ -239,201 +306,642 @@ pub async fn p2p_loop(
     peer_share_interval.tick().await;
 
     let mut sync_interval =
-        tokio::time::interval(std::time::Duration::from_secs(P2P_SYNC_CHECK_SECS));
+        tokio::time::interval(std::time::Duration::from_secs(p2p_sync_check_secs));
     sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sync_interval.tick().await;
 
-    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(P2P_GOV_TICK_SECS));
+    let mut gov_interval = tokio::time::interval(std::time::Duration::from_secs(p2p_gov_tick_secs));
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 
-    // Governor event channel
-    let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
+    // Push retry queue: sender-side retry with exponential backoff.
+    // Spawned push tasks report failures via retry_fail_tx. The select loop
+    // drains failures into retry_queue and re-attempts on a 2s timer.
+    // Max 3 retries (2s, 4s, 8s backoff). After that, pull-sync is the safety net.
+    // Silent drop on receiver side stays -- no NACK (DoS amplification vector).
+    const PUSH_RETRY_MAX: u8 = 3;
+    struct RetryEntry {
+        item: cordelia_network::messages::Item,
+        peer_id: NodeId,
+        channel_id: String,
+        exclude_peer: Option<NodeId>,
+        attempt: u8,
+        retry_at: tokio::time::Instant,
+    }
+    let (retry_fail_tx, mut retry_fail_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RetryEntry>();
+    let mut retry_queue: Vec<RetryEntry> = Vec::new();
+    let mut retry_interval =
+        tokio::time::interval(std::time::Duration::from_secs(2));
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retry_interval.tick().await;
+
+    // Relay re-push flush timer: batch + de-dupe items before forwarding.
+    // Jittered start so relays don't all flush simultaneously (§7.2).
+    let repush_base = cordelia_core::protocol::REPUSH_INTERVAL_SECS;
+    let repush_jitter = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        our_node_id.0.hash(&mut h);
+        (h.finish() % (repush_base * 1000)) as u64 // ms jitter within interval
+    };
+    let repush_start = std::time::Duration::from_millis(repush_jitter);
+    tokio::time::sleep(repush_start).await;
+    let mut repush_interval =
+        tokio::time::interval(std::time::Duration::from_secs(repush_base));
+    repush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    repush_interval.tick().await;
+
+    // Peer-share has two independent concerns:
+    // (a) Request addresses from peers (subject to per-peer cooldown for rate limits)
+    // (b) Connect to discovered candidates (every cycle from cached addresses)
+    //
+    // Address cache persists between cycles so connects continue even when
+    // all peers are on cooldown (critical during early mesh formation with few peers).
+    let mut peer_share_rotation: usize = 0;
+    let mut peer_share_target_idx: usize = 0;
+    let mut peer_share_last_request: std::collections::HashMap<NodeId, std::time::Instant> =
+        std::collections::HashMap::new();
+    let peer_share_cooldown = std::time::Duration::from_secs(
+        cordelia_core::protocol::RATE_WINDOW_SECS
+            / cordelia_core::protocol::PEER_SHARES_PER_PEER_PER_MINUTE as u64,
+    );
+    let mut peer_share_cache: Vec<cordelia_network::messages::PeerAddress> = Vec::new();
+
+    // Non-blocking connect infrastructure (cordelia-node#8).
+    // Spawned tasks send results back via channels; the select loop
+    // registers connections and updates governor state inline.
+    let endpoint = conn_mgr.endpoint();
+    let connect_ctx = conn_mgr.connect_context();
+    type ConnectMsg = Result<
+        cordelia_network::connection::ConnectOutcome,
+        (std::net::SocketAddr, String),
+    >;
+    let (connect_tx, mut connect_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectMsg>();
+    let (discovery_tx, mut discovery_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Vec<cordelia_network::messages::PeerAddress>>();
+    let mut in_flight: std::collections::HashSet<std::net::SocketAddr> =
+        std::collections::HashSet::new();
+    let mut gov_pending: std::collections::HashMap<std::net::SocketAddr, NodeId> =
+        std::collections::HashMap::new();
+    const MAX_IN_FLIGHT: usize = 10;
+    const CONNECTS_PER_CYCLE: usize = 3;
 
     loop {
         tokio::select! {
-            // ── Accept incoming connection ─────────────────────────────
-            result = conn_mgr.accept_incoming() => {
+            // ── Accept incoming connection (non-blocking) ─────────────
+            result = endpoint.accept() => {
                 match result {
-                    Ok(node_id) => {
-                        // Connection limit check (§3.1) -- post-handshake for now
-                        let remote_ip = conn_mgr.get_connection(&node_id)
-                            .map(|c| c.remote_address().ip());
-                        if let Some(ip) = remote_ip {
+                    Some(incoming) => {
+                        let ctx = connect_ctx.clone();
+                        let tx = connect_tx.clone();
+                        tokio::spawn(async move {
+                            match cordelia_network::connection::inbound_accept(&ctx, incoming).await {
+                                Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "inbound accept failed");
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        tracing::warn!("QUIC endpoint closed");
+                    }
+                }
+            }
+
+            // ── Connect/accept results ───────────────────────────────
+            Some(result) = connect_rx.recv() => {
+                match result {
+                    Ok(outcome) => {
+                        let addr = outcome.addr;
+                        let direction = outcome.direction;
+
+                        if direction == Direction::Outbound {
+                            in_flight.remove(&addr);
+                        }
+
+                        // Personal nodes are outbound-only (§8.2), except from
+                        // trusted_peers (§8.2.2 Personal Area Network).
+                        if direction == Direction::Inbound && node_role == "personal" {
+                            // TODO: check trusted_peers config for PAN exception
+                            tracing::debug!(peer = %outcome.node_id, "rejecting inbound: personal nodes are outbound-only");
+                            outcome.conn.close(0u32.into(), b"outbound-only");
+                            continue;
+                        }
+
+                        // Connection tracker check (inbound only, §3.1)
+                        if direction == Direction::Inbound {
+                            let ip = outcome.conn.remote_address().ip();
                             if !conn_tracker.would_allow(ip) {
-                                tracing::warn!(peer = %node_id, ip = %ip, "rejecting: connection limit exceeded");
-                                conn_mgr.disconnect(&node_id);
+                                tracing::warn!(peer = %outcome.node_id, ip = %ip, "rejecting: connection limit exceeded");
+                                outcome.conn.close(0u32.into(), b"limit");
                                 continue;
                             }
                             conn_tracker.add(ip);
                         }
 
-                        let count = conn_mgr.connection_count() as u64;
-                        state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(peer = %node_id, peers = count, "accepted inbound connection");
-                        post_connect(
-                            &node_id, &conn_mgr, &mut governor, &shared_peers,
-                            &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
-                        );
+                        if direction == Direction::Outbound {
+                            gov_pending.remove(&addr);
+                        }
+
+                        match conn_mgr.register(outcome) {
+                            Ok(node_id) => {
+                                let count = conn_mgr.connection_count() as u64;
+                                state.peers_hot.store(count, std::sync::atomic::Ordering::Relaxed);
+                                let dir_label = if direction == Direction::Inbound {
+                                    "accepted inbound connection"
+                                } else {
+                                    "connected via peer-sharing"
+                                };
+                                tracing::info!(peer = %node_id, peers = count, "{}", dir_label);
+                                post_connect(
+                                    &node_id, &conn_mgr, &mut governor, &shared_peers,
+                                    &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
+                                    &peer_relays, &gov_tx,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(addr = %addr, error = %e, "register failed");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "inbound connection failed");
+                    Err((addr, error)) => {
+                        in_flight.remove(&addr);
+                        if let Some(nid) = gov_pending.remove(&addr) {
+                            governor.mark_dial_failed(&nid);
+                        }
+                        tracing::debug!(addr = %addr, error = %error, "outbound connect failed");
                     }
                 }
             }
 
-            // ── Peer-sharing ──────────────────────────────────────────
+            // ── Discovery results ────────────────────────────────────
+            Some(discovered) = discovery_rx.recv() => {
+                for pa in discovered {
+                    let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                    if nid != our_node_id && !peer_share_cache.iter().any(|c| c.node_id == pa.node_id) {
+                        peer_share_cache.push(pa);
+                    }
+                }
+            }
+
+            // ── Peer-sharing (spawn discovery + connects) ─────────────
+            // (a) Request addresses from a peer whose cooldown has expired (spawned).
+            // (b) Spawn up to CONNECTS_PER_CYCLE candidates from the cache.
             _ = peer_share_interval.tick() => {
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
-                let target = peers[0].clone();
-                if let Some(conn) = conn_mgr.get_connection(&target) {
-                    let conn = conn.clone();
-                    let (mut send, mut recv) = match open_bi(&conn).await {
-                        Ok(s) => s,
-                        Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share open_bi"); continue; }
-                    };
-                    let mut stream = tokio::io::join(&mut recv, &mut send);
-                    let discovered = match cordelia_network::peer_sharing::request_peers(&mut stream, cordelia_core::protocol::DEFAULT_MAX_PEERS_SHARE).await {
-                        Ok(d) => d,
-                        Err(e) => { tracing::debug!(peer = %target, error = %e, "peer-share request failed"); continue; }
-                    };
-                    let own_addr = conn_mgr.local_addr().ok();
-                    let valid = if allow_private_addresses {
-                        discovered
-                    } else {
-                        cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
-                    };
-                    for peer_addr in &valid {
-                        let peer_node_id = NodeId(
-                            peer_addr.node_id.as_slice().try_into().unwrap_or([0u8; 32])
-                        );
-                        if peer_node_id == our_node_id || conn_mgr.is_connected(&peer_node_id) {
-                            continue;
-                        }
-                        if let Some(addr_str) = peer_addr.addrs.first()
-                            && let Ok(addr) = addr_str.parse() {
-                                match tokio::time::timeout(
-                                    cordelia_network::codec::STREAM_TIMEOUT,
-                                    conn_mgr.connect_to(addr),
+
+                // (a) Discovery: find a peer whose cooldown has expired
+                let now = std::time::Instant::now();
+                let mut target = None;
+                for offset in 0..peers.len() {
+                    let idx = (peer_share_target_idx + offset) % peers.len();
+                    let candidate = &peers[idx];
+                    let elapsed = peer_share_last_request
+                        .get(candidate)
+                        .map(|t| now.duration_since(*t))
+                        .unwrap_or(peer_share_cooldown);
+                    if elapsed >= peer_share_cooldown {
+                        target = Some(candidate.clone());
+                        peer_share_target_idx = idx + 1;
+                        break;
+                    }
+                }
+                if let Some(target) = target {
+                    peer_share_last_request.insert(target.clone(), now);
+                    if let Some(conn) = conn_mgr.get_connection(&target) {
+                        let conn = conn.clone();
+                        let own_addr = conn_mgr.local_addr().ok();
+                        let dtx = discovery_tx.clone();
+                        let allow_private = allow_private_addresses;
+                        tokio::spawn(async move {
+                            if let Ok((mut send, mut recv)) = open_bi(&conn).await {
+                                let mut stream = tokio::io::join(&mut recv, &mut send);
+                                if let Ok(discovered) = cordelia_network::peer_sharing::request_peers(
+                                    &mut stream, cordelia_core::protocol::DEFAULT_MAX_PEERS_SHARE,
                                 ).await {
-                                    Ok(Ok(new_id)) => {
-                                        tracing::info!(peer = %new_id, peers = conn_mgr.connection_count(), "connected via peer-sharing");
-                                        post_connect(
-                                            &new_id, &conn_mgr, &mut governor, &shared_peers,
-                                            &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
-                                        );
-                                    }
-                                    Ok(Err(e)) => { tracing::debug!(addr = %addr_str, error = %e, "peer-share connect failed"); }
-                                    Err(_) => { tracing::warn!(addr = %addr_str, "peer-share connect timed out (10s)"); }
+                                    let valid = if allow_private {
+                                        discovered
+                                    } else {
+                                        cordelia_network::peer_sharing::filter_valid_addresses(&discovered, own_addr.as_ref())
+                                    };
+                                    let _ = dtx.send(valid);
                                 }
                             }
+                        });
                     }
+                }
+
+                // (b) Connect: spawn candidates from cache (non-blocking).
+                // During bootstrap (hot < hot_min), peers come from trusted
+                // bootnodes -- connect as fast as MAX_IN_FLIGHT allows.
+                // Post-bootstrap, rate-limit to CONNECTS_PER_CYCLE per tick.
+                let (hot, _, _, _) = governor.counts();
+                let bootstrap_urgent = hot < gov_config.hot_min as usize;
+                let max_connects = if bootstrap_urgent {
+                    MAX_IN_FLIGHT
+                } else {
+                    CONNECTS_PER_CYCLE
+                };
+                let candidates: Vec<_> = peer_share_cache.iter()
+                    .filter(|pa| {
+                        let nid = NodeId(pa.node_id.as_slice().try_into().unwrap_or([0u8; 32]));
+                        nid != our_node_id && !conn_mgr.is_connected(&nid)
+                    })
+                    .collect();
+                if !candidates.is_empty() {
+                    let mut spawned = 0usize;
+                    for offset in 0..candidates.len() {
+                        if spawned >= max_connects || in_flight.len() >= MAX_IN_FLIGHT {
+                            break;
+                        }
+                        let idx = (peer_share_rotation + offset) % candidates.len();
+                        let peer_addr = candidates[idx];
+                        if let Some(addr_str) = peer_addr.addrs.first() {
+                            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                if in_flight.contains(&addr) { continue; }
+                                in_flight.insert(addr);
+                                let ctx = connect_ctx.clone();
+                                let tx = connect_tx.clone();
+                                tokio::spawn(async move {
+                                    match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                                        Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                        Err(e) => {
+                                            tracing::debug!(addr = %addr, error = %e, "peer-share connect failed");
+                                            let _ = tx.send(Err((addr, e.to_string())));
+                                        }
+                                    }
+                                });
+                                spawned += 1;
+                            }
+                        }
+                    }
+                    peer_share_rotation = peer_share_rotation.wrapping_add(spawned);
                 }
             }
 
-            // ── Push items to hot peers ───────────────────────────────
-            Some(push_item) = push_rx.recv() => {
-                let item = cordelia_network::messages::Item {
-                    item_id: push_item.item_id.clone(),
-                    channel_id: push_item.channel_id.clone(),
-                    item_type: push_item.item_type,
-                    encrypted_blob: push_item.encrypted_blob,
-                    content_hash: push_item.content_hash,
-                    content_length: 0,
-                    author_id: push_item.author_id,
-                    signature: push_item.signature,
-                    key_version: push_item.key_version,
-                    published_at: push_item.published_at,
-                    is_tombstone: push_item.is_tombstone,
-                    parent_id: push_item.parent_id,
-                };
+            // ── Push items to hot relay peers (batched, §7.1) ─────────
+            // Originator push: personal/keeper writes go to hot relay peers
+            // only. Relays handle distribution. Non-relay peers pull (§4.5).
+            Some(first_push) = push_rx.recv() => {
+                let mut all_pushes = vec![first_push];
+                while let Ok(more) = push_rx.try_recv() {
+                    all_pushes.push(more);
+                }
 
-                let exclude = push_item.exclude_peer;
-                // Gate 1: push only to peers carrying this channel (§7.1)
-                let all_peers = governor.hot_peers_for_channel(&push_item.channel_id);
-                let mut push_count = 0u32;
-                let mut skip_count = 0u32;
-                for peer_id in &all_peers {
-                    if exclude.as_ref() == Some(peer_id) {
-                        skip_count += 1;
-                        continue;
+                // Target: hot relay peers only (§8.2.1)
+                let relay_targets: Vec<NodeId> = governor.hot_peers().into_iter()
+                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+                    .collect();
+
+                let mut peer_batches: std::collections::HashMap<
+                    NodeId,
+                    Vec<cordelia_network::messages::Item>,
+                > = std::collections::HashMap::new();
+
+                let item_count = all_pushes.len();
+                for push_item in all_pushes {
+                    let exclude = push_item.exclude_peer;
+                    let item = cordelia_network::messages::Item {
+                        item_id: push_item.item_id,
+                        channel_id: push_item.channel_id,
+                        item_type: push_item.item_type,
+                        encrypted_blob: push_item.encrypted_blob,
+                        content_hash: push_item.content_hash,
+                        content_length: 0,
+                        author_id: push_item.author_id,
+                        signature: push_item.signature,
+                        key_version: push_item.key_version,
+                        published_at: push_item.published_at,
+                        is_tombstone: push_item.is_tombstone,
+                        parent_id: push_item.parent_id,
+                    };
+
+                    for peer_id in &relay_targets {
+                        if exclude.as_ref() == Some(peer_id) {
+                            continue;
+                        }
+                        peer_batches
+                            .entry(peer_id.clone())
+                            .or_default()
+                            .push(item.clone());
                     }
-                    if let Some(conn) = conn_mgr.get_connection(peer_id) {
+                }
+
+                if peer_batches.is_empty() { continue; }
+                tracing::debug!(
+                    items = item_count,
+                    peers = peer_batches.len(),
+                    "push batch assembled"
+                );
+
+                // One push stream per peer, all items batched
+                for (peer_id, items) in peer_batches {
+                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
                         let conn = conn.clone();
-                        let items = vec![item.clone()];
-                        let pid = peer_id.clone();
-                        push_count += 1;
-                        let iid = push_item.item_id.clone();
-                        tracing::debug!(peer = %pid, item = %iid, "spawning push task");
+                        let pid = peer_id;
+                        let batch_size = items.len();
+                        let rtx = retry_fail_tx.clone();
                         tokio::spawn(async move {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
-                                Err(e) => { tracing::debug!(peer = %pid, error = %e, "push open_bi"); return; }
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch open_bi failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
+                                    return;
+                                }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
                             match cordelia_network::item_sync::send_push(&mut stream, &items).await {
-                                Ok(ack) => tracing::debug!(peer = %pid, stored = ack.stored, "push delivered"),
-                                Err(e) => tracing::debug!(peer = %pid, error = %e, "push send failed"),
+                                Ok(ack) => {
+                                    tracing::debug!(peer = %pid, items = batch_size, stored = ack.stored, "push batch delivered");
+                                }
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
+                                }
                             }
                         });
-                    } else {
-                        tracing::warn!(peer = %peer_id, "push skipped: get_connection returned None");
                     }
                 }
-                tracing::debug!(
-                    channel = %push_item.channel_id,
-                    item = %push_item.item_id,
-                    total_peers = all_peers.len(),
-                    pushed = push_count,
-                    excluded = skip_count,
-                    "item pushed to peers"
-                );
             }
 
-            // ── Pull-sync from hot peers ──────────────────────────────
+            // ── Push retry processing ─────────────────────────────────
+            _ = retry_interval.tick() => {
+                // Drain failure reports into retry queue
+                while let Ok(entry) = retry_fail_rx.try_recv() {
+                    retry_queue.push(entry);
+                }
+                if retry_queue.is_empty() { continue; }
+
+                let now = tokio::time::Instant::now();
+                let mut remaining = Vec::new();
+                for entry in retry_queue.drain(..) {
+                    if entry.retry_at > now {
+                        remaining.push(entry);
+                        continue;
+                    }
+                    if entry.attempt >= PUSH_RETRY_MAX {
+                        tracing::warn!(
+                            peer = %entry.peer_id, channel = %entry.channel_id,
+                            attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
+                        );
+                        continue;
+                    }
+                    // Only retry if peer is still hot
+                    if !governor.hot_peers().contains(&entry.peer_id) {
+                        tracing::debug!(
+                            peer = %entry.peer_id, "push retry skipped: peer no longer hot"
+                        );
+                        continue;
+                    }
+                    if let Some(conn) = conn_mgr.get_connection(&entry.peer_id) {
+                        let conn = conn.clone();
+                        let items = vec![entry.item.clone()];
+                        let pid = entry.peer_id.clone();
+                        let attempt = entry.attempt + 1;
+                        let rtx = retry_fail_tx.clone();
+                        let retry_item = entry.item;
+                        let retry_ch = entry.channel_id;
+                        let retry_ex = entry.exclude_peer;
+                        tracing::debug!(peer = %pid, attempt, "push retry");
+                        tokio::spawn(async move {
+                            let (mut send, mut recv) = match open_bi(&conn).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
+                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt,
+                                        retry_at: tokio::time::Instant::now() + backoff,
+                                    });
+                                    return;
+                                }
+                            };
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
+                                Ok(ack) => tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered"),
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
+                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+                                    let _ = rtx.send(RetryEntry {
+                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
+                                        exclude_peer: retry_ex, attempt,
+                                        retry_at: tokio::time::Instant::now() + backoff,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                retry_queue = remaining;
+            }
+
+            // ── Relay re-push flush (batched, de-duped) ───────────────
+            _ = repush_interval.tick() => {
+                // Drain and de-dupe by item_id
+                let mut pending: std::collections::HashMap<
+                    String,
+                    (cordelia_network::messages::Item, NodeId),
+                > = std::collections::HashMap::new();
+                while let Ok((item, source)) = repush_rx.try_recv() {
+                    pending.entry(item.item_id.clone()).or_insert((item, source));
+                }
+                if pending.is_empty() { continue; }
+
+                // Build per-peer batches -- relay peers only (§7.2: single-hop,
+                // relay-to-relay broadcast). Exclude the sender of each item.
+                let relay_peers: Vec<NodeId> = governor.hot_peers().into_iter()
+                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+                    .collect();
+                let mut peer_batches: std::collections::HashMap<
+                    NodeId,
+                    Vec<cordelia_network::messages::Item>,
+                > = std::collections::HashMap::new();
+                for (_, (item, source)) in &pending {
+                    for peer_id in &relay_peers {
+                        if peer_id == source { continue; }
+                        peer_batches
+                            .entry(peer_id.clone())
+                            .or_default()
+                            .push(item.clone());
+                    }
+                }
+
+                if peer_batches.is_empty() { continue; }
+                let deduped = pending.len();
+                tracing::debug!(items = deduped, peers = peer_batches.len(), "relay repush flush");
+
+                for (peer_id, items) in peer_batches {
+                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                        let conn = conn.clone();
+                        let pid = peer_id;
+                        let count = items.len();
+                        let rtx = retry_fail_tx.clone();
+                        tokio::spawn(async move {
+                            let (mut send, mut recv) = match open_bi(&conn).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, items = count, error = %e, "repush open_bi failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
+                                    return;
+                                }
+                            };
+                            let mut stream = tokio::io::join(&mut recv, &mut send);
+                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
+                                Ok(ack) => tracing::debug!(peer = %pid, items = count, stored = ack.stored, "repush delivered"),
+                                Err(e) => {
+                                    tracing::debug!(peer = %pid, items = count, error = %e, "repush failed");
+                                    for item in items {
+                                        let ch = item.channel_id.clone();
+                                        let _ = rtx.send(RetryEntry {
+                                            item, peer_id: pid.clone(), channel_id: ch,
+                                            exclude_peer: None, attempt: 0,
+                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // ── Channel-announce on local subscribe ──────────────────
+            // API subscribe handler sends channel_id here; we announce
+            // to all hot peers so they add us to their push routing.
+            Some(_channel_id) = announce_rx.recv() => {
+                // Drain all pending announces (batch subscribes)
+                while let Ok(_) = announce_rx.try_recv() {}
+                // Send full channel list to all hot peers (simpler than
+                // incremental per-channel -- reconnect-safe too)
+                if node_role != "relay" {
+                    for peer_id in governor.hot_peers() {
+                        if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                            let conn = conn.clone();
+                            let announce_state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                                    tracing::debug!(error = %e, "channel announcements failed on subscribe");
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ── Pull-sync from hot peers (§4.5) ─────────────────────
+            // "The node MUST sync from all hot peers each cycle."
+            // Relays: Phase 0 channel discovery + stored channels (relay_learned_channels).
+            // Personal nodes: subscribed channels (list_for_entity), skip Phase 0.
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
-                let channels: Vec<String> = {
+
+                // Personal nodes: get subscribed channels, skip if empty
+                let local_channels: Vec<String> = {
                     let db = match state.db.lock() {
                         Ok(db) => db,
                         Err(_) => continue,
                     };
-                    let pk = state.identity.public_key();
-                    cordelia_storage::channels::list_for_entity(&db, &pk)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| c.channel_id)
-                        .collect()
+                    if node_role == "relay" {
+                        cordelia_storage::channels::list_stored_channel_ids(&db)
+                            .unwrap_or_default()
+                    } else {
+                        let pk = state.identity.public_key();
+                        cordelia_storage::channels::list_for_entity(&db, &pk)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|c| c.channel_id)
+                            .collect()
+                    }
                 };
-                if channels.is_empty() { continue; }
+                // Personal nodes with no subscribed channels: nothing to sync
+                if local_channels.is_empty() && node_role != "relay" { continue; }
 
+                let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();
-                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
+                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), local_channels = local_channels.len(), "pull-sync cycle");
                 for target in &hot {
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
-                    let sync_channels = channels.clone();
+                    let sync_local = local_channels.clone();
                     let target = target.clone();
                     let gtx = gov_tx.clone();
                     let role = node_role.clone();
-                    tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
+                    let do_phase0 = is_relay;
                     tokio::spawn(async move {
+                        // Phase 0: relay channel discovery (§4.5)
+                        // Ask peer "what channels do you have?", merge with local.
+                        let sync_channels = if do_phase0 {
+                            let (mut send, mut recv) = match open_bi(&conn).await {
+                                Ok(s) => s,
+                                Err(e) => { tracing::debug!(peer = %target, error = %e, "phase0 open_bi failed"); return; }
+                            };
+                            // Write protocol byte
+                            if let Err(e) = cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await {
+                                tracing::debug!(peer = %target, error = %e, "phase0 protocol byte failed");
+                                return;
+                            }
+                            let discovered = match cordelia_network::item_sync::send_channel_list_request(&mut send, &mut recv).await {
+                                Ok(resp) => resp.channel_ids,
+                                Err(e) => {
+                                    tracing::debug!(peer = %target, error = %e, "phase0 channel list request failed");
+                                    Vec::new()
+                                }
+                            };
+                            if !discovered.is_empty() {
+                                tracing::debug!(peer = %target, discovered = discovered.len(), "phase0: discovered channels");
+                            }
+                            // Merge: local stored + peer discovered (deduplicated)
+                            let mut merged: std::collections::HashSet<String> = sync_local.into_iter().collect();
+                            for ch in discovered {
+                                merged.insert(ch);
+                            }
+                            merged.into_iter().collect::<Vec<_>>()
+                        } else {
+                            sync_local
+                        };
+
+                        if sync_channels.is_empty() { return; }
+                        tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
+
                         for ch_id in &sync_channels {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
                                 Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync open_bi"); break; }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
-                            tracing::debug!(peer = %target, channel = %ch_id, "sync request sent");
                             let resp = match cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
                                 Ok(r) => r,
                                 Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); continue; }
                             };
-                            tracing::debug!(peer = %target, channel = %ch_id, headers = resp.items.len(), "sync response received");
                             if resp.items.is_empty() { continue; }
 
                             let known = {
@@ -483,8 +991,20 @@ pub async fn p2p_loop(
             // ── Governor tick ─────────────────────────────────────────
             _ = gov_interval.tick() => {
                 // Drain event channels
-                while let Ok(GovEvent::ItemsDelivered(peer_id, count)) = gov_rx.try_recv() {
-                    governor.record_items_delivered(&peer_id, count);
+                while let Ok(event) = gov_rx.try_recv() {
+                    match event {
+                        GovEvent::ItemsDelivered(peer_id, count) => {
+                            governor.record_items_delivered(&peer_id, count);
+                        }
+                        GovEvent::ChannelAnnounced(peer_id, channel_id) => {
+                            governor.add_peer_channel(&peer_id, &channel_id);
+                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: added peer channel");
+                        }
+                        GovEvent::ChannelWithdrawn(peer_id, channel_id) => {
+                            governor.remove_peer_channel(&peer_id, &channel_id);
+                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: removed peer channel");
+                        }
+                    }
                 }
                 while let Ok((peer_id, count)) = delivery_rx.try_recv() {
                     governor.record_items_delivered(&peer_id, count);
@@ -512,6 +1032,19 @@ pub async fn p2p_loop(
                 if !actions.transitions.is_empty() {
                     for (node_id, from, to) in &actions.transitions {
                         tracing::info!(peer = %node_id, from, to, "gov: state transition");
+
+                        // Send channel announcements on warm->hot promotion (non-relay only, §4.4)
+                        if from == "warm" && to == "hot" && node_role != "relay" {
+                            if let Some(conn) = conn_mgr.get_connection(node_id) {
+                                let conn = conn.clone();
+                                let announce_state = state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                                        tracing::debug!(error = %e, "channel announcements failed on promotion");
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
                 for node_id in &actions.disconnect {
@@ -520,28 +1053,25 @@ pub async fn p2p_loop(
                 for node_id in &actions.connect {
                     if let Some(peer) = governor.peer_info(node_id)
                         && let Some(addr_str) = peer.addrs.first()
-                            && let Ok(addr) = addr_str.parse() {
-                                match tokio::time::timeout(
-                                    cordelia_network::codec::STREAM_TIMEOUT,
-                                    conn_mgr.connect_to(addr),
-                                ).await {
-                                    Ok(Ok(new_id)) => {
-                                        tracing::info!(peer = %new_id, "gov: connected (promotion)");
-                                        post_connect(
-                                            &new_id, &conn_mgr, &mut governor, &shared_peers,
-                                            &state, &node_role, &relay_push_tx, &delivery_tx, &peer_rates, &peer_states,
-                                        );
-                                    }
-                                    Ok(Err(e)) => {
-                                        governor.mark_dial_failed(node_id);
-                                        tracing::debug!(peer = %node_id, error = %e, "gov: connect failed");
-                                    }
-                                    Err(_) => {
-                                        governor.mark_dial_failed(node_id);
-                                        tracing::debug!(peer = %node_id, "gov: connect timed out (10s)");
-                                    }
+                        && let Ok(addr) = addr_str.parse::<std::net::SocketAddr>()
+                    {
+                        if in_flight.len() >= MAX_IN_FLIGHT || in_flight.contains(&addr) {
+                            continue;
+                        }
+                        in_flight.insert(addr);
+                        gov_pending.insert(addr, node_id.clone());
+                        let ctx = connect_ctx.clone();
+                        let tx = connect_tx.clone();
+                        tokio::spawn(async move {
+                            match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                                Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                Err(e) => {
+                                    tracing::debug!(addr = %addr, error = %e, "gov: connect failed");
+                                    let _ = tx.send(Err((addr, e.to_string())));
                                 }
                             }
+                        });
+                    }
                 }
                 let (hot, warm, cold, banned) = governor.counts();
                 state.peers_hot.store(hot as u64, std::sync::atomic::Ordering::Relaxed);
@@ -557,6 +1087,50 @@ pub async fn p2p_loop(
                             cordelia_network::governor::PeerState::Banned { .. } => 0,
                         };
                         states.insert(peer.node_id.clone(), state_byte);
+                    }
+                }
+
+                // Sync relay peer set for single-hop re-push check (§7.2)
+                if let Ok(mut relays) = peer_relays.write() {
+                    relays.clear();
+                    for peer in governor.all_peers() {
+                        if peer.is_relay {
+                            relays.insert(peer.node_id.clone());
+                        }
+                    }
+                }
+
+                // Bootstrap retry: if no relay in hot set, retry bootstrap
+                // addresses (§8.3: bootnode connection is transient, but the
+                // config may include relay addresses that failed on first attempt).
+                let has_hot_relay = governor.hot_peers().iter()
+                    .any(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false));
+                if !has_hot_relay && !bootstrap_addrs.is_empty() && node_role != "bootnode" {
+                    for addr in &bootstrap_addrs {
+                        if in_flight.len() >= MAX_IN_FLIGHT || in_flight.contains(addr) {
+                            continue;
+                        }
+                        if conn_mgr.connected_peers().iter().any(|p| {
+                            conn_mgr.get_connection(p)
+                                .map(|c| c.remote_address() == *addr)
+                                .unwrap_or(false)
+                        }) {
+                            continue; // already connected to this address
+                        }
+                        in_flight.insert(*addr);
+                        let ctx = connect_ctx.clone();
+                        let tx = connect_tx.clone();
+                        let addr = *addr;
+                        tracing::info!(%addr, "retrying bootstrap address (no hot relay)");
+                        tokio::spawn(async move {
+                            match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                                Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                Err(e) => {
+                                    tracing::debug!(%addr, error = %e, "bootstrap retry failed");
+                                    let _ = tx.send(Err((addr, e.to_string())));
+                                }
+                            }
+                        });
                     }
                 }
 
@@ -589,7 +1163,7 @@ pub async fn handle_peer_streams(
     state: web::Data<cordelia_api::state::AppState>,
     shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: String,
-    push_tx: tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
+    repush_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     peer_rates: std::sync::Arc<
         std::sync::Mutex<
@@ -597,6 +1171,8 @@ pub async fn handle_peer_streams(
         >,
     >,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
+    peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -629,6 +1205,7 @@ pub async fn handle_peer_streams(
             cordelia_network::messages::Protocol::ItemPush => "item_push",
             cordelia_network::messages::Protocol::ItemSync => "item_sync",
             cordelia_network::messages::Protocol::PeerSharing => "peer_share",
+            cordelia_network::messages::Protocol::ChannelAnnounce => "channel_announce",
             _ => "other",
         };
         tracing::debug!(peer = %peer_id, protocol = proto_name, stream = stream_count, "stream opened (inbound)");
@@ -668,6 +1245,7 @@ pub async fn handle_peer_streams(
         match protocol {
             cordelia_network::messages::Protocol::ItemPush
             | cordelia_network::messages::Protocol::ItemSync
+            | cordelia_network::messages::Protocol::ChannelAnnounce
                 if !is_hot =>
             {
                 tracing::debug!(peer = %peer_id, protocol = proto_name, "rejected: data protocol from non-hot peer");
@@ -680,8 +1258,9 @@ pub async fn handle_peer_streams(
                     &peer_id,
                     &state,
                     &node_role,
-                    &push_tx,
+                    &repush_tx,
                     &delivery_tx,
+                    &peer_relays,
                 )
                 .await;
             }
@@ -691,6 +1270,9 @@ pub async fn handle_peer_streams(
             cordelia_network::messages::Protocol::PeerSharing => {
                 // Allowed on Warm + Hot (§2.1)
                 handle_inbound_peer_share(&mut send, &mut recv, &peer_id, &shared_peers).await;
+            }
+            cordelia_network::messages::Protocol::ChannelAnnounce => {
+                handle_inbound_channel_announce(&mut recv, &peer_id, &gov_tx).await;
             }
             other => {
                 tracing::debug!(peer = %peer_id, protocol = ?other, "ignoring unhandled protocol");
@@ -712,8 +1294,9 @@ async fn handle_inbound_push(
     peer_id: &NodeId,
     state: &web::Data<cordelia_api::state::AppState>,
     node_role: &str,
-    push_tx: &tokio::sync::mpsc::UnboundedSender<cordelia_api::state::PushItem>,
+    repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
+    peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -728,6 +1311,8 @@ async fn handle_inbound_push(
         _ => return,
     };
 
+    // Track which items are newly stored (for selective re-push)
+    let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
     let (stored, dedup) = {
         let db = match state.db.lock() {
             Ok(db) => db,
@@ -737,7 +1322,10 @@ async fn handle_inbound_push(
         let mut dedup = 0u32;
         for item in &payload.items {
             match store_item(&db, item, node_role) {
-                Ok(true) => stored += 1,
+                Ok(true) => {
+                    stored += 1;
+                    newly_stored.push(item.clone());
+                }
                 Ok(false) => dedup += 1,
                 Err(_) => {}
             }
@@ -751,25 +1339,22 @@ async fn handle_inbound_push(
         let _ = delivery_tx.send((peer_id.clone(), stored as u64));
     }
 
-    // Relay re-push: forward received items to other peers
-    if node_role == "relay" && stored > 0 {
-        for item in &payload.items {
-            let _ = push_tx.send(cordelia_api::state::PushItem {
-                channel_id: item.channel_id.clone(),
-                item_id: item.item_id.clone(),
-                encrypted_blob: item.encrypted_blob.clone(),
-                content_hash: item.content_hash.clone(),
-                author_id: item.author_id.clone(),
-                signature: item.signature.clone(),
-                key_version: item.key_version,
-                published_at: item.published_at.clone(),
-                item_type: item.item_type.clone(),
-                is_tombstone: item.is_tombstone,
-                parent_id: item.parent_id.clone(),
-                exclude_peer: Some(peer_id.clone()),
-            });
+    // Relay single-hop re-push (§7.2):
+    // - Only re-push items received from non-relay peers (first hop only)
+    // - Only queue items that were newly stored (not duplicates)
+    // - Repush flush targets relay peers only
+    if node_role == "relay" && !newly_stored.is_empty() {
+        let sender_is_relay = peer_relays
+            .read()
+            .ok()
+            .map(|r| r.contains(peer_id))
+            .unwrap_or(false);
+        if !sender_is_relay {
+            for item in &newly_stored {
+                let _ = repush_tx.send((item.clone(), peer_id.clone()));
+            }
+            tracing::debug!(peer = %peer_id, queued = newly_stored.len(), "relay repush queued (single-hop)");
         }
-        tracing::debug!(peer = %peer_id, stored, "relay re-push queued");
     }
 
     let ack =
@@ -797,7 +1382,31 @@ async fn handle_inbound_sync(
         }
     };
 
+    // Phase 0: channel list discovery (§4.5). If the first message is
+    // SyncChannelListRequest, respond with our stored channel IDs and
+    // then read the next message as a normal SyncRequest.
     let req = match msg {
+        cordelia_network::messages::WireMessage::SyncChannelListRequest(_) => {
+            let channel_ids = {
+                let db = match state.db.lock() {
+                    Ok(db) => db,
+                    Err(_) => return,
+                };
+                cordelia_storage::channels::list_stored_channel_ids(&db).unwrap_or_default()
+            };
+            tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
+            let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
+                cordelia_network::messages::SyncChannelListResponse { channel_ids },
+            );
+            let _ = cordelia_network::codec::write_frame(send, &resp).await;
+
+            // Now read the actual SyncRequest
+            match cordelia_network::codec::read_frame(recv).await {
+                Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => r,
+                Ok(_) => return,
+                Err(_) => return, // Peer may close after Phase 0 (no channels to sync)
+            }
+        }
         cordelia_network::messages::WireMessage::SyncRequest(r) => r,
         _ => return,
     };
@@ -898,7 +1507,28 @@ async fn handle_inbound_peer_share(
         let max = req.max_peers as usize;
         let current_peers = shared_peers
             .read()
-            .map(|p| p.iter().take(max).cloned().collect::<Vec<_>>())
+            .map(|p| {
+                // Shuffle before returning (§4.3): each requester gets a random
+                // subset in a random order, distributing load across the relay mesh.
+                let mut peers: Vec<_> = p.clone();
+                // Mix nanos + peer_id for per-request entropy
+                let seed = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .hash(&mut h);
+                    peer_id.0.hash(&mut h);
+                    h.finish() as usize
+                };
+                for i in (1..peers.len()).rev() {
+                    let j = (seed.wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);
+                    peers.swap(i, j);
+                }
+                peers.into_iter().take(max).collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let count = current_peers.len();
         let resp = cordelia_network::messages::WireMessage::PeerShareResponse(
@@ -909,4 +1539,112 @@ async fn handle_inbound_peer_share(
         let _ = cordelia_network::codec::write_frame(send, &resp).await;
         tracing::debug!(peer = %peer_id, count, "served peer-share request");
     }
+}
+
+/// Handle inbound ChannelAnnounce (0x04) stream.
+/// Reads frames until EOF/error, dispatches ChannelJoined/ChannelLeft to governor.
+async fn handle_inbound_channel_announce(
+    recv: &mut quinn::RecvStream,
+    peer_id: &NodeId,
+    gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
+) {
+    loop {
+        let msg = match cordelia_network::codec::read_frame(recv).await {
+            Ok(m) => m,
+            Err(_) => break, // EOF or error -- stream done
+        };
+        match msg {
+            cordelia_network::messages::WireMessage::ChannelJoined(joined) => {
+                if let Err(e) =
+                    cordelia_network::channel_announce::validate_descriptor(&joined.descriptor)
+                {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        channel = %joined.channel_id,
+                        error = %e,
+                        "channel-announce: invalid descriptor"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    peer = %peer_id,
+                    channel = %joined.channel_id,
+                    "peer announced channel"
+                );
+                let _ = gov_tx.send(GovEvent::ChannelAnnounced(
+                    peer_id.clone(),
+                    joined.channel_id,
+                ));
+            }
+            cordelia_network::messages::WireMessage::ChannelLeft(left) => {
+                tracing::info!(
+                    peer = %peer_id,
+                    channel = %left.channel_id,
+                    "peer withdrew channel"
+                );
+                let _ = gov_tx.send(GovEvent::ChannelWithdrawn(
+                    peer_id.clone(),
+                    left.channel_id,
+                ));
+            }
+            _ => {
+                tracing::debug!(peer = %peer_id, "channel-announce: unexpected message type");
+                break;
+            }
+        }
+    }
+}
+
+/// Send ChannelJoined announcements for all our subscribed channels.
+/// Opens a 0x04 stream and sends one ChannelJoined per channel.
+async fn send_channel_announcements(
+    conn: &quinn::Connection,
+    state: &web::Data<cordelia_api::state::AppState>,
+) -> Result<(), String> {
+    let channels = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| format!("db lock: {e}"))?;
+        let pk = state.identity.public_key();
+        cordelia_storage::channels::list_for_entity(&db, &pk).unwrap_or_default()
+    };
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let (mut send, _recv) = open_bi(conn).await?;
+
+    // Write protocol byte for ChannelAnnounce (0x04)
+    send.write_all(&[cordelia_network::messages::Protocol::ChannelAnnounce as u8])
+        .await
+        .map_err(|e| format!("write protocol byte: {e}"))?;
+
+    for ch in &channels {
+        let psk_hash: [u8; 32] = ch
+            .psk_hash
+            .as_ref()
+            .and_then(|h| h.as_slice().try_into().ok())
+            .unwrap_or([0u8; 32]);
+        let descriptor = cordelia_network::channel_announce::create_signed_descriptor(
+            &state.identity,
+            &ch.channel_id,
+            ch.channel_name.as_deref(),
+            &ch.access,
+            &ch.mode,
+            &psk_hash,
+            ch.key_version as u32,
+            &ch.created_at,
+        );
+        if let Err(e) =
+            cordelia_network::channel_announce::send_channel_joined(&mut send, &ch.channel_id, &descriptor).await
+        {
+            tracing::debug!(channel = %ch.channel_id, error = %e, "channel announce send failed");
+            break;
+        }
+    }
+
+    let _ = send.finish();
+    tracing::debug!(channels = channels.len(), "sent channel announcements");
+    Ok(())
 }

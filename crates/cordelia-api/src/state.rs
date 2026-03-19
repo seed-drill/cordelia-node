@@ -43,6 +43,10 @@ pub struct AppState {
     /// Channel for sending items to the P2P layer for push delivery.
     /// None if P2P is not running (e.g., in tests).
     pub push_tx: Option<tokio::sync::mpsc::UnboundedSender<PushItem>>,
+    /// Channel for notifying P2P layer of local channel subscriptions.
+    /// Triggers channel-announce (0x04) to hot peers.
+    /// None if P2P is not running (e.g., in tests).
+    pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AppState {

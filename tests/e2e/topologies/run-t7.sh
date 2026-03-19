@@ -83,6 +83,9 @@ wait_for "p2 has 1+ hot peers" \
     '[ "$(api_get t7-p2 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
 wait_for "p3 has 1+ hot peers" \
     '[ "$(api_get t7-p3 status | jq -r ".peers_hot // 0")" -ge 1 ]' 30
+# Zone model: R1 must promote all personal nodes to hot before items flow.
+wait_for "r1 has 4 hot peers (b1+p1+p2+p3)" \
+    '[ "$(api_get t7-r1 status | jq -r ".peers_hot // 0")" -ge 4 ]' 30
 
 # -- Step 4: Subscribe to channels ---------------------------------------
 

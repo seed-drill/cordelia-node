@@ -251,7 +251,7 @@ pub enum ChannelAnnounceAction {
 ///
 /// Checks channel_name length (§4.4.6: max 63 chars), serialized size
 /// (§4.4.6: max 512 bytes CBOR), and Ed25519 signature.
-fn validate_descriptor(desc: &ChannelDescriptor) -> Result<(), ChannelAnnounceError> {
+pub fn validate_descriptor(desc: &ChannelDescriptor) -> Result<(), ChannelAnnounceError> {
     // Field size limits (§4.4.6)
     if let Some(ref name) = desc.channel_name
         && name.len() > MAX_CHANNEL_NAME_LEN

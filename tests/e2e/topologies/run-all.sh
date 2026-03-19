@@ -35,13 +35,17 @@ if [ -f "$BINARY" ]; then
     fi
 fi
 
-# Flush kernel conntrack table between runs to prevent stale UDP flow
-# entries from interfering with QUIC connections (BV-23).
+# Flush kernel conntrack table and Docker networks between runs to prevent
+# stale UDP flow entries from interfering with QUIC connections (BV-23).
+# Zone-based topologies create multiple bridge networks per test; kernel
+# needs time to drain iptables chains and conntrack entries after teardown.
 # Requires: sudo apt-get install conntrack
 # Requires: sysctl net.netfilter.nf_conntrack_udp_timeout=10
 #           sysctl net.netfilter.nf_conntrack_udp_timeout_stream=30
-flush_conntrack() {
+inter_test_drain() {
     sudo conntrack -F 2>/dev/null || true
+    docker network prune -f >/dev/null 2>&1 || true
+    sleep 3
 }
 
 for t in $TESTS; do
@@ -54,7 +58,7 @@ for t in $TESTS; do
     echo "================================================================"
     echo "  Running $t"
     echo "================================================================"
-    flush_conntrack
+    inter_test_drain
     if bash "$SCRIPT"; then
         PASS=$((PASS + 1))
     else

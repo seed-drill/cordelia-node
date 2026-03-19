@@ -1,4 +1,4 @@
-# T7 Personal node 3 (ch-alpha + ch-beta)
+# T7 Personal node 3 (ch-alpha + ch-beta, home-3 zone)
 [identity]
 entity_id = "p3_test"
 
@@ -14,11 +14,12 @@ push_policy = "subscribers_only"
 allow_private_addresses = true
 dns_discovery = ""
 
+# Bootnodes: B1 + R1 on home-3 zone
 [[network.bootnodes]]
-addr = "172.28.0.10:9474"
+addr = "172.28.3.10:9474"
 
 [[network.bootnodes]]
-addr = "172.28.0.20:9474"
+addr = "172.28.3.20:9474"
 
 [governor]
 hot_min = 5

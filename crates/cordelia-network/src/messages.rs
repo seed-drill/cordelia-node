@@ -168,6 +168,16 @@ pub struct ChannelDescriptor {
 
 // ── Item-Sync (0x05, §4.5) ─────────────────────────────────────────
 
+/// Phase 0: relay channel discovery (§4.5). "What channels do you have?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncChannelListRequest {}
+
+/// Phase 0 response: channel IDs the responder has stored items for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncChannelListResponse {
+    pub channel_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub channel_id: String,
@@ -303,6 +313,8 @@ pub enum WireMessage {
     ChannelListResponse(ChannelListResponse),
 
     // Item-Sync
+    SyncChannelListRequest(SyncChannelListRequest),
+    SyncChannelListResponse(SyncChannelListResponse),
     SyncRequest(SyncRequest),
     SyncResponse(SyncResponse),
     FetchRequest(FetchRequest),
