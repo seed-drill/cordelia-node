@@ -141,6 +141,8 @@ pub struct PeerInfo {
     pub is_relay: bool,
     /// Whether this peer is a bootnode (discovery-only, never promoted to Hot, §8.3).
     pub is_bootnode: bool,
+    /// Whether this peer is an HKDF-verified swarm member (always Hot, exempt from hot_max).
+    pub is_swarm: bool,
     /// Items this peer relayed to us (contribution tracking, §16.1).
     pub items_relayed: u64,
     /// Items we requested from this peer via sync (contribution tracking, §16.1).
@@ -166,6 +168,7 @@ impl PeerInfo {
             last_disconnected: None,
             is_relay: false,
             is_bootnode: false,
+            is_swarm: false,
             items_relayed: 0,
             items_requested: 0,
             score_ema: 0.0,
@@ -338,12 +341,9 @@ impl Governor {
     /// Mark peer as connected. Promotes to Hot immediately if there's room
     /// (hot_count < hot_max), otherwise Warm. This ensures newly connected
     /// peers participate in push/sync without waiting for the next tick.
+    /// Swarm peers (HKDF-verified) always go to Hot, exempt from hot_max.
     pub fn mark_connected(&mut self, node_id: &NodeId) {
-        let hot_count = self
-            .peers
-            .values()
-            .filter(|p| p.state == PeerState::Hot)
-            .count();
+        let hot_governed = self.hot_count_governed();
         if let Some(peer) = self.peers.get_mut(node_id)
             && peer.state == PeerState::Cold
         {
@@ -354,7 +354,12 @@ impl Governor {
             if peer.is_bootnode {
                 tracing::info!(peer = %node_id, "gov: cold -> warm (bootnode, discovery-only)");
                 peer.set_state(PeerState::Warm);
-            } else if hot_count < self.targets.hot_min {
+            } else if peer.is_swarm {
+                // Swarm peers: always Hot, exempt from hot_max (HKDF-verified)
+                tracing::info!(peer = %node_id, "gov: cold -> hot (swarm, HKDF-verified)");
+                peer.set_state(PeerState::Hot);
+                peer.disconnect_count = 0;
+            } else if hot_governed < self.targets.hot_min {
                 // Bootstrap: urgently need hot peers, bypass tenure guard
                 tracing::info!(peer = %node_id, "gov: cold -> hot (bootstrap, hot < hot_min)");
                 peer.set_state(PeerState::Hot);
@@ -487,6 +492,28 @@ impl Governor {
         if let Some(peer) = self.peers.get_mut(node_id) {
             peer.is_bootnode = is_bootnode;
         }
+    }
+
+    /// Mark a peer as an HKDF-verified swarm member.
+    /// Swarm peers are always Hot and exempt from hot_max accounting.
+    /// Promotes to Hot immediately if currently Warm/Cold.
+    pub fn set_peer_swarm(&mut self, node_id: &NodeId) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.is_swarm = true;
+            if peer.state != PeerState::Hot {
+                tracing::info!(peer = %node_id, "gov: swarm peer -> hot (HKDF-verified, exempt from hot_max)");
+                peer.set_state(PeerState::Hot);
+                peer.disconnect_count = 0;
+            }
+        }
+    }
+
+    /// Count hot peers that are NOT swarm members (the pool governed by hot_max).
+    fn hot_count_governed(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !p.is_swarm)
+            .count()
     }
 
     /// Check if a peer is dialable under the current policy.
@@ -701,18 +728,19 @@ impl Governor {
     }
 
     fn promote_warm_to_hot(&mut self, actions: &mut GovernorActions) {
-        let (hot, _, _, _) = self.counts();
+        let hot = self.hot_count_governed();
         if hot >= self.targets.hot_max {
-            return; // Hot set is full
+            return; // Hot set is full (swarm peers excluded from count)
         }
 
-        // Collect eligible warm peers (past hysteresis cooldown, not bootnodes)
+        // Collect eligible warm peers (past hysteresis cooldown, not bootnodes/swarm)
         let eligible: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| {
                 p.state == PeerState::Warm
                     && !p.is_bootnode
+                    && !p.is_swarm
                     && p.demoted_at
                         .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
             })
@@ -820,16 +848,17 @@ impl Governor {
     }
 
     fn demote_excess_hot(&mut self, actions: &mut GovernorActions) {
-        let (hot, _, _, _) = self.counts();
+        let hot = self.hot_count_governed();
         if hot <= self.targets.hot_max {
             return;
         }
 
         let excess = hot - self.targets.hot_max;
+        // Only consider non-swarm hot peers for demotion
         let mut hot_peers: Vec<(NodeId, f64, bool)> = self
             .peers
             .values()
-            .filter(|p| p.state == PeerState::Hot)
+            .filter(|p| p.state == PeerState::Hot && !p.is_swarm)
             .map(|p| {
                 let is_stale = p.last_activity.elapsed() > self.timeouts.stale_timeout;
                 (p.node_id.clone(), p.score(), is_stale)
@@ -2111,5 +2140,63 @@ mod tests {
         // After remove: back to relay only
         gov.remove_peer_channel(&personal_id, "ch1");
         assert_eq!(gov.hot_peers_for_channel("ch1").len(), 1);
+    }
+
+    #[test]
+    fn test_swarm_peers_exempt_from_hot_max() {
+        // hot_max=2: 4 swarm peers + 1 relay should ALL be hot
+        // (swarm exempt from hot_max, relay fills governed slot)
+        let targets = GovernorTargets {
+            hot_min: 1,
+            hot_max: 2,
+            hot_min_relays: 1,
+            ..GovernorTargets::default()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+
+        // Add 4 swarm peers
+        let swarm_ids: Vec<NodeId> = (0..4).map(|i| make_node_id(i)).collect();
+        for id in &swarm_ids {
+            gov.add_peer(id.clone(), make_addr(), vec![]);
+            gov.set_peer_swarm(id);
+            gov.mark_connected(id);
+        }
+
+        // Add 1 relay
+        let relay_id = make_node_id(10);
+        gov.add_peer(relay_id.clone(), make_addr(), vec![]);
+        gov.set_peer_relay(&relay_id, true);
+        gov.mark_connected(&relay_id);
+
+        // All 4 swarm peers should be hot
+        for id in &swarm_ids {
+            assert_eq!(
+                gov.peer_state(id),
+                Some(&PeerState::Hot),
+                "swarm peer should be hot"
+            );
+        }
+        // Relay should be hot (hot_governed=1 < hot_max=2, bootstrap promotion)
+        assert_eq!(
+            gov.peer_state(&relay_id),
+            Some(&PeerState::Hot),
+            "relay should be hot"
+        );
+
+        // Total hot = 5 (4 swarm + 1 relay), but hot_count_governed = 1
+        let (hot, _, _, _) = gov.counts();
+        assert_eq!(hot, 5, "total hot should be 5");
+        assert_eq!(gov.hot_count_governed(), 1, "governed hot should be 1");
+
+        // Tick should NOT demote anyone (governed=1 <= hot_max=2)
+        let actions = gov.tick();
+        for id in &swarm_ids {
+            assert_eq!(gov.peer_state(id), Some(&PeerState::Hot), "swarm peer should remain hot after tick");
+        }
+        assert_eq!(gov.peer_state(&relay_id), Some(&PeerState::Hot), "relay should remain hot after tick");
+
+        // No demotions in actions
+        let demotions: Vec<_> = actions.transitions.iter().filter(|(_, _, to)| to == "warm").collect();
+        assert!(demotions.is_empty(), "no demotions expected: {demotions:?}");
     }
 }

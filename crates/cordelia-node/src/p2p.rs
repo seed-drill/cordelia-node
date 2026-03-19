@@ -134,7 +134,15 @@ pub fn post_connect(
         tracing::info!(peer = %node_id, "peer identified as bootnode");
     }
 
-    // Step 4: Mark connected (triggers Hot/Warm promotion -- bootnodes stay Warm)
+    // Step 3b: Mark swarm member (HKDF-verified, always Hot, exempt from hot_max)
+    let is_swarm = swarm_members.read().ok()
+        .map(|m| m.contains(node_id))
+        .unwrap_or(false);
+    if is_swarm {
+        governor.set_peer_swarm(node_id);
+    }
+
+    // Step 4: Mark connected (triggers Hot/Warm promotion -- bootnodes stay Warm, swarm always Hot)
     governor.mark_connected(node_id);
 
     // Step 5: Update shared peer list
