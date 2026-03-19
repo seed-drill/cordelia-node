@@ -1,0 +1,41 @@
+# S2 relay mesh convergence test: R=20, default params.
+# Baseline scenario -- equivalent to `run-s2.sh 20`.
+
+[topology]
+name = "s2-r20"
+relays = 20
+personal_per_zone = 1
+bootnodes = 2
+
+[governor]
+relay_hot_max = 25          # R + 5 (full mesh feasible)
+personal_hot_max = 2
+tick_interval_secs = 2
+warm_tenure_secs = 300
+
+[experiment]
+channel_name = "test-channel"
+subscribe_all = true
+
+[[experiment.phases]]
+type = "wait_mesh"
+target = 19                 # R - 1 (all other relays)
+target_fraction = 1.0
+timeout_secs = 180
+
+[[experiment.phases]]
+type = "publish"
+publishers = ["p1", "p5", "p9", "p13", "p17"]
+items_per_publisher = 3
+item_size_bytes = 256
+
+[[experiment.phases]]
+type = "wait_delivery"
+target_items = 15           # 5 publishers x 3 items
+target_nodes = "personal"   # all personal nodes
+target_fraction = 1.0
+timeout_secs = 120
+
+[collection]
+poll_interval_secs = 2
+metrics = ["peers_hot", "peers_warm", "items_stored"]

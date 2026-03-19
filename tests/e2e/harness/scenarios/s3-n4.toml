@@ -1,0 +1,42 @@
+# S3 PAN swarm test: 2 leads, 4 swarm nodes each.
+# Equivalent to `run-s3.sh 4`.
+
+[topology]
+name = "s3-4"
+type = "s3"                 # PAN swarm topology
+leads = 2
+swarm_per_lead = 4
+relays = 2
+bootnodes = 1
+
+[governor]
+relay_hot_max = 10
+personal_hot_max = 2
+tick_interval_secs = 2
+warm_tenure_secs = 300
+
+[experiment]
+channel_name = "s3-test-channel"
+subscribe_all = true
+
+[[experiment.phases]]
+type = "wait_connectivity"
+min_hot_per_node = 1
+timeout_secs = 30
+
+[[experiment.phases]]
+type = "publish"
+publishers = ["swarm-0-0"]
+items_per_publisher = 1
+item_size_bytes = 256
+
+[[experiment.phases]]
+type = "wait_delivery"
+target_items = 1
+target_nodes = "all"
+target_fraction = 1.0
+timeout_secs = 60
+
+[collection]
+poll_interval_secs = 2
+metrics = ["peers_hot", "peers_warm", "items_stored"]
