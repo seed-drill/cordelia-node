@@ -522,6 +522,8 @@ Note: `author_id` is raw bytes(32) on the wire for compactness. The signed metad
 
 **Sync flow:**
 
+A single sync stream handles **all channels** for one peer in one cycle. This is critical for rate limiting: the rate limit counts sync *streams* (one per peer per cycle), not individual channel requests. A node syncing 10 channels uses the same rate budget as one syncing 1 channel.
+
 Phase 0 (relay channel discovery): Before per-channel sync, relay nodes send a `SyncChannelListRequest` to learn which channels the peer has items for. The responder returns `SyncChannelListResponse` with its stored channel IDs. The initiator merges these into its `relay_learned_channels` set for this and future sync cycles. This solves the bootstrap problem: a relay with 0 items can discover channels from its peers, then sync items for those channels.
 
 ```
@@ -534,7 +536,7 @@ SyncChannelListResponse {
 
 Phase 0 runs on every relay sync cycle, on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
 
-Phase 1-4 (per-channel sync, unchanged):
+Phase 1-4 (per-channel sync, **looped on one stream**):
 1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync
 2. Responder returns `SyncResponse` with item headers since the cursor
 3. Initiator compares headers to local storage:
@@ -542,7 +544,11 @@ Phase 1-4 (per-channel sync, unchanged):
    - Known item_id, different content_hash → compare `published_at`, keep latest (LWW)
    - Known item_id, same content_hash → skip (already have it)
    - is_tombstone → mark local item as deleted
-4. Initiator fetches missing items via Item-Fetch (piggybacked on sync stream)
+4. Initiator fetches missing items via Item-Fetch (on same stream, after SyncResponse)
+5. **Repeat from step 1** for the next channel. Stream stays open.
+6. After all channels: initiator closes the send half (FIN). Responder detects EOF and closes.
+
+**Backward compatibility:** The responder detects batched vs single-channel mode by reading the next frame after serving a fetch. If it receives another `SyncRequest`, it loops. If it receives EOF or an unexpected message, the stream is done. Old clients that close after one channel work unchanged. Old servers that close after one channel cause the new client to open a new stream for the next channel (graceful fallback).
 
 **Item-Fetch (on same stream, after SyncResponse):**
 
@@ -1378,8 +1384,10 @@ Beyond limits: new connections receive QUIC `CONNECTION_CLOSE` with application 
 |-------|---------|-----------------|
 | Writes per peer per minute | 10 | Reject with `PushAck.policy_rejected++` |
 | Writes per channel per minute | 100 | Drop, log warning |
-| Sync requests per peer per minute | 6 | Ignore excess, log |
+| Sync streams per peer per minute | 6 | Ignore excess, log |
 | Peer-share requests per peer per minute | 2 | Ignore excess |
+
+**Sync rate limit counts streams, not channel requests.** A sync stream may carry multiple channels (§4.5 batched sync). One stream per peer per sync cycle, regardless of channel count. The limit of 6 streams/min allows one sync cycle every 10 seconds with no headroom consumed by channel count. The 3x headroom in the implementation (18 in code) accounts for retries and overlapping cycles.
 
 Exceeding rate limits 3 times in 10 minutes → ban (§5.6).
 
