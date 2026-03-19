@@ -1,0 +1,42 @@
+# S2 R=20 with stress publishing: 100 items at 5/s after mesh formation.
+# Tests sustained write load across relay mesh.
+
+[topology]
+name = "s2-r20-stress"
+relays = 20
+personal_per_zone = 1
+bootnodes = 2
+
+[governor]
+relay_hot_max = 25
+personal_hot_max = 2
+tick_interval_secs = 2
+
+[experiment]
+channel_name = "test-channel"
+subscribe_all = true
+
+[[experiment.phases]]
+type = "wait_mesh"
+target = 19
+target_fraction = 1.0
+timeout_secs = 180
+
+[[experiment.phases]]
+type = "stress_publish"
+publishers = ["p1", "p5", "p9", "p13", "p17"]
+total_items = 100
+item_size_bytes = 1024          # 1KB items
+rate_per_sec = 5
+poll_every_items = 20
+
+[[experiment.phases]]
+type = "wait_delivery"
+target_items = 100
+target_nodes = "personal"
+target_fraction = 1.0
+timeout_secs = 180
+
+[collection]
+poll_interval_secs = 3
+metrics = ["peers_hot", "peers_warm", "items_stored"]

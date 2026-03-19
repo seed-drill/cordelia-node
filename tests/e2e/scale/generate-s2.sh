@@ -21,8 +21,9 @@ PERSONAL=$((RELAYS * PERSONAL_PER_ZONE))
 CONTAINER_COUNT=$((BOOTNODES + RELAYS + PERSONAL))
 NUM_ZONES=$RELAYS
 
-# Relay hot_max: must fit all other relays + bootnodes
-RELAY_HOT_MAX=$((RELAYS + 5))
+# Relay hot_max: must fit all other relays + bootnodes.
+# Override via RELAY_HOT_MAX_OVERRIDE env var for sparse mesh testing.
+RELAY_HOT_MAX=${RELAY_HOT_MAX_OVERRIDE:-$((RELAYS + 5))}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$SCRIPT_DIR/s2-${RELAYS}"
