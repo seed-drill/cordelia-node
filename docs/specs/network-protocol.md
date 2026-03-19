@@ -1204,20 +1204,24 @@ An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" pe
 
 **Topology:** `swarm_node -> lead_node -> relay -> relay_mesh`
 
+**Lead as gateway:** The lead runs `role = relay` but is deployed alongside its swarm, not as public infrastructure. It acts as a local proxy: accepts inbound from swarm nodes, serves Item-Sync, and maintains a single upstream connection to the relay mesh. The lead:
+- Accepts inbound from swarm nodes (relay role accepts all inbound)
+- Serves Item-Sync pull requests and Channel-Announce to swarm nodes
+- Pushes items from swarm nodes to the relay mesh via its upstream relay connection
+- Can gate, filter, or throttle forwarding in future (rate limit per sub-agent, restrict channel access, audit)
+
+**Identity model:** Swarm nodes generate their own Ed25519 identities. They are distinct entities from the network's perspective. Channel access is via PSK: swarm nodes mount the lead's PSK key files to encrypt/decrypt items on shared channels. The lead distributes PSKs to swarm nodes via the local filesystem (mounted volume), not via the P2P PSK-Exchange protocol.
+
 **Configuration:**
 
-| Node | role | hot_max | dial_policy | trusted_peers | Notes |
-|------|------|---------|-------------|---------------|-------|
-| Lead | personal | N+2 | relays_only | -- | N swarm nodes + 2 relay slots |
-| Swarm | personal | 1 | trusted_only | [lead] | Single connection to lead |
+| Node | role | hot_max | bootnodes | Notes |
+|------|------|---------|-----------|-------|
+| Lead | relay | N+2 | Zone relay + bootnode | N swarm slots + upstream relay slots |
+| Swarm | personal | 1 | Lead address only | Single connection to lead |
 
-**No new role needed.** The existing governor and dial_policy machinery handles swarm topology:
-- Lead runs `hot_min_relays = 1` to maintain relay connectivity
-- Swarm nodes use `dial_policy = "trusted_only"` with the lead's address
-- Swarm nodes pull-sync from the lead, which pull-syncs from relays
-- Lead serves inbound Item-Sync from swarm nodes (all nodes serve inbound sync)
+**No new role needed.** The lead runs as a relay (accepts inbound, serves sync, repushes). Swarm nodes run as personal (outbound-only, pull-sync). The lead bootstraps from the zone relay like a personal node would, but participates in the relay mesh as a leaf relay.
 
-**Inbound connection exception:** Personal nodes reject inbound connections (§8.2), **except** from peers listed in `trusted_peers`. This allows swarm nodes to connect to the lead while maintaining the outbound-only posture for all other traffic.
+**Future (Phase 3+): HD key derivation.** If per-agent attribution is needed (which agent wrote which item), the lead can derive child keys from its seed (BIP-32 style). Each swarm node gets a unique identity provably owned by the lead. The lead then acts as an authorisation gateway, deciding which child keys may access which channels.
 
 **Use cases:**
 - AI agent orchestration: one daemon per machine, sub-agents share memory via the lead

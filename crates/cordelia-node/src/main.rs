@@ -56,6 +56,8 @@ enum Commands {
     Channels,
     /// Show detailed metrics
     Stats,
+    /// Print public key from identity.key (for PAN trusted_peers config)
+    Pubkey,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,6 +79,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Peers) => cmd_peers(),
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats) => cmd_stats(&cli.config),
+        Some(Commands::Pubkey) => cmd_pubkey(&cli.config),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
             println!("Encrypted pub/sub for AI agents");
@@ -559,6 +562,23 @@ fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
     println!("Sync errors:    0");
     println!("Peers:          0 (P2P not yet implemented)");
 
+    Ok(())
+}
+
+fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+    let data_dir = config.data_dir();
+
+    let identity_path = data_dir.join("identity.key");
+    if !identity_path.exists() {
+        anyhow::bail!("Node not initialised. Run `cordelia init` first.");
+    }
+
+    let identity = NodeIdentity::from_file(&identity_path)?;
+    let pk_bech32 = cordelia_crypto::bech32::encode_public_key(&identity.public_key())?;
+    println!("{pk_bech32}");
     Ok(())
 }
 
