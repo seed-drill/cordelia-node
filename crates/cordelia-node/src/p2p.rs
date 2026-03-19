@@ -1491,7 +1491,7 @@ async fn handle_inbound_sync(
     // Phase 0: channel list discovery (§4.5). If the first message is
     // SyncChannelListRequest, respond with our stored channel IDs and
     // then read the next message as a normal SyncRequest.
-    let req = match msg {
+    let mut current_req = match msg {
         cordelia_network::messages::WireMessage::SyncChannelListRequest(_) => {
             let channel_ids = {
                 let db = match state.db.lock() {
@@ -1524,101 +1524,133 @@ async fn handle_inbound_sync(
         _ => return,
     };
 
-    // Scope check: don't serve local-scope channel items to non-swarm peers (§8.2.2)
-    if !is_swarm_peer {
-        let is_local = {
+    // Batched sync loop (§4.5): serve multiple channels on one stream.
+    // After each SyncResponse + optional FetchResponse, read the next frame.
+    // SyncRequest -> continue loop. EOF/error -> break. Backward compatible:
+    // old clients close after one channel, server reads EOF, loop breaks.
+    let mut channels_served: u32 = 0;
+    loop {
+        // Scope check: don't serve local-scope channel items to non-swarm peers (§8.2.2)
+        if !is_swarm_peer {
+            let is_local = {
+                let db = match state.db.lock() {
+                    Ok(db) => db,
+                    Err(_) => break,
+                };
+                cordelia_storage::channels::is_local_scope(&db, &current_req.channel_id).unwrap_or(false)
+            };
+            if is_local {
+                tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "rejecting sync for local-scope channel from non-swarm peer");
+                let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                    cordelia_network::messages::SyncResponse { items: vec![], has_more: false },
+                );
+                let _ = cordelia_network::codec::write_frame(send, &resp).await;
+                // Don't abort stream -- read next frame to continue batch
+                match cordelia_network::codec::read_frame(recv).await {
+                    Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
+                        current_req = r;
+                        channels_served += 1;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // Build sync response headers
+        let (headers, has_more) = {
             let db = match state.db.lock() {
                 Ok(db) => db,
-                Err(_) => return,
+                Err(_) => break,
             };
-            cordelia_storage::channels::is_local_scope(&db, &req.channel_id).unwrap_or(false)
+            let items = cordelia_storage::items::query_listen(
+                &db,
+                &current_req.channel_id,
+                current_req.since.as_deref(),
+                current_req.limit,
+            )
+            .unwrap_or_default();
+            let has_more = items.len() as u32 >= current_req.limit;
+            let headers: Vec<cordelia_network::messages::ItemHeader> = items
+                .iter()
+                .map(|si| cordelia_network::messages::ItemHeader {
+                    item_id: si.item_id.clone(),
+                    channel_id: si.channel_id.clone(),
+                    item_type: si.item_type.clone(),
+                    content_hash: si.content_hash.clone(),
+                    author_id: si.author_id.clone(),
+                    signature: si.signature.clone(),
+                    key_version: si.key_version as u32,
+                    published_at: si.published_at.clone(),
+                    is_tombstone: si.is_tombstone,
+                    parent_id: si.parent_id.clone(),
+                })
+                .collect();
+            (headers, has_more)
         };
-        if is_local {
-            tracing::debug!(peer = %peer_id, channel = %req.channel_id, "rejecting sync for local-scope channel from non-swarm peer");
-            let resp = cordelia_network::messages::WireMessage::SyncResponse(
-                cordelia_network::messages::SyncResponse { items: vec![], has_more: false },
-            );
-            let _ = cordelia_network::codec::write_frame(send, &resp).await;
-            return;
+
+        let resp = cordelia_network::messages::WireMessage::SyncResponse(
+            cordelia_network::messages::SyncResponse {
+                items: headers,
+                has_more,
+            },
+        );
+        let _ = cordelia_network::codec::write_frame(send, &resp).await;
+        channels_served += 1;
+        tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "served sync request");
+
+        // Read next frame: FetchRequest (for this channel), SyncRequest (next channel), or EOF
+        match cordelia_network::codec::read_frame(recv).await {
+            Ok(cordelia_network::messages::WireMessage::FetchRequest(freq)) => {
+                let fetch_items = {
+                    let db = match state.db.lock() {
+                        Ok(db) => db,
+                        Err(_) => break,
+                    };
+                    cordelia_storage::items::query_listen(&db, &current_req.channel_id, None, 1000)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|si| freq.item_ids.contains(&si.item_id))
+                        .map(|si| cordelia_network::messages::Item {
+                            item_id: si.item_id,
+                            channel_id: si.channel_id,
+                            item_type: si.item_type,
+                            content_length: si.encrypted_blob.len() as u32,
+                            encrypted_blob: si.encrypted_blob,
+                            content_hash: si.content_hash,
+                            author_id: si.author_id,
+                            signature: si.signature,
+                            key_version: si.key_version as u32,
+                            published_at: si.published_at,
+                            is_tombstone: si.is_tombstone,
+                            parent_id: si.parent_id,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let fresp = cordelia_network::messages::WireMessage::FetchResponse(
+                    cordelia_network::messages::FetchResponse { items: fetch_items },
+                );
+                let _ = cordelia_network::codec::write_frame(send, &fresp).await;
+                tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
+
+                // After fetch, read next frame for potential next channel
+                match cordelia_network::codec::read_frame(recv).await {
+                    Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
+                        current_req = r;
+                        continue;
+                    }
+                    _ => break, // EOF or unexpected -> done
+                }
+            }
+            Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
+                // No fetch for previous channel, move to next
+                current_req = r;
+                continue;
+            }
+            _ => break, // EOF or unexpected -> done
         }
     }
-
-    // Build sync response headers
-    let (headers, has_more) = {
-        let db = match state.db.lock() {
-            Ok(db) => db,
-            Err(_) => return,
-        };
-        let items = cordelia_storage::items::query_listen(
-            &db,
-            &req.channel_id,
-            req.since.as_deref(),
-            req.limit,
-        )
-        .unwrap_or_default();
-        let has_more = items.len() as u32 >= req.limit;
-        let headers: Vec<cordelia_network::messages::ItemHeader> = items
-            .iter()
-            .map(|si| cordelia_network::messages::ItemHeader {
-                item_id: si.item_id.clone(),
-                channel_id: si.channel_id.clone(),
-                item_type: si.item_type.clone(),
-                content_hash: si.content_hash.clone(),
-                author_id: si.author_id.clone(),
-                signature: si.signature.clone(),
-                key_version: si.key_version as u32,
-                published_at: si.published_at.clone(),
-                is_tombstone: si.is_tombstone,
-                parent_id: si.parent_id.clone(),
-            })
-            .collect();
-        (headers, has_more)
-    };
-
-    let resp = cordelia_network::messages::WireMessage::SyncResponse(
-        cordelia_network::messages::SyncResponse {
-            items: headers,
-            has_more,
-        },
-    );
-    let _ = cordelia_network::codec::write_frame(send, &resp).await;
-    tracing::debug!(peer = %peer_id, channel = %req.channel_id, "served sync request");
-
-    // Optional fetch phase: peer may request full items
-    if let Ok(fetch_msg) = cordelia_network::codec::read_frame(recv).await
-        && let cordelia_network::messages::WireMessage::FetchRequest(freq) = fetch_msg
-    {
-        let fetch_items = {
-            let db = match state.db.lock() {
-                Ok(db) => db,
-                Err(_) => return,
-            };
-            cordelia_storage::items::query_listen(&db, &req.channel_id, None, 1000)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|si| freq.item_ids.contains(&si.item_id))
-                .map(|si| cordelia_network::messages::Item {
-                    item_id: si.item_id,
-                    channel_id: si.channel_id,
-                    item_type: si.item_type,
-                    content_length: si.encrypted_blob.len() as u32,
-                    encrypted_blob: si.encrypted_blob,
-                    content_hash: si.content_hash,
-                    author_id: si.author_id,
-                    signature: si.signature,
-                    key_version: si.key_version as u32,
-                    published_at: si.published_at,
-                    is_tombstone: si.is_tombstone,
-                    parent_id: si.parent_id,
-                })
-                .collect::<Vec<_>>()
-        };
-        let fresp = cordelia_network::messages::WireMessage::FetchResponse(
-            cordelia_network::messages::FetchResponse { items: fetch_items },
-        );
-        let _ = cordelia_network::codec::write_frame(send, &fresp).await;
-        tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
-    }
+    tracing::debug!(peer = %peer_id, channels_served, "inbound sync stream complete");
 }
 
 async fn handle_inbound_peer_share(
