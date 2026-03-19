@@ -225,6 +225,7 @@ pub async fn p2p_loop(
     allow_private_addresses: bool,
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
+    bootstrap_addrs: Vec<std::net::SocketAddr>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -1096,6 +1097,40 @@ pub async fn p2p_loop(
                         if peer.is_relay {
                             relays.insert(peer.node_id.clone());
                         }
+                    }
+                }
+
+                // Bootstrap retry: if no relay in hot set, retry bootstrap
+                // addresses (§8.3: bootnode connection is transient, but the
+                // config may include relay addresses that failed on first attempt).
+                let has_hot_relay = governor.hot_peers().iter()
+                    .any(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false));
+                if !has_hot_relay && !bootstrap_addrs.is_empty() && node_role != "bootnode" {
+                    for addr in &bootstrap_addrs {
+                        if in_flight.len() >= MAX_IN_FLIGHT || in_flight.contains(addr) {
+                            continue;
+                        }
+                        if conn_mgr.connected_peers().iter().any(|p| {
+                            conn_mgr.get_connection(p)
+                                .map(|c| c.remote_address() == *addr)
+                                .unwrap_or(false)
+                        }) {
+                            continue; // already connected to this address
+                        }
+                        in_flight.insert(*addr);
+                        let ctx = connect_ctx.clone();
+                        let tx = connect_tx.clone();
+                        let addr = *addr;
+                        tracing::info!(%addr, "retrying bootstrap address (no hot relay)");
+                        tokio::spawn(async move {
+                            match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                                Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                Err(e) => {
+                                    tracing::debug!(%addr, error = %e, "bootstrap retry failed");
+                                    let _ = tx.send(Err((addr, e.to_string())));
+                                }
+                            }
+                        });
                     }
                 }
 
