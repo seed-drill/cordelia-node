@@ -519,6 +519,20 @@ Note: `author_id` is raw bytes(32) on the wire for compactness. The signed metad
 ```
 
 **Sync flow:**
+
+Phase 0 (relay channel discovery): Before per-channel sync, relay nodes send a `SyncChannelListRequest` to learn which channels the peer has items for. The responder returns `SyncChannelListResponse` with its stored channel IDs. The initiator merges these into its `relay_learned_channels` set for this and future sync cycles. This solves the bootstrap problem: a relay with 0 items can discover channels from its peers, then sync items for those channels.
+
+```
+SyncChannelListRequest {}           // "What channels do you have?"
+
+SyncChannelListResponse {
+    channel_ids: [string]           // Channels the responder has stored items for
+}
+```
+
+Phase 0 runs on every relay sync cycle, on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
+
+Phase 1-4 (per-channel sync, unchanged):
 1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync
 2. Responder returns `SyncResponse` with item headers since the cursor
 3. Initiator compares headers to local storage:
@@ -568,7 +582,7 @@ Item {
 
 **Peer selection for pull-sync:** The node MUST sync from all **hot** peers each cycle (governor state = Hot, §5). Each peer sync is independent and MAY run concurrently (separate tasks). This ensures O(hot_max) sync cost per cycle, bounded by the governor's hot peer set regardless of total network size.
 
-**Channel source for pull-sync:** Personal nodes sync their subscribed channels (`list_for_entity`). Relay nodes sync all channels they have stored items for (`SELECT DISTINCT channel_id FROM items`). This allows relays to fill gaps via anti-entropy without being channel members.
+**Channel source for pull-sync:** Personal nodes sync their subscribed channels (`list_for_entity`). Relay nodes sync `relay_learned_channels`: the union of channels they have stored items for (`SELECT DISTINCT channel_id FROM items`) and channels discovered from peers via Phase 0 channel discovery (`SyncChannelListResponse`). This breaks the bootstrap dependency: a relay with 0 items discovers channels from peers, then syncs items for those channels. The `relay_learned_channels` set is maintained in memory and rebuilt each sync cycle from stored items + peer responses.
 
 The governor (§5) manages which peers are hot:
 - Peers that deliver items the node didn't have are scored higher (§5.5)
@@ -1056,7 +1070,7 @@ accept IF channel_id IN relay_subscribed_channels
          OR channel_id IN relay_learned_channels
 ```
 
-Phase 1 relays are transparent: they accept all channels. The `relay_learned_channels` set grows as relays observe items flowing through them. Future phases add explicit allowlists.
+Phase 1 relays are transparent: they accept all channels. The `relay_learned_channels` set grows from two sources: (a) channels observed in stored items (`SELECT DISTINCT channel_id FROM items`) and (b) channels discovered from peers via sync Phase 0 (`SyncChannelListResponse`, §4.5). Future phases add explicit allowlists.
 
 Bootnodes (§8.2) never reach Gate 2 -- they do not participate in item replication.
 
@@ -1100,11 +1114,12 @@ When a relay stores an item received from a **non-relay** peer (personal node or
 
 ### 7.3 Channel Intersection
 
-`channel_intersection(peer)` determines which channels a peer and this node have in common. Computed from Channel-Announce data (§4.4).
+`channel_intersection(peer)` determines which channels a peer and this node have in common. Computed from Channel-Announce data (§4.4) and sync Phase 0 discovery (§4.5).
 
 ```
 local_channels = subscribed_channels
     UNION relay_learned_channels (if this node is a relay)
+    // relay_learned_channels = stored items channels + sync Phase 0 discovered channels
 
 channel_intersection(peer) = peer.channels INTERSECT local_channels
     (bootnode peers excluded -- they have no channel state)

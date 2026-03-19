@@ -43,6 +43,33 @@ pub enum ItemSyncError {
 
 // ── Item-Sync (0x05) ───────────────────────────────────────────────
 
+/// Send a channel list request (Phase 0, §4.5).
+/// Relay nodes use this to discover which channels a peer has items for.
+pub async fn send_channel_list_request<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    writer: &mut W,
+    reader: &mut R,
+) -> Result<SyncChannelListResponse, ItemSyncError> {
+    let req = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
+    write_frame(writer, &req).await?;
+    let resp = read_frame(reader).await?;
+    match resp {
+        WireMessage::SyncChannelListResponse(r) => Ok(r),
+        _ => Err(ItemSyncError::UnexpectedMessage),
+    }
+}
+
+/// Handle a channel list request (Phase 0 responder, §4.5).
+pub async fn handle_channel_list_request<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    channel_ids: &[String],
+) -> Result<(), ItemSyncError> {
+    let resp = WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+        channel_ids: channel_ids.to_vec(),
+    });
+    write_frame(writer, &resp).await?;
+    Ok(())
+}
+
 /// Send a sync request (initiator side).
 pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,

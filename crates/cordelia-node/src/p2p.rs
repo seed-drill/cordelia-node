@@ -827,13 +827,15 @@ pub async fn p2p_loop(
 
             // ── Pull-sync from hot peers (§4.5) ─────────────────────
             // "The node MUST sync from all hot peers each cycle."
-            // Relays use stored channel IDs (they aren't channel members).
-            // Personal nodes use list_for_entity (subscribed channels).
+            // Relays: Phase 0 channel discovery + stored channels (relay_learned_channels).
+            // Personal nodes: subscribed channels (list_for_entity), skip Phase 0.
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
-                let channels: Vec<String> = {
+
+                // Personal nodes: get subscribed channels, skip if empty
+                let local_channels: Vec<String> = {
                     let db = match state.db.lock() {
                         Ok(db) => db,
                         Err(_) => continue,
@@ -850,32 +852,67 @@ pub async fn p2p_loop(
                             .collect()
                     }
                 };
-                if channels.is_empty() { continue; }
+                // Personal nodes with no subscribed channels: nothing to sync
+                if local_channels.is_empty() && node_role != "relay" { continue; }
 
+                let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();
-                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), channels = channels.len(), "pull-sync cycle");
+                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), local_channels = local_channels.len(), "pull-sync cycle");
                 for target in &hot {
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
                     let sync_state = state.clone();
-                    let sync_channels = channels.clone();
+                    let sync_local = local_channels.clone();
                     let target = target.clone();
                     let gtx = gov_tx.clone();
                     let role = node_role.clone();
-                    tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
+                    let do_phase0 = is_relay;
                     tokio::spawn(async move {
+                        // Phase 0: relay channel discovery (§4.5)
+                        // Ask peer "what channels do you have?", merge with local.
+                        let sync_channels = if do_phase0 {
+                            let (mut send, mut recv) = match open_bi(&conn).await {
+                                Ok(s) => s,
+                                Err(e) => { tracing::debug!(peer = %target, error = %e, "phase0 open_bi failed"); return; }
+                            };
+                            // Write protocol byte
+                            if let Err(e) = cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await {
+                                tracing::debug!(peer = %target, error = %e, "phase0 protocol byte failed");
+                                return;
+                            }
+                            let discovered = match cordelia_network::item_sync::send_channel_list_request(&mut send, &mut recv).await {
+                                Ok(resp) => resp.channel_ids,
+                                Err(e) => {
+                                    tracing::debug!(peer = %target, error = %e, "phase0 channel list request failed");
+                                    Vec::new()
+                                }
+                            };
+                            if !discovered.is_empty() {
+                                tracing::debug!(peer = %target, discovered = discovered.len(), "phase0: discovered channels");
+                            }
+                            // Merge: local stored + peer discovered (deduplicated)
+                            let mut merged: std::collections::HashSet<String> = sync_local.into_iter().collect();
+                            for ch in discovered {
+                                merged.insert(ch);
+                            }
+                            merged.into_iter().collect::<Vec<_>>()
+                        } else {
+                            sync_local
+                        };
+
+                        if sync_channels.is_empty() { return; }
+                        tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
+
                         for ch_id in &sync_channels {
                             let (mut send, mut recv) = match open_bi(&conn).await {
                                 Ok(s) => s,
                                 Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync open_bi"); break; }
                             };
                             let mut stream = tokio::io::join(&mut recv, &mut send);
-                            tracing::debug!(peer = %target, channel = %ch_id, "sync request sent");
                             let resp = match cordelia_network::item_sync::send_sync_request(&mut stream, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
                                 Ok(r) => r,
                                 Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); continue; }
                             };
-                            tracing::debug!(peer = %target, channel = %ch_id, headers = resp.items.len(), "sync response received");
                             if resp.items.is_empty() { continue; }
 
                             let known = {
@@ -1282,7 +1319,31 @@ async fn handle_inbound_sync(
         }
     };
 
+    // Phase 0: channel list discovery (§4.5). If the first message is
+    // SyncChannelListRequest, respond with our stored channel IDs and
+    // then read the next message as a normal SyncRequest.
     let req = match msg {
+        cordelia_network::messages::WireMessage::SyncChannelListRequest(_) => {
+            let channel_ids = {
+                let db = match state.db.lock() {
+                    Ok(db) => db,
+                    Err(_) => return,
+                };
+                cordelia_storage::channels::list_stored_channel_ids(&db).unwrap_or_default()
+            };
+            tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
+            let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
+                cordelia_network::messages::SyncChannelListResponse { channel_ids },
+            );
+            let _ = cordelia_network::codec::write_frame(send, &resp).await;
+
+            // Now read the actual SyncRequest
+            match cordelia_network::codec::read_frame(recv).await {
+                Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => r,
+                Ok(_) => return,
+                Err(_) => return, // Peer may close after Phase 0 (no channels to sync)
+            }
+        }
         cordelia_network::messages::WireMessage::SyncRequest(r) => r,
         _ => return,
     };
