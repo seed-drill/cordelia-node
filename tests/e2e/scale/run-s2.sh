@@ -63,10 +63,9 @@ fi
 # Relay hot_max from generate-s2.sh: R + 5
 RELAY_HOT_MAX=$((RELAYS + 5))
 
-# Mesh target: ideal = all relays + bootnodes. But with personal nodes
-# consuming hot slots, full mesh may exceed hot_max. Phase 1 reports
-# progress but only asserts mesh if hot_max is sufficient.
-MESH_TARGET=$((RELAYS + BOOTNODES - 1))
+# Mesh target: all other relays (excluding self). Bootnodes stay Warm
+# (§8.3, never promoted to Hot) so they don't count toward mesh target.
+MESH_TARGET=$((RELAYS - 1))
 MESH_FEASIBLE=true
 if [ "$MESH_TARGET" -gt "$((RELAY_HOT_MAX - PERSONAL_PER_ZONE))" ]; then
     MESH_FEASIBLE=false
