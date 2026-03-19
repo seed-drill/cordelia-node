@@ -284,6 +284,7 @@ for z in $(seq 1 "$NUM_ZONES"); do
     name="p${PERSONAL_IDX}"
     ip="172.28.${z}.$((29 + pi))"
 
+    relay_name="r${z}"
     cat >> "$COMPOSE" << YAML
   ${name}:
     image: \${CORDELIA_IMAGE:-cordelia-test:latest}
@@ -303,8 +304,8 @@ for z in $(seq 1 "$NUM_ZONES"); do
       home-${z}:
         ipv4_address: ${ip}
     depends_on:
-      b1:
-        condition: service_healthy
+      ${relay_name}:
+        condition: service_started
 
 YAML
     done
