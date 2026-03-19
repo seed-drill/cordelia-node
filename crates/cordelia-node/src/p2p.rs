@@ -354,6 +354,14 @@ pub async fn p2p_loop(
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
 
+    // P2P telemetry counters
+    let mut select_iterations: u64 = 0;
+    let mut sync_cycles_completed: u64 = 0;
+    let mut heartbeat_interval =
+        tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat_interval.tick().await;
+
     // Relay re-push flush timer: batch + de-dupe items before forwarding.
     // Jittered start so relays don't all flush simultaneously (§7.2).
     let repush_base = cordelia_core::protocol::REPUSH_INTERVAL_SECS;
@@ -406,7 +414,20 @@ pub async fn p2p_loop(
     const CONNECTS_PER_CYCLE: usize = 3;
 
     loop {
+        select_iterations += 1;
         tokio::select! {
+            // ── P2P heartbeat (30s telemetry) ────────────────────────
+            _ = heartbeat_interval.tick() => {
+                let (hot, warm, _cold, _banned) = governor.counts();
+                tracing::info!(
+                    iterations = select_iterations,
+                    hot_peers = hot,
+                    warm_peers = warm,
+                    sync_cycles = sync_cycles_completed,
+                    "p2p heartbeat"
+                );
+            }
+
             // ── Accept incoming connection (non-blocking) ─────────────
             result = endpoint.accept() => {
                 match result {
@@ -963,7 +984,8 @@ pub async fn p2p_loop(
 
                 let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();
-                tracing::debug!(hot_peers = hot.len(), total_peers = peers.len(), local_channels = local_channels.len(), "pull-sync cycle");
+                sync_cycles_completed += 1;
+                tracing::info!(hot_peers = hot.len(), total_peers = peers.len(), local_channels = local_channels.len(), cycle = sync_cycles_completed, "pull-sync cycle");
                 for target in &hot {
                     if let Some(conn) = conn_mgr.get_connection(target) {
                     let conn = conn.clone();
@@ -1215,7 +1237,7 @@ pub async fn p2p_loop(
                     }
                 }
 
-                tracing::debug!(hot, warm, cold, banned, "gov: tick complete");
+                tracing::info!(hot, warm, cold, banned, "gov: tick complete");
             }
 
             // ── Shutdown ──────────────────────────────────────────────
