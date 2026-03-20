@@ -103,6 +103,7 @@ pub fn post_connect(
     peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
     swarm_members: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
 ) {
     // Step 1: Extract peer roles from handshake
     let (is_relay, is_bootnode) = conn_mgr
@@ -215,9 +216,10 @@ pub fn post_connect(
         let relays = peer_relays.clone();
         let gtx = gov_tx.clone();
         let sm = swarm_members.clone();
+        let st = seen_table.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx, sm,
+                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx, sm, st,
             )
             .await;
         });
@@ -283,10 +285,16 @@ pub async fn p2p_loop(
     let peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
-    // Shared set of relay peer IDs. Used by handle_inbound_push for single-hop
-    // re-push check (§7.2: only re-push items from non-relay senders).
+    // Shared set of relay peer IDs. Used for relay detection after handshake (§7.2).
     let peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
+    // Epidemic forwarding seen table (§7.2). Shared between inbound push
+    // (records senders) and repush flush (computes forward targets).
+    let seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>> =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            cordelia_network::seen_table::SeenTable::new(),
+        ));
 
     // Verified swarm members (§8.2.2). Peers whose NodeId matches an HKDF-derived
     // child key from the lead's seed. Populated on inbound verification.
@@ -315,6 +323,7 @@ pub async fn p2p_loop(
             &peer_relays,
             &gov_tx,
             &swarm_members,
+            &seen_table,
         );
     }
     governor.tick();
@@ -538,7 +547,7 @@ pub async fn p2p_loop(
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
-                                    &peer_relays, &gov_tx, &swarm_members,
+                                    &peer_relays, &gov_tx, &swarm_members, &seen_table,
                                 );
                             }
                             Err(e) => {
@@ -1287,9 +1296,10 @@ pub async fn handle_peer_streams(
         >,
     >,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
-    peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    _peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
     swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
 ) {
     let mut stream_count: u64 = 0;
     loop {
@@ -1377,7 +1387,7 @@ pub async fn handle_peer_streams(
                     &node_role,
                     &repush_tx,
                     &delivery_tx,
-                    &peer_relays,
+                    &seen_table,
                 )
                 .await;
             }
@@ -1414,7 +1424,7 @@ async fn handle_inbound_push(
     node_role: &str,
     repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
-    peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -1457,22 +1467,21 @@ async fn handle_inbound_push(
         let _ = delivery_tx.send((peer_id.clone(), stored as u64));
     }
 
-    // Relay single-hop re-push (§7.2):
-    // - Only re-push items received from non-relay peers (first hop only)
-    // - Only queue items that were newly stored (not duplicates)
-    // - Repush flush targets relay peers only
+    // Epidemic relay forwarding (§7.2):
+    // - ALL newly stored items queued for forwarding regardless of sender role
+    // - Sender recorded in seen table so they're excluded from forward targets
+    // - Seen table prevents forwarding loops across multi-hop paths
     if node_role == "relay" && !newly_stored.is_empty() {
-        let sender_is_relay = peer_relays
-            .read()
-            .ok()
-            .map(|r| r.contains(peer_id))
-            .unwrap_or(false);
-        if !sender_is_relay {
+        if let Ok(mut st) = seen_table.write() {
             for item in &newly_stored {
-                let _ = repush_tx.send((item.clone(), peer_id.clone()));
+                let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                st.record_sender(&hash, peer_id);
             }
-            tracing::debug!(peer = %peer_id, queued = newly_stored.len(), "relay repush queued (single-hop)");
         }
+        for item in &newly_stored {
+            let _ = repush_tx.send((item.clone(), peer_id.clone()));
+        }
+        tracing::debug!(peer = %peer_id, queued = newly_stored.len(), "relay repush queued (epidemic)");
     }
 
     let ack =
