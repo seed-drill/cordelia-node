@@ -60,8 +60,11 @@ def run(cmd: str, check=True, capture=True, timeout=60, env=None) -> subprocess.
 def docker_exec(container: str, cmd: str, timeout=10) -> str:
     """Run a command inside a Docker container, return stdout."""
     full = f"docker exec {shlex.quote(container)} {cmd}"
-    result = run(full, check=False, timeout=timeout)
-    return result.stdout.strip() if result.returncode == 0 else ""
+    try:
+        result = run(full, check=False, timeout=timeout)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except subprocess.TimeoutExpired:
+        return ""
 
 
 def api_get(container: str, endpoint: str) -> dict:
@@ -382,7 +385,8 @@ def phase_startup(topo, cfg: dict, db: MetricsDB):
 
     # Compose up
     project = topo.compose_project()
-    run(f"docker compose -p {project} -f {compose_file} up -d", timeout=120)
+    compose_timeout = max(120, topo.container_count)
+    run(f"docker compose -p {project} -f {compose_file} up -d", timeout=compose_timeout)
 
     # Wait healthy -- timeout scales with container count
     health_timeout = max(120, topo.container_count * 2)
