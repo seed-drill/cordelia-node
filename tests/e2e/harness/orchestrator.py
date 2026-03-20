@@ -73,7 +73,7 @@ def run(cmd: str, check=True, capture=True, timeout=60, env=None) -> subprocess.
     )
 
 
-def docker_exec(container: str, cmd: str, timeout=10) -> str:
+def docker_exec(container: str, cmd: str, timeout=15) -> str:
     """Run a command inside a Docker container, return stdout."""
     full = f"docker exec {shlex.quote(container)} {cmd}"
     try:
@@ -101,24 +101,28 @@ def api_get(container: str, endpoint: str) -> dict:
         return {}
 
 
-def api_post(container: str, endpoint: str, body: dict) -> dict:
-    """POST to a node's REST API endpoint."""
+def api_post(container: str, endpoint: str, body: dict, retries: int = 3) -> dict:
+    """POST to a node's REST API endpoint with retry."""
     token = _get_token(container)
     if not token:
         return {}
     body_json = json.dumps(body)
-    raw = docker_exec(
-        container,
+    cmd = (
         f'curl -sf -H "Authorization: Bearer {token}" '
         f'-H "Content-Type: application/json" '
         f"-d '{body_json}' "
-        f"http://localhost:{API_PORT}/api/v1/{endpoint}",
-        timeout=15,
+        f"http://localhost:{API_PORT}/api/v1/{endpoint}"
     )
-    try:
-        return json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        return {}
+    for attempt in range(retries):
+        raw = docker_exec(container, cmd, timeout=30)
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+        if attempt < retries - 1:
+            time.sleep(1)
+    return {}
 
 
 def db_query(container: str, sql: str) -> str:
