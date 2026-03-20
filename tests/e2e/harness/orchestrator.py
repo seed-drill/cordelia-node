@@ -22,6 +22,8 @@ import sys
 import time
 import tomllib
 import uuid
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -388,17 +390,25 @@ def phase_startup(topo, cfg: dict, db: MetricsDB):
     compose_timeout = max(120, topo.container_count)
     run(f"docker compose -p {project} -f {compose_file} up -d", timeout=compose_timeout)
 
-    # Wait healthy -- parallel batch checking for scale
+    # Wait healthy -- concurrent checking with thread pool
     health_timeout = max(120, topo.container_count)
     all_containers = topo.all_containers()
     pending = set(all_containers)
     start = time.time()
+    workers = min(32, len(all_containers))
+
+    def check_one(container):
+        status = api_get(container, "status")
+        return container, status.get("status") == "running"
+
     while pending and time.time() - start < health_timeout:
-        still_pending = set()
-        for container in pending:
-            status = api_get(container, "status")
-            if status.get("status") != "running":
-                still_pending.add(container)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(check_one, c): c for c in pending}
+            still_pending = set()
+            for f in as_completed(futures):
+                container, healthy = f.result()
+                if not healthy:
+                    still_pending.add(container)
         pending = still_pending
         if pending:
             elapsed = int(time.time() - start)
@@ -713,7 +723,6 @@ def phase_delivery(topo, cfg: dict, db: MetricsDB,
         elapsed = int(time.time() - start)
 
         # Build distribution of relay item counts
-        from collections import Counter
         dist = Counter(relay_counts)
         dist_str = " ".join(f"{v}:{c}" for v, c in sorted(dist.items()))
 
