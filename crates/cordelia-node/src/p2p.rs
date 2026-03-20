@@ -1018,6 +1018,9 @@ pub async fn p2p_loop(
                     let gtx = gov_tx.clone();
                     let role = node_role.clone();
                     let do_phase0 = is_relay;
+                    let is_relay_node = is_relay;
+                    let rtx = repush_tx.clone();
+                    let seen_ref = seen_table.clone();
                     tokio::spawn(async move {
                         // Batched sync (§4.5): one stream per peer, all channels.
                         // Open one (send, recv) pair, write protocol byte once.
@@ -1088,6 +1091,7 @@ pub async fn p2p_loop(
                             };
 
                             let mut stored_count = 0u32;
+                            let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
                             {
                                 let db = match sync_state.db.lock() {
                                     Ok(db) => db,
@@ -1096,7 +1100,23 @@ pub async fn p2p_loop(
                                 for item in &items {
                                     if let Ok(true) = store_item(&db, item, &role) {
                                         stored_count += 1;
+                                        if is_relay_node {
+                                            newly_stored_items.push(item.clone());
+                                        }
                                     }
+                                }
+                            }
+                            // Epidemic forwarding: relay queues sync-discovered items
+                            // for repush, recording sync source in seen table.
+                            if is_relay_node && !newly_stored_items.is_empty() {
+                                if let Ok(mut st) = seen_ref.write() {
+                                    for item in &newly_stored_items {
+                                        let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                                        st.record_sender(&hash, &target);
+                                    }
+                                }
+                                for item in newly_stored_items {
+                                    let _ = rtx.send((item, target.clone()));
                                 }
                             }
                             if stored_count > 0 {

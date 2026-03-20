@@ -1,5 +1,6 @@
 # S2 relay mesh: R=50 with sparse connectivity (hot_max=20).
-# Tests multi-hop relay propagation. Mesh will be partial.
+# Tests multi-hop relay propagation via epidemic forwarding (§7.2).
+# Regression test for cordelia-node#9 (sparse mesh partitioning).
 
 [topology]
 name = "s2-r50-sparse"
