@@ -230,16 +230,186 @@ SeenEntry {
 | Phase | Deliverable | Dependency |
 |-------|------------|------------|
 | Phase 1.1 | Epidemic forwarding + seen table | None (fixes cordelia-node#9) |
-| Phase 1.2 | Route discovery + encrypted tokens | Phase 1.1 |
-| Phase 1.3 | Expanding ring search | Phase 1.2 |
-| Phase 1.4 | Paranoia mode (envelope padding) | Phase 1.2 |
-| Phase 2+ | Path quality metrics, multi-path failover | Phase 1.2 |
+| Phase 1.2 | Peer trust scoring (§11) | Phase 1.1 |
+| Phase 1.3 | Route discovery + encrypted tokens | Phase 1.1 |
+| Phase 1.4 | Expanding ring search + TTL rate limits (§10) | Phase 1.3 |
+| Phase 1.5 | Paranoia mode (envelope padding) | Phase 1.3 |
+| Phase 2+ | Path quality metrics, multi-path failover | Phase 1.3 |
 
 Phase 1.1 is the immediate priority: it unblocks sparse mesh scaling with minimal protocol change. Phases 1.2-1.4 can follow iteratively.
 
 ---
 
-## 10. Open Questions
+## 10. Security: Broadcast Attack Mitigation
+
+**Decision**: Make skipping expanding ring search economically irrational through TTL-proportional rate limits, per-peer trust scoring, and discovery budgets.
+
+### 10.1 Attack Vectors
+
+| Attack | Mechanism | Impact |
+|--------|-----------|--------|
+| Broadcast flood | Send many route discoveries, each flooding O(N) messages | Network saturation, relay CPU/bandwidth exhaustion |
+| TTL skip | Jump straight to TTL=255, bypassing expanding ring | Maximum amplification per message |
+| Seen table exhaustion | Flood unique fake message IDs | Legitimate items evicted from seen table |
+| Token cache exhaustion | Flood discovery messages | Relay session key LRU caches filled with attacker state |
+| Relay amplification | Compromised relay forwards items it should suppress | Duplicate traffic, wasted bandwidth |
+
+### 10.2 TTL-Proportional Rate Limits
+
+Higher reach = stricter limit. A new rate limit dimension alongside existing §9.2 buckets:
+
+| TTL band | Budget per peer per minute | Reach (R=50, hot_max=20) | Rationale |
+|----------|---------------------------|--------------------------|-----------|
+| 1-4 (local) | 10 | ~20 relays | Affects only direct peers, cheap |
+| 5-16 (regional) | 3 | ~40 relays | Moderate reach, moderate cost |
+| 17+ (global) | 1 | All relays | Full network flood, expensive |
+
+Epidemic items (group memories, TTL=255) use the existing write rate limit (§9.2), not discovery budget. Only `routing_mode=routed` messages consume discovery budget.
+
+**Tuning rationale**: A legitimate publisher doing expanding ring search uses ~1 low-TTL attempt (succeeds 90%+ of the time in a well-connected mesh), occasionally 1 mid-TTL, and rarely 1 global. The budget of 10/3/1 per minute gives generous headroom for legitimate use while making sustained flooding of high-TTL broadcasts impossible.
+
+### 10.3 Discovery Budget with Cooldown
+
+Each node gets a finite discovery budget per time window:
+
+```
+MAX_DISCOVERIES_PER_HOUR = 20     (configurable)
+DISCOVERY_BUDGET_WINDOW  = 3600s  (1 hour)
+```
+
+- Only broadcast discoveries (not cached-route sends) consume budget
+- After exhaustion, discovery broadcasts are silently dropped by the first relay that checks
+- Budget resets after the window expires
+- Relays track per-peer discovery count in the rate limiter
+
+**Worst case bound**: A compromised node triggers at most 20 network-wide floods per hour. Combined with TTL-proportional limits, that's effectively ~20 low-TTL (affecting 20 peers each) and ~1 global per hour.
+
+### 10.4 Seen Table Defence
+
+Against seen table exhaustion:
+- Relay verifies content hash before adding to seen table (fake items rejected)
+- Seen table entries require a valid, parseable item (not just a hash)
+- `SEEN_TABLE_MAX = 10_000` with LRU eviction by `first_seen`
+- Attacker must create real items (content hash must match encrypted_blob) to occupy slots
+- Cost of creating a valid item >> cost of checking a hash
+
+### 10.5 Escalation Detection
+
+Relays cannot strictly enforce expanding ring (they can't prove a publisher tried TTL=2 first), but they can detect patterns statistically:
+
+- Relay tracks per-peer: `{item_id -> Vec<(ttl, timestamp)>}` for recent discoveries
+- If a peer consistently sends TTL=17+ without prior lower-TTL attempts for the same item, increment trust penalty (see §11)
+- Pattern detection, not per-message blocking: one TTL=255 with no prior low-TTL is normal (relay wasn't in range). Doing it every time is suspicious.
+- Detection window: `ESCALATION_TRACK_WINDOW = 300s` (aligned with warm tenure)
+
+### 10.6 Making It Economically Irrational
+
+The combined effect of layers 10.2-10.5:
+
+| Strategy | Cost to attacker | Benefit to attacker |
+|----------|------------------|---------------------|
+| TTL=2 expanding ring (legitimate) | 1 discovery budget, affects ~20 peers | Route found in <1s |
+| TTL=255 direct (skip ring) | 1 discovery budget, 1 global slot/min, trust penalty | Route found in <1s (same) |
+| TTL=255 flood (attack) | 1 global slot/min, trust drain, ban after ~5 min | Brief amplification, then banned |
+
+The rational strategy IS expanding ring: same outcome (route found), lower cost (cheap budget), no trust penalty. Skipping to global is strictly worse for a legitimate user and time-limited for an attacker.
+
+---
+
+## 11. Peer Trust Scoring
+
+**Decision**: Replace the binary breach counter with an inverse trust score that starts high and decays on bad behaviour. Operators can tune decay rates and thresholds.
+
+### 11.1 Design
+
+Each peer gets a trust score in the governor:
+
+```rust
+pub struct PeerTrust {
+    score: f64,              // 0.0 (banned) to 1.0 (fully trusted)
+    last_decay_reason: Option<String>,
+    last_decay_at: Option<Instant>,
+}
+```
+
+New peers start at `TRUST_INITIAL = 0.5` (neutral -- must earn full trust). Existing peers with good history drift toward 1.0. Bad behaviour decays the score. Score recovery is slow (hours), decay is fast (immediate).
+
+### 11.2 Decay Events
+
+| Event | Decay amount | Rationale |
+|-------|-------------|-----------|
+| Rate limit breach (any bucket) | -0.10 | Existing §9.2 behaviour, now continuous |
+| High-TTL discovery without prior low-TTL | -0.05 | Escalation skipping pattern |
+| Invalid content hash on forwarded item | -0.15 | Data integrity violation |
+| Protocol violation (wrong message type) | -0.10 | Existing, now feeds trust score |
+| Push of item we already have (duplicate) | -0.02 | Minor: may be timing, not malicious |
+| Forwarding an item with expired/invalid token | -0.05 | Possible replay or corruption |
+
+### 11.3 Recovery
+
+Trust recovers slowly via legitimate behaviour:
+
+| Event | Recovery amount | Cap |
+|-------|----------------|-----|
+| Successful item delivery (new items to us) | +0.01 per item | Max 1.0 |
+| Successful sync cycle (items exchanged) | +0.005 | Max 1.0 |
+| Time-based passive recovery | +0.01 per hour | Max 1.0 |
+
+Recovery is asymmetric by design: one bad event costs more than many good events earn. This makes sustained misbehaviour expensive even if interleaved with legitimate traffic.
+
+### 11.4 Thresholds and Actions
+
+| Threshold | Action |
+|-----------|--------|
+| score < 0.3 | Demote from Hot to Warm (reduce influence) |
+| score < 0.2 | Deprioritise in sync target selection |
+| score < 0.1 | Ban (Transient tier, 900s base with escalation) |
+| score = 0.0 | Ban (Systematic tier, 28800s base) |
+
+### 11.5 Operator Configuration
+
+All trust parameters are configurable in the node config (same pattern as governor config):
+
+```toml
+[trust]
+initial_score = 0.5
+recovery_per_hour = 0.01
+recovery_per_item = 0.01
+recovery_cap = 1.0
+
+[trust.decay]
+rate_limit_breach = 0.10
+escalation_skip = 0.05
+invalid_content = 0.15
+protocol_violation = 0.10
+duplicate_push = 0.02
+invalid_token = 0.05
+
+[trust.thresholds]
+demote_hot = 0.3
+deprioritise_sync = 0.2
+ban_transient = 0.1
+ban_systematic = 0.0
+```
+
+**Rationale for operator tunability**:
+- Different deployments have different risk profiles (enterprise intranet vs public relay)
+- Operators running high-value keepers may want aggressive decay (low tolerance)
+- Operators running open community relays may want relaxed thresholds (higher tolerance for noisy peers)
+- Defaults are tuned for the common case (public relay mesh, moderate adversarial environment)
+
+### 11.6 Relationship to Existing Governor Score
+
+The existing `score_ema` in PeerInfo measures **performance** (throughput, RTT, contribution). The new trust score measures **behaviour**. They are orthogonal:
+
+- A fast, high-throughput peer (high performance score) that rate-limits breaches (low trust score) should be demoted
+- A slow peer (low performance score) that never misbehaves (high trust score) should be kept
+- Governor promotion decisions consider both: `effective_score = score_ema * trust_score`
+- This naturally demotes high-performing bad actors and retains honest slow peers
+
+---
+
+## 12. Open Questions
 
 1. **Seen table persistence**: Should the seen table survive relay restart? Currently proposed as in-memory only. Pull-sync safety net handles restart gaps, but warm restart would reduce duplicate traffic.
 
