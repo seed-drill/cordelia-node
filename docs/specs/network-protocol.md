@@ -200,8 +200,9 @@ The first byte of each new QUIC stream identifies the mini-protocol:
 | `0x06` | Item-Push | Sender-initiated (push) | §4.6 |
 | `0x07` | PSK-Exchange | Request-Response | §4.7 |
 | `0x08` | Pairing | Request-Response | §4.8 |
+| `0x09` | RouteACK | Sender-initiated (push) | §7.4 |
 
-Stream lifecycle: the initiator opens a bidirectional QUIC stream, writes the protocol byte, then the first message. The responder reads the protocol byte to determine the handler. Unknown protocol bytes (0x09+) cause the stream to be reset with application error code `0x02` (unknown protocol).
+Stream lifecycle: the initiator opens a bidirectional QUIC stream, writes the protocol byte, then the first message. The responder reads the protocol byte to determine the handler. Unknown protocol bytes (0x0A+) cause the stream to be reset with application error code `0x02` (unknown protocol).
 
 ---
 
@@ -646,17 +647,45 @@ PushAck {
 }
 ```
 
+**Item wire format extensions:**
+
+Items carried in PushPayload gain the following optional fields:
+
+```
+Item {
+    // ... existing fields (item_id, channel_id, content_hash, encrypted_blob, etc.) ...
+    routing_mode:  u8           // 0 = epidemic (default), 1 = routed
+    ttl:           u8           // Default 255 (epidemic), starts at 2 (routed expanding ring)
+    route_tokens:  [bytes]      // Optional, empty for epidemic. Each token ~48 bytes.
+}
+```
+
+- `routing_mode`: Set by the publisher. Group channels use `epidemic` (0); personal channels use `routed` (1). Relays forward both modes identically via the seen table (§7.2) -- the distinction affects only ACK behaviour (§7.4) and rate limiting (§9.2).
+- `ttl`: Decremented by relays before forwarding. Items with TTL=0 are stored but not forwarded (§7.5).
+- `route_tokens`: Accumulated encrypted routing tokens for path privacy (§7.4). Empty for epidemic items.
+
+**RouteACK (0x09):**
+
+```
+RouteACK {
+    item_id:  string            // Item being acknowledged
+    tokens:   [bytes]           // Reversed token chain from receiver to publisher
+}
+```
+
+Sent by the receiver of a `routed` item back through the relay chain. Each relay peels one token to discover the next hop (§7.4).
+
 **When Item-Push fires:**
 - On local write to a realtime channel: push to hot relay peers only. The originator (personal node or keeper) pushes to its hot relays; relays handle distribution. Non-relay peers receive items via Item-Sync pull (§4.5). Respects `push_policy` (§8.1.1).
-- Relay re-push (single-hop): if a relay stores an item received from a **non-relay** peer (`stored > 0`), it re-pushes to all **hot relay peers** except the sender. Items received from other relays are stored but NOT re-pushed (single-hop, no cascade). Bootnodes (§8.2) do NOT re-push -- they are discovery-only.
+- Relay forwarding (§7.2): if a relay stores an item (`stored > 0`), it forwards to all hot peers not in the seen table for this item's `content_hash`. Items received from other relays ARE forwarded (with duplicate suppression). Bootnodes (§8.2) do NOT forward -- they are discovery-only.
 - Bootnode nodes never initiate or relay Item-Push. They participate only in Handshake, Peer-Sharing, and Keep-Alive.
 - Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5), not via relay push. This eliminates relay-side routing state and Channel-Announce dependency for push routing.
 
-**Single-hop relay push:** Only the relay that receives an item from its originator (personal node or keeper) re-pushes to the relay mesh. Intermediate relays that receive via re-push store the item but do NOT re-push. This bounds amplification to O(R) per item (one push per relay), not O(R²). Pull-sync (§4.5) is the safety net for any items missed during re-push.
+**Epidemic relay forwarding:** Relays forward newly stored items to all hot relay peers that have not seen this item (checked via seen table, §7.2). This replaces the single-hop model and ensures items propagate across the full relay mesh in O(log N) hops. Pull-sync (§4.5) remains the safety net for any items missed during forwarding.
 
-**Loop prevention:** Single-hop re-push eliminates cascading by design. Additionally, duplicate items (same `content_hash` + `item_id` already stored) yield `stored: 0`, preventing re-push even if the single-hop check were bypassed.
+**Loop prevention:** The seen table (§7.2) tracks which peers have received each item. Combined with dedup (step 3 in §6.2), each item is forwarded at most once per peer. No cascading loops are possible.
 
-**Re-push item filtering:** The relay MUST only queue items that were **newly stored** (`store_item` returned true) for re-push. Items that were deduplicated or already present MUST NOT be queued, even if other items in the same batch were new.
+**Forward item filtering:** The relay MUST only queue items that were **newly stored** (`store_item` returned true) for forwarding. Items that were deduplicated or already present MUST NOT be queued, even if other items in the same batch were new.
 
 **Signature verification:** Before storing a pushed item, the receiver MUST verify the `signature` against the `author_id` and metadata envelope (ECIES spec §11.7). Reject items with invalid signatures.
 
@@ -1078,7 +1107,7 @@ When a node receives a pushed or synced item:
 3. **Dedup**: Same `item_id` + same `content_hash` → skip (idempotent).
 4. **Conflict resolution**: Same `item_id`, different `content_hash` → last-writer-wins by `published_at`. Deterministic tiebreak compares the hex-encoded `content_hash` strings lexicographically (character-by-character, using ASCII ordering: 0-9, a-f). The item with the lexicographically smaller `content_hash` wins. This ensures all replicas converge to the same item regardless of receive order.
 5. **Store**: Write encrypted blob to SQLite. Never decrypt at the P2P layer.
-6. **Relay re-push (single-hop)**: If this node is a relay AND the sender is a non-relay peer AND `stored > 0`, re-push newly stored items to all hot **relay** peers except sender. Items received from other relays are NOT re-pushed.
+6. **Relay forwarding (§7.2)**: If this node is a relay AND `stored > 0`, forward newly stored items to all hot peers not in the seen table for this item's `content_hash`. Items received from other relays ARE forwarded (with duplicate suppression via seen table).
 7. **Log**: Record in access log (author_id, channel_id, item_id, action, timestamp).
 
 ### 6.3 Tombstones
@@ -1148,11 +1177,32 @@ accept IF channel_id IN node_subscribed_channels
 
 Strict membership check. The channel must be explicitly subscribed on the destination node.
 
-### 7.2 Relay Re-Push
+### 7.2 Relay Forwarding
 
-When a relay stores an item received from a **non-relay** peer (personal node or secret keeper) and `stored > 0`, it re-pushes to all **hot relay peers** except the sender. This is single-hop: items received from other relays are stored but NOT re-pushed.
+When a relay stores an item and `stored > 0`, it forwards to all hot peers that have NOT seen this item, checked via the seen table. Items received from other relays ARE forwarded (with duplicate suppression). This replaces the previous single-hop model and fixes sparse mesh partitioning (cordelia-node#9).
 
-**Single-hop design:** Only the first relay (that receives from the originator) re-pushes. This bounds amplification to O(R) per item. Pull-sync (§4.5) provides eventual consistency for any items missed during re-push. The relay mesh converges within one pull-sync interval (10s for realtime channels).
+**Epidemic forwarding with seen table:**
+
+```
+seen_table: HashMap<[u8; 32], SeenEntry>
+
+SeenEntry {
+    peers: HashSet<NodeId>,     // peers we've forwarded to or received from
+    first_seen: Instant,        // for TTL eviction
+}
+```
+
+On receiving an item (push or sync), the relay:
+1. Adds the sender to `seen_table[content_hash].peers`
+2. Computes `forward_targets = hot_relay_peers - seen_table[content_hash].peers`
+3. Forwards to each target, adding them to the seen set
+
+**Seen table bounds:**
+- `SEEN_TABLE_MAX = 10,000` (configurable) -- max entries
+- `SEEN_TABLE_TTL = 600s` (10 minutes) -- covers 2x the slowest convergence path
+- Eviction: LRU by `first_seen` when at capacity
+- Memory: ~10K entries * (32 hash + ~60 peers * 32 bytes + 8 timestamp) = ~19 MB worst case
+- Typical: much smaller (most items seen by <10 peers before TTL expiry)
 
 **Push targets: relay peers only.** Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5). The relay does not maintain per-channel routing tables for push delivery. This eliminates Channel-Announce as a routing dependency and makes relays stateless store-and-forward nodes.
 
@@ -1164,17 +1214,21 @@ When a relay stores an item received from a **non-relay** peer (personal node or
 
 **Relay affinity:** The governor (§5.4) SHOULD prefer promoting relays that carry the node's subscribed channels. When a personal node's governor evaluates warm relay peers for promotion to Hot, it SHOULD prefer relays that have announced interest in the personal node's channels. This naturally clusters related nodes on the same relays without explicit sharding, providing self-organising channel locality.
 
-**Loop prevention:** Single-hop re-push eliminates cascading by design. Additionally, dedup (`stored: 0` for known items) prevents re-push even if the single-hop check were bypassed. Convergence: each relay stores the item at most once, the originator's relay re-pushes at most once.
+**Loop prevention:** The seen table tracks which peers have received each item. Combined with dedup (`stored: 0` for known items, §6.2 step 3), each item is forwarded at most once per peer. No cascading loops are possible regardless of network topology.
 
-**Amplification bound:** Single-hop re-push generates exactly R-1 push messages per item (one to each relay peer except sender). This is O(R), independent of network topology or channel count.
+**Amplification bound:** With the seen table, each relay forwards to at most `hot_max` unseen peers per item. The seen set grows per hop, limiting total network-wide push messages to O(N * log(N)) where N is the number of relays:
 
-| Scale | Total Relays | Cost/item (single-hop) |
-|-------|-------------|----------------------|
-| Small (<1K nodes) | 7 | 6 pushes |
-| Medium (<100K nodes) | 100 | 99 pushes |
-| Large (>100K nodes) | 1,000 | 999 pushes |
+| Scale | Total Relays | hot_max | Hops to converge | Cost/item (epidemic) |
+|-------|-------------|---------|-------------------|---------------------|
+| Small (<1K nodes) | 7 | 6 | 2 | ~12 pushes |
+| Medium (<100K nodes) | 100 | 20 | 3-4 | ~200 pushes |
+| Large (>100K nodes) | 1,000 | 50 | 4-5 | ~3,000 pushes |
 
-**Concurrency:** The relay MUST push to all hot relay peers present at the time the re-push handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this push cycle; the peer will receive the item via the next Item-Sync pull (§4.5).
+Pull-sync (§4.5) remains the safety net for any items missed during forwarding.
+
+**Concurrency:** The relay MUST forward to all hot relay peers present at the time the forwarding handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this cycle; the peer will receive the item via the next Item-Sync pull (§4.5).
+
+**Backward compatibility:** Old relays running the single-hop model will still function correctly -- they store items and serve them via pull-sync. They will not forward items from other relays, so they act as dead-ends in the epidemic propagation. The network converges slower with mixed versions but remains correct.
 
 ### 7.3 Channel Intersection
 
@@ -1193,6 +1247,92 @@ Updated when:
 - Channel-Announce receives a `ChannelJoined` from the peer
 - Channel-Announce reconciliation reveals a change
 - Local node subscribes to a new channel
+
+### 7.4 Route Discovery
+
+Personal memories (routed items) target a specific secret keeper whose network location is unknown at publish time. Route discovery uses broadcast-discover-cache routing with encrypted routing tokens for path privacy.
+
+**Two routing modes:**
+
+| Mode | Behaviour | Envelope | ACK | Cache |
+|------|-----------|----------|-----|-------|
+| `epidemic` (0) | Forward to all unseen peers | Optional (privacy tokens) | None | No |
+| `routed` (1) | Broadcast-discover-cache | Required (tokens) | Required (RouteACK 0x09) | Yes |
+
+The `routing_mode` field on the item (§4.6) determines the mode. Group channels use `epidemic`; personal channels use `routed`. Relays forward both modes identically via the seen table (§7.2) -- the distinction affects only ACK behaviour and rate limiting.
+
+**Forward path (discovery broadcast):**
+
+1. Publisher P sends item with empty `route_tokens`
+2. Relay R_1 receives, generates session key `k_1`, stores `nonce_1 -> k_1` in LRU cache
+3. R_1 appends: `Token_1 = AES-256-GCM(k_1, {prev_hop_addr, nonce_1})` (~48 bytes)
+4. R_2 receives, appends Token_2 (same process)
+5. Envelope grows: `[Token_1, Token_2, ..., Token_n]`
+
+**Return path (ACK):**
+
+1. Receiver reverses token list: `[Token_n, ..., Token_1]`
+2. Sends RouteACK (0x09) to the peer it received the item from
+3. R_n decrypts Token_n, finds `prev_hop_addr`, forwards RouteACK to R_{n-1}
+4. Cascade continues until publisher receives the ACK
+
+**Cached routing (subsequent messages):**
+
+1. Publisher stores `[Token_1, ..., Token_n]` from successful ACK
+2. Subsequent items include the cached tokens in `route_tokens`
+3. Each relay peels one token, finds `next_hop_addr`, forwards remainder
+4. If any token fails decryption (key expired, relay gone), message falls back to epidemic broadcast
+
+**Path staleness:** Session keys in relay LRU caches have TTL aligned with warm tenure (300s). Expired keys cause decryption failure, triggering automatic re-broadcast. This is self-healing -- no explicit path invalidation needed.
+
+**Multi-path:** The receiver may receive the same item via multiple paths. It keeps the top 2-3 shortest paths (fewest tokens) for failover. If the primary path fails (no ACK on return), the publisher re-broadcasts to discover a new path.
+
+**Privacy properties:**
+
+| Observer | Knows | Does not know |
+|----------|-------|---------------|
+| Publisher | Path works, hop count (see §7.6) | Relay identities |
+| Receiver | Hop count (token count) | Relay identities, addresses |
+| Relay R_i | Predecessor + successor addresses | Full path, other relay identities |
+| Network observer | Adjacent message flow | End-to-end correspondence |
+
+**Token format:** `AES-256-GCM(session_key, {prev_hop_addr, nonce})` -- 16 bytes addr + 12 bytes nonce + 16 bytes auth tag + 4 bytes length = ~48 bytes per token. Symmetric crypto only (AES-256-GCM already in our stack). No asymmetric crypto per hop.
+
+**Session key storage:** Bounded LRU per relay, ~64 bytes per active path. TTL aligned with warm tenure (300s).
+
+### 7.5 Expanding Ring Search
+
+Route discovery (§7.4) uses expanding ring search to bound broadcast scope for routed items.
+
+**Mechanism:**
+
+1. Publisher sends with `ttl=2` (2-hop neighbourhood)
+2. If no ACK within `2 * estimated_round_trip` (default 30s), retry with `ttl=4`
+3. If still no ACK, full broadcast (`ttl=255`)
+4. Each relay decrements TTL before forwarding; TTL=0 items are stored but NOT forwarded
+
+**TTL semantics:**
+- Epidemic items: TTL defaults to 255 (full mesh propagation)
+- Routed items: TTL starts at 2, escalates on timeout
+- Relays decrement TTL before forwarding regardless of routing mode
+- TTL=0 items are stored locally but not forwarded to any peer
+
+**Escalation timeout:** `2 * estimated_round_trip` between each escalation step. The round trip estimate is derived from Keep-Alive RTT measurements (§4.2) across hot peers.
+
+**Rationale:** Most secret keepers will be 2-3 hops away in a well-connected mesh. Full broadcast is expensive at scale (1000+ relays) and only needed for edge cases (target behind a partition, just joined). Expanding ring is a standard optimisation from AODV/DSR literature.
+
+### 7.6 Envelope Padding (Paranoia Mode)
+
+Optional padding to fixed envelope size prevents hop count leakage from `route_tokens` length.
+
+**Mechanism:**
+- Publisher pads `route_tokens` to a fixed number of tokens (default 20) with random bytes
+- Dummy tokens are indistinguishable from real tokens (same size, random content)
+- Receiver counts all tokens but cannot determine actual hop count (decryption of dummy tokens fails silently)
+
+**Cost:** 20 tokens * 48 bytes = ~960 bytes per message. Negligible compared to typical item payload.
+
+**Configuration:** Per-channel or per-publisher option. Default off. Secret keepers already require a degree of trust (they hold PSKs), so hop count leakage is acceptable in default mode. Enable for high-sensitivity personal channels.
 
 ---
 
