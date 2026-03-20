@@ -14,4 +14,5 @@ pub mod messages;
 pub mod peer_sharing;
 pub mod psk_exchange;
 pub mod rate_limit;
+pub mod seen_table;
 pub mod transport;

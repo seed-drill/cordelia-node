@@ -409,6 +409,18 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 /// when they come back online within a week.
 pub const TOMBSTONE_RETENTION_DAYS: u32 = 7;
 
+// ── Seen table (network-protocol.md §7.2) ────────────────────────────
+
+/// Maximum seen table entries (network-protocol.md §7.2).
+/// Primitive: 10,000 items in flight. At 12 items/min per relay,
+/// this covers ~14 hours of unique items before eviction.
+pub const SEEN_TABLE_MAX: usize = 10_000;
+
+/// Seen table TTL in seconds (network-protocol.md §7.2).
+/// Derived: 2x the slowest convergence path (5 hops × 5s repush = 25s).
+/// 10 minutes gives 24x margin for delayed or partitioned relays.
+pub const SEEN_TABLE_TTL_SECS: u64 = 600;
+
 // ── Queue capacities (network-protocol.md §9.4) ─────────────────────
 
 /// Handshake queue capacity.
@@ -761,6 +773,17 @@ mod tests {
         assert_eq!(REASON_NOT_FOUND, "not_found");
         assert_eq!(REASON_NOT_AUTHORIZED, "not_authorized");
         assert_eq!(REASON_NOT_AVAILABLE, "not_available");
+    }
+
+    // Seen table (network-protocol.md §7.2)
+    #[test]
+    fn test_seen_table_max_network_protocol_7_2() {
+        assert_eq!(SEEN_TABLE_MAX, 10_000);
+    }
+
+    #[test]
+    fn test_seen_table_ttl_network_protocol_7_2() {
+        assert_eq!(SEEN_TABLE_TTL_SECS, 600);
     }
 
     // ── Consistency checks ───────────────────────────────────────────
