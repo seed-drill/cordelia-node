@@ -37,6 +37,9 @@ target_nodes = "personal"
 target_fraction = 1.0
 timeout_secs = 300          # More hops than R=50
 
+[logging]
+level = "info"                  # Scale test: info sufficient, debug too noisy for 402 containers
+
 [collection]
 poll_interval_secs = 5
 metrics = ["peers_hot", "peers_warm", "items_stored"]

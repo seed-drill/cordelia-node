@@ -232,10 +232,11 @@ class S2Topology:
 
     def patch_configs(self, cfg: dict):
         """Patch generated configs if governor params differ from defaults."""
+        config_dir = SCALE_DIR / f"s2-{self.relays}" / "configs"
+
         gov = cfg.get("governor", {})
         relay_hot_max = gov.get("relay_hot_max", self.relays + 5)
         if relay_hot_max != self.relays + 5:
-            config_dir = SCALE_DIR / f"s2-{self.relays}" / "configs"
             for cfg_file in config_dir.glob("*.toml"):
                 text = cfg_file.read_text()
                 default = f"hot_max = {self.relays + 5}"
@@ -243,6 +244,15 @@ class S2Topology:
                     text = text.replace(default, f"hot_max = {relay_hot_max}")
                     cfg_file.write_text(text)
             print(f"  Patched relay hot_max to {relay_hot_max}")
+
+        # Patch log level if scenario overrides it (default: debug from generator)
+        log_level = cfg.get("logging", {}).get("level")
+        if log_level and log_level != "debug":
+            for cfg_file in config_dir.glob("*.toml"):
+                text = cfg_file.read_text()
+                text = text.replace('level = "debug"', f'level = "{log_level}"')
+                cfg_file.write_text(text)
+            print(f"  Patched log level to {log_level}")
 
 
 class S3Topology:
@@ -374,16 +384,17 @@ def phase_startup(topo, cfg: dict, db: MetricsDB):
     project = topo.compose_project()
     run(f"docker compose -p {project} -f {compose_file} up -d", timeout=120)
 
-    # Wait healthy
+    # Wait healthy -- timeout scales with container count
+    health_timeout = max(120, topo.container_count * 2)
     start = time.time()
     for container in topo.all_containers():
-        while time.time() - start < 120:
+        while time.time() - start < health_timeout:
             status = api_get(container, "status")
             if status.get("status") == "running":
                 break
             time.sleep(1)
         else:
-            print(f"  TIMEOUT: {container} not healthy after 120s")
+            print(f"  TIMEOUT: {container} not healthy after {health_timeout}s")
             db.event("startup", "timeout", container)
             return False
 
@@ -850,11 +861,12 @@ def teardown(topo, db: MetricsDB, log_dir: Path):
 
     for container in topo.all_containers():
         log_file = log_dir / f"{container}.log"
-        run(f"docker logs {container} > {log_file} 2>&1", check=False, timeout=30)
+        run(f"docker logs {container} > {log_file} 2>&1", check=False, timeout=60)
 
     print("\nTearing down...")
+    teardown_timeout = max(120, topo.container_count)
     run(f"docker compose -p {project} -f {compose_file} down -v --remove-orphans",
-        check=False, timeout=60)
+        check=False, timeout=teardown_timeout)
     db.event("teardown", "phase_end")
 
 
