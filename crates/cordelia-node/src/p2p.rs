@@ -1387,28 +1387,34 @@ pub async fn handle_peer_streams(
             }
         }
 
-        // Protocol gating by peer state (connection-lifecycle.md §2.1, §7.2)
+        // Protocol gating by peer state (§5.4.2, §7.2)
+        // Relays accept data protocols from Warm+ peers (public infrastructure).
+        // Personal nodes require Hot for data protocols (private, serve chosen peers only).
+        // PSK-Exchange remains Hot-only for all roles (security boundary).
         let peer_state = peer_states
             .read()
             .ok()
             .and_then(|s| s.get(&peer_id).copied())
             .unwrap_or(1); // default Warm if not yet synced
         let is_hot = peer_state == 2;
-        let is_warm = peer_state == 1;
+        let is_warm_or_hot = peer_state >= 1;
 
-        // Relays accept inbound ItemPush from Warm peers (§7.2 asymmetric hot sets).
-        // In sparse meshes, peer A may have us as Hot while we have A as Warm.
-        let relay_warm_push = node_role == "relay"
-            && is_warm
-            && protocol == cordelia_network::messages::Protocol::ItemPush;
+        let data_allowed = match protocol {
+            cordelia_network::messages::Protocol::ItemPush
+            | cordelia_network::messages::Protocol::ItemSync
+            | cordelia_network::messages::Protocol::ChannelAnnounce => {
+                if node_role == "relay" { is_warm_or_hot } else { is_hot }
+            }
+            _ => true, // non-data protocols handled elsewhere
+        };
 
         match protocol {
             cordelia_network::messages::Protocol::ItemPush
             | cordelia_network::messages::Protocol::ItemSync
             | cordelia_network::messages::Protocol::ChannelAnnounce
-                if !is_hot && !relay_warm_push =>
+                if !data_allowed =>
             {
-                tracing::debug!(peer = %peer_id, protocol = proto_name, "rejected: data protocol from non-hot peer");
+                tracing::debug!(peer = %peer_id, protocol = proto_name, state = peer_state, "rejected: data protocol below required state");
                 continue;
             }
             cordelia_network::messages::Protocol::ItemPush => {

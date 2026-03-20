@@ -957,18 +957,20 @@ This prevents Sybil attacks: an attacker connecting many identities can only get
 
 ### 5.4.2 Protocol-per-State Table
 
-| Protocol | Cold | Warm | Hot |
-|----------|------|------|-----|
-| Handshake (0x01) | On promotion Cold→Warm | -- | -- |
-| Keep-Alive (0x02) | -- | YES | YES |
-| Peer-Sharing (0x03) | -- | YES (after `min_warm_tenure`) | YES |
-| Channel-Announce (0x04) | -- | -- | YES |
-| Item-Sync (0x05) | -- | -- | YES |
-| Item-Push (0x06) | -- | Relay inbound only (§7.2) | YES |
-| PSK-Exchange (0x07) | -- | -- | YES |
-| Pairing (0x08) | Bootnode only | -- | -- |
+| Protocol | Cold | Warm (personal) | Warm (relay) | Hot |
+|----------|------|-----------------|--------------|-----|
+| Handshake (0x01) | On promotion Cold→Warm | -- | -- | -- |
+| Keep-Alive (0x02) | -- | YES | YES | YES |
+| Peer-Sharing (0x03) | -- | YES (after `min_warm_tenure`) | YES | YES |
+| Channel-Announce (0x04) | -- | -- | YES | YES |
+| Item-Sync (0x05) | -- | -- | YES | YES |
+| Item-Push (0x06) | -- | -- | YES | YES |
+| PSK-Exchange (0x07) | -- | -- | -- | YES |
+| Pairing (0x08) | Bootnode only | -- | -- | -- |
 
-Push and Sync target Hot peers only. Peer-Sharing runs on Warm (for discovery) and Hot. Keep-Alive runs on all connected peers (Warm + Hot). **Exception:** relays accept inbound Item-Push from Warm peers (§7.2) because epidemic forwarding targets hot relay peers, but hot sets are asymmetric in sparse meshes -- peer A may have B as Hot while B has A as Warm.
+**Relay inbound gating (§7.2):** Relays are public infrastructure and MUST accept data protocols (Item-Push, Item-Sync, Channel-Announce) from Warm peers. Hot sets are asymmetric in sparse meshes (`hot_max < R`): peer A may have B as Hot while B has A as Warm. Without Warm acceptance, B rejects A's forwarded items and sync requests, partitioning the network. Personal nodes retain Hot-only gating for data protocols (they are private and serve only their chosen hot peers). PSK-Exchange remains Hot-only for all roles (security boundary).
+
+**Outbound vs inbound:** The Hot-only rule applies to *outbound* decisions -- nodes only push/sync to peers they have promoted to Hot. The gating table above governs *inbound* acceptance. This distinction matters because governor promotion is local: two nodes may disagree on each other's state.
 
 ### 5.5 Peer Scoring
 
@@ -1226,7 +1228,7 @@ On receiving an item (push or sync), the relay:
 
 Pull-sync (§4.5) remains the safety net for any items missed during forwarding.
 
-**Asymmetric hot sets:** In sparse meshes (`hot_max < R`), hot sets are asymmetric: relay A may have B in its hot set while B has A in its warm set. When A pushes to B, B MUST accept the push even though A is Warm from B's perspective. Therefore relays MUST accept inbound Item-Push from Warm peers (not just Hot). Personal nodes retain the Hot-only gate -- they only push to their hot relays and only receive via pull-sync.
+**Asymmetric hot sets:** In sparse meshes (`hot_max < R`), hot sets are asymmetric: relay A may have B in its hot set while B has A in its warm set. Relays MUST accept all data protocols (Item-Push, Item-Sync, Channel-Announce) from Warm peers (§5.4.2). Without this, B rejects A's forwarded items, personal nodes cannot sync from relays that have them as Warm, and channel announcements are lost. Personal nodes retain Hot-only inbound gating -- they serve only their chosen hot peers.
 
 **Concurrency:** The relay MUST forward to all hot relay peers present at the time the forwarding handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this cycle; the peer will receive the item via the next Item-Sync pull (§4.5).
 
