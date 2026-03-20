@@ -113,9 +113,9 @@ def db_query(container: str, sql: str) -> str:
 def docker_cleanup():
     """Full Docker cleanup: remove containers, prune networks/volumes, rm test artifacts."""
     print("Cleaning Docker state...")
-    run("docker rm -f $(docker ps -aq) 2>/dev/null", check=False, timeout=30)
-    run("docker network prune -f 2>/dev/null", check=False, timeout=15)
-    run("docker volume prune -af 2>/dev/null", check=False, timeout=30)
+    run("docker rm -f $(docker ps -aq) 2>/dev/null", check=False, timeout=120)
+    run("docker network prune -f 2>/dev/null", check=False, timeout=60)
+    run("docker volume prune -af 2>/dev/null", check=False, timeout=60)
     run(f"sudo rm -rf {SCALE_DIR}/s2-* {SCALE_DIR}/s3-* {SCALE_DIR}/keys "
         f"{E2E_DIR}/logs 2>/dev/null", check=False, timeout=15)
 
