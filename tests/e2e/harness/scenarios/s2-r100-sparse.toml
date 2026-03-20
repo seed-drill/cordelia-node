@@ -1,0 +1,42 @@
+# S2 relay mesh: R=100 with sparse connectivity (hot_max=20).
+# Scale test for epidemic forwarding (§7.2). Each relay sees 20% of mesh.
+# 100 relays + 100 personal + 2 bootnodes = 202 containers.
+
+[topology]
+name = "s2-r100-sparse"
+relays = 100
+personal_per_zone = 1
+bootnodes = 2
+
+[governor]
+relay_hot_max = 20          # 20% connectivity: multi-hop required
+personal_hot_max = 2
+tick_interval_secs = 2
+warm_tenure_secs = 300
+
+[experiment]
+channel_name = "test-channel"
+subscribe_all = true
+
+[[experiment.phases]]
+type = "wait_mesh"
+target = 19                 # hot_max - 1
+target_fraction = 0.9       # 90% of relays at target
+timeout_secs = 300
+
+[[experiment.phases]]
+type = "publish"
+publishers = ["p1", "p26", "p51", "p76", "p100"]
+items_per_publisher = 3
+item_size_bytes = 256
+
+[[experiment.phases]]
+type = "wait_delivery"
+target_items = 15
+target_nodes = "personal"
+target_fraction = 1.0
+timeout_secs = 240
+
+[collection]
+poll_interval_secs = 5
+metrics = ["peers_hot", "peers_warm", "items_stored"]

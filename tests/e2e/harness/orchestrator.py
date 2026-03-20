@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Constants ────────────────────────────────────────────────────────
+# -- Constants ----------------------------------------------------------------
 
 DB_PATH_IN_CONTAINER = "/data/cordelia/cordelia.db"
 TOKEN_PATH_IN_CONTAINER = "/data/cordelia/node-token"
@@ -38,15 +38,29 @@ E2E_DIR = SCRIPT_DIR.parent
 SCALE_DIR = E2E_DIR / "scale"
 SCHEMA_PATH = SCRIPT_DIR / "schema.sql"
 
+MAX_WORKERS = int(os.environ.get("CORDELIA_E2E_WORKERS", "64"))
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# -- Token cache --------------------------------------------------------------
+
+_token_cache: dict[str, str] = {}
+
+
+def _get_token(container: str) -> str:
+    if container not in _token_cache:
+        token = docker_exec(container, f"cat {TOKEN_PATH_IN_CONTAINER}")
+        if token:
+            _token_cache[container] = token
+    return _token_cache.get(container, "")
+
+
+# -- Helpers ------------------------------------------------------------------
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def channel_id_for(name: str) -> str:
-    """Derive channel_id from name (channels-api.md §3.1)."""
+    """Derive channel_id from name (channels-api.md S3.1)."""
     payload = f"cordelia:channel:{name.lower()}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -71,7 +85,7 @@ def docker_exec(container: str, cmd: str, timeout=10) -> str:
 
 def api_get(container: str, endpoint: str) -> dict:
     """GET a node's REST API endpoint, return parsed JSON."""
-    token = docker_exec(container, f"cat {TOKEN_PATH_IN_CONTAINER}")
+    token = _get_token(container)
     if not token:
         return {}
     raw = docker_exec(
@@ -89,7 +103,7 @@ def api_get(container: str, endpoint: str) -> dict:
 
 def api_post(container: str, endpoint: str, body: dict) -> dict:
     """POST to a node's REST API endpoint."""
-    token = docker_exec(container, f"cat {TOKEN_PATH_IN_CONTAINER}")
+    token = _get_token(container)
     if not token:
         return {}
     body_json = json.dumps(body)
@@ -125,7 +139,7 @@ def docker_cleanup():
         f"{E2E_DIR}/logs 2>/dev/null", check=False, timeout=15)
 
 
-# ── Database ─────────────────────────────────────────────────────────
+# -- Database -----------------------------------------------------------------
 
 class MetricsDB:
     def __init__(self, db_path: str):
@@ -178,7 +192,7 @@ class MetricsDB:
         self.conn.close()
 
 
-# ── Topology ─────────────────────────────────────────────────────────
+# -- Topology -----------------------------------------------------------------
 
 class S2Topology:
     """S2 relay mesh topology: 2B + R relays + R*PPZ personal."""
@@ -346,21 +360,38 @@ def make_topology(cfg: dict):
     return S2Topology(cfg)
 
 
-# ── Phases ───────────────────────────────────────────────────────────
+# -- Phases -------------------------------------------------------------------
 
 def poll_metrics(db: MetricsDB, topo, phase: str, metrics: list[str]):
     """Poll all data nodes once, write observations."""
-    for container in topo.data_containers():
-        role = topo.role_of(container)
-        status = api_get(container, "status")
+    containers = topo.data_containers()
 
+    def _fetch_one(container):
+        """Worker: fetch status + item count via docker exec. No DB writes."""
+        status = api_get(container, "status")
+        item_count = None
+        if "items_stored" in metrics:
+            val = db_query(container, "SELECT COUNT(*) FROM items WHERE is_tombstone=0")
+            try:
+                item_count = float(val)
+            except (ValueError, TypeError):
+                item_count = None
+        return container, status, item_count
+
+    workers = min(MAX_WORKERS, len(containers))
+    results = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, c): c for c in containers}
+        for f in as_completed(futures):
+            container = futures[f]
+            results[container] = f.result()
+
+    # Write to DB on main thread (SQLite not thread-safe)
+    for container, (_, status, item_count) in results.items():
+        role = topo.role_of(container)
         for metric in metrics:
-            if metric == "items_stored":
-                val = db_query(container, "SELECT COUNT(*) FROM items WHERE is_tombstone=0")
-                try:
-                    db.observe(phase, container, role, metric, float(val))
-                except (ValueError, TypeError):
-                    pass
+            if metric == "items_stored" and item_count is not None:
+                db.observe(phase, container, role, metric, item_count)
             elif metric in status:
                 try:
                     db.observe(phase, container, role, metric, float(status[metric]))
@@ -395,7 +426,7 @@ def phase_startup(topo, cfg: dict, db: MetricsDB):
     all_containers = topo.all_containers()
     pending = set(all_containers)
     start = time.time()
-    workers = min(32, len(all_containers))
+    workers = min(MAX_WORKERS, len(all_containers))
 
     def check_one(container):
         status = api_get(container, "status")
@@ -449,10 +480,22 @@ def phase_connectivity(topo, cfg: dict, db: MetricsDB, collection: dict):
     time.sleep(min(timeout, 15))
     poll_metrics(db, topo, "connectivity", metrics)
 
+    containers = topo.data_containers()
+    workers = min(MAX_WORKERS, len(containers))
+
+    # Fetch status concurrently
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(api_get, c, "status"): c for c in containers}
+        status_results = {}
+        for f in as_completed(futures):
+            container = futures[f]
+            status_results[container] = f.result()
+
+    # Assertions on main thread
     passed = 0
     failed = 0
-    for container in topo.data_containers():
-        status = api_get(container, "status")
+    for container in containers:
+        status = status_results.get(container, {})
         hot = int(status.get("peers_hot", 0))
         ok = hot >= min_hot
         if ok:
@@ -487,13 +530,23 @@ def phase_mesh(topo, cfg: dict, db: MetricsDB, collection: dict):
 
     start = time.time()
     required = int(topo.relays * target_frac)
+    relay_containers = topo.relay_containers()
 
     while time.time() - start < timeout:
         poll_metrics(db, topo, "mesh", metrics)
 
+        # Fetch relay status concurrently
+        workers = min(MAX_WORKERS, len(relay_containers))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(api_get, c, "status"): c for c in relay_containers}
+            status_results = {}
+            for f in as_completed(futures):
+                container = futures[f]
+                status_results[container] = f.result()
+
         meshed = 0
-        for container in topo.relay_containers():
-            status = api_get(container, "status")
+        for container in relay_containers:
+            status = status_results.get(container, {})
             hot = int(status.get("peers_hot", 0))
             if hot >= target:
                 meshed += 1
@@ -536,11 +589,17 @@ def phase_subscribe(topo, cfg: dict, db: MetricsDB):
         psk_file.write_text(psk)
     psk = psk_file.read_text().strip()
 
-    for container in targets:
-        api_post(container, "channels/subscribe", {
-            "channel": channel_name,
-        })
-        db.event("subscribe", "subscribe", container)
+    # Subscribe concurrently
+    workers = min(MAX_WORKERS, len(targets))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(api_post, c, "channels/subscribe", {"channel": channel_name}): c
+            for c in targets
+        }
+        for f in as_completed(futures):
+            container = futures[f]
+            f.result()  # consume result / propagate exceptions
+            db.event("subscribe", "subscribe", container)
 
     wait = 10 if isinstance(topo, S3Topology) else 5
     time.sleep(wait)
@@ -571,31 +630,41 @@ def phase_publish(topo, cfg: dict, db: MetricsDB, channel_id: str, psk: str):
     # Resolve publisher names to container names
     channel_name = cfg["experiment"]["channel_name"]
     prefix = topo.prefix
-    total = 0
-    for pub_name in publishers:
-        # Handle both "p1" style (S2) and "swarm-0-0" style (S3)
+
+    def _publish_serial(pub_name):
+        """Publish all items for one publisher serially (preserves ordering)."""
         if isinstance(topo, S3Topology):
             container = f"{prefix}-{pub_name}-1"
         else:
             container = f"{prefix}-{pub_name}"
 
+        pub_results = []
         for i in range(items_per):
-            # API takes channel name (not ID), content as string
             content = f"{pub_name} item {i+1} " + os.urandom(item_size).hex()
             result = api_post(container, "channels/publish", {
                 "channel": channel_name,
                 "item_type": "message",
                 "content": content,
             })
-            if result:
-                total += 1
-                db.event("publish", "publish", container, json.dumps({
-                    "item_id": result.get("item_id", ""),
-                    "seq": i,
-                }))
-
+            pub_results.append((container, i, result))
             if rate_per_sec > 0:
                 time.sleep(1.0 / rate_per_sec)
+        return pub_results
+
+    # Different publishers run concurrently; items within each are serial
+    total = 0
+    workers = min(MAX_WORKERS, len(publishers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_publish_serial, p): p for p in publishers}
+        for f in as_completed(futures):
+            pub_results = f.result()
+            for container, seq, result in pub_results:
+                if result:
+                    total += 1
+                    db.event("publish", "publish", container, json.dumps({
+                        "item_id": result.get("item_id", ""),
+                        "seq": seq,
+                    }))
 
     db.event("publish", "phase_end", detail=json.dumps({"total_published": total}))
     print(f"  Published {total} items")
@@ -690,34 +759,57 @@ def phase_delivery(topo, cfg: dict, db: MetricsDB,
     }))
     print(f"\nPhase 4: Waiting for delivery ({target_items} items to {len(targets)} nodes)...")
 
+    relay_containers = topo.relay_containers()
+
     start = time.time()
     done = 0
     while time.time() - start < timeout:
         poll_metrics(db, topo, "delivery", metrics)
 
-        done = 0
-        relay_counts = []
-        for container in targets:
-            count_str = db_query(
+        # Query target + relay containers concurrently in one batch
+        all_query_containers = list(set(targets) | set(relay_containers))
+        workers = min(MAX_WORKERS, len(all_query_containers))
+
+        def _query_container(container):
+            """Worker: query channel items and total items counts."""
+            channel_count_str = db_query(
                 container,
                 f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}' AND is_tombstone=0",
             )
-            try:
-                count = int(count_str)
-            except (ValueError, TypeError):
-                count = 0
-            if count >= target_items:
-                done += 1
-
-        for container in topo.relay_containers():
-            count_str = db_query(
+            total_count_str = db_query(
                 container,
                 "SELECT COUNT(*) FROM items WHERE is_tombstone=0",
             )
             try:
-                relay_counts.append(int(count_str))
+                channel_count = int(channel_count_str)
             except (ValueError, TypeError):
-                relay_counts.append(0)
+                channel_count = 0
+            try:
+                total_count = int(total_count_str)
+            except (ValueError, TypeError):
+                total_count = 0
+            return container, channel_count, total_count
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_query_container, c): c for c in all_query_containers}
+            query_results = {}
+            for f in as_completed(futures):
+                container = futures[f]
+                query_results[container] = f.result()
+
+        # Compute delivery progress from results
+        done = 0
+        personal_counts = []
+        for container in targets:
+            _, channel_count, _ = query_results.get(container, (container, 0, 0))
+            personal_counts.append(channel_count)
+            if channel_count >= target_items:
+                done += 1
+
+        relay_counts = []
+        for container in relay_containers:
+            _, _, total_count = query_results.get(container, (container, 0, 0))
+            relay_counts.append(total_count)
 
         relay_full = sum(1 for c in relay_counts if c >= target_items)
         elapsed = int(time.time() - start)
@@ -726,17 +818,6 @@ def phase_delivery(topo, cfg: dict, db: MetricsDB,
         dist = Counter(relay_counts)
         dist_str = " ".join(f"{v}:{c}" for v, c in sorted(dist.items()))
 
-        # Personal node item counts
-        personal_counts = []
-        for container in targets:
-            count_str = db_query(
-                container,
-                f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}' AND is_tombstone=0",
-            )
-            try:
-                personal_counts.append(int(count_str))
-            except (ValueError, TypeError):
-                personal_counts.append(0)
         pdist = Counter(personal_counts)
         pdist_str = " ".join(f"{v}:{c}" for v, c in sorted(pdist.items()))
 
@@ -784,55 +865,67 @@ def phase_assertions(topo, cfg: dict, db: MetricsDB,
             failed += 1
         db.assertion(name, ok, expected, actual)
 
-    # Personal nodes: item count
-    for container in topo.personal_containers():
-        count_str = db_query(
-            container,
-            f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}' AND is_tombstone=0",
-        )
+    # ---- Gather ALL queries concurrently ----
+    personal_containers = topo.personal_containers()
+    relay_containers = topo.relay_containers()
+    bootnode_containers = topo.bootnode_containers()
+
+    # Build a list of (container, query_name, sql) tuples
+    queries = []
+    for c in personal_containers:
+        queries.append((c, "personal_count",
+                        f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}' AND is_tombstone=0"))
+        queries.append((c, "personal_total",
+                        f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}'"))
+        queries.append((c, "personal_unique",
+                        f"SELECT COUNT(DISTINCT item_id) FROM items WHERE channel_id='{channel_id}'"))
+    for c in relay_containers:
+        queries.append((c, "relay_count",
+                        "SELECT COUNT(*) FROM items WHERE is_tombstone=0"))
+    for c in bootnode_containers:
+        queries.append((c, "bootnode_count",
+                        "SELECT COUNT(*) FROM items"))
+
+    def _run_query(item):
+        container, query_name, sql = item
+        result_str = db_query(container, sql)
         try:
-            count = int(count_str)
+            val = int(result_str)
         except (ValueError, TypeError):
-            count = 0
+            val = 0
+        return container, query_name, val
+
+    workers = min(MAX_WORKERS, len(queries))
+    query_results = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run_query, q): q for q in queries}
+        for f in as_completed(futures):
+            container, query_name, val = f.result()
+            query_results[(container, query_name)] = val
+
+    # ---- Run assertions on main thread ----
+
+    # Personal nodes: item count
+    for container in personal_containers:
+        count = query_results.get((container, "personal_count"), 0)
         assert_check(f"{container} has {expected_items} items",
                      count == expected_items, expected_items, count)
 
     # Personal nodes: no duplicates
-    for container in topo.personal_containers():
-        total_str = db_query(
-            container,
-            f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}'",
-        )
-        unique_str = db_query(
-            container,
-            f"SELECT COUNT(DISTINCT item_id) FROM items WHERE channel_id='{channel_id}'",
-        )
-        try:
-            total, unique = int(total_str), int(unique_str)
-        except (ValueError, TypeError):
-            total, unique = 0, 0
+    for container in personal_containers:
+        total = query_results.get((container, "personal_total"), 0)
+        unique = query_results.get((container, "personal_unique"), 0)
         assert_check(f"{container} no duplicates", total == unique, 0, total - unique)
 
     # Relay nodes: should have all items
-    for container in topo.relay_containers():
-        count_str = db_query(
-            container,
-            "SELECT COUNT(*) FROM items WHERE is_tombstone=0",
-        )
-        try:
-            count = int(count_str)
-        except (ValueError, TypeError):
-            count = 0
+    for container in relay_containers:
+        count = query_results.get((container, "relay_count"), 0)
         assert_check(f"{container} has >= {expected_items} stored items",
                      count >= expected_items, expected_items, count)
 
     # Bootnodes: zero items
-    for container in topo.bootnode_containers():
-        count_str = db_query(container, "SELECT COUNT(*) FROM items")
-        try:
-            count = int(count_str)
-        except (ValueError, TypeError):
-            count = 0
+    for container in bootnode_containers:
+        count = query_results.get((container, "bootnode_count"), 0)
         assert_check(f"{container} stores zero items", count == 0, 0, count)
 
     # S3-specific: local channel isolation + HKDF verification
@@ -850,7 +943,7 @@ def phase_assertions(topo, cfg: dict, db: MetricsDB,
             )
 
         # Relay isolation: relays should not have local-scope items
-        for container in topo.relay_containers():
+        for container in relay_containers:
             count_str = db_query(
                 container,
                 "SELECT COUNT(*) FROM items WHERE channel_id LIKE 'cordelia:local:%'",
@@ -881,9 +974,19 @@ def teardown(topo, db: MetricsDB, log_dir: Path):
     compose_file = topo.compose_file()
     project = topo.compose_project()
 
-    for container in topo.all_containers():
+    # Collect logs concurrently
+    all_containers = topo.all_containers()
+
+    def _collect_log(container):
         log_file = log_dir / f"{container}.log"
         run(f"docker logs {container} > {log_file} 2>&1", check=False, timeout=60)
+        return container
+
+    workers = min(MAX_WORKERS, len(all_containers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_collect_log, c): c for c in all_containers}
+        for f in as_completed(futures):
+            f.result()  # propagate exceptions
 
     print("\nTearing down...")
     teardown_timeout = max(120, topo.container_count)
@@ -892,13 +995,15 @@ def teardown(topo, db: MetricsDB, log_dir: Path):
     db.event("teardown", "phase_end")
 
 
-# ── Run a single scenario ────────────────────────────────────────────
+# -- Run a single scenario ----------------------------------------------------
 
 def run_scenario(scenario_path: Path, db_path: str = None,
                  no_teardown: bool = False, clean: bool = False) -> bool:
     """Run a single scenario. Returns True if all assertions pass."""
     with open(scenario_path, "rb") as f:
         cfg = tomllib.load(f)
+
+    _token_cache.clear()
 
     topo = make_topology(cfg)
     collection = cfg.get("collection", {})
@@ -970,7 +1075,7 @@ def run_scenario(scenario_path: Path, db_path: str = None,
     return ok
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Cordelia E2E test orchestrator")
