@@ -1,0 +1,43 @@
+# S2 relay mesh: R=30 with PPZ=7 (242 nodes).
+# Regression test for channel-aware push routing gap.
+# 30 relays + 210 personal + 2 bootnodes = 242 containers.
+# Each relay serves ~14 personal nodes (210*2/30).
+
+[topology]
+name = "s2-r30-ppz7"
+relays = 30
+personal_per_zone = 7
+bootnodes = 2
+
+[governor]
+relay_hot_max = 35          # Full mesh for relays
+personal_hot_max = 2
+tick_interval_secs = 2
+warm_tenure_secs = 300
+
+[experiment]
+channel_name = "test-channel"
+subscribe_all = true
+
+[[experiment.phases]]
+type = "wait_mesh"
+target = 29                 # R - 1 (full mesh)
+target_fraction = 0.9
+timeout_secs = 300
+
+[[experiment.phases]]
+type = "publish"
+publishers = ["p1", "p51", "p101", "p151", "p201"]
+items_per_publisher = 3
+item_size_bytes = 256
+
+[[experiment.phases]]
+type = "wait_delivery"
+target_items = 15
+target_nodes = "personal"
+target_fraction = 1.0
+timeout_secs = 120
+
+[collection]
+poll_interval_secs = 3
+metrics = ["peers_hot", "peers_warm", "items_stored"]
