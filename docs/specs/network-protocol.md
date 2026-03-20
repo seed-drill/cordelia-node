@@ -972,8 +972,64 @@ The governor MUST receive these events from the P2P loop to function correctly:
 | Protocol violation detected | On invalid message/signature | `ban_peer(node_id, reason, tier)` |
 | Channel subscription changed | After subscribe/unsubscribe API | `set_groups(channel_ids)` |
 | Connection attempt failed | On connect_to error | `mark_dial_failed(node_id)` |
+| Trust decay event | On rate breach, protocol violation, escalation skip | `decay_trust(node_id, reason, amount)` |
+| Trust recovery event | On item delivery, sync completion | `recover_trust(node_id, amount)` |
 
 Without these calls, the governor is deaf -- it cannot score, demote, ban, or reconnect peers based on real behaviour.
+
+### 5.5.2 Peer Trust
+
+Each peer carries an inverse trust score (1.0 = fully trusted, 0.0 = banned) orthogonal to the performance-based `score_ema` (§5.5). Performance measures throughput and latency; trust measures behaviour.
+
+```
+PeerTrust {
+    score: f64,              // 0.0 (banned) to 1.0 (fully trusted)
+    last_decay_reason: Option<String>,
+    last_decay_at: Option<Instant>,
+}
+```
+
+**Initial score:** New peers start at `TRUST_INITIAL = 0.5` (neutral). Existing peers with sustained good behaviour drift toward 1.0.
+
+**Decay events** (immediate):
+
+| Event | Decay | Rationale |
+|-------|-------|-----------|
+| Rate limit breach (any bucket) | -0.10 | Existing §9.2 behaviour, now continuous |
+| High-TTL discovery without prior low-TTL | -0.05 | Escalation skipping pattern (§7.5) |
+| Invalid content hash on forwarded item | -0.15 | Data integrity violation |
+| Protocol violation (wrong message type) | -0.10 | Existing, now feeds trust score |
+| Push of item we already have (duplicate) | -0.02 | Minor: may be timing, not malicious |
+| Forwarding item with expired/invalid routing token | -0.05 | Possible replay or corruption |
+
+**Recovery events** (slow):
+
+| Event | Recovery | Cap |
+|-------|----------|-----|
+| Successful item delivery (new items to us) | +0.01 per item | 1.0 |
+| Successful sync cycle (items exchanged) | +0.005 | 1.0 |
+| Time-based passive recovery | +0.01 per hour | 1.0 |
+
+Recovery is asymmetric by design: one bad event costs more than many good events earn. This makes sustained misbehaviour expensive even if interleaved with legitimate traffic.
+
+**Thresholds:**
+
+| Threshold | Action |
+|-----------|--------|
+| score < 0.3 | Demote from Hot to Warm (reduce influence) |
+| score < 0.2 | Deprioritise in sync target selection |
+| score < 0.1 | Ban (Transient tier, §5.6) |
+| score = 0.0 | Ban (Systematic tier, §5.6) |
+
+**Effective score:** Governor promotion decisions combine both dimensions:
+
+```
+effective_score = score_ema * trust_score
+```
+
+This naturally demotes high-performing bad actors and retains honest slow peers. A fast relay that breaches rate limits is demoted despite high throughput.
+
+**Operator configuration:** All trust parameters are configurable (§12.5). Different deployments have different risk profiles -- enterprise intranets may want aggressive decay while open community relays may prefer relaxed thresholds.
 
 ### 5.6 Banning
 
@@ -995,6 +1051,8 @@ Protocol violations are classified into severity tiers:
 | Identity mismatch | Moderate | 24 hours | Permanent on 3rd |
 | Rate limit exceeded | Transient | 15 minutes | 2x per repeat, cap 24h, permanent on 5th |
 | Invalid item signature | Moderate | 1 hour | 2x per repeat, cap 24h, permanent on 5th |
+
+**Trust-score-driven banning:** Peer trust score thresholds (§5.5.2) complement violation-based banning. Trust score < 0.1 triggers a Transient ban (900s base, standard escalation). Trust score = 0.0 triggers a Systematic ban (28800s base). Trust thresholds add a continuous behavioural signal to the discrete violation tiers above -- a peer that accumulates many minor infractions (each below the ban threshold individually) will eventually cross a trust threshold and be banned.
 
 ---
 
@@ -1658,6 +1716,32 @@ bootstrap_connections_per_ip_per_hour = 5  # bootnode rate limit (§16.2.1)
 probe_interval_secs = 300               # relay health probe interval (§16.1.2)
 probe_timeout_secs = 60                 # probe delivery timeout (§16.1.2)
 ```
+
+### 12.5 Trust Section
+
+```toml
+[trust]
+initial_score = 0.5
+recovery_per_hour = 0.01
+recovery_per_item = 0.01
+recovery_cap = 1.0
+
+[trust.decay]
+rate_limit_breach = 0.10
+escalation_skip = 0.05
+invalid_content = 0.15
+protocol_violation = 0.10
+duplicate_push = 0.02
+invalid_token = 0.05
+
+[trust.thresholds]
+demote_hot = 0.3
+deprioritise_sync = 0.2
+ban_transient = 0.1
+ban_systematic = 0.0
+```
+
+See §5.5.2 for trust scoring semantics and §5.6 for trust-driven banning.
 
 ---
 
