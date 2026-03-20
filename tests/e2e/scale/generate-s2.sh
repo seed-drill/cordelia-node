@@ -136,7 +136,7 @@ max_batch_size = 50
 bind_address = "127.0.0.1"
 
 [logging]
-level = "info"
+level = "debug"
 TOML
 done
 
@@ -191,7 +191,7 @@ max_batch_size = 50
 bind_address = "127.0.0.1"
 
 [logging]
-level = "info"
+level = "debug"
 TOML
     done
 done

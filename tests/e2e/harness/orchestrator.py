@@ -687,6 +687,26 @@ def phase_delivery(topo, cfg: dict, db: MetricsDB,
 
         relay_full = sum(1 for c in relay_counts if c >= target_items)
         elapsed = int(time.time() - start)
+
+        # Build distribution of relay item counts
+        from collections import Counter
+        dist = Counter(relay_counts)
+        dist_str = " ".join(f"{v}:{c}" for v, c in sorted(dist.items()))
+
+        # Personal node item counts
+        personal_counts = []
+        for container in targets:
+            count_str = db_query(
+                container,
+                f"SELECT COUNT(*) FROM items WHERE channel_id='{channel_id}' AND is_tombstone=0",
+            )
+            try:
+                personal_counts.append(int(count_str))
+            except (ValueError, TypeError):
+                personal_counts.append(0)
+        pdist = Counter(personal_counts)
+        pdist_str = " ".join(f"{v}:{c}" for v, c in sorted(pdist.items()))
+
         print(
             f"  tick {elapsed}s: {done}/{len(targets)} done"
             f" | relays: {relay_full}/{topo.relays} full,"
@@ -694,6 +714,7 @@ def phase_delivery(topo, cfg: dict, db: MetricsDB,
             f" avg={sum(relay_counts) // max(len(relay_counts), 1)}"
             f" max={max(relay_counts, default=0)} of {target_items}"
         )
+        print(f"    relay dist: [{dist_str}] | personal dist: [{pdist_str}]")
 
         if done >= required:
             db.event("delivery", "phase_end", detail=json.dumps({

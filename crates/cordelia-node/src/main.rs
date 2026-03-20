@@ -369,13 +369,32 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // Set up logging
     init_tracing(&config.logging.level);
 
-    println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
+    let role = &config.network.role;
+    let log_level = &config.logging.level;
+    let hot_min = config.governor.hot_min;
+    let hot_max = config.governor.hot_max;
+    let warm_min = config.governor.warm_min;
+    let warm_max = config.governor.warm_max;
+
+    println!("Cordelia v{version}");
     println!("  Entity:    {}", config.identity.entity_id);
     println!("  Public key: {pk_bech32}");
     println!("  HTTP API:  http://{listen_addr}/api/v1/channels/");
     println!("  P2P port:  {p2p_port}/UDP");
-    println!("  Role:      {}", config.network.role);
+    println!("  Role:      {role}");
     println!();
+
+    tracing::info!(
+        version,
+        %role,
+        %log_level,
+        hot_min,
+        hot_max,
+        warm_min,
+        warm_max,
+        "node starting"
+    );
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);

@@ -78,7 +78,7 @@ tick_interval_secs = 2
 [replication]
 sync_interval_realtime_secs = 5
 [logging]
-level = "info"
+level = "debug"
 TOML
 
 # Relays
@@ -108,7 +108,7 @@ tick_interval_secs = 2
 [replication]
 sync_interval_realtime_secs = 5
 [logging]
-level = "info"
+level = "debug"
 TOML
 done
 
@@ -139,7 +139,7 @@ tick_interval_secs = 2
 [replication]
 sync_interval_realtime_secs = 5
 [logging]
-level = "info"
+level = "debug"
 TOML
 done
 
@@ -175,7 +175,7 @@ tick_interval_secs = 2
 [replication]
 sync_interval_realtime_secs = 5
 [logging]
-level = "info"
+level = "debug"
 [swarm]
 swarm_index = ${s}
 lead_identity_path = "/keys/lead.identity.key"
