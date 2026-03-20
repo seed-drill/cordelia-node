@@ -1587,6 +1587,19 @@ Exceeding rate limits 3 times in 10 minutes → ban (§5.6).
 
 **Sync streams vs sync requests:** Rate limiting counts sync *streams* (one QUIC stream per peer per cycle), not individual channel SyncRequests within a batched stream. A node with N subscribed channels opens one stream and sends N SyncRequests on it -- this counts as one sync stream for rate limiting purposes. All limits follow the 3x headroom principle: `limit = 3 * expected_legitimate_rate` (see `protocol.rs` derivations).
 
+**Discovery rate limits (routed items only):**
+
+| Limit | Default | Action on exceed |
+|-------|---------|-----------------|
+| Discovery broadcasts (TTL 1-4) per peer per minute | 10 | Drop, log, trust decay (§5.5.2) |
+| Discovery broadcasts (TTL 5-16) per peer per minute | 3 | Drop, log, trust decay |
+| Discovery broadcasts (TTL 17+) per peer per minute | 1 | Drop, log, trust decay |
+| Max discoveries per peer per hour | 20 | Drop all discoveries until window resets |
+
+Only `routing_mode=routed` messages consume discovery budget. Epidemic items (group memories, TTL=255) use the existing write rate limits above.
+
+TTL-proportional rate limiting makes expanding ring search (§7.5) the economically rational strategy. A legitimate publisher doing expanding ring uses ~1 low-TTL attempt (succeeds 90%+ of the time), occasionally 1 mid-TTL, and rarely 1 global. High-TTL broadcasts consume expensive budget for no additional benefit in the common case. Skipping to TTL=255 is strictly worse for a legitimate user (wastes global budget) and time-limited for an attacker (budget exhaustion + trust decay + ban).
+
 ### 9.3 Size Limits
 
 | Parameter | Value | Enforcement |
@@ -1717,7 +1730,7 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 |--------|-----------|-------|
 | **Sybil** (flood with fake peers) | Connection limits per IP/subnet (§9.1). Min warm tenure before promotion (§5.4). | 1 |
 | **Eclipse** (surround target with attacker peers) | 20%/hr churn (§5.4). Bootnode diversity. 25+ active peers needed at >75% network control. | 1 |
-| **Amplification** (one write → many messages) | Single-hop push bounded by hot_max. Rate limits (§9.2). | 1 |
+| **Amplification** (one write → many messages) | Seen table dedup bounds epidemic forwarding to O(N * log N) (§7.2). Rate limits (§9.2). Trust scoring (§5.5.2). | 1 |
 | **Replay** | TLS 1.3 (transport). Idempotent writes (application). Timestamp validation in handshake. | 1 |
 | **Identity spoofing** | TLS certificate binds to Ed25519 key (§2.2). Application-layer verification (§4.1.6). | 1 |
 | **Metadata leakage** | Channel lists removed from peer-sharing (§4.3). Channel digest in handshake, not full list (§4.1.2). | 1 |
@@ -1738,6 +1751,10 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 | **Bandwidth amplification** | Per-peer/channel/relay fanout rate limits (§16.4). pull_only mode (§8.1.1). | 1 |
 | **DM spam** | DM creation rate limit 5/min (channels-api.md §9.1). | 1 |
 | **Ephemeral channel griefing** | Channel creation rate limit 1/sec, cap 50/entity (channels-api.md §9.1). | 1 |
+| **Broadcast flood** (route discovery spam) | TTL-proportional rate limits (§9.2): 10/3/1 per minute for low/mid/high TTL. Max 20 discoveries per peer per hour. Trust decay on abuse (§5.5.2). | 1 |
+| **TTL skip** (bypass expanding ring) | Statistical escalation detection: peers consistently using high TTL without prior low-TTL attempts incur trust penalty (§5.5.2). Expanding ring is the economically rational strategy. | 1 |
+| **Seen table exhaustion** (flood unique fake IDs) | Content hash verification before seen table insertion. `SEEN_TABLE_MAX=10,000` with LRU eviction (§7.2). Attacker must create valid items (expensive) to occupy slots. | 1 |
+| **Token cache exhaustion** (flood discovery messages) | Relay session key LRU caches bounded. Discovery rate limits (§9.2) cap inbound discoveries. Trust decay on repeated invalid tokens (§5.5.2). | 1 |
 
 ### 11.4 Accepted Risks (Phase 1)
 
