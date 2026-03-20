@@ -878,8 +878,8 @@ pub async fn p2p_loop(
                 }
                 if pending.is_empty() { continue; }
 
-                // Build per-peer batches -- relay peers only (§7.2: single-hop,
-                // relay-to-relay broadcast). Exclude the sender of each item.
+                // Build per-peer batches using seen table (§7.2 epidemic forwarding).
+                // Forward to all hot relay peers that haven't seen each item.
                 let relay_peers: Vec<NodeId> = governor.hot_peers().into_iter()
                     .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
                     .collect();
@@ -887,19 +887,25 @@ pub async fn p2p_loop(
                     NodeId,
                     Vec<cordelia_network::messages::Item>,
                 > = std::collections::HashMap::new();
-                for (_, (item, source)) in &pending {
-                    for peer_id in &relay_peers {
-                        if peer_id == source { continue; }
-                        peer_batches
-                            .entry(peer_id.clone())
-                            .or_default()
-                            .push(item.clone());
+                let seen_len = {
+                    let mut st = seen_table.write().unwrap_or_else(|e| e.into_inner());
+                    st.evict(); // TTL sweep piggy-backed on 5s timer
+                    for (_, (item, _source)) in &pending {
+                        let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                        let targets = st.forward_targets(&hash, &relay_peers);
+                        if !targets.is_empty() {
+                            st.record_targets(&hash, &targets);
+                            for peer_id in targets {
+                                peer_batches.entry(peer_id).or_default().push(item.clone());
+                            }
+                        }
                     }
-                }
+                    st.len()
+                };
 
                 if peer_batches.is_empty() { continue; }
                 let deduped = pending.len();
-                tracing::debug!(items = deduped, peers = peer_batches.len(), "relay repush flush");
+                tracing::debug!(items = deduped, peers = peer_batches.len(), seen_table = seen_len, "relay repush flush (epidemic)");
 
                 for (peer_id, items) in peer_batches {
                     if let Some(conn) = conn_mgr.get_connection(&peer_id) {
