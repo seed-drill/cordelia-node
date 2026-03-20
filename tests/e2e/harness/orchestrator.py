@@ -388,19 +388,28 @@ def phase_startup(topo, cfg: dict, db: MetricsDB):
     compose_timeout = max(120, topo.container_count)
     run(f"docker compose -p {project} -f {compose_file} up -d", timeout=compose_timeout)
 
-    # Wait healthy -- timeout scales with container count
-    health_timeout = max(120, topo.container_count * 2)
+    # Wait healthy -- parallel batch checking for scale
+    health_timeout = max(120, topo.container_count)
+    all_containers = topo.all_containers()
+    pending = set(all_containers)
     start = time.time()
-    for container in topo.all_containers():
-        while time.time() - start < health_timeout:
+    while pending and time.time() - start < health_timeout:
+        still_pending = set()
+        for container in pending:
             status = api_get(container, "status")
-            if status.get("status") == "running":
-                break
-            time.sleep(1)
-        else:
-            print(f"  TIMEOUT: {container} not healthy after {health_timeout}s")
-            db.event("startup", "timeout", container)
-            return False
+            if status.get("status") != "running":
+                still_pending.add(container)
+        pending = still_pending
+        if pending:
+            elapsed = int(time.time() - start)
+            print(f"    {len(all_containers) - len(pending)}/{len(all_containers)} healthy ({elapsed}s)...")
+            time.sleep(3)
+
+    if pending:
+        elapsed = int(time.time() - start)
+        print(f"  TIMEOUT: {len(pending)} containers not healthy after {elapsed}s: {sorted(pending)[:5]}...")
+        db.event("startup", "timeout", detail=json.dumps({"pending": len(pending)}))
+        return False
 
     elapsed = int(time.time() - start)
     print(f"  All {topo.container_count} containers healthy ({elapsed}s)")
