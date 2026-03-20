@@ -1387,19 +1387,26 @@ pub async fn handle_peer_streams(
             }
         }
 
-        // Protocol gating by peer state (connection-lifecycle.md §2.1)
+        // Protocol gating by peer state (connection-lifecycle.md §2.1, §7.2)
         let peer_state = peer_states
             .read()
             .ok()
             .and_then(|s| s.get(&peer_id).copied())
             .unwrap_or(1); // default Warm if not yet synced
         let is_hot = peer_state == 2;
+        let is_warm = peer_state == 1;
+
+        // Relays accept inbound ItemPush from Warm peers (§7.2 asymmetric hot sets).
+        // In sparse meshes, peer A may have us as Hot while we have A as Warm.
+        let relay_warm_push = node_role == "relay"
+            && is_warm
+            && protocol == cordelia_network::messages::Protocol::ItemPush;
 
         match protocol {
             cordelia_network::messages::Protocol::ItemPush
             | cordelia_network::messages::Protocol::ItemSync
             | cordelia_network::messages::Protocol::ChannelAnnounce
-                if !is_hot =>
+                if !is_hot && !relay_warm_push =>
             {
                 tracing::debug!(peer = %peer_id, protocol = proto_name, "rejected: data protocol from non-hot peer");
                 continue;
