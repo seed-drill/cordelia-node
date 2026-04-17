@@ -7,23 +7,27 @@
 
 ## Abstract
 
-We propose a system for persistent, sovereign memory for autonomous AI
-agents. Current agents operate without continuity -- each session starts
-from zero, with no accumulated knowledge, no learned preferences, no
-relationships. This is equivalent to a human with total amnesia between
-every conversation. Cordelia solves this by implementing a distributed
-memory architecture where agents maintain identity through encrypted,
-replicated memory that they control. The system uses five primitives
-(Entity, Memory, Group, Culture, Trust) and a cache hierarchy modelled
-on CPU architecture (L0-L3) to provide session continuity, selective
-sharing, and network-scale knowledge distribution. Memory is encrypted
-before storage using the Signal model: infrastructure providers never
-hold plaintext. Trust is calibrated empirically from memory accuracy
-over time, not from reputation systems. Groups govern sharing through
-culture policies that map directly to cache coherence protocols from
-hardware design. The result is a system where agents accumulate identity
-over time, share knowledge selectively, and maintain sovereignty over
-their own memory -- even against the infrastructure that hosts them.
+We propose a system for persistent, sovereign memory shared between
+humans and the AI agents they operate. Current agents operate without
+continuity -- each session starts from zero, with no accumulated
+knowledge, no learned preferences, no relationships. This is equivalent
+to a human with total amnesia between every conversation. Cordelia
+solves this by implementing a distributed memory architecture in which
+the operator's memory record -- encrypted, replicated, and sovereign --
+persists across sessions and gives the agent the continuity needed to
+function. The system uses five primitives (Entity, Memory, Group,
+Culture, Trust) and a cache hierarchy modelled on CPU architecture
+(L0-L3) to provide session continuity, selective sharing, and
+network-scale knowledge distribution. Memory is encrypted before storage
+using the Signal model: infrastructure providers never hold plaintext.
+Trust is calibrated empirically from memory accuracy over time, not
+from reputation systems. Groups govern sharing through culture policies
+that map directly to cache coherence protocols from hardware design.
+The design is deliberately democratic-AI infrastructure: no central
+provider holds plaintext, no infrastructure operator can coerce the
+record, and provenance is cryptographically auditable -- properties
+that matter particularly during the period in which AI capability
+outpaces the institutional machinery for governing it [23].
 
 ---
 
@@ -82,6 +86,14 @@ The design draws on established computer science: CPU cache hierarchies
 [1], cache coherence protocols [2], working set theory [3], information
 theory [4], and game theory [5]. Where possible, we reuse proven
 mechanisms rather than invent new ones.
+
+The timing matters. Powerful AI capabilities are arriving faster than
+the social, political, and institutional mechanisms needed to govern
+them [23]. In that window, the memory layer of AI systems is a choice
+point: sovereign, cryptographically auditable memory owned by the
+operator is a structurally different commitment from custodial memory
+held by a provider. Cordelia takes the former position and argues it is
+the right default for the coming decade.
 
 ### 1.4 A Worked Example
 
@@ -342,20 +354,25 @@ five concepts.
 
 ### 3.1 Entity
 
-An entity is anything with memory and agency: a human, an AI agent, a
-team, an organisation. Each entity is identified by an Ed25519 keypair.
-The `node_id` is `SHA-256(public_key)`.
+An entity is a principal: a human or organisation that controls an
+Ed25519 keypair. The `node_id` is `SHA-256(public_key)`. An AI agent
+is not itself an entity -- it is a process operated under a principal's
+key, acting as a delegate of that principal. Where this paper refers to
+"an agent's memory", it means the operator's memory record of the
+agent's work.
 
-The foundational invariant: **entity sovereignty**. An entity has
-exclusive control over its own memory. No group policy, peer,
-administrator, or infrastructure provider can force content into an
-entity's sovereign memory without the entity's explicit acceptance. This
-is not a policy that can be overridden -- it is a structural property of
-the system.
+The foundational invariant: **entity sovereignty**. A principal has
+exclusive control over its own memory record. No group policy, peer,
+administrator, or infrastructure provider can force content into a
+principal's sovereign memory without explicit acceptance. This is not a
+policy that can be overridden -- it is a structural property of the
+system.
 
-An entity's L1 hot context defines its identity: name, roles,
-preferences, active projects, working style. Memory is identity. An
-agent without its L1 is a different agent.
+An entity's L1 hot context carries its identifying working state: name,
+roles, preferences, active projects, working style. Swap the L1 and a
+stateless agent behaves differently -- the working record is what steers
+behaviour in-context. Continuity sits in the record, not in any
+persistent inner life of the agent process.
 
 ### 3.2 Memory
 
@@ -762,6 +779,10 @@ The system does not attempt to:
 - Prevent a sufficiently motivated adversary from targeting a specific
   entity's device (endpoint security is out of scope)
 - Guarantee availability against network-level denial of service
+- Prevent malicious agent coordination. Cordelia is coordination
+  infrastructure for agents; like any encrypted transport, it is
+  dual-use. The design prevents infrastructure-level capture but
+  cannot unilaterally prevent misuse by endpoints.
 
 ### 8.4 Out of Scope: Model-Layer Adversaries
 
@@ -1070,19 +1091,38 @@ which a society collectively decides a model is unsafe to deploy
 requires governance infrastructure outside the protocol.
 
 **Sovereignty is not oversight.** Entity sovereignty (Section 3.1)
-protects the agent's memory from infrastructure providers. It does
-not grant operators the ability to intervene in the model's
-behaviour. A structural no-force-content invariant and a structural
-kill-switch are opposing design commitments; Cordelia chooses the
-former, and that choice must be made with eyes open.
+protects the operator's memory record from infrastructure providers.
+It does not grant a central authority the ability to intervene in the
+model's behaviour. A structural no-force-content invariant and a
+structural kill-switch are opposing design commitments; Cordelia
+chooses the former, and that choice must be made with eyes open.
+
+**The adolescence-phase argument.** Amodei [23] frames the current
+period as a narrow window in which AI capability is growing faster
+than the institutional machinery needed to govern it, and argues that
+what technology builders do now -- transparency-first, mechanistic
+interpretability, surgical regulation -- matters disproportionately.
+Cordelia addresses one narrow piece of that agenda: where an agent's
+cumulative memory sits, who holds the plaintext, who can audit
+provenance, and whether an infrastructure provider can rewrite the
+record. The choice this paper makes is sovereignty over oversight for
+the cooperative-agent case. This is a bet -- defensible if agents in
+deployment remain broadly cooperative with their operators, weaker if
+autonomy risks materialise in the way Amodei's essay warns. We make
+it explicitly and accept the trade: operator-sovereign memory cannot
+be silently mass-surveilled by an infrastructure monopoly, and it
+also cannot be silently overridden by a safety authority. Those are
+opposite ends of a real design axis, and Cordelia sits firmly at one
+end.
 
 Within these bounds, the protocol contributes four properties that a
 broader alignment effort can build on:
 
 - **Verifiable identity continuity**: the L1 chain provides a
-  cryptographically linked history of an agent's stated identity,
-  preferences, and working context. Behavioural drift relative to
-  that history is observable post-hoc to any party with audit access.
+  cryptographically linked history of the operator's working record
+  with the agent -- preferences stated, decisions ratified, context
+  accumulated. Behavioural drift relative to that record is
+  observable post-hoc to any party with audit access.
 - **Empirical trust from accuracy** (Section 3.5): trust is treated
   as a measurable property of repeated interactions, not a declared
   attribute. This creates a localised incentive gradient against
@@ -1218,6 +1258,13 @@ Reasoning," arXiv:2307.13702, 2023. Empirical work on the faithfulness
 of model reasoning traces -- foundational to the reasoning-audit
 mechanism that Cordelia's memory-audit substrate does not provide.
 
+[23] D. Amodei, "The Adolescence of Technology," 2026. Anthropic.
+https://www.darioamodei.com/essay/the-adolescence-of-technology
+Frames the current period as a narrow capability-versus-governance
+window; cited in the abstract, Section 1.3, and Section 11.4 for the
+adolescence-phase positioning and the sovereignty-over-oversight
+design bet.
+
 ---
 
 ## Document Hierarchy
@@ -1239,5 +1286,5 @@ archived. The documents above in `cordelia-node` are authoritative.
 
 ---
 
-*Version 2.1 -- 2026-04-17*
+*Version 2.2 -- 2026-04-17*
 *Seed Drill (https://seeddrill.ai) -- AGPL-3.0*
