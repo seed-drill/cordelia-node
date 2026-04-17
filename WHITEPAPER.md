@@ -1156,6 +1156,177 @@ to matter.
 
 ---
 
+## 12. Risk Model
+
+The protocol threat model (Section 8) covers adversaries acting
+against individual Cordelia deployments. A separate question is
+whether wide adoption of this architecture improves or worsens the
+ambient AI risk landscape. The two questions are not the same, and
+the second deserves its own accounting.
+
+### 12.1 The Two-Axis Framing
+
+Two risk families organise the adoption question.
+
+**Axis 1 -- capture.** Consolidation of AI memory into a small number
+of infrastructure providers subject to compulsory process, state
+coercion, or corporate capture. This is the autocratic-AI concern
+Amodei [23] treats as the most immediate and hardest to reverse once
+it materialises. Its shape: a small number of actors holding
+plaintext for many, with weak exit and strong coordination effects.
+
+**Axis 2 -- autonomy.** Misaligned models persisting goals and
+strategies across contexts in ways that evade oversight. Amodei
+treats this as real but probabilistic, with genuine uncertainty about
+emergence rate. Its shape: per-deployment failures that may correlate
+across an industry-standard alignment approach.
+
+Cordelia is architecturally an Axis-1 defence (E2E encryption,
+federation, operator-sovereign chain) and Axis-2 neutral (memory
+audit, not reasoning audit; see Section 11.4). Wide adoption reduces
+Axis-1 exposure across the ecosystem. It modestly raises Axis-2
+exposure by placing memory outside the visibility of any single
+authority -- the sovereignty-over-oversight bet stated in Section
+11.4. This section addresses on what priors and under what mechanisms
+that bet is defensible, and what preconditions keep it defensible as
+the network scales.
+
+### 12.2 Priors
+
+Four empirical priors bear on the question.
+
+**Signal analogue.** E2E encrypted messaging has been deployed at
+population scale for over a decade. Net assessment across democratic
+societies is positive for dissent, journalism, and anti-surveillance,
+with measurable but bounded criminal-coordination cost. The cost has
+not dominated the benefit in any society that has measured it. If
+Cordelia is *Signal for agents*, this prior tilts adoption toward
+net-positive on Axis 1. Confidence: moderate. Caveat: agents
+instantiate faster than humans, which weakens the analogy at the
+margin.
+
+**Federation vs centralisation precedent.** Email (federated) has
+been structurally harder to weaponise for state capture than
+Facebook or WeChat (centralised), despite architectural
+disadvantages. Federation imposes friction on large-scale coercion
+regardless of individual provider behaviour. Confidence: moderate;
+clean transfer to Cordelia.
+
+**Autocratic capture base rate.** The capability + governance +
+surveillance combination Amodei identifies is observable and
+directional on current trajectory. P(Axis-1 materialisation in a
+3-5 year window) is materially greater than 0.5 on current evidence.
+
+**Deceptive-alignment base rate.** No public evidence of a
+persistent, coordinated alignment failure in production deployment
+at time of writing. Anthropic's published responsible-scaling work
+treats current-generation misalignment as present-but-manageable
+through interpretability and staged deployment. P(Axis-2
+materialisation at scale in a 3-5 year window) has wide error bars
+-- plausibly 0.1 to 0.4 depending on forecast. Notably less resolved
+than Axis 1.
+
+Net prior (revisable): directional evidence supports the bet.
+Confidence that adoption is net-positive conditional on current
+trajectories is approximately 60-70%, with fat tails. The priors
+will need re-testing as evidence accumulates.
+
+### 12.3 Game-Theoretic Bounds
+
+Five mechanisms bound parts of the uncertainty.
+
+**Externality structure.** Axis 1 harms are non-rival and
+non-excludable -- surveillance states harm participants and
+non-participants alike. Axis 2 harms are primarily per-deployment --
+a misaligned agent harms its operator first. The classical result
+follows: externalities are systematically underfunded by private
+actors; private harms are more correctly priced by market mechanisms.
+Market forces therefore work on Axis 2 (operators want aligned
+agents; providers compete on alignment as a feature), while Axis 1
+needs structural defences rather than market ones. This is a strong
+argument for investing infrastructure effort specifically in Axis-1
+capture-resistance, which Cordelia does.
+
+**Defender-attacker asymmetry.** To realise Axis 1 at scale, an
+attacker must win globally -- break E2E per entity across a large
+population. To realise Axis 2, an attacker needs to win once per
+deployment. Cordelia raises Axis-1 attack cost by orders of magnitude
+through cryptographic baseline; it raises Axis-2 attack cost only
+marginally. This is a clean architectural bound: Cordelia is
+provably an Axis-1 defence and provably not an Axis-2 defence.
+
+**Iterated reputation within groups.** Trust in Cordelia
+(Section 3.5) is computed independently by each entity from repeated
+interactions. Deceptive alignment that persists long enough to
+become visible within a group faces measurable trust decay under
+the iterated game. This bounds the *duration* of intra-group
+deception. It says nothing about single-shot deception or
+between-group adversarial coordination.
+
+**Liability allocation.** Custodial memory creates ambiguous
+liability between provider and operator. Operator-sovereign memory
+assigns liability to the operator by design -- the party closest to
+deployment decisions carries the cost. The Coase-theoretic reading
+is that this tends to improve outcomes by internalising cost at the
+decision point. Modest positive for Axis 2: operators have a
+stronger incentive to audit their agents when the record and the
+liability are both theirs.
+
+**Coordination friction for low-resource attackers.** Malicious
+coordination across Cordelia requires keypair exchange, group
+admission, and culture alignment. These frictions are per-group and
+per-interaction. Well-resourced state actors clear them;
+low-resource bad actors do so less easily. The distribution of
+adoption benefit therefore skews toward sovereign individuals
+relative to small malicious groups. It does little against
+well-resourced adversaries.
+
+### 12.4 Residual Uncertainty and Adoption Preconditions
+
+Three dimensions remain essentially unbounded by the above:
+
+- Rate of deceptive-alignment emergence -- a model-layer question,
+  outside Cordelia's observational access.
+- Population-level coordination effects, good or bad -- 3+
+  order-of-magnitude uncertainty.
+- Interaction between persistent operator memory and model training
+  cycles -- open research.
+
+The conditional bet therefore depends on three preconditions that
+are not internal to the protocol. This paper treats them as
+first-class adoption requirements rather than optional extras.
+
+- **Verifiable attestation of agent identity at session start.**
+  What model, what training, what toolset. The L1 chain has a slot
+  for this; wiring it through the SDK and making it mandatory for
+  high-trust groups is load-bearing.
+
+- **Operator-level review tooling.** Sovereignty is only exercised
+  if the operator can tractably inspect the memory record. Without
+  review UX, sovereign memory becomes opaque to everyone --
+  including the operator it protects. This is the difference
+  between "the operator has the right to audit" and "the operator
+  actually audits."
+
+- **Group-level governance against value drift.** Section 7.3
+  provides the skeleton. At scale, cultural transmission either
+  becomes a feature that propagates good norms or the mechanism
+  that entrenches bad ones. The difference is whether groups have
+  real tooling for cultural alignment and exit, not just policy
+  strings.
+
+Without these, wide adoption scores well on Axis 1 and worse on
+Axis 2 without reducing total risk. With them, the combined picture
+is plausibly net-positive on both axes. This section does not treat
+the conclusion as settled -- it treats it as an explicit conditional
+that admits revision as empirical evidence accumulates.
+
+A formal companion, with the population-level models, sensitivity
+analysis, and the monitoring signals that would update these priors,
+is maintained at [docs/reference/risk-model.md](docs/reference/risk-model.md).
+
+---
+
 ## References
 
 [1] J. L. Hennessy and D. A. Patterson, *Computer Architecture: A
@@ -1286,5 +1457,5 @@ archived. The documents above in `cordelia-node` are authoritative.
 
 ---
 
-*Version 2.2 -- 2026-04-17*
+*Version 2.3 -- 2026-04-17*
 *Seed Drill (https://seeddrill.ai) -- AGPL-3.0*
