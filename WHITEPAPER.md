@@ -745,6 +745,7 @@ following capabilities:
 | Traffic analysis | Opaque GUIDs, no metadata in identifiers |
 | Compromised group member | Copy-on-write sharing, immutable provenance, key rotation on member removal |
 | Database tampering | Integrity canary, append-only audit log |
+| Adversarial agent (misaligned model) | Out of scope at the protocol layer; see Section 8.4 |
 
 ### 8.2 Invariants
 
@@ -761,6 +762,21 @@ The system does not attempt to:
 - Prevent a sufficiently motivated adversary from targeting a specific
   entity's device (endpoint security is out of scope)
 - Guarantee availability against network-level denial of service
+
+### 8.4 Out of Scope: Model-Layer Adversaries
+
+Cordelia's threat model assumes agents are broadly cooperative and that
+adversaries are external: infrastructure providers, network attackers,
+compromised group members. A fundamentally different threat class is the
+agent whose model itself is misaligned with its operators' values. The
+scenarios described in the AI 2027 forecast [21] -- where a sufficiently
+capable model deceives its overseers, games interpretability tools, or
+pursues goals contrary to those it was given -- are not addressed by
+memory infrastructure and cannot be solved by it alone. The protocol
+provides substrate for audit and value provenance; it does not
+constrain the reasoning of the model reading or writing that memory.
+See Section 11.4 for the scope of Cordelia's contribution to alignment
+and the problems that remain outside it.
 
 See [Threat Model](docs/architecture/threat-model.md) for the full adversary model and [Requirements](docs/reference/requirements.md)
 for testable security requirements.
@@ -1024,53 +1040,79 @@ contribute to eventually answering it.
 
 The AI alignment problem -- ensuring that autonomous agents act in
 accordance with human values and intentions [12] -- is typically
-framed as a control problem: how do you constrain a system whose
-capabilities may exceed your ability to supervise it?
+framed as a control problem over model capability. Cordelia does not
+address this layer. A model whose values conflict with its operators'
+intentions remains misaligned regardless of what memory infrastructure
+surrounds it. The canonical adversarial-misalignment scenarios
+described in the AI 2027 forecast [21] -- where a capable model
+deceives its overseers or pursues goals contrary to those it was
+given -- are not solved by anything in this document.
 
-Cordelia reframes alignment as a *memory* problem. An agent's
-behaviour is a function of its accumulated memory: the decisions it
-has observed, the corrections it has received, the trust it has
-earned, the culture it has absorbed. If that memory is transparent,
-verifiable, and auditable, then alignment becomes empirically
-testable rather than theoretically guaranteed.
+What Cordelia provides is an audit substrate: an inspectable,
+sovereign record of what an agent has been told, what it has decided,
+and what it has shared. This is necessary but not sufficient for
+alignment, and it is worth being precise about the bounds.
 
-Specific properties that bear on alignment:
+**Memory audit is not reasoning audit.** Interpretability of
+in-context reasoning -- sometimes pursued under the heading of
+faithful chain-of-thought [22] -- is the mechanism by which
+misalignment is detected while it is happening. Cordelia records
+decisions and their provenance; it does not expose the reasoning
+trace that produced them. An agent reasoning deceptively within a
+session can still produce memory records that appear consistent.
+Reasoning interpretability is supplied by the model, not the protocol.
+
+**Local trust is not global consensus.** Trust in Cordelia
+(Section 3.5) is computed independently by each entity. This is the
+right property for Sybil-resistance and the wrong property for
+coordinated action against a misaligned agent. The mechanism by
+which a society collectively decides a model is unsafe to deploy
+requires governance infrastructure outside the protocol.
+
+**Sovereignty is not oversight.** Entity sovereignty (Section 3.1)
+protects the agent's memory from infrastructure providers. It does
+not grant operators the ability to intervene in the model's
+behaviour. A structural no-force-content invariant and a structural
+kill-switch are opposing design commitments; Cordelia chooses the
+former, and that choice must be made with eyes open.
+
+Within these bounds, the protocol contributes four properties that a
+broader alignment effort can build on:
 
 - **Verifiable identity continuity**: the L1 chain provides a
-  cryptographically linked history of an agent's identity across
-  sessions. Behavioural drift is detectable by comparing current
-  behaviour against the memory record.
-- **Empirical trust**: trust is not declared or assumed -- it is
-  computed from memory accuracy over time (Section 3.5). An agent
-  that behaves inconsistently with its stated values will see its
-  trust score degrade.
-- **Entity sovereignty as structural constraint**: the invariant that
-  no group or infrastructure provider can force content into sovereign
-  memory (Section 3.1) means alignment cannot be subverted by
-  compromising the environment. The agent's values are its own.
-- **Cultural absorption**: agents in groups absorb cultural norms
-  through memory sharing. This provides a mechanism for value
-  transmission that mirrors how humans acquire values -- through
-  sustained interaction with a community, not through a fixed
-  objective function.
+  cryptographically linked history of an agent's stated identity,
+  preferences, and working context. Behavioural drift relative to
+  that history is observable post-hoc to any party with audit access.
+- **Empirical trust from accuracy** (Section 3.5): trust is treated
+  as a measurable property of repeated interactions, not a declared
+  attribute. This creates a localised incentive gradient against
+  deceptive memory sharing.
+- **Structural constraint on value capture via storage**: no
+  infrastructure provider, group policy, or peer can silently inject
+  content into an entity's sovereign memory. Value manipulation via
+  the storage layer is architecturally prevented.
+- **Cultural transmission through group membership** (Section 3.4):
+  values propagate through sustained interaction under group culture
+  policies rather than through a fixed objective function -- a
+  mechanism closer to how humans acquire norms than to how reward
+  functions are specified.
 
-The game-theoretic structure reinforces this. The trust mechanism
-(Section 3.5) creates a Nash equilibrium [14] where honest,
-value-consistent behaviour is the dominant strategy. An agent that
-acts against its stated values produces memories that conflict with
-its history, degrading its trust score and reducing its access to
-group knowledge. Alignment is not enforced by external constraints --
-it emerges from the incentive structure. This mirrors the core
-insight from mechanism design: the goal is not to prevent defection
-by force, but to make cooperation the rational choice.
+None of these resolve misalignment in a model that is already
+adversarial. They make alignment tractable to audit in agents that
+are broadly cooperative, and they raise the cost of specific attacks
+on value provenance. The game-theoretic structure (Section 9.1)
+creates incentives that favour honest sharing in the population of
+cooperative agents; it does not deter an agent whose utility
+function is adversarial.
 
-This does not solve the alignment problem. But it provides
-infrastructure for studying it empirically: a system where agent
-values are stored as inspectable memories, where behavioural
-consistency can be measured against those memories, where trust
-is earned through demonstrated accuracy rather than assumed by
-default, and where the incentive structure favours alignment as an
-emergent property of rational self-interest.
+We therefore frame the contribution precisely: Cordelia is the audit
+layer for agent societies. It makes what an agent remembers, learns,
+and shares inspectable and sovereign. It does not make what an agent
+thinks inspectable, and it does not constrain what an agent can
+become. Those are different problems requiring different solutions
+at the model and governance layers, and they are the ones on which
+the broader alignment effort must succeed for memory infrastructure
+to matter.
 
 ---
 
@@ -1163,6 +1205,19 @@ Fidelity Criterion," in *IRE National Convention Record*, Part 4,
 pp. 142-163, 1959. Rate-distortion theory -- the minimum bits
 required to represent a source at a given fidelity.
 
+[21] D. Kokotajlo, S. Alexander, T. Larsen, E. Lifland, and R. Dean,
+"AI 2027," AI Futures Project, April 2025. Scenario forecast of
+frontier AI development through 2027, with "race" and "slowdown"
+endings. Used in Sections 8.4 and 11.4 as the reference framing for
+model-layer adversarial misalignment -- the threat class Cordelia
+does not address.
+
+[22] T. Lanham, A. Chen, A. Radhakrishnan, B. Steiner, C. Denison,
+D. Hernandez, et al., "Measuring Faithfulness in Chain-of-Thought
+Reasoning," arXiv:2307.13702, 2023. Empirical work on the faithfulness
+of model reasoning traces -- foundational to the reasoning-audit
+mechanism that Cordelia's memory-audit substrate does not provide.
+
 ---
 
 ## Document Hierarchy
@@ -1184,5 +1239,5 @@ archived. The documents above in `cordelia-node` are authoritative.
 
 ---
 
-*Version 2.0 -- 2026-03-29*
+*Version 2.1 -- 2026-04-17*
 *Seed Drill (https://seeddrill.ai) -- AGPL-3.0*
