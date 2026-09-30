@@ -299,6 +299,20 @@ fn concurrent_edits_leave_a_conflict_file_everywhere() {
         vec!["from a\n".to_string(), "from b\n".to_string()],
         "no edit lost"
     );
+
+    // The report lists the conflict file (what the status indicator shows)
+    // until it is merged and deleted.
+    let listed = |report: cordelia_sync::claude::CycleReport| -> Vec<String> {
+        report
+            .folders
+            .into_iter()
+            .flat_map(|f| f.conflict_files)
+            .collect()
+    };
+    let path = a_mem.join(&on_a[0]).display().to_string();
+    assert_eq!(listed(a.cycle()), vec![path.clone()]);
+    std::fs::remove_file(&path).unwrap();
+    assert!(listed(a.cycle()).is_empty());
 }
 
 #[test]

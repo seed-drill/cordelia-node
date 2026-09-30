@@ -436,6 +436,27 @@ fn cli_reports_when_the_node_is_not_running() {
     // `status` still works, and says the node is not running.
     let status = n.cli(&["status"]);
     assert!(status.contains("Running:   no"), "{status}");
+    let line = n.cli(&["status", "--line"]);
+    assert!(line.contains("memory: node stopped"), "{line}");
+    let json: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
+    assert_eq!(json["state"], "stopped", "{json}");
+
+    // On a machine without Cordelia, the status line prints nothing.
+    let none = Command::new(BIN)
+        .args([
+            "--config",
+            "/nonexistent/cordelia/config.toml",
+            "status",
+            "--line",
+        ])
+        .output()
+        .unwrap();
+    assert!(none.status.success());
+    assert!(
+        none.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&none.stdout)
+    );
 }
 
 /// A Claude Code project folder under `home` whose sessions ran in `cwd`;
@@ -559,4 +580,33 @@ fn claude_memory_syncs_between_two_machines() {
         status.contains("github.com/seed-drill/cordelia-node"),
         "{status}"
     );
+
+    // The status indicator: once everything has reached the relay, both
+    // devices say so.
+    let state = |n: &Node| -> serde_json::Value {
+        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+    };
+    for n in [&a, &b] {
+        let s = wait_for("the device reports synced", &all, 60, || {
+            let s = state(n);
+            (s["state"] == "synced").then_some(s)
+        });
+        assert_eq!(s["sync"]["enabled"], true, "{s}");
+        assert!(s["sync"]["last_change_at"].is_string(), "{s}");
+        assert_eq!(s["outbox_waiting"], 0, "{s}");
+    }
+    let line = a.cli(&["status", "--line"]);
+    assert!(line.contains("memory synced"), "{line}");
+
+    // A conflict file shows until someone merges it and deletes it.
+    let conflict = a_proj_mem.join("decision.conflict-0123abcd.md");
+    std::fs::write(&conflict, "the other version\n").unwrap();
+    wait_for("a reports the conflict", &all, 60, || {
+        let s = state(&a);
+        (s["summary"] == "memory: 1 conflict" && s["state"] == "attention").then_some(())
+    });
+    std::fs::remove_file(&conflict).unwrap();
+    wait_for("a is synced again", &all, 60, || {
+        (state(&a)["state"] == "synced").then_some(())
+    });
 }

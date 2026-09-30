@@ -362,6 +362,20 @@ pub fn query_sync_after(
     Ok(items)
 }
 
+/// How many items are in this node's [`outbox`]: written by `author`, not
+/// yet acknowledged by a relay.
+pub fn outbox_len(conn: &Connection, author: &[u8; 32]) -> Result<u64, CordeliaError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM items
+         WHERE author_id = ?1 AND relayed_at IS NULL
+           AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')",
+        params![author.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n as u64)
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
 /// This node's outbox: items authored by `author` in network-scope channels
 /// that no relay has acknowledged yet, oldest first. Bounded by count and
 /// total encrypted bytes, but always at least one item if any are pending.
@@ -1066,8 +1080,12 @@ mod tests {
         assert_eq!(ids(outbox(&conn, &me, 10, 150).unwrap()), vec!["ci_m1"]);
         assert_eq!(ids(outbox(&conn, &me, 10, 1).unwrap()), vec!["ci_m1"]);
 
+        // Three items wait for a relay; two of them are ours.
+        assert_eq!(outbox_len(&conn, &me).unwrap(), 2);
+
         mark_relayed(&conn, &["ci_m1".to_string()]).unwrap();
         assert_eq!(ids(outbox(&conn, &me, 10, 1 << 20).unwrap()), vec!["ci_m2"]);
+        assert_eq!(outbox_len(&conn, &me).unwrap(), 1);
     }
 
     #[test]

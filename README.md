@@ -53,6 +53,30 @@ Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device everywhere and rotates keys),
 `cordelia sync off`.
 
+### Status
+
+`cordelia status` shows this device and, while the node runs, its peers and
+memory sync. For status bars:
+
+- `cordelia status --line` prints one short line: `● memory synced`,
+  `◐ memory sending 3`, `○ memory offline`, `▲ memory: 1 conflict`, and so on.
+  It prints nothing on a machine where Cordelia is not set up.
+- `cordelia status --json` gives the same `state` (`synced`, `syncing`,
+  `offline`, `attention`, `off`, `stopped`) and `summary`, with the details:
+  peers, items waiting to reach a relay, last change, and the conflict files
+  waiting to be merged.
+
+To show it in Claude Code, add this to `~/.claude/settings.json` (use the full
+path, e.g. `~/.cordelia/bin/cordelia`, if `cordelia` is not on the `PATH`
+Claude Code starts with):
+
+```json
+{ "statusLine": { "type": "command", "command": "cordelia status --line" } }
+```
+
+If you already have a status line command, add `$(cordelia status --line)` to
+what it prints.
+
 ## Build from source
 
 ```bash
