@@ -127,8 +127,8 @@ impl ChannelState {
     pub fn validate(&self) -> Result<(), CryptoError> {
         let invalid = |msg: &str| Err(CryptoError::InvalidMessage(msg.to_string()));
 
-        if !self.channel_id.starts_with("grp_") {
-            return invalid("channel state must name a group channel");
+        if !is_group_channel_id(&self.channel_id) {
+            return invalid("channel state must name a group channel (grp_<uuid>)");
         }
         if self.mode != "realtime" && self.mode != "batch" {
             return invalid("mode must be 'realtime' or 'batch'");
@@ -318,6 +318,20 @@ impl ChannelState {
     }
 }
 
+/// `grp_` followed by a lowercase hyphenated UUID, as `group_channel_id`
+/// generates. Channel IDs from other nodes become file names, so nothing
+/// looser is accepted.
+fn is_group_channel_id(id: &str) -> bool {
+    let Some(uuid) = id.strip_prefix("grp_") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
+        })
+}
+
 fn text(s: &str) -> Value {
     Value::Text(s.to_string())
 }
@@ -454,6 +468,17 @@ mod tests {
         let mut not_group = sample(&sender, &recipient);
         not_group.channel_id = "dm_abc".into();
         assert!(not_group.validate().is_err());
+
+        for bad_id in [
+            "grp_../../../etc/passwd",
+            "grp_550e8400-e29b-41d4-a716-44665544000", // short
+            "grp_550E8400-E29B-41D4-A716-446655440000", // uppercase
+            "grp_550e8400xe29b-41d4-a716-446655440000", // bad separator
+        ] {
+            let mut s = sample(&sender, &recipient);
+            s.channel_id = bad_id.into();
+            assert!(s.validate().is_err(), "{bad_id}");
+        }
 
         // Invalid states cannot even be sealed.
         assert!(not_group.seal(&recipient.public_key()).is_err());

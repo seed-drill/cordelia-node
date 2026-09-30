@@ -7,7 +7,15 @@ use rusqlite::{Connection, params};
 use cordelia_core::CordeliaError;
 
 /// Node-internal item types filtered from listen/search responses.
-const INTERNAL_TYPES: &[&str] = &["psk_envelope", "kv", "attestation", "descriptor", "probe"];
+/// Keep in sync with the `NOT IN` lists in the SQL below (a test checks).
+const INTERNAL_TYPES: &[&str] = &[
+    "psk_envelope",
+    "kv",
+    "attestation",
+    "descriptor",
+    "probe",
+    "invite",
+];
 
 /// Check if an item_type is node-internal (not publishable via API).
 pub fn is_internal_type(item_type: &str) -> bool {
@@ -106,7 +114,7 @@ pub fn query_listen(
          FROM items
          WHERE channel_id = ?1
            AND published_at > ?2
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0
          ORDER BY published_at ASC, item_id ASC
          LIMIT ?3"
@@ -115,7 +123,7 @@ pub fn query_listen(
                 is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
          FROM items
          WHERE channel_id = ?1
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0
          ORDER BY published_at DESC, item_id DESC
          LIMIT ?3"
@@ -306,7 +314,7 @@ pub fn count_for_channel(conn: &Connection, channel_id: &str) -> Result<i64, Cor
     conn.query_row(
         "SELECT COUNT(*) FROM items
          WHERE channel_id = ?1
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0",
         params![channel_id],
         |row| row.get(0),
@@ -568,6 +576,25 @@ mod tests {
         let (hash, published_at) = &known["ci_k1"];
         assert_eq!(hash.as_slice(), &[0x61; 32]);
         assert_eq!(published_at, "2026-01-01T00:01:00Z");
+    }
+
+    #[test]
+    fn test_every_internal_type_hidden_from_listen_and_count() {
+        let conn = setup();
+        for (i, t) in INTERNAL_TYPES.iter().enumerate() {
+            let id = Box::leak(format!("ci_int{i}").into_boxed_str());
+            let mut item = test_item(id, "2026-01-01T00:01:00Z");
+            item.item_type = t;
+            let hash = Box::leak(Box::new([0x70 + i as u8; 32]));
+            item.content_hash = hash;
+            insert_item(&conn, &item).unwrap();
+        }
+        assert!(query_listen(&conn, "ch1", None, 50).unwrap().is_empty());
+        assert_eq!(count_for_channel(&conn, "ch1").unwrap(), 0);
+        assert_eq!(
+            query_sync(&conn, "ch1", None, 50).unwrap().len(),
+            INTERNAL_TYPES.len()
+        );
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item
