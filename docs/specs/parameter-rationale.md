@@ -283,6 +283,23 @@ Increasing later is non-breaking.
 plus CBOR overhead. 1MB allows batch fetch of up to 4 items at maximum
 size, or 100+ typical items in a single FetchResponse.
 
+### outbox_flush_interval = 2s
+
+**Rationale:** A personal node's own items stay in an outbox until a relay
+acknowledges them, and go out as one batched push per flush (decision
+2026-09-30-agent-memory-sync §4.4a). 60 / writes_per_peer_per_minute (36)
+= 1.67s, rounded up to 2s: 30 pushes/min against the relay's 36, however
+many items were written. Before the outbox, each write was its own push and
+a burst of 150 writes tripped the limit 467 times, losing most items.
+Checked at compile time in protocol.rs.
+
+### outbox_batch_max_bytes = 768KB, outbox_batch_max_items = 500
+
+**Rationale:** One outbox push must fit in max_message_bytes with room for
+per-item headers and CBOR framing (768KB + 128KB <= 1MB, checked at compile
+time). An item larger than the byte bound (items are at most
+max_item_bytes) is sent alone. The item bound caps header overhead.
+
 ---
 
 ## 5. Connection Limits

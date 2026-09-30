@@ -96,6 +96,116 @@ pub fn store_item(
     }
 }
 
+/// Send this node's outbox (own items no relay has acknowledged) to one hot
+/// relay as a single push, and mark the items relayed once that relay has
+/// accounted for every one of them (decision 2026-09-30 §4.4a). Relays
+/// forward to each other, so one acknowledgement is enough. Rotates across
+/// hot relays so one unhelpful relay cannot stall the outbox; anything not
+/// acknowledged is simply sent again on a later flush.
+fn flush_outbox(
+    state: &web::Data<cordelia_api::state::AppState>,
+    governor: &cordelia_network::governor::Governor,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rotation: &mut usize,
+) {
+    use std::sync::atomic::Ordering;
+
+    let relays: Vec<NodeId> = governor
+        .hot_peers()
+        .into_iter()
+        .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+        .collect();
+    if relays.is_empty() {
+        return;
+    }
+    let target = relays[*rotation % relays.len()].clone();
+    let Some(conn) = conn_mgr.get_connection(&target).cloned() else {
+        return;
+    };
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return; // previous flush still running
+    }
+
+    let batch = {
+        let Ok(db) = state.db.lock() else {
+            in_flight.store(false, Ordering::Release);
+            return;
+        };
+        cordelia_storage::items::outbox(
+            &db,
+            &state.identity.public_key(),
+            cordelia_core::protocol::OUTBOX_BATCH_MAX_ITEMS,
+            cordelia_core::protocol::OUTBOX_BATCH_MAX_BYTES,
+        )
+        .unwrap_or_default()
+    };
+    if batch.is_empty() {
+        in_flight.store(false, Ordering::Release);
+        return;
+    }
+    *rotation = rotation.wrapping_add(1);
+
+    let ids: Vec<String> = batch.iter().map(|i| i.item_id.clone()).collect();
+    let items: Vec<cordelia_network::messages::Item> = batch
+        .into_iter()
+        .map(|si| cordelia_network::messages::Item {
+            item_id: si.item_id,
+            channel_id: si.channel_id,
+            item_type: si.item_type,
+            content_length: si.encrypted_blob.len() as u32,
+            encrypted_blob: si.encrypted_blob,
+            content_hash: si.content_hash,
+            author_id: si.author_id,
+            signature: si.signature,
+            key_version: si.key_version as u32,
+            published_at: si.published_at,
+            is_tombstone: si.is_tombstone,
+            parent_id: si.parent_id,
+            slot: si.slot,
+            rev: si.rev,
+        })
+        .collect();
+
+    let state = state.clone();
+    let in_flight = in_flight.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let (mut send, mut recv) = open_bi(&conn).await?;
+            let mut stream = tokio::io::join(&mut recv, &mut send);
+            cordelia_network::item_sync::send_push(&mut stream, &items)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        match result {
+            Ok(ack) => {
+                let accounted =
+                    ack.stored + ack.dedup_dropped + ack.policy_rejected + ack.verification_failed;
+                if accounted as usize == ids.len() {
+                    if ack.policy_rejected + ack.verification_failed > 0 {
+                        tracing::warn!(
+                            relay = %target,
+                            rejected = ack.policy_rejected + ack.verification_failed,
+                            "relay rejected outbox items; not retrying them"
+                        );
+                    }
+                    if let Ok(db) = state.db.lock() {
+                        let _ = cordelia_storage::items::mark_relayed(&db, &ids);
+                    }
+                    tracing::debug!(relay = %target, items = ids.len(), stored = ack.stored, "outbox delivered");
+                } else {
+                    tracing::debug!(relay = %target, items = ids.len(), accounted, "outbox partially acknowledged; will resend");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(relay = %target, items = ids.len(), error = %e, "outbox push failed; will resend")
+            }
+        }
+        in_flight.store(false, Ordering::Release);
+    });
+}
+
 /// Canonical post-connection sequence (connection-lifecycle.md §1.2).
 /// ALL connection paths MUST call this after successful connection.
 #[allow(clippy::too_many_arguments)]
@@ -398,6 +508,17 @@ pub async fn p2p_loop(
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
 
+    // Outbox flush state (§4.4a): one flush in flight at a time, spaced by
+    // OUTBOX_FLUSH_INTERVAL_SECS, rotating across hot relays.
+    let outbox_interval_dur =
+        std::time::Duration::from_secs(cordelia_core::protocol::OUTBOX_FLUSH_INTERVAL_SECS);
+    let mut outbox_interval = tokio::time::interval(outbox_interval_dur);
+    outbox_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    outbox_interval.tick().await;
+    let mut last_outbox_flush = std::time::Instant::now() - outbox_interval_dur;
+    let outbox_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut outbox_rotation: usize = 0;
+
     // P2P telemetry counters
     let mut select_iterations: u64 = 0;
     let mut sync_cycles_completed: u64 = 0;
@@ -694,117 +815,23 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Push items to hot relay peers (batched, §7.1) ─────────
-            // Originator push: personal/keeper writes go to hot relay peers
-            // only. Relays handle distribution. Non-relay peers pull (§4.5).
-            // Scope-aware: skip items for local-scope channels (§8.2.2).
-            Some(first_push) = push_rx.recv() => {
-                let mut all_pushes = vec![first_push];
-                while let Ok(more) = push_rx.try_recv() {
-                    all_pushes.push(more);
+            // ── Outbox (§7.1, decision 2026-09-30 §4.4a) ───────────────
+            // Local writes notify here. Our own items stay in the outbox
+            // until a relay acknowledges them, and go out as one batched
+            // push per flush: at most one flush per OUTBOX_FLUSH_INTERVAL_SECS,
+            // so a burst of writes cannot trip a relay's per-peer write limit.
+            Some(_) = push_rx.recv() => {
+                while push_rx.try_recv().is_ok() {}
+                if last_outbox_flush.elapsed() >= outbox_interval_dur {
+                    last_outbox_flush = std::time::Instant::now();
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
                 }
+            }
 
-                // Filter out local-scope items (§8.2.2: never forward to relay mesh)
-                {
-                    let db = state.db.lock();
-                    if let Ok(db) = db {
-                        all_pushes.retain(|p| {
-                            !cordelia_storage::channels::is_local_scope(&db, &p.channel_id).unwrap_or(false)
-                        });
-                    }
-                }
-                if all_pushes.is_empty() { continue; }
-
-                // Target: hot relay peers only (§8.2.1)
-                let relay_targets: Vec<NodeId> = governor.hot_peers().into_iter()
-                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
-                    .collect();
-
-                let mut peer_batches: std::collections::HashMap<
-                    NodeId,
-                    Vec<cordelia_network::messages::Item>,
-                > = std::collections::HashMap::new();
-
-                let item_count = all_pushes.len();
-                for push_item in all_pushes {
-                    let exclude = push_item.exclude_peer;
-                    let item = cordelia_network::messages::Item {
-                        item_id: push_item.item_id,
-                        channel_id: push_item.channel_id,
-                        item_type: push_item.item_type,
-                        encrypted_blob: push_item.encrypted_blob,
-                        content_hash: push_item.content_hash,
-                        content_length: 0,
-                        author_id: push_item.author_id,
-                        signature: push_item.signature,
-                        key_version: push_item.key_version,
-                        published_at: push_item.published_at,
-                        is_tombstone: push_item.is_tombstone,
-                        parent_id: push_item.parent_id,
-                        slot: push_item.slot,
-                        rev: push_item.rev,
-                    };
-
-                    for peer_id in &relay_targets {
-                        if exclude.as_ref() == Some(peer_id) {
-                            continue;
-                        }
-                        peer_batches
-                            .entry(peer_id.clone())
-                            .or_default()
-                            .push(item.clone());
-                    }
-                }
-
-                if peer_batches.is_empty() { continue; }
-                tracing::debug!(
-                    items = item_count,
-                    peers = peer_batches.len(),
-                    "push batch assembled"
-                );
-
-                // One push stream per peer, all items batched
-                for (peer_id, items) in peer_batches {
-                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
-                        let conn = conn.clone();
-                        let pid = peer_id;
-                        let batch_size = items.len();
-                        let rtx = retry_fail_tx.clone();
-                        tokio::spawn(async move {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch open_bi failed");
-                                    for item in items {
-                                        let ch = item.channel_id.clone();
-                                        let _ = rtx.send(RetryEntry {
-                                            item, peer_id: pid.clone(), channel_id: ch,
-                                            exclude_peer: None, attempt: 0,
-                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                                        });
-                                    }
-                                    return;
-                                }
-                            };
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
-                                Ok(ack) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, stored = ack.stored, "push batch delivered");
-                                }
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch failed");
-                                    for item in items {
-                                        let ch = item.channel_id.clone();
-                                        let _ = rtx.send(RetryEntry {
-                                            item, peer_id: pid.clone(), channel_id: ch,
-                                            exclude_peer: None, attempt: 0,
-                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                                        });
-                                    }
-                                }
-                            }
-                        });
-                    }
+            _ = outbox_interval.tick() => {
+                if node_role == "personal" && last_outbox_flush.elapsed() >= outbox_interval_dur {
+                    last_outbox_flush = std::time::Instant::now();
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
                 }
             }
 
@@ -1554,13 +1581,14 @@ async fn handle_inbound_push(
 
     // Track which items are newly stored (for selective re-push)
     let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
-    let (stored, dedup) = {
+    let (stored, dedup, rejected) = {
         let db = match state.db.lock() {
             Ok(db) => db,
             Err(_) => return,
         };
         let mut stored = 0u32;
         let mut dedup = 0u32;
+        let mut rejected = 0u32;
         for item in &payload.items {
             match store_item(&db, item, node_role) {
                 Ok(true) => {
@@ -1568,10 +1596,10 @@ async fn handle_inbound_push(
                     newly_stored.push(item.clone());
                 }
                 Ok(false) => dedup += 1,
-                Err(_) => {}
+                Err(_) => rejected += 1,
             }
         }
-        (stored, dedup)
+        (stored, dedup, rejected)
     };
 
     tracing::debug!(peer = %peer_id, stored, dedup, items = payload.items.len(), "processed inbound push");
@@ -1602,7 +1630,7 @@ async fn handle_inbound_push(
             stored,
             dedup_dropped: dedup,
             policy_rejected: 0,
-            verification_failed: 0,
+            verification_failed: rejected,
         });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
 }

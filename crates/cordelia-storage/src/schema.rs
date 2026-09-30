@@ -214,6 +214,9 @@ const MIGRATION_V5: &str = r#"
 ALTER TABLE items ADD COLUMN seq INTEGER;
 ALTER TABLE items ADD COLUMN slot BLOB;
 ALTER TABLE items ADD COLUMN rev INTEGER;
+-- Outbox: when a relay acknowledged storing this node's own item. NULL
+-- items authored by this node are re-sent until one does.
+ALTER TABLE items ADD COLUMN relayed_at TEXT;
 UPDATE items SET seq = rowid;
 
 CREATE TABLE IF NOT EXISTS counters (
@@ -226,6 +229,8 @@ INSERT OR REPLACE INTO counters (name, value)
 CREATE INDEX IF NOT EXISTS idx_items_channel_seq ON items(channel_id, seq);
 CREATE INDEX IF NOT EXISTS idx_items_slot ON items(channel_id, slot, author_id)
     WHERE slot IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_items_unrelayed ON items(author_id, seq)
+    WHERE relayed_at IS NULL;
 "#;
 
 /// Initialise the database: set pragmas and run pending migrations.

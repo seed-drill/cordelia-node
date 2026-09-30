@@ -362,6 +362,57 @@ pub fn query_sync_after(
     Ok(items)
 }
 
+/// This node's outbox: items authored by `author` in network-scope channels
+/// that no relay has acknowledged yet, oldest first. Bounded by count and
+/// total encrypted bytes, but always at least one item if any are pending.
+pub fn outbox(
+    conn: &Connection,
+    author: &[u8; 32],
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE author_id = ?1 AND relayed_at IS NULL
+               AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')
+             ORDER BY seq ASC
+             LIMIT ?2"
+        ))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(
+            params![author.as_slice(), max_items as i64],
+            stored_item_from_row,
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows {
+        let item = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        bytes += item.encrypted_blob.len();
+        if !batch.is_empty() && bytes > max_bytes {
+            break;
+        }
+        batch.push(item);
+    }
+    Ok(batch)
+}
+
+/// Record that a relay acknowledged these items.
+pub fn mark_relayed(conn: &Connection, item_ids: &[String]) -> Result<(), CordeliaError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare("UPDATE items SET relayed_at = ?1 WHERE item_id = ?2")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    for id in item_ids {
+        stmt.execute(params![now, id])
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Fetch specific items of a channel by ID, for item-sync fetch requests.
 ///
 /// Includes internal types and tombstones, like [`query_sync`]. Unknown IDs
@@ -889,6 +940,37 @@ mod tests {
         item.is_tombstone = true;
         insert_item(&conn, &item).unwrap();
         assert!(query_sync(&conn, "ch1", None, 10).unwrap()[0].is_tombstone);
+    }
+
+    #[test]
+    fn test_outbox_holds_own_unacknowledged_items() {
+        let conn = setup();
+        let me = [0x42u8; 32];
+        let other = [0x43u8; 32];
+        let mut mine1 = test_item("ci_m1", "2026-01-01T00:01:00Z");
+        mine1.content_hash = &[0x81; 32];
+        insert_item(&conn, &mine1).unwrap();
+        let mut theirs = test_item("ci_t1", "2026-01-01T00:02:00Z");
+        theirs.author_id = &other;
+        theirs.content_hash = &[0x82; 32];
+        insert_item(&conn, &theirs).unwrap();
+        let mut mine2 = test_item("ci_m2", "2026-01-01T00:03:00Z");
+        mine2.content_hash = &[0x83; 32];
+        insert_item(&conn, &mine2).unwrap();
+
+        let ids = |v: Vec<StoredItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 1 << 20).unwrap()),
+            vec!["ci_m1", "ci_m2"]
+        );
+
+        // Byte bound: blobs are 100 bytes each; a 150-byte batch holds one,
+        // and a batch always holds at least one.
+        assert_eq!(ids(outbox(&conn, &me, 10, 150).unwrap()), vec!["ci_m1"]);
+        assert_eq!(ids(outbox(&conn, &me, 10, 1).unwrap()), vec!["ci_m1"]);
+
+        mark_relayed(&conn, &["ci_m1".to_string()]).unwrap();
+        assert_eq!(ids(outbox(&conn, &me, 10, 1 << 20).unwrap()), vec!["ci_m2"]);
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item
