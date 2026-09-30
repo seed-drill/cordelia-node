@@ -334,6 +334,24 @@ pub fn list_active_members(
     Ok(out)
 }
 
+/// When `entity_key` joined the channel (RFC 3339), if it is a member.
+pub fn member_joined_at(
+    conn: &Connection,
+    channel_id: &str,
+    entity_key: &[u8; 32],
+) -> Result<Option<String>, CordeliaError> {
+    match conn.query_row(
+        "SELECT joined_at FROM channel_members
+         WHERE channel_id = ?1 AND entity_key = ?2 AND posture = 'active'",
+        params![channel_id, entity_key.as_slice()],
+        |row| row.get(0),
+    ) {
+        Ok(at) => Ok(Some(at)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CordeliaError::Storage(e.to_string())),
+    }
+}
+
 /// Group channels (network scope) in which `entity_key` is an active owner.
 pub fn list_owned_groups(
     conn: &Connection,

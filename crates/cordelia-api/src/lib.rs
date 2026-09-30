@@ -9,6 +9,7 @@ pub mod error;
 pub mod handlers;
 pub mod membership;
 pub mod state;
+pub mod sync;
 pub mod types;
 pub mod verify;
 
@@ -56,6 +57,13 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::scope("/api/v1/invites")
             .route("/list", web::post().to(devices::list_invites))
             .route("/process", web::post().to(devices::process)),
+    );
+
+    // Sync adapters (decision 2026-09-30-agent-memory-sync §4.5)
+    cfg.service(
+        web::scope("/api/v1/sync")
+            .route("/claude", web::post().to(sync::claude))
+            .route("/status", web::post().to(sync::sync_status)),
     );
 
     // Health check (GET, unauthenticated, operations.md §8)

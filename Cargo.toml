@@ -5,6 +5,7 @@ members = [
     "crates/cordelia-storage",
     "crates/cordelia-network",
     "crates/cordelia-api",
+    "crates/cordelia-sync",
     "crates/cordelia-node",
     "crates/cordelia-test",
 ]
@@ -25,6 +26,7 @@ cordelia-crypto = { path = "crates/cordelia-crypto" }
 cordelia-storage = { path = "crates/cordelia-storage" }
 cordelia-network = { path = "crates/cordelia-network" }
 cordelia-api = { path = "crates/cordelia-api" }
+cordelia-sync = { path = "crates/cordelia-sync" }
 cordelia-test = { path = "crates/cordelia-test" }
 
 # Async runtime

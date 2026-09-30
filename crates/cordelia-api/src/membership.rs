@@ -317,6 +317,44 @@ fn announce(state: &AppState, channel_id: &str) {
     }
 }
 
+/// This node's personal channel, created on first use.
+pub fn personal_channel_id(state: &AppState) -> Result<String, CordeliaError> {
+    let db = lock(state)?;
+    ensure_personal_channel(state, &db)
+}
+
+/// Create a group channel shared by all of this person's devices (every
+/// member of the personal channel, as owners) and send each of them its
+/// state. Used for a project's memory channel.
+pub fn create_device_group(state: &AppState, name: &str) -> Result<String, CordeliaError> {
+    let pk = state.identity.public_key();
+    let db = lock(state)?;
+    let personal = ensure_personal_channel(state, &db)?;
+
+    let key = cordelia_crypto::generate_psk().map_err(crypto_err)?;
+    let slot_key = cordelia_crypto::generate_psk().map_err(crypto_err)?;
+    let ch = channels::create_group(&db, &pk, "realtime", Some(name), Some(&key))?;
+    psk::write_psk(&state.home_dir, &ch.channel_id, &key)?;
+    psk::write_slot_key(&state.home_dir, &ch.channel_id, &slot_key)?;
+    for device in channels::list_active_member_keys(&db, &personal)? {
+        if device != pk {
+            channels::add_member(&db, &ch.channel_id, &device, "owner")?;
+        }
+    }
+    channels::set_state(
+        &db,
+        &ch.channel_id,
+        1,
+        &pk,
+        1,
+        &cordelia_crypto::sha256(&key),
+    )?;
+    publish_state(state, &db, &ch.channel_id)?;
+    announce(state, &ch.channel_id);
+    tracing::info!(channel = %ch.channel_id, %name, "created channel for this person's devices");
+    Ok(ch.channel_id)
+}
+
 /// Add another of this person's devices: trust it, and make it an owner of
 /// every group channel this node owns (creating the personal channel if
 /// needed). Each affected channel moves to a new epoch, sent to all members.

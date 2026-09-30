@@ -726,6 +726,7 @@ dependencies = [
  "cordelia-crypto",
  "cordelia-network",
  "cordelia-storage",
+ "cordelia-sync",
  "hex",
  "quinn",
  "rusqlite",
@@ -755,6 +756,23 @@ dependencies = [
  "tracing",
  "ulid",
  "uuid",
+]
+
+[[package]]
+name = "cordelia-sync"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cordelia-api",
+ "cordelia-core",
+ "cordelia-crypto",
+ "cordelia-storage",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

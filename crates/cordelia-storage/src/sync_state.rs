@@ -1,0 +1,78 @@
+//! Sync adapter state: what each local folder last agreed with its channel,
+//! per key (decision 2026-09-30-agent-memory-sync §4.5).
+
+use std::collections::HashMap;
+
+use rusqlite::{Connection, params};
+
+use cordelia_core::CordeliaError;
+
+/// Agreed state of one key: content hash (`None` = deleted) and revision.
+pub type Agreed = (Option<[u8; 32]>, u64);
+
+/// Everything `folder` agreed with `channel_id`, by key.
+pub fn load(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+) -> Result<HashMap<String, Agreed>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key, hash, rev FROM sync_files WHERE folder = ?1 AND channel_id = ?2")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![folder, channel_id], |row| {
+            let hash: Option<Vec<u8>> = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, hash, row.get::<_, i64>(2)?))
+        })
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, hash, rev) = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        let hash = hash.and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok());
+        out.insert(key, (hash, rev.max(0) as u64));
+    }
+    Ok(out)
+}
+
+/// Record what `folder` and `channel_id` now agree on for `key`.
+pub fn save(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    key: &str,
+    agreed: Agreed,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO sync_files (folder, channel_id, key, hash, rev) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(folder, channel_id, key) DO UPDATE SET hash = excluded.hash, rev = excluded.rev",
+        params![
+            folder,
+            channel_id,
+            key,
+            agreed.0.map(|h| h.to_vec()),
+            i64::try_from(agreed.1).unwrap_or(i64::MAX)
+        ],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    #[test]
+    fn test_save_and_load() {
+        let conn = db::open_in_memory().unwrap();
+        save(&conn, "/m", "grp_a", "notes.md", (Some([7; 32]), 2)).unwrap();
+        save(&conn, "/m", "grp_a", "gone.md", (None, 5)).unwrap();
+        save(&conn, "/m", "grp_a", "notes.md", (Some([8; 32]), 3)).unwrap();
+        save(&conn, "/other", "grp_a", "notes.md", (Some([9; 32]), 1)).unwrap();
+
+        let state = load(&conn, "/m", "grp_a").unwrap();
+        assert_eq!(state.len(), 2);
+        assert_eq!(state["notes.md"], (Some([8; 32]), 3));
+        assert_eq!(state["gone.md"], (None, 5));
+    }
+}

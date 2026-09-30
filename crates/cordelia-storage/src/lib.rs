@@ -11,6 +11,7 @@ pub mod naming;
 pub mod psk;
 pub mod schema;
 pub mod search;
+pub mod sync_state;
 pub mod trust;
 
 /// Storage-level errors (wraps rusqlite and IO errors).

@@ -7,6 +7,19 @@ use cordelia_core::CordeliaError;
 /// Key under which the ID of this node's personal channel is stored.
 pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
 
+/// Claude Code directory to sync; sync is off when absent.
+pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
+
+/// JSON report of the last sync cycle.
+pub const SYNC_CLAUDE_REPORT: &str = "sync.claude.report";
+
+/// Delete a metadata value.
+pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
+    conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Read a metadata value.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<String>, CordeliaError> {
     match conn.query_row(
