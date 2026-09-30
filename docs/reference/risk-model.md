@@ -1,4 +1,8 @@
-# Risk Model -- Formal Companion to WHITEPAPER.md §12
+# Risk Model -- Formal Companion to Whitepaper v2.3 §12
+
+> Written for [whitepaper v2.3](../archive/whitepaper-v2.3.md) §12 (archived). The
+> current, shorter framing is [`docs/vision.md`](../vision.md) §5. Section
+> references below (`WHITEPAPER.md §n`) are to v2.3.
 
 > Formal treatment of the adoption-scale risk argument summarised in
 > the whitepaper. Covers the priors, game-theoretic mechanisms,
