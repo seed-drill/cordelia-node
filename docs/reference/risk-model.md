@@ -438,5 +438,5 @@ Internal:
 - `WHITEPAPER.md` §8 (Security Model), §9.1 (Cooperative
   Equilibrium), §11.4 (Alignment), §12 (Risk Model).
 - `docs/architecture/threat-model.md` (protocol adversary model).
-- `docs/reference/game-theory.md` (formal cooperative-equilibrium
+- `docs/archive/reference/game-theory.md` (formal cooperative-equilibrium
   treatment).

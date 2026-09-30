@@ -1,5 +1,7 @@
 # Implementation Plan: Encrypted Pub/Sub MVP
 
+> **Archived 2026-09-30.** Replaced by the v1 build sequence in [`docs/decisions/2026-09-30-agent-memory-sync.md`](../../decisions/2026-09-30-agent-memory-sync.md) §11.
+
 **Date**: 2026-03-09
 **Owner**: Russell Wing (plan), Martin Stevens (Rust implementation)
 **Depends on**: decisions/2026-03-09-architecture-simplification.md (pending approval)

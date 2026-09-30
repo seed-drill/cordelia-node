@@ -7,6 +7,11 @@
 **Depends on**: specs/network-protocol.md, specs/network-protocol.tla, specs/operations.md, specs/channels-api.md
 **Implements**: decisions/2026-03-10-testing-strategy-bdd.md (Layer 2: Topology E2E)
 
+> **v1 status (2026-09-30).** The Docker topology suite (T1-T7) predates v1
+> and has failed since 2026-03-20; its workflow runs only on demand. v1 is
+> covered by real-process tests over QUIC through a relay, in
+> `crates/cordelia-node/tests/devices_e2e.rs`.
+
 ---
 
 ## 1. Purpose

@@ -6,6 +6,15 @@
 **Scope**: Phase 1 defences (network-protocol.md §16, channels-api.md §9)
 **Purpose**: For each attacker persona, enumerate best strategies and verify ROI < 1 against specified defences. Pre-coding gate.
 
+> **v1 status (2026-09-30).** Attacks that need keepers, open channels, named
+> channels or SPOs (D1, D2, B3, E1, E2) do not apply to v1, which has none of
+> them. v1 adds its own surfaces: invites from strangers (held until
+> `cordelia accept`), junk revisions sent to relays (stored per author, so they
+> cannot displace yours) and replayed channel states (applied only if newer and
+> from an owner). The [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.1 and §4.3 give the defences,
+> and the tests in `crates/cordelia-api/tests/` and
+> `crates/cordelia-storage/src/items.rs` cover them.
+
 ---
 
 ## 1. Methodology

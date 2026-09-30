@@ -7,6 +7,14 @@
 **Implements**: WP2 (Name-Based Group Resolution)
 **Depends on**: specs/channels-api.md, decisions/2026-03-10-identity-privacy-model.md §8
 
+> **v1 status (2026-09-30).** v1 creates only `grp_` channels, and accepts a
+> group channel ID only in the exact form `grp_<lowercase uuid>`. It adds the
+> **inbox channel**, `inbox_` + hex(SHA-256(`"cordelia:inbox:v1:"` ||
+> ed25519_pk)), whose underscore keeps it clear of every channel name (§5).
+> The personal channel is a `grp_` channel, not a derived ID. Named channels,
+> DMs and protocol channels (§4.1, §4.2, §6) are not used by v1
+> ([decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.1, §4.2).
+
 ---
 
 ## 1. Overview

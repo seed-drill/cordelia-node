@@ -8,6 +8,25 @@
 **Depends on**: specs/ecies-envelope-encryption.md, decisions/2026-03-09-mvp-implementation-plan.md
 **Reference**: cordelia-core/docs/reference/api.md (existing node API, pre-pivot)
 
+> **v1 status (2026-09-30).** Changes and additions, per the
+> [decision record](../decisions/2026-09-30-agent-memory-sync.md); request and response types are in
+> `crates/cordelia-api/src/types.rs`.
+>
+> - **`publish`** takes an optional `key`: it publishes a new revision of that
+>   key instead of appending an item (group channels only).
+> - **New:** `POST /api/v1/channels/entries` returns the current value of every
+>   key in a channel, with any conflicts, and `POST /api/v1/channels/delete-key`
+>   deletes a key.
+> - **`delete-item` (§3.12)** deletes only the caller's own items, in the
+>   channel named.
+> - **New, used by the CLI:** `/api/v1/devices/{add,accept,remove,list}`,
+>   `/api/v1/invites/{list,process}` and `/api/v1/sync/{claude,status}`.
+> - **Not used by v1:** `dm` (§3.7), `group/invite` (§3.9), `group/remove`
+>   (§3.10) and `rotate-psk` (§3.11) still write key envelopes into the
+>   channel itself, which never reach other nodes. Open channels and PSK
+>   discovery (§6.1, §11) are deferred. Search (§3.13) is deferred and its spec
+>   archived; the SDK mapping (§8) applies to the deferred SDK.
+
 ---
 
 ## 1. Overview

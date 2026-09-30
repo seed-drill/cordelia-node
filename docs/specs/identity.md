@@ -7,6 +7,23 @@
 **Depends on**: specs/ecies-envelope-encryption.md, specs/network-protocol.md
 **Informs**: All specs that reference entity identity, key management, or authentication
 
+> **v1 status (2026-09-30).** v1 implements Layer 0 only: key generation and
+> storage (§3), entity, node and author IDs (§4), authentication (§5) and Bech32
+> (§11) stand. Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.1:
+>
+> - **Pairing (§6) is dropped.** Each device keeps its own key and joins its
+>   person's channels as a member: `cordelia add-device <key>` on one device,
+>   `cordelia accept <key>` on the other. There is no shared seed.
+> - **The personal channel (§7.4)** is an ordinary `grp_` channel, not an ID
+>   derived from the public key. It holds the device roster (its member list),
+>   home memory, and the map from project to channel.
+> - **Compromise response (§10.1)** is `cordelia remove-device <key>` from
+>   another device, which removes it and rotates channel keys (the decision
+>   record's §9 lists a gap).
+> - Layers 1-3 (§2.2-§2.4), DM channels (§7.3) and proof of agency (§9) are
+>   not in v1. The identity ADR this spec cites is archived
+>   ([`docs/archive/`](../archive/README.md)).
+
 ---
 
 ## 1. Design Principles

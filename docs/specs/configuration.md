@@ -6,6 +6,14 @@
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Canonical for**: All `config.toml` parameters across all specs
 
+> **v1 status (2026-09-30).** The default bootnodes (`FALLBACK_PEERS`) are
+> the two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`. QUIC binds
+> to the host part of `listen_addr` (a host name is resolved) on `p2p_port`.
+> The sync adapter's settings are not in this file: `cordelia sync claude`
+> stores them in the node's database. The `[memory]` and `[search]` sections
+> (§2.7, §2.8) belong to archived specs ([`docs/archive/`](../archive/README.md)), and the
+> `keeper` role is deferred ([decision record](../decisions/2026-09-30-agent-memory-sync.md)).
+
 ---
 
 ## 1. File Location and Format

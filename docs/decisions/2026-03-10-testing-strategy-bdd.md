@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-10
 **Decision Maker(s)**: Russell Wing, Martin Stevens
-**Status**: Accepted
+**Status**: Accepted; dormant since 2026-09-30. Gherkin applies to the TypeScript SDK, which is deferred ([2026-09-30-agent-memory-sync.md](2026-09-30-agent-memory-sync.md) §8). The Rust tests stay as `cargo test`, as §3 decided, and v1 adds real-process tests (`crates/cordelia-node/tests/devices_e2e.rs`).
 **Triggered by**: Martin raised Cucumber/Gherkin as a testing approach for Cordelia
 
 ---

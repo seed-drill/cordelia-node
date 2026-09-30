@@ -10,8 +10,10 @@ encrypted, carried by relays that hold no keys. v1 syncs Claude Code memory
 (`crates/cordelia-sync`). Rust workspace, single binary daemon. QUIC transport,
 CBOR wire format, Ed25519 per-device identity, AES-256-GCM channel encryption.
 Design: `WHITEPAPER.md` (v3) and the decision record
-`docs/decisions/2026-09-30-agent-memory-sync.md` (drafted in the private
-strategy repo until approved).
+`docs/decisions/2026-09-30-agent-memory-sync.md`. Code comments cite its
+sections ("decision 2026-09-30 §4.3"). Specs predate v1: each live spec opens
+with a "v1 status" note saying what v1 changed, and pre-v1 documents are in
+`docs/archive/` (see its README).
 
 ## Repo Structure
 
@@ -20,16 +22,18 @@ cordelia-node/
   crates/
     cordelia-core/       # Shared types, config, errors
     cordelia-crypto/     # Ed25519/X25519, ECIES, AES-256-GCM, Bech32
-    cordelia-storage/    # SQLite, channels, items, PSK, FTS5 search
+    cordelia-storage/    # SQLite, channels, items, keys, trust, invites, sync state
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols
     cordelia-api/        # REST API (actix-web), auth, handlers
     cordelia-sync/       # Sync adapters: Claude Code memory <-> channels
     cordelia-node/       # Binary: CLI, daemon lifecycle, p2p networking
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
-    specs/               # 28 specification files + TLA+ model
-    decisions/           # Active ADRs (architecture, economics, identity)
-    reference/           # Cherry-picked research (game theory, test vectors, network model)
+    specs/               # Protocol and component specs + TLA+ model
+    decisions/           # ADRs; 2026-09-30-agent-memory-sync.md is the current design
+    reference/           # Test vectors, network model, risk model
+    archive/             # Pre-v1 documents, kept for history
+    vision.md            # Direction after v1
   tests/                 # Integration tests
   deploy/relay/          # Relay image, Fly.io and self-hosted configs
   scripts/               # Install script
@@ -42,6 +46,7 @@ Start here when working on a module:
 
 | Module | Spec |
 |--------|------|
+| v1 design (devices, keyed items, deletes, adapter, relays) | `docs/decisions/2026-09-30-agent-memory-sync.md` |
 | Wire format | `docs/specs/network-protocol.md` (Section 3: CBOR tags, framing) |
 | Mini-protocols | `docs/specs/network-protocol.md` (Sections 4-8) |
 | Governor | `docs/specs/network-behaviour.md` |
@@ -52,8 +57,8 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Search | `docs/specs/search-indexing.md` |
-| Topology/E2E | `docs/specs/topology-e2e.md`, `topology-scale.md` |
+| Real-process tests | `crates/cordelia-node/tests/devices_e2e.rs` (`CORDELIA_E2E_KEEP=1` keeps node dirs) |
+| Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
 ## Key Parameters (from protocol.rs)
@@ -77,6 +82,9 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `CHURN_INTERVAL_SECS` | 3600s | parameter-rationale.md §3 |
 | `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
+| `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
+| `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 | decision 2026-09-30 §4.4 |
+| `FALLBACK_PEERS` | relay1/relay2.cordelia.seeddrill.ai:9474 | decision 2026-09-30 §4.6 |
 
 ## Running Tests
 
@@ -107,16 +115,19 @@ cargo test -p cordelia-crypto
 
 ## Branch and Merge Workflow
 
-Feature work goes on branches (`feat/X`). Merge to main only after E2E passes.
+Feature work goes on branches (`feat/X`). Merge to main only after CI passes, including the real-process tests in `devices_e2e.rs`.
 
 1. **Branch from main**: `git checkout -b feat/my-feature`
 2. **Small, tested commits**: Each commit independently testable. Never bundle code + test harness changes.
-3. **Test after each meaningful change**: Run `cargo test --all` locally, run S2 R=20 on cordelia-test for P2P changes.
-4. **Tag known-good states**: After S2/S3 passes, tag: `git tag s2-passing-<commit-short>`
-5. **PR to main**: Only after E2E passes on the branch. Squash merge preserves clean history.
-6. **Protocol changes get their own branch**: Wire format changes (codec, sync protocol) are never mixed with feature work.
+3. **Test after each meaningful change**: Run `cargo test --all` locally; for P2P or sync changes, `cargo test -p cordelia-node --test devices_e2e`.
+4. **PR to main**: Squash merge preserves clean history.
+5. **Protocol changes get their own branch**: Wire format changes (codec, sync protocol) are never mixed with feature work.
 
 ## E2E Testing on cordelia-test VM
+
+The Docker topology suite (T1-T7) and the S2/S3 scale runs predate v1 and are
+stale; `e2e.yml` runs only on demand. Whether the `cordelia-test` VM still
+exists is an open question. v1 is covered by `devices_e2e.rs` (above).
 
 ```bash
 ssh rezi@cordelia-test
@@ -149,13 +160,15 @@ Note: root-owned key files from Docker need `sudo rm -rf` to clean.
 ## Related Repos
 
 - **seed-drill** (strategy-and-planning): ROADMAP.md, STRATEGY.md, venture docs
-- **cordelia-sdk**: TypeScript SDK (`@seeddrill/cordelia`)
-- **cordelia-agent-sdk**: Agent SDK (renamed from original cordelia-sdk)
-- **cordelia-core**: ARCHIVED -- old libp2p+JSON+axum implementation, do not use
+- **seeddrill-website**: seeddrill.ai (Astro, Cloudflare Pages); `/install.sh` redirects to `scripts/install.sh` here
+- **cordelia-sdk**: TypeScript SDK (`@seeddrill/cordelia`), deferred
+- **ARCHIVED, do not use:** cordelia-core (old libp2p+JSON+axum implementation), cordelia-proxy,
+  cordelia-agent-sdk, cordelia-dashboard, cordelia-portal, rutherford
 
 ## What NOT to Do
 
-- Do not reference cordelia-core for anything. It is archived.
+- Do not reference cordelia-core or the other archived repos for anything.
+- Do not treat `docs/archive/` as current; it describes the pre-v1 design.
 - Do not put specs in seed-drill. All Cordelia specs live here in docs/specs/.
 - Do not add new timeout values without updating parameter-rationale.md.
 - Do not change governor defaults without checking demand-model.md derivations.

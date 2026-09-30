@@ -8,6 +8,23 @@
 **References**: cordelia-core/docs/design/encryption-test-vectors.md (test vectors remain valid)
 **Depends on**: specs/channel-naming.md (§4.2 system channels), specs/network-protocol.md (§4.4 Channel-Announce, §4.7 PSK-Exchange)
 
+> **v1 status (2026-09-30).** The primitives stand: key types (§2), Bech32
+> (§3), the ECIES construction (§4), item encryption (§5) and signing (§11).
+> Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md):
+>
+> - **Key distribution (§6.2).** Only invite-only channels are used, and keys
+>   are no longer written into the channel itself. The owner seals the
+>   channel's whole state (key ring, slot key, members, epoch, sender) to each
+>   member with ECIES and posts it, as an item of type `invite`, in that
+>   member's inbox channel (decision §4.1). Open channels, PSK requests and keepers are
+>   deferred.
+> - **AAD (§5.5).** A slotted item binds `channel_id || slot || rev` (rev as a
+>   big-endian u64), so a relay cannot move an item to another slot or replay
+>   an old revision (decision §4.3). Unslotted items still bind `channel_id` alone.
+> - **Signed metadata (§11.7)** gains optional `slot` and `rev`, present only
+>   on slotted items; test vector TV-C1 is unchanged.
+> - The TypeScript guidance (§9.2) applies to the SDK, which is deferred.
+
 ---
 
 ## 1. Overview

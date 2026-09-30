@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-20
 **Decision Maker(s)**: Russell Wing, Claude (Opus 4.6)
-**Status**: Draft
+**Status**: Draft. v1 ([2026-09-30-agent-memory-sync.md](2026-09-30-agent-memory-sync.md)) uses relay forwarding with a seen table for duplicate suppression (§2, §6). Route discovery, routing tokens, padding, expanding ring search and peer trust scoring (§3-§5, §8, §11) are not in v1.
 **Triggered by**: cordelia-node#9 (sparse mesh item partitioning), session 117-118 analysis of multi-hop relay propagation failures
 
 ---

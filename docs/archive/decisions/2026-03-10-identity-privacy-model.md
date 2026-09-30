@@ -1,5 +1,7 @@
 # Decision: Cordelia Identity Model and Privacy Position
 
+> **Archived 2026-09-30.** v1 keeps Layer 0 only, one Ed25519 key per device ([`docs/decisions/2026-09-30-agent-memory-sync.md`](../../decisions/2026-09-30-agent-memory-sync.md) §4.1). The rest is outside v1.
+
 **Date**: 2026-03-10
 **Decision Maker(s)**: Russell Wing
 **Status**: Approved in principle (Martin confirmed pivot 2026-03-10; identity ADR addresses his auth/subscribe question)
