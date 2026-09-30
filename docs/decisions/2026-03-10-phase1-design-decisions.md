@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-10
 **Decision Maker(s)**: Russell Wing
-**Status**: Accepted
+**Status**: Accepted. §1 and §2 stand. §3 is superseded by [2026-09-30-agent-memory-sync.md](2026-09-30-agent-memory-sync.md) §4.1: devices pair with `add-device` and `accept`.
 **Triggered by**: Design readiness audit for Phase 1 spec writing
 
 ---

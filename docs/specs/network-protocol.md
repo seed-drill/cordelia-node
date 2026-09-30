@@ -7,6 +7,30 @@
 **Implements**: WP3 (Pub/Sub API network layer), WP12 (Bootnode DNS)
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md
 
+> **v1 status (2026-09-30).** Transport, framing, handshake, keep-alive,
+> peer-sharing, channel-announce, the governor and relay forwarding stand.
+> Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.3 and §4.4a:
+>
+> - **Items** (`Item`, `ItemHeader`) gain optional `slot` (32 bytes) and `rev`
+>   (u64), both present or both absent and omitted when absent, so ordinary
+>   items encode as before.
+> - **Every node verifies an item's signature before storing it,** and keeps
+>   the newest `rev` per `(channel, slot, author)`.
+> - **Item-Sync (0x05)** serves every item, including internal items and
+>   tombstones. `SyncRequest` gains optional `after_seq` and `SyncResponse`
+>   optional `last_seq`, for paging in arrival order; peers that omit them get
+>   the `since` behaviour.
+> - **Item-Push (0x06).** A personal node pushes its own new items to one relay
+>   from an outbox, at most every 2 s, and marks them relayed when the relay
+>   acknowledges them.
+> - **PSK-Exchange (0x07)** is deferred and **Pairing (§4.8)** is dropped. Keys
+>   travel as sealed channel states in inbox channels (decision §4.1).
+> - **Secret keepers (§8.5)** are deferred. The bootnodes (§8.3, §10) are the
+>   two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`
+>   (`FALLBACK_PEERS`).
+> - Specs this one cites that are now archived (`sdk-api-reference.md`, the
+>   identity ADR) are in [`docs/archive/`](../archive/README.md).
+
 ---
 
 ## 1. Overview

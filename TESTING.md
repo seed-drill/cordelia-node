@@ -1,5 +1,12 @@
 # Testing Guide
 
+> **v1 status (2026-09-30).** `cargo test --all` runs everything v1 needs,
+> including real-process tests over QUIC through a relay
+> (`crates/cordelia-node/tests/devices_e2e.rs`; set `CORDELIA_E2E_KEEP=1` to
+> keep the node directories). The toolchain is pinned in `rust-toolchain.toml`,
+> so `rustup update stable` is not needed. The Docker topology and scale suites
+> below predate v1 and are stale.
+
 ## Pre-flight Checks
 
 Before running any tests:

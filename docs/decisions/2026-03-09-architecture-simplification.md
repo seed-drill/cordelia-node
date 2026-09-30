@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-09
 **Decision Maker(s)**: Russell Wing
-**Status**: Approved in principle (Martin confirmed 2026-03-10: "Absolutely makes sense")
+**Status**: Approved in principle (Martin confirmed 2026-03-10: "Absolutely makes sense"). **Superseded in part** on 2026-09-30 by [2026-09-30-agent-memory-sync.md](2026-09-30-agent-memory-sync.md): its positioning and roadmap are replaced; the transport and channel design stand. The SPO and identity ADRs it cites are in [`docs/archive/decisions/`](../archive/decisions/).
 **Triggered by**: portal#30 scoping, competitive landscape analysis, market research
 **Supersedes**: portal#30 approach (vault migration), previous Track 1-3 roadmap structure
 **Related**: decisions/2026-03-07-network-architecture-review.md, decisions/2026-03-09-spo-economic-model.md, decisions/2026-03-10-identity-privacy-model.md, competitors/ai-memory-landscape-2026.md

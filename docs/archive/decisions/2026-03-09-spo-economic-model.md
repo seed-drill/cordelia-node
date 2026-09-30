@@ -1,5 +1,7 @@
 # Decision: Cardano SPO Distribution and Economic Model for Cordelia Infrastructure
 
+> **Archived 2026-09-30.** Dropped: no settlement layer is chosen, and Cardano is not the plan ([`docs/decisions/2026-09-30-agent-memory-sync.md`](../../decisions/2026-09-30-agent-memory-sync.md) §8, [`docs/vision.md`](../../vision.md) §4).
+
 **Date**: 2026-03-09
 **Decision Maker(s)**: Russell Wing
 **Status**: Approved in principle (Martin confirmed 2026-03-10)

@@ -1,7 +1,7 @@
 # Game-Theoretic Foundations of Trust in Cordelia
 
-**Deep dive document, written for [whitepaper v2.3](../archive/whitepaper-v2.3.md) Sections 3.5 and 9.1 (archived; trust calibration and economics are not part of v1).**
-**Quantitative trust model: [Network Model](../architecture/network-model.md) Section 4.9.**
+**Deep dive document, written for [whitepaper v2.3](../whitepaper-v2.3.md) Sections 3.5 and 9.1 (archived; trust calibration and economics are not part of v1).**
+**Quantitative trust model: [Network Model](../../reference/network-model.md) Section 4.9.**
 **Threat analysis: [Threat Model](../architecture/threat-model.md) Sections 4.8, 8.3.**
 
 ---
@@ -240,7 +240,7 @@ socially optimal (no better outcome exists for the group as a whole).
 
 **Gain**: 1 poisoned memory accepted by high-trust peers.
 
-**Detection aftermath** (quantified from [Network Model](../architecture/network-model.md)):
+**Detection aftermath** (quantified from [Network Model](../../reference/network-model.md)):
 
 ```
 Pre-attack:    E[T] = 0.99  (Beta(101, 1))
@@ -688,4 +688,4 @@ Press, 1970.
 ---
 
 *Version 1.0 -- 2026-01-31*
-*Companion to [whitepaper v2.3](../archive/whitepaper-v2.3.md) (archived). Quantitative model from [Network Model](../architecture/network-model.md).*
+*Companion to [whitepaper v2.3](../whitepaper-v2.3.md) (archived). Quantitative model from [Network Model](../../reference/network-model.md).*
