@@ -140,7 +140,7 @@ Other agents come later as further adapters that map their own memory locations 
 
 Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. We run two, each also serving as a bootnode, so that losing one doesn't stop sync:
 
-- **`relay1`** and **`relay2`** run at two of our own sites, as Docker containers, from the image and guide in [`deploy/relay/`](../../deploy/relay/). **Changed 2026-09-30:** the record planned `relay1` on Fly.io; running both at our sites is simpler, and the same image still runs on Fly. Running them ourselves also shows that a relay is something anyone can run.
+- **`relay1`** and **`relay2`** are Docker containers we operate, from the image and guide in [`deploy/relay/`](../../deploy/relay/): a pinned release checked against its sha256, run unprivileged on a read-only filesystem. **Changed 2026-09-30:** for the alpha we host both ourselves. Before any public announcement, the public relays move to a cloud provider (the Fly.io config is ready for that), and the storage cap and retention ship (section 9).
 - **DNS:** `relay1.cordelia.seeddrill.ai` and `relay2.cordelia.seeddrill.ai`, UDP 9474. New nodes list both (`FALLBACK_PEERS`), and anyone can add their own. **As built:** nodes keep the names, not the addresses. They resolve them again while running and redial whenever they have no relay, so a node started before its network was up, or a relay whose address changed, is still reached.
 - **Retention** for relays is not implemented yet (section 9).
 
@@ -194,7 +194,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 
 - Two devices changing the membership of the same channel at the same moment can lose one of the changes.
 - A project channel that the removing device is not in is rotated by its remaining owner with the lowest key (4.1). If that device is offline, the rotation waits until it next runs, and until then the removed device can still read what others write to that project.
-- Relays keep what they store; the retention limit (30 days was proposed) is not implemented.
+- Relays keep what they store: the retention limit (30 days was proposed) is not implemented, and the storage cap (`max_storage_bytes`, 1 GiB by default) is declared but not enforced. Both must ship before any public announcement, because every node dials our relays by default.
 - The older key-distribution endpoints (`dm`, `group/invite`, `group/remove`, `rotate-psk`) still write key envelopes into the channel itself, which never reach other nodes. v1 doesn't use them; they will move onto sealed channel states or be removed.
 - The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
 

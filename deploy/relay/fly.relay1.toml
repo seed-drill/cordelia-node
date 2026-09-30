@@ -9,13 +9,20 @@
 # - the app binds UDP to fly-global-services (CORDELIA_LISTEN_ADDR below);
 # - the external port equals the internal port (9474);
 # - ~1300 bytes of usable packet size (QUIC starts at 1200 and probes up).
-# Full procedure: strategy-and-planning/infrastructure/cordelia-relays.md
+# Fly mounts volumes as root, and the image runs as uid 10001: after
+# creating the volume, run once: fly ssh console -C "chown 10001:10001 /data".
 
 app = "cordelia-relay1"
 primary_region = "lhr"
 
 [build]
   dockerfile = "deploy/relay/Dockerfile"
+
+# Pin the release to deploy (see deploy/relay/Dockerfile).
+[build.args]
+  CORDELIA_SOURCE = "release"
+  CORDELIA_VERSION = ""
+  CORDELIA_SHA256 = ""
 
 [env]
   CORDELIA_CONFIG = "/etc/cordelia/relay1.toml"
