@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -233,6 +233,20 @@ CREATE INDEX IF NOT EXISTS idx_items_unrelayed ON items(author_id, seq)
     WHERE relayed_at IS NULL;
 "#;
 
+/// Migration v6: sync adapter state (decision 2026-09-30 §4.5). For each
+/// local memory folder, channel, and key: what the folder and the channel
+/// last agreed on (content hash, or NULL for "deleted", and revision).
+const MIGRATION_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_files (
+    folder      TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    hash        BLOB,
+    rev         INTEGER NOT NULL,
+    PRIMARY KEY (folder, channel_id, key)
+);
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -278,6 +292,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
                 return Err(e.into());
             }
         }
+    }
+
+    if current < 6 {
+        tracing::info!("applying migration v6 (sync adapter state)");
+        conn.execute_batch(MIGRATION_V6)?;
+        conn.pragma_update(None, "user_version", 6)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;

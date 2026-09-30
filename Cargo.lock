@@ -768,6 +768,7 @@ dependencies = [
  "cordelia-storage",
  "hex",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
