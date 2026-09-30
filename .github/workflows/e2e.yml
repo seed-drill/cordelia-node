@@ -12,7 +12,9 @@ env:
 
 jobs:
   e2e:
-    runs-on: [self-hosted, cordelia-docker]
+    # GitHub-hosted: T1-T7 are 3-6 containers each. The self-hosted
+    # cordelia-docker runner no longer exists; S2/S3 scale runs stay manual.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
@@ -28,8 +30,8 @@ jobs:
 
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
           rustup toolchain install
           rustup target add x86_64-unknown-linux-musl
 
