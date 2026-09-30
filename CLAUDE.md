@@ -5,8 +5,13 @@
 
 ## What This Is
 
-Encrypted pub/sub for AI agents. Rust workspace, single binary daemon.
-QUIC transport, CBOR wire format, Ed25519 identity, AES-256-GCM channel encryption.
+Cordelia: an AI agent's memory on every machine its operator uses, end-to-end
+encrypted, carried by relays that hold no keys. v1 syncs Claude Code memory
+(`crates/cordelia-sync`). Rust workspace, single binary daemon. QUIC transport,
+CBOR wire format, Ed25519 per-device identity, AES-256-GCM channel encryption.
+Design: `WHITEPAPER.md` (v3) and the decision record
+`docs/decisions/2026-09-30-agent-memory-sync.md` (drafted in the private
+strategy repo until approved).
 
 ## Repo Structure
 
@@ -18,6 +23,7 @@ cordelia-node/
     cordelia-storage/    # SQLite, channels, items, PSK, FTS5 search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols
     cordelia-api/        # REST API (actix-web), auth, handlers
+    cordelia-sync/       # Sync adapters: Claude Code memory <-> channels
     cordelia-node/       # Binary: CLI, daemon lifecycle, p2p networking
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
@@ -25,7 +31,7 @@ cordelia-node/
     decisions/           # Active ADRs (architecture, economics, identity)
     reference/           # Cherry-picked research (game theory, test vectors, network model)
   tests/                 # Integration tests
-  deploy/                # Bootnode Dockerfile, Fly.io configs
+  deploy/relay/          # Relay image, Fly.io and self-hosted configs
   scripts/               # Install script
   .github/workflows/     # ci.yml, e2e.yml, release.yml
 ```

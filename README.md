@@ -1,109 +1,88 @@
-# cordelia-node
+# Cordelia
 
-Encrypted pub/sub for AI agents. The Rust node that powers [Cordelia](https://seeddrill.ai).
+**Your AI agent's memory on every machine you use, readable only by you and the
+people you choose.**
 
-## What it does
+AI coding agents keep memory, but it lives in one folder on one machine, filed
+under the path the agent ran in. Cordelia keeps it in step across your devices:
+end-to-end encrypted, carried by relays that hold only ciphertext and no keys,
+and matched by project (git remote) rather than by path. Version 1 syncs Claude
+Code's memory.
 
-- **End-to-end encryption**: AES-256-GCM with per-channel pre-shared keys
-- **Ed25519 identity**: Keypair-based, no central authority
-- **Named channels**: Human-readable names (RFC 1035), DMs, and groups
-- **Full-text search**: FTS5 indexing with BM25 ranking
-- **ECIES key distribution**: X25519 envelope encryption for PSK sharing
-- **PSK rotation**: Key ring preserves history, forward secrecy on member removal
-- **P2P replication**: QUIC transport, Cardano-inspired governor topology
+- **How it works, and what it promises:** [WHITEPAPER.md](WHITEPAPER.md)
+- **Where it is going:** [docs/vision.md](docs/vision.md)
 
-## Quick start
+## Status
 
-```bash
-# Build
-cargo build --release
+**Pre-release (October 2026).** v1 is built and tested, including end-to-end
+tests with real processes over QUIC through a relay. The first two relays are
+being deployed; the first pre-release (`v0.2.0-alpha.1`) follows. Until then,
+build from source.
 
-# Initialise (generates keypair, creates DB, writes auth token)
-./target/release/cordelia init
+## Use
 
-# Start the node (REST API on localhost:9473)
-./target/release/cordelia start
-```
-
-Then use the [TypeScript SDK](https://github.com/seed-drill/cordelia-sdk):
+On each machine:
 
 ```bash
-npm install @seeddrill/cordelia
+cordelia init          # create this device's key
+cordelia start         # run the node (install.sh sets it up as a service)
 ```
 
-```typescript
-import { Cordelia } from '@seeddrill/cordelia'
+Pair two machines, one key copied in each direction:
 
-const c = new Cordelia()
-await c.subscribe('research-findings')
-await c.publish('research-findings', { text: 'Hello, Cordelia' })
-const items = await c.listen('research-findings')
+```bash
+laptop$  cordelia id                                  # prints cordelia_pk1...
+desktop$ cordelia add-device cordelia_pk1... --name laptop
+         #   On the other device, run: cordelia accept cordelia_pk1...
+laptop$  cordelia accept cordelia_pk1...
 ```
 
-## REST API
+Then sync Claude Code's memory on both:
 
-All endpoints are `POST /api/v1/channels/*` with bearer token auth.
+```bash
+cordelia sync claude       # home memory and every git project in ~/.claude
+cordelia sync status       # what syncs, what is waiting, what does not
+```
 
-| Endpoint | Purpose |
-|----------|---------|
-| `/subscribe` | Join or create an encrypted channel |
-| `/publish` | Publish content (encrypted + signed) |
-| `/listen` | Cursor-based item retrieval |
-| `/search` | FTS5 full-text search with BM25 |
-| `/list` | List subscribed channels |
-| `/info` | Check channel existence |
-| `/unsubscribe` | Leave a channel |
-| `/dm` | Create bilateral DM |
-| `/list-dms` | List DM channels |
-| `/group` | Create group channel |
-| `/group/invite` | Invite member (ECIES PSK envelope) |
-| `/group/remove` | Remove member (PSK rotation) |
-| `/list-groups` | List group channels |
-| `/rotate-psk` | Manual key rotation |
-| `/delete-item` | Tombstone an item |
-| `/identity` | Node public keys and stats |
+Other commands: `cordelia devices`, `cordelia invites`,
+`cordelia remove-device <key>` (removes a device everywhere and rotates keys),
+`cordelia sync off`.
 
-Full spec: [channels-api.md](docs/specs/channels-api.md)
+## Build from source
 
-## Architecture
+```bash
+cargo build --release          # toolchain pinned in rust-toolchain.toml
+./target/release/cordelia --help
+cargo test --all               # unit, protocol, and end-to-end tests
+```
 
-Rust workspace with 7 crates:
+## Repository
 
-| Crate | Purpose | Tests |
-|-------|---------|-------|
-| `cordelia-core` | Shared types, config, errors | 5 |
-| `cordelia-crypto` | Ed25519/X25519, ECIES, AES-256-GCM, Bech32 | 34 |
-| `cordelia-storage` | SQLite, channels, items, PSK, FTS5 search | 83 |
-| `cordelia-network` | Governor state machine (QUIC transport WIP) | 19 |
-| `cordelia-api` | REST API, auth, handlers | 21 |
-| `cordelia-node` | Binary: CLI, daemon lifecycle | - |
-| `cordelia-test` | Test harness: TestNode, TestMesh | - |
-| **Total** | | **162** |
+| Path | What |
+|---|---|
+| `crates/cordelia-core` | Types, config, protocol constants (`protocol.rs`) |
+| `crates/cordelia-crypto` | Ed25519/X25519 identity, AES-256-GCM, ECIES, sealed channel states, slots |
+| `crates/cordelia-storage` | SQLite: channels, items, keys, trust, invites, sync state |
+| `crates/cordelia-network` | QUIC transport, governor, mini-protocols, item sync |
+| `crates/cordelia-api` | Local REST API; devices, invites, keyed entries, membership |
+| `crates/cordelia-sync` | The Claude Code adapter |
+| `crates/cordelia-node` | The `cordelia` binary: CLI, daemon, p2p loop |
+| `deploy/relay` | Relay image and configs (Fly.io and self-hosted) |
+| `docs/decisions` | Decision records |
+| `docs/specs` | Protocol and component specs |
 
-## Cryptography
+The local API (`127.0.0.1:9473`, bearer token in `~/.cordelia/node-token`)
+covers channels (`/api/v1/channels/*`, including `entries` and `delete-key` for
+keyed items), devices (`/api/v1/devices/*`), invites (`/api/v1/invites/*`), and
+sync (`/api/v1/sync/*`).
 
-- **Identity**: Ed25519 keypair, X25519 derived via birational map
-- **Channel encryption**: AES-256-GCM with 12-byte random IV
-- **Key exchange**: ECIES (X25519 + HKDF-SHA256 + AES-256-GCM)
-- **Signatures**: Ed25519 over deterministic CBOR metadata envelope
-- **Key encoding**: Bech32 with `cordelia_pk1` / `cordelia_xpk1` / `cordelia_sig1` HRPs
-- **PSK lifecycle**: Generation, rotation with key ring, ECIES envelope distribution
+## Security
 
-## Specs
-
-All specifications live in [docs/specs/](docs/specs/).
-ADRs in [docs/decisions/](docs/decisions/).
-Reference material in [docs/reference/](docs/reference/).
-
-Key specs:
-- [channels-api.md](docs/specs/channels-api.md) -- REST API
-- [data-formats.md](docs/specs/data-formats.md) -- SQLite schema, item format
-- [ecies-envelope-encryption.md](docs/specs/ecies-envelope-encryption.md) -- Cryptographic primitives
-- [search-indexing.md](docs/specs/search-indexing.md) -- FTS5 + semantic search
-- [network-protocol.md](docs/specs/network-protocol.md) -- QUIC transport, mini-protocols
-- [demand-model.md](docs/specs/demand-model.md) -- Agent personas, parameter derivations
-- [parameter-rationale.md](docs/specs/parameter-rationale.md) -- Every configurable value explained
+Relays and relay operators see channel IDs, device public keys, and item sizes,
+types and timing; never content, file names, member lists, or keys. See
+[WHITEPAPER.md §4](WHITEPAPER.md#4-security-model) for the full model and its
+limits. To report a vulnerability privately, email hello@seeddrill.ai.
 
 ## License
 
-AGPL-3.0-only
+AGPL-3.0-only. See [LICENSE](LICENSE).
