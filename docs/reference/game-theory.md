@@ -1,6 +1,6 @@
 # Game-Theoretic Foundations of Trust in Cordelia
 
-**Deep dive document. Entry point: [WHITEPAPER.md](../../WHITEPAPER.md) Section 3.5, 9.1.**
+**Deep dive document, written for [whitepaper v2.3](../archive/whitepaper-v2.3.md) Sections 3.5 and 9.1 (archived; trust calibration and economics are not part of v1).**
 **Quantitative trust model: [Network Model](../architecture/network-model.md) Section 4.9.**
 **Threat analysis: [Threat Model](../architecture/threat-model.md) Sections 4.8, 8.3.**
 
@@ -688,4 +688,4 @@ Press, 1970.
 ---
 
 *Version 1.0 -- 2026-01-31*
-*Companion to [WHITEPAPER.md](../../WHITEPAPER.md). Quantitative model from [Network Model](../architecture/network-model.md).*
+*Companion to [whitepaper v2.3](../archive/whitepaper-v2.3.md) (archived). Quantitative model from [Network Model](../architecture/network-model.md).*
