@@ -1,5 +1,5 @@
 # Single source of truth for the Rust toolchain: local builds, CI,
-# release, E2E, and deploy/bootnode/Dockerfile all use this version.
+# release, E2E, and deploy/relay/Dockerfile all use this version.
 # Bump deliberately, in its own PR, fixing any new lints in the same PR.
 [toolchain]
 channel = "1.98.1"

@@ -472,8 +472,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         tracing::info!(%listen_addr, p2p_port, "starting node");
 
         // ── P2P transport ──────────────────────────────────────────
-        let p2p_bind: std::net::SocketAddr =
-            format!("0.0.0.0:{p2p_port}").parse().unwrap();
+        let p2p_bind = p2p_bind_addr(&config.network.listen_addr, p2p_port)?;
         let endpoint = cordelia_network::transport::create_endpoint(&identity_arc, p2p_bind)
             .map_err(|e| anyhow::anyhow!("P2P transport: {e}"))?;
         let p2p_local = endpoint.local_addr()?;
@@ -592,6 +591,24 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
         result
     })
+}
+
+/// The address to bind the P2P (QUIC) socket to: the host of
+/// `network.listen_addr` (resolved, so a name like Fly's
+/// `fly-global-services` works) with the node's P2P port. The port always
+/// comes from `node.p2p_port` so CORDELIA_P2P_PORT keeps working.
+fn p2p_bind_addr(listen_addr: &str, p2p_port: u16) -> anyhow::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let host = match listen_addr.rsplit_once(':') {
+        Some((host, _port)) if !host.is_empty() => host,
+        _ => "0.0.0.0",
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (host, p2p_port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("resolve listen_addr host {host:?}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("listen_addr host {host:?} resolved to no address"))
 }
 
 // ── Sync adapter loop ──────────────────────────────────────────────
@@ -1134,4 +1151,31 @@ fn init_tracing(level: &str) {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_p2p_bind_addr() {
+        let v4 = p2p_bind_addr("0.0.0.0:9474", 9474).unwrap();
+        assert_eq!(v4.to_string(), "0.0.0.0:9474");
+        // The port always comes from p2p_port.
+        assert_eq!(p2p_bind_addr("0.0.0.0:9474", 19474).unwrap().port(), 19474);
+        // Names resolve (Fly's fly-global-services is a hosts-file name).
+        assert!(
+            p2p_bind_addr("localhost:9474", 9474)
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(p2p_bind_addr("[::]:9474", 9474).unwrap().is_ipv6());
+        // Missing host falls back to all interfaces.
+        assert_eq!(
+            p2p_bind_addr(":9474", 9474).unwrap().to_string(),
+            "0.0.0.0:9474"
+        );
+        assert!(p2p_bind_addr("no-such-host.invalid:9474", 9474).is_err());
+    }
 }

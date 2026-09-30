@@ -1,0 +1,28 @@
+# relay2.cordelia.seeddrill.ai, run at one of our sites.
+#
+# Needs: an always-on Linux host with Docker; a public IPv4 (static, or
+# kept current in DNS); UDP 9474 forwarded to this host.
+#
+# From the repository root:
+#   docker compose -f deploy/relay/compose.relay2.yml up -d --build
+#   docker compose -f deploy/relay/compose.relay2.yml logs -f
+#
+# Full procedure: strategy-and-planning/infrastructure/cordelia-relays.md
+
+services:
+  relay2:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    image: cordelia-relay
+    container_name: cordelia-relay2
+    restart: unless-stopped
+    environment:
+      CORDELIA_CONFIG: /etc/cordelia/relay2.toml
+    ports:
+      - "9474:9474/udp"
+    volumes:
+      - cordelia-relay2:/data
+
+volumes:
+  cordelia-relay2:
