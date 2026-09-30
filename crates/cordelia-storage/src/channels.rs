@@ -190,6 +190,177 @@ pub fn create_group(
     })
 }
 
+/// Create an inbox channel row (decision 2026-09-30 §4.1).
+///
+/// `owner` is the key whose inbox this is. A node creates its own inbox
+/// with `owner_is_self` (and becomes its member, so pull-sync fetches it),
+/// and creates other nodes' inbox rows without membership, only so that
+/// invites it sends can be stored and served to relays. Idempotent.
+pub fn ensure_inbox(
+    conn: &Connection,
+    channel_id: &str,
+    owner: &[u8; 32],
+    owner_is_self: bool,
+) -> Result<(), CordeliaError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+         VALUES (?1, 'inbox', 'realtime', 'invite_only', ?2, ?3, ?3)",
+        params![channel_id, owner.as_slice(), now],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    if owner_is_self {
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', ?3)",
+            params![channel_id, owner.as_slice(), now],
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Create the row for a group channel this node is joining, with the ID
+/// and attributes from a channel state. Membership and key state are set
+/// separately. Idempotent: an existing row is left as it is.
+pub fn ensure_group(
+    conn: &Connection,
+    channel_id: &str,
+    name: Option<&str>,
+    mode: &str,
+    creator_id: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO channels (channel_id, channel_name, channel_type, mode, access, creator_id, created_at, updated_at)
+         VALUES (?1, ?2, 'group', ?3, 'invite_only', ?4, ?5, ?5)",
+        params![channel_id, name, mode, creator_id.as_slice(), now],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// A channel's membership epoch and the author of the state that set it.
+pub fn epoch(conn: &Connection, channel_id: &str) -> Result<(u64, Vec<u8>), CordeliaError> {
+    conn.query_row(
+        "SELECT epoch, epoch_author FROM channels WHERE channel_id = ?1",
+        params![channel_id],
+        |row| {
+            let epoch: i64 = row.get(0)?;
+            let author: Option<Vec<u8>> = row.get(1)?;
+            Ok((epoch.max(0) as u64, author.unwrap_or_default()))
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => CordeliaError::ChannelNotFound {
+            channel: channel_id.to_string(),
+        },
+        other => CordeliaError::Storage(other.to_string()),
+    })
+}
+
+/// Record the channel state applied to a channel: epoch, its author, the
+/// current key version, and the current key's hash.
+pub fn set_state(
+    conn: &Connection,
+    channel_id: &str,
+    epoch: u64,
+    epoch_author: &[u8; 32],
+    key_version: u32,
+    psk_hash: &[u8],
+) -> Result<(), CordeliaError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE channels SET epoch = ?1, epoch_author = ?2, key_version = ?3, psk_hash = ?4,
+                             updated_at = ?5
+         WHERE channel_id = ?6",
+        params![
+            epoch as i64,
+            epoch_author.as_slice(),
+            key_version,
+            psk_hash,
+            now,
+            channel_id
+        ],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Make the channel's active members exactly `members` (key, role):
+/// listed keys are added or updated, anyone else is soft-removed.
+pub fn replace_members(
+    conn: &Connection,
+    channel_id: &str,
+    members: &[([u8; 32], &str)],
+) -> Result<(), CordeliaError> {
+    for (key, role) in members {
+        add_member(conn, channel_id, key, role)?;
+    }
+    for existing in list_active_member_keys(conn, channel_id)? {
+        if !members.iter().any(|(k, _)| *k == existing) {
+            remove_member(conn, channel_id, &existing)?;
+        }
+    }
+    Ok(())
+}
+
+/// Active members of a channel with their roles.
+pub fn list_active_members(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<([u8; 32], String)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT entity_key, role FROM channel_members
+             WHERE channel_id = ?1 AND posture = 'active'
+             ORDER BY joined_at ASC",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![channel_id], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok((blob, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (blob, role) = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        if let Ok(key) = <[u8; 32]>::try_from(blob.as_slice()) {
+            out.push((key, role));
+        }
+    }
+    Ok(out)
+}
+
+/// Group channels (network scope) in which `entity_key` is an active owner.
+pub fn list_owned_groups(
+    conn: &Connection,
+    entity_key: &[u8; 32],
+) -> Result<Vec<Channel>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.channel_id, c.channel_name, c.channel_type, c.mode, c.access,
+                    c.creator_id, c.key_version, c.psk_hash, c.created_at, c.updated_at, c.scope
+             FROM channels c
+             INNER JOIN channel_members m ON c.channel_id = m.channel_id
+             WHERE m.entity_key = ?1 AND m.posture = 'active' AND m.role = 'owner'
+               AND c.channel_type = 'group' AND c.scope = 'network'
+             ORDER BY c.created_at ASC",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![entity_key.as_slice()], channel_from_row)
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(out)
+}
+
 /// Look up a channel by name (canonicalizes first) or by raw channel ID.
 pub fn get(conn: &Connection, name_or_id: &str) -> Result<Channel, CordeliaError> {
     let channel_type = ChannelType::from_id(name_or_id);
@@ -260,7 +431,7 @@ pub fn resolve(name_or_id: &str) -> Result<ChannelId, CordeliaError> {
             let canonical = naming::canonicalize(name_or_id)?;
             Ok(ChannelId(naming::named_channel_id(&canonical)))
         }
-        ChannelType::Dm | ChannelType::Group | ChannelType::Protocol => {
+        ChannelType::Dm | ChannelType::Group | ChannelType::Inbox | ChannelType::Protocol => {
             Ok(ChannelId(name_or_id.to_string()))
         }
     }

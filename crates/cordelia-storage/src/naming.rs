@@ -105,13 +105,19 @@ pub fn group_channel_id() -> String {
     format!("grp_{}", uuid::Uuid::new_v4())
 }
 
-/// Derive channel ID for the __personal system channel.
+/// Derive a node's inbox channel ID from its Ed25519 public key.
 ///
-/// `SHA-256("cordelia:channel:__personal:" + hex(pubkey))`
-pub fn personal_channel_id(pubkey: &[u8; 32]) -> String {
-    let preimage = format!("cordelia:channel:__personal:{}", hex::encode(pubkey));
-    let hash = Sha256::digest(preimage.as_bytes());
-    hex::encode(hash)
+/// `channel_id = "inbox_" + hex(SHA-256("cordelia:inbox:v1:" || pubkey))`
+///
+/// Anyone who knows a node's public key can derive its inbox and publish an
+/// invite to it; only the key's owner can decrypt one (decision
+/// 2026-09-30-agent-memory-sync §4.1).
+pub fn inbox_channel_id(pubkey: &[u8; 32]) -> String {
+    let mut preimage = Vec::with_capacity(18 + 32);
+    preimage.extend_from_slice(b"cordelia:inbox:v1:");
+    preimage.extend_from_slice(pubkey);
+    let hash = Sha256::digest(&preimage);
+    format!("inbox_{}", hex::encode(hash))
 }
 
 /// Derive a well-known PSK for a protocol channel.
@@ -139,6 +145,7 @@ pub enum ChannelType {
     Named,
     Dm,
     Group,
+    Inbox,
     Protocol,
 }
 
@@ -149,6 +156,8 @@ impl ChannelType {
             Self::Dm
         } else if id.starts_with("grp_") {
             Self::Group
+        } else if id.starts_with("inbox_") {
+            Self::Inbox
         } else if id.starts_with("cordelia:") {
             Self::Protocol
         } else {
@@ -161,6 +170,7 @@ impl ChannelType {
             Self::Named => "named",
             Self::Dm => "dm",
             Self::Group => "group",
+            Self::Inbox => "inbox",
             Self::Protocol => "protocol",
         }
     }
@@ -418,5 +428,24 @@ mod tests {
         // 32 '\u{00E9}' chars = 64 bytes (over 63 byte limit) -- also rejected.
         let name_over: String = std::iter::repeat_n('\u{00E9}', 32).collect();
         assert!(validate_channel_name(&name_over).is_err());
+    }
+
+    #[test]
+    fn test_inbox_channel_id() {
+        let pk_a = [0x01u8; 32];
+        let pk_b = [0x02u8; 32];
+        let a = inbox_channel_id(&pk_a);
+
+        assert!(a.starts_with("inbox_"));
+        assert_eq!(a.len(), 6 + 64);
+        assert_eq!(a, inbox_channel_id(&pk_a), "derivation is deterministic");
+        assert_ne!(a, inbox_channel_id(&pk_b), "each key has its own inbox");
+        assert_eq!(ChannelType::from_id(&a), ChannelType::Inbox);
+
+        // Pin the derivation: SHA-256("cordelia:inbox:v1:" || 0x01 * 32).
+        let mut preimage = b"cordelia:inbox:v1:".to_vec();
+        preimage.extend_from_slice(&pk_a);
+        let expected = format!("inbox_{}", hex::encode(Sha256::digest(&preimage)));
+        assert_eq!(a, expected);
     }
 }

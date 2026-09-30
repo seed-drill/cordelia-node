@@ -980,6 +980,18 @@ pub async fn p2p_loop(
             // Personal nodes: subscribed channels (list_for_entity), skip Phase 0.
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
+
+                // Apply channel states that arrived in our inbox since the last
+                // cycle (decision 2026-09-30 §4.1). Off the select loop: it does
+                // crypto and SQLite work under the db lock.
+                if node_role == "personal" {
+                    let inbox_state = state.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = cordelia_api::membership::process_inbox(&inbox_state) {
+                            tracing::warn!(error = %e, "inbox processing failed");
+                        }
+                    });
+                }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
@@ -1075,10 +1087,8 @@ pub async fn p2p_loop(
                                     Ok(db) => db,
                                     Err(_) => break,
                                 };
-                                let stored = cordelia_storage::items::query_listen(&db, ch_id, None, cordelia_core::protocol::MAX_LISTEN_LIMIT).unwrap_or_default();
-                                stored.into_iter()
-                                    .map(|si| (si.item_id, (si.content_hash, si.published_at)))
-                                    .collect::<std::collections::HashMap<_, _>>()
+                                let offered: Vec<String> = resp.items.iter().map(|h| h.item_id.clone()).collect();
+                                cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
                             };
                             let fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
                             if fetch_ids.is_empty() { continue; }
@@ -1653,7 +1663,7 @@ async fn handle_inbound_sync(
                 Ok(db) => db,
                 Err(_) => break,
             };
-            let items = cordelia_storage::items::query_listen(
+            let items = cordelia_storage::items::query_sync(
                 &db,
                 &current_req.channel_id,
                 current_req.since.as_deref(),
@@ -1697,25 +1707,28 @@ async fn handle_inbound_sync(
                         Ok(db) => db,
                         Err(_) => break,
                     };
-                    cordelia_storage::items::query_listen(&db, &current_req.channel_id, None, 1000)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|si| freq.item_ids.contains(&si.item_id))
-                        .map(|si| cordelia_network::messages::Item {
-                            item_id: si.item_id,
-                            channel_id: si.channel_id,
-                            item_type: si.item_type,
-                            content_length: si.encrypted_blob.len() as u32,
-                            encrypted_blob: si.encrypted_blob,
-                            content_hash: si.content_hash,
-                            author_id: si.author_id,
-                            signature: si.signature,
-                            key_version: si.key_version as u32,
-                            published_at: si.published_at,
-                            is_tombstone: si.is_tombstone,
-                            parent_id: si.parent_id,
-                        })
-                        .collect::<Vec<_>>()
+                    cordelia_storage::items::get_items_by_ids(
+                        &db,
+                        &current_req.channel_id,
+                        &freq.item_ids,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|si| cordelia_network::messages::Item {
+                        item_id: si.item_id,
+                        channel_id: si.channel_id,
+                        item_type: si.item_type,
+                        content_length: si.encrypted_blob.len() as u32,
+                        encrypted_blob: si.encrypted_blob,
+                        content_hash: si.content_hash,
+                        author_id: si.author_id,
+                        signature: si.signature,
+                        key_version: si.key_version as u32,
+                        published_at: si.published_at,
+                        is_tombstone: si.is_tombstone,
+                        parent_id: si.parent_id,
+                    })
+                    .collect::<Vec<_>>()
                 };
                 let fresp = cordelia_network::messages::WireMessage::FetchResponse(
                     cordelia_network::messages::FetchResponse { items: fetch_items },

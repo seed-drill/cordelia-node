@@ -7,7 +7,15 @@ use rusqlite::{Connection, params};
 use cordelia_core::CordeliaError;
 
 /// Node-internal item types filtered from listen/search responses.
-const INTERNAL_TYPES: &[&str] = &["psk_envelope", "kv", "attestation", "descriptor", "probe"];
+/// Keep in sync with the `NOT IN` lists in the SQL below (a test checks).
+const INTERNAL_TYPES: &[&str] = &[
+    "psk_envelope",
+    "kv",
+    "attestation",
+    "descriptor",
+    "probe",
+    "invite",
+];
 
 /// Check if an item_type is node-internal (not publishable via API).
 pub fn is_internal_type(item_type: &str) -> bool {
@@ -106,7 +114,7 @@ pub fn query_listen(
          FROM items
          WHERE channel_id = ?1
            AND published_at > ?2
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0
          ORDER BY published_at ASC, item_id ASC
          LIMIT ?3"
@@ -115,7 +123,7 @@ pub fn query_listen(
                 is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
          FROM items
          WHERE channel_id = ?1
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0
          ORDER BY published_at DESC, item_id DESC
          LIMIT ?3"
@@ -157,6 +165,139 @@ pub fn query_listen(
     Ok(items)
 }
 
+/// Query items for item-sync (network replication, §4.5).
+///
+/// Unlike [`query_listen`], this returns every item stored for the channel,
+/// including node-internal types (key envelopes, invites, membership events)
+/// and tombstones: replication must carry them, while the listen API hides
+/// them. Ordering and the `since`/`limit` semantics match `query_listen`.
+pub fn query_sync(
+    conn: &Connection,
+    channel_id: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    const COLUMNS: &str = "item_id, channel_id, author_id, item_type, published_at,
+         is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob";
+
+    let mut items = Vec::new();
+    match since {
+        Some(since) => {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM items
+                 WHERE channel_id = ?1 AND published_at > ?2
+                 ORDER BY published_at ASC, item_id ASC
+                 LIMIT ?3"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![channel_id, since, limit], stored_item_from_row)
+                .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+            for row in rows {
+                items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+            }
+        }
+        None => {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM items
+                 WHERE channel_id = ?1
+                 ORDER BY published_at DESC, item_id DESC
+                 LIMIT ?2"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![channel_id, limit], stored_item_from_row)
+                .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+            for row in rows {
+                items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+            }
+        }
+    }
+
+    // Without `since` we fetched the newest first; return oldest first.
+    if since.is_none() {
+        items.reverse();
+    }
+    Ok(items)
+}
+
+/// Fetch specific items of a channel by ID, for item-sync fetch requests.
+///
+/// Includes internal types and tombstones, like [`query_sync`]. Unknown IDs
+/// and IDs belonging to other channels are skipped.
+pub fn get_items_by_ids(
+    conn: &Connection,
+    channel_id: &str,
+    item_ids: &[String],
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT item_id, channel_id, author_id, item_type, published_at,
+                    is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
+             FROM items
+             WHERE channel_id = ?1 AND item_id = ?2",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut items = Vec::with_capacity(item_ids.len());
+    for item_id in item_ids {
+        match stmt.query_row(params![channel_id, item_id], stored_item_from_row) {
+            Ok(item) => items.push(item),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(CordeliaError::Storage(e.to_string())),
+        }
+    }
+    Ok(items)
+}
+
+/// Look up which of the given item IDs are already stored.
+///
+/// Returns item_id -> (content_hash, published_at), the shape
+/// `compute_fetch_list` expects. Checking only the IDs a peer offered keeps
+/// the cost independent of channel size.
+pub fn known_items(
+    conn: &Connection,
+    item_ids: &[String],
+) -> Result<std::collections::HashMap<String, (Vec<u8>, String)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT content_hash, published_at FROM items WHERE item_id = ?1")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut known = std::collections::HashMap::new();
+    for item_id in item_ids {
+        match stmt.query_row(params![item_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(entry) => {
+                known.insert(item_id.clone(), entry);
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(CordeliaError::Storage(e.to_string())),
+        }
+    }
+    Ok(known)
+}
+
+fn stored_item_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredItem> {
+    Ok(StoredItem {
+        item_id: row.get(0)?,
+        channel_id: row.get(1)?,
+        author_id: row.get(2)?,
+        item_type: row.get(3)?,
+        published_at: row.get(4)?,
+        is_tombstone: row.get::<_, i64>(5)? != 0,
+        parent_id: row.get(6)?,
+        key_version: row.get(7)?,
+        content_hash: row.get(8)?,
+        signature: row.get(9)?,
+        encrypted_blob: row.get(10)?,
+    })
+}
+
 /// Tombstone an item (soft delete).
 pub fn tombstone_item(conn: &Connection, item_id: &str) -> Result<bool, CordeliaError> {
     let updated = conn
@@ -173,7 +314,7 @@ pub fn count_for_channel(conn: &Connection, channel_id: &str) -> Result<i64, Cor
     conn.query_row(
         "SELECT COUNT(*) FROM items
          WHERE channel_id = ?1
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe')
+           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
            AND is_tombstone = 0",
         params![channel_id],
         |row| row.get(0),
@@ -328,6 +469,132 @@ mod tests {
         assert!(!is_internal_type("message"));
         assert!(!is_internal_type("event"));
         assert!(!is_internal_type("memory:entity"));
+    }
+
+    #[test]
+    fn test_query_sync_includes_internal_types_and_tombstones() {
+        let conn = setup();
+        let mut envelope = test_item("ci_env", "2026-01-01T00:01:00Z");
+        envelope.item_type = "psk_envelope";
+        envelope.content_hash = &[0x11; 32];
+        insert_item(&conn, &envelope).unwrap();
+
+        let mut deleted = test_item("ci_gone", "2026-01-01T00:02:00Z");
+        deleted.content_hash = &[0x22; 32];
+        insert_item(&conn, &deleted).unwrap();
+        tombstone_item(&conn, "ci_gone").unwrap();
+
+        let mut live = test_item("ci_live", "2026-01-01T00:03:00Z");
+        live.content_hash = &[0x33; 32];
+        insert_item(&conn, &live).unwrap();
+
+        // The listen API hides both...
+        let listened: Vec<_> = query_listen(&conn, "ch1", None, 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.item_id)
+            .collect();
+        assert_eq!(listened, vec!["ci_live"]);
+
+        // ...but replication must carry all three, oldest first.
+        let synced = query_sync(&conn, "ch1", None, 50).unwrap();
+        let ids: Vec<_> = synced.iter().map(|i| i.item_id.as_str()).collect();
+        assert_eq!(ids, vec!["ci_env", "ci_gone", "ci_live"]);
+        assert!(synced[1].is_tombstone);
+    }
+
+    #[test]
+    fn test_query_sync_since_and_limit() {
+        let conn = setup();
+        for (i, hash) in [0x41u8, 0x42, 0x43].iter().enumerate() {
+            let id = format!("ci_s{i}");
+            let ts = format!("2026-01-01T00:0{}:00Z", i + 1);
+            let mut item = test_item(&id, &ts);
+            let h = Box::leak(Box::new([*hash; 32]));
+            item.content_hash = h;
+            insert_item(&conn, &item).unwrap();
+        }
+
+        // No cursor: newest `limit` items, returned oldest first.
+        let latest: Vec<_> = query_sync(&conn, "ch1", None, 2)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.item_id)
+            .collect();
+        assert_eq!(latest, vec!["ci_s1", "ci_s2"]);
+
+        // Cursor: strictly after `since`, oldest first.
+        let after: Vec<_> = query_sync(&conn, "ch1", Some("2026-01-01T00:01:00Z"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.item_id)
+            .collect();
+        assert_eq!(after, vec!["ci_s1", "ci_s2"]);
+    }
+
+    #[test]
+    fn test_get_items_by_ids_scoped_to_channel() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('ch2', 'other', 'named', 'realtime', 'open', X'00', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let mut a = test_item("ci_a", "2026-01-01T00:01:00Z");
+        a.item_type = "invite";
+        a.content_hash = &[0x51; 32];
+        insert_item(&conn, &a).unwrap();
+        let mut b = test_item("ci_b", "2026-01-01T00:02:00Z");
+        b.channel_id = "ch2";
+        b.content_hash = &[0x52; 32];
+        insert_item(&conn, &b).unwrap();
+
+        let ids = vec![
+            "ci_a".to_string(),
+            "ci_b".to_string(),
+            "ci_none".to_string(),
+        ];
+        let got: Vec<_> = get_items_by_ids(&conn, "ch1", &ids)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.item_id)
+            .collect();
+        // Internal type is served; other channel's item and unknown ID are not.
+        assert_eq!(got, vec!["ci_a"]);
+    }
+
+    #[test]
+    fn test_known_items() {
+        let conn = setup();
+        let mut a = test_item("ci_k1", "2026-01-01T00:01:00Z");
+        a.content_hash = &[0x61; 32];
+        insert_item(&conn, &a).unwrap();
+
+        let known = known_items(&conn, &["ci_k1".to_string(), "ci_k2".to_string()]).unwrap();
+        assert_eq!(known.len(), 1);
+        let (hash, published_at) = &known["ci_k1"];
+        assert_eq!(hash.as_slice(), &[0x61; 32]);
+        assert_eq!(published_at, "2026-01-01T00:01:00Z");
+    }
+
+    #[test]
+    fn test_every_internal_type_hidden_from_listen_and_count() {
+        let conn = setup();
+        for (i, t) in INTERNAL_TYPES.iter().enumerate() {
+            let id = Box::leak(format!("ci_int{i}").into_boxed_str());
+            let mut item = test_item(id, "2026-01-01T00:01:00Z");
+            item.item_type = t;
+            let hash = Box::leak(Box::new([0x70 + i as u8; 32]));
+            item.content_hash = hash;
+            insert_item(&conn, &item).unwrap();
+        }
+        assert!(query_listen(&conn, "ch1", None, 50).unwrap().is_empty());
+        assert_eq!(count_for_channel(&conn, "ch1").unwrap(), 0);
+        assert_eq!(
+            query_sync(&conn, "ch1", None, 50).unwrap().len(),
+            INTERNAL_TYPES.len()
+        );
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item

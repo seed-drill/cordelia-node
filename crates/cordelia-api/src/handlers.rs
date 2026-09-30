@@ -13,6 +13,7 @@ use crate::auth;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::types::*;
+use crate::verify::verify_item_signature;
 
 /// Max item size: 256 KB (parameter-rationale.md §4, sourced from protocol.rs).
 const MAX_CONTENT_BYTES: usize = cordelia_core::protocol::MAX_ITEM_BYTES;
@@ -658,6 +659,14 @@ pub async fn group_create(
 
     let ch = channels::create_group(&db, &pk, &body.mode, body.name.as_deref(), Some(&new_psk))?;
     psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
+    let slot_key =
+        cordelia_crypto::generate_psk().map_err(|e| ApiError::Internal(e.to_string()))?;
+    psk::write_slot_key(&state.home_dir, &ch.channel_id, &slot_key)?;
+
+    // Tell hot peers we want this channel (§4.4a: groups were never announced).
+    if let Some(ref tx) = state.announce_tx {
+        let _ = tx.send(ch.channel_id.clone());
+    }
 
     Ok(HttpResponse::Ok().json(GroupCreateResponse {
         channel_id: ch.channel_id,
@@ -1220,35 +1229,6 @@ fn decrypt_item_content(
     let metadata = envelope.get("metadata").cloned().filter(|v| !v.is_null());
 
     (content, metadata)
-}
-
-/// Verify an item's Ed25519 signature over the CBOR metadata envelope.
-fn verify_item_signature(item: &items::StoredItem) -> bool {
-    if item.author_id.len() != 32 || item.content_hash.len() != 32 || item.signature.len() != 64 {
-        return false;
-    }
-
-    let mut author = [0u8; 32];
-    author.copy_from_slice(&item.author_id);
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(&item.content_hash);
-    let mut sig = [0u8; 64];
-    sig.copy_from_slice(&item.signature);
-
-    let cbor = match signing::build_item_metadata_envelope(
-        &author,
-        &item.channel_id,
-        &content_hash,
-        item.is_tombstone,
-        &item.item_id,
-        item.key_version,
-        &item.published_at,
-    ) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    cordelia_crypto::identity::verify_signature(&author, &cbor, &sig)
 }
 
 // ── Health + Status ────────────────────────────────────────────────

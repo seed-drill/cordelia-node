@@ -4,11 +4,14 @@
 
 pub mod channels;
 pub mod db;
+pub mod invites;
 pub mod items;
+pub mod meta;
 pub mod naming;
 pub mod psk;
 pub mod schema;
 pub mod search;
+pub mod trust;
 
 /// Storage-level errors (wraps rusqlite and IO errors).
 #[derive(Debug, thiserror::Error)]
@@ -18,4 +21,7 @@ pub enum StorageError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("migration failed: {0}")]
+    Migration(String),
 }
