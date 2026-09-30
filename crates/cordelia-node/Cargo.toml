@@ -15,6 +15,7 @@ cordelia-crypto = { workspace = true }
 cordelia-storage = { workspace = true }
 cordelia-network = { workspace = true }
 cordelia-api = { workspace = true }
+cordelia-sync = { workspace = true }
 tokio = { workspace = true }
 quinn = { workspace = true }
 actix-web = { workspace = true }

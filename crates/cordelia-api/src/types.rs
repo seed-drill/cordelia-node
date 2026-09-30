@@ -465,3 +465,22 @@ pub struct DeleteKeyResponse {
     pub rev: u64,
     pub item_id: String,
 }
+
+// ── Sync adapters (decision 2026-09-30-agent-memory-sync §4.5) ──
+
+#[derive(Deserialize)]
+pub struct SyncClaudeRequest {
+    pub enabled: bool,
+    /// Claude Code directory; defaults to ~/.claude of the user running the node.
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SyncStatusResponse {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// The last cycle's report, once one has run.
+    pub report: Option<serde_json::Value>,
+}

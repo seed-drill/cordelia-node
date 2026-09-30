@@ -84,6 +84,11 @@ enum Commands {
     Devices,
     /// List invites waiting for `accept`
     Invites,
+    /// Sync an agent's memory across your devices
+    Sync {
+        #[command(subcommand)]
+        what: SyncCommand,
+    },
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -98,6 +103,20 @@ enum Commands {
         #[arg(long)]
         lead_entity_id: String,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum SyncCommand {
+    /// Sync Claude Code's memory (home and project folders)
+    Claude {
+        /// Claude Code directory (default: ~/.claude)
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Stop syncing (files already synced are left in place)
+    Off,
+    /// Show what is syncing, and what is not
+    Status,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -125,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::RemoveDevice { key }) => cmd_remove_device(&cli.config, &key),
         Some(Commands::Devices) => cmd_devices(&cli.config),
         Some(Commands::Invites) => cmd_invites(&cli.config),
+        Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -528,6 +548,13 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             tracing::info!(count = trusted_peer_ids.len(), "trusted peers configured (PAN §8.2.2)");
         }
 
+        // ── Sync adapter (decision 2026-09-30 §4.5) ─────────────────
+        // Runs while a Claude Code directory is configured; `cordelia sync
+        // claude` / `cordelia sync off` take effect on the next cycle.
+        if config.network.role == "personal" {
+            tokio::spawn(run_sync_loop(state.clone()));
+        }
+
         let p2p_handle = tokio::spawn(async move {
             let bootstrap_addrs: Vec<std::net::SocketAddr> = config.network.bootnodes.iter()
                 .filter_map(|b| b.addr.parse().ok())
@@ -565,6 +592,60 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
         result
     })
+}
+
+// ── Sync adapter loop ──────────────────────────────────────────────
+
+/// Every `CYCLE_SECS`, if sync is on, run one adapter cycle off the async
+/// runtime and store its report for `cordelia sync status`.
+async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
+    use cordelia_storage::meta;
+    use cordelia_sync::claude::ClaudeAdapter;
+
+    let adapter: std::sync::Arc<Mutex<Option<(std::path::PathBuf, ClaudeAdapter)>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_sync::claude::CYCLE_SECS,
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        let state = state.clone();
+        let adapter = adapter.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let dir = match state.db.lock() {
+                Ok(db) => meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
+                Err(_) => return,
+            };
+            let Ok(mut slot) = adapter.lock() else { return };
+            let Some(dir) = dir.map(std::path::PathBuf::from) else {
+                *slot = None;
+                return;
+            };
+            if slot.as_ref().is_none_or(|(d, _)| *d != dir) {
+                let home = std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
+                let pk = state.identity.public_key();
+                *slot = Some((dir.clone(), ClaudeAdapter::new(dir, home, &pk)));
+                tracing::info!("sync adapter started");
+            }
+            let Some((_, running)) = slot.as_mut() else {
+                return;
+            };
+            let report = running.run_cycle(&state);
+            for e in &report.errors {
+                tracing::warn!(error = %e, "sync cycle error");
+            }
+            let mut json = serde_json::to_value(&report).unwrap_or_default();
+            json["at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+            if let Ok(db) = state.db.lock() {
+                let _ = meta::set(&db, meta::SYNC_CLAUDE_REPORT, &json.to_string());
+            }
+        })
+        .await;
+    }
 }
 
 // ── cordelia peers ─────────────────────────────────────────────────
@@ -936,6 +1017,84 @@ fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
     }
     println!();
     println!("To join, trust the sender: cordelia accept <from>");
+    Ok(())
+}
+
+fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
+    let resp = match what {
+        SyncCommand::Claude { dir } => {
+            let dir = dir.map(|d| {
+                std::fs::canonicalize(&d)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(d)
+            });
+            let resp = api_post(
+                config_path,
+                "/api/v1/sync/claude",
+                serde_json::json!({ "enabled": true, "dir": dir }),
+            )?;
+            println!(
+                "Syncing Claude Code memory in {}.",
+                resp["dir"].as_str().unwrap_or("~/.claude")
+            );
+            println!("Run `cordelia sync status` in a few seconds to see what is syncing.");
+            return Ok(());
+        }
+        SyncCommand::Off => {
+            api_post(
+                config_path,
+                "/api/v1/sync/claude",
+                serde_json::json!({ "enabled": false }),
+            )?;
+            println!("Sync is off. Files already synced stay where they are.");
+            return Ok(());
+        }
+        SyncCommand::Status => api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?,
+    };
+
+    if resp["enabled"].as_bool() != Some(true) {
+        println!("Sync is off. Turn it on with `cordelia sync claude`.");
+        return Ok(());
+    }
+    println!(
+        "Syncing Claude Code memory in {}",
+        resp["dir"].as_str().unwrap_or_default()
+    );
+    let report = &resp["report"];
+    if report.is_null() {
+        println!("  (first cycle not run yet)");
+        return Ok(());
+    }
+    println!(
+        "  last cycle: {}",
+        report["at"].as_str().unwrap_or_default()
+    );
+    for f in report["folders"].as_array().into_iter().flatten() {
+        let state = if f["waiting"].as_bool() == Some(true) {
+            "waiting to join".to_string()
+        } else {
+            "syncing".to_string()
+        };
+        println!(
+            "  {:<45} {} ({})",
+            f["project"].as_str().unwrap_or_default(),
+            state,
+            f["folder"].as_str().unwrap_or_default()
+        );
+        for s in f["skipped"].as_array().into_iter().flatten() {
+            println!("      skipped: {}", s.as_str().unwrap_or_default());
+        }
+    }
+    let unsynced = report["unsynced"].as_array().cloned().unwrap_or_default();
+    if !unsynced.is_empty() {
+        println!("  not synced (no git remote):");
+        for u in &unsynced {
+            println!("    {}", u.as_str().unwrap_or_default());
+        }
+    }
+    for e in report["errors"].as_array().into_iter().flatten() {
+        println!("  error: {}", e.as_str().unwrap_or_default());
+    }
     Ok(())
 }
 

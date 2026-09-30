@@ -73,13 +73,20 @@ impl Node {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    /// This node's stand-in home directory (for the sync adapter).
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
     fn start(&mut self) {
         let log = std::fs::File::create(self.log()).unwrap();
+        std::fs::create_dir_all(self.home()).unwrap();
         let child = Command::new(BIN)
             .arg("--config")
             .arg(self.config())
             .arg("start")
             .env("CORDELIA_DATA_DIR", self.data_dir())
+            .env("HOME", self.home())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -377,4 +384,127 @@ fn cli_reports_when_the_node_is_not_running() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cordelia start"), "{stderr}");
+}
+
+/// A Claude Code project folder under `home` whose sessions ran in `cwd`;
+/// returns its memory folder.
+fn claude_folder(home: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
+    let slug = cwd.display().to_string().replace(['/', '.'], "-");
+    let folder = home.join(".claude/projects").join(slug);
+    std::fs::create_dir_all(folder.join("memory")).unwrap();
+    std::fs::write(
+        folder.join("session.jsonl"),
+        format!(
+            "{{\"cwd\":{:?},\"type\":\"user\"}}\n",
+            cwd.display().to_string()
+        ),
+    )
+    .unwrap();
+    folder.join("memory")
+}
+
+fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
+    let repo = home.join(rel);
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/seed-drill/cordelia-node.git",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    repo
+}
+
+/// The product, end to end: two machines, each with its own home, Claude
+/// Code folder, and clone of the same repository at a different path.
+/// After pairing and `cordelia sync claude` on both, memory Claude writes
+/// on one machine appears on the other, in the home and project folders.
+#[test]
+fn claude_memory_syncs_between_two_machines() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    let all = [&relay, &a, &b];
+    for n in [&a, &b] {
+        wait_for("node healthy", &all, 30, || healthy(n));
+        wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
+    }
+
+    // Each machine: home memory, and a clone at a different path.
+    let a_home_mem = claude_folder(&a.home(), &a.home());
+    let b_home_mem = claude_folder(&b.home(), &b.home());
+    let a_proj_mem = claude_folder(&a.home(), &clone_at(&a.home(), "Work/cordelia-node"));
+    let b_proj_mem = claude_folder(&b.home(), &clone_at(&b.home(), "code/cn"));
+
+    // Pair, then switch sync on.
+    let b_key = b.cli(&["id"]).trim().to_string();
+    let added = a.cli(&["add-device", &b_key]);
+    let a_key = added
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("cordelia accept "))
+        .unwrap()
+        .to_string();
+    b.cli(&["accept", &a_key]);
+    for n in [&a, &b] {
+        let claude_dir = n.home().join(".claude");
+        n.cli(&["sync", "claude", "--dir", claude_dir.to_str().unwrap()]);
+    }
+
+    // Claude writes memories on A.
+    std::fs::write(a_home_mem.join("user_role.md"), "Russ is the CPO.\n").unwrap();
+    std::fs::write(
+        a_proj_mem.join("decision.md"),
+        "Invite-only channels only.\n",
+    )
+    .unwrap();
+
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    wait_for("b gets a's home memory", &all, 120, || {
+        (read(&b_home_mem.join("user_role.md"))?.as_str() == "Russ is the CPO.\n").then_some(())
+    });
+    wait_for(
+        "b gets a's project memory, at a different path",
+        &all,
+        120,
+        || {
+            (read(&b_proj_mem.join("decision.md"))?.as_str() == "Invite-only channels only.\n")
+                .then_some(())
+        },
+    );
+
+    // And back: B edits, A sees it.
+    std::fs::write(
+        b_proj_mem.join("decision.md"),
+        "Invite-only channels only. No keepers.\n",
+    )
+    .unwrap();
+    wait_for("a gets b's edit", &all, 120, || {
+        (read(&a_proj_mem.join("decision.md"))?.as_str()
+            == "Invite-only channels only. No keepers.\n")
+            .then_some(())
+    });
+
+    let status = b.cli(&["sync", "status"]);
+    assert!(
+        status.contains("github.com/seed-drill/cordelia-node"),
+        "{status}"
+    );
 }
