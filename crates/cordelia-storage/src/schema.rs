@@ -151,7 +151,12 @@ CREATE TABLE channels_v4 (
     descriptor    BLOB,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    scope         TEXT NOT NULL DEFAULT 'network' CHECK(scope IN ('network', 'local'))
+    scope         TEXT NOT NULL DEFAULT 'network' CHECK(scope IN ('network', 'local')),
+    -- Membership/key epoch: the highest channel-state message applied
+    -- (§4.1). States with a lower epoch are stale and ignored; equal
+    -- epochs are ordered by author key, so all members converge.
+    epoch         INTEGER NOT NULL DEFAULT 0,
+    epoch_author  BLOB
 );
 
 INSERT INTO channels_v4 (channel_id, channel_name, channel_type, mode, access, creator_id,
