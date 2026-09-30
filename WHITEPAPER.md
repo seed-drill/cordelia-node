@@ -211,7 +211,13 @@ Two mechanisms carry items between them:
    - a repository syncs with the **project's channel**, found by its normalised
      git remote (lower-cased host and path, without scheme, credentials, port, or
      `.git`) in a map held in the personal channel. The first device to see a
-     project creates its channel.
+     project creates its channel, owned by it alone. Another of the person's
+     devices joins only when it has the project too: it posts a join request in
+     the personal channel, and any device that owns the channel adds it. A
+     request is honoured only from the device it names. So a machine that works
+     on one project holds keys to that project alone.
+   - per device, projects can be **excluded** (never synced from that machine)
+     and home memory can be left off.
 2. **Plan each file.** A pure function compares the file on disk, the channel's
    current value, and what the folder last agreed with the channel. Whichever side
    changed is taken. If both changed, the channel's version goes in the file and
@@ -249,7 +255,7 @@ readable only by the user).
 | Relay compromise | Relays hold ciphertext only; no keys. Signatures stop them forging or relabelling items. |
 | Stranger writes to a channel | Items from non-members are ignored; per-author storage stops them evicting members' items. |
 | Stranger invites a device | Invitations apply only from trusted keys; others wait for `accept`. |
-| Lost or stolen device | `remove-device` from any other device removes it everywhere and rotates keys. |
+| Lost or stolen device | `remove-device` from any other device removes it everywhere and rotates keys. A device only ever held keys for the projects it had. |
 | Replayed old channel state | Epoch ordering: stale states are ignored. |
 | Malicious file names | Only plain names are written, only inside the memory folder. |
 | Burst writes, floods | Outbox batching within relay limits; per-peer rate limits; pending invites capped. |
@@ -278,8 +284,6 @@ deployed; the first pre-release follows.
   using the same membership mechanism as devices. Before it ships we will decide
   how an agent should treat memory written by other people, since it reads
   memory as its own notes.
-- **Devices join only the projects they have**, so a machine that works on one
-  project holds keys to that project alone.
 - **More adapters**, starting with a second coding agent, so memory survives a
   change of agent as well as a change of machine.
 - **More relays, run by others.** Anyone can run one; the configuration lists

@@ -474,6 +474,13 @@ pub struct SyncClaudeRequest {
     /// Claude Code directory; defaults to ~/.claude of the user running the node.
     #[serde(default)]
     pub dir: Option<String>,
+    /// Project remotes this device never syncs (`host/owner/repo`, or a
+    /// prefix ending in `*`). Replaces the current list when given.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+    /// Whether home-folder memory syncs on this device (default: yes).
+    #[serde(default)]
+    pub home: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -481,6 +488,8 @@ pub struct SyncStatusResponse {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    pub exclude: Vec<String>,
+    pub home: bool,
     /// The last cycle's report, once one has run.
     pub report: Option<serde_json::Value>,
 }

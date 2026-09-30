@@ -323,24 +323,20 @@ pub fn personal_channel_id(state: &AppState) -> Result<String, CordeliaError> {
     ensure_personal_channel(state, &db)
 }
 
-/// Create a group channel shared by all of this person's devices (every
-/// member of the personal channel, as owners) and send each of them its
-/// state. Used for a project's memory channel.
-pub fn create_device_group(state: &AppState, name: &str) -> Result<String, CordeliaError> {
+/// Create a group channel owned by this device alone, e.g. for a project's
+/// memory. Other devices of the person join only when they have the project
+/// themselves, by [`request_join`]; a device that never works on the
+/// project never holds its key.
+pub fn create_project_group(state: &AppState, name: &str) -> Result<String, CordeliaError> {
     let pk = state.identity.public_key();
     let db = lock(state)?;
-    let personal = ensure_personal_channel(state, &db)?;
+    ensure_personal_channel(state, &db)?;
 
     let key = cordelia_crypto::generate_psk().map_err(crypto_err)?;
     let slot_key = cordelia_crypto::generate_psk().map_err(crypto_err)?;
     let ch = channels::create_group(&db, &pk, "realtime", Some(name), Some(&key))?;
     psk::write_psk(&state.home_dir, &ch.channel_id, &key)?;
     psk::write_slot_key(&state.home_dir, &ch.channel_id, &slot_key)?;
-    for device in channels::list_active_member_keys(&db, &personal)? {
-        if device != pk {
-            channels::add_member(&db, &ch.channel_id, &device, "owner")?;
-        }
-    }
     channels::set_state(
         &db,
         &ch.channel_id,
@@ -349,16 +345,129 @@ pub fn create_device_group(state: &AppState, name: &str) -> Result<String, Corde
         1,
         &cordelia_crypto::sha256(&key),
     )?;
-    publish_state(state, &db, &ch.channel_id)?;
     announce(state, &ch.channel_id);
-    tracing::info!(channel = %ch.channel_id, %name, "created channel for this person's devices");
+    tracing::info!(channel = %ch.channel_id, %name, "created channel");
     Ok(ch.channel_id)
 }
 
+/// Key prefix of join requests in the personal channel.
+const JOIN_PREFIX: &str = "join/";
+
+/// How long after a request was granted this device waits for the
+/// invitation before asking again.
+const JOIN_RETRY_SECS: i64 = 120;
+
+fn join_key(channel_id: &str, device: &[u8; 32]) -> Result<String, CordeliaError> {
+    let device = cordelia_crypto::bech32::encode_public_key(device).map_err(crypto_err)?;
+    Ok(format!("{JOIN_PREFIX}{channel_id}/{device}"))
+}
+
+/// Ask this person's other devices to add this device to `channel_id` (a
+/// project it has found locally). The request is a keyed item in the
+/// personal channel, so any owner of the channel can grant it the next time
+/// it runs. Returns true if a new request was published: not while one is
+/// pending, nor within [`JOIN_RETRY_SECS`] of one being granted.
+pub fn request_join(state: &AppState, channel_id: &str) -> Result<bool, CordeliaError> {
+    let pk = state.identity.public_key();
+    let db = lock(state)?;
+    let personal = ensure_personal_channel(state, &db)?;
+    let key = join_key(channel_id, &pk)?;
+
+    if let Some(existing) = crate::entries::current(state, &db, &personal)?
+        .into_iter()
+        .find(|e| e.key == key)
+    {
+        if !existing.current.deleted {
+            return Ok(false); // still pending
+        }
+        let granted = chrono::DateTime::parse_from_rfc3339(&existing.current.published_at)
+            .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds())
+            .unwrap_or(i64::MAX);
+        if granted < JOIN_RETRY_SECS {
+            return Ok(false); // granted recently; the invitation is on its way
+        }
+    }
+
+    crate::entries::publish(
+        state,
+        &db,
+        &personal,
+        &crate::entries::Write {
+            key: &key,
+            content: &serde_json::json!({ "channel_id": channel_id }),
+            metadata: None,
+            item_type: "membership",
+            deleted: false,
+        },
+    )?;
+    tracing::info!(channel = %channel_id, "asked this person's other devices to join");
+    Ok(true)
+}
+
+/// Grant the join requests this device can: for each request in the
+/// personal channel made by one of this person's devices, for a channel this
+/// device owns, add the requester as an owner and send the new state; then
+/// clear the request. A request is honoured only from the device it names
+/// (its author), so no device can ask on another's behalf. Returns the
+/// number of devices added.
+pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
+    let pk = state.identity.public_key();
+    let db = lock(state)?;
+    let Some(personal) = personal_channel(&db, &pk)? else {
+        return Ok(0);
+    };
+
+    let mut added = 0;
+    for entry in crate::entries::current(state, &db, &personal)? {
+        let Some(rest) = entry.key.strip_prefix(JOIN_PREFIX) else {
+            continue;
+        };
+        if entry.current.deleted {
+            continue;
+        }
+        let requester = entry.current.author;
+        let Some((channel_id, _)) = rest.split_once('/') else {
+            continue;
+        };
+        // Honour a request only from the device it names, and only if that
+        // device is one of this person's.
+        if entry.key != join_key(channel_id, &requester)?
+            || requester == pk
+            || !channels::is_member(&db, &personal, &requester)?
+        {
+            continue;
+        }
+        if channels::get_member_role(&db, channel_id, &pk)?.as_deref() != Some("owner") {
+            continue; // another device owns it and will answer
+        }
+        if !channels::is_member(&db, channel_id, &requester)? {
+            channels::add_member(&db, channel_id, &requester, "owner")?;
+            bump_epoch(state, &db, channel_id)?;
+            publish_state(state, &db, channel_id)?;
+            added += 1;
+            tracing::info!(channel = %channel_id, "added one of this person's devices to a channel");
+        }
+        crate::entries::publish(
+            state,
+            &db,
+            &personal,
+            &crate::entries::Write {
+                key: &entry.key,
+                content: &serde_json::Value::Null,
+                metadata: None,
+                item_type: "membership",
+                deleted: true,
+            },
+        )?;
+    }
+    Ok(added)
+}
+
 /// Add another of this person's devices: trust it, and make it an owner of
-/// every group channel this node owns (creating the personal channel if
-/// needed). Each affected channel moves to a new epoch, sent to all members.
-/// Re-adding a current member re-sends it the current state.
+/// the personal channel (created if needed), whose new epoch goes to every
+/// member. It joins project channels on its own, as it finds those projects
+/// locally ([`request_join`]). Re-adding a current member re-sends it the
+/// current state.
 pub fn add_device(
     state: &AppState,
     device: &[u8; 32],
@@ -376,19 +485,16 @@ pub fn add_device(
     trust::trust(&db, device, TrustKind::Device, label)?;
     let personal_channel_id = ensure_personal_channel(state, &db)?;
 
-    let mut updated = Vec::new();
-    for ch in channels::list_owned_groups(&db, &pk)? {
-        if channels::get_member_role(&db, &ch.channel_id, device)?.as_deref() == Some("owner") {
-            let cs = build_state(state, &db, &ch.channel_id)?;
-            send_state(state, &db, device, &cs)?;
-        } else {
-            channels::add_member(&db, &ch.channel_id, device, "owner")?;
-            bump_epoch(state, &db, &ch.channel_id)?;
-            publish_state(state, &db, &ch.channel_id)?;
-        }
-        updated.push(ch.channel_id);
+    if channels::get_member_role(&db, &personal_channel_id, device)?.as_deref() == Some("owner") {
+        let cs = build_state(state, &db, &personal_channel_id)?;
+        send_state(state, &db, device, &cs)?;
+    } else {
+        channels::add_member(&db, &personal_channel_id, device, "owner")?;
+        bump_epoch(state, &db, &personal_channel_id)?;
+        publish_state(state, &db, &personal_channel_id)?;
     }
-    tracing::info!(channels = updated.len(), "device added");
+    let updated = vec![personal_channel_id.clone()];
+    tracing::info!("device added");
 
     Ok(AddDeviceOutcome {
         personal_channel_id,

@@ -19,9 +19,15 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
     let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
     let report =
         meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+    let exclude = meta::get(&db, meta::SYNC_CLAUDE_EXCLUDE)?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
     Ok(SyncStatusResponse {
         enabled: dir.is_some(),
         dir,
+        exclude,
+        home,
         report,
     })
 }
@@ -50,6 +56,26 @@ pub async fn claude(
                 return Err(ApiError::BadRequest("dir must be an absolute path".into()));
             }
             meta::set(&db, meta::SYNC_CLAUDE_DIR, &dir)?;
+            if let Some(exclude) = &body.exclude {
+                let normalised: Vec<String> = exclude
+                    .iter()
+                    .map(|e| e.trim().trim_end_matches(".git").to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect();
+                meta::set(
+                    &db,
+                    meta::SYNC_CLAUDE_EXCLUDE,
+                    &serde_json::to_string(&normalised)
+                        .map_err(|e| ApiError::Internal(e.to_string()))?,
+                )?;
+            }
+            if let Some(home) = body.home {
+                if home {
+                    meta::remove(&db, meta::SYNC_CLAUDE_HOME)?;
+                } else {
+                    meta::set(&db, meta::SYNC_CLAUDE_HOME, "off")?;
+                }
+            }
         } else {
             meta::remove(&db, meta::SYNC_CLAUDE_DIR)?;
         }

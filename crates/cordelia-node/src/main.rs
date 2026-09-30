@@ -112,6 +112,14 @@ enum SyncCommand {
         /// Claude Code directory (default: ~/.claude)
         #[arg(long)]
         dir: Option<String>,
+        /// Never sync this project from this device (its git remote, e.g.
+        /// github.com/client-co/app, or a prefix ending in *). Repeatable;
+        /// replaces the current list.
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Do not sync home-folder memory on this device
+        #[arg(long)]
+        no_home: bool,
     },
     /// Stop syncing (files already synced are left in place)
     Off,
@@ -1039,21 +1047,34 @@ fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
 
 fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     let resp = match what {
-        SyncCommand::Claude { dir } => {
+        SyncCommand::Claude {
+            dir,
+            exclude,
+            no_home,
+        } => {
             let dir = dir.map(|d| {
                 std::fs::canonicalize(&d)
                     .map(|p| p.display().to_string())
                     .unwrap_or(d)
             });
-            let resp = api_post(
-                config_path,
-                "/api/v1/sync/claude",
-                serde_json::json!({ "enabled": true, "dir": dir }),
-            )?;
+            let mut body = serde_json::json!({ "enabled": true, "dir": dir, "home": !no_home });
+            if !exclude.is_empty() {
+                body["exclude"] = serde_json::json!(exclude);
+            }
+            let resp = api_post(config_path, "/api/v1/sync/claude", body)?;
             println!(
                 "Syncing Claude Code memory in {}.",
                 resp["dir"].as_str().unwrap_or("~/.claude")
             );
+            if resp["home"].as_bool() == Some(false) {
+                println!("Home-folder memory is not synced on this device.");
+            }
+            for e in resp["exclude"].as_array().into_iter().flatten() {
+                println!(
+                    "Never synced from this device: {}",
+                    e.as_str().unwrap_or_default()
+                );
+            }
             println!("Run `cordelia sync status` in a few seconds to see what is syncing.");
             return Ok(());
         }
@@ -1101,6 +1122,12 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
         for s in f["skipped"].as_array().into_iter().flatten() {
             println!("      skipped: {}", s.as_str().unwrap_or_default());
         }
+    }
+    for e in report["excluded"].as_array().into_iter().flatten() {
+        println!(
+            "  {:<45} excluded on this device",
+            e.as_str().unwrap_or_default()
+        );
     }
     let unsynced = report["unsynced"].as_array().cloned().unwrap_or_default();
     if !unsynced.is_empty() {
