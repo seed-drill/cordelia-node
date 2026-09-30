@@ -8,8 +8,8 @@ cost per node regardless of network size N. Phase 1 E2E tests (T1-T7) validate
 correctness at 3-6 nodes. Scale tests validate that convergence time, resource
 usage, and delivery reliability remain bounded as N grows.
 
-> **v1 status (2026-09-30).** The S2 and S3 scale runs predate v1 and need the
-> `cordelia-test` VM. PAN and swarm (S3) are deferred
+> **v1 status (2026-09-30).** The S2 and S3 scale runs predate v1 and need a
+> large test VM. PAN and swarm (S3) are deferred
 > ([decision record](../decisions/2026-09-30-agent-memory-sync.md) §8).
 
 ---

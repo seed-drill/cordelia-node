@@ -1,5 +1,5 @@
-# A Cordelia relay: Docker on a Linux host (for us, an Ubuntu VM in a
-# site's DMZ) with a public IPv4 reaching it on UDP 9474.
+# A Cordelia relay: Docker on a Linux host with a public IPv4 reaching it
+# on UDP 9474.
 #
 # From the repository root, with RELAY set to relay1 or relay2:
 #   RELAY=relay1 docker compose -f deploy/relay/compose.yml up -d --build

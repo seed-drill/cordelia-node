@@ -151,7 +151,7 @@ But there is NO `generate-s1.sh`, `generate-s4.sh`, `generate-s5.sh`, or runners
 2. S1 is implicit in `generate-scale.sh` but never documented as such.
 3. S4 (eclipse) and S5 (500-node partition) were never implemented (§5 step 8 explicitly defers S4; S5 has no shipped generator).
 
-The implementation plan in §5 says "Request VM resize to 64GB for 500+ nodes" -- MEMORY.md shows cordelia-test is 64GB RAM already. Status is stale.
+The implementation plan in §5 says "Request VM resize to 64GB for 500+ nodes" -- the test VM already has 64GB RAM. Status is stale.
 
 Additionally, §5 step 5 says "Request VM resize to 64GB for 500+ nodes" but the memory budget in §1.1 says `500 nodes | 32GB | 8`. These conflict: spec says 500 nodes need 32GB in §1.1 but 64GB in §5. MEMORY.md says "64GB RAM, 12 CPU" on cordelia-test. Spec is internally inconsistent and stale.
 
@@ -159,7 +159,7 @@ Additionally, §5 step 5 says "Request VM resize to 64GB for 500+ nodes" but the
 1. Update §3 to match shipped scenarios. If `generate-s2.sh` and `generate-s3.sh` implement the S2 (throughput) and S3 (churn) scenarios, describe what they generate (sizing, zone layout, publisher count) explicitly.
 2. Document `generate-scale.sh` as the S1 generator (parameterised). Rename to `generate-s1.sh` or leave as the "generic" base.
 3. Mark S4 (eclipse) and S5 (partition at scale) as "Not implemented in Phase 1" with a backlog pointer.
-4. Reconcile §1.1 memory sizing with §5 VM sizing. Confirm actual cordelia-test is 64GB (per MEMORY.md).
+4. Reconcile §1.1 memory sizing with §5 VM sizing. Confirm the test VM has 64GB.
 5. Add `harness/orchestrator.py` reference -- the Python orchestrator is the execution engine for scale tests and embodies the "Concurrent orchestrator (ThreadPoolExecutor), token caching, publish retries, scaled timeouts" design noted in MEMORY.md. It belongs in §4 (Measurement Framework) and §2 (generators).
 
 ### TS-05: `hot_min_relays` missing from scale governor config
@@ -198,7 +198,7 @@ Additionally, §1.3 says "1000 nodes: /21 (2046 usable IPs)" -- but the zone mod
 1. Downgrade 1000-node target to "stretch goal, Phase 2". 500-node is the realistic Phase 1 ceiling.
 2. Update §1.1 memory table. For 1000 nodes, memory budget should be ≥ 96GB, not 64GB.
 3. Add a §3.0 sub-note: "Scaling beyond R=500 requires either (a) increasing relay count to maintain backbone fan-out, or (b) accepting slower convergence from increased hop count. See network-protocol.md §7.2 scaling table."
-4. Confirm with Martin / capacity planning whether pdukvm20 can host 500+ containers at once.
+4. Confirm with Martin / capacity planning whether the test hypervisor can host 500+ containers at once.
 
 ### TS-07: S4 eclipse scenario under-specified and blocked
 

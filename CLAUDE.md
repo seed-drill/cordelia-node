@@ -123,39 +123,14 @@ Feature work goes on branches (`feat/X`). Merge to main only after CI passes, in
 4. **PR to main**: Squash merge preserves clean history.
 5. **Protocol changes get their own branch**: Wire format changes (codec, sync protocol) are never mixed with feature work.
 
-## E2E Testing on cordelia-test VM
+## E2E topology and scale suites (stale)
 
-The Docker topology suite (T1-T7) and the S2/S3 scale runs predate v1 and are
-stale; `e2e.yml` runs only on demand. Whether the `cordelia-test` VM still
-exists is an open question. v1 is covered by `devices_e2e.rs` (above).
-
-```bash
-ssh rezi@cordelia-test
-export PATH=$HOME/.cargo/bin:$PATH
-cd ~/actions-runner/_work/cordelia-node/cordelia-node
-
-# Clean state (ALWAYS do this before testing)
-docker rm -f $(docker ps -aq) 2>/dev/null
-docker network prune -f 2>/dev/null
-docker volume prune -af 2>/dev/null
-sudo rm -rf tests/e2e/scale/s2-* tests/e2e/scale/s3-* tests/e2e/logs tests/e2e/scale/keys
-
-# Build + image
-cargo build --release --target x86_64-unknown-linux-musl --bin cordelia
-cp target/x86_64-unknown-linux-musl/release/cordelia cordelia-bin
-DOCKER_BUILDKIT=0 docker build --no-cache -t cordelia-test:latest \
-  -f tests/e2e/Dockerfile --build-arg BINARY=cordelia-bin .
-rm cordelia-bin
-
-# S2 (relay mesh convergence)
-bash tests/e2e/scale/run-s2.sh 20        # R=20, 42 containers
-bash tests/e2e/scale/run-s2.sh 50        # R=50, 102 containers
-
-# S3 (PAN swarm)
-bash tests/e2e/scale/run-s3.sh 4         # 2 leads + 8 swarm, 13 containers
-```
-
-Note: root-owned key files from Docker need `sudo rm -rf` to clean.
+The Docker topology suite (T1-T7) and the S2/S3 scale runs predate v1 and
+are stale; `e2e.yml` runs only on demand. They ran on a self-hosted runner,
+whose details are in the private infrastructure docs, not here. To run them
+anywhere with Docker: `bash tests/e2e/build-image.sh`, then the scripts in
+`tests/e2e/` (`run-e2e.sh`, `scale/run-s2.sh`, `scale/run-s3.sh`). v1 is
+covered by `crates/cordelia-node/tests/devices_e2e.rs`.
 
 ## Related Repos
 
