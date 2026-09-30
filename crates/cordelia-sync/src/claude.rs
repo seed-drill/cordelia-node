@@ -371,6 +371,7 @@ fn sync_folder(
     keys.dedup();
 
     for key in keys {
+        let seen = local.get(key).map(|c| c.hash);
         let actions = plan::plan(
             key,
             local.get(key),
@@ -378,38 +379,67 @@ fn sync_folder(
             agreed.get(key),
             &deleted,
         );
+        let ctx = Ctx {
+            state,
+            dir,
+            channel,
+            prefix,
+            tag,
+            folder: &folder,
+        };
         for action in actions {
-            apply(
-                state,
-                dir,
-                channel,
-                prefix,
-                tag,
-                &folder,
-                key,
-                action,
-                &mut report,
-            )?;
+            if !apply(&ctx, key, seen, action, &mut report)? {
+                break; // the file changed under us; re-plan it next cycle
+            }
         }
     }
     Ok(report)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the folder/channel context is passed through unchanged from sync_folder"
-)]
+/// The folder and channel an action applies to.
+struct Ctx<'a> {
+    state: &'a AppState,
+    dir: &'a Path,
+    channel: &'a str,
+    prefix: &'a str,
+    tag: &'a str,
+    folder: &'a str,
+}
+
+/// Hash of the file as it is on disk right now (`None` if absent).
+fn current_hash(dir: &Path, key: &str) -> Option<[u8; 32]> {
+    std::fs::read(dir.join(key))
+        .ok()
+        .map(|bytes| cordelia_crypto::sha256(&bytes))
+}
+
+/// Apply one action. Returns `false`, doing nothing, if the action would
+/// replace or remove the file but the file changed since it was scanned:
+/// an agent wrote to it mid-cycle. The next cycle plans with that write, so
+/// it is published or kept as a conflict, never overwritten.
 fn apply(
-    state: &AppState,
-    dir: &Path,
-    channel: &str,
-    prefix: &str,
-    tag: &str,
-    folder: &str,
+    ctx: &Ctx,
     key: &str,
+    seen: Option<[u8; 32]>,
     action: Action,
     report: &mut FolderReport,
-) -> Result<(), CordeliaError> {
+) -> Result<bool, CordeliaError> {
+    let Ctx {
+        state,
+        dir,
+        channel,
+        prefix,
+        tag,
+        folder,
+    } = *ctx;
+    let replaces_file = matches!(
+        action,
+        Action::Pull { .. } | Action::RemoveFile { .. } | Action::Merge(_)
+    );
+    if replaces_file && current_hash(dir, key) != seen {
+        tracing::debug!(file = %dir.join(key).display(), "changed during the cycle; deferring");
+        return Ok(false);
+    }
     let io =
         |e: std::io::Error| CordeliaError::Internal(format!("{}: {e}", dir.join(key).display()));
     let full_key = format!("{prefix}{key}");
@@ -475,5 +505,85 @@ fn apply(
         }
         Action::Record(a) => record(a.hash, a.rev)?,
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(dir: &Path) -> AppState {
+        AppState {
+            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
+            bearer_token: "t".into(),
+            home_dir: dir.join("node"),
+            started_at: std::time::Instant::now(),
+            sync_errors: std::sync::atomic::AtomicU64::new(0),
+            peers_hot: std::sync::atomic::AtomicU64::new(0),
+            peers_warm: std::sync::atomic::AtomicU64::new(0),
+            push_tx: None,
+            announce_tx: None,
+        }
+    }
+
+    /// An agent writing a file after the scan must not be overwritten by an
+    /// incoming version planned from the older scan.
+    #[test]
+    fn a_file_written_mid_cycle_is_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("notes.md"), "scanned\n").unwrap();
+        let seen = Some(Content::new("scanned\n").hash);
+
+        // The agent writes after the scan...
+        std::fs::write(mem.join("notes.md"), "written mid-cycle\n").unwrap();
+
+        let ctx = Ctx {
+            state: &st,
+            dir: &mem,
+            channel: "grp_x",
+            prefix: "",
+            tag: "abcd",
+            folder: "f",
+        };
+        let mut report = FolderReport::default();
+        for action in [
+            Action::Pull {
+                text: "incoming\n".into(),
+                rev: 2,
+            },
+            Action::RemoveFile { rev: 2 },
+            Action::Merge("merged\n".into()),
+        ] {
+            assert!(!apply(&ctx, "notes.md", seen, action, &mut report).unwrap());
+        }
+        // ...and it survives every replacing action.
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "written mid-cycle\n"
+        );
+
+        // With an unchanged file, the pull goes ahead.
+        let now = Some(Content::new("written mid-cycle\n").hash);
+        assert!(
+            apply(
+                &ctx,
+                "notes.md",
+                now,
+                Action::Pull {
+                    text: "incoming\n".into(),
+                    rev: 2
+                },
+                &mut report
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "incoming\n"
+        );
+    }
 }
