@@ -1,33 +1,52 @@
 # A Cordelia relay: Docker on a Linux host with a public IPv4 reaching it
 # on UDP 9474.
 #
-# From the repository root, with RELAY set to relay1 or relay2:
-#   RELAY=relay1 docker compose -f deploy/relay/compose.yml up -d --build
-#   RELAY=relay1 docker compose -f deploy/relay/compose.yml logs -f
+# Settings live in deploy/relay/.env (copy relay.env.example): which relay
+# this is, and exactly which binary to deploy. From the repository root:
+#   docker compose -f deploy/relay/compose.yml up -d --build
+#   docker compose -f deploy/relay/compose.yml logs -f
 #   docker exec cordelia-relay1 cordelia status
 #
-# RELAY picks the config (relay1.toml or relay2.toml, each listing the
-# other relay) and names the container and its data volume.
 # Full guide: deploy/relay/README.md
 
-name: cordelia-${RELAY:?set RELAY=relay1 or RELAY=relay2}
+name: cordelia-${RELAY:?set RELAY=relay1 or RELAY=relay2 in deploy/relay/.env}
 
 services:
   relay:
     build:
       context: ../..
       dockerfile: deploy/relay/Dockerfile
-    image: cordelia-relay
+      args:
+        CORDELIA_SOURCE: ${CORDELIA_SOURCE:-release}
+        CORDELIA_VERSION: ${CORDELIA_VERSION:-}
+        CORDELIA_SHA256: ${CORDELIA_SHA256:-}
+    image: cordelia-relay:${CORDELIA_VERSION:-local}
     container_name: cordelia-${RELAY}
-    restart: unless-stopped
+    restart: always
+    # QUIC binds UDP 9474 on the host itself, so the host's own firewall
+    # (ufw) decides what reaches it. The API stays on 127.0.0.1:9473.
+    network_mode: host
     environment:
       CORDELIA_CONFIG: /etc/cordelia/${RELAY}.toml
-    ports:
-      - "9474:9474/udp"
     volumes:
+      # The relay's identity key and store live here; keep it across upgrades.
       - data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 512
+    healthcheck:
+      # Fails when the node stops answering on its local API.
+      test: ["CMD", "cordelia", "peers"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
-  # The relay's identity key lives here; keep it across upgrades.
   data:
     name: cordelia-${RELAY}-data

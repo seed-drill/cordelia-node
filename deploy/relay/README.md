@@ -7,56 +7,77 @@ relays by name, so two devices always have somewhere to meet, even when
 they are never online at the same time (decision
 [2026-09-30-agent-memory-sync](../../docs/decisions/2026-09-30-agent-memory-sync.md) §4.6).
 
-Seed Drill runs two, `relay1.cordelia.seeddrill.ai` and
-`relay2.cordelia.seeddrill.ai`, at two of our own sites. They list each other,
-so they form a mesh, and every node dials both by default. This guide is how they are set up; anyone can run
-a relay the same way (see the end).
+Seed Drill operates two relays, `relay1.cordelia.seeddrill.ai` and
+`relay2.cordelia.seeddrill.ai`. They list each other, so they form a mesh,
+and every node dials both by default. This guide is how they are set up;
+anyone can run a relay the same way (see the end).
 
 | File | What |
 |---|---|
-| `compose.yml` | Docker Compose for one relay; `RELAY=relay1` or `RELAY=relay2` picks which |
-| `Dockerfile` | The image: builds `cordelia` from this repository. No secrets in it. |
+| `compose.yml` | Docker Compose for one relay, hardened (section 3) |
+| `relay.env.example` | Settings to copy to `.env`: which relay, and exactly what to deploy |
+| `Dockerfile` | The image: a pinned release binary checked against its sha256, or a build of this checkout. Base images pinned by digest. |
 | `entrypoint.sh` | First start creates the identity (`cordelia init`); every start runs the node |
 | `relay1.toml`, `relay2.toml` | Relay config; each lists the other relay |
-| `fly.relay1.toml` | Optional: the same relay on Fly.io (not used for ours) |
+| `fly.relay1.toml` | Optional: the same relay on Fly.io |
 
 ## 1. What the host needs
 
-- **An always-on Linux VM.** Ubuntu 22.04 or later, 1 vCPU and 1 GB RAM to
-  run it. The first image build compiles Rust: allow about 4 GB RAM and 10
-  minutes for that.
-- **Docker Engine with the Compose plugin.** On Ubuntu:
+- **An always-on Linux host,** such as an Ubuntu 22.04+ VM: 1 vCPU and
+  1 GB RAM. Building from source (section 2) wants about 4 GB RAM and 10
+  minutes once; deploying a release does not.
+- **Docker Engine with the Compose plugin and BuildKit** (the default):
   ```bash
   sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2 git
   sudo usermod -aG docker "$USER"      # then log out and in again
   docker compose version               # must print a version
   ```
-- **A public IPv4 that reaches the VM on UDP 9474.** Either the VM's DMZ
-  address is itself public, or the site firewall forwards UDP 9474 on the
-  public address to the VM's DMZ address, port 9474. Keep the port the same
-  on both sides. The VM also needs outbound UDP, to reach the other relay.
-- **Nothing else exposed.** QUIC on UDP 9474 is the only open port. The
-  relay's HTTP API listens on 127.0.0.1 inside the container.
+- **UDP 9474 reachable from the internet,** at the same port number, for
+  example by a port-forward from the site's public IPv4. The host also needs
+  outbound UDP, to reach the other relay.
+- **The host firewall open for it.** The relay uses the host's network
+  directly, so the host firewall applies: `sudo ufw allow 9474/udp`. Nothing
+  else needs opening; the relay's API listens on 127.0.0.1:9473 only.
 
-Docker publishes the port through its own firewall rules, which bypass
-`ufw`: UDP 9474 is reachable whatever `ufw` says, so the site firewall is what
-controls exposure. If the VM has more than one network interface, publish
-only on the DMZ address by changing the `ports` line in `compose.yml` to
-`"<dmz-address>:9474:9474/udp"`.
-
-## 2. Start it
+## 2. Choose exactly what to deploy
 
 ```bash
 git clone https://github.com/seed-drill/cordelia-node.git
 cd cordelia-node
-RELAY=relay1 docker compose -f deploy/relay/compose.yml up -d --build
+cp deploy/relay/relay.env.example deploy/relay/.env
 ```
 
-Use `RELAY=relay2` at the other site. `RELAY` picks the config and names the
-container (`cordelia-relay1`) and its data volume (`cordelia-relay1-data`).
-The container restarts on failure and when the VM boots.
+Then edit `deploy/relay/.env`:
 
-## 3. Check it
+- `RELAY=relay1` or `RELAY=relay2`.
+- **A release (preferred):** `CORDELIA_VERSION` (e.g. `v0.2.0-alpha.1`) and
+  `CORDELIA_SHA256`, the sha256 of `cordelia-linux-amd64` from that release's
+  page (its `.sha256` file). The image build downloads the binary and refuses
+  it if the hash differs.
+- **Before the first release:** `CORDELIA_SOURCE=build`, and check out the
+  agreed commit first (`git checkout <sha>`). Record it: that commit is what
+  the relay runs.
+
+`.env` stays on the host; git ignores it.
+
+## 3. Start it
+
+```bash
+docker compose -f deploy/relay/compose.yml up -d --build
+```
+
+The container is `cordelia-relay1` (or `cordelia-relay2`) and its data volume
+is `cordelia-relay1-data`. It restarts always, including when the host boots.
+It runs hardened:
+
+- as an unprivileged user (uid 10001), on a read-only filesystem, with a
+  small writable `/tmp`;
+- with every Linux capability dropped and `no-new-privileges`;
+- with memory (512 MB) and process (512) limits;
+- with a healthcheck, `cordelia peers`, which fails when the node stops
+  answering: `docker ps` shows `(healthy)`.
+
+## 4. Check it
 
 1. **Logs.** `docker logs cordelia-relay1` shows, on first start:
    ```
@@ -76,26 +97,29 @@ The container restarts on failure and when the VM boots.
    `docker logs --tail 5 cordelia-relay1`: the same node key, and no "first
    start" line.
 4. **DNS.** In Cloudflare, zone `seeddrill.ai`: an **A** record
-   `relay1.cordelia` (or `relay2.cordelia`) pointing at the public IPv4 from
-   section 1, with the proxy **off** ("DNS only", grey cloud), because
-   Cloudflare's proxy does not carry QUIC. No AAAA record.
+   `relay1.cordelia` (or `relay2.cordelia`) pointing at the public IPv4 that
+   forwards to the host, with the proxy **off** ("DNS only", grey cloud),
+   because Cloudflare's proxy does not carry QUIC. No AAAA record.
    `dig +short relay1.cordelia.seeddrill.ai` should print that address.
-5. **From outside.** Any personal node with the default config dials both
-   relays: `cordelia init`, `cordelia start`, then `cordelia status` shows
-   `Peers: 1 hot` or more.
+5. **From outside.** On a machine on another network (not the relay's own,
+   whose router may not loop back to its public address), a node with the
+   default config dials both relays: `cordelia init`, `cordelia start`, then
+   `cordelia status` shows `Peers: 1 hot` or more.
 
-## 4. Upgrade
+## 5. Upgrade
+
+Change the pin in `deploy/relay/.env` (a new `CORDELIA_VERSION` and its
+`CORDELIA_SHA256`, or check out a new agreed commit), then:
 
 ```bash
-cd cordelia-node && git pull
-RELAY=relay1 docker compose -f deploy/relay/compose.yml up -d --build
+docker compose -f deploy/relay/compose.yml up -d --build
 ```
 
 The identity stays on the `cordelia-relay1-data` volume. Do not delete that
 volume: a relay with a new identity still works, since nodes find relays by
 name, but there is no reason to change it.
 
-## 5. Your own relay
+## 6. Your own relay
 
 Copy `relay1.toml`, change `entity_id`, and list whichever relays yours
 should mesh with under `[[network.bootnodes]]`. Run the same image with your
@@ -107,5 +131,6 @@ should use it. A relay can only ever see ciphertext, whoever runs it.
 
 `fly.relay1.toml` runs relay1 on Fly.io instead: UDP there needs a dedicated
 IPv4 and a bind to `fly-global-services` (set through `CORDELIA_LISTEN_ADDR`),
-with the same port inside and out. Deploy from the repository root with
+with the same port inside and out. Pin the release in its `[build.args]`,
+then deploy from the repository root with
 `fly deploy . --config deploy/relay/fly.relay1.toml --remote-only`.
