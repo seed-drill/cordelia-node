@@ -13,6 +13,12 @@ pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 /// JSON report of the last sync cycle.
 pub const SYNC_CLAUDE_REPORT: &str = "sync.claude.report";
 
+/// JSON array of project remotes this device never syncs.
+pub const SYNC_CLAUDE_EXCLUDE: &str = "sync.claude.exclude";
+
+/// `"off"` when this device does not sync home-folder memory.
+pub const SYNC_CLAUDE_HOME: &str = "sync.claude.home";
+
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])

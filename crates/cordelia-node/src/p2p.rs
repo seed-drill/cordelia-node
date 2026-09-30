@@ -1062,6 +1062,11 @@ pub async fn p2p_loop(
                         if let Err(e) = cordelia_api::membership::process_inbox(&inbox_state) {
                             tracing::warn!(error = %e, "inbox processing failed");
                         }
+                        // Add this person's other devices to projects they have
+                        // found locally (decision 2026-09-30 §4.5).
+                        if let Err(e) = cordelia_api::membership::process_join_requests(&inbox_state) {
+                            tracing::warn!(error = %e, "join request processing failed");
+                        }
                     });
                 }
                 let peers = conn_mgr.connected_peers();

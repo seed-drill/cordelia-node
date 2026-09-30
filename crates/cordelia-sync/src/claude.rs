@@ -73,7 +73,49 @@ pub struct CycleReport {
     pub folders: Vec<FolderReport>,
     /// Folders that do not sync: not the home folder, and no git remote.
     pub unsynced: Vec<String>,
+    /// Folders not synced because this device excludes them (the project's
+    /// remote, or "~" for home memory).
+    pub excluded: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Per-device sync settings, kept in node metadata.
+#[derive(Debug, Clone, Default)]
+pub struct Settings {
+    /// Project remotes this device never syncs. A trailing `*` matches a
+    /// prefix (`github.com/client-co/*`).
+    pub exclude: Vec<String>,
+    /// Whether home-folder memory syncs on this device.
+    pub home: bool,
+}
+
+impl Settings {
+    /// Read from node metadata: `sync.claude.exclude` (JSON array) and
+    /// `sync.claude.home` (`"off"` disables home memory).
+    pub fn load(state: &AppState) -> Result<Self, CordeliaError> {
+        let db = lock(state)?;
+        let exclude =
+            cordelia_storage::meta::get(&db, cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE)?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+        let home = cordelia_storage::meta::get(&db, cordelia_storage::meta::SYNC_CLAUDE_HOME)?
+            .is_none_or(|v| v != "off");
+        Ok(Self { exclude, home })
+    }
+
+    /// Whether this device excludes `project`.
+    pub fn excludes(&self, project: &Project) -> bool {
+        match project {
+            Project::Home => !self.home,
+            Project::Repo(remote) => self.exclude.iter().any(|pattern| {
+                let pattern = pattern.to_lowercase();
+                match pattern.strip_suffix('*') {
+                    Some(prefix) => remote.starts_with(prefix),
+                    None => *remote == pattern,
+                }
+            }),
+        }
+    }
 }
 
 /// The adapter for one Claude Code directory (`~/.claude`).
@@ -111,6 +153,13 @@ impl ClaudeAdapter {
     /// Run one sync cycle over every folder.
     pub fn run_cycle(&mut self, state: &AppState) -> CycleReport {
         let mut report = CycleReport::default();
+        let settings = match Settings::load(state) {
+            Ok(s) => s,
+            Err(e) => {
+                report.errors.push(format!("settings: {e}"));
+                return report;
+            }
+        };
         let personal = match membership::personal_channel_id(state) {
             Ok(id) => id,
             Err(e) => {
@@ -125,6 +174,13 @@ impl ClaudeAdapter {
                 report.unsynced.push(label);
                 continue;
             };
+            if settings.excludes(&project) {
+                report.excluded.push(match &project {
+                    Project::Home => "~".into(),
+                    Project::Repo(remote) => remote.clone(),
+                });
+                continue;
+            }
             let result = match &project {
                 Project::Home => sync_folder(
                     state,
@@ -169,9 +225,10 @@ impl ClaudeAdapter {
     }
 }
 
-/// The channel for a project, from the personal channel's map; created and
-/// shared with this person's devices if no device has mapped it yet.
-/// `None` while this node has not yet joined the mapped channel.
+/// The channel for a project, from the personal channel's map, or created
+/// (owned by this device alone) if no device has mapped it yet. `None`
+/// while this device is not yet a member of the mapped channel: it asks the
+/// person's other devices to add it, and waits.
 fn project_channel(
     state: &AppState,
     personal: &str,
@@ -194,14 +251,21 @@ fn project_channel(
 
     if let Some(channel) = mapped {
         let pk = state.identity.public_key();
-        let db = lock(state)?;
-        return Ok(channels::is_member(&db, &channel, &pk)?.then_some(channel));
+        let member = {
+            let db = lock(state)?;
+            channels::is_member(&db, &channel, &pk)?
+        };
+        if member {
+            return Ok(Some(channel));
+        }
+        membership::request_join(state, &channel)?;
+        return Ok(None);
     }
 
     if recently_joined(state, personal)? {
         return Ok(None);
     }
-    let channel = membership::create_device_group(state, &format!("project:{remote}"))?;
+    let channel = membership::create_project_group(state, &format!("project:{remote}"))?;
     let db = lock(state)?;
     entries::publish(
         state,

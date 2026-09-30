@@ -44,6 +44,11 @@ cordelia sync claude       # home memory and every git project in ~/.claude
 cordelia sync status       # what syncs, what is waiting, what does not
 ```
 
+A device joins a project's channel only once it has the project locally, so
+it holds keys only for the projects it works on. Per device:
+`cordelia sync claude --exclude github.com/client-co/*` (never sync those
+projects from this machine) and `--no-home` (leave home memory off it).
+
 Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device everywhere and rotates keys),
 `cordelia sync off`.

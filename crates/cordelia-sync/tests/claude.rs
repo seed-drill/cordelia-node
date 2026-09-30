@@ -157,18 +157,27 @@ fn relay(from: &Device, to: &Device) {
     }
 }
 
-/// Everything flows both ways until quiet: relay, apply invites, sync.
+/// Everything flows both ways until quiet: relay, apply invites, grant
+/// join requests, sync -- what each node's p2p loop and adapter do.
 fn settle(a: &mut Device, b: &mut Device) {
-    for _ in 0..4 {
+    for _ in 0..5 {
         relay(a, b);
         relay(b, a);
         membership::process_inbox(&a.state).unwrap();
         membership::process_inbox(&b.state).unwrap();
+        membership::process_join_requests(&a.state).unwrap();
+        membership::process_join_requests(&b.state).unwrap();
         relay(a, b);
         relay(b, a);
         a.cycle();
         b.cycle();
     }
+}
+
+/// Set a per-device sync setting in node metadata.
+fn set_meta(d: &Device, key: &str, value: &str) {
+    let db = d.state.db.lock().unwrap();
+    cordelia_storage::meta::set(&db, key, value).unwrap();
 }
 
 /// Two devices of one person: A adds B, B accepts A.
@@ -373,4 +382,129 @@ fn folders_without_a_repository_are_reported_not_synced() {
     let report = a.cycle();
     assert_eq!(report.unsynced.len(), 1);
     assert!(report.unsynced[0].ends_with(&scratch.display().to_string().replace(['/', '.'], "-")));
+}
+
+#[test]
+fn a_device_without_the_project_never_holds_its_key() {
+    let (mut a, mut b) = paired();
+    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
+    std::fs::write(a_mem.join("decision.md"), "Invite-only channels only.\n").unwrap();
+    b.home_memory(); // B works only in its home folder: no clone of the project
+    settle(&mut a, &mut b);
+
+    let report = a.cycle();
+    let channel = report
+        .folders
+        .iter()
+        .find(|f| f.project == "github.com/seed-drill/cordelia-node")
+        .and_then(|f| f.channel_id.clone())
+        .expect("A created the project channel");
+    let db = b.state.db.lock().unwrap();
+    assert!(
+        !channels::is_member(&db, &channel, &b.pk()).unwrap(),
+        "B was never added"
+    );
+    drop(db);
+    assert!(
+        cordelia_storage::psk::read_psk(&b.state.home_dir, &channel).is_err(),
+        "B holds no key for a project it does not have"
+    );
+
+    // Once B clones the project, it asks, A grants, and the memory arrives.
+    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
+    settle(&mut a, &mut b);
+    assert_eq!(
+        read(&b_mem, "decision.md").as_deref(),
+        Some("Invite-only channels only.\n")
+    );
+}
+
+#[test]
+fn excluded_projects_never_sync() {
+    let (mut a, mut b) = paired();
+    set_meta(
+        &a,
+        cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE,
+        r#"["github.com/seed-drill/*"]"#,
+    );
+    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
+    std::fs::write(a_mem.join("secret.md"), "stays on this machine\n").unwrap();
+    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
+    settle(&mut a, &mut b);
+
+    let report = a.cycle();
+    assert_eq!(
+        report.excluded,
+        vec!["github.com/seed-drill/cordelia-node".to_string()]
+    );
+    assert_eq!(read(&b_mem, "secret.md"), None);
+}
+
+#[test]
+fn home_memory_can_be_left_off_a_device() {
+    let (mut a, mut b) = paired();
+    set_meta(&b, cordelia_storage::meta::SYNC_CLAUDE_HOME, "off");
+    let a_home = a.home_memory();
+    let b_home = b.home_memory();
+    std::fs::write(a_home.join("user_role.md"), "general profile\n").unwrap();
+    std::fs::write(b_home.join("lab_notes.md"), "lab only\n").unwrap();
+    settle(&mut a, &mut b);
+
+    assert_eq!(
+        read(&b_home, "user_role.md"),
+        None,
+        "B does not receive home memory"
+    );
+    assert_eq!(read(&a_home, "lab_notes.md"), None, "nor send it");
+    assert!(b.cycle().excluded.contains(&"~".to_string()));
+}
+
+#[test]
+fn a_device_cannot_ask_to_join_on_anothers_behalf() {
+    let (mut a, mut b) = paired();
+    // D is also one of this person's devices, but has no clone of the project.
+    let mut d = Device::new();
+    membership::add_device(&a.state, &d.pk(), Some("d")).unwrap();
+    relay(&a, &d);
+    membership::accept(&d.state, &a.pk(), Some("a")).unwrap();
+
+    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
+    std::fs::write(a_mem.join("decision.md"), "x\n").unwrap();
+    settle(&mut a, &mut b);
+    settle(&mut a, &mut d);
+    let channel = a
+        .cycle()
+        .folders
+        .into_iter()
+        .find(|f| f.project == "github.com/seed-drill/cordelia-node")
+        .and_then(|f| f.channel_id)
+        .unwrap();
+
+    // B, a device of the same person, publishes a request that names D.
+    let personal = membership::personal_channel_id(&b.state).unwrap();
+    let naming_d = format!(
+        "join/{channel}/{}",
+        cordelia_crypto::bech32::encode_public_key(&d.pk()).unwrap()
+    );
+    {
+        let db = b.state.db.lock().unwrap();
+        entries::publish(
+            &b.state,
+            &db,
+            &personal,
+            &Write {
+                key: &naming_d,
+                content: &serde_json::json!({ "channel_id": channel }),
+                metadata: None,
+                item_type: "membership",
+                deleted: false,
+            },
+        )
+        .unwrap();
+    }
+    settle(&mut a, &mut b);
+
+    // A honours a request only from the device it names: D stays out.
+    let db = a.state.db.lock().unwrap();
+    assert!(!channels::is_member(&db, &channel, &d.pk()).unwrap());
 }
