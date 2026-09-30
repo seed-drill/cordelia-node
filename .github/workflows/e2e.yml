@@ -1,10 +1,10 @@
 name: E2E Topology Tests
 
+# Manual only. T1-T7 predate the relay-only personal-node design: every
+# run since 2026-03-20 has failed (e.g. T1 waits for a personal node to
+# reach a Hot peer with only a bootnode, which the RelaysOnly dial policy
+# never allows). They are replaced by v1 scenarios, which run on PRs.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
