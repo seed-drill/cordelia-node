@@ -409,7 +409,10 @@ lead_entity_id = "lead_a1b2"
 "#;
         let config: Config = toml::from_str(partial).unwrap();
         assert_eq!(config.swarm.swarm_index, Some(7));
-        assert_eq!(config.swarm.lead_identity_path.as_deref(), Some("/tmp/lead/identity.key"));
+        assert_eq!(
+            config.swarm.lead_identity_path.as_deref(),
+            Some("/tmp/lead/identity.key")
+        );
         assert_eq!(config.swarm.lead_entity_id.as_deref(), Some("lead_a1b2"));
 
         // Round-trip

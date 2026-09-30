@@ -846,7 +846,13 @@ mod tests {
     fn test_create_local_channel() {
         let conn = db::open_in_memory().unwrap();
         let creator = test_creator();
-        let ch = create_local(&conn, "cordelia:local:test-session", &creator, Some(&test_psk())).unwrap();
+        let ch = create_local(
+            &conn,
+            "cordelia:local:test-session",
+            &creator,
+            Some(&test_psk()),
+        )
+        .unwrap();
         assert_eq!(ch.scope, "local");
         assert_eq!(ch.access, "invite_only");
         assert_eq!(ch.channel_id, "cordelia:local:test-session");

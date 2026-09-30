@@ -730,11 +730,8 @@ async fn test_incoming_handshake_timeout() {
         let outcome = connection::inbound_accept(&ctx_b, incoming).await.unwrap();
         // Now B has one connection. Next accept will wait for a new
         // connection that never arrives.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            ep_b_accept.accept(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), ep_b_accept.accept()).await;
         (outcome, result)
     });
 

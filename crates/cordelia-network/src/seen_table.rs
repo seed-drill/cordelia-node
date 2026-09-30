@@ -55,11 +55,7 @@ impl SeenTable {
 
     /// Return hot relay peers that have NOT seen this item.
     /// If the hash is unknown, returns all peers (new item, no one has seen it).
-    pub fn forward_targets(
-        &self,
-        hash: &ContentHash,
-        hot_relay_peers: &[NodeId],
-    ) -> Vec<NodeId> {
+    pub fn forward_targets(&self, hash: &ContentHash, hot_relay_peers: &[NodeId]) -> Vec<NodeId> {
         match self.entries.get(hash) {
             Some(entry) => hot_relay_peers
                 .iter()
@@ -83,13 +79,12 @@ impl SeenTable {
     /// Evict expired entries (TTL sweep), then cap at SEEN_TABLE_MAX
     /// by removing oldest entries first.
     pub fn evict(&mut self) {
-        let ttl = std::time::Duration::from_secs(
-            cordelia_core::protocol::SEEN_TABLE_TTL_SECS,
-        );
+        let ttl = std::time::Duration::from_secs(cordelia_core::protocol::SEEN_TABLE_TTL_SECS);
         let now = Instant::now();
 
         // TTL sweep
-        self.entries.retain(|_, entry| now.duration_since(entry.first_seen) < ttl);
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.first_seen) < ttl);
 
         // Cap enforcement: remove oldest first
         let max = cordelia_core::protocol::SEEN_TABLE_MAX;
@@ -215,10 +210,13 @@ mod tests {
             let mut h = [0u8; 32];
             h[0] = (i & 0xFF) as u8;
             h[1] = ((i >> 8) & 0xFF) as u8;
-            st.entries.insert(h, SeenEntry {
-                peers: HashSet::new(),
-                first_seen: Instant::now(),
-            });
+            st.entries.insert(
+                h,
+                SeenEntry {
+                    peers: HashSet::new(),
+                    first_seen: Instant::now(),
+                },
+            );
         }
         assert!(st.len() > max);
         st.evict();
