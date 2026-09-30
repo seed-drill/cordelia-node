@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -131,6 +131,72 @@ ALTER TABLE channels ADD COLUMN scope TEXT NOT NULL DEFAULT 'network'
     CHECK(scope IN ('network', 'local'));
 "#;
 
+/// Migration v4: device invites (decision 2026-09-30-agent-memory-sync §4.1).
+///
+/// Rebuilds `channels` to admit the `inbox` channel type (SQLite cannot
+/// alter a CHECK constraint in place), then adds explicit trust, invite
+/// processing state, and node metadata. Runs with foreign keys disabled,
+/// per SQLite's table-rebuild procedure; `init_db` verifies integrity with
+/// `PRAGMA foreign_key_check` before committing.
+const MIGRATION_V4: &str = r#"
+CREATE TABLE channels_v4 (
+    channel_id    TEXT PRIMARY KEY,
+    channel_name  TEXT,
+    channel_type  TEXT NOT NULL CHECK(channel_type IN ('named', 'dm', 'group', 'inbox')),
+    mode          TEXT NOT NULL CHECK(mode IN ('realtime', 'batch')),
+    access        TEXT NOT NULL CHECK(access IN ('open', 'invite_only')),
+    creator_id    BLOB NOT NULL,
+    key_version   INTEGER NOT NULL DEFAULT 1,
+    psk_hash      BLOB,
+    descriptor    BLOB,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    scope         TEXT NOT NULL DEFAULT 'network' CHECK(scope IN ('network', 'local'))
+);
+
+INSERT INTO channels_v4 (channel_id, channel_name, channel_type, mode, access, creator_id,
+                         key_version, psk_hash, descriptor, created_at, updated_at, scope)
+    SELECT channel_id, channel_name, channel_type, mode, access, creator_id,
+           key_version, psk_hash, descriptor, created_at, updated_at, scope
+    FROM channels;
+
+DROP TABLE channels;
+ALTER TABLE channels_v4 RENAME TO channels;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_name ON channels(channel_name)
+    WHERE channel_name IS NOT NULL AND channel_type = 'named';
+
+-- Keys this node trusts to invite it into channels without asking:
+-- set by `add-device` and `accept`. A person's other devices are also
+-- trusted through membership of the personal channel (not stored here).
+CREATE TABLE IF NOT EXISTS trusted_keys (
+    entity_key  BLOB PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK(kind IN ('device', 'person')),
+    label       TEXT,
+    added_at    TEXT NOT NULL,
+    revoked_at  TEXT
+);
+
+-- Processing state for invite items received in this node's inbox.
+-- The invite itself stays in `items`; nothing secret is copied here.
+CREATE TABLE IF NOT EXISTS invites (
+    item_id     TEXT PRIMARY KEY,
+    inviter     BLOB NOT NULL,
+    channel_id  TEXT NOT NULL,
+    status      TEXT NOT NULL
+                CHECK(status IN ('pending', 'accepted', 'rejected', 'invalid', 'superseded')),
+    received_at TEXT NOT NULL,
+    decided_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_invites_status ON invites(status, received_at);
+
+CREATE TABLE IF NOT EXISTS node_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -158,10 +224,48 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 3)?;
     }
 
+    if current < 4 {
+        tracing::info!("applying migration v4 (device invites)");
+        migrate_v4(conn)?;
+    }
+
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     tracing::debug!(schema_version = actual, "database initialised");
 
     Ok(())
+}
+
+/// Apply migration v4 inside one transaction, with foreign keys disabled
+/// for the `channels` rebuild and integrity checked before commit.
+fn migrate_v4(conn: &Connection) -> Result<(), StorageError> {
+    // PRAGMA foreign_keys is a no-op inside a transaction, so toggle it outside.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<(), StorageError> {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        conn.execute_batch(MIGRATION_V4)?;
+
+        // Every child row must still reference an existing channel.
+        let violations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations > 0 {
+            return Err(StorageError::Migration(format!(
+                "v4: {violations} foreign key violations after channels rebuild"
+            )));
+        }
+
+        conn.pragma_update(None, "user_version", 4)?;
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 #[cfg(test)]
@@ -300,6 +404,139 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scope, "network");
+    }
+
+    #[test]
+    fn test_inbox_channel_type_accepted() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('inbox_ab', 'inbox', 'realtime', 'invite_only', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("v4 admits the inbox channel type");
+    }
+
+    #[test]
+    fn test_v4_tables_and_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let bad_kind = conn.execute(
+            "INSERT INTO trusted_keys (entity_key, kind, added_at) VALUES (X'01', 'robot', '2026-01-01')",
+            [],
+        );
+        assert!(
+            bad_kind.is_err(),
+            "trusted_keys.kind CHECK should reject 'robot'"
+        );
+
+        let bad_status = conn.execute(
+            "INSERT INTO invites (item_id, inviter, channel_id, status, received_at)
+             VALUES ('ci_1', X'01', 'grp_x', 'maybe', '2026-01-01')",
+            [],
+        );
+        assert!(
+            bad_status.is_err(),
+            "invites.status CHECK should reject 'maybe'"
+        );
+
+        conn.execute(
+            "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Upgrading a populated v3 database must keep every row and every
+    /// foreign key intact across the `channels` rebuild.
+    #[test]
+    fn test_upgrade_from_v3_preserves_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access, creator_id,
+                                   key_version, psk_hash, created_at, updated_at, scope)
+             VALUES ('named1', 'research', 'named', 'realtime', 'open', X'AA', 2, X'BB',
+                     '2026-01-01', '2026-01-02', 'network'),
+                    ('grp_1', NULL, 'group', 'batch', 'invite_only', X'AA', 1, NULL,
+                     '2026-01-01', '2026-01-01', 'local');
+             INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES ('named1', X'AA', 'owner', '2026-01-01'),
+                    ('grp_1', X'CC', 'member', '2026-01-01');
+             INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length)
+             VALUES ('ci_1', 'named1', X'AA', 'message', '2026-01-01', X'01', X'02', X'03', 1);",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+
+        let fk_on: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign keys must be re-enabled after v4");
+
+        let (name, kv, scope): (String, i64, String) = conn
+            .query_row(
+                "SELECT channel_name, key_version, scope FROM channels WHERE channel_id = 'named1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), kv, scope.as_str()),
+            ("research", 2, "network")
+        );
+
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM channels),
+                        (SELECT COUNT(*) FROM channel_members),
+                        (SELECT COUNT(*) FROM items)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 2, 1));
+
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+
+        // Foreign keys still enforced against the rebuilt table.
+        let orphan = conn.execute(
+            "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length)
+             VALUES ('ci_2', 'missing', X'AA', 'message', '2026-01-01', X'04', X'02', X'03', 1)",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "items.channel_id FK must survive the rebuild"
+        );
+
+        // Named-channel uniqueness index was recreated.
+        let dup = conn.execute(
+            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access, creator_id, created_at, updated_at)
+             VALUES ('named2', 'research', 'named', 'realtime', 'open', X'AA', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(dup.is_err(), "idx_channels_name must survive the rebuild");
     }
 
     // T3-1: verify all valid enum values are accepted

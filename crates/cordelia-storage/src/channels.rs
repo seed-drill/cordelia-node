@@ -260,7 +260,7 @@ pub fn resolve(name_or_id: &str) -> Result<ChannelId, CordeliaError> {
             let canonical = naming::canonicalize(name_or_id)?;
             Ok(ChannelId(naming::named_channel_id(&canonical)))
         }
-        ChannelType::Dm | ChannelType::Group | ChannelType::Protocol => {
+        ChannelType::Dm | ChannelType::Group | ChannelType::Inbox | ChannelType::Protocol => {
             Ok(ChannelId(name_or_id.to_string()))
         }
     }

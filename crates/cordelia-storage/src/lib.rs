@@ -18,4 +18,7 @@ pub enum StorageError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("migration failed: {0}")]
+    Migration(String),
 }
