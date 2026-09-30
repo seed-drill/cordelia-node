@@ -1,6 +1,7 @@
 #!/bin/sh
 # Cordelia install script
-# Usage: curl -sSL https://install.seeddrill.ai | sh
+# Usage: curl -fsSL https://github.com/seed-drill/cordelia-node/releases/latest/download/install.sh | sh
+#        Pre-release: CORDELIA_VERSION=v0.2.0-alpha.1 sh install.sh
 #
 # Detects platform/architecture, downloads binary from GitHub Releases,
 # verifies SHA-256 checksum, installs to ~/.cordelia/bin/, sets up
@@ -48,10 +49,12 @@ detect_platform() {
 
 resolve_version() {
     if [ "$VERSION" = "latest" ]; then
-        VERSION=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4) || true
         if [ -z "$VERSION" ]; then
-            echo "Error: could not determine latest version"
+            echo "Error: could not determine the latest release of ${REPO}."
+            echo "  If only pre-releases exist, pin one: CORDELIA_VERSION=v0.2.0-alpha.1 sh install.sh"
+            echo "  Releases: https://github.com/${REPO}/releases"
             exit 1
         fi
     fi
@@ -67,8 +70,14 @@ download_binary() {
     TMPDIR=$(mktemp -d)
     trap 'rm -rf "$TMPDIR"' EXIT
 
-    curl -sSL -o "${TMPDIR}/cordelia" "$BINARY_URL"
-    curl -sSL -o "${TMPDIR}/checksum.sha256" "$CHECKSUM_URL"
+    if ! curl -fsSL -o "${TMPDIR}/cordelia" "$BINARY_URL"; then
+        echo "Error: download failed: ${BINARY_URL}"
+        exit 1
+    fi
+    if ! curl -fsSL -o "${TMPDIR}/checksum.sha256" "$CHECKSUM_URL"; then
+        echo "Error: download failed: ${CHECKSUM_URL}"
+        exit 1
+    fi
 
     # Verify checksum
     echo "Verifying checksum..."

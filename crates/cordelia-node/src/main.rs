@@ -14,7 +14,7 @@ use cordelia_crypto::identity::NodeIdentity;
 mod p2p;
 
 #[derive(Parser)]
-#[command(name = "cordelia", about = "Encrypted pub/sub for AI agents")]
+#[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
 struct Cli {
     /// Path to config file
     #[arg(long, default_value = "~/.cordelia/config.toml")]
