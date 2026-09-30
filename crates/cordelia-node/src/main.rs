@@ -414,6 +414,13 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         announce_tx: Some(announce_tx),
     });
 
+    // Personal nodes receive invites and channel states in an inbox channel
+    // derived from their key (decision 2026-09-30 §4.1).
+    if config.network.role == "personal" {
+        let inbox = cordelia_api::membership::ensure_own_inbox(&state)?;
+        tracing::info!(%inbox, "inbox ready");
+    }
+
     // Start the tokio/actix runtime with graceful shutdown
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {

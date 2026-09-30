@@ -980,6 +980,18 @@ pub async fn p2p_loop(
             // Personal nodes: subscribed channels (list_for_entity), skip Phase 0.
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
+
+                // Apply channel states that arrived in our inbox since the last
+                // cycle (decision 2026-09-30 §4.1). Off the select loop: it does
+                // crypto and SQLite work under the db lock.
+                if node_role == "personal" {
+                    let inbox_state = state.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = cordelia_api::membership::process_inbox(&inbox_state) {
+                            tracing::warn!(error = %e, "inbox processing failed");
+                        }
+                    });
+                }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 

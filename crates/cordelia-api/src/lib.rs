@@ -3,10 +3,13 @@
 //! Spec: seed-drill/specs/channels-api.md
 
 pub mod auth;
+pub mod devices;
 pub mod error;
 pub mod handlers;
+pub mod membership;
 pub mod state;
 pub mod types;
+pub mod verify;
 
 use actix_web::web;
 
@@ -36,6 +39,20 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/search", web::post().to(handlers::search_handler))
             // Identity
             .route("/identity", web::post().to(handlers::identity)),
+    );
+
+    // Devices and invites (decision 2026-09-30-agent-memory-sync §4.1)
+    cfg.service(
+        web::scope("/api/v1/devices")
+            .route("/add", web::post().to(devices::add))
+            .route("/accept", web::post().to(devices::accept))
+            .route("/remove", web::post().to(devices::remove))
+            .route("/list", web::post().to(devices::list)),
+    );
+    cfg.service(
+        web::scope("/api/v1/invites")
+            .route("/list", web::post().to(devices::list_invites))
+            .route("/process", web::post().to(devices::process)),
     );
 
     // Health check (GET, unauthenticated, operations.md §8)
