@@ -120,15 +120,6 @@ pub fn inbox_channel_id(pubkey: &[u8; 32]) -> String {
     format!("inbox_{}", hex::encode(hash))
 }
 
-/// Derive channel ID for the __personal system channel.
-///
-/// `SHA-256("cordelia:channel:__personal:" + hex(pubkey))`
-pub fn personal_channel_id(pubkey: &[u8; 32]) -> String {
-    let preimage = format!("cordelia:channel:__personal:{}", hex::encode(pubkey));
-    let hash = Sha256::digest(preimage.as_bytes());
-    hex::encode(hash)
-}
-
 /// Derive a well-known PSK for a protocol channel.
 ///
 /// `protocol_psk = SHA-256("cordelia-protocol-channel:" + channel_name)`

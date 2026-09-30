@@ -224,17 +224,11 @@ fn cmd_init(
         }
     }
 
-    // 6. Create personal channel
-    let personal_channel_id = cordelia_storage::naming::personal_channel_id(&pk);
-    let personal_psk_path = cordelia_storage::psk::psk_path(&data_dir, &personal_channel_id);
-    if !personal_psk_path.exists() {
-        println!("Creating personal channel...");
-        let psk = cordelia_crypto::generate_psk()?;
-        cordelia_storage::psk::write_psk(&data_dir, &personal_channel_id, &psk)?;
-        println!("  done.");
-    }
+    // The personal channel is created on first use (`add-device`), as a
+    // group channel shared by all of a person's devices (decision
+    // 2026-09-30-agent-memory-sync §4.1).
 
-    // 7. Write config
+    // 6. Write config
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
