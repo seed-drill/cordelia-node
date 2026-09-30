@@ -80,6 +80,17 @@ impl EciesEnvelope {
             auth_tag,
         })
     }
+
+    /// Deserialise an envelope whose plaintext length is not known in
+    /// advance (e.g. a sealed channel state): everything between the IV and
+    /// the tag is ciphertext.
+    pub fn from_bytes_any(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let overhead = 32 + IV_LEN + TAG_LEN;
+        if bytes.len() <= overhead {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        Self::from_bytes(bytes, bytes.len() - overhead)
+    }
 }
 
 /// Derive a 32-byte wrapping key from an X25519 shared secret via HKDF-SHA256.

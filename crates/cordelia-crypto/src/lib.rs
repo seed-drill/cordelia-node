@@ -6,6 +6,7 @@
 
 pub mod aes_gcm;
 pub mod bech32;
+pub mod channel_state;
 pub mod ecies;
 pub mod identity;
 pub mod psk_envelope;
@@ -38,6 +39,9 @@ pub enum CryptoError {
 
     #[error("bech32 error: {0}")]
     Bech32Error(String),
+
+    #[error("invalid message: {0}")]
+    InvalidMessage(String),
 
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
