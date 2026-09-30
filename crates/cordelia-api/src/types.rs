@@ -40,6 +40,10 @@ pub struct PublishRequest {
     pub item_type: String,
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Publish a new revision of this key instead of appending an item
+    /// (decision 2026-09-30 §4.3). Group channels only.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +53,10 @@ pub struct PublishResponse {
     pub published_at: String,
     pub author: String,
     pub item_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
 }
 
 // ── Listen ─────────────────────────────────────────────────────────
@@ -406,4 +414,39 @@ pub struct PendingInviteEntry {
 #[derive(Serialize)]
 pub struct ListInvitesResponse {
     pub pending: Vec<PendingInviteEntry>,
+}
+
+// ── Keyed entries (decision 2026-09-30-agent-memory-sync §4.3) ──
+
+#[derive(Deserialize)]
+pub struct EntriesRequest {
+    pub channel: String,
+}
+
+#[derive(Serialize)]
+pub struct VersionResponse {
+    pub item_id: String,
+    pub author: String,
+    pub rev: u64,
+    pub published_at: String,
+    pub deleted: bool,
+    pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct EntryResponse {
+    pub key: String,
+    #[serde(flatten)]
+    pub current: VersionResponse,
+    /// Other versions at the same revision: concurrent edits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<VersionResponse>,
+}
+
+#[derive(Serialize)]
+pub struct EntriesResponse {
+    pub channel: String,
+    pub entries: Vec<EntryResponse>,
 }

@@ -160,6 +160,31 @@ pub async fn publish(
         return Err(ApiError::Forbidden("not a member of this channel".into()));
     }
 
+    // Keyed write: a new revision of the key (decision 2026-09-30 §4.3).
+    if let Some(key) = &body.key {
+        let published = crate::entries::publish(
+            &state,
+            &db,
+            &channel_id.0,
+            &crate::entries::Write {
+                key,
+                content: &body.content,
+                metadata: body.metadata.as_ref(),
+                item_type: &body.item_type,
+                deleted: false,
+            },
+        )?;
+        return Ok(HttpResponse::Ok().json(PublishResponse {
+            item_id: published.item_id,
+            channel: body.channel.clone(),
+            published_at: published.published_at,
+            author: encode_public_key(&pk).map_err(|e| ApiError::Internal(e.to_string()))?,
+            item_type: body.item_type.clone(),
+            key: Some(key.clone()),
+            rev: Some(published.rev),
+        }));
+    }
+
     // Serialize plaintext content
     let plaintext_envelope = serde_json::json!({
         "content": body.content,
@@ -219,6 +244,9 @@ pub async fn publish(
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &encrypted_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )?;
 
@@ -249,6 +277,8 @@ pub async fn publish(
             is_tombstone: false,
             parent_id: body.parent_id.clone(),
             exclude_peer: None, // local publish -> push to all peers
+            slot: None,
+            rev: None,
         });
     }
 
@@ -261,6 +291,8 @@ pub async fn publish(
         published_at,
         author: author_bech32,
         item_type: body.item_type.clone(),
+        key: None,
+        rev: None,
     }))
 }
 
@@ -299,14 +331,15 @@ pub async fn listen(
         &rows
     };
 
-    // Load PSK for decryption
-    let channel_psk = psk::read_psk(&state.home_dir, &channel_id.0)?;
+    // Decrypt each item with the key version it claims and its own
+    // associated data (keyed items bind slot and revision, §4.3).
+    let channel = channels::get_by_id(&db, &channel_id.0)?;
 
     // Decrypt and verify each item
     let mut listen_items = Vec::with_capacity(result_rows.len());
     for row in result_rows {
         let (content, metadata) =
-            decrypt_item_content(&channel_psk, &row.encrypted_blob, &channel_id.0);
+            split_envelope(crate::entries::decrypt(&state, channel.key_version, row));
         let signature_valid = verify_item_signature(row);
 
         let mut author_pk = [0u8; 32];
@@ -582,6 +615,9 @@ pub async fn dm(
                     content_hash: &content_hash,
                     signature: &signature,
                     encrypted_blob: &cbor_blob,
+                    is_tombstone: false,
+                    slot: None,
+                    rev: None,
                 },
             )?;
 
@@ -751,6 +787,9 @@ pub async fn group_invite(
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &cbor_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )?;
 
@@ -845,6 +884,9 @@ pub async fn group_remove(
                 content_hash: &content_hash,
                 signature: &signature,
                 encrypted_blob: &cbor_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )?;
     }
@@ -967,6 +1009,9 @@ pub async fn rotate_psk_handler(
                 content_hash: &content_hash,
                 signature: &signature,
                 encrypted_blob: &cbor_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )?;
     }
@@ -1055,8 +1100,7 @@ pub async fn search_handler(
         body.since.as_deref(),
     )?;
 
-    // Load PSK for decryption
-    let channel_psk = psk::read_psk(&state.home_dir, &channel_id.0)?;
+    let channel = channels::get_by_id(&db, &channel_id.0)?;
 
     // Fetch full items for each hit
     let mut results = Vec::with_capacity(hits.len());
@@ -1064,31 +1108,18 @@ pub async fn search_handler(
         // Look up the stored item
         let row = db
             .query_row(
-                "SELECT item_id, channel_id, author_id, item_type, published_at,
-                        is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
-                 FROM items WHERE item_id = ?1",
+                &format!(
+                    "SELECT {} FROM items WHERE item_id = ?1",
+                    items::ITEM_COLUMNS
+                ),
                 rusqlite::params![hit.item_id],
-                |row| {
-                    Ok(items::StoredItem {
-                        item_id: row.get(0)?,
-                        channel_id: row.get(1)?,
-                        author_id: row.get(2)?,
-                        item_type: row.get(3)?,
-                        published_at: row.get(4)?,
-                        is_tombstone: row.get::<_, i64>(5)? != 0,
-                        parent_id: row.get(6)?,
-                        key_version: row.get(7)?,
-                        content_hash: row.get(8)?,
-                        signature: row.get(9)?,
-                        encrypted_blob: row.get(10)?,
-                    })
-                },
+                items::stored_item_from_row,
             )
             .ok();
 
         if let Some(item) = row {
             let (content, metadata) =
-                decrypt_item_content(&channel_psk, &item.encrypted_blob, &channel_id.0);
+                split_envelope(crate::entries::decrypt(&state, channel.key_version, &item));
             let signature_valid = verify_item_signature(&item);
 
             let mut author_pk = [0u8; 32];
@@ -1205,30 +1236,64 @@ fn channel_label(channel_id: &str) -> &str {
 
 // ── Internal helpers ───────────────────────────────────────────────
 
-/// Decrypt an item's encrypted_blob and parse the JSON {content, metadata} envelope.
-fn decrypt_item_content(
-    psk: &[u8; 32],
-    encrypted_blob: &[u8],
-    channel_id: &str,
+/// Split a decrypted `{content, metadata}` envelope; `(Null, None)` if the
+/// item could not be decrypted.
+fn split_envelope(
+    envelope: Option<serde_json::Value>,
 ) -> (serde_json::Value, Option<serde_json::Value>) {
-    let plaintext = match cordelia_crypto::item_decrypt(psk, encrypted_blob, channel_id.as_bytes())
-    {
-        Ok(p) => p,
-        Err(_) => return (serde_json::Value::Null, None),
+    let Some(envelope) = envelope else {
+        return (serde_json::Value::Null, None);
     };
-
-    let envelope: serde_json::Value = match serde_json::from_slice(&plaintext) {
-        Ok(v) => v,
-        Err(_) => return (serde_json::Value::Null, None),
-    };
-
     let content = envelope
         .get("content")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let metadata = envelope.get("metadata").cloned().filter(|v| !v.is_null());
-
     (content, metadata)
+}
+
+// ── POST /api/v1/channels/entries ─────────────────────────────────
+
+/// Each key's current value in a channel, with concurrent versions.
+pub async fn entries(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<EntriesRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let channel_id = channels::resolve(&body.channel)?;
+
+    let version = |v: crate::entries::Version| -> Result<VersionResponse, ApiError> {
+        Ok(VersionResponse {
+            item_id: v.item_id,
+            author: encode_public_key(&v.author).map_err(|e| ApiError::Internal(e.to_string()))?,
+            rev: v.rev,
+            published_at: v.published_at,
+            deleted: v.deleted,
+            content: v.content,
+            metadata: v.metadata,
+        })
+    };
+    let mut entries = Vec::new();
+    for e in crate::entries::current(&state, &db, &channel_id.0)? {
+        entries.push(EntryResponse {
+            key: e.key,
+            current: version(e.current)?,
+            conflicts: e
+                .conflicts
+                .into_iter()
+                .map(version)
+                .collect::<Result<Vec<_>, _>>()?,
+        });
+    }
+    Ok(HttpResponse::Ok().json(EntriesResponse {
+        channel: body.channel.clone(),
+        entries,
+    }))
 }
 
 // ── Health + Status ────────────────────────────────────────────────

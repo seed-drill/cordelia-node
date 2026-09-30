@@ -6,8 +6,9 @@ use cordelia_storage::items::StoredItem;
 
 /// Verify an item's Ed25519 signature over its CBOR metadata envelope
 /// (ecies-envelope-encryption.md §11.7). The envelope commits to the
-/// author, channel, content hash, tombstone flag, item ID, key version and
-/// publication time, so none of them can be altered without detection.
+/// author, channel, content hash, tombstone flag, item ID, key version,
+/// publication time, and a replaceable item's slot and revision, so none of
+/// them can be altered without detection.
 pub fn verify_item_signature(item: &StoredItem) -> bool {
     let (Ok(author), Ok(content_hash), Ok(sig)) = (
         <[u8; 32]>::try_from(item.author_id.as_slice()),
@@ -17,15 +18,28 @@ pub fn verify_item_signature(item: &StoredItem) -> bool {
         return false;
     };
 
-    let Ok(cbor) = signing::build_item_metadata_envelope(
-        &author,
-        &item.channel_id,
-        &content_hash,
-        item.is_tombstone,
-        &item.item_id,
-        item.key_version,
-        &item.published_at,
-    ) else {
+    let slot: Option<[u8; 32]> = match &item.slot {
+        None => None,
+        Some(s) => match <[u8; 32]>::try_from(s.as_slice()) {
+            Ok(s) => Some(s),
+            Err(_) => return false,
+        },
+    };
+    if slot.is_some() != item.rev.is_some() {
+        return false;
+    }
+    let Ok(cbor) = signing::ItemMetadata {
+        author_id: &author,
+        channel_id: &item.channel_id,
+        content_hash: &content_hash,
+        is_tombstone: item.is_tombstone,
+        item_id: &item.item_id,
+        key_version: item.key_version,
+        published_at: &item.published_at,
+        slot: slot.as_ref(),
+        rev: item.rev,
+    }
+    .encode() else {
         return false;
     };
 

@@ -81,6 +81,7 @@ pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
         channel_id: channel_id.to_string(),
         since: since.map(|s| s.to_string()),
         limit,
+        after_seq: None,
     });
     let resp = crate::codec::send_request(stream, Protocol::ItemSync, &req).await?;
     match resp {
@@ -104,10 +105,35 @@ pub async fn send_sync_request_raw<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         channel_id: channel_id.to_string(),
         since: since.map(|s| s.to_string()),
         limit,
+        after_seq: None,
     });
     write_frame(send, &req).await?;
     let resp = read_frame(recv).await?;
     match resp {
+        WireMessage::SyncResponse(sr) => Ok(sr),
+        _ => Err(ItemSyncError::UnexpectedMessage),
+    }
+}
+
+/// Request one page of a channel by the responder's arrival sequence, on an
+/// already-opened sync stream (§4.4a). Returns items that arrived on the
+/// responder after `after_seq`; the response's `last_seq` is the cursor for
+/// the next page (absent if the responder predates arrival paging).
+pub async fn send_sync_page<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    send: &mut W,
+    recv: &mut R,
+    channel_id: &str,
+    after_seq: u64,
+    limit: u32,
+) -> Result<SyncResponse, ItemSyncError> {
+    let req = WireMessage::SyncRequest(SyncRequest {
+        channel_id: channel_id.to_string(),
+        since: None,
+        limit,
+        after_seq: Some(after_seq),
+    });
+    write_frame(send, &req).await?;
+    match read_frame(recv).await? {
         WireMessage::SyncResponse(sr) => Ok(sr),
         _ => Err(ItemSyncError::UnexpectedMessage),
     }
@@ -134,6 +160,7 @@ pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
     let resp = WireMessage::SyncResponse(SyncResponse {
         items: headers,
         has_more,
+        last_seq: None,
     });
     write_frame(stream, &resp).await?;
 
@@ -230,6 +257,45 @@ pub fn verify_content_hash(item: &Item) -> bool {
     item.content_hash == hash.as_slice()
 }
 
+/// Verify an item's Ed25519 signature over its metadata envelope,
+/// including slot and revision for replaceable items (decision 2026-09-30
+/// §4.3). Relays and personal nodes check this before storing anything, so
+/// an item's author, slot, and revision cannot be forged or altered.
+pub fn verify_item_signature(item: &Item) -> bool {
+    let (Ok(author), Ok(hash), Ok(sig)) = (
+        <[u8; 32]>::try_from(item.author_id.as_slice()),
+        <[u8; 32]>::try_from(item.content_hash.as_slice()),
+        <[u8; 64]>::try_from(item.signature.as_slice()),
+    ) else {
+        return false;
+    };
+    let slot: Option<[u8; 32]> = match &item.slot {
+        None => None,
+        Some(s) => match <[u8; 32]>::try_from(s.as_slice()) {
+            Ok(s) => Some(s),
+            Err(_) => return false,
+        },
+    };
+    if slot.is_some() != item.rev.is_some() {
+        return false;
+    }
+    let Ok(cbor) = cordelia_crypto::signing::ItemMetadata {
+        author_id: &author,
+        channel_id: &item.channel_id,
+        content_hash: &hash,
+        is_tombstone: item.is_tombstone,
+        item_id: &item.item_id,
+        key_version: item.key_version as i64,
+        published_at: &item.published_at,
+        slot: slot.as_ref(),
+        rev: item.rev,
+    }
+    .encode() else {
+        return false;
+    };
+    cordelia_crypto::identity::verify_signature(&author, &cbor, &sig)
+}
+
 /// Determine which item IDs from a sync response we need to fetch.
 ///
 /// `known_items` maps item_id -> (content_hash, published_at) for items we already have.
@@ -279,6 +345,8 @@ mod tests {
             published_at: "2026-03-10T14:30:00Z".into(),
             is_tombstone: false,
             parent_id: None,
+            slot: None,
+            rev: None,
         }
     }
 
@@ -296,6 +364,8 @@ mod tests {
             published_at: "2026-03-10T14:30:00Z".into(),
             is_tombstone: false,
             parent_id: None,
+            slot: None,
+            rev: None,
         }
     }
 
@@ -480,6 +550,124 @@ mod tests {
         assert!(!verify_content_hash(&item));
     }
 
+    fn signed_item(
+        id: &cordelia_crypto::NodeIdentity,
+        slot: Option<[u8; 32]>,
+        rev: Option<u64>,
+    ) -> Item {
+        let blob = vec![0x42; 48];
+        let hash: [u8; 32] = Sha256::digest(&blob).into();
+        let pk = id.public_key();
+        let cbor = cordelia_crypto::signing::ItemMetadata {
+            author_id: &pk,
+            channel_id: "grp_x",
+            content_hash: &hash,
+            is_tombstone: false,
+            item_id: "ci_sig",
+            key_version: 1,
+            published_at: "2026-09-30T00:00:00Z",
+            slot: slot.as_ref(),
+            rev,
+        }
+        .encode()
+        .unwrap();
+        Item {
+            item_id: "ci_sig".into(),
+            channel_id: "grp_x".into(),
+            item_type: "memory".into(),
+            content_length: blob.len() as u32,
+            encrypted_blob: blob,
+            content_hash: hash.to_vec(),
+            author_id: pk.to_vec(),
+            signature: id.sign(&cbor).to_vec(),
+            key_version: 1,
+            published_at: "2026-09-30T00:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: slot.map(|s| s.to_vec()),
+            rev,
+        }
+    }
+
+    #[test]
+    fn test_verify_item_signature() {
+        let id = cordelia_crypto::NodeIdentity::generate().unwrap();
+
+        let plain = signed_item(&id, None, None);
+        assert!(verify_item_signature(&plain));
+
+        let slotted = signed_item(&id, Some([0x5A; 32]), Some(3));
+        assert!(verify_item_signature(&slotted));
+
+        // Relabelled slot, replayed revision, forged author, flipped
+        // tombstone, or half a slot/rev pair: all rejected.
+        let mut moved = slotted.clone();
+        moved.slot = Some(vec![0x5B; 32]);
+        assert!(!verify_item_signature(&moved));
+        let mut bumped = slotted.clone();
+        bumped.rev = Some(4);
+        assert!(!verify_item_signature(&bumped));
+        let mut forged = slotted.clone();
+        forged.author_id = cordelia_crypto::NodeIdentity::generate()
+            .unwrap()
+            .public_key()
+            .to_vec();
+        assert!(!verify_item_signature(&forged));
+        let mut deleted = slotted.clone();
+        deleted.is_tombstone = true;
+        assert!(!verify_item_signature(&deleted));
+        let mut half = slotted.clone();
+        half.rev = None;
+        assert!(!verify_item_signature(&half));
+        let mut short_slot = slotted;
+        short_slot.slot = Some(vec![0x5A; 31]);
+        assert!(!verify_item_signature(&short_slot));
+    }
+
+    #[test]
+    fn test_new_fields_are_backward_compatible_on_the_wire() {
+        // Ordinary items encode without the new keys...
+        let item = make_test_item("ci_compat");
+        let mut buf = Vec::new();
+        ciborium::into_writer(&item, &mut buf).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(buf.as_slice()).unwrap();
+        let ciborium::Value::Map(entries) = value else {
+            panic!("not a map")
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(String::from))
+            .collect();
+        assert!(!keys.contains(&"slot".to_string()));
+        assert!(!keys.contains(&"rev".to_string()));
+
+        // ...and an encoding without them (from an older peer) decodes.
+        let decoded: Item = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded.slot, None);
+        assert_eq!(decoded.rev, None);
+
+        let req = SyncRequest {
+            channel_id: "ch".into(),
+            since: None,
+            limit: 10,
+            after_seq: None,
+        };
+        let mut rbuf = Vec::new();
+        ciborium::into_writer(&req, &mut rbuf).unwrap();
+        let back: SyncRequest = ciborium::from_reader(rbuf.as_slice()).unwrap();
+        assert_eq!(back.after_seq, None);
+
+        // Slotted items round-trip.
+        let id = cordelia_crypto::NodeIdentity::generate().unwrap();
+        let slotted = signed_item(&id, Some([0x11; 32]), Some(9));
+        let mut sbuf = Vec::new();
+        ciborium::into_writer(&slotted, &mut sbuf).unwrap();
+        let back: Item = ciborium::from_reader(sbuf.as_slice()).unwrap();
+        assert_eq!(back.slot, Some(vec![0x11; 32]));
+        assert_eq!(back.rev, Some(9));
+        assert!(verify_item_signature(&back));
+    }
+
     // T1-05: Empty items
     #[test]
     fn test_verify_empty_item() {
@@ -498,6 +686,8 @@ mod tests {
             published_at: "2026-03-14T10:00:00Z".into(),
             is_tombstone: false,
             parent_id: None,
+            slot: None,
+            rev: None,
         };
         assert!(verify_content_hash(&item));
     }
@@ -523,6 +713,7 @@ mod tests {
                 let resp = WireMessage::SyncResponse(SyncResponse {
                     items: vec![make_test_header(&format!("item_{expected_ch}"))],
                     has_more: false,
+                    last_seq: None,
                 });
                 write_frame(&mut server_w, &resp).await.unwrap();
             }

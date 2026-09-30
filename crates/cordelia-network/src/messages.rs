@@ -183,12 +183,21 @@ pub struct SyncRequest {
     pub channel_id: String,
     pub since: Option<String>,
     pub limit: u32,
+    /// Page by the responder's arrival sequence instead of `since`: return
+    /// items that arrived after this value, in arrival order (§4.4a).
+    /// Absent from older peers, which get the `since` behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub items: Vec<ItemHeader>,
     pub has_more: bool,
+    /// With `after_seq` paging: the responder's sequence number of the last
+    /// header returned, to send as the next request's `after_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +215,13 @@ pub struct ItemHeader {
     pub published_at: String,
     pub is_tombstone: bool,
     pub parent_id: Option<String>,
+    /// Replaceable-item slot (32 bytes) and revision (decision 2026-09-30
+    /// §4.3). Both present or both absent; omitted from the encoding when
+    /// absent, so ordinary items encode exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub slot: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +252,13 @@ pub struct Item {
     pub published_at: String,
     pub is_tombstone: bool,
     pub parent_id: Option<String>,
+    /// Replaceable-item slot (32 bytes) and revision (decision 2026-09-30
+    /// §4.3). Both present or both absent; omitted from the encoding when
+    /// absent, so ordinary items encode exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub slot: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
 }
 
 // ── Item-Push (0x06, §4.6) ─────────────────────────────────────────

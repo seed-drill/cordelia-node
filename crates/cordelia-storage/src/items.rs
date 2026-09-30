@@ -39,47 +39,161 @@ pub struct NewItem<'a> {
     pub content_hash: &'a [u8],
     pub signature: &'a [u8],
     pub encrypted_blob: &'a [u8],
+    pub is_tombstone: bool,
+    /// Replaceable-item slot and revision (decision 2026-09-30 §4.3).
+    /// Both set, or both `None` for an ordinary append-only item.
+    pub slot: Option<&'a [u8; 32]>,
+    pub rev: Option<u64>,
 }
 
-/// Insert an item with deduplication by content_hash.
-///
-/// Returns true if inserted, false if duplicate (content_hash already exists for this channel).
-pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaError> {
-    // Check for duplicate content_hash in same channel
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM items WHERE channel_id = ?1 AND content_hash = ?2)",
-            params![item.channel_id, item.content_hash],
-            |row| row.get(0),
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+impl<'a> NewItem<'a> {
+    /// An ordinary (append-only, live) item: no slot, not a tombstone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plain(
+        item_id: &'a str,
+        channel_id: &'a str,
+        author_id: &'a [u8; 32],
+        item_type: &'a str,
+        published_at: &'a str,
+        key_version: i64,
+        content_hash: &'a [u8],
+        signature: &'a [u8],
+        encrypted_blob: &'a [u8],
+    ) -> Self {
+        Self {
+            item_id,
+            channel_id,
+            author_id,
+            item_type,
+            published_at,
+            parent_id: None,
+            key_version,
+            content_hash,
+            signature,
+            encrypted_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
+        }
+    }
+}
 
-    if exists {
-        return Ok(false);
+/// Insert an item.
+///
+/// Returns false, storing nothing, if the channel already holds an item
+/// with the same content hash, or, for a slotted item, if the same author
+/// already has an equal or newer revision in that slot. Storing a slotted
+/// item deletes that author's older revisions of the slot: storage keeps
+/// the newest revision per (channel, slot, author), never per slot alone,
+/// so no one can overwrite another author's item (§4.3).
+///
+/// Every stored item gets the next value of this node's arrival sequence,
+/// which item-sync pages by.
+pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    if item.slot.is_some() != item.rev.is_some() {
+        return Err(CordeliaError::Validation(
+            "slot and rev must be set together".into(),
+        ));
     }
 
-    conn.execute(
-        "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                            is_tombstone, parent_id, key_version, content_hash, signature,
-                            encrypted_blob, content_length)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            item.item_id,
-            item.channel_id,
-            item.author_id.as_slice(),
-            item.item_type,
-            item.published_at,
-            item.parent_id,
-            item.key_version,
-            item.content_hash,
-            item.signature,
-            item.encrypted_blob,
-            item.encrypted_blob.len() as i64,
-        ],
-    )
-    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    conn.execute_batch("SAVEPOINT insert_item")
+        .map_err(storage)?;
+    let result = (|| -> Result<bool, CordeliaError> {
+        let duplicate: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM items WHERE channel_id = ?1 AND content_hash = ?2)",
+                params![item.channel_id, item.content_hash],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if duplicate {
+            return Ok(false);
+        }
 
-    Ok(true)
+        if let (Some(slot), Some(rev)) = (item.slot, item.rev) {
+            let newest: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(rev) FROM items
+                     WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
+                    params![item.channel_id, slot.as_slice(), item.author_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(storage)?;
+            if newest.is_some_and(|n| n >= rev_to_sql(rev)) {
+                return Ok(false);
+            }
+        }
+
+        let seq: i64 = conn
+            .query_row(
+                "UPDATE counters SET value = value + 1 WHERE name = 'item_seq' RETURNING value",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+
+        conn.execute(
+            "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                is_tombstone, parent_id, key_version, content_hash, signature,
+                                encrypted_blob, content_length, seq, slot, rev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                item.item_id,
+                item.channel_id,
+                item.author_id.as_slice(),
+                item.item_type,
+                item.published_at,
+                item.is_tombstone,
+                item.parent_id,
+                item.key_version,
+                item.content_hash,
+                item.signature,
+                item.encrypted_blob,
+                item.encrypted_blob.len() as i64,
+                seq,
+                item.slot.map(|s| s.as_slice()),
+                item.rev.map(rev_to_sql),
+            ],
+        )
+        .map_err(storage)?;
+
+        if let (Some(slot), Some(rev)) = (item.slot, item.rev) {
+            let args = params![
+                item.channel_id,
+                slot.as_slice(),
+                item.author_id.as_slice(),
+                rev_to_sql(rev)
+            ];
+            conn.execute(
+                "DELETE FROM search_content WHERE item_id IN (
+                     SELECT item_id FROM items
+                     WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3 AND rev < ?4)",
+                args,
+            )
+            .map_err(storage)?;
+            conn.execute(
+                "DELETE FROM items
+                 WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3 AND rev < ?4",
+                args,
+            )
+            .map_err(storage)?;
+        }
+        Ok(true)
+    })();
+
+    match &result {
+        Ok(_) => conn.execute_batch("RELEASE insert_item").map_err(storage)?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK TO insert_item; RELEASE insert_item");
+        }
+    }
+    result
+}
+
+/// Revisions are u64 on the wire and i64 in SQLite; clamp rather than wrap.
+fn rev_to_sql(rev: u64) -> i64 {
+    i64::try_from(rev).unwrap_or(i64::MAX)
 }
 
 /// A stored item row.
@@ -96,7 +210,17 @@ pub struct StoredItem {
     pub content_hash: Vec<u8>,
     pub signature: Vec<u8>,
     pub encrypted_blob: Vec<u8>,
+    /// This node's arrival sequence number for the item.
+    pub seq: i64,
+    pub slot: Option<Vec<u8>>,
+    pub rev: Option<u64>,
 }
+
+/// Column list matching [`stored_item_from_row`]; other modules select
+/// items with it so the mapping lives in one place.
+pub const ITEM_COLUMNS: &str = "item_id, channel_id, author_id, item_type, published_at,
+    is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob,
+    seq, slot, rev";
 
 /// Query items for the listen endpoint.
 ///
@@ -108,60 +232,48 @@ pub fn query_listen(
     since: Option<&str>,
     limit: u32,
 ) -> Result<Vec<StoredItem>, CordeliaError> {
-    let sql = if since.is_some() {
-        "SELECT item_id, channel_id, author_id, item_type, published_at,
-                is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
-         FROM items
-         WHERE channel_id = ?1
-           AND published_at > ?2
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
-           AND is_tombstone = 0
-         ORDER BY published_at ASC, item_id ASC
-         LIMIT ?3"
-    } else {
-        "SELECT item_id, channel_id, author_id, item_type, published_at,
-                is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
-         FROM items
-         WHERE channel_id = ?1
-           AND item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
-           AND is_tombstone = 0
-         ORDER BY published_at DESC, item_id DESC
-         LIMIT ?3"
-    };
-
-    let since_val = since.unwrap_or("");
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-
-    let rows = stmt
-        .query_map(params![channel_id, since_val, limit], |row| {
-            Ok(StoredItem {
-                item_id: row.get(0)?,
-                channel_id: row.get(1)?,
-                author_id: row.get(2)?,
-                item_type: row.get(3)?,
-                published_at: row.get(4)?,
-                is_tombstone: row.get::<_, i64>(5)? != 0,
-                parent_id: row.get(6)?,
-                key_version: row.get(7)?,
-                content_hash: row.get(8)?,
-                signature: row.get(9)?,
-                encrypted_blob: row.get(10)?,
-            })
-        })
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    const VISIBLE: &str =
+        "item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe', 'invite')
+               AND is_tombstone = 0";
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
 
     let mut items = Vec::new();
-    for row in rows {
-        items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    match since {
+        Some(since) => {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {ITEM_COLUMNS} FROM items
+                     WHERE channel_id = ?1 AND published_at > ?2 AND {VISIBLE}
+                     ORDER BY published_at ASC, item_id ASC
+                     LIMIT ?3"
+                ))
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map(params![channel_id, since, limit], stored_item_from_row)
+                .map_err(storage)?;
+            for row in rows {
+                items.push(row.map_err(storage)?);
+            }
+        }
+        None => {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {ITEM_COLUMNS} FROM items
+                     WHERE channel_id = ?1 AND {VISIBLE}
+                     ORDER BY published_at DESC, item_id DESC
+                     LIMIT ?2"
+                ))
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map(params![channel_id, limit], stored_item_from_row)
+                .map_err(storage)?;
+            for row in rows {
+                items.push(row.map_err(storage)?);
+            }
+            // Fetched newest first; respond oldest first.
+            items.reverse();
+        }
     }
-
-    // If no `since`, we fetched DESC (latest first) -- reverse to ASC for response
-    if since.is_none() {
-        items.reverse();
-    }
-
     Ok(items)
 }
 
@@ -177,14 +289,11 @@ pub fn query_sync(
     since: Option<&str>,
     limit: u32,
 ) -> Result<Vec<StoredItem>, CordeliaError> {
-    const COLUMNS: &str = "item_id, channel_id, author_id, item_type, published_at,
-         is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob";
-
     let mut items = Vec::new();
     match since {
         Some(since) => {
             let sql = format!(
-                "SELECT {COLUMNS} FROM items
+                "SELECT {ITEM_COLUMNS} FROM items
                  WHERE channel_id = ?1 AND published_at > ?2
                  ORDER BY published_at ASC, item_id ASC
                  LIMIT ?3"
@@ -201,7 +310,7 @@ pub fn query_sync(
         }
         None => {
             let sql = format!(
-                "SELECT {COLUMNS} FROM items
+                "SELECT {ITEM_COLUMNS} FROM items
                  WHERE channel_id = ?1
                  ORDER BY published_at DESC, item_id DESC
                  LIMIT ?2"
@@ -225,6 +334,124 @@ pub fn query_sync(
     Ok(items)
 }
 
+/// Items of a channel that arrived on this node after `after_seq`, in
+/// arrival order: the item-sync paging query. Includes internal types and
+/// tombstones, like [`query_sync`]. Arrival order is this node's own, so a
+/// peer paging with it never skips an item whatever the author's clock said.
+pub fn query_sync_after(
+    conn: &Connection,
+    channel_id: &str,
+    after_seq: i64,
+    limit: u32,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE channel_id = ?1 AND seq > ?2
+             ORDER BY seq ASC
+             LIMIT ?3"
+        ))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![channel_id, after_seq, limit], stored_item_from_row)
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(items)
+}
+
+/// This node's outbox: items authored by `author` in network-scope channels
+/// that no relay has acknowledged yet, oldest first. Bounded by count and
+/// total encrypted bytes, but always at least one item if any are pending.
+pub fn outbox(
+    conn: &Connection,
+    author: &[u8; 32],
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE author_id = ?1 AND relayed_at IS NULL
+               AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')
+             ORDER BY seq ASC
+             LIMIT ?2"
+        ))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(
+            params![author.as_slice(), max_items as i64],
+            stored_item_from_row,
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows {
+        let item = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        bytes += item.encrypted_blob.len();
+        if !batch.is_empty() && bytes > max_bytes {
+            break;
+        }
+        batch.push(item);
+    }
+    Ok(batch)
+}
+
+/// Record that a relay acknowledged these items.
+pub fn mark_relayed(conn: &Connection, item_ids: &[String]) -> Result<(), CordeliaError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare("UPDATE items SET relayed_at = ?1 WHERE item_id = ?2")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    for id in item_ids {
+        stmt.execute(params![now, id])
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// The highest revision stored for a slot, from any author.
+pub fn max_rev(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+) -> Result<Option<u64>, CordeliaError> {
+    let rev: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(rev) FROM items WHERE channel_id = ?1 AND slot = ?2",
+            params![channel_id, slot.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(rev.map(|r| r.max(0) as u64))
+}
+
+/// Every stored slotted item in a channel (all authors, all slots),
+/// including tombstones, in arrival order.
+pub fn slotted_items(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE channel_id = ?1 AND slot IS NOT NULL
+             ORDER BY seq ASC"
+        ))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![channel_id], stored_item_from_row)
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(items)
+}
+
 /// Fetch specific items of a channel by ID, for item-sync fetch requests.
 ///
 /// Includes internal types and tombstones, like [`query_sync`]. Unknown IDs
@@ -235,12 +462,9 @@ pub fn get_items_by_ids(
     item_ids: &[String],
 ) -> Result<Vec<StoredItem>, CordeliaError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT item_id, channel_id, author_id, item_type, published_at,
-                    is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
-             FROM items
-             WHERE channel_id = ?1 AND item_id = ?2",
-        )
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE channel_id = ?1 AND item_id = ?2"
+        ))
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
 
     let mut items = Vec::with_capacity(item_ids.len());
@@ -282,7 +506,8 @@ pub fn known_items(
     Ok(known)
 }
 
-fn stored_item_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredItem> {
+/// Map a row selected with [`ITEM_COLUMNS`] to a [`StoredItem`].
+pub fn stored_item_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredItem> {
     Ok(StoredItem {
         item_id: row.get(0)?,
         channel_id: row.get(1)?,
@@ -295,6 +520,9 @@ fn stored_item_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredItem> {
         content_hash: row.get(8)?,
         signature: row.get(9)?,
         encrypted_blob: row.get(10)?,
+        seq: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        slot: row.get(12)?,
+        rev: row.get::<_, Option<i64>>(13)?.map(|r| r.max(0) as u64),
     })
 }
 
@@ -363,6 +591,9 @@ mod tests {
             content_hash: &[0x01u8; 32],
             signature: &[0x02u8; 64],
             encrypted_blob: &[0x03u8; 100],
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         }
     }
 
@@ -595,6 +826,190 @@ mod tests {
             query_sync(&conn, "ch1", None, 50).unwrap().len(),
             INTERNAL_TYPES.len()
         );
+    }
+
+    fn slotted<'a>(
+        id: &'a str,
+        author: &'a [u8; 32],
+        slot: &'a [u8; 32],
+        rev: u64,
+        hash: &'a [u8; 32],
+    ) -> NewItem<'a> {
+        NewItem {
+            item_id: id,
+            channel_id: "ch1",
+            author_id: author,
+            item_type: "memory",
+            published_at: "2026-01-01T00:00:00Z",
+            parent_id: None,
+            key_version: 1,
+            content_hash: hash,
+            signature: &[0x02; 64],
+            encrypted_blob: &[0x03; 10],
+            is_tombstone: false,
+            slot: Some(slot),
+            rev: Some(rev),
+        }
+    }
+
+    fn ids(conn: &Connection) -> Vec<String> {
+        query_sync(conn, "ch1", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.item_id)
+            .collect()
+    }
+
+    #[test]
+    fn test_newer_revision_replaces_older_from_same_author() {
+        let conn = setup();
+        let (me, slot) = ([0xA1; 32], [0x51; 32]);
+        assert!(insert_item(&conn, &slotted("ci_r1", &me, &slot, 1, &[0x01; 32])).unwrap());
+        assert!(insert_item(&conn, &slotted("ci_r2", &me, &slot, 2, &[0x02; 32])).unwrap());
+        assert_eq!(ids(&conn), vec!["ci_r2"]);
+
+        // Stale and equal revisions are refused and change nothing.
+        assert!(!insert_item(&conn, &slotted("ci_r1b", &me, &slot, 1, &[0x03; 32])).unwrap());
+        assert!(!insert_item(&conn, &slotted("ci_r2b", &me, &slot, 2, &[0x04; 32])).unwrap());
+        assert_eq!(ids(&conn), vec!["ci_r2"]);
+
+        let kept = &query_sync(&conn, "ch1", None, 10).unwrap()[0];
+        assert_eq!(kept.slot.as_deref(), Some(&slot[..]));
+        assert_eq!(kept.rev, Some(2));
+    }
+
+    #[test]
+    fn test_other_authors_cannot_evict_an_item() {
+        let conn = setup();
+        let (me, stranger, slot) = ([0xA1; 32], [0xEE; 32], [0x51; 32]);
+        insert_item(&conn, &slotted("ci_mine", &me, &slot, 1, &[0x01; 32])).unwrap();
+
+        // A higher revision from someone else lands in their own cell.
+        insert_item(
+            &conn,
+            &slotted("ci_junk", &stranger, &slot, 999, &[0x02; 32]),
+        )
+        .unwrap();
+        let mut got = ids(&conn);
+        got.sort();
+        assert_eq!(got, vec!["ci_junk", "ci_mine"]);
+
+        // And replacing their own cell never touches mine.
+        insert_item(
+            &conn,
+            &slotted("ci_junk2", &stranger, &slot, 1000, &[0x03; 32]),
+        )
+        .unwrap();
+        let mut got = ids(&conn);
+        got.sort();
+        assert_eq!(got, vec!["ci_junk2", "ci_mine"]);
+    }
+
+    #[test]
+    fn test_slot_and_rev_must_come_together() {
+        let conn = setup();
+        let (me, slot) = ([0xA1; 32], [0x51; 32]);
+        let mut item = slotted("ci_x", &me, &slot, 1, &[0x01; 32]);
+        item.rev = None;
+        assert!(insert_item(&conn, &item).is_err());
+        assert!(ids(&conn).is_empty(), "failed insert leaves nothing behind");
+    }
+
+    #[test]
+    fn test_arrival_sequence_is_monotonic_and_never_reused() {
+        let conn = setup();
+        let (me, slot) = ([0xA1; 32], [0x51; 32]);
+        insert_item(&conn, &slotted("ci_s1", &me, &slot, 1, &[0x01; 32])).unwrap();
+        let first = query_sync(&conn, "ch1", None, 10).unwrap()[0].seq;
+
+        // Replacing deletes the row holding the current maximum...
+        insert_item(&conn, &slotted("ci_s2", &me, &slot, 2, &[0x02; 32])).unwrap();
+        let second = query_sync(&conn, "ch1", None, 10).unwrap()[0].seq;
+        assert!(second > first);
+
+        // ...and a later item still gets a fresh, larger number.
+        let mut plain = test_item("ci_p", "2026-01-01T00:00:00Z");
+        plain.content_hash = &[0x09; 32];
+        insert_item(&conn, &plain).unwrap();
+        let all = query_sync(&conn, "ch1", None, 10).unwrap();
+        let plain_seq = all.iter().find(|i| i.item_id == "ci_p").unwrap().seq;
+        assert!(plain_seq > second);
+    }
+
+    #[test]
+    fn test_query_sync_after_pages_in_arrival_order() {
+        let conn = setup();
+        // Authors' clocks disagree: the second arrival claims to be oldest.
+        for (i, ts) in [
+            "2026-01-02T00:00:00Z",
+            "2020-01-01T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = Box::leak(format!("ci_a{i}").into_boxed_str());
+            let mut item = test_item(id, ts);
+            let hash = Box::leak(Box::new([0x20 + i as u8; 32]));
+            item.content_hash = hash;
+            insert_item(&conn, &item).unwrap();
+        }
+
+        let page1 = query_sync_after(&conn, "ch1", 0, 2).unwrap();
+        assert_eq!(
+            page1.iter().map(|i| i.item_id.as_str()).collect::<Vec<_>>(),
+            vec!["ci_a0", "ci_a1"]
+        );
+        let page2 = query_sync_after(&conn, "ch1", page1[1].seq, 2).unwrap();
+        assert_eq!(
+            page2.iter().map(|i| i.item_id.as_str()).collect::<Vec<_>>(),
+            vec!["ci_a2"]
+        );
+        assert!(
+            query_sync_after(&conn, "ch1", page2[0].seq, 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_tombstone_flag_is_stored() {
+        let conn = setup();
+        let mut item = test_item("ci_t", "2026-01-01T00:00:00Z");
+        item.is_tombstone = true;
+        insert_item(&conn, &item).unwrap();
+        assert!(query_sync(&conn, "ch1", None, 10).unwrap()[0].is_tombstone);
+    }
+
+    #[test]
+    fn test_outbox_holds_own_unacknowledged_items() {
+        let conn = setup();
+        let me = [0x42u8; 32];
+        let other = [0x43u8; 32];
+        let mut mine1 = test_item("ci_m1", "2026-01-01T00:01:00Z");
+        mine1.content_hash = &[0x81; 32];
+        insert_item(&conn, &mine1).unwrap();
+        let mut theirs = test_item("ci_t1", "2026-01-01T00:02:00Z");
+        theirs.author_id = &other;
+        theirs.content_hash = &[0x82; 32];
+        insert_item(&conn, &theirs).unwrap();
+        let mut mine2 = test_item("ci_m2", "2026-01-01T00:03:00Z");
+        mine2.content_hash = &[0x83; 32];
+        insert_item(&conn, &mine2).unwrap();
+
+        let ids = |v: Vec<StoredItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 1 << 20).unwrap()),
+            vec!["ci_m1", "ci_m2"]
+        );
+
+        // Byte bound: blobs are 100 bytes each; a 150-byte batch holds one,
+        // and a batch always holds at least one.
+        assert_eq!(ids(outbox(&conn, &me, 10, 150).unwrap()), vec!["ci_m1"]);
+        assert_eq!(ids(outbox(&conn, &me, 10, 1).unwrap()), vec!["ci_m1"]);
+
+        mark_relayed(&conn, &["ci_m1".to_string()]).unwrap();
+        assert_eq!(ids(outbox(&conn, &me, 10, 1 << 20).unwrap()), vec!["ci_m2"]);
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item

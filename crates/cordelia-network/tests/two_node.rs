@@ -254,6 +254,8 @@ async fn test_two_node_item_sync() {
         published_at: "2026-03-14T10:30:00Z".into(),
         is_tombstone: false,
         parent_id: None,
+        slot: None,
+        rev: None,
     };
 
     let test_header = ItemHeader {
@@ -267,6 +269,8 @@ async fn test_two_node_item_sync() {
         published_at: "2026-03-14T10:30:00Z".into(),
         is_tombstone: false,
         parent_id: None,
+        slot: None,
+        rev: None,
     };
 
     // Server: handle sync request + fetch
@@ -618,6 +622,7 @@ async fn test_chaos_disconnect_during_sync() {
             channel_id: "test-channel".to_string(),
             since: None,
             limit: 100,
+            after_seq: None,
         },
     );
     cordelia_network::codec::write_frame(&mut send, &req)

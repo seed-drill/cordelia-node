@@ -38,6 +38,12 @@ pub fn store_item(
         tracing::warn!(item = %item.item_id, "content hash mismatch");
         return Err(());
     }
+    // Relays too: storage keeps the newest revision per (slot, author), which
+    // only holds if the author cannot be forged (decision 2026-09-30 §4.3).
+    if !cordelia_network::item_sync::verify_item_signature(item) {
+        tracing::warn!(item = %item.item_id, "invalid item signature");
+        return Err(());
+    }
 
     // Relay: ensure channel row exists (no FK violation, BV-21)
     if node_role == "relay" {
@@ -59,6 +65,11 @@ pub fn store_item(
         Ok(s) => s,
         Err(_) => return Err(()),
     };
+    // Well-formed after verify_item_signature: 32 bytes, set with rev.
+    let slot: Option<[u8; 32]> = item
+        .slot
+        .as_ref()
+        .and_then(|s| s.as_slice().try_into().ok());
 
     let new_item = cordelia_storage::items::NewItem {
         item_id: &item.item_id,
@@ -71,6 +82,9 @@ pub fn store_item(
         content_hash: &hash,
         signature: &sig,
         encrypted_blob: &item.encrypted_blob,
+        is_tombstone: item.is_tombstone,
+        slot: slot.as_ref(),
+        rev: item.rev,
     };
 
     match cordelia_storage::items::insert_item(db, &new_item) {
@@ -80,6 +94,116 @@ pub fn store_item(
             Err(())
         }
     }
+}
+
+/// Send this node's outbox (own items no relay has acknowledged) to one hot
+/// relay as a single push, and mark the items relayed once that relay has
+/// accounted for every one of them (decision 2026-09-30 §4.4a). Relays
+/// forward to each other, so one acknowledgement is enough. Rotates across
+/// hot relays so one unhelpful relay cannot stall the outbox; anything not
+/// acknowledged is simply sent again on a later flush.
+fn flush_outbox(
+    state: &web::Data<cordelia_api::state::AppState>,
+    governor: &cordelia_network::governor::Governor,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rotation: &mut usize,
+) {
+    use std::sync::atomic::Ordering;
+
+    let relays: Vec<NodeId> = governor
+        .hot_peers()
+        .into_iter()
+        .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
+        .collect();
+    if relays.is_empty() {
+        return;
+    }
+    let target = relays[*rotation % relays.len()].clone();
+    let Some(conn) = conn_mgr.get_connection(&target).cloned() else {
+        return;
+    };
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return; // previous flush still running
+    }
+
+    let batch = {
+        let Ok(db) = state.db.lock() else {
+            in_flight.store(false, Ordering::Release);
+            return;
+        };
+        cordelia_storage::items::outbox(
+            &db,
+            &state.identity.public_key(),
+            cordelia_core::protocol::OUTBOX_BATCH_MAX_ITEMS,
+            cordelia_core::protocol::OUTBOX_BATCH_MAX_BYTES,
+        )
+        .unwrap_or_default()
+    };
+    if batch.is_empty() {
+        in_flight.store(false, Ordering::Release);
+        return;
+    }
+    *rotation = rotation.wrapping_add(1);
+
+    let ids: Vec<String> = batch.iter().map(|i| i.item_id.clone()).collect();
+    let items: Vec<cordelia_network::messages::Item> = batch
+        .into_iter()
+        .map(|si| cordelia_network::messages::Item {
+            item_id: si.item_id,
+            channel_id: si.channel_id,
+            item_type: si.item_type,
+            content_length: si.encrypted_blob.len() as u32,
+            encrypted_blob: si.encrypted_blob,
+            content_hash: si.content_hash,
+            author_id: si.author_id,
+            signature: si.signature,
+            key_version: si.key_version as u32,
+            published_at: si.published_at,
+            is_tombstone: si.is_tombstone,
+            parent_id: si.parent_id,
+            slot: si.slot,
+            rev: si.rev,
+        })
+        .collect();
+
+    let state = state.clone();
+    let in_flight = in_flight.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let (mut send, mut recv) = open_bi(&conn).await?;
+            let mut stream = tokio::io::join(&mut recv, &mut send);
+            cordelia_network::item_sync::send_push(&mut stream, &items)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        match result {
+            Ok(ack) => {
+                let accounted =
+                    ack.stored + ack.dedup_dropped + ack.policy_rejected + ack.verification_failed;
+                if accounted as usize == ids.len() {
+                    if ack.policy_rejected + ack.verification_failed > 0 {
+                        tracing::warn!(
+                            relay = %target,
+                            rejected = ack.policy_rejected + ack.verification_failed,
+                            "relay rejected outbox items; not retrying them"
+                        );
+                    }
+                    if let Ok(db) = state.db.lock() {
+                        let _ = cordelia_storage::items::mark_relayed(&db, &ids);
+                    }
+                    tracing::debug!(relay = %target, items = ids.len(), stored = ack.stored, "outbox delivered");
+                } else {
+                    tracing::debug!(relay = %target, items = ids.len(), accounted, "outbox partially acknowledged; will resend");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(relay = %target, items = ids.len(), error = %e, "outbox push failed; will resend")
+            }
+        }
+        in_flight.store(false, Ordering::Release);
+    });
 }
 
 /// Canonical post-connection sequence (connection-lifecycle.md §1.2).
@@ -309,6 +433,13 @@ pub async fn p2p_loop(
     let swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>> =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
 
+    // Pull-sync cursors (§4.4a): per (peer, channel), the peer's arrival
+    // sequence of the last item we have processed. In memory: after a
+    // restart each channel is re-listed once, and only unknown items fetched.
+    let sync_cursors: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
@@ -376,6 +507,17 @@ pub async fn p2p_loop(
     let mut retry_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
+
+    // Outbox flush state (§4.4a): one flush in flight at a time, spaced by
+    // OUTBOX_FLUSH_INTERVAL_SECS, rotating across hot relays.
+    let outbox_interval_dur =
+        std::time::Duration::from_secs(cordelia_core::protocol::OUTBOX_FLUSH_INTERVAL_SECS);
+    let mut outbox_interval = tokio::time::interval(outbox_interval_dur);
+    outbox_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    outbox_interval.tick().await;
+    let mut last_outbox_flush = std::time::Instant::now() - outbox_interval_dur;
+    let outbox_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut outbox_rotation: usize = 0;
 
     // P2P telemetry counters
     let mut select_iterations: u64 = 0;
@@ -673,115 +815,23 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Push items to hot relay peers (batched, §7.1) ─────────
-            // Originator push: personal/keeper writes go to hot relay peers
-            // only. Relays handle distribution. Non-relay peers pull (§4.5).
-            // Scope-aware: skip items for local-scope channels (§8.2.2).
-            Some(first_push) = push_rx.recv() => {
-                let mut all_pushes = vec![first_push];
-                while let Ok(more) = push_rx.try_recv() {
-                    all_pushes.push(more);
+            // ── Outbox (§7.1, decision 2026-09-30 §4.4a) ───────────────
+            // Local writes notify here. Our own items stay in the outbox
+            // until a relay acknowledges them, and go out as one batched
+            // push per flush: at most one flush per OUTBOX_FLUSH_INTERVAL_SECS,
+            // so a burst of writes cannot trip a relay's per-peer write limit.
+            Some(_) = push_rx.recv() => {
+                while push_rx.try_recv().is_ok() {}
+                if last_outbox_flush.elapsed() >= outbox_interval_dur {
+                    last_outbox_flush = std::time::Instant::now();
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
                 }
+            }
 
-                // Filter out local-scope items (§8.2.2: never forward to relay mesh)
-                {
-                    let db = state.db.lock();
-                    if let Ok(db) = db {
-                        all_pushes.retain(|p| {
-                            !cordelia_storage::channels::is_local_scope(&db, &p.channel_id).unwrap_or(false)
-                        });
-                    }
-                }
-                if all_pushes.is_empty() { continue; }
-
-                // Target: hot relay peers only (§8.2.1)
-                let relay_targets: Vec<NodeId> = governor.hot_peers().into_iter()
-                    .filter(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false))
-                    .collect();
-
-                let mut peer_batches: std::collections::HashMap<
-                    NodeId,
-                    Vec<cordelia_network::messages::Item>,
-                > = std::collections::HashMap::new();
-
-                let item_count = all_pushes.len();
-                for push_item in all_pushes {
-                    let exclude = push_item.exclude_peer;
-                    let item = cordelia_network::messages::Item {
-                        item_id: push_item.item_id,
-                        channel_id: push_item.channel_id,
-                        item_type: push_item.item_type,
-                        encrypted_blob: push_item.encrypted_blob,
-                        content_hash: push_item.content_hash,
-                        content_length: 0,
-                        author_id: push_item.author_id,
-                        signature: push_item.signature,
-                        key_version: push_item.key_version,
-                        published_at: push_item.published_at,
-                        is_tombstone: push_item.is_tombstone,
-                        parent_id: push_item.parent_id,
-                    };
-
-                    for peer_id in &relay_targets {
-                        if exclude.as_ref() == Some(peer_id) {
-                            continue;
-                        }
-                        peer_batches
-                            .entry(peer_id.clone())
-                            .or_default()
-                            .push(item.clone());
-                    }
-                }
-
-                if peer_batches.is_empty() { continue; }
-                tracing::debug!(
-                    items = item_count,
-                    peers = peer_batches.len(),
-                    "push batch assembled"
-                );
-
-                // One push stream per peer, all items batched
-                for (peer_id, items) in peer_batches {
-                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
-                        let conn = conn.clone();
-                        let pid = peer_id;
-                        let batch_size = items.len();
-                        let rtx = retry_fail_tx.clone();
-                        tokio::spawn(async move {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch open_bi failed");
-                                    for item in items {
-                                        let ch = item.channel_id.clone();
-                                        let _ = rtx.send(RetryEntry {
-                                            item, peer_id: pid.clone(), channel_id: ch,
-                                            exclude_peer: None, attempt: 0,
-                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                                        });
-                                    }
-                                    return;
-                                }
-                            };
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
-                                Ok(ack) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, stored = ack.stored, "push batch delivered");
-                                }
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, items = batch_size, error = %e, "push batch failed");
-                                    for item in items {
-                                        let ch = item.channel_id.clone();
-                                        let _ = rtx.send(RetryEntry {
-                                            item, peer_id: pid.clone(), channel_id: ch,
-                                            exclude_peer: None, attempt: 0,
-                                            retry_at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                                        });
-                                    }
-                                }
-                            }
-                        });
-                    }
+            _ = outbox_interval.tick() => {
+                if node_role == "personal" && last_outbox_flush.elapsed() >= outbox_interval_dur {
+                    last_outbox_flush = std::time::Instant::now();
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
                 }
             }
 
@@ -1035,6 +1085,7 @@ pub async fn p2p_loop(
                     let is_relay_node = is_relay;
                     let rtx = repush_tx.clone();
                     let seen_ref = seen_table.clone();
+                    let cursors = sync_cursors.clone();
                     tokio::spawn(async move {
                         // Batched sync (§4.5): one stream per peer, all channels.
                         // Open one (send, recv) pair, write protocol byte once.
@@ -1073,67 +1124,83 @@ pub async fn p2p_loop(
                         if sync_channels.is_empty() { return; }
                         tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
 
-                        // Loop channels on single stream using send_sync_request_raw
+                        // Loop channels on one stream. Each channel is paged by the
+                        // peer's arrival sequence from our cursor (§4.4a), at most
+                        // SYNC_PAGES_PER_CYCLE pages per cycle; the cursor moves only
+                        // after a page is fully processed, so a failure retries it.
+                        const SYNC_PAGES_PER_CYCLE: usize = 10;
                         let mut total_stored: u64 = 0;
-                        for ch_id in &sync_channels {
-                            let resp = match cordelia_network::item_sync::send_sync_request_raw(&mut send, &mut recv, ch_id, None, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
-                                Ok(r) => r,
-                                Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); break; }
-                            };
-                            if resp.items.is_empty() { continue; }
-
-                            let known = {
-                                let db = match sync_state.db.lock() {
-                                    Ok(db) => db,
-                                    Err(_) => break,
+                        'channels: for ch_id in &sync_channels {
+                            let cursor_key = (target.clone(), ch_id.clone());
+                            for _page in 0..SYNC_PAGES_PER_CYCLE {
+                                let after = cursors.lock().ok().and_then(|c| c.get(&cursor_key).copied()).unwrap_or(0);
+                                let resp = match cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, ch_id, after, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
+                                    Ok(r) => r,
+                                    Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); break 'channels; }
                                 };
-                                let offered: Vec<String> = resp.items.iter().map(|h| h.item_id.clone()).collect();
-                                cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
-                            };
-                            let fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
-                            if fetch_ids.is_empty() { continue; }
 
-                            if let Err(e) = cordelia_network::item_sync::send_fetch_request(&mut send, &fetch_ids).await {
-                                tracing::debug!(peer = %target, error = %e, "fetch request failed");
-                                break; // Stream corrupted
-                            }
-                            let items = match cordelia_network::item_sync::read_fetch_response(&mut recv).await {
-                                Ok(items) => items,
-                                Err(e) => { tracing::debug!(peer = %target, error = %e, "fetch response failed"); break; }
-                            };
+                                if !resp.items.is_empty() {
+                                    let known = {
+                                        let db = match sync_state.db.lock() {
+                                            Ok(db) => db,
+                                            Err(_) => break 'channels,
+                                        };
+                                        let offered: Vec<String> = resp.items.iter().map(|h| h.item_id.clone()).collect();
+                                        cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
+                                    };
+                                    let fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
+                                    if !fetch_ids.is_empty() {
+                                        if let Err(e) = cordelia_network::item_sync::send_fetch_request(&mut send, &fetch_ids).await {
+                                            tracing::debug!(peer = %target, error = %e, "fetch request failed");
+                                            break 'channels; // Stream corrupted
+                                        }
+                                        let items = match cordelia_network::item_sync::read_fetch_response(&mut recv).await {
+                                            Ok(items) => items,
+                                            Err(e) => { tracing::debug!(peer = %target, error = %e, "fetch response failed"); break 'channels; }
+                                        };
 
-                            let mut stored_count = 0u32;
-                            let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
-                            {
-                                let db = match sync_state.db.lock() {
-                                    Ok(db) => db,
-                                    Err(_) => break,
-                                };
-                                for item in &items {
-                                    if let Ok(true) = store_item(&db, item, &role) {
-                                        stored_count += 1;
-                                        if is_relay_node {
-                                            newly_stored_items.push(item.clone());
+                                        let mut stored_count = 0u32;
+                                        let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
+                                        {
+                                            let db = match sync_state.db.lock() {
+                                                Ok(db) => db,
+                                                Err(_) => break 'channels,
+                                            };
+                                            for item in &items {
+                                                if let Ok(true) = store_item(&db, item, &role) {
+                                                    stored_count += 1;
+                                                    if is_relay_node {
+                                                        newly_stored_items.push(item.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Epidemic forwarding: relay queues sync-discovered items
+                                        // for repush, recording sync source in seen table.
+                                        if is_relay_node && !newly_stored_items.is_empty() {
+                                            if let Ok(mut st) = seen_ref.write() {
+                                                for item in &newly_stored_items {
+                                                    let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                                                    st.record_sender(&hash, &target);
+                                                }
+                                            }
+                                            for item in newly_stored_items {
+                                                let _ = rtx.send((item, target.clone()));
+                                            }
+                                        }
+                                        if stored_count > 0 {
+                                            tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync page complete");
+                                            total_stored += stored_count as u64;
                                         }
                                     }
                                 }
-                            }
-                            // Epidemic forwarding: relay queues sync-discovered items
-                            // for repush, recording sync source in seen table.
-                            if is_relay_node && !newly_stored_items.is_empty() {
-                                if let Ok(mut st) = seen_ref.write() {
-                                    for item in &newly_stored_items {
-                                        let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
-                                        st.record_sender(&hash, &target);
-                                    }
+
+                                // A peer without arrival paging answers once, the old way.
+                                let Some(last_seq) = resp.last_seq else { break };
+                                if let Ok(mut c) = cursors.lock() {
+                                    c.insert(cursor_key.clone(), last_seq);
                                 }
-                                for item in newly_stored_items {
-                                    let _ = rtx.send((item, target.clone()));
-                                }
-                            }
-                            if stored_count > 0 {
-                                tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync channel complete");
-                                total_stored += stored_count as u64;
+                                if !resp.has_more { break; }
                             }
                         }
                         // FIN: signal end of batch to server
@@ -1514,13 +1581,14 @@ async fn handle_inbound_push(
 
     // Track which items are newly stored (for selective re-push)
     let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
-    let (stored, dedup) = {
+    let (stored, dedup, rejected) = {
         let db = match state.db.lock() {
             Ok(db) => db,
             Err(_) => return,
         };
         let mut stored = 0u32;
         let mut dedup = 0u32;
+        let mut rejected = 0u32;
         for item in &payload.items {
             match store_item(&db, item, node_role) {
                 Ok(true) => {
@@ -1528,10 +1596,10 @@ async fn handle_inbound_push(
                     newly_stored.push(item.clone());
                 }
                 Ok(false) => dedup += 1,
-                Err(_) => {}
+                Err(_) => rejected += 1,
             }
         }
-        (stored, dedup)
+        (stored, dedup, rejected)
     };
 
     tracing::debug!(peer = %peer_id, stored, dedup, items = payload.items.len(), "processed inbound push");
@@ -1562,7 +1630,7 @@ async fn handle_inbound_push(
             stored,
             dedup_dropped: dedup,
             policy_rejected: 0,
-            verification_failed: 0,
+            verification_failed: rejected,
         });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
 }
@@ -1642,6 +1710,7 @@ async fn handle_inbound_sync(
                     cordelia_network::messages::SyncResponse {
                         items: vec![],
                         has_more: false,
+                        last_seq: None,
                     },
                 );
                 let _ = cordelia_network::codec::write_frame(send, &resp).await;
@@ -1658,19 +1727,32 @@ async fn handle_inbound_sync(
         }
 
         // Build sync response headers
-        let (headers, has_more) = {
+        let (headers, has_more, last_seq) = {
             let db = match state.db.lock() {
                 Ok(db) => db,
                 Err(_) => break,
             };
-            let items = cordelia_storage::items::query_sync(
-                &db,
-                &current_req.channel_id,
-                current_req.since.as_deref(),
-                current_req.limit,
-            )
+            let items = match current_req.after_seq {
+                Some(after) => cordelia_storage::items::query_sync_after(
+                    &db,
+                    &current_req.channel_id,
+                    i64::try_from(after).unwrap_or(i64::MAX),
+                    current_req.limit,
+                ),
+                None => cordelia_storage::items::query_sync(
+                    &db,
+                    &current_req.channel_id,
+                    current_req.since.as_deref(),
+                    current_req.limit,
+                ),
+            }
             .unwrap_or_default();
             let has_more = items.len() as u32 >= current_req.limit;
+            // Arrival paging: tell the peer where this page ended. With no
+            // items, echo its cursor so it keeps its place.
+            let last_seq = current_req
+                .after_seq
+                .map(|after| items.last().map(|i| i.seq.max(0) as u64).unwrap_or(after));
             let headers: Vec<cordelia_network::messages::ItemHeader> = items
                 .iter()
                 .map(|si| cordelia_network::messages::ItemHeader {
@@ -1684,15 +1766,18 @@ async fn handle_inbound_sync(
                     published_at: si.published_at.clone(),
                     is_tombstone: si.is_tombstone,
                     parent_id: si.parent_id.clone(),
+                    slot: si.slot.clone(),
+                    rev: si.rev,
                 })
                 .collect();
-            (headers, has_more)
+            (headers, has_more, last_seq)
         };
 
         let resp = cordelia_network::messages::WireMessage::SyncResponse(
             cordelia_network::messages::SyncResponse {
                 items: headers,
                 has_more,
+                last_seq,
             },
         );
         let _ = cordelia_network::codec::write_frame(send, &resp).await;
@@ -1727,6 +1812,8 @@ async fn handle_inbound_sync(
                         published_at: si.published_at,
                         is_tombstone: si.is_tombstone,
                         parent_id: si.parent_id,
+                        slot: si.slot,
+                        rev: si.rev,
                     })
                     .collect::<Vec<_>>()
                 };

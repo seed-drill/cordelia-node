@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod devices;
+pub mod entries;
 pub mod error;
 pub mod handlers;
 pub mod membership;
@@ -21,6 +22,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/subscribe", web::post().to(handlers::subscribe))
             .route("/publish", web::post().to(handlers::publish))
             .route("/listen", web::post().to(handlers::listen))
+            .route("/entries", web::post().to(handlers::entries))
             .route("/list", web::post().to(handlers::list))
             .route("/info", web::post().to(handlers::info))
             .route("/unsubscribe", web::post().to(handlers::unsubscribe))

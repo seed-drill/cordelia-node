@@ -350,6 +350,29 @@ pub const MAX_CONCURRENT_STREAMS: usize = 64;
 pub const WRITES_PER_PEER_PER_MINUTE: u32 =
     RATE_LIMIT_HEADROOM * (60 / REPUSH_INTERVAL_SECS) as u32;
 
+/// How often a personal node flushes its outbox: its own items that no
+/// relay has yet acknowledged, sent as one batched push (decision
+/// 2026-09-30-agent-memory-sync §4.4a).
+/// Derived: the fastest cadence within a relay's per-peer write limit,
+/// 60 / WRITES_PER_PEER_PER_MINUTE = 1.67s, rounded up to 2s (30 pushes/min
+/// against 36). One push per interval however many items were written, so
+/// a burst of writes can never trip the relay's limit.
+pub const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 2;
+
+/// Most encrypted bytes in one outbox push. Below MAX_MESSAGE_BYTES to leave
+/// room for per-item headers and CBOR framing; an item bigger than this
+/// (items are at most MAX_ITEM_BYTES) is still sent, alone.
+pub const OUTBOX_BATCH_MAX_BYTES: usize = 768 * 1024;
+
+/// Most items in one outbox push, bounding per-item header overhead.
+pub const OUTBOX_BATCH_MAX_ITEMS: usize = 500;
+
+// Checked at compile time: one push per flush interval stays within a
+// relay's write limit, and a full batch plus framing fits in one message.
+const _: () = assert!(OUTBOX_FLUSH_INTERVAL_SECS * WRITES_PER_PEER_PER_MINUTE as u64 >= 60);
+const _: () = assert!(OUTBOX_BATCH_MAX_BYTES + 128 * 1024 <= MAX_MESSAGE_BYTES as usize);
+const _: () = assert!(MAX_ITEM_BYTES <= OUTBOX_BATCH_MAX_BYTES);
+
 /// Write operations per channel per minute.
 /// Primitive: 100 writes/min aggregate across all peers.
 /// A busy channel with 10 writers each at the per-peer limit.
