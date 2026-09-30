@@ -473,3 +473,131 @@ fn re_adding_a_current_member_resends_without_new_epoch() {
     );
     assert!(trust::is_trusted(&b.state.db.lock().unwrap(), &a.pk()).unwrap());
 }
+
+/// Copy every item of `channel_id` that `from` holds into `to`'s database,
+/// keeping slots and revisions: what pull-sync does for a keyed channel.
+fn sync_channel(from: &Node, to: &Node, channel_id: &str) {
+    let stored = {
+        let db = from.state.db.lock().unwrap();
+        items::query_sync(&db, channel_id, None, 10_000).unwrap()
+    };
+    let db = to.state.db.lock().unwrap();
+    for it in stored {
+        let slot: Option<[u8; 32]> = it.slot.as_deref().map(|s| s.try_into().unwrap());
+        items::insert_item(
+            &db,
+            &items::NewItem {
+                item_id: &it.item_id,
+                channel_id: &it.channel_id,
+                author_id: it.author_id.as_slice().try_into().unwrap(),
+                item_type: &it.item_type,
+                published_at: &it.published_at,
+                parent_id: it.parent_id.as_deref(),
+                key_version: it.key_version,
+                content_hash: &it.content_hash,
+                signature: &it.signature,
+                encrypted_blob: &it.encrypted_blob,
+                is_tombstone: it.is_tombstone,
+                slot: slot.as_ref(),
+                rev: it.rev,
+            },
+        )
+        .unwrap();
+    }
+}
+
+/// A, B and C, all devices of one person.
+fn three_devices() -> (Node, Node, Node, String) {
+    let (a, b, personal) = paired();
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    relay(&a, &b);
+    relay(&a, &c);
+    membership::process_inbox(&b.state).unwrap();
+    membership::accept(&c.state, &a.pk(), None).unwrap();
+    (a, b, c, personal)
+}
+
+/// `joiner` asks to join `owner`'s project channel and is granted.
+fn join_project(owner: &Node, joiner: &Node, personal: &str, project: &str) {
+    assert!(membership::request_join(&joiner.state, project).unwrap());
+    sync_channel(joiner, owner, personal);
+    assert_eq!(membership::process_join_requests(&owner.state).unwrap(), 1);
+    relay(owner, joiner);
+    membership::process_inbox(&joiner.state).unwrap();
+    assert!(
+        joiner
+            .members(project)
+            .iter()
+            .any(|(k, _)| *k == joiner.pk())
+    );
+}
+
+#[test]
+fn removing_a_device_reaches_projects_the_remover_does_not_have() {
+    let (a, b, c, personal) = three_devices();
+
+    // B has a project that A does not; C joins it.
+    let project = membership::create_project_group(&b.state, "github.com/acme/app").unwrap();
+    join_project(&b, &c, &personal, &project);
+    let old_key = c.key(&project);
+
+    // A, which is not in the project, removes C.
+    let outcome = membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_eq!(outcome.channels_rotated, vec![personal.clone()]);
+
+    // B learns that C left the personal channel, and removes C from the
+    // project too, with a new key.
+    relay(&a, &b);
+    membership::process_inbox(&b.state).unwrap();
+    assert!(!b.members(&project).iter().any(|(k, _)| *k == c.pk()));
+    assert_ne!(b.key(&project), old_key);
+
+    // C is sent nothing, so keeps only the old key.
+    assert_eq!(relay(&b, &c), 0);
+    membership::process_inbox(&c.state).unwrap();
+    assert_eq!(c.key(&project), old_key);
+}
+
+#[test]
+fn only_one_remaining_owner_rotates_a_project_after_a_removal() {
+    let (a, b, c, personal) = three_devices();
+    let d = node();
+    membership::add_device(&a.state, &d.pk(), None).unwrap();
+    relay(&a, &b);
+    relay(&a, &c);
+    relay(&a, &d);
+    membership::process_inbox(&b.state).unwrap();
+    membership::process_inbox(&c.state).unwrap();
+    membership::accept(&d.state, &a.pk(), None).unwrap();
+
+    // B's project, joined by C and D; A never has it.
+    let project = membership::create_project_group(&b.state, "github.com/acme/app").unwrap();
+    join_project(&b, &c, &personal, &project);
+    join_project(&b, &d, &personal, &project);
+    relay(&b, &c);
+    membership::process_inbox(&c.state).unwrap();
+    let old_key = b.key(&project);
+
+    // A removes C. B and D both hear about it.
+    membership::remove_device(&a.state, &c.pk()).unwrap();
+    relay(&a, &b);
+    relay(&a, &d);
+    membership::process_inbox(&b.state).unwrap();
+    membership::process_inbox(&d.state).unwrap();
+
+    // Exactly one of them, the one with the lower key, rotated.
+    let (low, high) = if b.pk() < d.pk() { (&b, &d) } else { (&d, &b) };
+    assert_ne!(low.key(&project), old_key);
+    assert_eq!(
+        high.key(&project),
+        old_key,
+        "the other owner leaves it alone"
+    );
+
+    // The other then receives the new state and converges.
+    relay(low, high);
+    membership::process_inbox(&high.state).unwrap();
+    assert_eq!(high.key(&project), low.key(&project));
+    assert!(!high.members(&project).iter().any(|(k, _)| *k == c.pk()));
+}
