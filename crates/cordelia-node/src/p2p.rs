@@ -71,6 +71,9 @@ pub fn store_item(
         content_hash: &hash,
         signature: &sig,
         encrypted_blob: &item.encrypted_blob,
+        is_tombstone: false,
+        slot: None,
+        rev: None,
     };
 
     match cordelia_storage::items::insert_item(db, &new_item) {

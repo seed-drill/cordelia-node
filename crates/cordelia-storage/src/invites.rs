@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 
-use crate::items::StoredItem;
+use crate::items::{self, ITEM_COLUMNS, StoredItem};
 
 /// Item type of a sealed channel state in an inbox.
 pub const INVITE_ITEM_TYPE: &str = "invite";
@@ -93,35 +93,20 @@ pub fn unprocessed(
     inbox_channel_id: &str,
 ) -> Result<Vec<StoredItem>, CordeliaError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT i.item_id, i.channel_id, i.author_id, i.item_type, i.published_at,
-                    i.is_tombstone, i.parent_id, i.key_version, i.content_hash, i.signature,
-                    i.encrypted_blob
-             FROM items i
-             LEFT JOIN invites v ON v.item_id = i.item_id
-             WHERE i.channel_id = ?1
-               AND i.item_type = ?2
-               AND i.is_tombstone = 0
-               AND (v.item_id IS NULL OR v.status = 'pending')
-             ORDER BY i.published_at ASC, i.item_id ASC",
-        )
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE channel_id = ?1
+               AND item_type = ?2
+               AND is_tombstone = 0
+               AND item_id NOT IN (SELECT item_id FROM invites WHERE status != 'pending')
+             ORDER BY published_at ASC, item_id ASC"
+        ))
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let rows = stmt
-        .query_map(params![inbox_channel_id, INVITE_ITEM_TYPE], |row| {
-            Ok(StoredItem {
-                item_id: row.get(0)?,
-                channel_id: row.get(1)?,
-                author_id: row.get(2)?,
-                item_type: row.get(3)?,
-                published_at: row.get(4)?,
-                is_tombstone: row.get::<_, i64>(5)? != 0,
-                parent_id: row.get(6)?,
-                key_version: row.get(7)?,
-                content_hash: row.get(8)?,
-                signature: row.get(9)?,
-                encrypted_blob: row.get(10)?,
-            })
-        })
+        .query_map(
+            params![inbox_channel_id, INVITE_ITEM_TYPE],
+            items::stored_item_from_row,
+        )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
 
     let mut out = Vec::new();
@@ -208,6 +193,9 @@ mod tests {
                 content_hash: &[hash; 32],
                 signature: &[0; 64],
                 encrypted_blob: &[1, 2, 3],
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )
         .unwrap();

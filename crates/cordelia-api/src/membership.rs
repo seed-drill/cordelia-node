@@ -230,6 +230,9 @@ fn send_state(
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &sealed,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )?;
 

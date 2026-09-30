@@ -219,6 +219,9 @@ pub async fn publish(
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &encrypted_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )?;
 
@@ -582,6 +585,9 @@ pub async fn dm(
                     content_hash: &content_hash,
                     signature: &signature,
                     encrypted_blob: &cbor_blob,
+                    is_tombstone: false,
+                    slot: None,
+                    rev: None,
                 },
             )?;
 
@@ -751,6 +757,9 @@ pub async fn group_invite(
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &cbor_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )?;
 
@@ -845,6 +854,9 @@ pub async fn group_remove(
                 content_hash: &content_hash,
                 signature: &signature,
                 encrypted_blob: &cbor_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )?;
     }
@@ -967,6 +979,9 @@ pub async fn rotate_psk_handler(
                 content_hash: &content_hash,
                 signature: &signature,
                 encrypted_blob: &cbor_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )?;
     }
@@ -1064,25 +1079,12 @@ pub async fn search_handler(
         // Look up the stored item
         let row = db
             .query_row(
-                "SELECT item_id, channel_id, author_id, item_type, published_at,
-                        is_tombstone, parent_id, key_version, content_hash, signature, encrypted_blob
-                 FROM items WHERE item_id = ?1",
+                &format!(
+                    "SELECT {} FROM items WHERE item_id = ?1",
+                    items::ITEM_COLUMNS
+                ),
                 rusqlite::params![hit.item_id],
-                |row| {
-                    Ok(items::StoredItem {
-                        item_id: row.get(0)?,
-                        channel_id: row.get(1)?,
-                        author_id: row.get(2)?,
-                        item_type: row.get(3)?,
-                        published_at: row.get(4)?,
-                        is_tombstone: row.get::<_, i64>(5)? != 0,
-                        parent_id: row.get(6)?,
-                        key_version: row.get(7)?,
-                        content_hash: row.get(8)?,
-                        signature: row.get(9)?,
-                        encrypted_blob: row.get(10)?,
-                    })
-                },
+                items::stored_item_from_row,
             )
             .ok();
 

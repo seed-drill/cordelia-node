@@ -87,6 +87,9 @@ fn relay(from: &Node, to: &Node) -> usize {
                 content_hash: &it.content_hash,
                 signature: &it.signature,
                 encrypted_blob: &it.encrypted_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )
         .unwrap();
@@ -132,6 +135,9 @@ fn insert_signed(signer: &NodeIdentity, to: &Node, blob: Vec<u8>) {
             content_hash: &content_hash,
             signature: &signature,
             encrypted_blob: &blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
         },
     )
     .unwrap();
@@ -405,6 +411,9 @@ fn tampered_or_misaddressed_invites_are_invalid() {
                 content_hash: &it.content_hash,
                 signature: &it.signature,
                 encrypted_blob: &it.encrypted_blob,
+                is_tombstone: false,
+                slot: None,
+                rev: None,
             },
         )
         .unwrap();

@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -202,6 +202,32 @@ CREATE TABLE IF NOT EXISTS node_meta (
 );
 "#;
 
+/// Migration v5: replaceable items and arrival-order sync (decision
+/// 2026-09-30-agent-memory-sync §4.3, §4.4a).
+///
+/// - `seq`: this node's arrival sequence, from a counter that never goes
+///   backwards (deleting the newest row must not let a later item reuse its
+///   number, or a peer paging by `seq` would skip it). Existing rows take
+///   their rowid, which is already in insertion order.
+/// - `slot`, `rev`: set together on replaceable items.
+const MIGRATION_V5: &str = r#"
+ALTER TABLE items ADD COLUMN seq INTEGER;
+ALTER TABLE items ADD COLUMN slot BLOB;
+ALTER TABLE items ADD COLUMN rev INTEGER;
+UPDATE items SET seq = rowid;
+
+CREATE TABLE IF NOT EXISTS counters (
+    name   TEXT PRIMARY KEY,
+    value  INTEGER NOT NULL
+);
+INSERT OR REPLACE INTO counters (name, value)
+    VALUES ('item_seq', (SELECT COALESCE(MAX(seq), 0) FROM items));
+
+CREATE INDEX IF NOT EXISTS idx_items_channel_seq ON items(channel_id, seq);
+CREATE INDEX IF NOT EXISTS idx_items_slot ON items(channel_id, slot, author_id)
+    WHERE slot IS NOT NULL;
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -232,6 +258,21 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 4 {
         tracing::info!("applying migration v4 (device invites)");
         migrate_v4(conn)?;
+    }
+
+    if current < 5 {
+        tracing::info!("applying migration v5 (replaceable items, arrival order)");
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        match conn
+            .execute_batch(MIGRATION_V5)
+            .and_then(|_| conn.pragma_update(None, "user_version", 5))
+        {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e.into());
+            }
+        }
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -486,7 +527,20 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // v5: existing items got an arrival sequence, and the counter
+        // continues after it.
+        let (seq, counter): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT seq FROM items WHERE item_id = 'ci_1'),
+                        (SELECT value FROM counters WHERE name = 'item_seq')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(seq > 0);
+        assert_eq!(counter, seq);
 
         let fk_on: i64 = conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
