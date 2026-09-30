@@ -26,6 +26,11 @@ impl Drop for Node {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // CORDELIA_E2E_KEEP=1 keeps each node's directory (config, data, log).
+        if std::env::var_os("CORDELIA_E2E_KEEP").is_some() {
+            let dir = std::mem::replace(&mut self.dir, tempfile::tempdir().unwrap());
+            eprintln!("kept {} at {}", self.name, dir.keep().display());
+        }
     }
 }
 
@@ -278,6 +283,67 @@ fn add_device_accept_and_sync_through_a_relay() {
     // Nothing is waiting: every invite was applied.
     let invites = b.cli(&["invites"]);
     assert!(invites.contains("No invites waiting"), "{invites}");
+
+    // Keyed items (§4.3): A writes a key, B reads it; B edits, A sees it.
+    let entry = |n: &Node, key: &str| -> Option<(String, u64)> {
+        let resp = n.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        );
+        resp["entries"]
+            .as_array()?
+            .iter()
+            .find(|e| e["key"] == key)
+            .map(|e| {
+                (
+                    e["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    e["rev"].as_u64().unwrap_or(0),
+                )
+            })
+    };
+    let written = a.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": personal, "key": "notes.md", "content": { "text": "v1" } }),
+    );
+    assert_eq!(written["rev"], 1, "{written}");
+    wait_for("b reads a's key", &all, 90, || {
+        (entry(&b, "notes.md")? == ("v1".to_string(), 1)).then_some(())
+    });
+    b.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": personal, "key": "notes.md", "content": { "text": "v2 from b" } }),
+    );
+    wait_for("a reads b's edit", &all, 90, || {
+        (entry(&a, "notes.md")? == ("v2 from b".to_string(), 2)).then_some(())
+    });
+
+    // Paging (§4.4a): more items than one sync page, all arrive.
+    const BULK: usize = 150;
+    for i in 0..BULK {
+        a.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "content": { "text": format!("bulk {i}") } }),
+        );
+    }
+    wait_for("b receives every bulk item", &all, 120, || {
+        let listened = b.post(
+            "/api/v1/channels/listen",
+            serde_json::json!({ "channel": personal, "limit": 500 }),
+        );
+        let got = listened["items"]
+            .as_array()?
+            .iter()
+            .filter(|i| {
+                i["content"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("bulk "))
+            })
+            .count();
+        (got == BULK).then_some(())
+    });
 }
 
 #[test]

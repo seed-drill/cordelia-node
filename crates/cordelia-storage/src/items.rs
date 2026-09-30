@@ -413,6 +413,45 @@ pub fn mark_relayed(conn: &Connection, item_ids: &[String]) -> Result<(), Cordel
     Ok(())
 }
 
+/// The highest revision stored for a slot, from any author.
+pub fn max_rev(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+) -> Result<Option<u64>, CordeliaError> {
+    let rev: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(rev) FROM items WHERE channel_id = ?1 AND slot = ?2",
+            params![channel_id, slot.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(rev.map(|r| r.max(0) as u64))
+}
+
+/// Every stored slotted item in a channel (all authors, all slots),
+/// including tombstones, in arrival order.
+pub fn slotted_items(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE channel_id = ?1 AND slot IS NOT NULL
+             ORDER BY seq ASC"
+        ))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![channel_id], stored_item_from_row)
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
+    }
+    Ok(items)
+}
+
 /// Fetch specific items of a channel by ID, for item-sync fetch requests.
 ///
 /// Includes internal types and tombstones, like [`query_sync`]. Unknown IDs
