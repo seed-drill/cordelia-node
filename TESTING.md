@@ -41,15 +41,12 @@ cargo test -p cordelia-network -- --nocapture
 **Current baseline:** 467 tests (315 Rust unit/integration + SDK + E2E smoke).
 All must pass before any E2E testing.
 
-## E2E Testing on cordelia-test VM
+## E2E topology and scale suites (stale)
 
-### SSH Access
-
-```bash
-ssh rezi@cordelia-test
-export PATH=$HOME/.cargo/bin:$PATH
-cd ~/actions-runner/_work/cordelia-node/cordelia-node
-```
+These suites predate v1 and are stale; `e2e.yml` runs them only on demand.
+Run them from the repository root on any Linux host with Docker and the
+musl target. They used to run on a self-hosted runner, whose details are in
+the private infrastructure docs.
 
 ### Docker Cleanup (ALWAYS do this first)
 

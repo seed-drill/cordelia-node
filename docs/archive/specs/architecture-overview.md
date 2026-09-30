@@ -541,7 +541,7 @@ Initiator                 Bootnode              Joiner
 | Bootnodes | 2+ Seed Drill (low cost, discovery only) | SPO-operated (near-zero marginal cost) |
 | Relays | 1+ Seed Drill | SPO-operated (bandwidth commitment) |
 | Keepers | -- | SPO-operated (storage + PSK holding) |
-| CI/CD | cordelia-test VM (pdukvm20, 32GB, 8 CPU) | Same |
+| CI/CD | Self-hosted test VM (32GB, 8 CPU) | Same |
 | Monitoring | Prometheus + Grafana | Per-operator dashboards |
 
 ---

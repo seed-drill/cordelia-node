@@ -36,14 +36,12 @@ These tests bridge the gap between model checking (abstract, bounded) and produc
 
 | Property | Value |
 |----------|-------|
-| VM | `cordelia-test` (pdukvm20) |
-| Address | `192.168.3.206` |
+| Host | A self-hosted runner VM (details are in the private infrastructure docs) |
 | OS | Ubuntu 24.04 |
 | CPU | 8 cores |
 | RAM | 32 GB |
 | Docker | 29.2+ |
 | Runner labels | `[self-hosted, cordelia-docker]` |
-| Service | `actions.runner.seed-drill.cordelia-test` |
 
 ### 2.2 Container Image
 

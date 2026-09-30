@@ -8,9 +8,8 @@ they are never online at the same time (decision
 [2026-09-30-agent-memory-sync](../../docs/decisions/2026-09-30-agent-memory-sync.md) §4.6).
 
 Seed Drill runs two, `relay1.cordelia.seeddrill.ai` and
-`relay2.cordelia.seeddrill.ai`, each as a Docker container on an Ubuntu VM in
-one of our sites' DMZ. They list each other, so they form a mesh, and every
-node dials both by default. This guide is how they are set up; anyone can run
+`relay2.cordelia.seeddrill.ai`, at two of our own sites. They list each other,
+so they form a mesh, and every node dials both by default. This guide is how they are set up; anyone can run
 a relay the same way (see the end).
 
 | File | What |

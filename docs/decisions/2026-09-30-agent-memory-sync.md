@@ -140,7 +140,7 @@ Other agents come later as further adapters that map their own memory locations 
 
 Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. We run two, each also serving as a bootnode, so that losing one doesn't stop sync:
 
-- **`relay1`** and **`relay2`** run at two of our own sites, each as a Docker container on a VM in the site's DMZ, from the image and guide in [`deploy/relay/`](../../deploy/relay/). **Changed 2026-09-30:** the record planned `relay1` on Fly.io; running both at our sites is simpler, and the same image still runs on Fly. Running them ourselves also shows that a relay is something anyone can run.
+- **`relay1`** and **`relay2`** run at two of our own sites, as Docker containers, from the image and guide in [`deploy/relay/`](../../deploy/relay/). **Changed 2026-09-30:** the record planned `relay1` on Fly.io; running both at our sites is simpler, and the same image still runs on Fly. Running them ourselves also shows that a relay is something anyone can run.
 - **DNS:** `relay1.cordelia.seeddrill.ai` and `relay2.cordelia.seeddrill.ai`, UDP 9474. New nodes list both (`FALLBACK_PEERS`), and anyone can add their own. **As built:** nodes keep the names, not the addresses. They resolve them again while running and redial whenever they have no relay, so a node started before its network was up, or a relay whose address changed, is still reached.
 - **Retention** for relays is not implemented yet (section 9).
 
