@@ -63,6 +63,10 @@ pub struct FolderReport {
     pub published: usize,
     pub pulled: usize,
     pub conflicts: usize,
+    /// Conflict files in the folder now, full paths: each holds a version of
+    /// a memory that lost to a concurrent edit, until someone merges it
+    /// and deletes the file.
+    pub conflict_files: Vec<String>,
     /// Files present but not synced (unsafe name, not text, too large).
     pub skipped: Vec<String>,
 }
@@ -457,7 +461,22 @@ fn sync_folder(
             }
         }
     }
+    report.conflict_files = conflict_files(dir);
     Ok(report)
+}
+
+/// The conflict files in `dir` now, sorted, as full paths.
+fn conflict_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| names::is_conflict_name(&e.file_name().to_string_lossy()))
+        .map(|e| e.path().display().to_string())
+        .collect();
+    files.sort();
+    files
 }
 
 /// The folder and channel an action applies to.

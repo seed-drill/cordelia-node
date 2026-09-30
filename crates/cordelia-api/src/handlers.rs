@@ -1384,6 +1384,7 @@ pub async fn status(
     let channels = cordelia_storage::channels::list_for_entity(&db, &pk)
         .map(|c| c.len())
         .unwrap_or(0);
+    let outbox_waiting = cordelia_storage::items::outbox_len(&db, &pk).unwrap_or(0);
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
@@ -1392,5 +1393,6 @@ pub async fn status(
         "peers_warm": peers_warm,
         "channels_subscribed": channels,
         "sync_errors": sync_errors,
+        "outbox_waiting": outbox_waiting,
     })))
 }

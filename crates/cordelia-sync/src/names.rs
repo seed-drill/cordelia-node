@@ -26,9 +26,45 @@ pub fn conflict_name(name: &str, tag: &str) -> String {
     }
 }
 
+/// Whether `name` is a conflict file made by [`conflict_name`]: the stem
+/// ends in `.conflict-<tag>`, where the tag is 8 hex digits, optionally
+/// followed by `-<n>` when an earlier conflict file was already taken.
+pub fn is_conflict_name(name: &str) -> bool {
+    let Some((_, rest)) = name.rsplit_once(".conflict-") else {
+        return false;
+    };
+    let tag = rest.split_once('.').map_or(rest, |(tag, _ext)| tag);
+    let (hex, n) = tag.split_once('-').unwrap_or((tag, ""));
+    hex.len() == 8
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && (n.is_empty() || n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_conflict_names_are_recognised() {
+        for name in [
+            conflict_name("notes.md", "3f9a0b1c"),
+            conflict_name("a.b.md", "3f9a0b1c"),
+            conflict_name("README", "3f9a0b1c"),
+            conflict_name("notes.md", "3f9a0b1c-2"),
+        ] {
+            assert!(is_conflict_name(&name), "{name}");
+        }
+        for name in [
+            "notes.md",
+            "notes.conflict-.md",
+            "notes.conflict-3f9a.md",
+            "notes.conflict-3f9a0b1z.md",
+            "notes.conflict-3f9a0b1c-x.md",
+            "conflict-resolution.md",
+        ] {
+            assert!(!is_conflict_name(name), "{name}");
+        }
+    }
 
     #[test]
     fn test_safe_file_names() {

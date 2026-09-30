@@ -23,12 +23,14 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
     let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
+    let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
     Ok(SyncStatusResponse {
         enabled: dir.is_some(),
         dir,
         exclude,
         home,
         report,
+        last_change_at,
     })
 }
 

@@ -492,4 +492,7 @@ pub struct SyncStatusResponse {
     pub home: bool,
     /// The last cycle's report, once one has run.
     pub report: Option<serde_json::Value>,
+    /// When a cycle last sent or received a memory (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_change_at: Option<String>,
 }

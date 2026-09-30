@@ -11,6 +11,7 @@ use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
+mod indicator;
 mod p2p;
 
 #[derive(Parser)]
@@ -49,8 +50,15 @@ enum Commands {
         #[arg(long)]
         show_secrets: bool,
     },
-    /// Show node status
-    Status,
+    /// Show node status (`--line` for a status bar, `--json` for tools)
+    Status {
+        /// One line for a status bar, e.g. Claude Code's status line
+        #[arg(long, conflicts_with = "json")]
+        line: bool,
+        /// Machine-readable state, for widgets and scripts
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the node daemon
     Start,
     /// Stop the node daemon
@@ -142,7 +150,7 @@ fn main() -> anyhow::Result<()> {
             force,
             show_secrets,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
-        Some(Commands::Status) => cmd_status(&cli.config),
+        Some(Commands::Status { line, json }) => cmd_status(&cli.config, line, json),
         Some(Commands::Start) => cmd_start(&cli.config),
         Some(Commands::Stop) => {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
@@ -310,7 +318,55 @@ fn default_entity_name() -> String {
 
 // ── cordelia status ────────────────────────────────────────────────
 
-fn cmd_status(config_path: &str) -> anyhow::Result<()> {
+fn cmd_status(config_path: &str, line: bool, json: bool) -> anyhow::Result<()> {
+    let status = gather_status(config_path);
+    let (state, summary) = indicator::derive(&status.facts);
+
+    if line {
+        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+        let text = indicator::line(state, &summary, color);
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        return Ok(());
+    }
+    if json {
+        let mut out = serde_json::json!({
+            "state": state.as_str(),
+            "summary": summary,
+            "version": env!("CARGO_PKG_VERSION"),
+            "running": status.facts.running,
+        });
+        if let Some(device) = &status.device {
+            out["device"] = device.clone().into();
+            out["role"] = status.facts.role.clone().into();
+        }
+        if let Some(live) = &status.live {
+            out["uptime_secs"] = live["uptime_secs"].clone();
+            out["peers"] = serde_json::json!({
+                "hot": live["peers_hot"],
+                "warm": live["peers_warm"],
+            });
+            out["outbox_waiting"] = live["outbox_waiting"].clone();
+        }
+        if let Some(sync) = &status.sync {
+            let report = &sync["report"];
+            out["sync"] = serde_json::json!({
+                "enabled": sync["enabled"],
+                "last_cycle_at": report["at"],
+                "last_change_at": sync["last_change_at"],
+                "folders": report["folders"].as_array().map_or(0, Vec::len),
+                "projects_waiting": status.facts.projects_waiting,
+                "conflicts": status.facts.conflicts,
+                "unsynced": report["unsynced"],
+                "excluded": report["excluded"],
+                "errors": status.facts.errors,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
@@ -354,8 +410,8 @@ fn cmd_status(config_path: &str) -> anyhow::Result<()> {
 
     println!();
     println!("Node:");
-    match api_get(config_path, "/api/v1/status") {
-        Ok(live) => {
+    match &status.live {
+        Some(live) => {
             let n = |k: &str| live[k].as_u64().unwrap_or(0);
             println!("  Running:   yes, up {}", format_uptime(n("uptime_secs")));
             println!(
@@ -364,11 +420,92 @@ fn cmd_status(config_path: &str) -> anyhow::Result<()> {
                 n("peers_warm")
             );
             println!("  Sync errors: {}", n("sync_errors"));
+            if config.network.role == "personal" {
+                println!("  Memory:    {summary}");
+                for c in &status.facts.conflicts {
+                    println!("    conflict: {c}");
+                }
+                for e in &status.facts.errors {
+                    println!("    error:    {e}");
+                }
+            }
         }
-        Err(_) => println!("  Running:   no (start it with `cordelia start`)"),
+        None => println!("  Running:   no (start it with `cordelia start`)"),
     }
 
     Ok(())
+}
+
+/// What `cordelia status` knows about this device and its running node.
+struct GatheredStatus {
+    facts: indicator::Facts,
+    /// This device's public key (bech32), once initialised.
+    device: Option<String>,
+    /// `GET /api/v1/status` from the running node.
+    live: Option<serde_json::Value>,
+    /// `POST /api/v1/sync/status` from the running node.
+    sync: Option<serde_json::Value>,
+}
+
+/// Collect the facts for [`indicator::derive`] without failing: a missing
+/// config, an uninitialised device or a stopped node are states to report,
+/// not errors. Status bars call this often, so the node gets a short
+/// timeout.
+fn gather_status(config_path: &str) -> GatheredStatus {
+    let mut out = GatheredStatus {
+        facts: indicator::Facts::default(),
+        device: None,
+        live: None,
+        sync: None,
+    };
+    let Ok(mut config) = Config::load(&config::expand_tilde(config_path)) else {
+        return out;
+    };
+    config.apply_env_overrides();
+    out.facts.role = config.network.role.clone();
+    let Ok(identity) = NodeIdentity::from_file(&config.data_dir().join("identity.key")) else {
+        return out;
+    };
+    out.facts.initialised = true;
+    out.device = encode_public_key(&identity.public_key()).ok();
+
+    let timeout = std::time::Duration::from_secs(1);
+    let Ok(live) = local_api(&config, false, "/api/v1/status", timeout) else {
+        return out;
+    };
+    out.facts.running = true;
+    out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
+    out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
+    out.live = Some(live);
+
+    if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {
+        let report = &sync["report"];
+        out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
+        out.facts.report_age_secs = report["at"]
+            .as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds());
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        out.facts.errors = strings(&report["errors"]);
+        if let Some(folders) = report["folders"].as_array() {
+            for f in folders {
+                out.facts.conflicts.extend(strings(&f["conflict_files"]));
+                if f["waiting"].as_bool().unwrap_or(false) {
+                    out.facts.projects_waiting += 1;
+                }
+            }
+        }
+        out.sync = Some(sync);
+    }
+    out
 }
 
 /// `3h 12m`, `4m 05s`, `40s`.
@@ -704,10 +841,15 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             for e in &report.errors {
                 tracing::warn!(error = %e, "sync cycle error");
             }
+            let now = chrono::Utc::now().to_rfc3339();
+            let changed = report.folders.iter().any(|f| f.published + f.pulled > 0);
             let mut json = serde_json::to_value(&report).unwrap_or_default();
-            json["at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+            json["at"] = serde_json::Value::String(now.clone());
             if let Ok(db) = state.db.lock() {
                 let _ = meta::set(&db, meta::SYNC_CLAUDE_REPORT, &json.to_string());
+                if changed {
+                    let _ = meta::set(&db, meta::SYNC_CLAUDE_LAST_CHANGE, &now);
+                }
             }
         })
         .await;
@@ -948,20 +1090,36 @@ fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
+    local_api(&config, false, path, std::time::Duration::from_secs(3))
+}
 
+/// Call the running node's local API (GET, or POST with an empty body)
+/// with the node token, failing after `timeout`.
+fn local_api(
+    config: &Config,
+    post: bool,
+    path: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<serde_json::Value> {
     let token = std::fs::read_to_string(config.token_path())?;
     let url = format!(
         "http://{}:{}{path}",
         config.api.bind_address, config.node.http_port
     );
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .timeout_global(Some(timeout))
         .build()
         .into();
-    let json = agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {}", token.trim()))
-        .call()
+    let auth = format!("Bearer {}", token.trim());
+    let resp = if post {
+        agent
+            .post(&url)
+            .header("Authorization", &auth)
+            .send_json(serde_json::json!({}))
+    } else {
+        agent.get(&url).header("Authorization", &auth).call()
+    };
+    let json = resp
         .map_err(|e| {
             anyhow::anyhow!(
                 "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
