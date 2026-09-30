@@ -17,7 +17,12 @@ mod p2p;
 #[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
 struct Cli {
     /// Path to config file (accepted before or after the subcommand)
-    #[arg(long, global = true, default_value = "~/.cordelia/config.toml")]
+    #[arg(
+        long,
+        global = true,
+        env = "CORDELIA_CONFIG",
+        default_value = "~/.cordelia/config.toml"
+    )]
     config: String,
 
     #[command(subcommand)]
@@ -50,7 +55,7 @@ enum Commands {
     Start,
     /// Stop the node daemon
     Stop,
-    /// List connected peers
+    /// Show how many peers the running node is connected to
     Peers,
     /// List subscribed channels
     Channels,
@@ -143,7 +148,7 @@ fn main() -> anyhow::Result<()> {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
             Ok(())
         }
-        Some(Commands::Peers) => cmd_peers(),
+        Some(Commands::Peers) => cmd_peers(&cli.config),
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats) => cmd_stats(&cli.config),
         Some(Commands::Id) => cmd_pubkey(&cli.config),
@@ -347,7 +352,35 @@ fn cmd_status(config_path: &str) -> anyhow::Result<()> {
     println!("  P2P port:  {}", config.node.p2p_port);
     println!("  Role:      {}", config.network.role);
 
+    println!();
+    println!("Node:");
+    match api_get(config_path, "/api/v1/status") {
+        Ok(live) => {
+            let n = |k: &str| live[k].as_u64().unwrap_or(0);
+            println!("  Running:   yes, up {}", format_uptime(n("uptime_secs")));
+            println!(
+                "  Peers:     {} hot, {} warm",
+                n("peers_hot"),
+                n("peers_warm")
+            );
+            println!("  Sync errors: {}", n("sync_errors"));
+        }
+        Err(_) => println!("  Running:   no (start it with `cordelia start`)"),
+    }
+
     Ok(())
+}
+
+/// `3h 12m`, `4m 05s`, `40s`.
+fn format_uptime(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 // ── cordelia start ─────────────────────────────────────────────────
@@ -562,10 +595,18 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             tokio::spawn(run_sync_loop(state.clone()));
         }
 
+        // Bootnodes are names (the defaults are relay1/relay2 by DNS), so
+        // they are resolved again while the node runs, not only at startup.
+        let bootstrap_addrs = p2p::BootstrapAddrs::default();
+        if !is_bootnode {
+            let names: Vec<String> = config.network.bootnodes.iter().map(|b| b.addr.clone()).collect();
+            tokio::spawn(p2p::keep_bootnodes_resolved(
+                cordelia_network::bootstrap::bootstrap_hosts(&names),
+                bootstrap_addrs.clone(),
+            ));
+        }
+
         let p2p_handle = tokio::spawn(async move {
-            let bootstrap_addrs: Vec<std::net::SocketAddr> = config.network.bootnodes.iter()
-                .filter_map(|b| b.addr.parse().ok())
-                .collect();
             p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), bootstrap_addrs, trusted_peer_ids).await;
         });
 
@@ -675,10 +716,15 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
 
 // ── cordelia peers ─────────────────────────────────────────────────
 
-fn cmd_peers() -> anyhow::Result<()> {
-    println!("ENTITY          STATE   LATENCY   ADDRESS");
-    println!();
-    println!("No peers connected (P2P transport not yet implemented).");
+fn cmd_peers(config_path: &str) -> anyhow::Result<()> {
+    let live = api_get(config_path, "/api/v1/status")?;
+    let n = |k: &str| live[k].as_u64().unwrap_or(0);
+    println!(
+        "Connected peers: {} hot, {} warm.",
+        n("peers_hot"),
+        n("peers_warm")
+    );
+    println!("(A per-peer list is not available yet.)");
     Ok(())
 }
 
@@ -897,6 +943,35 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 // node (cordelia_api::membership), which must be started first.
 
 /// POST `body` to the local node's API and return the JSON response.
+/// GET a local API endpoint of the running node; errors if it isn't running.
+fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+
+    let token = std::fs::read_to_string(config.token_path())?;
+    let url = format!(
+        "http://{}:{}{path}",
+        config.api.bind_address, config.node.http_port
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .build()
+        .into();
+    let json = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {}", token.trim()))
+        .call()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+            )
+        })?
+        .body_mut()
+        .read_json()?;
+    Ok(json)
+}
+
 fn api_post(
     config_path: &str,
     path: &str,
@@ -1204,5 +1279,12 @@ mod tests {
             "0.0.0.0:9474"
         );
         assert!(p2p_bind_addr("no-such-host.invalid:9474", 9474).is_err());
+    }
+
+    #[test]
+    fn test_format_uptime() {
+        assert_eq!(format_uptime(40), "40s");
+        assert_eq!(format_uptime(245), "4m 05s");
+        assert_eq!(format_uptime(3 * 3600 + 12 * 60 + 9), "3h 12m");
     }
 }

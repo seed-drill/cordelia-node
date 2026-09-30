@@ -131,14 +131,24 @@ fn free_port() -> u16 {
 }
 
 fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
+    node_with_bootnode(
+        name,
+        role,
+        relay_p2p.map(|port| format!("127.0.0.1:{port}")),
+    )
+}
+
+/// A node whose one bootnode is `bootnode` (`host:port`; a name, like the
+/// default relays, or an address).
+fn node_with_bootnode(name: &'static str, role: &str, bootnode: Option<String>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
     let mut p2p = free_port();
     while p2p == http {
         p2p = free_port();
     }
-    let bootnodes = relay_p2p
-        .map(|port| format!("[[network.bootnodes]]\naddr = \"127.0.0.1:{port}\"\n"))
+    let bootnodes = bootnode
+        .map(|addr| format!("[[network.bootnodes]]\naddr = \"{addr}\"\n"))
         .unwrap_or_default();
     let (hot_min, hot_max) = if role == "relay" { (1, 10) } else { (1, 2) };
     let config = format!(
@@ -240,6 +250,16 @@ fn add_device_accept_and_sync_through_a_relay() {
     wait_for("b healthy", &all, 30, || healthy(&b));
     wait_for("a connected to the relay", &all, 60, || has_hot_peer(&a));
     wait_for("b connected to the relay", &all, 60, || has_hot_peer(&b));
+
+    // `cordelia status` reports the running node's connections.
+    let status = a.cli(&["status"]);
+    assert!(status.contains("Running:   yes"), "{status}");
+    let hot: u64 = status
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Peers:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("status lacks a Peers line:\n{status}"));
+    assert!(hot >= 1, "{status}");
 
     // The documented flow: one key copied in each direction.
     let b_key = b.cli(&["id"]).trim().to_string();
@@ -372,6 +392,34 @@ fn add_device_accept_and_sync_through_a_relay() {
 }
 
 #[test]
+fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
+    // The relay is given by name, as the default relays are, and does not
+    // exist yet when the node starts: its startup dial fails, and it must
+    // keep resolving and retrying the name rather than give up.
+    let mut relay = node("relay", "relay", None);
+    let mut a = node_with_bootnode(
+        "early",
+        "personal",
+        Some(format!("localhost:{}", relay.p2p)),
+    );
+    a.start();
+    wait_for("a healthy", &[&a], 30, || healthy(&a));
+    wait_for("a's startup dial to give up", &[&a], 60, || {
+        std::fs::read_to_string(a.log())
+            .ok()?
+            .contains("bootstrap complete")
+            .then_some(())
+    });
+    assert!(has_hot_peer(&a).is_none(), "no relay yet, so no peer");
+
+    relay.start();
+    wait_for("relay healthy", &[&relay, &a], 30, || healthy(&relay));
+    wait_for("a reaches the relay by name", &[&relay, &a], 60, || {
+        has_hot_peer(&a)
+    });
+}
+
+#[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
     let out = Command::new(BIN)
@@ -384,6 +432,10 @@ fn cli_reports_when_the_node_is_not_running() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cordelia start"), "{stderr}");
+
+    // `status` still works, and says the node is not running.
+    let status = n.cli(&["status"]);
+    assert!(status.contains("Running:   no"), "{status}");
 }
 
 /// A Claude Code project folder under `home` whose sessions ran in `cwd`;

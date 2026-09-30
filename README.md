@@ -72,7 +72,7 @@ cargo test --all               # unit, protocol, and end-to-end tests
 | `crates/cordelia-api` | Local REST API; devices, invites, keyed entries, membership |
 | `crates/cordelia-sync` | The Claude Code adapter |
 | `crates/cordelia-node` | The `cordelia` binary: CLI, daemon, p2p loop |
-| `deploy/relay` | Relay image and configs (Fly.io and self-hosted) |
+| `deploy/relay` | Relay image, Docker Compose and a guide to running a relay |
 | `docs/decisions` | Decision records; [`2026-09-30-agent-memory-sync.md`](docs/decisions/2026-09-30-agent-memory-sync.md) is the v1 design |
 | `docs/specs` | Protocol and component specs, each with a note on what v1 changed |
 | `docs/archive` | Pre-v1 documents, kept for history |
