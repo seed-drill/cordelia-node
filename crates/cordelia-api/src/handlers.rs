@@ -1217,10 +1217,7 @@ fn decrypt_item_content(
         .get("content")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let metadata = envelope
-        .get("metadata")
-        .cloned()
-        .and_then(|v| if v.is_null() { None } else { Some(v) });
+    let metadata = envelope.get("metadata").cloned().filter(|v| !v.is_null());
 
     (content, metadata)
 }

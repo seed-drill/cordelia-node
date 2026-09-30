@@ -106,6 +106,17 @@ impl SeenTable {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Whether no entries are currently tracked.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for SeenTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

@@ -144,12 +144,11 @@ fn derive_child_seed(lead_seed: &[u8; 32], index: u32) -> Result<[u8; 32], Crypt
 /// Worst case ~2.5ms for max_check=256.
 pub fn verify_swarm_child(lead_seed: &[u8; 32], peer_pk: &[u8; 32], max_check: u32) -> Option<u32> {
     for i in 0..max_check {
-        if let Ok(child_seed) = derive_child_seed(lead_seed, i) {
-            if let Ok(child) = NodeIdentity::from_seed(child_seed) {
-                if child.public_key() == *peer_pk {
-                    return Some(i);
-                }
-            }
+        if let Ok(child_seed) = derive_child_seed(lead_seed, i)
+            && let Ok(child) = NodeIdentity::from_seed(child_seed)
+            && child.public_key() == *peer_pk
+        {
+            return Some(i);
         }
     }
     None

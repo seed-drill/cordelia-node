@@ -192,16 +192,17 @@ pub fn post_connect(
         .peer_info(node_id)
         .map(|p| p.state == cordelia_network::governor::PeerState::Hot)
         .unwrap_or(false);
-    if peer_is_hot && node_role != "relay" {
-        if let Some(conn) = conn_mgr.get_connection(node_id) {
-            let conn = conn.clone();
-            let announce_state = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
-                    tracing::debug!(error = %e, "channel announcements failed on connect");
-                }
-            });
-        }
+    if peer_is_hot
+        && node_role != "relay"
+        && let Some(conn) = conn_mgr.get_connection(node_id)
+    {
+        let conn = conn.clone();
+        let announce_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                tracing::debug!(error = %e, "channel announcements failed on connect");
+            }
+        });
     }
 
     // Step 8: Spawn stream handler
@@ -231,6 +232,10 @@ pub fn post_connect(
 
 /// Background task that accepts incoming QUIC connections, handles
 /// outbound item pushes, and manages peer lifecycle.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "config args move into a struct when the relay work reshapes this loop"
+)]
 pub async fn p2p_loop(
     mut conn_mgr: cordelia_network::connection::ConnectionManager,
     state: web::Data<cordelia_api::state::AppState>,
@@ -386,7 +391,7 @@ pub async fn p2p_loop(
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         our_node_id.0.hash(&mut h);
-        (h.finish() % (repush_base * 1000)) as u64 // ms jitter within interval
+        h.finish() % (repush_base * 1000) // ms jitter within interval
     };
     let repush_start = std::time::Duration::from_millis(repush_jitter);
     tokio::time::sleep(repush_start).await;
@@ -645,23 +650,23 @@ pub async fn p2p_loop(
                         }
                         let idx = (peer_share_rotation + offset) % candidates.len();
                         let peer_addr = candidates[idx];
-                        if let Some(addr_str) = peer_addr.addrs.first() {
-                            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                                if in_flight.contains(&addr) { continue; }
-                                in_flight.insert(addr);
-                                let ctx = connect_ctx.clone();
-                                let tx = connect_tx.clone();
-                                tokio::spawn(async move {
-                                    match cordelia_network::connection::outbound_connect(&ctx, addr).await {
-                                        Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
-                                        Err(e) => {
-                                            tracing::debug!(addr = %addr, error = %e, "peer-share connect failed");
-                                            let _ = tx.send(Err((addr, e.to_string())));
-                                        }
+                        if let Some(addr_str) = peer_addr.addrs.first()
+                            && let Ok(addr) = addr_str.parse::<std::net::SocketAddr>()
+                        {
+                            if in_flight.contains(&addr) { continue; }
+                            in_flight.insert(addr);
+                            let ctx = connect_ctx.clone();
+                            let tx = connect_tx.clone();
+                            tokio::spawn(async move {
+                                match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                                    Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                                    Err(e) => {
+                                        tracing::debug!(addr = %addr, error = %e, "peer-share connect failed");
+                                        let _ = tx.send(Err((addr, e.to_string())));
                                     }
-                                });
-                                spawned += 1;
-                            }
+                                }
+                            });
+                            spawned += 1;
                         }
                     }
                     peer_share_rotation = peer_share_rotation.wrapping_add(spawned);
@@ -887,7 +892,7 @@ pub async fn p2p_loop(
                 let seen_len = {
                     let mut st = seen_table.write().unwrap_or_else(|e| e.into_inner());
                     st.evict(); // TTL sweep piggy-backed on 5s timer
-                    for (_, (item, _source)) in &pending {
+                    for (item, _source) in pending.values() {
                         let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
                         let targets = st.forward_targets(&hash, &relay_peers);
                         if !targets.is_empty() {
@@ -951,7 +956,7 @@ pub async fn p2p_loop(
             // to all hot peers so they add us to their push routing.
             Some(_channel_id) = announce_rx.recv() => {
                 // Drain all pending announces (batch subscribes)
-                while let Ok(_) = announce_rx.try_recv() {}
+                while announce_rx.try_recv().is_ok() {}
                 // Send full channel list to all hot peers (simpler than
                 // incremental per-channel -- reconnect-safe too)
                 if node_role != "relay" {
@@ -1182,16 +1187,18 @@ pub async fn p2p_loop(
                         tracing::info!(peer = %node_id, from, to, "gov: state transition");
 
                         // Send channel announcements on warm->hot promotion (non-relay only, §4.4)
-                        if from == "warm" && to == "hot" && node_role != "relay" {
-                            if let Some(conn) = conn_mgr.get_connection(node_id) {
-                                let conn = conn.clone();
-                                let announce_state = state.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
-                                        tracing::debug!(error = %e, "channel announcements failed on promotion");
-                                    }
-                                });
-                            }
+                        if from == "warm"
+                            && to == "hot"
+                            && node_role != "relay"
+                            && let Some(conn) = conn_mgr.get_connection(node_id)
+                        {
+                            let conn = conn.clone();
+                            let announce_state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = send_channel_announcements(&conn, &announce_state).await {
+                                    tracing::debug!(error = %e, "channel announcements failed on promotion");
+                                }
+                            });
                         }
                     }
                 }
@@ -1468,6 +1475,10 @@ pub async fn handle_peer_streams(
 
 // ── Protocol handlers (extracted from handle_peer_streams) ───────
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "forwarding state moves into a struct when slot/rev and tombstones change this handler"
+)]
 async fn handle_inbound_push(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,

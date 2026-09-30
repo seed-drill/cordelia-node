@@ -2160,7 +2160,7 @@ mod tests {
         let mut gov = Governor::new(targets, vec![]);
 
         // Add 4 swarm peers
-        let swarm_ids: Vec<NodeId> = (0..4).map(|i| make_node_id(i)).collect();
+        let swarm_ids: Vec<NodeId> = (0..4).map(make_node_id).collect();
         for id in &swarm_ids {
             gov.add_peer(id.clone(), make_addr(), vec![]);
             gov.set_peer_swarm(id);
