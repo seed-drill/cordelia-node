@@ -26,10 +26,12 @@ jobs:
           done
           docker image rm cordelia-test:latest 2>/dev/null || true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
 
       - name: Build release binary (musl)
         run: cargo build --release --target x86_64-unknown-linux-musl --bin cordelia

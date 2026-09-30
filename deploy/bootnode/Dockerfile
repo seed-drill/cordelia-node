@@ -2,7 +2,8 @@
 # Build: docker build -t cordelia-bootnode -f deploy/bootnode/Dockerfile .
 # Run:   docker run -p 9474:9474/udp -p 9473:9473 cordelia-bootnode
 
-FROM rust:1.83-slim AS builder
+# Keep in sync with rust-toolchain.toml. bookworm matches the runtime image.
+FROM rust:1.98.1-slim-bookworm AS builder
 
 WORKDIR /build
 COPY . .
