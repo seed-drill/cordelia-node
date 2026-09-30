@@ -347,7 +347,8 @@ pub const MAX_CONCURRENT_STREAMS: usize = 64;
 /// Derived: 3x the expected relay repush rate. A relay flushes batched
 /// items every REPUSH_INTERVAL_SECS, so expected rate = 60/5 = 12/min.
 /// 3x headroom → 36. Allows burst tolerance without triggering bans.
-pub const WRITES_PER_PEER_PER_MINUTE: u32 = RATE_LIMIT_HEADROOM * (60 / REPUSH_INTERVAL_SECS) as u32;
+pub const WRITES_PER_PEER_PER_MINUTE: u32 =
+    RATE_LIMIT_HEADROOM * (60 / REPUSH_INTERVAL_SECS) as u32;
 
 /// Write operations per channel per minute.
 /// Primitive: 100 writes/min aggregate across all peers.
@@ -357,14 +358,16 @@ pub const WRITES_PER_CHANNEL_PER_MINUTE: u32 = 100;
 /// Sync requests per peer per minute.
 /// Derived: 3x the expected rate (1 sync per governor tick in a rate window).
 /// Expected = RATE_WINDOW_SECS / TICK_INTERVAL_SECS = 6. With 3x → 18.
-pub const SYNCS_PER_PEER_PER_MINUTE: u32 = RATE_LIMIT_HEADROOM * (RATE_WINDOW_SECS / TICK_INTERVAL_SECS) as u32;
+pub const SYNCS_PER_PEER_PER_MINUTE: u32 =
+    RATE_LIMIT_HEADROOM * (RATE_WINDOW_SECS / TICK_INTERVAL_SECS) as u32;
 
 /// Peer-share requests per peer per minute.
 /// Derived: 3x the expected rate (1 peer-share per ping interval in a rate window).
 /// Expected = RATE_WINDOW_SECS / PING_INTERVAL_SECS = 2. With 3x → 6.
 /// Side effect: sender-side cooldown drops from 30s to 10s, accelerating
 /// mesh discovery during bootstrap.
-pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 = RATE_LIMIT_HEADROOM * (RATE_WINDOW_SECS / PING_INTERVAL_SECS) as u32;
+pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 =
+    RATE_LIMIT_HEADROOM * (RATE_WINDOW_SECS / PING_INTERVAL_SECS) as u32;
 
 // ── Intervals ────────────────────────────────────────────────────────
 
@@ -869,12 +872,18 @@ mod tests {
 
     #[test]
     fn test_derived_syncs_per_minute() {
-        assert_eq!(SYNCS_PER_PEER_PER_MINUTE as u64, RATE_LIMIT_HEADROOM as u64 * RATE_WINDOW_SECS / TICK_INTERVAL_SECS);
+        assert_eq!(
+            SYNCS_PER_PEER_PER_MINUTE as u64,
+            RATE_LIMIT_HEADROOM as u64 * RATE_WINDOW_SECS / TICK_INTERVAL_SECS
+        );
     }
 
     #[test]
     fn test_derived_peer_shares_per_minute() {
-        assert_eq!(PEER_SHARES_PER_PEER_PER_MINUTE as u64, RATE_LIMIT_HEADROOM as u64 * RATE_WINDOW_SECS / PING_INTERVAL_SECS);
+        assert_eq!(
+            PEER_SHARES_PER_PEER_PER_MINUTE as u64,
+            RATE_LIMIT_HEADROOM as u64 * RATE_WINDOW_SECS / PING_INTERVAL_SECS
+        );
     }
 
     #[test]
@@ -889,7 +898,10 @@ mod tests {
 
     #[test]
     fn test_derived_channel_reconciliation_interval() {
-        assert_eq!(CHANNEL_RECONCILIATION_INTERVAL_SECS, PEER_SHARE_INTERVAL_SECS);
+        assert_eq!(
+            CHANNEL_RECONCILIATION_INTERVAL_SECS,
+            PEER_SHARE_INTERVAL_SECS
+        );
     }
 
     #[test]

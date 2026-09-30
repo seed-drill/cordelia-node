@@ -1,10 +1,10 @@
 name: E2E Topology Tests
 
+# Manual only. T1-T7 predate the relay-only personal-node design: every
+# run since 2026-03-20 has failed (e.g. T1 waits for a personal node to
+# reach a Hot peer with only a bootnode, which the RelaysOnly dial policy
+# never allows). They are replaced by v1 scenarios, which run on PRs.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
@@ -12,7 +12,9 @@ env:
 
 jobs:
   e2e:
-    runs-on: [self-hosted, cordelia-docker]
+    # GitHub-hosted: T1-T7 are 3-6 containers each. The self-hosted
+    # cordelia-docker runner no longer exists; S2/S3 scale runs stay manual.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
@@ -26,10 +28,12 @@ jobs:
           done
           docker image rm cordelia-test:latest 2>/dev/null || true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
 
       - name: Build release binary (musl)
         run: cargo build --release --target x86_64-unknown-linux-musl --bin cordelia

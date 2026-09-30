@@ -292,11 +292,13 @@ mod tests {
              VALUES ('test_default_scope', 'named', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
             [],
         ).unwrap();
-        let scope: String = conn.query_row(
-            "SELECT scope FROM channels WHERE channel_id = 'test_default_scope'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let scope: String = conn
+            .query_row(
+                "SELECT scope FROM channels WHERE channel_id = 'test_default_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(scope, "network");
     }
 
