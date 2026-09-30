@@ -252,6 +252,8 @@ pub async fn publish(
             is_tombstone: false,
             parent_id: body.parent_id.clone(),
             exclude_peer: None, // local publish -> push to all peers
+            slot: None,
+            rev: None,
         });
     }
 

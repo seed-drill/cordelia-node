@@ -249,6 +249,8 @@ fn send_state(
             item_type: invites::INVITE_ITEM_TYPE.to_string(),
             is_tombstone: false,
             parent_id: None,
+            slot: None,
+            rev: None,
             exclude_peer: None,
         });
     }

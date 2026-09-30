@@ -55,7 +55,55 @@ pub fn encode_metadata_envelope(
     Ok(buf)
 }
 
-/// Build and encode the item metadata envelope for signing (ECIES spec §11.7).
+/// The signed fields of an item (ECIES spec §11.7), plus the slot and
+/// revision of a replaceable item (decision 2026-09-30-agent-memory-sync
+/// §4.3). Slot and revision are signed only when present, so the encoding
+/// of ordinary items, and test vector TV-C1, are unchanged.
+pub struct ItemMetadata<'a> {
+    pub author_id: &'a [u8; 32],
+    pub channel_id: &'a str,
+    pub content_hash: &'a [u8; 32],
+    pub is_tombstone: bool,
+    pub item_id: &'a str,
+    pub key_version: i64,
+    pub published_at: &'a str,
+    pub slot: Option<&'a [u8; 32]>,
+    pub rev: Option<u64>,
+}
+
+impl ItemMetadata<'_> {
+    /// Deterministic CBOR bytes ready for Ed25519 signing.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut fields = vec![
+            ("author_id", ciborium::Value::Bytes(self.author_id.to_vec())),
+            ("channel_id", ciborium::Value::Text(self.channel_id.into())),
+            (
+                "content_hash",
+                ciborium::Value::Bytes(self.content_hash.to_vec()),
+            ),
+            ("is_tombstone", ciborium::Value::Bool(self.is_tombstone)),
+            ("item_id", ciborium::Value::Text(self.item_id.into())),
+            (
+                "key_version",
+                ciborium::Value::Integer(self.key_version.into()),
+            ),
+            (
+                "published_at",
+                ciborium::Value::Text(self.published_at.into()),
+            ),
+        ];
+        if let Some(slot) = self.slot {
+            fields.push(("slot", ciborium::Value::Bytes(slot.to_vec())));
+        }
+        if let Some(rev) = self.rev {
+            fields.push(("rev", ciborium::Value::Integer(rev.into())));
+        }
+        encode_metadata_envelope(&fields)
+    }
+}
+
+/// Build and encode the item metadata envelope for an ordinary (unslotted)
+/// item (ECIES spec §11.7).
 ///
 /// Returns deterministic CBOR bytes ready for Ed25519 signing.
 pub fn build_item_metadata_envelope(
@@ -67,19 +115,18 @@ pub fn build_item_metadata_envelope(
     key_version: i64,
     published_at: &str,
 ) -> Result<Vec<u8>, CryptoError> {
-    let fields = [
-        ("author_id", ciborium::Value::Bytes(author_id.to_vec())),
-        ("channel_id", ciborium::Value::Text(channel_id.into())),
-        (
-            "content_hash",
-            ciborium::Value::Bytes(content_hash.to_vec()),
-        ),
-        ("is_tombstone", ciborium::Value::Bool(is_tombstone)),
-        ("item_id", ciborium::Value::Text(item_id.into())),
-        ("key_version", ciborium::Value::Integer(key_version.into())),
-        ("published_at", ciborium::Value::Text(published_at.into())),
-    ];
-    encode_metadata_envelope(&fields)
+    ItemMetadata {
+        author_id,
+        channel_id,
+        content_hash,
+        is_tombstone,
+        item_id,
+        key_version,
+        published_at,
+        slot: None,
+        rev: None,
+    }
+    .encode()
 }
 
 #[cfg(test)]
@@ -179,6 +226,53 @@ mod tests {
         } else {
             panic!("expected CBOR map");
         }
+    }
+
+    #[test]
+    fn test_slot_and_rev_are_signed() {
+        let id = NodeIdentity::generate().unwrap();
+        let pk = id.public_key();
+        let meta = |slot: Option<&'static [u8; 32]>, rev: Option<u64>| ItemMetadata {
+            author_id: &pk,
+            channel_id: "grp_x",
+            content_hash: &[0x01; 32],
+            is_tombstone: false,
+            item_id: "ci_1",
+            key_version: 1,
+            published_at: "2026-09-30T00:00:00Z",
+            slot,
+            rev,
+        };
+        static SLOT: [u8; 32] = [0x5A; 32];
+        static OTHER: [u8; 32] = [0x5B; 32];
+
+        let signed = meta(Some(&SLOT), Some(2)).encode().unwrap();
+        let sig = sign_cbor(&id, &signed);
+
+        // Moving the item to another slot, or replaying it as another
+        // revision, breaks the signature.
+        let moved = meta(Some(&OTHER), Some(2)).encode().unwrap();
+        let bumped = meta(Some(&SLOT), Some(3)).encode().unwrap();
+        let unslotted = meta(None, None).encode().unwrap();
+        assert!(verify_cbor(&pk, &signed, &sig));
+        assert!(!verify_cbor(&pk, &moved, &sig));
+        assert!(!verify_cbor(&pk, &bumped, &sig));
+        assert!(!verify_cbor(&pk, &unslotted, &sig));
+
+        // Without a slot, the encoding is exactly the original envelope.
+        assert_eq!(
+            unslotted,
+            build_item_metadata_envelope(
+                &pk,
+                "grp_x",
+                &[0x01; 32],
+                false,
+                "ci_1",
+                1,
+                "2026-09-30T00:00:00Z"
+            )
+            .unwrap()
+        );
     }
 
     /// TV-C1 from ecies-envelope-encryption.md §8.6.

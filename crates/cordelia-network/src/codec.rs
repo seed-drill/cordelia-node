@@ -308,6 +308,8 @@ mod tests {
             published_at: "2026-03-10T14:30:00Z".into(),
             is_tombstone: false,
             parent_id: None,
+            slot: None,
+            rev: None,
         };
         let msg = WireMessage::PushPayload(PushPayload { items: vec![item] });
         let encoded = encode_message(&msg).unwrap();
@@ -401,10 +403,12 @@ mod tests {
                 channel_id: "test".into(),
                 since: None,
                 limit: 100,
+                after_seq: None,
             }),
             WireMessage::SyncResponse(SyncResponse {
                 items: vec![],
                 has_more: false,
+                last_seq: None,
             }),
             WireMessage::FetchRequest(FetchRequest { item_ids: vec![] }),
             WireMessage::FetchResponse(FetchResponse { items: vec![] }),
