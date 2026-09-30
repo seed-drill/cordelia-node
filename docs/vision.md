@@ -43,19 +43,17 @@ signatures, and hold no keys. Anyone can run one, and a node's configuration
 lists the relays it uses. We run the first two; the aim is for others to run
 most of them, so no single operator, including us, is necessary.
 
-## 4. Paying for relays: optional settlement
+## 4. Paying for relays
 
-Relays cost a little to run. The protocol must work with no payment layer at
-all: people running their own relays, or using relays run by their organisation
-or by us. Where a payment layer helps, it should be optional and pluggable, and
-it must never require a relay to hold plaintext or keys.
+Relays cost a little to run. The protocol works with no payment layer at all:
+people run their own relays, or use relays run by their organisation or by us.
 
-One option we have studied is Cardano stake pool operators, who already run
-always-on infrastructure and could bundle relays funded through delegation
-(the analysis is archived with the v2.3 whitepaper and in
-`docs/decisions/2026-03-09-spo-economic-model.md`). It is one option among
-several, not a dependency. No token is required, and the protocol will not
-require one.
+We have deliberately **not chosen a settlement layer**. There are many ways
+relays could be paid for, and nothing to gain from picking one before real use
+shows what is needed. Whatever comes later must be optional and pluggable,
+must never require a relay to hold plaintext or keys, and must not make the
+protocol depend on it. No token is required, and the protocol will not require
+one.
 
 ## 5. Why it matters
 

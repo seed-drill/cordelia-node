@@ -285,8 +285,8 @@ deployed; the first pre-release follows.
 - **More relays, run by others.** Anyone can run one; the configuration lists
   relays.
 
-Longer-term direction, including optional settlement layers, is in
-[`docs/vision.md`](docs/vision.md).
+Longer-term direction, including how relays might be paid for (no
+settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 
 ## References
 
