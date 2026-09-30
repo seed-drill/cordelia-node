@@ -369,7 +369,7 @@ pub async fn p2p_loop(
     allow_private_addresses: bool,
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
-    bootstrap_addrs: Vec<std::net::SocketAddr>,
+    bootstrap_addrs: BootstrapAddrs,
     trusted_peer_ids: Vec<NodeId>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
@@ -1364,8 +1364,9 @@ pub async fn p2p_loop(
                 // config may include relay addresses that failed on first attempt).
                 let has_hot_relay = governor.hot_peers().iter()
                     .any(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false));
-                if !has_hot_relay && !bootstrap_addrs.is_empty() && node_role != "bootnode" {
-                    for addr in &bootstrap_addrs {
+                let retry_addrs = bootstrap_addrs.read().map(|a| a.clone()).unwrap_or_default();
+                if !has_hot_relay && !retry_addrs.is_empty() && node_role != "bootnode" {
+                    for addr in &retry_addrs {
                         if in_flight.len() >= MAX_IN_FLIGHT || in_flight.contains(addr) {
                             continue;
                         }
@@ -1410,6 +1411,40 @@ pub async fn p2p_loop(
                 }
             }
         }
+    }
+}
+
+/// The resolved addresses of a node's bootnodes, which the P2P loop dials
+/// while it has no hot relay. [`keep_bootnodes_resolved`] keeps it current.
+pub type BootstrapAddrs = std::sync::Arc<std::sync::RwLock<Vec<std::net::SocketAddr>>>;
+
+/// Look up the bootnode names now, then again every
+/// `BOOTNODE_RESOLVE_INTERVAL_SECS` (every `BOOTNODE_RESOLVE_RETRY_SECS`
+/// while none resolves), and publish the addresses to `addrs`. Names, not
+/// addresses, are the configuration: a node that started offline, or whose
+/// relay changed address, still reaches it. The last good list is kept
+/// while lookups fail.
+pub async fn keep_bootnodes_resolved(hosts: Vec<String>, addrs: BootstrapAddrs) {
+    use cordelia_core::protocol::{BOOTNODE_RESOLVE_INTERVAL_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
+    loop {
+        let resolved = cordelia_network::bootstrap::resolve_hosts(&hosts).await;
+        let have_any = if resolved.is_empty() {
+            addrs.read().map(|a| !a.is_empty()).unwrap_or(false)
+        } else {
+            if let Ok(mut current) = addrs.write()
+                && *current != resolved
+            {
+                tracing::info!(addrs = ?resolved, "bootnode addresses updated");
+                *current = resolved;
+            }
+            true
+        };
+        let wait = if have_any {
+            BOOTNODE_RESOLVE_INTERVAL_SECS
+        } else {
+            BOOTNODE_RESOLVE_RETRY_SECS
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
     }
 }
 

@@ -1,0 +1,33 @@
+# A Cordelia relay: Docker on a Linux host (for us, an Ubuntu VM in a
+# site's DMZ) with a public IPv4 reaching it on UDP 9474.
+#
+# From the repository root, with RELAY set to relay1 or relay2:
+#   RELAY=relay1 docker compose -f deploy/relay/compose.yml up -d --build
+#   RELAY=relay1 docker compose -f deploy/relay/compose.yml logs -f
+#   docker exec cordelia-relay1 cordelia status
+#
+# RELAY picks the config (relay1.toml or relay2.toml, each listing the
+# other relay) and names the container and its data volume.
+# Full guide: deploy/relay/README.md
+
+name: cordelia-${RELAY:?set RELAY=relay1 or RELAY=relay2}
+
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    image: cordelia-relay
+    container_name: cordelia-${RELAY}
+    restart: unless-stopped
+    environment:
+      CORDELIA_CONFIG: /etc/cordelia/${RELAY}.toml
+    ports:
+      - "9474:9474/udp"
+    volumes:
+      - data:/data
+
+volumes:
+  # The relay's identity key lives here; keep it across upgrades.
+  data:
+    name: cordelia-${RELAY}-data

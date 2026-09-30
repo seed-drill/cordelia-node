@@ -123,6 +123,39 @@ pub fn resolve_fallback_peers() -> Vec<BootnodeAddr> {
     resolved
 }
 
+/// The bootnode names a node keeps dialling: its configured bootnodes, or
+/// the compiled-in fallback peers when it has none.
+pub fn bootstrap_hosts(config_addrs: &[String]) -> Vec<String> {
+    if config_addrs.is_empty() {
+        FALLBACK_PEERS.iter().map(|s| s.to_string()).collect()
+    } else {
+        config_addrs.to_vec()
+    }
+}
+
+/// Resolve `host:port` names with the system resolver (so `/etc/hosts`
+/// applies), one address per name, IPv4 first: the P2P endpoint binds IPv4.
+/// Names that do not resolve are skipped; that is expected while offline.
+pub async fn resolve_hosts(hosts: &[String]) -> Vec<SocketAddr> {
+    let timeout = std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS);
+    let mut resolved = Vec::new();
+    for host in hosts {
+        match tokio::time::timeout(timeout, tokio::net::lookup_host(host.as_str())).await {
+            Ok(Ok(addrs)) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                if let Some(addr) = addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first())
+                    && !resolved.contains(addr)
+                {
+                    resolved.push(*addr);
+                }
+            }
+            Ok(Err(e)) => debug!(%host, error = %e, "bootnode name did not resolve"),
+            Err(_) => debug!(%host, "bootnode lookup timed out"),
+        }
+    }
+    resolved
+}
+
 /// Resolve all bootnode addresses: config first, then DNS SRV, then fallback.
 ///
 /// Deduplicates by socket address.
@@ -320,5 +353,33 @@ mod tests {
         // Debug is derived
         let debug = format!("{:?}", bn);
         assert!(debug.contains("test-host"));
+    }
+
+    #[test]
+    fn bootstrap_hosts_are_the_config_or_the_fallback() {
+        let fallback = bootstrap_hosts(&[]);
+        assert_eq!(fallback.len(), FALLBACK_PEERS.len());
+        assert_eq!(fallback[0], FALLBACK_PEERS[0]);
+        let own = vec!["relay.example.org:9474".to_string()];
+        assert_eq!(bootstrap_hosts(&own), own);
+    }
+
+    #[tokio::test]
+    async fn resolve_hosts_looks_names_up_and_skips_the_rest() {
+        let hosts = vec![
+            "localhost:9474".to_string(),
+            "127.0.0.1:9474".to_string(), // the same address again
+            "10.1.2.3:1234".to_string(),
+            "no-such-host.invalid:9474".to_string(),
+        ];
+        let resolved = resolve_hosts(&hosts).await;
+        assert_eq!(
+            resolved,
+            vec![
+                "127.0.0.1:9474".parse::<SocketAddr>().unwrap(),
+                "10.1.2.3:1234".parse().unwrap(),
+            ],
+            "localhost resolves to IPv4, duplicates and unknown names are dropped"
+        );
     }
 }

@@ -372,6 +372,7 @@ pub const OUTBOX_BATCH_MAX_ITEMS: usize = 500;
 const _: () = assert!(OUTBOX_FLUSH_INTERVAL_SECS * WRITES_PER_PEER_PER_MINUTE as u64 >= 60);
 const _: () = assert!(OUTBOX_BATCH_MAX_BYTES + 128 * 1024 <= MAX_MESSAGE_BYTES as usize);
 const _: () = assert!(MAX_ITEM_BYTES <= OUTBOX_BATCH_MAX_BYTES);
+const _: () = assert!(BOOTNODE_RESOLVE_RETRY_SECS < BOOTNODE_RESOLVE_INTERVAL_SECS);
 
 /// Write operations per channel per minute.
 /// Primitive: 100 writes/min aggregate across all peers.
@@ -499,6 +500,14 @@ pub const FALLBACK_PEERS: &[&str] = &[
     "relay1.cordelia.seeddrill.ai:9474",
     "relay2.cordelia.seeddrill.ai:9474",
 ];
+
+/// How often a node looks up its bootnodes' names again, so the addresses
+/// it retries follow DNS (a relay moved, or a site's address changed).
+pub const BOOTNODE_RESOLVE_INTERVAL_SECS: u64 = 300;
+
+/// How often it tries instead while none of the names resolves: a node
+/// started before its network was up finds its relays soon after.
+pub const BOOTNODE_RESOLVE_RETRY_SECS: u64 = 30;
 
 // ── PSK exchange reasons (network-protocol.md §4.7) ──────────────────
 

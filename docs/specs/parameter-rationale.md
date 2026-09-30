@@ -406,9 +406,32 @@ state is automatic: once `hot >= hot_min`, the rate drops to CONNECTS_PER_CYCLE.
 **If you increase to 10:** Faster gossip exploration but more aggressive
 outbound traffic. May be appropriate for relays in large meshes.
 
+
+## 8. Bootstrap Parameters
+
+Bootnodes are configured by name (the defaults are `relay1` and
+`relay2.cordelia.seeddrill.ai`). A node resolves the names again while it
+runs, and the P2P loop dials the latest addresses whenever it has no hot
+relay (decision 2026-09-30-agent-memory-sync §4.6).
+
+### bootnode_resolve_interval = 300s
+
+**Rationale:** How often the names are looked up again once they resolve,
+so a relay that moves, or a site whose address changes, is followed. DNS
+changes for relays are rare and TTLs are minutes, so five minutes costs
+nothing and catches a change well within an hour.
+
+### bootnode_resolve_retry = 30s
+
+**Rationale:** How often a node tries while none of the names resolves,
+typically because it started before its network was up (a laptop at
+login). It then finds its relays within half a minute of the network
+coming up; one DNS query per name every 30 s is negligible. It must be
+shorter than the interval (`protocol.rs` asserts this).
+
 ---
 
-*Spec version: 1.2*
+*Spec version: 1.3*
 *Created: 2026-03-16*
-*Updated: 2026-03-18*
+*Updated: 2026-09-30*
 *Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*

@@ -61,7 +61,7 @@ actix-rt = "2"
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Logging
 tracing = "0.1"

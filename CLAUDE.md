@@ -35,7 +35,7 @@ cordelia-node/
     archive/             # Pre-v1 documents, kept for history
     vision.md            # Direction after v1
   tests/                 # Integration tests
-  deploy/relay/          # Relay image, Fly.io and self-hosted configs
+  deploy/relay/          # Relay image, Docker Compose and guide (Fly.io optional)
   scripts/               # Install script
   .github/workflows/     # ci.yml, e2e.yml, release.yml
 ```
