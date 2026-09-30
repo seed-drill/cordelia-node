@@ -430,6 +430,17 @@ pub const MAX_FETCH_ITEMS: usize = 100;
 /// enabling address-space enumeration.
 pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 
+/// How long a deleted key's tombstone is kept (decision 2026-09-30 §4.4).
+/// Primitive: 90 days. When a key's newest revision is a tombstone older
+/// than this, every node drops the key's whole slot history. A device
+/// offline for longer than this can bring a deleted file back with a stale
+/// edit; 90 days covers a laptop left in a drawer for a season.
+pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
+
+/// How often nodes collect expired keyed tombstones. Hourly is plenty
+/// against a 90-day retention.
+pub const TOMBSTONE_GC_INTERVAL_SECS: u64 = 3600;
+
 /// Tombstone retention in days (data-formats.md §4).
 /// Primitive: 7 days; ensures offline nodes can sync deletions
 /// when they come back online within a week.

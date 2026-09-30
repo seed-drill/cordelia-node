@@ -413,6 +413,64 @@ pub fn mark_relayed(conn: &Connection, item_ids: &[String]) -> Result<(), Cordel
     Ok(())
 }
 
+/// Drop the whole history of every key whose newest revision is a
+/// tombstone that arrived more than `retention_days` ago (decision
+/// 2026-09-30 §4.4). Removing only the tombstone would let a lower
+/// revision by another author become current again, so the slot goes as a
+/// whole. Returns the number of items removed.
+pub fn gc_keyed_tombstones(conn: &Connection, retention_days: u32) -> Result<usize, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    let cutoff = format!("-{retention_days} days");
+    let expired = "SELECT i.channel_id, i.slot FROM items i
+         WHERE i.slot IS NOT NULL AND i.is_tombstone = 1
+           AND i.received_at < datetime('now', ?1)
+           AND i.rev = (SELECT MAX(j.rev) FROM items j
+                        WHERE j.channel_id = i.channel_id AND j.slot = i.slot)";
+
+    conn.execute_batch("SAVEPOINT gc_tombstones")
+        .map_err(storage)?;
+    let result = (|| -> Result<usize, CordeliaError> {
+        conn.execute(
+            &format!(
+                "DELETE FROM search_content WHERE item_id IN (
+                     SELECT item_id FROM items WHERE (channel_id, slot) IN ({expired}))"
+            ),
+            params![cutoff],
+        )
+        .map_err(storage)?;
+        conn.execute(
+            &format!("DELETE FROM items WHERE (channel_id, slot) IN ({expired})"),
+            params![cutoff],
+        )
+        .map_err(storage)
+    })();
+    match &result {
+        Ok(_) => conn
+            .execute_batch("RELEASE gc_tombstones")
+            .map_err(storage)?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK TO gc_tombstones; RELEASE gc_tombstones");
+        }
+    }
+    result
+}
+
+/// An item's author and channel, if it exists.
+pub fn item_owner(
+    conn: &Connection,
+    item_id: &str,
+) -> Result<Option<(String, Vec<u8>)>, CordeliaError> {
+    match conn.query_row(
+        "SELECT channel_id, author_id FROM items WHERE item_id = ?1",
+        params![item_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(owner) => Ok(Some(owner)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CordeliaError::Storage(e.to_string())),
+    }
+}
+
 /// The highest revision stored for a slot, from any author.
 pub fn max_rev(
     conn: &Connection,
@@ -1010,6 +1068,38 @@ mod tests {
 
         mark_relayed(&conn, &["ci_m1".to_string()]).unwrap();
         assert_eq!(ids(outbox(&conn, &me, 10, 1 << 20).unwrap()), vec!["ci_m2"]);
+    }
+
+    #[test]
+    fn test_gc_drops_whole_history_of_expired_deleted_keys() {
+        let conn = setup();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let (deleted_slot, live_slot, fresh_slot) = ([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]);
+
+        // Deleted key: A wrote rev 1, B deleted it at rev 2, long ago.
+        insert_item(&conn, &slotted("ci_d1", &a, &deleted_slot, 1, &[0x11; 32])).unwrap();
+        let mut tomb = slotted("ci_d2", &b, &deleted_slot, 2, &[0x12; 32]);
+        tomb.is_tombstone = true;
+        insert_item(&conn, &tomb).unwrap();
+        // Live key, also old: never collected.
+        insert_item(&conn, &slotted("ci_l1", &a, &live_slot, 1, &[0x21; 32])).unwrap();
+        // Recently deleted key: kept until its retention passes.
+        let mut recent = slotted("ci_f1", &a, &fresh_slot, 1, &[0x31; 32]);
+        recent.is_tombstone = true;
+        insert_item(&conn, &recent).unwrap();
+
+        conn.execute(
+            "UPDATE items SET received_at = datetime('now', '-100 days') WHERE item_id != 'ci_f1'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(gc_keyed_tombstones(&conn, 90).unwrap(), 2);
+        let mut left = ids(&conn);
+        left.sort();
+        // A's older revision went too: otherwise it would become current.
+        assert_eq!(left, vec!["ci_f1", "ci_l1"]);
+        assert_eq!(gc_keyed_tombstones(&conn, 90).unwrap(), 0);
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item

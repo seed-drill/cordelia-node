@@ -1024,3 +1024,71 @@ async fn test_metrics_requires_auth() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401);
 }
+
+/// delete-item acts only on the caller's own items in the channel named:
+/// an item ID alone must not let a member hide someone else's item, or an
+/// item in another channel.
+#[actix_web::test]
+async fn test_delete_item_only_own_items_in_named_channel() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    for ch in ["delete-a", "delete-b"] {
+        let req = test::TestRequest::post()
+            .uri("/api/v1/channels/subscribe")
+            .insert_header(auth_header())
+            .set_json(json!({ "channel": ch }))
+            .to_request();
+        test::call_service(&app, req).await;
+    }
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "delete-b", "content": "mine, in b"}))
+        .to_request();
+    let body: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let mine_in_b = body["item_id"].as_str().unwrap().to_string();
+
+    // Someone else's item in channel a (as if received from the network).
+    let channel_a = cordelia_storage::channels::resolve("delete-a").unwrap().0;
+    {
+        let db = state.db.lock().unwrap();
+        cordelia_storage::items::insert_item(
+            &db,
+            &cordelia_storage::items::NewItem::plain(
+                "ci_someone_else",
+                &channel_a,
+                &[0x77; 32],
+                "message",
+                "2026-09-30T00:00:00Z",
+                1,
+                &[0x99; 32],
+                &[0; 64],
+                &[1, 2, 3],
+            ),
+        )
+        .unwrap();
+    }
+
+    let delete = |channel: &str, item_id: &str| {
+        test::TestRequest::post()
+            .uri("/api/v1/channels/delete-item")
+            .insert_header(auth_header())
+            .set_json(json!({ "channel": channel, "item_id": item_id }))
+            .to_request()
+    };
+    // Another author's item: forbidden.
+    let resp = test::call_service(&app, delete("delete-a", "ci_someone_else")).await;
+    assert_eq!(resp.status(), 403);
+    // My item, but named under the wrong channel: not found.
+    let resp = test::call_service(&app, delete("delete-a", &mine_in_b)).await;
+    assert_eq!(resp.status(), 404);
+    // My item in its own channel: deleted.
+    let resp = test::call_service(&app, delete("delete-b", &mine_in_b)).await;
+    assert_eq!(resp.status(), 200);
+}

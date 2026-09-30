@@ -23,6 +23,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/publish", web::post().to(handlers::publish))
             .route("/listen", web::post().to(handlers::listen))
             .route("/entries", web::post().to(handlers::entries))
+            .route("/delete-key", web::post().to(handlers::delete_key))
             .route("/list", web::post().to(handlers::list))
             .route("/info", web::post().to(handlers::info))
             .route("/unsubscribe", web::post().to(handlers::unsubscribe))
