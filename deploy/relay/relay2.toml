@@ -1,0 +1,37 @@
+# Cordelia relay 2: relay2.cordelia.seeddrill.ai
+# Store-and-forward for encrypted items; also the bootstrap address that
+# personal nodes dial. Relays hold ciphertext only and never hold keys.
+# Decision 2026-09-30-agent-memory-sync §4.6.
+
+[identity]
+entity_id = "relay2"
+
+[node]
+http_port = 9473
+p2p_port = 9474
+data_dir = "/data/cordelia"
+
+[api]
+# The local API stays on loopback; nothing but QUIC is exposed.
+bind_address = "127.0.0.1"
+
+[network]
+# On Fly, CORDELIA_LISTEN_ADDR overrides this with fly-global-services:9474
+# (Fly only delivers UDP to apps bound to that address).
+listen_addr = "0.0.0.0:9474"
+role = "relay"
+dns_discovery = ""
+
+# The other relay, so the two form a mesh and forward to each other.
+[[network.bootnodes]]
+addr = "relay1.cordelia.seeddrill.ai:9474"
+
+[governor]
+hot_min = 1
+hot_max = 50
+warm_min = 1
+warm_max = 50
+cold_max = 200
+
+[logging]
+level = "info"

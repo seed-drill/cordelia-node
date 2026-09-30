@@ -491,10 +491,13 @@ pub const ERR_CAPACITY: u32 = 0x01;
 /// DNS SRV record for bootnode discovery (network-protocol.md §10).
 pub const SRV_RECORD: &str = "_cordelia._udp.seeddrill.ai";
 
-/// Fallback peer addresses, compiled into binary (network-protocol.md §10).
+/// Default bootstrap addresses, compiled into the binary: the two relays
+/// (decision 2026-09-30-agent-memory-sync §4.6). Relays double as
+/// bootnodes: a personal node dials them, learns their role from the
+/// handshake, and keeps them as its Hot relay peers.
 pub const FALLBACK_PEERS: &[&str] = &[
-    "boot1.cordelia.seeddrill.ai:9474",
-    "boot2.cordelia.seeddrill.ai:9474",
+    "relay1.cordelia.seeddrill.ai:9474",
+    "relay2.cordelia.seeddrill.ai:9474",
 ];
 
 // ── PSK exchange reasons (network-protocol.md §4.7) ──────────────────
