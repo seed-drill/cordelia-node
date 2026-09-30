@@ -519,6 +519,12 @@ pub async fn p2p_loop(
     let outbox_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut outbox_rotation: usize = 0;
 
+    // Expired keyed tombstones (decision 2026-09-30 §4.4), on every node.
+    let mut gc_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::TOMBSTONE_GC_INTERVAL_SECS,
+    ));
+    gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // P2P telemetry counters
     let mut select_iterations: u64 = 0;
     let mut sync_cycles_completed: u64 = 0;
@@ -833,6 +839,22 @@ pub async fn p2p_loop(
                     last_outbox_flush = std::time::Instant::now();
                     flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
                 }
+            }
+
+            // ── Keyed tombstone GC (§4.4) ─────────────────────────────
+            _ = gc_interval.tick() => {
+                let gc_state = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    let Ok(db) = gc_state.db.lock() else { return };
+                    match cordelia_storage::items::gc_keyed_tombstones(
+                        &db,
+                        cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+                    ) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
+                        Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
+                    }
+                });
             }
 
             // ── Push retry processing ─────────────────────────────────

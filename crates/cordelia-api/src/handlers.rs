@@ -1046,6 +1046,24 @@ pub async fn delete_item(
         return Err(ApiError::Forbidden("not a member of this channel".into()));
     }
 
+    // Only the caller's own items, and only in the channel named: the
+    // item ID alone must not let one member hide another's item, or an
+    // item in some other channel.
+    match items::item_owner(&db, &body.item_id)? {
+        Some((ch, author)) if ch == channel_id.0 && author.as_slice() == pk.as_slice() => {}
+        Some((ch, _)) if ch == channel_id.0 => {
+            return Err(ApiError::Forbidden(
+                "only the item's author can delete it".into(),
+            ));
+        }
+        _ => {
+            return Err(ApiError::NotFound(format!(
+                "item '{}' not found",
+                body.item_id
+            )));
+        }
+    }
+
     let deleted = items::tombstone_item(&db, &body.item_id)?;
     if !deleted {
         return Err(ApiError::NotFound(format!(
@@ -1293,6 +1311,51 @@ pub async fn entries(
     Ok(HttpResponse::Ok().json(EntriesResponse {
         channel: body.channel.clone(),
         entries,
+    }))
+}
+
+// ── POST /api/v1/channels/delete-key ──────────────────────────────
+
+/// Delete a key: publish a tombstone revision, which replicates like any
+/// other revision (decision 2026-09-30 §4.4).
+pub async fn delete_key(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DeleteKeyRequest>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let channel_id = channels::resolve(&body.channel)?;
+
+    // Deleting a key that does not exist (or is already deleted) would only
+    // create an empty slot.
+    let exists = crate::entries::current(&state, &db, &channel_id.0)?
+        .iter()
+        .any(|e| e.key == body.key && !e.current.deleted);
+    if !exists {
+        return Err(ApiError::NotFound(format!("key '{}' not found", body.key)));
+    }
+
+    let published = crate::entries::publish(
+        &state,
+        &db,
+        &channel_id.0,
+        &crate::entries::Write {
+            key: &body.key,
+            content: &serde_json::Value::Null,
+            metadata: None,
+            item_type: "memory",
+            deleted: true,
+        },
+    )?;
+    Ok(HttpResponse::Ok().json(DeleteKeyResponse {
+        channel: body.channel.clone(),
+        key: body.key.clone(),
+        rev: published.rev,
+        item_id: published.item_id,
     }))
 }
 

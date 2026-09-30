@@ -450,3 +450,18 @@ pub struct EntriesResponse {
     pub channel: String,
     pub entries: Vec<EntryResponse>,
 }
+
+#[derive(Deserialize)]
+pub struct DeleteKeyRequest {
+    pub channel: String,
+    pub key: String,
+}
+
+#[derive(Serialize)]
+pub struct DeleteKeyResponse {
+    pub channel: String,
+    pub key: String,
+    /// Revision of the tombstone.
+    pub rev: u64,
+    pub item_id: String,
+}

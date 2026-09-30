@@ -320,6 +320,24 @@ fn add_device_accept_and_sync_through_a_relay() {
         (entry(&a, "notes.md")? == ("v2 from b".to_string(), 2)).then_some(())
     });
 
+    // Deleting a key replicates as a tombstone revision (§4.4).
+    let deleted = a.post(
+        "/api/v1/channels/delete-key",
+        serde_json::json!({ "channel": personal, "key": "notes.md" }),
+    );
+    assert_eq!(deleted["rev"], 3, "{deleted}");
+    wait_for("b sees the key deleted", &all, 90, || {
+        let resp = b.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        );
+        resp["entries"]
+            .as_array()?
+            .iter()
+            .any(|e| e["key"] == "notes.md" && e["deleted"] == true && e["rev"] == 3)
+            .then_some(())
+    });
+
     // Paging (§4.4a): more items than one sync page, all arrive.
     const BULK: usize = 150;
     for i in 0..BULK {

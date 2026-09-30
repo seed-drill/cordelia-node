@@ -324,3 +324,46 @@ fn items_from_before_a_key_rotation_still_read() {
     relay(&a, &b, &ch);
     assert_eq!(b.read(&ch).len(), 2);
 }
+
+#[test]
+fn deleting_a_key_replicates_and_a_later_write_revives_it() {
+    let (a, b, ch) = paired();
+    a.write(&ch, "notes.md", "v1");
+    relay(&a, &b, &ch);
+
+    // A deletes: a tombstone revision.
+    {
+        let db = a.state.db.lock().unwrap();
+        let rev = entries::publish(
+            &a.state,
+            &db,
+            &ch,
+            &Write {
+                key: "notes.md",
+                content: &serde_json::Value::Null,
+                metadata: None,
+                item_type: "memory",
+                deleted: true,
+            },
+        )
+        .unwrap()
+        .rev;
+        assert_eq!(rev, 2);
+    }
+    relay(&a, &b, &ch);
+    let deleted = {
+        let db = b.state.db.lock().unwrap();
+        entries::current(&b.state, &db, &ch).unwrap()
+    };
+    assert_eq!(deleted.len(), 1);
+    assert!(deleted[0].current.deleted, "B sees the key as deleted");
+    assert_eq!(deleted[0].current.rev, 2);
+
+    // Writing the key again after the delete brings it back everywhere.
+    assert_eq!(b.write(&ch, "notes.md", "recreated"), 3);
+    relay(&b, &a, &ch);
+    assert_eq!(
+        a.read(&ch),
+        vec![("notes.md".into(), "recreated".into(), 3, 0)]
+    );
+}
