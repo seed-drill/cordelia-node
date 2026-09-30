@@ -88,7 +88,7 @@ Without a trust check, anyone who knows your public key could add you to a chann
 
 **Personal channel.** A `grp_` channel that holds the device roster, home memory and the map from project to channel (4.5). A node creates one on first use, and a device that accepts a `device` invite adopts the inviter's personal channel as its own.
 
-**Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
+**Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. **As built:** since devices join only the projects they have (4.5), the remover may not be in every project channel. Each device that sees a device dropped from the personal channel therefore removes it from the project channels the remover is not in. Of a channel's remaining owners, the one with the lowest key acts, so two devices never rotate the same channel at once. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
 
 **Roles.** All of a person's devices are equal: any device can add, revoke and rotate, so a device's membership in its person's channels is `owner`.
 
@@ -193,7 +193,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 ## 9. Known limits
 
 - Two devices changing the membership of the same channel at the same moment can lose one of the changes.
-- `remove-device` removes the device from, and rotates the keys of, the channels that the device running it owns. Since devices join only the projects they have (4.5), a project channel the remover is not in keeps the removed device as a member until another device removes it. To be fixed before the first pre-release: devices that see a device dropped from the personal channel will remove it from the channels they own.
+- A project channel that the removing device is not in is rotated by its remaining owner with the lowest key (4.1). If that device is offline, the rotation waits until it next runs, and until then the removed device can still read what others write to that project.
 - Relays keep what they store; the retention limit (30 days was proposed) is not implemented.
 - The older key-distribution endpoints (`dm`, `group/invite`, `group/remove`, `rotate-psk`) still write key envelopes into the channel itself, which never reach other nodes. v1 doesn't use them; they will move onto sealed channel states or be removed.
 - The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.

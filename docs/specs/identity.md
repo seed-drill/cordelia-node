@@ -18,8 +18,8 @@
 >   derived from the public key. It holds the device roster (its member list),
 >   home memory, and the map from project to channel.
 > - **Compromise response (§10.1)** is `cordelia remove-device <key>` from
->   another device, which removes it and rotates channel keys (the decision
->   record's §9 lists a gap).
+>   another device, which removes it from every channel and rotates their
+>   keys.
 > - Layers 1-3 (§2.2-§2.4), DM channels (§7.3) and proof of agency (§9) are
 >   not in v1. The identity ADR this spec cites is archived
 >   ([`docs/archive/`](../archive/README.md)).

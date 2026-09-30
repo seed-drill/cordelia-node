@@ -555,6 +555,48 @@ pub fn remove_device(
     })
 }
 
+/// Finish removing `gone` from this person's channels after `remover`
+/// dropped it from the personal channel. The remover already rotated every
+/// channel it owns; since devices join only the projects they have, a
+/// project channel the remover is not in still lists `gone`. Of that
+/// channel's remaining owners that are still this person's `devices`, the
+/// one with the lowest key removes it and rotates the key, so two devices
+/// never rotate the same channel at once. Returns the channels rotated.
+fn remove_where_remover_absent(
+    state: &AppState,
+    db: &Connection,
+    gone: &[u8; 32],
+    remover: &[u8; 32],
+    personal: &str,
+    devices: &[[u8; 32]],
+) -> Result<Vec<String>, CordeliaError> {
+    let pk = state.identity.public_key();
+    let mut rotated = Vec::new();
+    for ch in channels::list_owned_groups(db, &pk)? {
+        let id = ch.channel_id;
+        if id == personal
+            || !channels::is_member(db, &id, gone)?
+            || channels::is_member(db, &id, remover)?
+        {
+            continue;
+        }
+        let acting = channels::list_active_members(db, &id)?
+            .into_iter()
+            .filter(|(key, role)| role == "owner" && key != gone && devices.contains(key))
+            .map(|(key, _)| key)
+            .min();
+        if acting != Some(pk) {
+            continue; // another remaining owner acts
+        }
+        channels::remove_member(db, &id, gone)?;
+        rotate_key(state, db, &id)?;
+        publish_state(state, db, &id)?;
+        tracing::info!(channel = %id, "removed a device the remover could not reach, keys rotated");
+        rotated.push(id);
+    }
+    Ok(rotated)
+}
+
 /// This person's devices: this node, members of the personal channel, and
 /// explicitly trusted devices.
 pub fn list_devices(state: &AppState) -> Result<Vec<DeviceInfo>, CordeliaError> {
@@ -706,6 +748,19 @@ fn apply(
         .current_key()
         .ok_or_else(|| CordeliaError::Crypto("state lacks current key".into()))?;
 
+    let personal = personal_channel(db, &pk)?;
+    let is_personal = personal.as_deref() == Some(channel_id.as_str());
+    // Devices this state drops from the personal channel, i.e. removed.
+    let dropped: Vec<[u8; 32]> = if is_personal {
+        channels::list_active_members(db, channel_id)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| cs.role_of(key).is_none())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     channels::ensure_group(db, channel_id, cs.name.as_deref(), &cs.mode, &cs.creator)?;
     psk::install_key_ring(&state.home_dir, channel_id, &cs.keys, cs.key_version)?;
     psk::write_slot_key(&state.home_dir, channel_id, &cs.slot_key)?;
@@ -724,7 +779,6 @@ fn apply(
         &cordelia_crypto::sha256(current_key),
     )?;
 
-    let personal = personal_channel(db, &pk)?;
     if cs.personal
         && cs.role_of(&pk) == Some(MemberRole::Owner)
         && trust::is_trusted(db, &cs.sender)?
@@ -741,8 +795,9 @@ fn apply(
         }
     }
 
-    // A device dropped from the personal channel is no longer trusted here.
-    if personal.as_deref() == Some(channel_id.as_str()) {
+    // A device dropped from the personal channel is no longer trusted here,
+    // and leaves the channels the remover could not reach.
+    if is_personal {
         for t in trust::list(db)? {
             if t.revoked_at.is_none()
                 && t.kind == TrustKind::Device.as_str()
@@ -750,6 +805,10 @@ fn apply(
             {
                 trust::revoke(db, &t.key)?;
             }
+        }
+        let devices: Vec<[u8; 32]> = cs.members.iter().map(|m| m.key).collect();
+        for gone in &dropped {
+            remove_where_remover_absent(state, db, gone, &cs.sender, channel_id, &devices)?;
         }
     }
 
