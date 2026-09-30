@@ -18,6 +18,7 @@ repository = "https://github.com/seed-drill/cordelia-node"
 authors = ["Seed Drill <hello@seeddrill.ai>"]
 
 [workspace.dependencies]
+ureq = { version = "3.4", default-features = false, features = ["json"] }
 # Internal crates
 cordelia-core = { path = "crates/cordelia-core" }
 cordelia-crypto = { path = "crates/cordelia-crypto" }

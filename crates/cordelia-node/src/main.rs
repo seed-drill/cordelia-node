@@ -16,8 +16,8 @@ mod p2p;
 #[derive(Parser)]
 #[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
 struct Cli {
-    /// Path to config file
-    #[arg(long, default_value = "~/.cordelia/config.toml")]
+    /// Path to config file (accepted before or after the subcommand)
+    #[arg(long, global = true, default_value = "~/.cordelia/config.toml")]
     config: String,
 
     #[command(subcommand)]
@@ -56,8 +56,34 @@ enum Commands {
     Channels,
     /// Show detailed metrics
     Stats,
-    /// Print public key from identity.key (for PAN trusted_peers config)
-    Pubkey,
+    /// Print this device's public key (give it to `add-device` elsewhere)
+    #[command(alias = "pubkey")]
+    Id,
+    /// Add another of your devices; then run `cordelia accept` on it
+    AddDevice {
+        /// The other device's key, from `cordelia id` on that device
+        key: String,
+        /// A name for the device, e.g. "imac"
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Trust the device that added this one with `add-device`
+    Accept {
+        /// The key printed by `add-device` on the other device
+        key: String,
+        /// A name for the device, e.g. "macbook"
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove one of your devices and rotate the keys it held
+    RemoveDevice {
+        /// The device's key
+        key: String,
+    },
+    /// List your devices
+    Devices,
+    /// List invites waiting for `accept`
+    Invites,
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -93,7 +119,12 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Peers) => cmd_peers(),
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats) => cmd_stats(&cli.config),
-        Some(Commands::Pubkey) => cmd_pubkey(&cli.config),
+        Some(Commands::Id) => cmd_pubkey(&cli.config),
+        Some(Commands::AddDevice { key, name }) => cmd_add_device(&cli.config, &key, name),
+        Some(Commands::Accept { key, name }) => cmd_accept(&cli.config, &key, name),
+        Some(Commands::RemoveDevice { key }) => cmd_remove_device(&cli.config, &key),
+        Some(Commands::Devices) => cmd_devices(&cli.config),
+        Some(Commands::Invites) => cmd_invites(&cli.config),
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -757,6 +788,160 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk_bech32 = cordelia_crypto::bech32::encode_public_key(&identity.public_key())?;
     println!("{pk_bech32}");
+    Ok(())
+}
+
+// ── Device commands (decision 2026-09-30-agent-memory-sync §3) ────
+//
+// Thin clients of the running node's local API: all logic lives in the
+// node (cordelia_api::membership), which must be started first.
+
+/// POST `body` to the local node's API and return the JSON response.
+fn api_post(
+    config_path: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+
+    let token_path = config.token_path();
+    let token = std::fs::read_to_string(&token_path).map_err(|e| {
+        anyhow::anyhow!(
+            "read node token {}: {e}. Run `cordelia init` first.",
+            token_path.display()
+        )
+    })?;
+    let url = format!(
+        "http://{}:{}{path}",
+        config.api.bind_address, config.node.http_port
+    );
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into();
+    let mut resp = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", token.trim()))
+        .send_json(&body)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+            )
+        })?;
+
+    let status = resp.status();
+    let json: serde_json::Value = resp
+        .body_mut()
+        .read_json()
+        .unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = json["error"]["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        anyhow::bail!("{message}");
+    }
+    Ok(json)
+}
+
+fn cmd_add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
+    let resp = api_post(
+        config_path,
+        "/api/v1/devices/add",
+        serde_json::json!({ "device": key, "name": name }),
+    )?;
+    let channels = resp["channels"].as_array().map(Vec::len).unwrap_or(0);
+    let this_device = resp["this_device"].as_str().unwrap_or_default();
+    println!(
+        "Added {} to {channels} channel{}.",
+        name.as_deref().unwrap_or(key),
+        if channels == 1 { "" } else { "s" }
+    );
+    println!();
+    println!("On the other device, run:");
+    println!("  cordelia accept {this_device}");
+    Ok(())
+}
+
+fn cmd_accept(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
+    let resp = api_post(
+        config_path,
+        "/api/v1/devices/accept",
+        serde_json::json!({ "key": key, "name": name }),
+    )?;
+    let joined = resp["applied"].as_array().map(Vec::len).unwrap_or(0);
+    println!("Trusted {}.", name.as_deref().unwrap_or(key));
+    if joined > 0 {
+        println!(
+            "Joined {joined} channel{}.",
+            if joined == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("Its invites have not arrived yet; they will be applied as they do.");
+    }
+    Ok(())
+}
+
+fn cmd_remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
+    let resp = api_post(
+        config_path,
+        "/api/v1/devices/remove",
+        serde_json::json!({ "device": key }),
+    )?;
+    let rotated = resp["channels_rotated"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    println!(
+        "Removed {key} from {rotated} channel{} and rotated {}.",
+        if rotated == 1 { "" } else { "s" },
+        if rotated == 1 {
+            "its key"
+        } else {
+            "their keys"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
+    let resp = api_post(config_path, "/api/v1/devices/list", serde_json::json!({}))?;
+    for d in resp["devices"].as_array().into_iter().flatten() {
+        let key = d["key"].as_str().unwrap_or_default();
+        let name = d["name"].as_str().unwrap_or("");
+        let marker = if d["this_device"].as_bool() == Some(true) {
+            "  (this device)"
+        } else if d["in_personal_channel"].as_bool() != Some(true) {
+            "  (waiting to join)"
+        } else {
+            ""
+        };
+        println!("{key}  {name}{marker}");
+    }
+    Ok(())
+}
+
+fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
+    let resp = api_post(config_path, "/api/v1/invites/list", serde_json::json!({}))?;
+    let pending = resp["pending"].as_array().cloned().unwrap_or_default();
+    if pending.is_empty() {
+        println!("No invites waiting.");
+        return Ok(());
+    }
+    for p in &pending {
+        println!(
+            "{}  from {}  ({})",
+            p["channel_id"].as_str().unwrap_or_default(),
+            p["from"].as_str().unwrap_or_default(),
+            p["received_at"].as_str().unwrap_or_default()
+        );
+    }
+    println!();
+    println!("To join, trust the sender: cordelia accept <from>");
     Ok(())
 }
 
