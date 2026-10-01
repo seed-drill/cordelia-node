@@ -149,6 +149,16 @@ enum SyncCommand {
     Off,
     /// Show what is syncing, and what is not
     Status,
+    /// Sync home-folder memory on this device, or not
+    Home {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Stop syncing one project from this device (its git remote, e.g.
+    /// github.com/client-co/app, or a prefix ending in *)
+    Exclude { project: String },
+    /// Sync a project again after `exclude`
+    Include { project: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -403,17 +413,50 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         }
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
+            // One entry per synced folder: what a panel lists and toggles.
+            let projects: Vec<serde_json::Value> = report["folders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| {
+                    serde_json::json!({
+                        "project": f["project"],
+                        "folder": f["folder"],
+                        "waiting": f["waiting"],
+                        "conflicts": f["conflict_files"],
+                    })
+                })
+                .collect();
             out["sync"] = serde_json::json!({
                 "enabled": sync["enabled"],
+                "dir": sync["dir"],
+                "home": sync["home"],
+                "exclude": sync["exclude"],
                 "last_cycle_at": report["at"],
                 "last_change_at": sync["last_change_at"],
                 "folders": report["folders"].as_array().map_or(0, Vec::len),
+                "projects": projects,
                 "projects_waiting": status.facts.projects_waiting,
                 "conflicts": status.facts.conflicts,
                 "unsynced": report["unsynced"],
                 "excluded": report["excluded"],
                 "errors": status.facts.errors,
             });
+        }
+        // The connected peers and this person's devices, for panels.
+        if status.facts.running
+            && let Ok(config) = Config::load(&config::expand_tilde(config_path)).map(|mut c| {
+                c.apply_env_overrides();
+                c
+            })
+        {
+            let timeout = std::time::Duration::from_secs(1);
+            if let Ok(peers) = local_api(&config, false, "/api/v1/peers", timeout) {
+                out["peers"]["list"] = peers["peers"].clone();
+            }
+            if let Ok(devices) = local_api(&config, true, "/api/v1/devices/list", timeout) {
+                out["devices"] = devices["devices"].clone();
+            }
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -1191,6 +1234,52 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 // node (cordelia_api::membership), which must be started first.
 
 /// POST `body` to the local node's API and return the JSON response.
+/// The sync settings one command changes at a time.
+struct SyncSettings {
+    exclude: Vec<String>,
+    home: bool,
+}
+
+/// A project as the exclude list stores it: lower case, no `.git`.
+fn normalise_project(project: &str) -> String {
+    project.trim().trim_end_matches(".git").to_lowercase()
+}
+
+/// Change one sync setting and keep the rest: read the current settings,
+/// apply `change`, and write them all back. Sync must already be on.
+fn change_sync_settings(
+    config_path: &str,
+    change: impl FnOnce(&mut SyncSettings),
+) -> anyhow::Result<()> {
+    let current = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
+    if current["enabled"].as_bool() != Some(true) {
+        anyhow::bail!("Sync is off. Turn it on with `cordelia sync claude`.");
+    }
+    let mut settings = SyncSettings {
+        exclude: current["exclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        home: current["home"].as_bool().unwrap_or(true),
+    };
+    change(&mut settings);
+    api_post(
+        config_path,
+        "/api/v1/sync/claude",
+        serde_json::json!({
+            "enabled": true,
+            "dir": current["dir"],
+            "exclude": settings.exclude,
+            "home": settings.home,
+        }),
+    )?;
+    Ok(())
+}
+
 /// GET a local API endpoint of the running node; errors if it isn't running.
 fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     let config_file = config::expand_tilde(config_path);
@@ -1427,6 +1516,33 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             return Ok(());
         }
         SyncCommand::Status => api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?,
+        SyncCommand::Home { state } => {
+            let on = state == "on";
+            change_sync_settings(config_path, |settings| settings.home = on)?;
+            println!(
+                "Home-folder memory {} on this device.",
+                if on { "syncs" } else { "is not synced" }
+            );
+            return Ok(());
+        }
+        SyncCommand::Exclude { project } => {
+            let project = normalise_project(&project);
+            change_sync_settings(config_path, |settings| {
+                if !settings.exclude.contains(&project) {
+                    settings.exclude.push(project.clone());
+                }
+            })?;
+            println!("Not synced from this device: {project}");
+            return Ok(());
+        }
+        SyncCommand::Include { project } => {
+            let project = normalise_project(&project);
+            change_sync_settings(config_path, |settings| {
+                settings.exclude.retain(|e| *e != project);
+            })?;
+            println!("Synced from this device again: {project}");
+            return Ok(());
+        }
     };
 
     if resp["enabled"].as_bool() != Some(true) {
