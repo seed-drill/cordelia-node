@@ -823,6 +823,43 @@ fn claude_memory_syncs_between_two_machines() {
         "{bar}"
     );
 
+    // The full snapshot a panel reads: relays, this person's devices, and
+    // each project with its settings.
+    let snapshot = state(&a);
+    assert_eq!(snapshot["peers"]["list"][0]["role"], "relay", "{snapshot}");
+    assert_eq!(
+        snapshot["devices"].as_array().unwrap().len(),
+        2,
+        "{snapshot}"
+    );
+    assert!(
+        snapshot["sync"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["project"] == "github.com/seed-drill/cordelia-node"),
+        "{snapshot}"
+    );
+
+    // One setting changes at a time; the others stay as they were.
+    a.cli(&["sync", "home", "off"]);
+    a.cli(&["sync", "exclude", "github.com/Client-Co/App.git"]);
+    let s = state(&a);
+    assert_eq!(s["sync"]["home"], false, "{s}");
+    assert_eq!(
+        s["sync"]["exclude"],
+        serde_json::json!(["github.com/client-co/app"])
+    );
+    assert_eq!(s["sync"]["enabled"], true);
+    a.cli(&["sync", "include", "github.com/client-co/app"]);
+    a.cli(&["sync", "home", "on"]);
+    let s = state(&a);
+    assert_eq!(s["sync"]["home"], true, "{s}");
+    assert_eq!(s["sync"]["exclude"], serde_json::json!([]));
+    wait_for("a settles after the settings changes", &all, 60, || {
+        (state(&a)["state"] == "synced").then_some(())
+    });
+
     // A conflict file shows until someone merges it and deletes it.
     let conflict = a_proj_mem.join("decision.conflict-0123abcd.md");
     std::fs::write(&conflict, "the other version\n").unwrap();
