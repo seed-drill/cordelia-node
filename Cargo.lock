@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-api"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "actix-rt",
  "actix-web",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-core"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "bech32",
  "chrono",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-crypto"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "bech32",
  "ciborium",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-network"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "chrono",
  "ciborium",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-node"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-storage"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "chrono",
  "cordelia-core",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-sync"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "chrono",
  "cordelia-api",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "cordelia-test"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "cordelia-api",
  "cordelia-core",
