@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -247,6 +247,19 @@ CREATE TABLE IF NOT EXISTS sync_files (
 );
 "#;
 
+/// Migration v7: aggregate usage counts for relay operators
+/// (`crate::usage`). Peers are stored as a keyed hash, never as a key.
+const MIGRATION_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS peer_sightings (
+    peer_hash   BLOB PRIMARY KEY,
+    is_relay    INTEGER NOT NULL DEFAULT 0,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_peer_sightings_last ON peer_sightings(last_seen);
+CREATE INDEX IF NOT EXISTS idx_items_received ON items(received_at);
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -298,6 +311,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v6 (sync adapter state)");
         conn.execute_batch(MIGRATION_V6)?;
         conn.pragma_update(None, "user_version", 6)?;
+    }
+
+    if current < 7 {
+        tracing::info!("applying migration v7 (usage counts)");
+        conn.execute_batch(MIGRATION_V7)?;
+        conn.pragma_update(None, "user_version", 7)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;

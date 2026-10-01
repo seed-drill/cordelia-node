@@ -29,6 +29,7 @@ fn test_state() -> web::Data<AppState> {
         peers_warm: AtomicU64::new(0),
         push_tx: None,
         announce_tx: None,
+        peers: Default::default(),
     })
 }
 

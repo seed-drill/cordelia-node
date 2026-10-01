@@ -573,6 +573,7 @@ pub async fn p2p_loop(
     let (connect_tx, mut connect_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectMsg>();
     let (discovery_tx, mut discovery_rx) =
         tokio::sync::mpsc::unbounded_channel::<Vec<cordelia_network::messages::PeerAddress>>();
+    let mut sightings = Sightings::default();
     let mut in_flight: std::collections::HashSet<std::net::SocketAddr> =
         std::collections::HashSet::new();
     let mut gov_pending: std::collections::HashMap<std::net::SocketAddr, NodeId> =
@@ -1359,6 +1360,20 @@ pub async fn p2p_loop(
                     }
                 }
 
+                // Connected peers, for `cordelia peers` and the usage counts.
+                let connected: Vec<&cordelia_network::governor::PeerInfo> = governor
+                    .all_peers()
+                    .filter(|p| {
+                        matches!(
+                            p.state,
+                            cordelia_network::governor::PeerState::Hot
+                                | cordelia_network::governor::PeerState::Warm
+                        )
+                    })
+                    .collect();
+                publish_peers(&state, &connected, &conn_mgr);
+                sightings.note(&state, &connected);
+
                 // Bootstrap retry: if no relay in hot set, retry bootstrap
                 // addresses (§8.3: bootnode connection is transient, but the
                 // config may include relay addresses that failed on first attempt).
@@ -1410,6 +1425,115 @@ pub async fn p2p_loop(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Publish the connected peers to the shared state, for `cordelia peers`.
+fn publish_peers(
+    state: &cordelia_api::state::AppState,
+    connected: &[&cordelia_network::governor::PeerInfo],
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) {
+    use cordelia_network::governor::PeerState;
+    let mut list: Vec<cordelia_api::state::PeerSnapshot> = connected
+        .iter()
+        .map(|p| cordelia_api::state::PeerSnapshot {
+            key: cordelia_crypto::bech32::encode_public_key(&p.node_id.0).unwrap_or_default(),
+            role: if p.is_relay {
+                "relay"
+            } else if p.is_bootnode {
+                "bootnode"
+            } else {
+                "node"
+            }
+            .into(),
+            state: if p.state == PeerState::Hot {
+                "hot"
+            } else {
+                "warm"
+            }
+            .into(),
+            address: conn_mgr
+                .get_connection(&p.node_id)
+                .map(|c| c.remote_address().to_string())
+                .or_else(|| p.addrs.first().cloned())
+                .unwrap_or_default(),
+            connected_secs: p.connected_since.map_or(0, |t| t.elapsed().as_secs()),
+            idle_secs: p.last_activity.elapsed().as_secs(),
+        })
+        .collect();
+    list.sort_by(|a, b| a.key.cmp(&b.key));
+    if let Ok(mut peers) = state.peers.write() {
+        *peers = list;
+    }
+}
+
+/// Notes which peers are connected, for the aggregate usage counts
+/// (`cordelia_storage::usage`): each as a hash made with a secret that
+/// stays on this node, refreshed every `SIGHTING_REFRESH_SECS` and
+/// forgotten `SIGHTING_RETENTION_DAYS` after the peer was last seen.
+#[derive(Default)]
+struct Sightings {
+    secret: Option<[u8; 32]>,
+    noted: std::collections::HashMap<NodeId, std::time::Instant>,
+    pruned: Option<std::time::Instant>,
+}
+
+impl Sightings {
+    fn note(
+        &mut self,
+        state: &cordelia_api::state::AppState,
+        connected: &[&cordelia_network::governor::PeerInfo],
+    ) {
+        use cordelia_core::protocol::{SIGHTING_REFRESH_SECS, SIGHTING_RETENTION_DAYS};
+        use cordelia_storage::{meta, usage};
+
+        let refresh = std::time::Duration::from_secs(SIGHTING_REFRESH_SECS);
+        let due: Vec<_> = connected
+            .iter()
+            .filter(|p| {
+                self.noted
+                    .get(&p.node_id)
+                    .is_none_or(|t| t.elapsed() >= refresh)
+            })
+            .collect();
+        let prune_due = self
+            .pruned
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3600));
+        if due.is_empty() && !prune_due {
+            return;
+        }
+        let Ok(db) = state.db.lock() else { return };
+
+        if self.secret.is_none() {
+            let stored = meta::get(&db, meta::USAGE_SIGHTING_SECRET)
+                .ok()
+                .flatten()
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            self.secret = stored.or_else(|| {
+                let fresh = cordelia_crypto::generate_psk().ok()?;
+                meta::set(&db, meta::USAGE_SIGHTING_SECRET, &hex::encode(fresh)).ok()?;
+                Some(fresh)
+            });
+        }
+        let Some(secret) = self.secret else { return };
+
+        let now = chrono::Utc::now().timestamp();
+        for p in due {
+            let mut keyed = secret.to_vec();
+            keyed.extend_from_slice(&p.node_id.0);
+            let hash = cordelia_crypto::sha256(&keyed);
+            if usage::record_sighting(&db, &hash, p.is_relay, now).is_ok() {
+                self.noted
+                    .insert(p.node_id.clone(), std::time::Instant::now());
+            }
+        }
+        if prune_due {
+            let _ = usage::prune_sightings(&db, now - SIGHTING_RETENTION_DAYS * 86_400);
+            self.noted.retain(|_, t| t.elapsed() < refresh);
+            self.pruned = Some(std::time::Instant::now());
         }
     }
 }

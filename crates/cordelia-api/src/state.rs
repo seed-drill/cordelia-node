@@ -50,6 +50,24 @@ pub struct AppState {
     /// Triggers channel-announce (0x04) to hot peers.
     /// None if P2P is not running (e.g., in tests).
     pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The peers this node is connected to, refreshed on each governor tick.
+    pub peers: std::sync::RwLock<Vec<PeerSnapshot>>,
+}
+
+/// One connected peer, as `cordelia peers` shows it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerSnapshot {
+    /// The peer's public key (bech32).
+    pub key: String,
+    /// `relay`, `bootnode` or `node`.
+    pub role: String,
+    /// `hot` or `warm`.
+    pub state: String,
+    pub address: String,
+    /// Seconds since the connection was made.
+    pub connected_secs: u64,
+    /// Seconds since anything was last heard from the peer.
+    pub idle_secs: u64,
 }
 
 impl AppState {
