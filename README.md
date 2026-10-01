@@ -1,7 +1,6 @@
 # Cordelia
 
-**Your AI agent's memory on every machine you use, readable only by you and the
-people you choose.**
+**Your AI agent's memory on every machine you use, readable only by you.**
 
 AI coding agents keep memory, but it lives in one folder on one machine, filed
 under the path the agent ran in. Cordelia keeps it in step across your devices:

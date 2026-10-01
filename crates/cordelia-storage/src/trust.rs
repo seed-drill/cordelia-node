@@ -16,7 +16,8 @@ use cordelia_core::CordeliaError;
 pub enum TrustKind {
     /// Another device of the same person.
     Device,
-    /// Another person (v1.1 sharing).
+    /// Another person, for channels shared between people (not built;
+    /// memory is never shared, decision 2026-09-30 §4.7).
     Person,
 }
 

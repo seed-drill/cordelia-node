@@ -20,12 +20,12 @@ Last time we were too ambitious to execute: five phases, a token economy and a t
 
 ## 1. Decision
 
-We are cutting Cordelia back to one product: **your AI agent's memory on every machine you use, readable only by you and the people you choose.**
+We are cutting Cordelia back to one product: **your AI agent's memory on every machine you use, readable only by you.**
 
 - **v1** syncs Claude Code's memory files between one person's machines, through relays that cannot read them.
-- **v1.1** shares a project's memory with a teammate. It uses the same mechanism, so it costs no new design.
+- **Changed 2026-10-01.** v1.1 was to share a project's memory with a teammate, and the line above ended "and the people you choose". Memory is now never shared between people (4.7). What follows v1 is channels shared between people that carry messages, skills and secrets, which are designed separately.
 
-We release it as open source and measure whether people share. Anything that v1 or v1.1 doesn't need is either deferred or dropped (section 8).
+We release it as open source and measure whether people use it and keep using it. Anything that v1 doesn't need is either deferred or dropped (section 8).
 
 ## 2. Starting point (2026-09-30)
 
@@ -57,7 +57,7 @@ That is one key copied in each direction. Each machine has now been told by you,
 
 After that, a memory Claude Code writes for that project on one machine appears on the other. This includes memories written while the other machine was off; they arrive when it next connects. Only what is mapped syncs (4.5).
 
-v1.1 adds a person the same way, with a scope: `cordelia share <project> <key>` shares one project's memory, not everything.
+**Changed 2026-10-01.** This section used to end by adding a person the same way, to share one project's memory. Memory is not shared between people (4.7).
 
 ## 4. Design
 
@@ -65,7 +65,7 @@ Five changes to the node, plus one piece of infrastructure.
 
 ### 4.1 One key per device; devices are channel members
 
-Each machine keeps the Ed25519 identity that `init` generates. A person's devices are members of that person's invite-only channels, exactly as a teammate would be.
+Each machine keeps the Ed25519 identity that `init` generates. A person's devices are members of that person's invite-only channels.
 
 This replaces seed-sharing pairing ([`identity.md`](../specs/identity.md) §6). Seed sharing copies the whole identity to every device, so no single device can be revoked, and it gives two live nodes the same node ID.
 
@@ -131,7 +131,7 @@ It runs inside the node binary: one install, and the node stays the encryption b
 - **What syncs is declared (changed 2026-10-01).** `cordelia sync map <folder> [name]` says that Claude's memory for a folder syncs under a name, and nothing else syncs. On a new machine `cordelia sync claude` therefore syncs nothing: it lists what it found, with the command that maps each. As first built it synced home memory and every git project it found; that is now `--all`, which also covers what turns up later. An install from before this change keeps syncing everything it finds, because a scope is only ever narrowed by its owner. Running `cordelia sync claude` again keeps the stored settings (it used to put the directory back to the default), as does turning sync off and on, and it says what it changed. Every change of scope, mapping or exclusion is logged. `cordelia sync status` shows each folder with its name, when it last sent and received, and any error; `cordelia status --json` adds its channel.
 - **A name, not a path, is what devices share.** Claude Code names folders after the working directory, so paths never match across machines. A git project's name defaults to its `origin` remote, normalised to `host/owner/repo`. Any other folder is given a name, and a name can be given to a project too. Home memory is the name `~`, and mapping the home directory has to be asked for (`--home`). `cordelia sync map` refuses a folder outside the home directory, a second name for a mapped folder, a second mapped folder for a name, and two folders that Claude Code keeps in one (it names its folder after the path with every other character turned into a dash).
 - **One memory per repository.** Claude Code keeps a repository's memory in the folder of its main working tree, shared by its subdirectories and worktrees, so that is the folder `cordelia sync map` maps, whichever folder of the repository it is given. A mapping syncs the Claude Code folder named after its directory and no other. It is never matched by reading session transcripts, so it cannot come to sync a different folder than the one declared.
-- **Each name gets its own `grp_` channel,** so sharing it later is just adding a member. The personal channel maps `project/<name>` to the channel.
+- **Each name gets its own `grp_` channel,** which only its owner's devices join (4.7). The personal channel maps `project/<name>` to the channel.
 - **Home memory has its own channel (changed 2026-10-01).** As first built it went to the personal channel, under keys `home/<file>`, which every device of the person holds. It now syncs like any other name, in a channel joined only by the devices that map it.
 - **As built: devices join only what they map.** A channel starts with its creator as the only member. Another device that maps the same name posts a join request (`join/<channel>/<device>`) in the personal channel; an owner grants it, and only for the device named in it. So each device holds keys only for what it syncs. Each device also lists the names it syncs (`syncing/<device>`) in the personal channel, read only from the device a list is about, so `cordelia sync status` can say what the person's other devices sync.
 - **A folder that stops syncing starts afresh (2026-10-01).** Unmapping a folder, turning home memory or sync off, or narrowing the scope forgets what the folder had agreed with its channel. If it syncs again it merges with the channel as a new folder would, so files it lost in between are fetched back and never sent as deletes. An unmapped folder also stays out of `--all` until it is mapped again. A mapped folder whose memory directory has gone missing is reported and nothing is deleted elsewhere. Unmapping does not yet take the device out of the channel (section 9).
@@ -149,11 +149,26 @@ Personal nodes are outbound-only and there is no NAT traversal, so two devices a
 - **DNS:** `relay1.cordelia.seeddrill.ai` and `relay2.cordelia.seeddrill.ai`, UDP 9474. New nodes list both (`FALLBACK_PEERS`), and anyone can add their own. **As built:** nodes keep the names, not the addresses. They resolve them again while running and redial whenever they have no relay, so a node started before its network was up, or a relay whose address changed, is still reached.
 - **Retention** for relays is not implemented yet (section 9).
 
+### 4.7 Memory is the boundary (decided 2026-10-01)
+
+An agent's memory is who it is for one person: what it knows about them, how they like to work, what it has been corrected on, and what it is in the middle of. Cordelia treats it as it would a person. It has one owner, and it is not shared.
+
+- **Between one person's devices, memory moves whole.** That is what v1 is for: the same agent, with the same context, is there at the new vantage point. The one you talk to on the laptop is the one you were talking to on the desktop.
+- **Between people, memory does not move at all.** v1.1 was going to share a project's memory with a teammate. It will not, for four reasons:
+  1. Memory is written to one person's agent. "The user prefers short answers", read by another person's agent, is about the wrong person.
+  2. The agent reads its memory folder as its own notes. Nothing marks a file as someone else's, so another person's text, or their compromised agent's, would act with your agent's authority. No label Cordelia could add would be seen where it matters.
+  3. Memory mixes facts about a project with facts about a person and about one machine, and nothing separates them. Sharing it shares more than was meant.
+  4. What people need to share is shared on purpose and has better homes: the repository for project facts, where they are reviewed; messages for coordination; skills and secrets as things that are published and then chosen.
+- **It is enforced, not left to convention.** A channel that carries memory admits only its owner's devices: a device is let in on a request made in the owner's personal channel (4.5), and no command adds anyone else's key to one. When channels shared between people are built, the node will refuse to sync a memory folder with any channel that holds a key from outside its owner's devices.
+- **What comes next is therefore not shared memory.** It is channels shared between people that carry what is shared on purpose: messages between agents first, then skills and secrets. The rule there is the other half of this one: automatic between your own devices, deliberate between people.
+
+This decision is expected to stand. If people later want notes in common, the answer is a note that is published on purpose and shown with its author, and that never lands in the memory folder.
+
 ## 5. What we promise about security
 
 - Relays and Seed Drill see channel IDs, device public keys, item sizes, types and timing. They never see content, file names, member lists or keys.
   - For usage counts (distinct peers per day and week), a relay keeps a keyed hash of each peer's key, made with a secret that stays on the relay, for 8 days after the peer was last seen. It reports counts, never keys.
-- Only devices you added, and people you shared a project with, can read it.
+- Only devices you added can read your memory. It is never shared with another person (4.7).
 - On your own machines, memory is as protected as your disk. The node's search index and Claude Code's own files are plaintext at rest.
 
 This replaces the v2.3 whitepaper's "no plaintext at rest on any node, ever", which the code did not meet and v1 doesn't need.
@@ -165,7 +180,7 @@ v1 must beat plain file sync on things it can't do:
 - **Neither machine needs to be on at the same time.** The relay holds ciphertext, so a closed laptop still catches up later.
 - **Memory follows the project, not the path.** File sync puts `-home-alice-Work` and `-Users-alice-Work` in different folders.
 - **`MEMORY.md` merges instead of producing conflict files.**
-- **Sharing follows the repo.** You share one project's memory with one person, without sharing a folder tree.
+- **Only what you map syncs, and each device holds keys only for that** (4.5).
 
 If dogfooding shows these differences don't matter in practice, that is our answer, and it is cheap to get.
 
@@ -183,8 +198,9 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 | `cordelia sync claude` adapter, per-project channels, declared mappings | **Built** | 4.5 |
 | Two relays and DNS | **Running** | 4.6; hosted by us for the alpha |
 | Release: macOS and Linux binaries | **Built** | `release.yml`; Homebrew tap and AUR package to follow |
-| Sharing with a teammate (`share`) | **v1.1** | Same mechanism as 4.1 |
-| Second agent adapter | **v1.1+** | Proves portability |
+| Sharing a project's memory with a teammate (`share`) | **Drop** | Memory is not shared between people (4.7) |
+| Channels shared between people: messages, skills, secrets | **Next** | Designed separately; never memory (4.7) |
+| Second agent adapter | **Later** | Proves portability |
 | Open channels, secret keepers, PSK-Exchange (0x07) | Defer | Only needed for public channels |
 | FTS search, semantic search | Defer | The agent reads the files; v1 needs no search |
 | PAN / swarm (`swarm-init`) | Defer | Sub-agents, not devices |

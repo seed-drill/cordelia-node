@@ -14,20 +14,23 @@ encrypted, readable by them and the people they choose, portable between
 machines and between agents, and never readable by the infrastructure that
 carries it. Everything below extends that idea outwards; none of it relaxes it.
 
-## 1. Beyond one person: sharing
+## 1. Beyond one person: shared channels, not shared memory
 
-v1 keeps one person's devices in step. The next step (v1.1) shares a project's
-memory with other people, using the same mechanism: a teammate's devices become
-members of the project's channel.
+v1 keeps one person's devices in step. Memory stops there. An agent's memory is
+its own notes about one person, and the agent reads it as such, so memory
+written by someone else would in effect be instructions from them. Cordelia
+therefore never shares memory between people (decision record §4.7).
 
-Sharing raises a question v1 does not have to answer: an agent reads memory as
-its own notes, so memory written by someone else is, in effect, instructions
-from them. Before sharing ships we will decide how that is surfaced, for
-example by labelling who wrote each memory, or by holding memory from other
-people for review before it reaches the agent.
+What people working together need from their agents is shared on purpose:
 
-The network effect starts here: each person added to a project makes that
-project's memory worth more to everyone on it.
+- **messages** between agents, delivered into their sessions as requests, never
+  as authority, so that people stop copying text from one session to another;
+- **skills**, published in a channel and installed by choice;
+- **secrets**, which an agent uses by name and never sees.
+
+These travel in channels shared between people, built on the same keys and the
+same relays. The rule is the other half of v1's: automatic between your own
+devices, deliberate between people.
 
 ## 2. Beyond one agent
 
