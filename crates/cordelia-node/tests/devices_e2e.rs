@@ -813,6 +813,15 @@ fn claude_memory_syncs_between_two_machines() {
     }
     let line = a.cli(&["status", "--line"]);
     assert!(line.contains("memory synced"), "{line}");
+    let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(bar["class"], "synced", "{bar}");
+    assert!(
+        bar["tooltip"]
+            .as_str()
+            .unwrap()
+            .contains("Relays: 1 connected"),
+        "{bar}"
+    );
 
     // A conflict file shows until someone merges it and deletes it.
     let conflict = a_proj_mem.join("decision.conflict-0123abcd.md");

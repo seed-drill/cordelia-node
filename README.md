@@ -83,6 +83,32 @@ Claude Code starts with):
 If you already have a status line command, add `$(cordelia status --line)` to
 what it prints.
 
+For a desktop bar, `cordelia status --waybar` prints an icon, a tooltip and
+the state as a class, in the JSON that Waybar's custom modules take. The
+icons are Nerd Font glyphs.
+
+- **Omarchy:** add this to `bar.layout.right` in `~/.config/omarchy/shell.json`.
+  The bar highlights the icon when a conflict or an error needs you, and a
+  click opens the details.
+  ```json
+  {
+    "id": "cordelia",
+    "type": "command",
+    "exec": "~/.cordelia/bin/cordelia status --waybar",
+    "interval": 5,
+    "onClick": "omarchy-launch-floating-terminal-with-presentation '~/.cordelia/bin/cordelia status; echo; ~/.cordelia/bin/cordelia sync status'"
+  }
+  ```
+- **Waybar:** a custom module, styled by class (`synced`, `syncing`,
+  `offline`, `attention`, `off`, `stopped`).
+  ```json
+  "custom/cordelia": {
+    "exec": "~/.cordelia/bin/cordelia status --waybar",
+    "return-type": "json",
+    "interval": 5
+  }
+  ```
+
 ## Build from source
 
 ```bash

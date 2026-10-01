@@ -58,6 +58,9 @@ enum Commands {
         /// Machine-readable state, for widgets and scripts
         #[arg(long)]
         json: bool,
+        /// Icon, tooltip and class as JSON, for Waybar and the Omarchy bar
+        #[arg(long, conflicts_with_all = ["line", "json"])]
+        waybar: bool,
     },
     /// Start the node daemon
     Start,
@@ -158,7 +161,9 @@ fn main() -> anyhow::Result<()> {
             force,
             show_secrets,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
-        Some(Commands::Status { line, json }) => cmd_status(&cli.config, line, json),
+        Some(Commands::Status { line, json, waybar }) => {
+            cmd_status(&cli.config, line, json, waybar)
+        }
         Some(Commands::Start) => cmd_start(&cli.config),
         Some(Commands::Stop) => {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
@@ -326,9 +331,48 @@ fn default_entity_name() -> String {
 
 // ── cordelia status ────────────────────────────────────────────────
 
-fn cmd_status(config_path: &str, line: bool, json: bool) -> anyhow::Result<()> {
+fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     let (state, summary) = indicator::derive(&status.facts);
+
+    if waybar {
+        let mut details = Vec::new();
+        if status.facts.running {
+            let relays = status.facts.peers_hot;
+            details.push(match relays {
+                0 => "Relays: none connected".to_string(),
+                n => format!("Relays: {n} connected"),
+            });
+            if status.facts.outbox_waiting > 0 {
+                details.push(format!("Waiting to send: {}", status.facts.outbox_waiting));
+            }
+        }
+        if let Some(sync) = &status.sync {
+            if let Some(folders) = sync["report"]["folders"].as_array()
+                && !folders.is_empty()
+            {
+                details.push(format!("Folders syncing: {}", folders.len()));
+            }
+            if let Some(at) = sync["last_change_at"]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            {
+                let secs = (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds();
+                details.push(format!("Last change: {}", indicator::ago(secs)));
+            }
+        }
+        for c in &status.facts.conflicts {
+            details.push(format!("Conflict: {c}"));
+        }
+        for e in &status.facts.errors {
+            details.push(format!("Error: {e}"));
+        }
+        let text = indicator::bar(state, &summary, &details);
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        return Ok(());
+    }
 
     if line {
         let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
