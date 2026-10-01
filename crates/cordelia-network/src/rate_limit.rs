@@ -173,6 +173,17 @@ impl ConnectionTracker {
         Self::default()
     }
 
+    /// A tracker counting these connections. Build it from the connections
+    /// that are open now, rather than adding and removing as they come and
+    /// go: a count that is never decremented locks an address out for good.
+    pub fn from_ips(ips: impl IntoIterator<Item = IpAddr>) -> Self {
+        let mut tracker = Self::default();
+        for ip in ips {
+            tracker.add(ip);
+        }
+        tracker
+    }
+
     /// Check if a new inbound connection from `addr` would be allowed.
     pub fn would_allow(&self, addr: IpAddr) -> bool {
         if self.total >= MAX_INBOUND_CONNECTIONS {
@@ -396,5 +407,18 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         tracker.remove(ip); // Remove without adding
         assert_eq!(tracker.total(), 0);
+    }
+
+    #[test]
+    fn test_tracker_counts_only_the_connections_given() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        // At the per-address limit, another connection is refused...
+        let full = ConnectionTracker::from_ips(vec![ip; MAX_CONNECTIONS_PER_IP]);
+        assert!(!full.would_allow(ip));
+        // ...and allowed again once one of them has closed, because the
+        // tracker is rebuilt from the connections that are open.
+        let one_closed = ConnectionTracker::from_ips(vec![ip; MAX_CONNECTIONS_PER_IP - 1]);
+        assert!(one_closed.would_allow(ip));
+        assert!(ConnectionTracker::from_ips(Vec::new()).would_allow(ip));
     }
 }

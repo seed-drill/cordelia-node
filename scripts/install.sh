@@ -191,8 +191,9 @@ install_launchctl() {
 </plist>
 PLIST
 
+    START_CMD="launchctl load ${PLIST_FILE}"
     echo "LaunchAgent installed: ${PLIST_FILE}"
-    echo "  Start:  launchctl load ${PLIST_FILE}"
+    echo "  Start:  ${START_CMD}"
     echo "  Stop:   launchctl unload ${PLIST_FILE}"
     echo "  Logs:   tail -f ${DATA_DIR}/logs/cordelia.log"
 }
@@ -205,7 +206,7 @@ install_systemd() {
 
     cat > "$SERVICE_FILE" << SERVICE
 [Unit]
-Description=Cordelia - Encrypted pub/sub for AI agents
+Description=Cordelia: your agent's memory on every machine you use
 After=network-online.target
 Wants=network-online.target
 
@@ -220,9 +221,9 @@ Environment=CORDELIA_DATA_DIR=${DATA_DIR}
 WantedBy=default.target
 SERVICE
 
+    START_CMD="systemctl --user enable --now cordelia"
     echo "systemd user service installed: ${SERVICE_FILE}"
-    echo "  Enable: systemctl --user enable cordelia"
-    echo "  Start:  systemctl --user start cordelia"
+    echo "  Start:  ${START_CMD}"
     echo "  Status: systemctl --user status cordelia"
     echo "  Logs:   journalctl --user -u cordelia -f"
 
@@ -265,8 +266,13 @@ main() {
     echo "Cordelia installed successfully."
     echo ""
     echo "Next steps:"
-    echo "  cordelia status    # verify installation"
-    echo "  cordelia start     # start the node"
+    echo "  ${START_CMD}"
+    echo "                        # run the node as a background service"
+    echo "  cordelia status       # the node and its relays"
+    echo "  cordelia id           # this device's key, to pair another device"
+    echo "  cordelia sync claude  # keep Claude Code's memory in step"
+    echo ""
+    echo "Open a new terminal first if 'cordelia' is not found."
     echo ""
 }
 

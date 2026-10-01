@@ -94,6 +94,26 @@ impl Node {
         self.child = Some(child);
     }
 
+    /// Stop the node as a service manager would (SIGTERM), so it closes
+    /// its connections on the way out.
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+        }
+    }
+
+    /// Kill the node outright, as a crash or power loss would: its peers
+    /// only find out when the connection times out.
+    fn crash(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     fn get(&self, path: &str) -> Option<serde_json::Value> {
         let url = format!("http://127.0.0.1:{}{path}", self.http);
         let mut resp = ureq::get(&url)
@@ -152,15 +172,21 @@ fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 /// A node whose one bootnode is `bootnode` (`host:port`; a name, like the
 /// default relays, or an address).
 fn node_with_bootnode(name: &'static str, role: &str, bootnode: Option<String>) -> Node {
+    node_with_bootnodes(name, role, &bootnode.into_iter().collect::<Vec<_>>())
+}
+
+/// A node with these bootnodes (`host:port` each).
+fn node_with_bootnodes(name: &'static str, role: &str, bootnode_addrs: &[String]) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
     let mut p2p = free_port();
     while p2p == http {
         p2p = free_port();
     }
-    let bootnodes = bootnode
+    let bootnodes: String = bootnode_addrs
+        .iter()
         .map(|addr| format!("[[network.bootnodes]]\naddr = \"{addr}\"\n"))
-        .unwrap_or_default();
+        .collect();
     let (hot_min, hot_max) = if role == "relay" { (1, 10) } else { (1, 2) };
     let config = format!(
         r#"[identity]
@@ -474,6 +500,141 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
     });
 }
 
+/// The peers `n` is connected to, by key.
+fn peer_keys(n: &Node) -> Vec<String> {
+    let Some(v) = n.get("/api/v1/peers") else {
+        return Vec::new();
+    };
+    v["peers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p["key"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn two_relays_and_two_devices_keep_delivering_through_restarts() {
+    // The topology we run: two relays that list each other, a device that
+    // reaches both, and a device that reaches only one. Everything is
+    // judged by items arriving, not by what the nodes say about themselves.
+    let mut r1 = node("relay1", "relay", None);
+    let mut r2 = node_with_bootnodes("relay2", "relay", &[format!("localhost:{}", r1.p2p)]);
+    r1.start();
+    wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
+    r2.start();
+    wait_for("relay2 healthy", &[&r1, &r2], 30, || healthy(&r2));
+    let (r1_key, r2_key) = (
+        r1.cli(&["id"]).trim().to_string(),
+        r2.cli(&["id"]).trim().to_string(),
+    );
+    wait_for("the relays mesh", &[&r1, &r2], 60, || {
+        (peer_keys(&r1).contains(&r2_key) && peer_keys(&r2).contains(&r1_key)).then_some(())
+    });
+
+    let both = [
+        format!("localhost:{}", r1.p2p),
+        format!("localhost:{}", r2.p2p),
+    ];
+    let mut a = node_with_bootnodes("a", "personal", &both);
+    let mut b = node_with_bootnodes("b", "personal", &both[1..]);
+    a.start();
+    b.start();
+    {
+        let all = [&r1, &r2, &a, &b];
+        wait_for("a healthy", &all, 30, || healthy(&a));
+        wait_for("b healthy", &all, 30, || healthy(&b));
+        wait_for("a reaches both relays", &all, 60, || {
+            (peer_keys(&a).len() == 2).then_some(())
+        });
+        wait_for("b reaches relay2", &all, 60, || {
+            peer_keys(&b).contains(&r2_key).then_some(())
+        });
+    }
+
+    let b_key = b.cli(&["id"]).trim().to_string();
+    let a_key = a.cli(&["id"]).trim().to_string();
+    a.cli(&["add-device", &b_key, "--name", "b"]);
+    b.cli(&["accept", &a_key, "--name", "a"]);
+    let personal = groups(&a)
+        .into_iter()
+        .next()
+        .expect("a has a personal channel");
+    wait_for(
+        "b joins a's personal channel",
+        &[&r1, &r2, &a, &b],
+        90,
+        || groups(&b).contains(&personal).then_some(()),
+    );
+
+    // `from` publishes `text`; it must arrive at `to`.
+    let deliver = |from: &Node, to: &Node, text: &str, all: &[&Node]| {
+        from.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "content": { "text": text } }),
+        );
+        wait_for(
+            &format!("{} receives {text:?} from {}", to.name, from.name),
+            all,
+            150,
+            || {
+                let listened = to.post(
+                    "/api/v1/channels/listen",
+                    serde_json::json!({ "channel": personal, "limit": 100 }),
+                );
+                listened["items"]
+                    .as_array()?
+                    .iter()
+                    .any(|i| i["content"]["text"] == text)
+                    .then_some(())
+            },
+        );
+    };
+    deliver(&a, &b, "first", &[&r1, &r2, &a, &b]);
+    deliver(&b, &a, "second", &[&r1, &r2, &a, &b]);
+
+    // A relay is upgraded: stopped cleanly and started again.
+    r2.stop();
+    r2.start();
+    wait_for("relay2 healthy again", &[&r1, &r2], 30, || healthy(&r2));
+    deliver(&a, &b, "after relay2 restarts", &[&r1, &r2, &a, &b]);
+    deliver(&b, &a, "and back", &[&r1, &r2, &a, &b]);
+    wait_for("the relays mesh again", &[&r1, &r2], 120, || {
+        (peer_keys(&r1).contains(&r2_key) && peer_keys(&r2).contains(&r1_key)).then_some(())
+    });
+
+    // The other relay crashes: nobody is told.
+    r1.crash();
+    r1.start();
+    wait_for("relay1 healthy again", &[&r1, &r2], 30, || healthy(&r1));
+    deliver(&a, &b, "after relay1 crashes", &[&r1, &r2, &a, &b]);
+    wait_for("a is back on both relays", &[&r1, &r2, &a, &b], 180, || {
+        let keys = peer_keys(&a);
+        (keys.contains(&r1_key) && keys.contains(&r2_key)).then_some(())
+    });
+
+    // A laptop sleeps and wakes more often than the per-address connection
+    // limit: every reconnect must still be accepted, and still deliver.
+    for round in 0..7 {
+        if round % 2 == 0 {
+            b.stop();
+        } else {
+            b.crash();
+        }
+        b.start();
+        wait_for("b healthy again", &[&r1, &r2, &a, &b], 30, || healthy(&b));
+        deliver(
+            &b,
+            &a,
+            &format!("b after restart {round}"),
+            &[&r1, &r2, &a, &b],
+        );
+    }
+    deliver(&a, &b, "last", &[&r1, &r2, &a, &b]);
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
@@ -496,14 +657,14 @@ fn cli_reports_when_the_node_is_not_running() {
     let json: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["state"], "stopped", "{json}");
 
-    // On a machine without Cordelia, the status line prints nothing.
+    // On a machine without Cordelia (an empty home directory), the status
+    // line prints nothing.
+    let empty_home = tempfile::tempdir().unwrap();
     let none = Command::new(BIN)
-        .args([
-            "--config",
-            "/nonexistent/cordelia/config.toml",
-            "status",
-            "--line",
-        ])
+        .args(["status", "--line"])
+        .env("HOME", empty_home.path())
+        .env_remove("CORDELIA_CONFIG")
+        .env_remove("CORDELIA_DATA_DIR")
         .output()
         .unwrap();
     assert!(none.status.success());

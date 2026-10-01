@@ -16,10 +16,10 @@ Code's memory.
 
 **Pre-release (October 2026).** v1 is built and tested, including end-to-end
 tests with real processes over QUIC through a relay. Two relays are running,
-and `v0.2.0-alpha.1` is the first pre-release, for macOS and Linux:
+and `v0.2.0-alpha.2` is the current pre-release, for macOS and Linux:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.1 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.2 sh
 ```
 
 It is an alpha: expect rough edges, and keep your own backup of anything you
