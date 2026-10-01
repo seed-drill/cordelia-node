@@ -63,12 +63,20 @@ enum Commands {
     Start,
     /// Stop the node daemon
     Stop,
-    /// Show how many peers the running node is connected to
-    Peers,
+    /// List the peers the running node is connected to
+    Peers {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// List subscribed channels
     Channels,
-    /// Show detailed metrics
-    Stats,
+    /// Show what this node stores and has seen (counts only)
+    Stats {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Print this device's public key (give it to `add-device` elsewhere)
     #[command(alias = "pubkey")]
     Id,
@@ -156,9 +164,9 @@ fn main() -> anyhow::Result<()> {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
             Ok(())
         }
-        Some(Commands::Peers) => cmd_peers(&cli.config),
+        Some(Commands::Peers { json }) => cmd_peers(&cli.config, json),
         Some(Commands::Channels) => cmd_channels(&cli.config),
-        Some(Commands::Stats) => cmd_stats(&cli.config),
+        Some(Commands::Stats { json }) => cmd_stats(&cli.config, json),
         Some(Commands::Id) => cmd_pubkey(&cli.config),
         Some(Commands::AddDevice { key, name }) => cmd_add_device(&cli.config, &key, name),
         Some(Commands::Accept { key, name }) => cmd_accept(&cli.config, &key, name),
@@ -635,6 +643,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         peers_warm: std::sync::atomic::AtomicU64::new(0),
         push_tx: Some(push_tx),
         announce_tx: Some(announce_tx),
+        peers: Default::default(),
     });
 
     // Personal nodes receive invites and channel states in an inbox channel
@@ -677,7 +686,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
                 .iter()
                 .map(|b| b.addr.clone())
                 .collect();
-            let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(&bootnode_addrs);
+            let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(
+                &bootnode_addrs,
+                config.network.role == "personal",
+            );
             tracing::info!(count = bootnodes.len(), "bootnodes resolved");
 
             for bn in &bootnodes {
@@ -738,7 +750,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         if !is_bootnode {
             let names: Vec<String> = config.network.bootnodes.iter().map(|b| b.addr.clone()).collect();
             tokio::spawn(p2p::keep_bootnodes_resolved(
-                cordelia_network::bootstrap::bootstrap_hosts(&names),
+                cordelia_network::bootstrap::bootstrap_hosts(
+                    &names,
+                    config.network.role == "personal",
+                ),
                 bootstrap_addrs.clone(),
             ));
         }
@@ -858,15 +873,34 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
 
 // ── cordelia peers ─────────────────────────────────────────────────
 
-fn cmd_peers(config_path: &str) -> anyhow::Result<()> {
-    let live = api_get(config_path, "/api/v1/status")?;
-    let n = |k: &str| live[k].as_u64().unwrap_or(0);
+fn cmd_peers(config_path: &str, json: bool) -> anyhow::Result<()> {
+    let resp = api_get(config_path, "/api/v1/peers")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+    let peers = resp["peers"].as_array().cloned().unwrap_or_default();
+    if peers.is_empty() {
+        println!("No peers connected.");
+        return Ok(());
+    }
     println!(
-        "Connected peers: {} hot, {} warm.",
-        n("peers_hot"),
-        n("peers_warm")
+        "{:<67} {:<8} {:<5} {:<22} {:>10} {:>9}",
+        "KEY", "ROLE", "STATE", "ADDRESS", "CONNECTED", "IDLE"
     );
-    println!("(A per-peer list is not available yet.)");
+    for p in &peers {
+        let text = |k: &str| p[k].as_str().unwrap_or("-");
+        let secs = |k: &str| format_uptime(p[k].as_u64().unwrap_or(0));
+        println!(
+            "{:<67} {:<8} {:<5} {:<22} {:>10} {:>9}",
+            text("key"),
+            text("role"),
+            text("state"),
+            text("address"),
+            secs("connected_secs"),
+            secs("idle_secs"),
+        );
+    }
     Ok(())
 }
 
@@ -918,7 +952,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
 
 // ── cordelia stats ────────────────────────────────────────────────
 
-fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
+fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
@@ -935,26 +969,54 @@ fn cmd_stats(config_path: &str) -> anyhow::Result<()> {
     let conn = cordelia_storage::db::open(&db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
+    let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?.len();
+    let usage = cordelia_storage::usage::snapshot(&conn, chrono::Utc::now().timestamp())?;
 
-    let mut total_items: i64 = 0;
-    for ch in &channels {
-        total_items += cordelia_storage::items::count_for_channel(&conn, &ch.channel_id)?;
+    if json {
+        let out = serde_json::json!({
+            "database_bytes": db_size,
+            "channels_subscribed": channels,
+            "items_stored": usage.items_stored,
+            "content_bytes_stored": usage.bytes_stored,
+            "peers_seen": {
+                "1d": { "node": usage.peers_1d, "relay": usage.relays_1d },
+                "7d": { "node": usage.peers_7d, "relay": usage.relays_7d },
+            },
+            "channels_active": {
+                "1d": usage.channels_active_1d,
+                "7d": usage.channels_active_7d,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
     }
 
-    let size_str = if db_size > 1_048_576 {
-        format!("{:.1} MB", db_size as f64 / 1_048_576.0)
-    } else {
-        format!("{:.1} KB", db_size as f64 / 1024.0)
-    };
-
-    println!("Storage:        {size_str}");
-    println!("Channels:       {}", channels.len());
-    println!("Total items:    {total_items}");
-    println!("Sync errors:    0");
-    println!("Peers:          0 (P2P not yet implemented)");
+    println!("Database:         {}", format_bytes(db_size));
+    println!(
+        "Stored:           {} items, {} of encrypted content",
+        usage.items_stored,
+        format_bytes(usage.bytes_stored)
+    );
+    println!("Channels:         {channels} subscribed");
+    println!(
+        "Peers seen:       {} in the last day, {} in the last week (plus {} and {} relays)",
+        usage.peers_1d, usage.peers_7d, usage.relays_1d, usage.relays_7d
+    );
+    println!(
+        "Active channels:  {} in the last day, {} in the last week",
+        usage.channels_active_1d, usage.channels_active_7d
+    );
 
     Ok(())
+}
+
+/// `1.5 MB`, `12.0 KB`.
+fn format_bytes(bytes: u64) -> String {
+    if bytes > 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
 }
 
 // ── cordelia swarm-init ────────────────────────────────────────────

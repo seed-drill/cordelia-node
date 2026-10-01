@@ -32,6 +32,7 @@ fn node() -> Node {
         peers_warm: AtomicU64::new(0),
         push_tx: None,
         announce_tx: None,
+        peers: Default::default(),
     };
     membership::ensure_own_inbox(&state).unwrap();
     Node { state, _dir: dir }

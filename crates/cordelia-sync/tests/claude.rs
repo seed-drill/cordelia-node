@@ -43,6 +43,7 @@ impl Device {
             peers_warm: AtomicU64::new(0),
             push_tx: None,
             announce_tx: None,
+            peers: Default::default(),
         };
         membership::ensure_own_inbox(&state).unwrap();
         let adapter = ClaudeAdapter::new(

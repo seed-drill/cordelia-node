@@ -607,6 +607,7 @@ mod tests {
             peers_warm: std::sync::atomic::AtomicU64::new(0),
             push_tx: None,
             announce_tx: None,
+            peers: Default::default(),
         }
     }
 

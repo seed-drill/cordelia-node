@@ -123,13 +123,17 @@ pub fn resolve_fallback_peers() -> Vec<BootnodeAddr> {
     resolved
 }
 
-/// The bootnode names a node keeps dialling: its configured bootnodes, or
-/// the compiled-in fallback peers when it has none.
-pub fn bootstrap_hosts(config_addrs: &[String]) -> Vec<String> {
-    if config_addrs.is_empty() {
+/// The bootnode names a node keeps dialling: its configured bootnodes, or,
+/// with `use_defaults` and none configured, the compiled-in default relays.
+/// Only personal nodes use the defaults: a relay given no bootnodes stands
+/// alone, and never dials relays it was not told about.
+pub fn bootstrap_hosts(config_addrs: &[String], use_defaults: bool) -> Vec<String> {
+    if !config_addrs.is_empty() {
+        config_addrs.to_vec()
+    } else if use_defaults {
         FALLBACK_PEERS.iter().map(|s| s.to_string()).collect()
     } else {
-        config_addrs.to_vec()
+        Vec::new()
     }
 }
 
@@ -159,7 +163,10 @@ pub async fn resolve_hosts(hosts: &[String]) -> Vec<SocketAddr> {
 /// Resolve all bootnode addresses: config first, then DNS SRV, then fallback.
 ///
 /// Deduplicates by socket address.
-pub fn resolve_all_bootnodes(config_addrs: &[String]) -> Vec<BootnodeAddr> {
+///
+/// DNS SRV and the fallback apply only with `use_defaults` (personal nodes);
+/// see [`bootstrap_hosts`].
+pub fn resolve_all_bootnodes(config_addrs: &[String], use_defaults: bool) -> Vec<BootnodeAddr> {
     let mut all = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -171,7 +178,7 @@ pub fn resolve_all_bootnodes(config_addrs: &[String]) -> Vec<BootnodeAddr> {
     }
 
     // 2. DNS SRV (skip if config already provided bootnodes)
-    if config_addrs.is_empty() {
+    if config_addrs.is_empty() && use_defaults {
         for bn in resolve_dns_bootnodes() {
             if seen.insert(bn.addr) {
                 all.push(bn);
@@ -180,7 +187,7 @@ pub fn resolve_all_bootnodes(config_addrs: &[String]) -> Vec<BootnodeAddr> {
     }
 
     // 3. Fallback (last resort, only if no config bootnodes)
-    if config_addrs.is_empty() {
+    if config_addrs.is_empty() && use_defaults {
         for bn in resolve_fallback_peers() {
             if seen.insert(bn.addr) {
                 all.push(bn);
@@ -243,7 +250,7 @@ mod tests {
             "127.0.0.1:9474".to_string(), // duplicate
             "127.0.0.2:9474".to_string(),
         ];
-        let resolved = resolve_all_bootnodes(&addrs);
+        let resolved = resolve_all_bootnodes(&addrs, true);
         // Should have at most 2 from config (deduplicated)
         let config_count = resolved
             .iter()
@@ -265,7 +272,7 @@ mod tests {
     #[test]
     fn test_resolve_all_empty_config_uses_dns_and_fallback() {
         // Empty config_addrs triggers DNS SRV + fallback branches (lines 141-156)
-        let resolved = resolve_all_bootnodes(&[]);
+        let resolved = resolve_all_bootnodes(&[], true);
         // DNS will likely fail in test env, fallback may or may not resolve.
         // Key assertion: the function doesn't panic and all results have correct sources.
         for bn in &resolved {
@@ -281,7 +288,7 @@ mod tests {
     fn test_resolve_all_config_prevents_dns_and_fallback() {
         // Non-empty config_addrs skips DNS + fallback branches
         let addrs = vec!["127.0.0.1:9474".to_string()];
-        let resolved = resolve_all_bootnodes(&addrs);
+        let resolved = resolve_all_bootnodes(&addrs, true);
         for bn in &resolved {
             assert_eq!(
                 bn.source,
@@ -357,11 +364,17 @@ mod tests {
 
     #[test]
     fn bootstrap_hosts_are_the_config_or_the_fallback() {
-        let fallback = bootstrap_hosts(&[]);
+        let fallback = bootstrap_hosts(&[], true);
         assert_eq!(fallback.len(), FALLBACK_PEERS.len());
         assert_eq!(fallback[0], FALLBACK_PEERS[0]);
         let own = vec!["relay.example.org:9474".to_string()];
-        assert_eq!(bootstrap_hosts(&own), own);
+        assert_eq!(bootstrap_hosts(&own, true), own);
+        assert_eq!(bootstrap_hosts(&own, false), own);
+
+        // A relay given no bootnodes stands alone: it never dials the
+        // default relays on its own.
+        assert!(bootstrap_hosts(&[], false).is_empty());
+        assert!(resolve_all_bootnodes(&[], false).is_empty());
     }
 
     #[tokio::test]

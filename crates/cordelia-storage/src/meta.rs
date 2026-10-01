@@ -19,6 +19,10 @@ pub const SYNC_CLAUDE_EXCLUDE: &str = "sync.claude.exclude";
 /// `"off"` when this device does not sync home-folder memory.
 pub const SYNC_CLAUDE_HOME: &str = "sync.claude.home";
 
+/// Hex secret this node hashes peer keys with for its usage counts
+/// (`crate::usage`). Never leaves the node.
+pub const USAGE_SIGHTING_SECRET: &str = "usage.sighting_secret";
+
 /// RFC 3339 time of the last sync cycle that sent or received a memory.
 pub const SYNC_CLAUDE_LAST_CHANGE: &str = "sync.claude.last_change";
 

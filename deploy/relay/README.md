@@ -93,6 +93,9 @@ It runs hardened:
    ```
    Peers stay at 0 until the other relay is running and both DNS names
    resolve (step 4). Then each relay shows the other within a minute.
+   `docker exec cordelia-relay1 cordelia peers` lists each connected peer:
+   its key, role, address, how long it has been connected, and when it was
+   last heard from.
 3. **Restart keeps the identity.** `docker restart cordelia-relay1`, then
    `docker logs --tail 5 cordelia-relay1`: the same node key, and no "first
    start" line.
@@ -106,7 +109,25 @@ It runs hardened:
    default config dials both relays: `cordelia init`, `cordelia start`, then
    `cordelia status` shows `Peers: 1 hot` or more.
 
-## 5. Upgrade
+## 5. Watch it
+
+`docker exec cordelia-relay1 cordelia stats` (add `--json` for tools) shows
+what the relay holds and how much it is used, as counts only:
+
+- items stored and their encrypted size, and the database size;
+- distinct peers seen in the last day and week, relays counted apart;
+- channels that received an item in the last day and week.
+
+The same counts are on the node's `/api/v1/metrics` (Prometheus format,
+127.0.0.1:9473, bearer token in `node-token` on the data volume) as
+`cordelia_peers_seen`, `cordelia_channels_active`, `cordelia_items_stored`
+and `cordelia_content_bytes_stored`.
+
+To count distinct peers, a relay keeps a keyed hash of each peer's public
+key, made with a secret that never leaves the relay, and drops it 8 days
+after the peer was last seen. It keeps no list of keys.
+
+## 6. Upgrade
 
 Change the pin in `deploy/relay/.env` (a new `CORDELIA_VERSION` and its
 `CORDELIA_SHA256`, or check out a new agreed commit), then:
@@ -119,10 +140,11 @@ The identity stays on the `cordelia-relay1-data` volume. Do not delete that
 volume: a relay with a new identity still works, since nodes find relays by
 name, but there is no reason to change it.
 
-## 6. Your own relay
+## 7. Your own relay
 
 Copy `relay1.toml`, change `entity_id`, and list whichever relays yours
-should mesh with under `[[network.bootnodes]]`. Run the same image with your
+should mesh with under `[[network.bootnodes]]`. With none listed, it stands
+alone: a relay never dials relays it was not told about. Run the same image with your
 file mounted and `CORDELIA_CONFIG` pointing at it. Then add your relay's
 `host:9474` under `[[network.bootnodes]]` in the config of each node that
 should use it. A relay can only ever see ciphertext, whoever runs it.

@@ -69,6 +69,9 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     // Health check (GET, unauthenticated, operations.md §8)
     cfg.route("/api/v1/health", web::get().to(handlers::health));
 
+    // Connected peers (GET, authenticated)
+    cfg.route("/api/v1/peers", web::get().to(handlers::peers));
+
     // Status (GET, authenticated, operations.md §8)
     cfg.route("/api/v1/status", web::get().to(handlers::status));
 

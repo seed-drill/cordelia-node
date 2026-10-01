@@ -103,6 +103,17 @@ impl Node {
         resp.body_mut().read_json().ok()
     }
 
+    fn get_text(&self, path: &str) -> String {
+        let url = format!("http://127.0.0.1:{}{path}", self.http);
+        ureq::get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token()))
+            .call()
+            .unwrap_or_else(|e| panic!("{}: GET {path} failed: {e}", self.name))
+            .body_mut()
+            .read_to_string()
+            .unwrap()
+    }
+
     fn post(&self, path: &str, body: serde_json::Value) -> serde_json::Value {
         let url = format!("http://127.0.0.1:{}{path}", self.http);
         let mut resp = ureq::post(&url)
@@ -260,6 +271,50 @@ fn add_device_accept_and_sync_through_a_relay() {
         .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
         .unwrap_or_else(|| panic!("status lacks a Peers line:\n{status}"));
     assert!(hot >= 1, "{status}");
+
+    // `cordelia peers` lists who each node is connected to: the devices
+    // see the relay, and the relay sees both devices, by key.
+    let peers_of = |n: &Node| -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(&n.cli(&["peers", "--json"])).unwrap();
+        v["peers"].as_array().cloned().unwrap_or_default()
+    };
+    let relay_key = relay.cli(&["id"]).trim().to_string();
+    let a_peers = wait_for("a lists the relay", &all, 30, || {
+        let p = peers_of(&a);
+        (!p.is_empty()).then_some(p)
+    });
+    assert_eq!(a_peers[0]["key"], relay_key.as_str(), "{a_peers:?}");
+    assert_eq!(a_peers[0]["role"], "relay");
+    assert!(a.cli(&["peers"]).contains(&relay_key));
+    let device_keys = [
+        a.cli(&["id"]).trim().to_string(),
+        b.cli(&["id"]).trim().to_string(),
+    ];
+    wait_for("the relay lists both devices", &all, 30, || {
+        let p = peers_of(&relay);
+        device_keys
+            .iter()
+            .all(|k| {
+                p.iter()
+                    .any(|x| x["key"] == k.as_str() && x["role"] == "node")
+            })
+            .then_some(())
+    });
+
+    // The relay's usage counts: two devices seen, as counts only.
+    wait_for("the relay counts two peers", &all, 30, || {
+        let v: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).ok()?;
+        (v["peers_seen"]["1d"]["node"] == 2 && v["peers_seen"]["7d"]["relay"] == 0).then_some(())
+    });
+    let metrics = relay.get_text("/api/v1/metrics");
+    assert!(
+        metrics.contains("cordelia_peers_seen{window=\"1d\",role=\"node\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains(&device_keys[0]),
+        "metrics carry counts, not keys"
+    );
 
     // The documented flow: one key copied in each direction.
     let b_key = b.cli(&["id"]).trim().to_string();

@@ -147,6 +147,7 @@ Personal nodes are outbound-only and there is no NAT traversal, so two devices a
 ## 5. What we promise about security
 
 - Relays and Seed Drill see channel IDs, device public keys, item sizes, types and timing. They never see content, file names, member lists or keys.
+  - For usage counts (distinct peers per day and week), a relay keeps a keyed hash of each peer's key, made with a secret that stays on the relay, for 8 days after the peer was last seen. It reports counts, never keys.
 - Only devices you added, and people you shared a project with, can read it.
 - On your own machines, memory is as protected as your disk. The node's search index and Claude Code's own files are plaintext at rest.
 

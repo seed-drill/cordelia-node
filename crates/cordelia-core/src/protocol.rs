@@ -505,6 +505,12 @@ pub const FALLBACK_PEERS: &[&str] = &[
 /// it retries follow DNS (a relay moved, or a site's address changed).
 pub const BOOTNODE_RESOLVE_INTERVAL_SECS: u64 = 300;
 
+/// How often a node refreshes its record that a connected peer is still
+/// there (`cordelia_storage::usage`), and how long a peer is remembered
+/// after it was last seen: one day more than the weekly count needs.
+pub const SIGHTING_REFRESH_SECS: u64 = 300;
+pub const SIGHTING_RETENTION_DAYS: i64 = 8;
+
 /// How often it tries instead while none of the names resolves: a node
 /// started before its network was up finds its relays soon after.
 pub const BOOTNODE_RESOLVE_RETRY_SECS: u64 = 30;

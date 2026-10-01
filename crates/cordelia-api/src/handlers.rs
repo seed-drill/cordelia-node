@@ -1207,6 +1207,36 @@ pub async fn metrics(
     let sync_errors = state.sync_error_count();
     let peers_hot = state.peers_hot.load(std::sync::atomic::Ordering::Relaxed);
     let peers_warm = state.peers_warm.load(std::sync::atomic::Ordering::Relaxed);
+    let usage = cordelia_storage::usage::snapshot(&db, chrono::Utc::now().timestamp())?;
+    let usage_lines = format!(
+        "# HELP cordelia_peers_seen Distinct peers connected in the window (counts only)\n\
+         # TYPE cordelia_peers_seen gauge\n\
+         cordelia_peers_seen{{window=\"1d\",role=\"node\"}} {}\n\
+         cordelia_peers_seen{{window=\"1d\",role=\"relay\"}} {}\n\
+         cordelia_peers_seen{{window=\"7d\",role=\"node\"}} {}\n\
+         cordelia_peers_seen{{window=\"7d\",role=\"relay\"}} {}\n\
+         \n\
+         # HELP cordelia_channels_active Channels that received an item in the window\n\
+         # TYPE cordelia_channels_active gauge\n\
+         cordelia_channels_active{{window=\"1d\"}} {}\n\
+         cordelia_channels_active{{window=\"7d\"}} {}\n\
+         \n\
+         # HELP cordelia_items_stored Items held by this node\n\
+         # TYPE cordelia_items_stored gauge\n\
+         cordelia_items_stored {}\n\
+         \n\
+         # HELP cordelia_content_bytes_stored Encrypted content held by this node\n\
+         # TYPE cordelia_content_bytes_stored gauge\n\
+         cordelia_content_bytes_stored {}\n",
+        usage.peers_1d,
+        usage.relays_1d,
+        usage.peers_7d,
+        usage.relays_7d,
+        usage.channels_active_1d,
+        usage.channels_active_7d,
+        usage.items_stored,
+        usage.bytes_stored,
+    );
 
     let body = format!(
         "# HELP cordelia_uptime_seconds Node uptime\n\
@@ -1235,12 +1265,27 @@ pub async fn metrics(
          \n\
          # HELP cordelia_peers_warm Number of peers in Warm state\n\
          # TYPE cordelia_peers_warm gauge\n\
-         cordelia_peers_warm {peers_warm}\n"
+         cordelia_peers_warm {peers_warm}\n\
+         \n\
+         {usage_lines}"
     );
 
     Ok(HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
         .body(body))
+}
+
+// ── GET /api/v1/peers ──────────────────────────────────────────────
+
+/// The peers this node is connected to (`cordelia peers`).
+pub async fn peers(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+    let peers = state
+        .peers
+        .read()
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .clone();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "peers": peers })))
 }
 
 /// Extract a privacy-safe label from a channel_id (first 8 hex chars after any prefix).

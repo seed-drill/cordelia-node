@@ -13,6 +13,7 @@ pub mod schema;
 pub mod search;
 pub mod sync_state;
 pub mod trust;
+pub mod usage;
 
 /// Storage-level errors (wraps rusqlite and IO errors).
 #[derive(Debug, thiserror::Error)]

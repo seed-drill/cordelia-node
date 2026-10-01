@@ -429,9 +429,26 @@ login). It then finds its relays within half a minute of the network
 coming up; one DNS query per name every 30 s is negligible. It must be
 shorter than the interval (`protocol.rs` asserts this).
 
+## 9. Usage Count Parameters
+
+A relay counts the distinct peers it has seen in the last day and week
+(`cordelia stats`, `/metrics`), from a keyed hash of each peer's key.
+
+### sighting_refresh = 300s
+
+**Rationale:** How often a connected peer's "last seen" is refreshed. Counts
+are per day and per week, so five minutes is ample precision, and it keeps
+the writes to one row per peer every five minutes.
+
+### sighting_retention = 8 days
+
+**Rationale:** How long a peer's hash is kept after it was last seen: the
+weekly window plus a day of slack. Nothing about a peer outlives the count
+it is needed for.
+
 ---
 
-*Spec version: 1.3*
+*Spec version: 1.4*
 *Created: 2026-03-16*
 *Updated: 2026-09-30*
 *Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*
