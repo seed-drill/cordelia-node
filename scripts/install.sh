@@ -111,9 +111,22 @@ install_binary() {
         echo "Previous version backed up to cordelia.prev"
     fi
 
-    cp "${TMPDIR}/cordelia" "${INSTALL_DIR}/cordelia"
-    chmod +x "${INSTALL_DIR}/cordelia"
+    # Put the new binary beside the old one, then rename it into place: a
+    # running node keeps its old file, and a plain copy over it would fail
+    # ("Text file busy").
+    cp "${TMPDIR}/cordelia" "${INSTALL_DIR}/cordelia.new"
+    chmod +x "${INSTALL_DIR}/cordelia.new"
+    mv -f "${INSTALL_DIR}/cordelia.new" "${INSTALL_DIR}/cordelia"
     echo "Installed to ${INSTALL_DIR}/cordelia"
+}
+
+# Whether the node is running as a service now, which makes this an upgrade.
+service_running() {
+    case "$PLATFORM" in
+        linux)  systemctl --user is-active --quiet cordelia 2>/dev/null ;;
+        darwin) launchctl list 2>/dev/null | grep -q ai.seeddrill.cordelia ;;
+        *)      return 1 ;;
+    esac
 }
 
 # ── PATH setup ──────────────────────────────────────────────────────
@@ -192,6 +205,7 @@ install_launchctl() {
 PLIST
 
     START_CMD="launchctl load ${PLIST_FILE}"
+    RESTART_CMD="launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Stop:   launchctl unload ${PLIST_FILE}"
@@ -222,6 +236,7 @@ WantedBy=default.target
 SERVICE
 
     START_CMD="systemctl --user enable --now cordelia"
+    RESTART_CMD="systemctl --user daemon-reload && systemctl --user restart cordelia"
     echo "systemd user service installed: ${SERVICE_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Status: systemctl --user status cordelia"
@@ -265,6 +280,12 @@ main() {
     echo ""
     echo "Cordelia installed successfully."
     echo ""
+    if service_running; then
+        echo "The node is running the previous version. To switch to this one:"
+        echo "  ${RESTART_CMD}"
+        echo ""
+        return
+    fi
     echo "Next steps:"
     echo "  ${START_CMD}"
     echo "                        # run the node as a background service"

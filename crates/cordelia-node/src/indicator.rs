@@ -129,6 +129,44 @@ pub fn line(state: State, summary: &str, color: bool) -> String {
     }
 }
 
+/// What a bar shows: an icon, a tooltip, and the state as a class.
+///
+/// The JSON is the shape Waybar's custom modules take, which Omarchy's bar
+/// reads too: `text`, `tooltip` and `class`. The class is the state name;
+/// `active` is added when the person is needed, which Omarchy highlights.
+/// The icons are Nerd Font glyphs. Empty when there is nothing to show.
+pub fn bar(state: State, summary: &str, details: &[String]) -> String {
+    let icon = match state {
+        State::Synced => "\u{f09d1}",               // brain
+        State::Syncing => "\u{f04e6}",              // sync
+        State::Offline => "\u{f0164}",              // cloud off
+        State::Attention => "\u{f0026}",            // alert
+        State::Off | State::Stopped => "\u{f04b2}", // sleep
+        State::Uninitialised => return String::new(),
+    };
+    let mut tooltip = format!("Cordelia: {summary}");
+    for line in details {
+        tooltip.push('\n');
+        tooltip.push_str(line);
+    }
+    let class = if state == State::Attention {
+        serde_json::json!([state.as_str(), "active"])
+    } else {
+        serde_json::json!(state.as_str())
+    };
+    serde_json::json!({ "text": icon, "tooltip": tooltip, "class": class }).to_string()
+}
+
+/// `3m ago`, `2h ago`, `5d ago`, for a time `secs` seconds in the past.
+pub fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
 fn plural(n: u64, word: &str) -> String {
     if n == 1 {
         word.to_string()
@@ -244,5 +282,33 @@ mod tests {
             "\x1b[31m▲ memory: 1 conflict\x1b[0m"
         );
         assert_eq!(line(State::Uninitialised, "x", true), "");
+    }
+
+    #[test]
+    fn bars_get_an_icon_a_tooltip_and_the_state_as_class() {
+        let v: serde_json::Value = serde_json::from_str(&bar(
+            State::Synced,
+            "memory synced",
+            &["Relays: 2 connected".into()],
+        ))
+        .unwrap();
+        assert_eq!(v["text"], "\u{f09d1}");
+        assert_eq!(v["tooltip"], "Cordelia: memory synced\nRelays: 2 connected");
+        assert_eq!(v["class"], "synced");
+
+        // Needing the person adds `active`, which Omarchy's bar highlights.
+        let v: serde_json::Value =
+            serde_json::from_str(&bar(State::Attention, "memory: 1 conflict", &[])).unwrap();
+        assert_eq!(v["class"], serde_json::json!(["attention", "active"]));
+
+        assert_eq!(bar(State::Uninitialised, "x", &[]), "");
+    }
+
+    #[test]
+    fn ages_read_naturally() {
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(200), "3m ago");
+        assert_eq!(ago(7300), "2h ago");
+        assert_eq!(ago(200_000), "2d ago");
     }
 }
