@@ -47,6 +47,8 @@ pub struct PeerConnection {
     pub handshake: HandshakeResult,
     /// Keep-alive state for this peer.
     pub keepalive: KeepAliveState,
+    /// Who opened the connection.
+    pub direction: Direction,
 }
 
 /// Data needed by spawned connect/accept tasks. All fields Clone.
@@ -160,11 +162,35 @@ impl ConnectionManager {
         self.endpoint.clone()
     }
 
-    /// Register a pre-handshaked connection. Returns error if duplicate.
+    /// Register a pre-handshaked connection.
+    ///
+    /// One connection is kept per peer. If the peer already has one:
+    /// - a closed one is replaced;
+    /// - if the peer dialled again, its old connection is gone on its side,
+    ///   so the new one replaces it;
+    /// - if both sides dialled at once, the connection opened by the lower
+    ///   key is kept, so both ends keep the same one;
+    /// - otherwise the existing connection stays and the new one is closed
+    ///   (`AlreadyConnected`).
     pub fn register(&mut self, outcome: ConnectOutcome) -> Result<NodeId, ConnectionError> {
-        if self.connections.contains_key(&outcome.node_id) {
-            outcome.conn.close(0u32.into(), b"duplicate");
-            return Err(ConnectionError::AlreadyConnected(outcome.node_id));
+        if let Some(existing) = self.connections.get(&outcome.node_id) {
+            let keep_existing = existing.conn.close_reason().is_none()
+                && match (existing.direction, outcome.direction) {
+                    (Direction::Inbound, Direction::Inbound) => false,
+                    (Direction::Outbound, Direction::Outbound) => true,
+                    (existing_direction, _) => {
+                        let we_are_lower = self.identity.public_key() < outcome.node_id.0;
+                        (existing_direction == Direction::Outbound) == we_are_lower
+                    }
+                };
+            if keep_existing {
+                outcome.conn.close(0u32.into(), b"duplicate");
+                return Err(ConnectionError::AlreadyConnected(outcome.node_id));
+            }
+            if let Some(old) = self.connections.remove(&outcome.node_id) {
+                old.conn.close(0u32.into(), b"replaced");
+                debug!(peer = %outcome.node_id, "replaced the peer's earlier connection");
+            }
         }
 
         let node_id = outcome.node_id.clone();
@@ -173,6 +199,7 @@ impl ConnectionManager {
             node_id: outcome.node_id.0,
             handshake: outcome.handshake,
             keepalive: KeepAliveState::new(),
+            direction: outcome.direction,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
@@ -227,10 +254,42 @@ impl ConnectionManager {
             node_id: peer_node_id,
             handshake: handshake_result,
             keepalive: KeepAliveState::new(),
+            direction: Direction::Outbound,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
         Ok(node_id)
+    }
+
+    /// Drop every connection that has closed (by the peer, by an idle
+    /// timeout, or by an error) and return those peers. Without this a dead
+    /// connection would still count as connected: the peer would never be
+    /// redialled, and its own reconnection would be refused as a duplicate.
+    pub fn reap_closed(&mut self) -> Vec<NodeId> {
+        let closed: Vec<NodeId> = self
+            .connections
+            .iter()
+            .filter(|(_, peer)| peer.conn.close_reason().is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &closed {
+            self.connections.remove(id);
+        }
+        closed
+    }
+
+    /// Remote addresses of the live inbound connections, leaving out
+    /// `except` (a peer that is reconnecting replaces its own connection).
+    pub fn inbound_ips(&self, except: &NodeId) -> Vec<std::net::IpAddr> {
+        self.connections
+            .iter()
+            .filter(|(id, peer)| {
+                *id != except
+                    && peer.direction == Direction::Inbound
+                    && peer.conn.close_reason().is_none()
+            })
+            .map(|(_, peer)| peer.conn.remote_address().ip())
+            .collect()
     }
 
     /// Disconnect from a peer.

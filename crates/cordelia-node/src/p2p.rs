@@ -402,7 +402,6 @@ pub async fn p2p_loop(
             .with_timeouts(gov_timeouts);
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
-    let mut conn_tracker = cordelia_network::rate_limit::ConnectionTracker::new();
 
     // Per-peer rate limiters, shared with handle_peer_streams tasks
     let peer_rates: std::sync::Arc<
@@ -631,14 +630,17 @@ pub async fn p2p_loop(
                         // Connection tracker check FIRST (inbound only, §3.1).
                         // Must run before HKDF verification to prevent attackers
                         // from bypassing per-IP limits to force CPU-expensive derivations.
+                        // The limits count the inbound connections open now.
                         if direction == Direction::Inbound {
                             let ip = outcome.conn.remote_address().ip();
-                            if !conn_tracker.would_allow(ip) {
+                            let open = cordelia_network::rate_limit::ConnectionTracker::from_ips(
+                                conn_mgr.inbound_ips(&outcome.node_id),
+                            );
+                            if !open.would_allow(ip) {
                                 tracing::warn!(peer = %outcome.node_id, ip = %ip, "rejecting: connection limit exceeded");
                                 outcome.conn.close(0u32.into(), b"limit");
                                 continue;
                             }
-                            conn_tracker.add(ip);
                         }
 
                         // Personal nodes are outbound-only (§8.2), except from
@@ -1267,12 +1269,20 @@ pub async fn p2p_loop(
                         governor.record_items_relayed(&peer_id, count);
                     }
                 }
-                // Sync with connection manager
+                // Sync with connection manager. Closed connections go first,
+                // so a peer that has gone is seen as gone and redialled.
+                for peer_id in conn_mgr.reap_closed() {
+                    tracing::info!(peer = %peer_id, "connection closed; peer removed");
+                }
                 let connected = conn_mgr.connected_peers();
                 for peer_id in &connected {
                     governor.record_activity(peer_id, None);
                 }
-                let gov_active: Vec<_> = governor.hot_peers();
+                let gov_active: Vec<_> = governor
+                    .all_peers()
+                    .filter(|p| p.state.is_active())
+                    .map(|p| p.node_id.clone())
+                    .collect();
                 for peer_id in &gov_active {
                     if !connected.contains(peer_id) {
                         governor.mark_disconnected(peer_id);
