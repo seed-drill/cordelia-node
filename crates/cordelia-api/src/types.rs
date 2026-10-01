@@ -481,6 +481,38 @@ pub struct SyncClaudeRequest {
     /// Whether home-folder memory syncs on this device (default: yes).
     #[serde(default)]
     pub home: Option<bool>,
+    /// Sync everything found (home and git projects), now and later, as
+    /// well as the declared mappings. Default when first enabled: no.
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// Put the directory, home and exclude settings back to their defaults.
+    /// Without it, a setting not given keeps its stored value.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// A declared mapping: Claude's memory for sessions started in `folder`
+/// syncs under `name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncMapping {
+    pub folder: String,
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+pub struct SyncMapRequest {
+    /// The working directory, absolute.
+    pub folder: String,
+    /// The name to sync under; `~` for home memory.
+    pub name: String,
+    /// Required to map the home directory itself.
+    #[serde(default)]
+    pub home: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SyncUnmapRequest {
+    pub folder: String,
 }
 
 #[derive(Serialize)]
@@ -488,8 +520,16 @@ pub struct SyncStatusResponse {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// Whether everything found syncs, or only the declared mappings.
+    pub all: bool,
+    pub mappings: Vec<SyncMapping>,
+    /// Never found by `all`: project names or prefixes, and folders
+    /// (absolute paths) that were unmapped.
     pub exclude: Vec<String>,
     pub home: bool,
+    /// How many times the settings have changed since the node started.
+    /// The report carries the generation it was made under.
+    pub generation: u64,
     /// The last cycle's report, once one has run.
     pub report: Option<serde_json::Value>,
     /// When a cycle last sent or received a memory (RFC 3339).

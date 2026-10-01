@@ -2,6 +2,7 @@
 //!
 //! Spec: seed-drill/specs/configuration.md
 
+pub mod claude_code;
 pub mod config;
 pub mod error;
 pub mod protocol;

@@ -26,6 +26,10 @@ pub struct Facts {
     pub conflicts: Vec<String>,
     /// Projects this device is waiting to be added to.
     pub projects_waiting: usize,
+    /// Folders the last cycle synced or is waiting to sync.
+    pub folders: usize,
+    /// Everything found syncs (`--all`), not only mapped folders.
+    pub sync_all: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +42,8 @@ pub enum State {
     Offline,
     /// Needs the person: a conflict to merge, or sync errors.
     Attention,
-    /// The node runs but `cordelia sync claude` is off.
+    /// The node runs but syncs nothing: `cordelia sync claude` is off, or
+    /// no folder is mapped.
     Off,
     /// Set up, but the node is not running.
     Stopped,
@@ -88,6 +93,14 @@ pub fn derive(f: &Facts) -> (State, String) {
             return (Attention, "memory sync stalled".into());
         }
         Some(_) => {}
+    }
+    if f.folders == 0 {
+        let summary = if f.sync_all {
+            "memory: nothing to sync"
+        } else {
+            "memory: nothing mapped"
+        };
+        return (Off, summary.into());
     }
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
@@ -187,6 +200,7 @@ mod tests {
             peers_hot: 2,
             sync_enabled: true,
             report_age_secs: Some(3),
+            folders: 2,
             ..Default::default()
         }
     }
@@ -227,6 +241,18 @@ mod tests {
         assert_eq!(
             with(&|f| f.report_age_secs = Some(STALE_REPORT_SECS + 1)),
             (State::Attention, "memory sync stalled".into())
+        );
+        // Sync is on, and nothing syncs: not an error, but not "synced".
+        assert_eq!(
+            with(&|f| f.folders = 0),
+            (State::Off, "memory: nothing mapped".into())
+        );
+        assert_eq!(
+            with(&|f| {
+                f.folders = 0;
+                f.sync_all = true;
+            }),
+            (State::Off, "memory: nothing to sync".into())
         );
         assert_eq!(
             with(&|f| f.conflicts = vec!["a".into(), "b".into()]),

@@ -15,8 +15,9 @@
 >   person's channels as a member: `cordelia add-device <key>` on one device,
 >   `cordelia accept <key>` on the other. There is no shared seed.
 > - **The personal channel (§7.4)** is an ordinary `grp_` channel, not an ID
->   derived from the public key. It holds the device roster (its member list),
->   home memory, and the map from project to channel.
+>   derived from the public key. It holds the device roster (its member list)
+>   and the map from name to channel. Until 0.2.0-alpha.3 it also held home
+>   memory, which now has a channel of its own.
 > - **Compromise response (§10.1)** is `cordelia remove-device <key>` from
 >   another device, which removes it from every channel and rotates their
 >   keys.

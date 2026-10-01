@@ -37,7 +37,7 @@ break that memory in practice:
 1. **It is per machine.** A laptop and a desktop each accumulate their own
    memory; neither knows what the other learned.
 2. **It is per path.** The folder is named after the directory the agent ran in
-   (`-home-rezi-Work` on Linux, `-Users-...` on macOS). The same repository
+   (`-home-sam-Work` on Linux, `-Users-...` on macOS). The same repository
    cloned at two paths, or on two machines, has two unrelated memories.
 3. **It is per vendor, or per host.** Syncing it through a hosted memory
    service puts the plaintext on someone else's servers; file sync tools move
@@ -59,21 +59,25 @@ $ cordelia add-device cordelia_pk1... --name imac
     cordelia accept cordelia_pk1...  (copy this back)
                                       $ cordelia accept cordelia_pk1...
 $ cordelia sync claude                $ cordelia sync claude
+$ cordelia sync map ~/Work/app        $ cordelia sync map ~/code/app
 ```
 
 After that:
 
 - A memory Claude Code writes on one machine appears on the other, including
   when the other machine was off at the time; it arrives when it next connects.
-- Memory written in the home directory follows the person. Memory written in a
-  repository follows the repository, matched by its git remote, whatever path
-  it is cloned at.
+- Only what is mapped syncs. A mapping gives a folder's memory a name, and the
+  name is what a person's devices share. A repository is named by its git
+  remote, so it is matched whatever path it is cloned at; any other folder is
+  given a name; home memory is mapped by asking for it (`--home`).
+- A device that has never mapped a name holds neither its memory nor its key.
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
   (`MEMORY.md`) is merged line by line instead.
-- Folders that are not repositories, or whose remote is a local path, are not
-  synced; `cordelia sync status` lists them.
+- `cordelia sync status` lists what was found on the machine and is not
+  syncing, with the command that maps it, and what the person's other
+  devices sync. `cordelia sync claude --all` syncs everything found instead.
 
 ## 3. Design
 
@@ -206,19 +210,38 @@ Two mechanisms carry items between them:
 
 `cordelia sync claude` runs a cycle every 5 seconds inside the node:
 
-1. **Find folders.** It lists `~/.claude/projects/*`, reads each folder's working
-   directory from its session transcripts, and identifies the project:
-   - the home directory syncs with the **personal channel**;
-   - a repository syncs with the **project's channel**, found by its normalised
-     git remote (lower-cased host and path, without scheme, credentials, port, or
-     `.git`) in a map held in the personal channel. The first device to see a
-     project creates its channel, owned by it alone. Another of the person's
-     devices joins only when it has the project too: it posts a join request in
-     the personal channel, and any device that owns the channel adds it. A
-     request is honoured only from the device it names. So a machine that works
-     on one project holds keys to that project alone.
-   - per device, projects can be **excluded** (never synced from that machine)
-     and home memory can be left off.
+1. **Decide what syncs.** A *mapping*, declared with `cordelia sync map`, says
+   that Claude's memory for a folder syncs under a name. Nothing else syncs
+   unless the device is set to sync everything it finds (`--all`).
+   - The folder is found by name alone. Claude Code keeps one folder per
+     working directory under `~/.claude/projects/`, named after the path, and
+     keeps a repository's memory in the folder of its main working tree, shared
+     by its subdirectories and worktrees. A mapping syncs exactly that folder,
+     never one chosen by reading transcripts, so it cannot come to sync a
+     different folder than the one declared.
+   - The name is what devices share. A repository's name defaults to its
+     normalised git remote (lower-cased host and path, without scheme,
+     credentials, port, or `.git`); any other folder is given one; home memory
+     is `~` and has to be asked for by name.
+   - Each name has its own channel, found in a map held in the personal
+     channel. The first device to sync a name creates its channel, owned by it
+     alone. Another of the person's devices joins only when it maps the name
+     too: it posts a join request in the personal channel, and any device that
+     owns the channel adds it. A request is honoured only from the device it
+     names. So a machine that syncs one project holds keys to that project
+     alone, and home memory reaches only the machines that map it.
+   - Each device also lists the names it syncs in the personal channel, so the
+     others can say what there is to map.
+   - With `--all`, the adapter also syncs what it finds: it lists
+     `~/.claude/projects/*`, reads each folder's working directory from its
+     session transcripts, and syncs home memory and every repository with a
+     remote. Per device, projects can then be **excluded** and home memory
+     left off.
+   - A folder that stops syncing (it is unmapped, or sync is turned off)
+     starts afresh if it syncs again: it merges with the channel, and files
+     it lost in between are fetched back, never sent as deletes. A mapped
+     folder whose memory directory has gone missing is reported, and nothing
+     is deleted on the other devices.
 2. **Plan each file.** A pure function compares the file on disk, the channel's
    current value, and what the folder last agreed with the channel. Whichever side
    changed is taken. If both changed, the channel's version goes in the file and
@@ -276,8 +299,8 @@ no hosted plaintext of any kind.
 ## 6. Status and roadmap
 
 **Status (October 2026):** v1 is built and tested, including end-to-end tests
-with real processes over QUIC through a relay. The first two relays are being
-deployed; the first pre-release follows.
+with real processes over QUIC through a relay. Two relays are running, and
+alpha pre-releases are published.
 
 **Next:**
 

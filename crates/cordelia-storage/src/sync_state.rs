@@ -57,10 +57,54 @@ pub fn save(
     Ok(())
 }
 
+/// Forget what every folder agreed, except the (folder, channel) pairs in
+/// `keep`. A folder that stops syncing and later syncs again then starts
+/// afresh: its files merge with the channel's, and nothing it lost in
+/// between is taken as a delete. Returns the number of keys forgotten.
+pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usize, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT folder, channel_id FROM sync_files")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut forgotten = 0;
+    for (folder, channel_id) in pairs {
+        if keep.iter().any(|(f, c)| *f == folder && *c == channel_id) {
+            continue;
+        }
+        forgotten += conn
+            .execute(
+                "DELETE FROM sync_files WHERE folder = ?1 AND channel_id = ?2",
+                params![folder, channel_id],
+            )
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
+    Ok(forgotten)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db;
+
+    #[test]
+    fn test_forget_except() {
+        let conn = db::open_in_memory().unwrap();
+        save(&conn, "/m", "grp_a", "notes.md", (Some([7; 32]), 2)).unwrap();
+        save(&conn, "/m", "grp_b", "notes.md", (Some([7; 32]), 1)).unwrap();
+        save(&conn, "/other", "grp_a", "x.md", (None, 4)).unwrap();
+
+        let keep = [("/m".to_string(), "grp_a".to_string())];
+        assert_eq!(forget_except(&conn, &keep).unwrap(), 2);
+        assert_eq!(load(&conn, "/m", "grp_a").unwrap().len(), 1);
+        assert!(load(&conn, "/m", "grp_b").unwrap().is_empty());
+        assert!(load(&conn, "/other", "grp_a").unwrap().is_empty());
+        assert_eq!(forget_except(&conn, &keep).unwrap(), 0);
+        assert_eq!(forget_except(&conn, &[]).unwrap(), 1);
+    }
 
     #[test]
     fn test_save_and_load() {
