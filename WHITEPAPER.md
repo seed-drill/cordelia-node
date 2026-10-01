@@ -15,8 +15,9 @@ the directory the agent ran in. Move to another machine and it is gone; clone
 the same project somewhere else and it is gone; hand it to a hosted memory
 service and someone else holds the plaintext.
 
-Cordelia keeps an agent's memory in step across a person's machines, and, when
-they choose, with the people they work with. Memory is encrypted on the device
+Cordelia keeps an agent's memory in step across a person's machines, so that
+the same agent, with the same context, is there wherever they work. Memory is
+never shared with another person. It is encrypted on the device
 that wrote it and travels through relays that store only ciphertext and hold no
 keys. Each device has its own key and is added or removed individually. A
 project's memory follows the project, matched by its git remote, not by where it
@@ -264,8 +265,10 @@ publication times, and which items are revisions of the same slot.
 **What they cannot see:** content, file names, project names, member lists, or
 any key. No relay holds a channel key in any form.
 
-**Who can read a channel:** the devices a person added, and the people they
-shared it with. A removed device keeps what it already had but cannot read
+**Who can read a channel:** the devices its owner added, and nobody else. Memory
+is never shared between people: an agent reads its memory as its own notes, so
+another person's text there would act with the agent's authority (decision
+record §4.7). A removed device keeps what it already had but cannot read
 anything written after the key rotation that removal triggers, and its later
 writes are ignored because it is no longer a member.
 
@@ -304,10 +307,10 @@ alpha pre-releases are published.
 
 **Next:**
 
-- **v1.1, sharing a project with a person** (`cordelia share <repo> <key>`),
-  using the same membership mechanism as devices. Before it ships we will decide
-  how an agent should treat memory written by other people, since it reads
-  memory as its own notes.
+- **Channels shared between people,** carrying what is shared on purpose:
+  messages between agents first, then skills and secrets. They will not carry
+  memory. An agent reads its memory as its own notes, so memory stays with one
+  person and moves only between that person's devices (decision record §4.7).
 - **More adapters**, starting with a second coding agent, so memory survives a
   change of agent as well as a change of machine.
 - **More relays, run by others.** Anyone can run one; the configuration lists
