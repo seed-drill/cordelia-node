@@ -16,10 +16,10 @@ Code's memory.
 
 **Pre-release (October 2026).** v1 is built and tested, including end-to-end
 tests with real processes over QUIC through a relay. Two relays are running,
-and `v0.2.0-alpha.2` is the current pre-release, for macOS and Linux:
+and `v0.2.0-alpha.3` is the current pre-release, for macOS and Linux:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.2 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.3 sh
 ```
 
 It is an alpha: expect rough edges, and keep your own backup of anything you
@@ -108,13 +108,22 @@ Claude Code starts with):
 If you already have a status line command, add `$(cordelia status --line)` to
 what it prints.
 
-For a desktop bar, `cordelia status --waybar` prints an icon, a tooltip and
+On [Omarchy](https://omarchy.org), the
+[Cordelia panel](https://github.com/seed-drill/omarchy-cordelia) puts an icon
+in the bar and opens a panel to turn sync on and off, choose what syncs, pair
+devices and open conflicts:
+
+```bash
+omarchy plugin add https://github.com/seed-drill/omarchy-cordelia.git --enable
+```
+
+For any other bar, `cordelia status --waybar` prints an icon, a tooltip and
 the state as a class, in the JSON that Waybar's custom modules take. The
 icons are Nerd Font glyphs.
 
-- **Omarchy:** add this to `bar.layout.right` in `~/.config/omarchy/shell.json`.
-  The bar highlights the icon when a conflict or an error needs you, and a
-  click opens the details.
+- **Omarchy, without the panel:** add this to `bar.layout.right` in
+  `~/.config/omarchy/shell.json`. The bar highlights the icon when a conflict
+  or an error needs you, and a click opens the details.
   ```json
   {
     "id": "cordelia",
