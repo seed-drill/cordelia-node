@@ -56,6 +56,22 @@ pub struct NetworkConfig {
     /// Allow private/RFC-1918 addresses in peer sharing (for Docker/test envs).
     #[serde(default)]
     pub allow_private_addresses: bool,
+    /// Whether to accept inbound connections. Unset, a personal node does
+    /// not, and has no listening socket (decision 2026-09-30 §4.6); every
+    /// other role does. Set it on a personal node that others dial
+    /// directly, such as a swarm lead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<bool>,
+}
+
+impl NetworkConfig {
+    /// Whether this node listens for inbound connections. A personal node
+    /// only dials out, unless it is told to listen or has trusted peers
+    /// (§8.2.2), which may dial it.
+    pub fn accepts_inbound(&self) -> bool {
+        self.listen
+            .unwrap_or(self.role != "personal" || !self.trusted_peers.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +190,7 @@ impl Default for NetworkConfig {
                 .collect(),
             trusted_peers: Vec::new(),
             allow_private_addresses: false,
+            listen: None,
         }
     }
 }
@@ -383,6 +400,35 @@ http_port = 8080
         let config: Config = toml::from_str(partial).unwrap();
         assert_eq!(config.node.http_port, 8080);
         assert_eq!(config.node.p2p_port, protocol::P2P_PORT); // default preserved
+    }
+
+    #[test]
+    fn test_only_personal_nodes_do_not_listen() {
+        let with = |toml: &str| -> bool {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.network.accepts_inbound()
+        };
+        // The default role is personal: it dials out and does not listen.
+        assert!(!with(""));
+        assert!(!with("[network]\nrole = \"personal\"\n"));
+        for role in ["relay", "bootnode", "keeper"] {
+            assert!(with(&format!("[network]\nrole = \"{role}\"\n")), "{role}");
+        }
+        // A personal node listens when told to, or when it has trusted
+        // peers, which may dial it.
+        assert!(with("[network]\nlisten = true\n"));
+        assert!(with(
+            "[[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n"
+        ));
+        assert!(!with(
+            "[network]\nlisten = false\n[[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n"
+        ));
+        // And any role can be kept from listening.
+        assert!(!with("[network]\nrole = \"relay\"\nlisten = false\n"));
+
+        // The option is not written to a config that does not set it.
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("listen ="), "{written}");
     }
 
     #[test]

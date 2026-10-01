@@ -500,7 +500,11 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     println!();
     println!("Config:");
     println!("  HTTP port: {}", config.node.http_port);
-    println!("  P2P port:  {}", config.node.p2p_port);
+    if config.network.accepts_inbound() {
+        println!("  P2P port:  {}", config.node.p2p_port);
+    } else {
+        println!("  P2P:       outbound only (no listening port)");
+    }
     println!("  Role:      {}", config.network.role);
 
     println!();
@@ -699,7 +703,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     println!("  Entity:    {}", config.identity.entity_id);
     println!("  Public key: {pk_bech32}");
     println!("  HTTP API:  http://{listen_addr}/api/v1/channels/");
-    println!("  P2P port:  {p2p_port}/UDP");
+    if config.network.accepts_inbound() {
+        println!("  P2P port:  {p2p_port}/UDP");
+    } else {
+        println!("  P2P:       outbound only (no listening port)");
+    }
     println!("  Role:      {role}");
     println!();
 
@@ -747,10 +755,24 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
         // ── P2P transport ──────────────────────────────────────────
         let p2p_bind = p2p_bind_addr(&config.network.listen_addr, p2p_port)?;
-        let endpoint = cordelia_network::transport::create_endpoint(&identity_arc, p2p_bind)
-            .map_err(|e| anyhow::anyhow!("P2P transport: {e}"))?;
+        let accepts_inbound = config.network.accepts_inbound();
+        let endpoint = if accepts_inbound {
+            cordelia_network::transport::create_endpoint(&identity_arc, p2p_bind)
+        } else {
+            // A personal node only dials out (decision 2026-09-30 §4.6):
+            // no listener, and whichever port the system gives it.
+            cordelia_network::transport::create_client_endpoint(&identity_arc, p2p_bind.ip())
+        }
+        .map_err(|e| anyhow::anyhow!("P2P transport: {e}"))?;
         let p2p_local = endpoint.local_addr()?;
-        tracing::info!(%p2p_local, "P2P endpoint listening");
+        if accepts_inbound {
+            tracing::info!(%p2p_local, "P2P endpoint listening");
+        } else {
+            tracing::info!(%p2p_local, "P2P endpoint dials out only; nothing listens");
+        }
+        // The port others can dial, sent in the handshake: none if this
+        // node does not listen.
+        let advertised_port = if accepts_inbound { p2p_port as u16 } else { 0 };
 
         // ── Connection manager ─────────────────────────────────────
         let roles = vec![config.network.role.clone()];
@@ -761,7 +783,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             endpoint,
             vec![], // channel IDs loaded later from DB
             roles,
-            p2p_port as u16,
+            advertised_port,
         );
 
         // ── Bootstrap: resolve and connect to bootnodes ──────────────

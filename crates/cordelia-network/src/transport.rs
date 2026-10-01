@@ -181,6 +181,19 @@ pub fn create_endpoint(
     Ok(endpoint)
 }
 
+/// Create a QUIC endpoint that only dials out. It has no server
+/// configuration, so it accepts no connection, and it binds whichever port
+/// the system gives it on `bind_ip`.
+pub fn create_client_endpoint(
+    identity: &NodeIdentity,
+    bind_ip: std::net::IpAddr,
+) -> Result<Endpoint, TransportError> {
+    let mut endpoint = Endpoint::client(SocketAddr::new(bind_ip, 0))
+        .map_err(|e| TransportError::Quic(e.to_string()))?;
+    endpoint.set_default_client_config(client_config(identity)?);
+    Ok(endpoint)
+}
+
 /// Extract the Ed25519 public key (node_id) from a peer's TLS certificate.
 ///
 /// Parses the certificate's Subject CN, which must be a valid Bech32
@@ -401,6 +414,60 @@ mod tests {
         // Verify server saw client's identity
         let a_node_id = server.await.unwrap();
         assert_eq!(a_node_id, pk_a);
+    }
+
+    /// An endpoint that only dials out reaches a listening one, which sees
+    /// its identity, and cannot itself be connected to.
+    #[tokio::test]
+    async fn test_client_endpoint_dials_out_and_accepts_nothing() {
+        let id_client = NodeIdentity::generate().unwrap();
+        let id_server = NodeIdentity::generate().unwrap();
+        let localhost: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        let client = create_client_endpoint(&id_client, localhost).unwrap();
+        let server = create_endpoint(&id_server, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let server_addr = server.local_addr().unwrap();
+        assert_ne!(client_addr.port(), 0, "the system picked a port");
+
+        // Out: the connection works, and the server learns who dialled.
+        let accepting = server.clone();
+        let seen = tokio::spawn(async move {
+            let conn = accepting.accept().await.unwrap().await.unwrap();
+            let certs = conn
+                .peer_identity()
+                .unwrap()
+                .downcast::<Vec<CertificateDer<'static>>>()
+                .unwrap();
+            let id = extract_peer_node_id(&certs).unwrap();
+            // Keep the connection until the client has checked its side.
+            conn.closed().await;
+            id
+        });
+        let conn = client
+            .connect(server_addr, "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        conn.close(0u32.into(), b"done");
+        assert_eq!(seen.await.unwrap(), id_client.public_key());
+
+        // In: nothing answers. The dialler gets no connection, and the
+        // client endpoint is never handed one.
+        let dial = server.connect(client_addr, "cordelia").unwrap();
+        let attempt = tokio::time::timeout(Duration::from_secs(2), dial).await;
+        assert!(
+            !matches!(attempt, Ok(Ok(_))),
+            "a client-only endpoint accepted a connection"
+        );
+        let handed = tokio::time::timeout(Duration::from_millis(200), client.accept()).await;
+        assert!(
+            handed.is_err(),
+            "accept() yielded on a client-only endpoint"
+        );
+
+        client.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
     }
 
     // T1-1: Transport parameter verification (BV-19 regression)

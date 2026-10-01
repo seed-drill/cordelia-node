@@ -635,6 +635,60 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     deliver(&a, &b, "last", &[&r1, &r2, &a, &b]);
 }
 
+/// A personal node only dials out. It starts and reaches its relay while
+/// something else holds its configured P2P port, so it cannot be listening
+/// there; told to listen, the same node needs the port and cannot start.
+#[test]
+fn a_personal_node_listens_on_nothing() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let _held = std::net::UdpSocket::bind(("0.0.0.0", a.p2p)).expect("the port is free");
+    a.start();
+    wait_for("node healthy", &[&relay, &a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&relay, &a], 60, || {
+        has_hot_peer(&a)
+    });
+    let status = a.cli(&["status"]);
+    assert!(status.contains("outbound only"), "{status}");
+    assert!(
+        std::fs::read_to_string(a.log())
+            .unwrap()
+            .contains("dials out only"),
+        "{}",
+        a.log_tail()
+    );
+
+    a.stop();
+    let config = std::fs::read_to_string(a.config()).unwrap();
+    assert!(config.contains("role = \"personal\"\n"));
+    std::fs::write(
+        a.config(),
+        config.replace(
+            "role = \"personal\"\n",
+            "role = \"personal\"\nlisten = true\n",
+        ),
+    )
+    .unwrap();
+    a.start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(status) = a.child.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the node kept running:\n{}",
+            a.log_tail()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(!exit.success());
+    assert!(a.log_tail().contains("P2P transport"), "{}", a.log_tail());
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);

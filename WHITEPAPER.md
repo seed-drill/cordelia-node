@@ -185,7 +185,8 @@ Nodes talk QUIC (RFC 9000, TLS 1.3, the device key as the certificate subject)
 with CBOR messages. Two roles matter in v1:
 
 - **Personal nodes** run on people's devices. They only dial out, so they work
-  behind NAT and firewalls, and connect to relays.
+  behind NAT and firewalls, and connect to relays. A personal node opens no
+  listening port: nothing on a network the device joins can connect to it.
 - **Relays** accept connections, store the ciphertext they receive, and forward
   it to the other relays they know, with a seen-table so nothing loops. Relays
   are also the addresses personal nodes dial first. Peer selection follows the
