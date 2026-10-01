@@ -54,15 +54,21 @@ impl Node {
             .to_string()
     }
 
-    /// Run a CLI command against this node and return its stdout.
-    fn cli(&self, args: &[&str]) -> String {
-        let out = Command::new(BIN)
+    /// A CLI command against this node, run as on its machine.
+    fn command(&self, args: &[&str]) -> std::process::Output {
+        Command::new(BIN)
             .arg("--config")
             .arg(self.config())
             .args(args)
             .env("CORDELIA_DATA_DIR", self.data_dir())
+            .env("HOME", self.home())
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Run a CLI command against this node and return its stdout.
+    fn cli(&self, args: &[&str]) -> String {
+        let out = self.command(args);
         assert!(
             out.status.success(),
             "{}: cordelia {args:?} failed:\n{}{}",
@@ -73,9 +79,22 @@ impl Node {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// This node's stand-in home directory (for the sync adapter).
+    /// Run a CLI command that must be refused, and return what it says.
+    fn refused(&self, args: &[&str]) -> String {
+        let out = self.command(args);
+        assert!(
+            !out.status.success(),
+            "{}: cordelia {args:?} should have been refused:\n{}",
+            self.name,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// This node's stand-in home directory (for the sync adapter): a real
+    /// path, as Claude Code records them.
     fn home(&self) -> PathBuf {
-        self.dir.path().join("home")
+        self.dir.path().canonicalize().unwrap().join("home")
     }
 
     fn start(&mut self) {
@@ -729,11 +748,22 @@ fn cli_reports_when_the_node_is_not_running() {
     );
 }
 
-/// A Claude Code project folder under `home` whose sessions ran in `cwd`;
-/// returns its memory folder.
+/// Claude Code's folder under `home` for `dir`, named as Claude Code names
+/// it: every character that is not a letter or a digit becomes `-`.
+fn claude_project(home: &std::path::Path, dir: &std::path::Path) -> PathBuf {
+    let name: String = dir
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    home.join(".claude/projects").join(name)
+}
+
+/// Record a Claude Code session started in `cwd` under `home`; returns the
+/// memory folder of its project folder (created).
 fn claude_folder(home: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
-    let slug = cwd.display().to_string().replace(['/', '.'], "-");
-    let folder = home.join(".claude/projects").join(slug);
+    let folder = claude_project(home, cwd);
     std::fs::create_dir_all(folder.join("memory")).unwrap();
     std::fs::write(
         folder.join("session.jsonl"),
@@ -772,12 +802,27 @@ fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
     repo
 }
 
+/// The names a device has mapped, from its status snapshot.
+fn mapped_names(snapshot: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = snapshot["sync"]["mappings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["name"].as_str().map(String::from))
+        .collect();
+    names.sort();
+    names
+}
+
 /// The product, end to end: two machines, each with its own home, Claude
 /// Code folder, and clone of the same repository at a different path.
-/// After pairing and `cordelia sync claude` on both, memory Claude writes
-/// on one machine appears on the other, in the home and project folders.
+/// After pairing, `cordelia sync claude` and mapping the same names on
+/// both, memory Claude writes on one machine appears on the other. Until a
+/// folder is mapped, nothing of it leaves the machine.
 #[test]
 fn claude_memory_syncs_between_two_machines() {
+    const PROJECT: &str = "github.com/seed-drill/cordelia-node";
+
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -790,12 +835,23 @@ fn claude_memory_syncs_between_two_machines() {
         wait_for("node healthy", &all, 30, || healthy(n));
         wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
     }
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let state = |n: &Node| -> serde_json::Value {
+        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+    };
 
-    // Each machine: home memory, and a clone at a different path.
+    // Each machine: home memory and a clone at a different path. A also has
+    // a folder that is not a repository.
     let a_home_mem = claude_folder(&a.home(), &a.home());
     let b_home_mem = claude_folder(&b.home(), &b.home());
-    let a_proj_mem = claude_folder(&a.home(), &clone_at(&a.home(), "Work/cordelia-node"));
-    let b_proj_mem = claude_folder(&b.home(), &clone_at(&b.home(), "code/cn"));
+    let a_repo = clone_at(&a.home(), "Work/cordelia-node");
+    let b_repo = clone_at(&b.home(), "code/cn");
+    let a_proj_mem = claude_folder(&a.home(), &a_repo);
+    let b_proj_mem = claude_folder(&b.home(), &b_repo);
+    let a_notes = a.home().join("notes");
+    std::fs::create_dir_all(&a_notes).unwrap();
+    let a_notes_mem = claude_folder(&a.home(), &a_notes);
 
     // Pair, then switch sync on.
     let b_key = b.cli(&["id"]).trim().to_string();
@@ -807,21 +863,108 @@ fn claude_memory_syncs_between_two_machines() {
         .to_string();
     b.cli(&["accept", &a_key]);
     for n in [&a, &b] {
-        let claude_dir = n.home().join(".claude");
-        n.cli(&["sync", "claude", "--dir", claude_dir.to_str().unwrap()]);
+        let out = n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        assert!(out.starts_with("Sync turned on.\n"), "{out}");
     }
 
     // Claude writes memories on A.
-    std::fs::write(a_home_mem.join("user_role.md"), "Russ is the CPO.\n").unwrap();
+    std::fs::write(a_home_mem.join("user_role.md"), "Prefers short answers.\n").unwrap();
     std::fs::write(
         a_proj_mem.join("decision.md"),
         "Invite-only channels only.\n",
     )
     .unwrap();
+    std::fs::write(a_notes_mem.join("idea.md"), "A thought.\n").unwrap();
 
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    // Nothing syncs until a folder is mapped. What was found is listed
+    // with the command that maps it.
+    let found = wait_for("a lists what it found", &all, 60, || {
+        let out = a.cli(&["sync", "status"]);
+        out.contains("Found on this machine").then_some(out)
+    });
+    for expected in [
+        "Nothing syncs yet.",
+        "cordelia sync map ~ --home",
+        "cordelia sync map ~/Work/cordelia-node",
+        "cordelia sync map ~/notes <name>",
+        "Scope: mapped folders only.",
+    ] {
+        assert!(
+            found.contains(expected),
+            "missing {expected:?} in:\n{found}"
+        );
+    }
+    let s = state(&a);
+    assert_eq!(s["state"], "off", "{s}");
+    assert_eq!(s["summary"], "memory: nothing mapped", "{s}");
+    assert_eq!(s["sync"]["all"], false, "{s}");
+    assert_eq!(s["sync"]["unmapped"].as_array().unwrap().len(), 3, "{s}");
+
+    // What cannot be mapped by accident, or by a slip.
+    let said = a.refused(&["sync", "map", &path(&a.home())]);
+    assert!(said.contains("cordelia sync map ~ --home"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a_repo), "--home"]);
+    assert!(said.contains("--home maps the home directory"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a_notes)]);
+    assert!(said.contains("needs a name"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a_notes), "Lab Notes"]);
+    assert!(said.contains("not a usable name"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a.home().join("missing"))]);
+    assert!(said.contains("No such file"), "{said}");
+    let outside = a.home().parent().unwrap().to_path_buf();
+    let said = a.refused(&["sync", "map", &path(&outside), "outside"]);
+    assert!(said.contains("outside the home directory"), "{said}");
+
+    // A maps the project (from one of its subdirectories: the repository is
+    // what gets mapped, under its remote), the folder under a name, and home.
+    let sub = a_repo.join("crates/x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let out = a.cli(&["sync", "map", &path(&sub)]);
+    assert!(
+        out.contains(&format!("Mapped ~/Work/cordelia-node to {PROJECT}.")),
+        "{out}"
+    );
+    a.cli(&["sync", "map", &path(&a_notes), "lab-notes"]);
+    let out = a.cli(&["sync", "map", &path(&a.home()), "--home"]);
+    assert!(out.contains("home memory"), "{out}");
+    let said = a.refused(&["sync", "map", &path(&a_notes), "other"]);
+    assert!(said.contains("already mapped"), "{said}");
+    assert_eq!(mapped_names(&state(&a)), [PROJECT, "lab-notes", "~"]);
+
+    // B is offered all three and has none of them: what it found itself is
+    // marked, and the name it has no folder for is listed on its own.
+    let offered = wait_for("b sees what a syncs", &all, 120, || {
+        let out = b.cli(&["sync", "status"]);
+        (out.matches("(your other devices sync it)").count() == 2 && out.contains("lab-notes"))
+            .then_some(out)
+    });
+    assert!(
+        offered.contains("cordelia sync map <folder> lab-notes"),
+        "{offered}"
+    );
+    let s = state(&b);
+    assert_eq!(
+        s["sync"]["available"],
+        serde_json::json!([PROJECT, "lab-notes", "~"]),
+        "{s}"
+    );
+    assert_eq!(s["sync"]["folders"], 0, "{s}");
+    assert_eq!(read(&b_proj_mem.join("decision.md")), None);
+    assert_eq!(read(&b_home_mem.join("user_role.md")), None);
+
+    // B maps the same names: its clone (named by its remote), a folder
+    // Claude Code has never run in, and home.
+    b.cli(&["sync", "map", &path(&b_repo)]);
+    let b_notes = b.home().join("Documents/lab");
+    std::fs::create_dir_all(&b_notes).unwrap();
+    let b_notes_mem = claude_project(&b.home(), &b_notes).join("memory");
+    b.cli(&["sync", "map", &path(&b_notes), "lab-notes"]);
+    b.cli(&["sync", "home", "on"]);
+    assert_eq!(mapped_names(&state(&b)), [PROJECT, "lab-notes", "~"]);
+
     wait_for("b gets a's home memory", &all, 120, || {
-        (read(&b_home_mem.join("user_role.md"))?.as_str() == "Russ is the CPO.\n").then_some(())
+        (read(&b_home_mem.join("user_role.md"))?.as_str() == "Prefers short answers.\n")
+            .then_some(())
     });
     wait_for(
         "b gets a's project memory, at a different path",
@@ -831,6 +974,12 @@ fn claude_memory_syncs_between_two_machines() {
             (read(&b_proj_mem.join("decision.md"))?.as_str() == "Invite-only channels only.\n")
                 .then_some(())
         },
+    );
+    wait_for(
+        "b gets the named folder's memory, where Claude Code will look",
+        &all,
+        120,
+        || (read(&b_notes_mem.join("idea.md"))?.as_str() == "A thought.\n").then_some(()),
     );
 
     // And back: B edits, A sees it.
@@ -845,17 +994,20 @@ fn claude_memory_syncs_between_two_machines() {
             .then_some(())
     });
 
+    // Status says, for each folder, when it last received and sent.
     let status = b.cli(&["sync", "status"]);
+    let line = status
+        .lines()
+        .find(|l| l.contains(PROJECT))
+        .unwrap_or_else(|| panic!("{status}"));
     assert!(
-        status.contains("github.com/seed-drill/cordelia-node"),
+        line.contains("syncing") && line.contains("received ") && line.contains("sent "),
         "{status}"
     );
+    assert!(!status.contains("Found on this machine"), "{status}");
 
     // The status indicator: once everything has reached the relay, both
     // devices say so.
-    let state = |n: &Node| -> serde_json::Value {
-        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
-    };
     for n in [&a, &b] {
         let s = wait_for("the device reports synced", &all, 60, || {
             let s = state(n);
@@ -878,7 +1030,7 @@ fn claude_memory_syncs_between_two_machines() {
     );
 
     // The full snapshot a panel reads: relays, this person's devices, and
-    // each project with its settings.
+    // each synced folder with its name and where it is.
     let snapshot = state(&a);
     assert_eq!(snapshot["peers"]["list"][0]["role"], "relay", "{snapshot}");
     assert_eq!(
@@ -886,30 +1038,84 @@ fn claude_memory_syncs_between_two_machines() {
         2,
         "{snapshot}"
     );
+    let project = snapshot["sync"]["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project"] == PROJECT)
+        .unwrap_or_else(|| panic!("{snapshot}"));
+    assert_eq!(project["mapped"], true, "{snapshot}");
+    assert_eq!(project["cwd"], path(&a_repo), "{snapshot}");
     assert!(
-        snapshot["sync"]["projects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["project"] == "github.com/seed-drill/cordelia-node"),
+        project["channel"].as_str().unwrap().starts_with("grp_"),
         "{snapshot}"
     );
+    assert!(project["last_published_at"].is_string(), "{snapshot}");
+    assert!(project["last_pulled_at"].is_string(), "{snapshot}");
+    assert!(project["error"].is_null(), "{snapshot}");
 
-    // One setting changes at a time; the others stay as they were.
+    // One setting changes at a time; the others stay as they were. Turning
+    // home memory off unmaps it; a mapped folder is unmapped, not excluded.
     a.cli(&["sync", "home", "off"]);
     a.cli(&["sync", "exclude", "github.com/Client-Co/App.git"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], false, "{s}");
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes"], "{s}");
     assert_eq!(
         s["sync"]["exclude"],
         serde_json::json!(["github.com/client-co/app"])
     );
     assert_eq!(s["sync"]["enabled"], true);
+    let said = a.refused(&["sync", "exclude", "lab-notes"]);
+    assert!(said.contains("cordelia sync unmap lab-notes"), "{said}");
     a.cli(&["sync", "include", "github.com/client-co/app"]);
     a.cli(&["sync", "home", "on"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], true, "{s}");
     assert_eq!(s["sync"]["exclude"], serde_json::json!([]));
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
+
+    // Turning sync on again changes nothing: not the directory (which is
+    // not the default here), not the scope, not the mappings.
+    let out = a.cli(&["sync", "claude"]);
+    assert!(out.starts_with("No settings changed.\n"), "{out}");
+    let s = state(&a);
+    assert_eq!(s["sync"]["dir"], path(&a.home().join(".claude")), "{s}");
+    assert_eq!(s["sync"]["all"], false, "{s}");
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
+
+    // Nor does turning it off and on again.
+    a.cli(&["sync", "off"]);
+    assert_eq!(state(&a)["state"], "off");
+    let out = a.cli(&["sync", "claude"]);
+    assert!(out.starts_with("Sync turned on.\n"), "{out}");
+    let s = state(&a);
+    assert_eq!(s["sync"]["dir"], path(&a.home().join(".claude")), "{s}");
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
+
+    // Unmapping, by name or by folder, stops the sync from this device and
+    // leaves the files. The folder is back among those found.
+    let out = a.cli(&["sync", "unmap", "lab-notes"]);
+    assert!(out.contains("Its files stay where they are."), "{out}");
+    assert!(out.contains("cordelia sync map ~/notes <name>"), "{out}");
+    assert!(
+        out.contains("cordelia sync map <folder> lab-notes"),
+        "B still syncs it:\n{out}"
+    );
+    assert_eq!(
+        read(&a_notes_mem.join("idea.md")).as_deref(),
+        Some("A thought.\n")
+    );
+    let said = a.refused(&["sync", "unmap", "lab-notes"]);
+    assert!(said.contains("not mapped on this device"), "{said}");
+    assert_eq!(
+        state(&a)["sync"]["exclude"],
+        serde_json::json!([path(&a_notes)]),
+        "an unmapped folder stays out until it is mapped again"
+    );
+    a.cli(&["sync", "unmap", &path(&sub)]);
+    assert_eq!(mapped_names(&state(&a)), ["~"]);
+    a.cli(&["sync", "map", &path(&a_repo)]);
     wait_for("a settles after the settings changes", &all, 60, || {
         (state(&a)["state"] == "synced").then_some(())
     });

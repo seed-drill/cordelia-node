@@ -63,6 +63,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1/sync")
             .route("/claude", web::post().to(sync::claude))
+            .route("/map", web::post().to(sync::map))
+            .route("/unmap", web::post().to(sync::unmap))
             .route("/status", web::post().to(sync::sync_status)),
     );
 

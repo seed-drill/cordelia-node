@@ -1,20 +1,30 @@
-//! The Claude Code adapter: keeps each Claude Code memory folder in step
-//! with a Cordelia channel (decision 2026-09-30-agent-memory-sync §4.5).
+//! The Claude Code adapter: keeps Claude Code memory folders in step with
+//! Cordelia channels (decision 2026-09-30-agent-memory-sync §4.5).
 //!
-//! - The home folder's memory syncs with the personal channel, under keys
-//!   `home/<file>`.
-//! - A project folder syncs with the project's own channel, found by its
-//!   git remote in the personal channel's map (`project/<remote>` ->
-//!   channel ID), and created, shared with all of this person's devices,
-//!   the first time any device sees the project.
-//! - Other folders (no repository, or no portable remote) do not sync and
-//!   are reported as such.
+//! What syncs is declared, not assumed. A *mapping* says that Claude's
+//! memory for a folder syncs under a name. The name is shared by all of a
+//! person's devices: the personal channel maps it to a channel
+//! (`project/<name>` -> channel ID), created by the first device to sync
+//! it and joined by each device that maps the same name. Home memory is
+//! the mapping of the home directory, under the name `~`.
+//!
+//! - With declared mappings only (the default), nothing else syncs. Other
+//!   memory found on the machine is reported, with the name each would
+//!   get, so it can be mapped.
+//! - With `all` on, everything found syncs as well: home, and each git
+//!   project under its normalised remote, minus the excluded ones.
+//!
+//! A mapped folder syncs exactly the Claude Code folder named after it
+//! ([`discover::claude_folder`]), never one chosen by reading transcripts:
+//! a mapping cannot come to sync a different folder than the one declared.
+//! Claude Code keeps one memory per git repository, so the folder to map
+//! is the repository's main working tree ([`discover::memory_root`]).
 //!
 //! Each cycle plans every file with [`crate::plan`] and applies the actions.
 //! Files are written atomically (temporary file, then rename), never
 //! through a symlink, and only under names [`crate::names`] accepts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -24,7 +34,7 @@ use cordelia_api::entries::{self, Write};
 use cordelia_api::membership;
 use cordelia_api::state::AppState;
 use cordelia_core::CordeliaError;
-use cordelia_storage::{channels, sync_state};
+use cordelia_storage::{channels, meta, sync_state};
 
 use crate::discover::{self, Project};
 use crate::names;
@@ -45,9 +55,16 @@ const PROJECT_CACHE: Duration = Duration::from_secs(300);
 /// made may still be arriving, and creating its own would only compete.
 const NEW_DEVICE_GRACE: Duration = Duration::from_secs(60);
 
-/// Keys in the personal channel.
-const HOME_PREFIX: &str = "home/";
+/// The name home memory syncs under.
+pub const HOME_NAME: &str = "~";
+
+/// Keys in the personal channel that map a name to its channel.
 const PROJECT_PREFIX: &str = "project/";
+
+/// Keys in the personal channel under which each device lists the names it
+/// syncs (`syncing/<device key>`), so the others can say what there is to
+/// map.
+const SYNCING_PREFIX: &str = "syncing/";
 
 /// Item type of synced memory files.
 const ITEM_TYPE: &str = "memory";
@@ -55,10 +72,16 @@ const ITEM_TYPE: &str = "memory";
 /// What one cycle did for one folder.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FolderReport {
+    /// Claude Code's folder for it (`~/.claude/projects/<slug>`).
     pub folder: String,
+    /// The working directory it belongs to, when known.
+    pub cwd: Option<String>,
+    /// The name it syncs under.
     pub project: String,
+    /// Declared with `cordelia sync map`, as opposed to found by `all`.
+    pub mapped: bool,
     pub channel_id: Option<String>,
-    /// Waiting to join the project's channel (its invite is in transit).
+    /// Waiting to join the name's channel (its invite is in transit).
     pub waiting: bool,
     pub published: usize,
     pub pulled: usize,
@@ -69,57 +92,167 @@ pub struct FolderReport {
     pub conflict_files: Vec<String>,
     /// Files present but not synced (unsafe name, not text, too large).
     pub skipped: Vec<String>,
+    /// When this device last received a memory under this name, and last
+    /// sent one (RFC 3339).
+    pub last_pulled_at: Option<String>,
+    pub last_published_at: Option<String>,
+    /// Why this folder did not sync this cycle.
+    pub error: Option<String>,
+}
+
+/// When a device last received and last sent a memory under one name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Activity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pulled: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
+}
+
+/// Memory found on this machine that does not sync.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Found {
+    /// Claude Code's folder for it.
+    pub folder: String,
+    /// The directory to map to sync it, when its transcripts say: the
+    /// directory it belongs to, or the repository that directory is in.
+    pub cwd: Option<String>,
+    /// The name it would sync under: `~` for home, the normalised remote
+    /// for a git project, nothing for any other folder (it needs a name).
+    pub name: Option<String>,
 }
 
 /// What one cycle did.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CycleReport {
     pub folders: Vec<FolderReport>,
-    /// Folders that do not sync: not the home folder, and no git remote.
+    /// Folders found on this machine that do not sync: not mapped, or,
+    /// with `all` on, neither home nor a git project.
+    pub unmapped: Vec<Found>,
+    /// The folders in `unmapped` that have no name to sync under (neither
+    /// home nor a git project).
     pub unsynced: Vec<String>,
-    /// Folders not synced because this device excludes them (the project's
-    /// remote, or "~" for home memory).
+    /// With `all` on: names found but excluded on this device.
     pub excluded: Vec<String>,
+    /// Names this person's other devices sync that this device does not,
+    /// sorted.
+    pub available: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// A declared mapping: Claude's memory for sessions started in `folder`
+/// syncs under `name`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Mapping {
+    pub folder: String,
+    pub name: String,
 }
 
 /// Per-device sync settings, kept in node metadata.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// Project remotes this device never syncs. A trailing `*` matches a
-    /// prefix (`github.com/client-co/*`).
+    /// Sync every folder found as well as the declared mappings.
+    pub all: bool,
+    /// With `all`: what this device never syncs. A name, where a trailing
+    /// `*` matches a prefix (`github.com/client-co/*`); or a folder (an
+    /// absolute path), which is how an unmapped folder stays unsynced.
     pub exclude: Vec<String>,
-    /// Whether home-folder memory syncs on this device.
+    /// With `all`: whether home memory syncs on this device.
     pub home: bool,
+    pub mappings: Vec<Mapping>,
 }
 
 impl Settings {
-    /// Read from node metadata: `sync.claude.exclude` (JSON array) and
-    /// `sync.claude.home` (`"off"` disables home memory).
+    /// Read from node metadata: `sync.claude.all`, `.mappings`, `.exclude`
+    /// and `.home`.
     pub fn load(state: &AppState) -> Result<Self, CordeliaError> {
         let db = lock(state)?;
-        let exclude =
-            cordelia_storage::meta::get(&db, cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE)?
+        let json = |key: &str| -> Result<Option<String>, CordeliaError> { meta::get(&db, key) };
+        Ok(Self {
+            all: json(meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on"),
+            exclude: json(meta::SYNC_CLAUDE_EXCLUDE)?
                 .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
-        let home = cordelia_storage::meta::get(&db, cordelia_storage::meta::SYNC_CLAUDE_HOME)?
-            .is_none_or(|v| v != "off");
-        Ok(Self { exclude, home })
+                .unwrap_or_default(),
+            home: json(meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off"),
+            mappings: json(meta::SYNC_CLAUDE_MAPPINGS)?
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+        })
     }
 
-    /// Whether this device excludes `project`.
+    /// With `all` on: whether this device leaves `project` out by name.
     pub fn excludes(&self, project: &Project) -> bool {
         match project {
             Project::Home => !self.home,
-            Project::Repo(remote) => self.exclude.iter().any(|pattern| {
-                let pattern = pattern.to_lowercase();
-                match pattern.strip_suffix('*') {
-                    Some(prefix) => remote.starts_with(prefix),
-                    None => *remote == pattern,
-                }
-            }),
+            Project::Repo(remote) => self
+                .exclude
+                .iter()
+                .filter(|entry| !entry.starts_with('/'))
+                .any(|pattern| {
+                    let pattern = pattern.to_lowercase();
+                    match pattern.strip_suffix('*') {
+                        Some(prefix) => remote.starts_with(prefix),
+                        None => *remote == pattern,
+                    }
+                }),
         }
     }
+
+    /// With `all` on: whether the folder `dir` was taken out of the sync on
+    /// this device (it was unmapped), whatever name it would sync under.
+    pub fn declines(&self, dir: &Path) -> bool {
+        self.exclude
+            .iter()
+            .any(|entry| entry.starts_with('/') && Path::new(entry) == dir)
+    }
+}
+
+/// The name a found project would sync under.
+fn name_of(project: &Project) -> String {
+    match project {
+        Project::Home => HOME_NAME.to_string(),
+        Project::Repo(remote) => remote.clone(),
+    }
+}
+
+/// One folder to sync this cycle.
+struct Target {
+    /// Claude Code's folder.
+    dir: PathBuf,
+    cwd: Option<String>,
+    name: String,
+    mapped: bool,
+}
+
+/// What a Claude Code folder's transcripts say about it.
+#[derive(Clone)]
+enum Seen {
+    /// Claude Code's own folder, named after the directory its sessions
+    /// started in. Their memory is kept in `dir`, the folder of `root`:
+    /// this folder, or the folder of the repository the directory is in.
+    Own {
+        dir: PathBuf,
+        root: PathBuf,
+        project: Option<Project>,
+    },
+    /// Claude Code's own folder, for a directory in a repository whose
+    /// folder name cannot be predicted: nothing to sync from here.
+    OwnElsewhere,
+    /// Not named after the directory its transcripts record: someone laid
+    /// it out by hand, and it is its own memory folder.
+    ByHand {
+        cwd: PathBuf,
+        project: Option<Project>,
+    },
+}
+
+/// Memory found on disk that no mapping claims.
+struct Candidate {
+    /// Claude Code's folder holding the memory, or due to.
+    dir: PathBuf,
+    /// The directory to map to sync it.
+    cwd: Option<PathBuf>,
+    project: Option<Project>,
 }
 
 /// The adapter for one Claude Code directory (`~/.claude`).
@@ -128,33 +261,144 @@ pub struct ClaudeAdapter {
     home: PathBuf,
     /// Tag in conflict file names: the first 8 hex digits of this device's key.
     device_tag: String,
-    projects: HashMap<PathBuf, (Instant, Option<Project>)>,
+    /// Per Claude folder: when its transcripts were read, and what they say.
+    seen: HashMap<PathBuf, (Instant, Option<Seen>)>,
+    /// Per mapped directory: when it was checked, and where Claude Code
+    /// keeps its memory now if that is no longer the directory itself.
+    moved: HashMap<String, (Instant, Option<PathBuf>)>,
 }
 
 impl ClaudeAdapter {
     pub fn new(claude_dir: PathBuf, home: PathBuf, device_key: &[u8; 32]) -> Self {
         Self {
             claude_dir,
-            home,
+            // Claude Code names folders after real paths, so compare with one.
+            home: home.canonicalize().unwrap_or(home),
             device_tag: hex::encode(&device_key[..4]),
-            projects: HashMap::new(),
+            seen: HashMap::new(),
+            moved: HashMap::new(),
         }
     }
 
-    fn project_of(&mut self, folder: &Path) -> Option<Project> {
-        if let Some((at, project)) = self.projects.get(folder)
+    /// The project a directory belongs to, if it has a name to sync under.
+    /// A remote that does not make a usable name is left for the person to
+    /// name.
+    fn project(&self, dir: &Path) -> Option<Project> {
+        discover::project_for(dir, &self.home).filter(|project| match project {
+            Project::Home => true,
+            Project::Repo(remote) => cordelia_api::sync::valid_sync_name(remote),
+        })
+    }
+
+    /// Where Claude Code keeps the memory of a mapped directory now, if
+    /// that is no longer the directory itself: a git repository has
+    /// appeared above it since it was mapped. Cached like `seen`.
+    fn moved_to(&mut self, mapped: &str) -> Option<PathBuf> {
+        if let Some((at, moved)) = self.moved.get(mapped)
             && at.elapsed() < PROJECT_CACHE
         {
-            return project.clone();
+            return moved.clone();
         }
-        let project =
-            discover::recorded_cwd(folder).and_then(|cwd| discover::project_for(&cwd, &self.home));
-        self.projects
-            .insert(folder.to_path_buf(), (Instant::now(), project.clone()));
-        project
+        let root = discover::memory_root(Path::new(mapped));
+        let moved = (root != Path::new(mapped)).then_some(root);
+        self.moved
+            .insert(mapped.to_string(), (Instant::now(), moved.clone()));
+        moved
     }
 
-    /// Run one sync cycle over every folder.
+    /// What a Claude folder's transcripts say about it, cached: reading
+    /// them and asking git is too slow to repeat every cycle.
+    fn seen(&mut self, folder: &Path) -> Option<Seen> {
+        if let Some((at, seen)) = self.seen.get(folder)
+            && at.elapsed() < PROJECT_CACHE
+        {
+            return seen.clone();
+        }
+        // Claude Code names its folders after an absolute path, so they
+        // start with a dash. Such a folder is believed only about the
+        // directory it is named after: a session can move elsewhere, and a
+        // transcript that starts in another directory must not turn this
+        // folder into that directory's memory.
+        let cwds = discover::recorded_cwds(folder);
+        let named_by_claude = folder
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('-'));
+        let own = cwds
+            .iter()
+            .find(|cwd| discover::is_claude_folder_for(folder, cwd));
+        let seen = match own {
+            Some(cwd) => {
+                let root = discover::memory_root(cwd);
+                let dir = if root == *cwd {
+                    Some(folder.to_path_buf())
+                } else {
+                    discover::claude_folder(&self.claude_dir, &root)
+                };
+                Some(match dir {
+                    Some(dir) => Seen::Own {
+                        project: self.project(&root),
+                        dir,
+                        root,
+                    },
+                    None => Seen::OwnElsewhere,
+                })
+            }
+            None if named_by_claude => None,
+            None => cwds.into_iter().next().map(|cwd| Seen::ByHand {
+                project: self.project(&cwd),
+                cwd,
+            }),
+        };
+        self.seen
+            .insert(folder.to_path_buf(), (Instant::now(), seen.clone()));
+        seen
+    }
+
+    /// Memory on disk that no mapping claims: each Claude folder that holds
+    /// memory, or belongs to a project and so may be sent some.
+    fn candidates(&mut self, claimed: &HashSet<PathBuf>) -> Vec<Candidate> {
+        let mut found: Vec<Candidate> = Vec::new();
+        for folder in discover::folders(&self.claude_dir) {
+            let holds_memory = folder.memory_dir.is_dir();
+            let candidate = match self.seen(&folder.dir) {
+                Some(Seen::Own { dir, root, project }) => Candidate {
+                    dir,
+                    cwd: Some(root),
+                    project,
+                },
+                Some(Seen::ByHand { cwd, project }) if holds_memory => Candidate {
+                    dir: folder.dir,
+                    cwd: Some(cwd),
+                    project,
+                },
+                // No transcripts: all that is known is that it holds memory.
+                None if holds_memory => Candidate {
+                    dir: folder.dir,
+                    cwd: None,
+                    project: None,
+                },
+                _ => continue,
+            };
+            // Nothing to send and no project to receive from: not worth a line.
+            if candidate.project.is_none() && !candidate.dir.join("memory").is_dir() {
+                continue;
+            }
+            if claimed.contains(&candidate.dir) {
+                continue;
+            }
+            match found.iter_mut().find(|c| c.dir == candidate.dir) {
+                // Several folders of one repository: one memory, listed once.
+                Some(existing) if existing.cwd.is_none() => *existing = candidate,
+                Some(_) => {}
+                None => found.push(candidate),
+            }
+        }
+        found.sort_by(|a, b| a.dir.cmp(&b.dir));
+        found
+    }
+
+    /// Run one sync cycle: the declared mappings, and with `all` on,
+    /// everything else found.
     pub fn run_cycle(&mut self, state: &AppState) -> CycleReport {
         let mut report = CycleReport::default();
         let settings = match Settings::load(state) {
@@ -172,61 +416,260 @@ impl ClaudeAdapter {
             }
         };
 
-        for folder in discover::folders(&self.claude_dir) {
-            let label = folder.dir.display().to_string();
-            let Some(project) = self.project_of(&folder.dir) else {
-                report.unsynced.push(label);
-                continue;
-            };
-            if settings.excludes(&project) {
-                report.excluded.push(match &project {
-                    Project::Home => "~".into(),
-                    Project::Repo(remote) => remote.clone(),
+        // What to sync: declared mappings first.
+        let mut targets: Vec<Target> = Vec::new();
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        for mapping in &settings.mappings {
+            let Some(dir) = discover::claude_folder(&self.claude_dir, Path::new(&mapping.folder))
+            else {
+                let error = "the path is too long to tell which folder Claude Code uses for it";
+                report.errors.push(format!("{}: {error}", mapping.folder));
+                report.folders.push(FolderReport {
+                    cwd: Some(mapping.folder.clone()),
+                    project: mapping.name.clone(),
+                    mapped: true,
+                    error: Some(error.to_string()),
+                    ..Default::default()
                 });
                 continue;
-            }
-            let result = match &project {
-                Project::Home => sync_folder(
-                    state,
-                    &folder.memory_dir,
-                    &personal,
-                    HOME_PREFIX,
-                    &self.device_tag,
-                )
-                .map(|mut r| {
-                    r.channel_id = Some(personal.clone());
-                    r
-                }),
-                Project::Repo(remote) => match project_channel(state, &personal, remote) {
-                    Ok(Some(channel)) => {
-                        sync_folder(state, &folder.memory_dir, &channel, "", &self.device_tag).map(
-                            |mut r| {
-                                r.channel_id = Some(channel);
-                                r
-                            },
-                        )
-                    }
-                    Ok(None) => Ok(FolderReport {
-                        waiting: true,
-                        ..Default::default()
-                    }),
-                    Err(e) => Err(e),
-                },
             };
-            match result {
-                Ok(mut r) => {
-                    r.folder = label;
-                    r.project = match &project {
-                        Project::Home => "~".into(),
-                        Project::Repo(remote) => remote.clone(),
-                    };
-                    report.folders.push(r);
+            claimed.insert(dir.clone());
+            targets.push(Target {
+                dir,
+                cwd: Some(mapping.folder.clone()),
+                name: mapping.name.clone(),
+                mapped: true,
+            });
+        }
+
+        // Then everything else on disk: synced with `all`, reported without.
+        // A folder that was unmapped stays out either way, under any name.
+        for candidate in self.candidates(&claimed) {
+            let label = candidate.dir.display().to_string();
+            let declined = candidate
+                .cwd
+                .as_deref()
+                .is_some_and(|dir| settings.declines(dir));
+            let cwd = candidate.cwd.map(|c| c.display().to_string());
+            match candidate.project {
+                Some(project) if settings.all && !declined && settings.excludes(&project) => {
+                    report.excluded.push(name_of(&project));
                 }
-                Err(e) => report.errors.push(format!("{label}: {e}")),
+                Some(project) if settings.all && !declined => targets.push(Target {
+                    dir: candidate.dir,
+                    cwd,
+                    name: name_of(&project),
+                    mapped: false,
+                }),
+                project => {
+                    if project.is_none() {
+                        report.unsynced.push(label.clone());
+                    }
+                    report.unmapped.push(Found {
+                        folder: label,
+                        cwd,
+                        name: project.as_ref().map(name_of),
+                    });
+                }
             }
+        }
+
+        // The names this device means to sync, and those it has a channel
+        // for: only the second kind is something to tell other devices.
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        let mut joined: BTreeSet<String> = BTreeSet::new();
+        // The (memory folder, channel) pairs that sync now. What any other
+        // pair agreed is forgotten below, unless a channel could not be
+        // looked up this cycle.
+        let mut syncing: Vec<(String, String)> = Vec::new();
+        let mut looked_up_all = true;
+        let stored = load_activity(state);
+        let mut activity: HashMap<String, Activity> = HashMap::new();
+        for target in targets {
+            let label = target.dir.display().to_string();
+            let memory = target.dir.join("memory");
+            wanted.insert(target.name.clone());
+            let result = match project_channel(state, &personal, &target.name) {
+                Ok(Some(channel)) => {
+                    joined.insert(target.name.clone());
+                    syncing.push((memory.display().to_string(), channel.clone()));
+                    sync_folder(state, &memory, &channel, "", &self.device_tag).map(|mut r| {
+                        r.channel_id = Some(channel);
+                        r
+                    })
+                }
+                Ok(None) => Ok(FolderReport {
+                    waiting: true,
+                    ..Default::default()
+                }),
+                Err(e) => {
+                    looked_up_all = false;
+                    Err(e)
+                }
+            };
+            // A folder that failed is still listed, with why.
+            let mut r = result.unwrap_or_else(|e| {
+                report.errors.push(format!("{label}: {e}"));
+                FolderReport {
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                }
+            });
+            // A repository created above a mapped folder moves its memory.
+            if target.mapped
+                && r.error.is_none()
+                && let Some(mapped) = target.cwd.as_deref()
+                && let Some(root) = self.moved_to(mapped)
+            {
+                let moved = format!(
+                    "Claude Code now keeps this folder's memory with {}, a git repository \
+                     that contains it: unmap it, and map that instead",
+                    root.display()
+                );
+                report.errors.push(format!("{mapped}: {moved}"));
+                r.error = Some(moved);
+            }
+            let seen = activity
+                .entry(target.name.clone())
+                .or_insert_with(|| stored.get(&target.name).cloned().unwrap_or_default());
+            let now = chrono::Utc::now().to_rfc3339();
+            if r.pulled > 0 {
+                seen.pulled = Some(now.clone());
+            }
+            if r.published > 0 {
+                seen.published = Some(now);
+            }
+            r.last_pulled_at = seen.pulled.clone();
+            r.last_published_at = seen.published.clone();
+            r.folder = label;
+            r.cwd = target.cwd;
+            r.project = target.name;
+            r.mapped = target.mapped;
+            report.folders.push(r);
+        }
+        // Kept for the names that sync now; written only when it changes.
+        if activity != stored
+            && let Err(e) = store_activity(state, &activity)
+        {
+            report.errors.push(format!("activity: {e}"));
+        }
+        // A folder that no longer syncs starts afresh if it syncs again:
+        // what it lost in between is not taken for deletes.
+        if looked_up_all && let Err(e) = forget_other_folders(state, &syncing) {
+            report.errors.push(format!("agreements: {e}"));
+        }
+
+        match exchange_names(state, &personal, &joined, &wanted) {
+            Ok(available) => report.available = available,
+            Err(e) => report.errors.push(format!("names: {e}")),
         }
         report
     }
+}
+
+/// Forget what every folder agreed with its channel, except those in
+/// `syncing` (memory folder, channel).
+fn forget_other_folders(
+    state: &AppState,
+    syncing: &[(String, String)],
+) -> Result<(), CordeliaError> {
+    let forgotten = sync_state::forget_except(&*lock(state)?, syncing)?;
+    if forgotten > 0 {
+        tracing::info!(
+            files = forgotten,
+            "sync: forgot what folders that no longer sync had agreed"
+        );
+    }
+    Ok(())
+}
+
+/// When this device last received and sent a memory under each name.
+fn load_activity(state: &AppState) -> HashMap<String, Activity> {
+    lock(state)
+        .ok()
+        .and_then(|db| meta::get(&db, meta::SYNC_CLAUDE_ACTIVITY).ok().flatten())
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn store_activity(
+    state: &AppState,
+    activity: &HashMap<String, Activity>,
+) -> Result<(), CordeliaError> {
+    let json =
+        serde_json::to_string(activity).map_err(|e| CordeliaError::Internal(e.to_string()))?;
+    meta::set(&*lock(state)?, meta::SYNC_CLAUDE_ACTIVITY, &json)
+}
+
+/// Sync was turned off: tell this person's other devices that this one
+/// no longer syncs anything, and forget what its folders had agreed, so
+/// that turning sync on again merges rather than replays what changed in
+/// between.
+pub fn withdraw(state: &AppState) -> Result<(), CordeliaError> {
+    forget_other_folders(state, &[])?;
+    let personal = membership::personal_channel_id(state)?;
+    let none = BTreeSet::new();
+    exchange_names(state, &personal, &none, &none).map(|_| ())
+}
+
+/// Publish the names this device syncs (`mine`), if they changed, and
+/// return the names this person's other devices sync that this one neither
+/// syncs nor is waiting to (`wanted`). Each device speaks only for itself:
+/// a list is read only from the device its key names, and only the names
+/// in it that could be mapped. (Another member writing a later revision
+/// under a device's key can therefore hide that device's list until it
+/// next publishes, but cannot add to it.)
+fn exchange_names(
+    state: &AppState,
+    personal: &str,
+    mine: &BTreeSet<String>,
+    wanted: &BTreeSet<String>,
+) -> Result<Vec<String>, CordeliaError> {
+    let crypto = |e: cordelia_crypto::CryptoError| CordeliaError::Crypto(e.to_string());
+    let me = state.identity.public_key();
+    let my_key = format!(
+        "{SYNCING_PREFIX}{}",
+        cordelia_crypto::bech32::encode_public_key(&me).map_err(crypto)?
+    );
+
+    let db = lock(state)?;
+    let mut published: BTreeSet<String> = BTreeSet::new();
+    let mut others: BTreeSet<String> = BTreeSet::new();
+    for entry in entries::current(state, &db, personal)? {
+        let Some(device) = entry.key.strip_prefix(SYNCING_PREFIX) else {
+            continue;
+        };
+        let author = cordelia_crypto::bech32::encode_public_key(&entry.current.author);
+        if entry.current.deleted || author.ok().as_deref() != Some(device) {
+            continue;
+        }
+        let names = entry.current.content["names"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str().map(String::from));
+        if entry.current.author == me {
+            published.extend(names);
+        } else {
+            // Shown to the person, and inside a command to copy.
+            others.extend(names.filter(|n| cordelia_api::sync::valid_sync_name(n)));
+        }
+    }
+    if published != *mine {
+        entries::publish(
+            state,
+            &db,
+            personal,
+            &Write {
+                key: &my_key,
+                content: &serde_json::json!({ "names": mine }),
+                metadata: None,
+                item_type: ITEM_TYPE,
+                deleted: false,
+            },
+        )?;
+    }
+    Ok(others.difference(wanted).cloned().collect())
 }
 
 /// The channel for a project, from the personal channel's map, or created
@@ -318,14 +761,19 @@ fn lock(
 }
 
 /// Read the syncable files of a memory folder. Symlinks, hidden files,
-/// unsafe names, non-UTF-8, and oversized files are skipped and listed.
-fn read_local(dir: &Path) -> (HashMap<String, Content>, Vec<String>) {
+/// unsafe names, non-UTF-8, and oversized files are skipped and listed. A
+/// folder that does not exist has no files; one that cannot be read is an
+/// error, never an empty folder.
+fn read_local(dir: &Path) -> std::io::Result<(HashMap<String, Content>, Vec<String>)> {
     let mut files = HashMap::new();
     let mut skipped = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (files, skipped);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((files, skipped)),
+        Err(e) => return Err(e),
     };
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue; // our temporary files, editor swap files, etc.
@@ -350,7 +798,7 @@ fn read_local(dir: &Path) -> (HashMap<String, Content>, Vec<String>) {
             _ => skipped.push(name),
         }
     }
-    (files, skipped)
+    Ok((files, skipped))
 }
 
 /// Write `text` to `dir/name` atomically: temporary file, then rename. The
@@ -391,7 +839,8 @@ fn sync_folder(
 ) -> Result<FolderReport, CordeliaError> {
     let folder = dir.display().to_string();
     let mut report = FolderReport::default();
-    let (local, skipped) = read_local(dir);
+    let (local, skipped) =
+        read_local(dir).map_err(|e| CordeliaError::Internal(format!("{}: {e}", dir.display())))?;
     report.skipped = skipped;
 
     let (remote, deleted, agreed) = {
@@ -429,6 +878,18 @@ fn sync_folder(
             .collect();
         (remote, deleted, agreed)
     };
+
+    // A memory folder that has gone is not a folder emptied by hand: its
+    // disk may not be attached, or it was moved or restored. Taking that
+    // for deletes would remove the memory from every other device.
+    if !agreed.is_empty() && !dir.is_dir() {
+        return Err(CordeliaError::Internal(format!(
+            "{} is gone (moved, removed, or its disk is not attached). Nothing was deleted \
+             on your other devices. Bring it back; or unmap it, and map it again to fetch \
+             the memory here",
+            dir.display()
+        )));
+    }
 
     let mut keys: Vec<&String> = local
         .keys()
@@ -608,6 +1069,7 @@ mod tests {
             push_tx: None,
             announce_tx: None,
             peers: Default::default(),
+            sync_control: Default::default(),
         }
     }
 

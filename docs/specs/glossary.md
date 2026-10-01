@@ -74,7 +74,7 @@
 See the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4 for each.
 
 - **Device**: One machine running a node, with its own Ed25519 key. A person's devices are members of that person's channels.
-- **Personal channel**: A `grp_` channel per person. Its member list is the device roster; it also holds home memory (keys `home/<file>`) and the map from project to channel (keys `project/<host/owner/repo>`). Replaces the derived `__personal` channel.
+- **Personal channel**: A `grp_` channel per person. Its member list is the device roster; it also holds the map from name to channel (keys `project/<name>`), join requests (`join/<channel>/<device>`), and each device's list of the names it syncs (`syncing/<device>`). Before 0.2.0-alpha.3 it also held home memory (keys `home/<file>`). Replaces the derived `__personal` channel.
 - **Inbox channel**: `inbox_` + hex(SHA-256("cordelia:inbox:v1:" || ed25519_pk)). Where a node receives sealed channel states.
 - **Channel state**: A channel's key ring, slot key, members and epoch, sealed to one member with ECIES and posted in that member's inbox as an item of type `invite`.
 - **Trust**: The keys a node accepts channel states from: those accepted with `cordelia accept`, and the members of its personal channel.
@@ -85,7 +85,8 @@ See the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4 for 
 - **Conflict**: Two revisions of a key with the same rev from different authors. The higher content hash wins; the device whose version lost keeps it as `<file>.conflict-<tag>.md`, where the tag is the first 8 hex digits of its key.
 - **Outbox**: Items this node wrote that no relay has acknowledged yet.
 - **Adapter**: The part of the node that maps one agent's memory files onto channels. v1 has one, for Claude Code (`cordelia sync claude`).
-- **Project channel**: A `grp_` channel per git project, identified by its normalised remote. A device joins it only once it has the project locally.
+- **Mapping**: A declaration, on one device, that Claude's memory for a folder syncs under a name (`cordelia sync map`). The name is what a person's devices share: a git project's normalised remote, a name given to a folder, or `~` for home memory.
+- **Project channel**: A `grp_` channel per synced name. A device joins it only once it maps that name.
 - **Relay (v1)**: Stores and forwards ciphertext, verifies every item's signature before storing it, and holds no keys. v1 relays do not evict.
 
 ---

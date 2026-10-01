@@ -50,11 +50,12 @@ laptop$  cordelia add-device cordelia_pk1... --name desktop
            cordelia accept cordelia_pk1...   (copy this back)
                                         desktop$ cordelia accept cordelia_pk1...
 laptop$  cordelia sync claude           desktop$ cordelia sync claude
+laptop$  cordelia sync map ~/Work/app   desktop$ cordelia sync map ~/code/app
 ```
 
 That is one key copied in each direction. Each machine has now been told by you, in person, which key belongs to the other, so each can authenticate the other (4.1).
 
-After that, a memory Claude Code writes on one machine appears on the other. This includes memories written while the other machine was off; they arrive when it next connects.
+After that, a memory Claude Code writes for that project on one machine appears on the other. This includes memories written while the other machine was off; they arrive when it next connects. Only what is mapped syncs (4.5).
 
 v1.1 adds a person the same way, with a scope: `cordelia share <project> <key>` shares one project's memory, not everything.
 
@@ -86,7 +87,7 @@ Membership changes, key rotations and invites are all the same operation: the ow
 
 Without a trust check, anyone who knows your public key could add you to a channel. Its content would land in Claude's memory folder, which your agent reads as its own notes.
 
-**Personal channel.** A `grp_` channel that holds the device roster, home memory and the map from project to channel (4.5). A node creates one on first use, and a device that accepts a `device` invite adopts the inviter's personal channel as its own.
+**Personal channel.** A `grp_` channel that holds the device roster and the map from name to channel (4.5). Until 0.2.0-alpha.3 it also held home memory. A node creates one on first use, and a device that accepts a `device` invite adopts the inviter's personal channel as its own.
 
 **Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. **As built:** since devices join only the projects they have (4.5), the remover may not be in every project channel. Each device that sees a device dropped from the personal channel therefore removes it from the project channels the remover is not in. Of a channel's remaining owners, the one with the lowest key acts, so two devices never rotate the same channel at once. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
 
@@ -125,12 +126,16 @@ A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept 
 
 ### 4.5 `cordelia sync claude`: the Claude Code adapter
 
-It runs inside the node binary: one install, and the node stays the encryption boundary ([2026-03-10 decision](2026-03-10-phase1-design-decisions.md) §1). Every 5 seconds it scans `~/.claude/projects/*/memory/`:
+It runs inside the node binary: one install, and the node stays the encryption boundary ([2026-03-10 decision](2026-03-10-phase1-design-decisions.md) §1). Every 5 seconds, and as soon as a setting changes, it syncs memory folders under `~/.claude/projects/*/memory/`:
 
-- **Project identity comes from the git remote, not the path.** Claude Code names memory folders after the working directory, so paths never match across machines. The adapter reads the `cwd` recorded in the folder's session transcripts and normalises that repository's `origin` remote to `host/owner/repo`.
-- **Home memory** (the folder for your home directory) goes to your personal channel, under keys `home/<file>`. Other folders that aren't git repositories are not synced, and `cordelia sync status` lists them.
-- **Each project gets its own `grp_` channel,** so sharing it later is just adding a member. The personal channel maps `project/<host/owner/repo>` to the project's channel.
-- **As built: devices join only the projects they have.** A project channel starts with its creator as the only member. Another device that has the project locally posts a join request (`join/<channel>/<device>`) in the personal channel; an owner grants it, and only for the device named in it. So each device holds keys only for the projects it works on. `--exclude <pattern>` keeps projects off a device, and `--no-home` keeps home memory off it.
+- **What syncs is declared (changed 2026-10-01).** `cordelia sync map <folder> [name]` says that Claude's memory for a folder syncs under a name, and nothing else syncs. On a new machine `cordelia sync claude` therefore syncs nothing: it lists what it found, with the command that maps each. As first built it synced home memory and every git project it found; that is now `--all`, which also covers what turns up later. An install from before this change keeps syncing everything it finds, because a scope is only ever narrowed by its owner. Running `cordelia sync claude` again keeps the stored settings (it used to put the directory back to the default), as does turning sync off and on, and it says what it changed. Every change of scope, mapping or exclusion is logged. `cordelia sync status` shows each folder with its name, when it last sent and received, and any error; `cordelia status --json` adds its channel.
+- **A name, not a path, is what devices share.** Claude Code names folders after the working directory, so paths never match across machines. A git project's name defaults to its `origin` remote, normalised to `host/owner/repo`. Any other folder is given a name, and a name can be given to a project too. Home memory is the name `~`, and mapping the home directory has to be asked for (`--home`). `cordelia sync map` refuses a folder outside the home directory, a second name for a mapped folder, a second mapped folder for a name, and two folders that Claude Code keeps in one (it names its folder after the path with every other character turned into a dash).
+- **One memory per repository.** Claude Code keeps a repository's memory in the folder of its main working tree, shared by its subdirectories and worktrees, so that is the folder `cordelia sync map` maps, whichever folder of the repository it is given. A mapping syncs the Claude Code folder named after its directory and no other. It is never matched by reading session transcripts, so it cannot come to sync a different folder than the one declared.
+- **Each name gets its own `grp_` channel,** so sharing it later is just adding a member. The personal channel maps `project/<name>` to the channel.
+- **Home memory has its own channel (changed 2026-10-01).** As first built it went to the personal channel, under keys `home/<file>`, which every device of the person holds. It now syncs like any other name, in a channel joined only by the devices that map it.
+- **As built: devices join only what they map.** A channel starts with its creator as the only member. Another device that maps the same name posts a join request (`join/<channel>/<device>`) in the personal channel; an owner grants it, and only for the device named in it. So each device holds keys only for what it syncs. Each device also lists the names it syncs (`syncing/<device>`) in the personal channel, read only from the device a list is about, so `cordelia sync status` can say what the person's other devices sync.
+- **A folder that stops syncing starts afresh (2026-10-01).** Unmapping a folder, turning home memory or sync off, or narrowing the scope forgets what the folder had agreed with its channel. If it syncs again it merges with the channel as a new folder would, so files it lost in between are fetched back and never sent as deletes. An unmapped folder also stays out of `--all` until it is mapped again. A mapped folder whose memory directory has gone missing is reported and nothing is deleted elsewhere. Unmapping does not yet take the device out of the channel (section 9).
+- **With `--all`,** the adapter reads the `cwd` recorded in each folder's session transcripts to find its repository. A folder Claude Code named is believed only about the directory it is named after, because a session can move to another directory and a transcript can start there. `cordelia sync exclude <pattern>` keeps projects off a device and `cordelia sync home off` keeps home memory off it. Folders that are neither home nor a git project with a remote need a name, and `cordelia sync status` lists them. Two clones of one repository on a device both sync under its name, so their memory merges.
 - **`MEMORY.md` is merged, not replaced.** It's an index of one-line pointers, so the merge is the union of lines, minus lines pointing at deleted files.
 - **Safety.** Only plain file names are synced, writes are atomic, a file edited during a cycle is left for the next one, and files over 128 KB are reported rather than synced.
 
@@ -175,8 +180,8 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 | Signature verification before storing, on every node | **Built** | 4.3 |
 | Replaceable items (`slot`, `rev`) | **Built** | 4.3 |
 | Tombstone-as-revision, delete authorisation fix | **Built** | 4.4 |
-| `cordelia sync claude` adapter, per-project channels | **Built** | 4.5 |
-| Two relays and DNS | **Image and configs built** | 4.6; deployment is next |
+| `cordelia sync claude` adapter, per-project channels, declared mappings | **Built** | 4.5 |
+| Two relays and DNS | **Running** | 4.6; hosted by us for the alpha |
 | Release: macOS and Linux binaries | **Built** | `release.yml`; Homebrew tap and AUR package to follow |
 | Sharing with a teammate (`share`) | **v1.1** | Same mechanism as 4.1 |
 | Second agent adapter | **v1.1+** | Proves portability |
@@ -197,6 +202,13 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 - A project channel that the removing device is not in is rotated by its remaining owner with the lowest key (4.1). If that device is offline, the rotation waits until it next runs, and until then the removed device can still read what others write to that project.
 - Relays keep what they store: the retention limit (30 days was proposed) is not implemented, and the storage cap (`max_storage_bytes`, 1 GiB by default) is declared but not enforced. Both must ship before any public announcement, because every node dials our relays by default.
 - The older key-distribution endpoints (`dm`, `group/invite`, `group/remove`, `rotate-psk`) still write key envelopes into the channel itself, which never reach other nodes. v1 doesn't use them; they will move onto sealed channel states or be removed.
+- Home memory synced before 0.2.0-alpha.3 stays in the personal channel as items no version reads any more. A device added later receives them with the rest of that channel, whether or not it maps home memory. Removing them safely needs every device of the person upgraded first (an older version takes a delete there as a delete of its own files), so it is not done yet.
+- With `--all`, a folder is found through its session transcripts, which Claude Code deletes after 30 days by default. A project not used for that long stops syncing on that device until it is used again. Mapped folders are not affected.
+- The adapter follows Claude Code's default memory location. It does not follow `autoMemoryDirectory` or `CLAUDE_CODE_PROJECT_DIR_NAME`, and a folder whose path is longer than 200 characters cannot be mapped yet, because Claude Code adds a hash to its folder name.
+- A name stays in the personal channel's map after the last device stops syncing it, and its channel and items stay on the relays.
+- Unmapping a folder stops the sync on that device and leaves it a member of the name's channel: it keeps the key, and its node keeps receiving the encrypted items, until the device is removed. Leaving a channel, with a key rotation, is not built yet.
+- Home memory does not sync between a device on 0.2.0-alpha.2 and one on 0.2.0-alpha.3, because the two keep it in different channels. Upgrade every device.
+- Where Claude Code keeps memory for a submodule, or for a worktree of a bare repository, is not confirmed. `cordelia sync map` says so when it maps one. Nor is its folder name confirmed for a path with accented characters on macOS.
 - The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
 
 ## 10. Done means
@@ -213,5 +225,5 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 
 1. **Clean up the public surface** so it matches this decision: whitepaper v3 and [`docs/vision.md`](../vision.md), seeddrill.ai, and this archive. Done.
 2. **Build**, each step its own PR: the release pipeline (#12); inbox, trust and devices (#13); replaceable items and verified storage (#14); deletes (#15); the adapter (#16); the relays (#18); per-project channels (#20). Done.
-3. **Deploy the relays,** then tag the first pre-release, `v0.2.0-alpha.1`.
+3. **Deploy the relays,** then tag the first pre-release, `v0.2.0-alpha.1`. Done.
 4. **Dogfood** on our own machines until section 10 holds. Then release publicly.

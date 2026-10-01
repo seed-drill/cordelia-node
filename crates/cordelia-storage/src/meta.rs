@@ -10,6 +10,10 @@ pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
 /// Claude Code directory to sync; sync is off when absent.
 pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 
+/// The directory sync last ran with, kept while sync is off so that
+/// turning it on again does not fall back to the default.
+pub const SYNC_CLAUDE_LAST_DIR: &str = "sync.claude.last_dir";
+
 /// JSON report of the last sync cycle.
 pub const SYNC_CLAUDE_REPORT: &str = "sync.claude.report";
 
@@ -19,12 +23,24 @@ pub const SYNC_CLAUDE_EXCLUDE: &str = "sync.claude.exclude";
 /// `"off"` when this device does not sync home-folder memory.
 pub const SYNC_CLAUDE_HOME: &str = "sync.claude.home";
 
+/// `"on"` when everything found syncs (home and git projects, now and
+/// later); `"off"` when only declared mappings sync.
+pub const SYNC_CLAUDE_ALL: &str = "sync.claude.all";
+
+/// JSON array of declared mappings, `[{"folder": "/abs/path", "name": "..."}]`:
+/// Claude's memory for sessions started in `folder` syncs under `name`.
+pub const SYNC_CLAUDE_MAPPINGS: &str = "sync.claude.mappings";
+
 /// Hex secret this node hashes peer keys with for its usage counts
 /// (`crate::usage`). Never leaves the node.
 pub const USAGE_SIGHTING_SECRET: &str = "usage.sighting_secret";
 
 /// RFC 3339 time of the last sync cycle that sent or received a memory.
 pub const SYNC_CLAUDE_LAST_CHANGE: &str = "sync.claude.last_change";
+
+/// JSON object, per synced name, of when this device last received and
+/// last sent a memory under it: `{"<name>": {"pulled": "...", "published": "..."}}`.
+pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {

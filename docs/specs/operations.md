@@ -10,7 +10,7 @@
 > **v1 status (2026-09-30).** Device pairing (§3) is replaced by
 > `cordelia add-device` and `cordelia accept` (see the README). The CLI (§4)
 > adds `id`, `add-device`, `accept`, `remove-device`, `devices`, `invites` and
-> `sync claude | off | status`. The install script pins a release with
+> `sync claude | map | unmap | off | status`. The install script pins a release with
 > `CORDELIA_VERSION`. Relays are run from [`deploy/relay/`](../../deploy/relay/)
 > ([decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.6).
 

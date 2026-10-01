@@ -30,6 +30,7 @@ fn test_state() -> web::Data<AppState> {
         push_tx: None,
         announce_tx: None,
         peers: Default::default(),
+        sync_control: Default::default(),
     })
 }
 
@@ -1092,4 +1093,298 @@ async fn test_delete_item_only_own_items_in_named_channel() {
     // My item in its own channel: deleted.
     let resp = test::call_service(&app, delete("delete-b", &mine_in_b)).await;
     assert_eq!(resp.status(), 200);
+}
+
+// ── Sync settings (decision 2026-09-30 §4.5) ─────────────────────────
+
+/// POST to a sync endpoint; returns the status code and the JSON body (or
+/// the error text).
+macro_rules! sync_post {
+    ($app:expr, $path:expr, $body:expr) => {{
+        let req = test::TestRequest::post()
+            .uri($path)
+            .insert_header(auth_header())
+            .set_json($body)
+            .to_request();
+        let resp = test::call_service($app, req).await;
+        let status = resp.status().as_u16();
+        let bytes = test::read_body(resp).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes).into_owned()));
+        (status, body)
+    }};
+}
+
+/// The home directory mappings are checked against: the test runner's.
+fn real_home() -> String {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    home.canonicalize().unwrap_or(home).display().to_string()
+}
+
+#[actix_web::test]
+async fn test_sync_turned_on_syncs_nothing_until_mapped() {
+    let home = real_home();
+    let app_dir = format!("{home}/code/app");
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    // Mapping needs sync to be on.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": app_dir, "name": "app" })
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("sync is off"), "{body}");
+
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "dir": "/srv/claude" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["all"], false, "only mapped folders by default");
+    assert_eq!(body["mappings"], json!([]));
+
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": app_dir, "name": "github.com/o/app" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body["mappings"],
+        json!([{ "folder": app_dir, "name": "github.com/o/app" }])
+    );
+
+    // The same again changes nothing; a second name for the folder, or a
+    // second folder for the name, is refused.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": format!("{app_dir}/"), "name": "github.com/o/app" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
+    let other_dir = format!("{home}/code/b");
+    for (folder, name) in [(&app_dir, "other"), (&other_dir, "github.com/o/app")] {
+        let (code, body) = sync_post!(
+            &app,
+            "/api/v1/sync/map",
+            json!({ "folder": folder, "name": name })
+        );
+        assert_eq!(code, 400, "{body}");
+        assert!(body.to_string().contains("already mapped"), "{body}");
+    }
+
+    // A folder outside the home directory is refused.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": "/srv/code/app", "name": "srv-app" })
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("outside the home"), "{body}");
+
+    // Unmap by name or by folder; unmapping what is not mapped is an error.
+    let (code, body) = sync_post!(&app, "/api/v1/sync/unmap", json!({ "folder": "nothing" }));
+    assert_eq!(code, 400, "{body}");
+    let generation = body["generation"].as_u64();
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/unmap",
+        json!({ "folder": "github.com/o/app" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"], json!([]));
+    // An unmapped folder is excluded, so a device that syncs everything it
+    // finds does not pick it up again under another name. Mapping it again
+    // ends the exclusion.
+    assert_eq!(body["exclude"], json!([app_dir]));
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": app_dir, "name": "app" })
+    );
+    assert_eq!(body["exclude"], json!([]), "{body}");
+    let (code, body) = sync_post!(&app, "/api/v1/sync/unmap", json!({ "folder": app_dir }));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"], json!([]));
+    // Every change moves the generation on, so a caller can tell a report
+    // made before its change from one made after.
+    assert!(body["generation"].as_u64() > generation, "{body}");
+
+    // Two folders that Claude Code keeps in one cannot both be mapped.
+    let (_, _) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": format!("{home}/code/my-app"), "name": "one" })
+    );
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": format!("{home}/code/my.app"), "name": "two" })
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("in one folder"), "{body}");
+}
+
+#[actix_web::test]
+async fn test_sync_settings_survive_being_turned_on_again() {
+    let home = real_home();
+    let app_dir = format!("{home}/code/app");
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({
+            "enabled": true,
+            "dir": "/srv/claude",
+            "all": true,
+            "home": false,
+            "exclude": ["github.com/Client-Co/*", "github.com/o/secret.git"],
+        })
+    );
+    assert_eq!(code, 200, "{body}");
+    let (_, _) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": app_dir, "name": "app" })
+    );
+
+    // Turning it on again, with nothing said, keeps every setting.
+    let (code, body) = sync_post!(&app, "/api/v1/sync/claude", json!({ "enabled": true }));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["dir"], "/srv/claude");
+    assert_eq!(body["all"], true);
+    assert_eq!(body["home"], false);
+    assert_eq!(
+        body["exclude"],
+        json!(["github.com/client-co/*", "github.com/o/secret"])
+    );
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
+
+    // One setting changes on its own.
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "all": false })
+    );
+    assert_eq!(body["all"], false);
+    assert_eq!(body["home"], false);
+    assert_eq!(body["dir"], "/srv/claude");
+
+    // Off and on again, with nothing said: still the same, the directory
+    // included.
+    let (_, body) = sync_post!(&app, "/api/v1/sync/claude", json!({ "enabled": false }));
+    assert_eq!(body["enabled"], false);
+    assert!(body["dir"].is_null(), "{body}");
+    let (_, body) = sync_post!(&app, "/api/v1/sync/claude", json!({ "enabled": true }));
+    assert_eq!(body["dir"], "/srv/claude", "{body}");
+    assert_eq!(body["all"], false);
+    assert_eq!(body["home"], false);
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
+
+    // Home memory turned off is off however it was on: not found by
+    // `all`, and no longer mapped. (The node's own home directory is the
+    // only folder that maps as `~`.)
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": home, "name": "~", "home": true })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        body["home"], true,
+        "mapping home memory turns it on: {body}"
+    );
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": home, "name": "everything" })
+    );
+    assert_eq!(code, 400, "home memory only when asked for: {body}");
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "home": false })
+    );
+    assert_eq!(
+        body["mappings"],
+        json!([{ "folder": app_dir, "name": "app" }])
+    );
+
+    // Reset puts the scope, home and exclude settings back to the
+    // defaults. Mappings stay: they are removed one at a time.
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "all": true })
+    );
+    assert_eq!(body["all"], true);
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "dir": "/srv/claude", "reset": true })
+    );
+    assert_eq!(body["home"], true);
+    assert_eq!(body["exclude"], json!([]));
+    assert_eq!(body["all"], false);
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
+    assert_eq!(body["dir"], "/srv/claude");
+
+    // Reset with no directory named goes back to the default one.
+    let (_, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "reset": true })
+    );
+    assert_eq!(
+        body["dir"],
+        format!("{}/.claude", std::env::var("HOME").unwrap())
+    );
+}
+
+#[actix_web::test]
+async fn test_an_install_from_before_mappings_keeps_its_scope() {
+    use cordelia_storage::meta;
+    let state = test_state();
+    let get = |key: &str| {
+        let db = state.db.lock().unwrap();
+        meta::get(&db, key).unwrap()
+    };
+
+    // Sync was never on: nothing to keep.
+    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
+    assert_eq!(get(meta::SYNC_CLAUDE_ALL), None);
+
+    // On, from before the scope was stored: everything found, as before.
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_DIR, "/home/x/.claude").unwrap();
+    }
+    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
+    assert_eq!(get(meta::SYNC_CLAUDE_ALL).as_deref(), Some("on"));
+
+    // A scope its owner chose is never widened.
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_ALL, "off").unwrap();
+    }
+    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
+    assert_eq!(get(meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
 }

@@ -52,6 +52,36 @@ pub struct AppState {
     pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// The peers this node is connected to, refreshed on each governor tick.
     pub peers: std::sync::RwLock<Vec<PeerSnapshot>>,
+    /// Tells the sync adapter when its settings change.
+    pub sync_control: SyncControl,
+}
+
+/// How the settings handlers and the sync adapter's loop keep in step.
+#[derive(Default)]
+pub struct SyncControl {
+    wake: tokio::sync::Notify,
+    generation: AtomicU64,
+}
+
+impl SyncControl {
+    /// A setting changed: count it, and wake the adapter so that the change
+    /// takes effect now rather than at its next cycle.
+    pub fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// How many times the settings have changed since the node started. A
+    /// sync report says which generation it was made under, so a reader
+    /// can tell a report from before a change from one after it.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Resolves when a setting has changed.
+    pub async fn woken(&self) {
+        self.wake.notified().await;
+    }
 }
 
 /// One connected peer, as `cordelia peers` shows it.

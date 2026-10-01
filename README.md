@@ -43,20 +43,40 @@ desktop$ cordelia add-device cordelia_pk1... --name laptop
 laptop$  cordelia accept cordelia_pk1...
 ```
 
-Then sync Claude Code's memory on both:
+Then turn on sync on both, and say what to sync:
 
 ```bash
-cordelia sync claude       # home memory and every git project in ~/.claude
-cordelia sync status       # what syncs, what is waiting, what does not
+cordelia sync claude                  # on: lists what it found, syncs nothing yet
+cordelia sync map ~/Work/my-project   # a git project, named by its remote
+cordelia sync map ~/notes lab-notes   # any other folder in your home directory, under a name you choose
+cordelia sync map ~ --home            # home memory
+cordelia sync status                  # what syncs, what was found, what your other devices sync
 ```
 
-A device joins a project's channel only once it has the project locally, so
-it holds keys only for the projects it works on. Per device:
-`cordelia sync claude --exclude github.com/client-co/*` (never sync those
-projects from this machine) and `--no-home` (leave home memory off it).
+Only what you map syncs. The name is what your devices share: map the same
+name on each device and Claude's memory for it stays in step. A git project
+is named by its remote (`github.com/owner/repo`), so the same clone at
+different paths on two machines needs no name; any other folder needs one.
+Claude Code keeps one memory per repository, shared by its folders and
+worktrees, so mapping any folder of a repository maps the repository.
 
-To change one setting later: `cordelia sync home off` (or `on`),
-`cordelia sync exclude <project>` and `cordelia sync include <project>`.
+A device joins a name's channel only when it maps that name. A device that
+has never mapped a name holds neither its memory nor its key, and home memory
+is the same.
+
+To sync everything Claude Code has memory for, now and later (home memory and
+every git project found), use `cordelia sync claude --all`. With `--all`,
+`cordelia sync exclude github.com/client-co/*` keeps projects off this
+machine, and `cordelia sync home off` keeps home memory off it.
+`cordelia sync claude --mapped-only` goes back to mapped folders only.
+
+Running `cordelia sync claude` again changes nothing; it keeps your settings,
+and says so. `cordelia sync unmap <folder or name>` stops syncing a folder
+from this device and leaves its files where they are. The folder then stays
+out, even with `--all`, until you map it again; mapping it again merges it
+with what your other devices have, and deletes nothing. The device stays a
+member of the name's channel (its node still receives the encrypted items)
+until you remove the device; leaving a channel is not built yet.
 
 Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device everywhere and rotates keys),
@@ -72,9 +92,10 @@ memory sync. For status bars:
   It prints nothing on a machine where Cordelia is not set up.
 - `cordelia status --json` gives the same `state` (`synced`, `syncing`,
   `offline`, `attention`, `off`, `stopped`) and `summary`, with everything a
-  panel needs: the connected relays, your devices, each project and its
-  settings, items waiting to reach a relay, last change, and the conflict
-  files waiting to be merged.
+  panel or an agent needs: the connected relays, your devices, each folder
+  that syncs and its name, what was found and is not syncing, what your
+  other devices sync, items waiting to reach a relay, last change, and the
+  conflict files waiting to be merged.
 
 To show it in Claude Code, add this to `~/.claude/settings.json` (use the full
 path, e.g. `~/.cordelia/bin/cordelia`, if `cordelia` is not on the `PATH`
