@@ -145,7 +145,9 @@ sync (`/api/v1/sync/*`).
 ## Security
 
 Relays and relay operators see channel IDs, device public keys, and item sizes,
-types and timing; never content, file names, member lists, or keys. See
+types and timing; never content, file names, member lists, or keys. The node
+on your machine dials out to the relays (UDP 9474) and listens only on its
+local API (127.0.0.1): nothing on a network you join can connect to it. See
 [WHITEPAPER.md §4](WHITEPAPER.md#4-security-model) for the full model and its
 limits. To report a vulnerability privately, email hello@seeddrill.ai.
 

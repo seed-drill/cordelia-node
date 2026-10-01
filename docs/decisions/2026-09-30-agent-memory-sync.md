@@ -138,7 +138,7 @@ Other agents come later as further adapters that map their own memory locations 
 
 ### 4.6 Two relays
 
-Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. We run two, each also serving as a bootnode, so that losing one doesn't stop sync:
+Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. **As built (0.2.0-alpha.3):** a personal node opens no listening socket at all. It dials out from a port the system picks, where earlier versions bound UDP 9474 and turned inbound peers away after the handshake. `listen = true` under `[network]` keeps a listener, for a node that others dial directly. We run two relays, each also serving as a bootnode, so that losing one doesn't stop sync:
 
 - **`relay1`** and **`relay2`** are Docker containers we operate, from the image and guide in [`deploy/relay/`](../../deploy/relay/): a pinned release checked against its sha256, run unprivileged on a read-only filesystem. **Changed 2026-09-30:** for the alpha we host both ourselves. Before any public announcement, the public relays move to a cloud provider (the Fly.io config is ready for that), and the storage cap and retention ship (section 9).
 - **DNS:** `relay1.cordelia.seeddrill.ai` and `relay2.cordelia.seeddrill.ai`, UDP 9474. New nodes list both (`FALLBACK_PEERS`), and anyone can add their own. **As built:** nodes keep the names, not the addresses. They resolve them again while running and redial whenever they have no relay, so a node started before its network was up, or a relay whose address changed, is still reached.

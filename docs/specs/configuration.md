@@ -9,6 +9,9 @@
 > **v1 status (2026-09-30).** The default bootnodes (`FALLBACK_PEERS`) are
 > the two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`. QUIC binds
 > to the host part of `listen_addr` (a host name is resolved) on `p2p_port`.
+> A personal node does not listen: it dials out from a port the system picks
+> on that host address, and `p2p_port` is unused unless `listen` is set
+> (§2.2).
 > The sync adapter's settings are not in this file: `cordelia sync claude`
 > stores them in the node's database. The `[memory]` and `[search]` sections
 > (§2.7, §2.8) belong to archived specs ([`docs/archive/`](../archive/README.md)), and the
@@ -63,6 +66,7 @@ P2P networking: listen address, node role, push policy, bootnode addresses, DNS 
 | Parameter | Type | Default | Valid Values | Description | Source |
 |-----------|------|---------|--------------|-------------|--------|
 | `listen_addr` | string | `"0.0.0.0:9474"` | `<ip>:<port>` | P2P listen address (UDP, QUIC). | operations.md SS5.1, network-protocol.md SS12.2 |
+| `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket (it still listens if it has `trusted_peers`). Set `true` on a personal node that others dial directly, such as a swarm lead. | decision 2026-09-30 §4.6 |
 | `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"`, `"keeper"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. | network-protocol.md SS8, SS12.2 |
 | `push_policy` | string | `"subscribers_only"` | `"subscribers_only"`, `"pull_only"` | Push behaviour for personal nodes. `subscribers_only`: push items to hot peers subscribed to the channel. `pull_only`: never push; peers must pull via Item-Sync. Trade-off: `pull_only` increases latency (bounded by `replication.sync_interval_realtime_secs`). | network-protocol.md SS8.1.1, SS12.2 |
 | `dns_discovery` | string | `"_cordelia._udp.seeddrill.ai"` | DNS SRV name | SRV record for bootnode discovery. Transport is QUIC (UDP), so the SRV record uses `_udp` per network-protocol.md SS10.2. | operations.md SS5.1 (note: corrected from `_tcp` to `_udp` per network-protocol.md SS10.2) |
