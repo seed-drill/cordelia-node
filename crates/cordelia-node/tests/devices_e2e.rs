@@ -543,6 +543,56 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     );
 }
 
+/// A device with a great many small entries to send is never the one its
+/// relay refuses. A relay counts each entry as its ciphertext and what an
+/// entry takes beyond it, and a device paces itself by the same count: if
+/// it counted ciphertext alone, it would send several times what the relay
+/// allows a connection, and be refused and then cut off.
+#[test]
+fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
+    const ENTRIES: u64 = 1100;
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
+    let relay_holds = |relay: &Node| -> u64 {
+        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"]))
+            .unwrap()["items_stored"]
+            .as_u64()
+            .unwrap()
+    };
+    let before = relay_holds(&relay);
+
+    // About a kilobyte each: a megabyte of content, which costs two.
+    let text = "x".repeat(900);
+    for n in 0..ENTRIES {
+        a.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "content": { "n": n, "text": text } }),
+        );
+    }
+    wait_for("the relay holds every entry", &[&relay, &a], 240, || {
+        (relay_holds(&relay) >= before + ENTRIES).then_some(())
+    });
+    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
+    for refusal in ["push over the byte allowance", "rate limit exceeded"] {
+        assert!(
+            !log.contains(refusal),
+            "the relay refused its device: {refusal}"
+        );
+    }
+}
+
 /// A channel holds more than fits in one message. A device that fetches it
 /// still gets all of it: when a relay cannot answer a request for a whole
 /// page of entries in one message, the device asks for fewer at a time.

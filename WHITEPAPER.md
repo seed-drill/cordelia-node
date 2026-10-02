@@ -363,7 +363,7 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | Outbox flush interval | 2 s | `OUTBOX_FLUSH_INTERVAL_SECS` |
 | Relay write limit per connection | 36 pushes and 2 MB / min | `WRITES_PER_PEER_PER_MINUTE`, `PUSH_BYTES_PER_PEER_PER_MINUTE` |
 | The same, for one address | 5 times a connection's | `MAX_CONNECTIONS_PER_IP` |
-| Largest entry, as it travels | 64 KB | `MAX_ITEM_BYTES` |
+| Largest entry, as it travels | 64 KB of ciphertext and at most 1 KB more | `MAX_ITEM_BYTES`, `ENTRY_OVERHEAD_BYTES` |
 | Largest synced memory file | what fits in one entry | `cordelia-sync` |
 | One channel at a relay | 16 MB | `MAX_CHANNEL_BYTES_AT_RELAY` |
 | A relay in total | 1 GiB unless its operator sets it | `max_storage_bytes` |
