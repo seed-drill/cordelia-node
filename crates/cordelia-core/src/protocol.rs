@@ -319,6 +319,72 @@ pub const MAX_ITEM_BYTES: usize = 65_536;
 /// AES-256-GCM. An entry's content can be at most MAX_ITEM_BYTES less this.
 pub const ITEM_SEAL_OVERHEAD_BYTES: usize = 12 + 16;
 
+/// The most an entry takes beyond its ciphertext, as it travels and where
+/// it is stored: its IDs, hash, author, signature, time and name, and its
+/// row and place in each index (parameter-rationale.md §4).
+///
+/// Every field of an entry has a size it must fit in (below), so this is a
+/// bound and not a guess. And every limit on bytes counts an entry as its
+/// ciphertext plus this ([`entry_cost`]): without it a thousand entries of
+/// three bytes would count as three kilobytes, and a limit on bytes would
+/// limit nothing that is small.
+pub const ENTRY_OVERHEAD_BYTES: usize = 1024;
+
+/// What one entry with `ciphertext` bytes of ciphertext counts as, against
+/// every limit on bytes: a relay's allowance for a connection and for an
+/// address, what one channel may hold at a relay, and what a device sends
+/// in one push and in one minute.
+pub const fn entry_cost(ciphertext: usize) -> u64 {
+    (ciphertext + ENTRY_OVERHEAD_BYTES) as u64
+}
+
+/// The most an entry's ID may be, in bytes. IDs are `ci_` and 26
+/// characters.
+pub const MAX_ITEM_ID_LEN: usize = 64;
+
+/// The most a channel's ID may be, in bytes. The longest kind is an inbox:
+/// `inbox_` and 64 characters.
+pub const MAX_CHANNEL_ID_LEN: usize = 96;
+
+/// The most an entry's type may be, in bytes (`memory`, `invite`, ...).
+pub const MAX_ITEM_TYPE_LEN: usize = 32;
+
+/// The most an entry's time may be, in bytes. An RFC 3339 time with
+/// nanoseconds and an offset is 35.
+pub const MAX_TIMESTAMP_LEN: usize = 40;
+
+// Checked at compile time: the fields of the largest entry, with what
+// encoding them adds (their names and lengths, 256 bytes), fit in the
+// overhead.
+const _: () = assert!(
+    2 * MAX_ITEM_ID_LEN      // the entry's ID, and its parent's
+        + MAX_CHANNEL_ID_LEN
+        + MAX_ITEM_TYPE_LEN
+        + MAX_TIMESTAMP_LEN
+        + 32 + 32 + 64 + 32  // hash, author, signature, name
+        + 3 * 9 + 2          // key version, revision, length; two flags
+        + 256
+        <= ENTRY_OVERHEAD_BYTES
+);
+
+/// Whether an entry's fields other than its ciphertext are each within the
+/// size they must fit in. With the limit on ciphertext this makes an entry
+/// one size at most, whatever it carries: MAX_ITEM_BYTES and
+/// ENTRY_OVERHEAD_BYTES. The other fields are of fixed size.
+pub fn entry_fields_fit(
+    item_id: &str,
+    channel_id: &str,
+    item_type: &str,
+    published_at: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    item_id.len() <= MAX_ITEM_ID_LEN
+        && channel_id.len() <= MAX_CHANNEL_ID_LEN
+        && item_type.len() <= MAX_ITEM_TYPE_LEN
+        && published_at.len() <= MAX_TIMESTAMP_LEN
+        && parent_id.is_none_or(|parent| parent.len() <= MAX_ITEM_ID_LEN)
+}
+
 /// Maximum items per batch fetch (demand-model.md §3.1).
 /// Primitive: 100 items per batch; balances throughput against memory
 /// pressure and response latency.
@@ -406,19 +472,20 @@ pub const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 2;
 /// Rationale: parameter-rationale.md §4.
 pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
 
-/// Most encrypted bytes in one outbox push: three entries of the largest
-/// size. Well below MAX_MESSAGE_BYTES, so that the message limit can come
-/// down to 256 KB once every node sends batches this small.
-pub const OUTBOX_BATCH_MAX_BYTES: usize = 3 * MAX_ITEM_BYTES;
+/// The most one outbox push may cost ([`entry_cost`]): three entries of
+/// the largest size. Well below MAX_MESSAGE_BYTES, so that the message
+/// limit can come down to 256 KB once every node sends batches this small.
+pub const OUTBOX_BATCH_MAX_BYTES: usize = 3 * (MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES);
 
-/// Most items in one outbox push, bounding per-item header overhead.
+/// Most items in one outbox push. The cost of a push bounds it sooner: a
+/// push of the smallest entries holds fewer than 200.
 pub const OUTBOX_BATCH_MAX_ITEMS: usize = 500;
 
 // Checked at compile time: one push per flush interval stays within a
 // relay's write limit, and a full batch plus framing fits in one message.
 const _: () = assert!(OUTBOX_FLUSH_INTERVAL_SECS * WRITES_PER_PEER_PER_MINUTE as u64 >= 60);
 const _: () = assert!(OUTBOX_BATCH_MAX_BYTES + 128 * 1024 <= MAX_MESSAGE_BYTES as usize);
-const _: () = assert!(MAX_ITEM_BYTES <= OUTBOX_BATCH_MAX_BYTES);
+const _: () = assert!(MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES <= OUTBOX_BATCH_MAX_BYTES);
 const _: () = assert!(BOOTNODE_RESOLVE_RETRY_SECS < BOOTNODE_RESOLVE_INTERVAL_SECS);
 
 /// Write operations per channel per minute.
@@ -483,10 +550,11 @@ pub const DEFAULT_SYNC_LIMIT: u32 = 100;
 /// one page could never be fetched: the same request failed for ever.
 pub const SYNC_PAGE_STEPS: [u32; 4] = [DEFAULT_SYNC_LIMIT, 14, 3, 1];
 
-// Checked at compile time: fourteen entries of the largest size, with a
-// kilobyte of header each, fit in one message; so do three old ones.
-const _: () = assert!(14 * (MAX_ITEM_BYTES + 1024) <= MAX_MESSAGE_BYTES as usize);
-const _: () = assert!(3 * (262_144 + 1024) <= MAX_MESSAGE_BYTES as usize);
+// Checked at compile time: fourteen entries of the largest size, with
+// what each takes beyond its ciphertext, fit in one message; so do three
+// old ones.
+const _: () = assert!(14 * (MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES) <= MAX_MESSAGE_BYTES as usize);
+const _: () = assert!(3 * (262_144 + ENTRY_OVERHEAD_BYTES) <= MAX_MESSAGE_BYTES as usize);
 
 /// Max items per fetch request (network-protocol.md §4.5).
 /// Primitive: 100 items; matches MAX_BATCH_SIZE.

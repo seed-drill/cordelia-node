@@ -152,8 +152,12 @@ impl Rates {
     /// no connection and no recent breach.
     pub fn prune(&mut self, connected: &[NodeId], open: &[std::net::IpAddr]) {
         self.by_peer.retain(|peer, _| connected.contains(peer));
-        self.by_address
-            .retain(|address, limiter| open.contains(address) || limiter.has_recent_breach());
+        // An address is forgotten only once it has nothing left in any
+        // window. Forgetting it as soon as its connections close would hand
+        // it a fresh allowance for the price of connecting again.
+        self.by_address.retain(|address, limiter| {
+            open.contains(address) || limiter.has_recent_breach() || !limiter.is_idle()
+        });
         let hour = std::time::Duration::from_secs(3600);
         self.new_channels
             .retain(|_, made| made.back().is_some_and(|at| at.elapsed() < hour));
@@ -246,7 +250,9 @@ impl<'a> RelayRoom<'a> {
     ) -> Result<(), &'static str> {
         use cordelia_network::messages::{REFUSED_FULL, REFUSED_STORAGE};
         use cordelia_storage::{channels, items};
-        let bytes = item.encrypted_blob.len() as u64;
+        // What the entry takes, not only its ciphertext: or a channel of
+        // small entries could hold any number of them.
+        let bytes = cordelia_core::protocol::entry_cost(item.encrypted_blob.len());
 
         if !channels::exists(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)? {
             // A channel the relay does not hold: only if there is room,
@@ -277,11 +283,11 @@ impl<'a> RelayRoom<'a> {
         // replaces (the same author's older revision of the same name).
         let held = match self.channel_bytes.get(&item.channel_id) {
             Some(held) => *held,
-            None => items::channel_bytes(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)?,
+            None => items::channel_cost(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)?,
         };
         let replaced = match &checked.slot {
             Some(slot) => {
-                items::author_slot_bytes(db, &item.channel_id, slot, &checked.author).unwrap_or(0)
+                items::author_slot_cost(db, &item.channel_id, slot, &checked.author).unwrap_or(0)
             }
             None => 0,
         };
@@ -342,7 +348,23 @@ pub fn check_item(item: &cordelia_network::messages::Item) -> Result<Checked, &'
     // One size for every entry, at every hop: a relay and a device both
     // refuse a larger one, whoever sends it.
     if item.encrypted_blob.len() > cordelia_core::protocol::MAX_ITEM_BYTES {
-        tracing::warn!(item = %item.item_id, bytes = item.encrypted_blob.len(), "item over the size limit");
+        tracing::warn!(
+            bytes = item.encrypted_blob.len(),
+            "item over the size limit"
+        );
+        return Err(REFUSED_TOO_LARGE);
+    }
+    // And one size means every field: an entry's ID, channel, type, time
+    // and parent each have a size they must fit in, or they could carry
+    // what its content may not.
+    if !cordelia_core::protocol::entry_fields_fit(
+        &item.item_id,
+        &item.channel_id,
+        &item.item_type,
+        &item.published_at,
+        item.parent_id.as_deref(),
+    ) {
+        tracing::warn!("item with a field over its size limit");
         return Err(REFUSED_TOO_LARGE);
     }
     if !cordelia_network::item_sync::verify_content_hash(item) {
@@ -486,9 +508,9 @@ struct OutboxRefusals {
 /// it in the last minute: nothing if there is not room for one entry of
 /// the largest size, else up to a full batch.
 fn outbox_room(sent: &mut cordelia_network::rate_limit::ByteCounter) -> Option<usize> {
-    use cordelia_core::protocol::{MAX_ITEM_BYTES, OUTBOX_BATCH_MAX_BYTES};
+    use cordelia_core::protocol::{MAX_ITEM_BYTES, OUTBOX_BATCH_MAX_BYTES, entry_cost};
     let room = sent.room();
-    (room >= MAX_ITEM_BYTES as u64).then(|| OUTBOX_BATCH_MAX_BYTES.min(room as usize))
+    (room >= entry_cost(MAX_ITEM_BYTES)).then(|| OUTBOX_BATCH_MAX_BYTES.min(room as usize))
 }
 
 struct RefusedItem {
@@ -664,7 +686,10 @@ fn flush_outbox(
     }
     *rotation = rotation.wrapping_add(1);
     {
-        let bytes: u64 = batch.iter().map(|i| i.encrypted_blob.len() as u64).sum();
+        let bytes: u64 = batch
+            .iter()
+            .map(|i| cordelia_core::protocol::entry_cost(i.encrypted_blob.len()))
+            .sum();
         let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sent) = held.sent.get_mut(&target) {
             // Recorded even if it is over (an entry from before the size
@@ -2030,6 +2055,9 @@ pub async fn p2p_loop(
                                                 max_bytes,
                                                 (!from_listed_relay).then_some((source_address, &*room_rates)),
                                             );
+                                            // One transaction for the page,
+                                            // as for a push.
+                                            let Ok(batch) = db.unchecked_transaction() else { break 'channels };
                                             for (item, checked) in items.iter().zip(checked) {
                                                 let room = is_relay_node.then_some(&mut room);
                                                 let outcome = checked.and_then(|checked| store_checked(&db, item, &checked, &role, &own, room));
@@ -2039,6 +2067,13 @@ pub async fn p2p_loop(
                                                         newly_stored_items.push(item.clone());
                                                     }
                                                 }
+                                            }
+                                            // A page that could not be stored
+                                            // is not passed: it is asked for
+                                            // again.
+                                            if let Err(e) = batch.commit() {
+                                                tracing::warn!(peer = %target, error = %e, "could not store a fetched page");
+                                                break 'channels;
                                             }
                                         }
                                         // Epidemic forwarding: relay queues sync-discovered items
@@ -2824,13 +2859,15 @@ async fn handle_inbound_push(
         _ => return None,
     };
 
-    // The bytes this push carries count against the connection's allowance
-    // and its address's. Over either, the push is refused whole: no answer,
-    // so a sender on any version keeps what it sent and offers it again.
+    // What this push carries counts against the connection's allowance
+    // and its address's: each entry as its ciphertext and what an entry
+    // takes beyond it, so that small entries cost what they take. Over
+    // either, the push is refused whole: no answer, so a sender on any
+    // version keeps what it sent and offers it again.
     let bytes: u64 = payload
         .items
         .iter()
-        .map(|item| item.encrypted_blob.len() as u64)
+        .map(|item| cordelia_core::protocol::entry_cost(item.encrypted_blob.len()))
         .sum();
     let over = limited
         .then(|| {
@@ -2870,6 +2907,16 @@ async fn handle_inbound_push(
         let mut stored = 0u32;
         let mut dedup = 0u32;
         let mut rejected = 0u32;
+        // One transaction for the push: one write to disk however many
+        // entries it carries. Stored one by one, a push of small entries
+        // held the database for seconds, and every other peer waited.
+        let batch = match db.unchecked_transaction() {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "could not begin storing a push");
+                return None;
+            }
+        };
         for (item, checked) in payload.items.iter().zip(checked) {
             let room = (node_role == "relay").then_some(&mut room);
             let outcome = checked
@@ -2888,6 +2935,12 @@ async fn handle_inbound_push(
                     });
                 }
             }
+        }
+        // Nothing is answered for a push that could not be stored: the
+        // sender keeps what it sent, and offers it again.
+        if let Err(e) = batch.commit() {
+            tracing::warn!(peer = %peer_id, error = %e, "could not store a push");
+            return None;
         }
         (stored, dedup, rejected)
     };
@@ -3094,14 +3147,13 @@ async fn handle_inbound_sync(
                     // one, end the stream now: the peer learns at once, and
                     // asks for fewer. (Reading them all first, only to find
                     // that they cannot be sent, cost a megabyte a request.)
-                    let bytes = cordelia_storage::items::total_bytes_by_ids(
+                    let bytes = cordelia_storage::items::total_cost_by_ids(
                         &db,
                         &current_req.channel_id,
                         &freq.item_ids,
                     )
                     .unwrap_or(0);
-                    let room = u64::from(cordelia_core::protocol::MAX_MESSAGE_BYTES)
-                        .saturating_sub(1024 * freq.item_ids.len() as u64);
+                    let room = u64::from(cordelia_core::protocol::MAX_MESSAGE_BYTES);
                     if bytes > room {
                         tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, asked = freq.item_ids.len(), bytes, "fetch does not fit in one message; ending the stream");
                         break;
@@ -3485,6 +3537,112 @@ mod tests {
         assert_eq!(store_item(&db, &largest, "relay", &[0x0E; 32]), Ok(true));
     }
 
+    /// An entry signed as it should be, with these values in the fields its
+    /// signature covers.
+    fn signed(
+        id: &cordelia_crypto::identity::NodeIdentity,
+        channel: &str,
+        item_id: &str,
+        published_at: &str,
+    ) -> cordelia_network::messages::Item {
+        let blob = vec![7u8; 16];
+        let hash = cordelia_crypto::sha256(&blob);
+        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+            &id.public_key(),
+            channel,
+            &hash,
+            false,
+            item_id,
+            1,
+            published_at,
+        )
+        .unwrap();
+        cordelia_network::messages::Item {
+            item_id: item_id.into(),
+            channel_id: channel.into(),
+            item_type: "memory".into(),
+            content_length: blob.len() as u32,
+            encrypted_blob: blob,
+            content_hash: hash.to_vec(),
+            author_id: id.public_key().to_vec(),
+            signature: id.sign(&cbor).to_vec(),
+            key_version: 1,
+            published_at: published_at.into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        }
+    }
+
+    /// T3. One size for every entry means every field of it. An entry whose
+    /// ID, channel, type, time or parent is over the size it must fit in is
+    /// refused by whoever is sent it, however small its content and though
+    /// it is signed as it should be. Otherwise a megabyte could travel as
+    /// an entry's type.
+    #[test]
+    fn an_entry_with_a_field_over_its_size_is_refused_by_whoever_is_sent_it() {
+        use cordelia_core::protocol::{
+            MAX_CHANNEL_ID_LEN, MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN, MAX_TIMESTAMP_LEN,
+        };
+        use cordelia_network::messages::{Item, REFUSED_TOO_LARGE};
+        const TIME: &str = "2026-10-02T00:00:00Z";
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let id = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let long = |len: usize| "x".repeat(len);
+
+        let over = [
+            (
+                "id",
+                signed(&id, A_CHANNEL, &long(MAX_ITEM_ID_LEN + 1), TIME),
+            ),
+            (
+                "channel",
+                signed(&id, &long(MAX_CHANNEL_ID_LEN + 1), "ci_channel", TIME),
+            ),
+            (
+                "time",
+                signed(&id, A_CHANNEL, "ci_time", &long(MAX_TIMESTAMP_LEN + 1)),
+            ),
+            (
+                "type",
+                Item {
+                    item_type: long(MAX_ITEM_TYPE_LEN + 1),
+                    ..signed(&id, A_CHANNEL, "ci_type", TIME)
+                },
+            ),
+            (
+                "parent",
+                Item {
+                    parent_id: Some(long(MAX_ITEM_ID_LEN + 1)),
+                    ..signed(&id, A_CHANNEL, "ci_parent", TIME)
+                },
+            ),
+        ];
+        for (field, item) in &over {
+            for role in ["relay", "personal"] {
+                assert_eq!(
+                    store_item(&db, item, role, &[0x0E; 32]),
+                    Err(REFUSED_TOO_LARGE),
+                    "{field}, {role}"
+                );
+            }
+        }
+
+        // An entry with each field at its largest is taken.
+        let largest = Item {
+            item_type: long(MAX_ITEM_TYPE_LEN),
+            parent_id: Some(long(MAX_ITEM_ID_LEN)),
+            ..signed(
+                &id,
+                &long(MAX_CHANNEL_ID_LEN),
+                &long(MAX_ITEM_ID_LEN),
+                &long(MAX_TIMESTAMP_LEN),
+            )
+        };
+        assert_eq!(store_item(&db, &largest, "relay", &[0x0E; 32]), Ok(true));
+    }
+
     /// T2. A device stores only what belongs in its own channels: an entry
     /// that a member of one of them wrote, and what is sent to its own
     /// inbox. A relay stores all of it.
@@ -3687,6 +3845,70 @@ mod tests {
         assert_eq!(relay_store(&db, &mut room, &channel(302), 100), Ok(true));
     }
 
+    /// T3. What one channel may hold at a relay counts each entry as its
+    /// ciphertext and what an entry takes beyond it. Entries of eight bytes
+    /// cannot be stored in a channel without end.
+    #[test]
+    fn small_entries_count_for_what_they_take_in_a_channel() {
+        use cordelia_core::protocol::entry_cost;
+        use cordelia_network::messages::REFUSED_FULL;
+        const SMALL: usize = 8;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let mut room = RelayRoom::new(u64::MAX, None);
+        // Room for a hundred of them, and half of one more.
+        room.max_channel_bytes = 100 * entry_cost(SMALL) + entry_cost(SMALL) / 2;
+        let small = channel(400);
+        for n in 0..100 {
+            assert_eq!(relay_store(&db, &mut room, &small, SMALL), Ok(true), "{n}");
+        }
+        assert_eq!(
+            relay_store(&db, &mut room, &small, SMALL),
+            Err(REFUSED_FULL)
+        );
+        // The next push finds the same: what the channel holds is counted
+        // the same way when it is read back.
+        let mut next = RelayRoom::new(u64::MAX, None);
+        next.max_channel_bytes = room.max_channel_bytes;
+        assert_eq!(
+            relay_store(&db, &mut next, &small, SMALL),
+            Err(REFUSED_FULL)
+        );
+        assert_eq!(holds(&db, &small), 100 * SMALL as u64);
+    }
+
+    /// T3. An address's allowance lasts as long as what was counted against
+    /// it, whether or not its connections do. Otherwise closing every
+    /// connection and connecting again, under new keys, would start it
+    /// afresh. An address that has used nothing is forgotten.
+    #[test]
+    fn an_addresss_allowance_outlasts_its_connections() {
+        use cordelia_core::protocol::{MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE};
+        let peer = |n: u8| NodeId([n; 32]);
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let quiet: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let mut rates = Rates::default();
+
+        // The address's connections push all it is allowed in a minute.
+        for n in 1..=MAX_CONNECTIONS_PER_IP as u8 {
+            assert_eq!(
+                rates.pushed(&peer(n), address, PUSH_BYTES_PER_PEER_PER_MINUTE),
+                Ok(()),
+                "{n}"
+            );
+        }
+        // Another address connects and pushes nothing.
+        assert_eq!(rates.pushed(&peer(50), quiet, 0), Ok(()));
+
+        // Every connection closes, and the allowances are tidied.
+        rates.prune(&[], &[]);
+
+        // A new connection from the first address, under a new key, finds
+        // the address's allowance used.
+        assert!(rates.pushed(&peer(60), address, 1).is_err());
+        // The quiet address was forgotten.
+        assert!(!rates.by_address.contains_key(&quiet));
+    }
+
     /// A device paces what it pushes to a relay: full batches while there is
     /// room in the minute, then smaller ones, then nothing until there is
     /// room for an entry of the largest size again.
@@ -3694,7 +3916,7 @@ mod tests {
     fn a_device_paces_what_it_pushes_to_a_relay() {
         use cordelia_core::protocol::{
             MAX_ITEM_BYTES, OUTBOX_BATCH_MAX_BYTES, OUTBOX_BYTES_PER_MINUTE,
-            PUSH_BYTES_PER_PEER_PER_MINUTE,
+            PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
         };
         let mut sent = cordelia_network::rate_limit::ByteCounter::new(
             std::time::Duration::from_secs(60),
@@ -3710,10 +3932,19 @@ mod tests {
             assert!(pushes < 100, "never stops");
         }
         // It stops under what a relay allows a connection in a minute, with
-        // less than one entry's room left.
+        // less room left than one entry of the largest size costs.
         assert!(total <= OUTBOX_BYTES_PER_MINUTE);
         assert!(total < PUSH_BYTES_PER_PEER_PER_MINUTE);
-        assert!(OUTBOX_BYTES_PER_MINUTE - total < MAX_ITEM_BYTES as u64);
+        assert!(OUTBOX_BYTES_PER_MINUTE - total < entry_cost(MAX_ITEM_BYTES));
+
+        // With room for an entry of the largest size, less one byte, it
+        // sends nothing: what an entry takes beyond its ciphertext counts.
+        let mut sent = cordelia_network::rate_limit::ByteCounter::new(
+            std::time::Duration::from_secs(60),
+            OUTBOX_BYTES_PER_MINUTE,
+        );
+        assert!(sent.check_and_record(OUTBOX_BYTES_PER_MINUTE - entry_cost(MAX_ITEM_BYTES) + 1));
+        assert_eq!(outbox_room(&mut sent), None);
     }
 
     /// T3. A connection has an allowance, and so does its address: the

@@ -398,6 +398,68 @@ mod tests {
         buf
     }
 
+    /// T3. One size for every entry: with every field at its largest, an
+    /// entry as it travels is at most its ciphertext and what an entry may
+    /// take beyond it. That bound is what every limit on bytes counts.
+    #[test]
+    fn the_largest_entry_as_it_travels_is_its_ciphertext_and_the_overhead() {
+        use cordelia_core::protocol::{
+            ENTRY_OVERHEAD_BYTES, MAX_CHANNEL_ID_LEN, MAX_ITEM_BYTES, MAX_ITEM_ID_LEN,
+            MAX_ITEM_TYPE_LEN, MAX_REV, MAX_TIMESTAMP_LEN, entry_fields_fit,
+        };
+        let long = |len: usize| "x".repeat(len);
+        let largest = Item {
+            item_id: long(MAX_ITEM_ID_LEN),
+            channel_id: long(MAX_CHANNEL_ID_LEN),
+            item_type: long(MAX_ITEM_TYPE_LEN),
+            content_length: u32::MAX,
+            encrypted_blob: vec![0xFF; MAX_ITEM_BYTES],
+            content_hash: vec![0xFF; 32],
+            author_id: vec![0xFF; 32],
+            signature: vec![0xFF; 64],
+            key_version: u32::MAX,
+            published_at: long(MAX_TIMESTAMP_LEN),
+            is_tombstone: true,
+            parent_id: Some(long(MAX_ITEM_ID_LEN)),
+            slot: Some(vec![0xFF; 32]),
+            rev: Some(MAX_REV),
+        };
+        assert!(entry_fields_fit(
+            &largest.item_id,
+            &largest.channel_id,
+            &largest.item_type,
+            &largest.published_at,
+            largest.parent_id.as_deref(),
+        ));
+        let travels = encode(&largest).len();
+        assert!(
+            travels <= MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES,
+            "the largest entry is {travels} bytes as it travels"
+        );
+        // And its header is what the overhead is for: well over half of it.
+        assert!(
+            travels - MAX_ITEM_BYTES > ENTRY_OVERHEAD_BYTES / 2,
+            "{travels}"
+        );
+
+        // One byte more in any field, and it does not fit.
+        for (id, channel, kind, time, parent) in [
+            (MAX_ITEM_ID_LEN + 1, 1, 1, 1, None),
+            (1, MAX_CHANNEL_ID_LEN + 1, 1, 1, None),
+            (1, 1, MAX_ITEM_TYPE_LEN + 1, 1, None),
+            (1, 1, 1, MAX_TIMESTAMP_LEN + 1, None),
+            (1, 1, 1, 1, Some(MAX_ITEM_ID_LEN + 1)),
+        ] {
+            assert!(!entry_fields_fit(
+                &long(id),
+                &long(channel),
+                &long(kind),
+                &long(time),
+                parent.map(long).as_deref(),
+            ));
+        }
+    }
+
     /// The answer to a push as nodes before 0.2.0-alpha.4 know it.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct OlderPushAck {

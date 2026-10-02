@@ -295,6 +295,35 @@ peer then takes at most a few megabytes a minute from it. Until
 64 to 128 KB synced then, and does not now: it is reported, and left as it
 is.
 
+### entry_overhead_bytes = 1KB, and the size of each field
+
+**Rationale:** One size for every entry has to mean every field of it, and
+a limit on bytes has to count what an entry takes. Otherwise an entry
+could carry in its type what its content may not, and a thousand entries
+of three bytes would count as three kilobytes.
+
+- Each field other than the ciphertext has a size it must fit in:
+  max_item_id_len = 64 (an ID is 29 characters), max_channel_id_len = 96
+  (the longest kind, an inbox, is 70), max_item_type_len = 32,
+  max_timestamp_len = 40 (an RFC 3339 time with nanoseconds and an offset
+  is 35). The rest are of fixed size. An entry over any of them is refused
+  by whoever is sent it, and is not stored.
+- entry_overhead_bytes is what an entry may take beyond its ciphertext.
+  Every limit on bytes counts an entry as its ciphertext plus this: a
+  connection's and an address's allowance, what one channel may hold at a
+  relay, and what a device sends in one push and in one minute. A device
+  and a relay count the same way, or a device would be refused.
+
+**Derivation:** The fields at their largest, with their names and lengths
+as they are encoded, come to about 660 bytes (checked at compile time, and
+by a test that encodes the largest entry). A row and its place in three
+indexes take about as much again where it is stored. 1KB covers both in
+round figures, and is what a fetch already allowed for each entry's
+header. An entry of memory is a kilobyte or more, so for those the limits
+are as they were to within a factor of two. For entries of a few bytes
+they are now limits: a connection can add about 2,000 entries a minute to
+a relay, and a channel can hold about 16,000.
+
 ### max_message_bytes = 1MB
 
 **Rationale:** Maximum CBOR wire message size. Must be >= max_item_bytes
@@ -378,8 +407,11 @@ hold small entries and never leave 100.
 
 **Rationale:** The count of pushes a minute bounds little by itself, since
 one push can be a whole message. So a connection may also push only so
-many bytes of entries a minute. A push that would go over is refused
-whole, with no answer, so a sender on any version keeps what it sent.
+many bytes of entries a minute, each entry counted as its ciphertext and
+entry_overhead_bytes. A push that would go over is refused whole, with no
+answer, so a sender on any version keeps what it sent. An address's
+allowance is kept until nothing is counted against it any more, whether or
+not its connections are still open.
 
 A device paces itself to 1.5MB a minute to each relay, a quarter under
 what a relay allows, so that it is never the one refused.
@@ -433,10 +465,12 @@ within ten minutes of the reason going away.
 
 ### outbox_batch_max_bytes = 192KB, outbox_batch_max_items = 500
 
-**Rationale:** One outbox push holds at most three entries of the largest
-size. That is far inside max_message_bytes today (checked at compile time),
-and is small enough that max_message_bytes can come down to 256KB once
-every node sends batches this small. The item bound caps header overhead.
+**Rationale:** One outbox push costs at most what three entries of the
+largest size cost (195KB with entry_overhead_bytes). That is far inside
+max_message_bytes today (checked at compile time), and is small enough
+that max_message_bytes can come down to 256KB once every node sends
+batches this small. Since each entry counts for at least a kilobyte, a
+push holds fewer than 200 entries, and the item bound is not reached.
 
 ---
 

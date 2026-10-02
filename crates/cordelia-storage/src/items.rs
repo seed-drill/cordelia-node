@@ -104,6 +104,26 @@ pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaEr
             limit: cordelia_core::protocol::MAX_ITEM_BYTES,
         });
     }
+    // One size for an entry means every field of it: the rest of an entry
+    // is bounded too, or its ID, type or time could carry what its content
+    // may not.
+    if !cordelia_core::protocol::entry_fields_fit(
+        item.item_id,
+        item.channel_id,
+        item.item_type,
+        item.published_at,
+        item.parent_id,
+    ) {
+        let fields = item.item_id.len()
+            + item.channel_id.len()
+            + item.item_type.len()
+            + item.published_at.len()
+            + item.parent_id.map_or(0, str::len);
+        return Err(CordeliaError::TooLarge {
+            bytes: fields,
+            limit: cordelia_core::protocol::ENTRY_OVERHEAD_BYTES,
+        });
+    }
     if item
         .rev
         .is_some_and(|rev| rev > cordelia_core::protocol::MAX_REV)
@@ -400,10 +420,11 @@ pub fn outbox_len(conn: &Connection, author: &[u8; 32]) -> Result<u64, CordeliaE
 
 /// This node's outbox: items authored by `author` in network-scope channels
 /// that no relay has acknowledged yet, oldest first. Bounded by count and
-/// total encrypted bytes, but always at least one item if any are pending.
-/// Items whose ID is in `skip` are left out (those a relay refused, which
-/// wait before they are offered again), and do not count towards the
-/// bounds.
+/// what they cost together ([`cordelia_core::protocol::entry_cost`]: a
+/// relay counts them the same way), but always at least one item if any
+/// are pending. Items whose ID is in `skip` are left out (those a relay
+/// refused, which wait before they are offered again), and do not count
+/// towards the bounds.
 pub fn outbox(
     conn: &Connection,
     author: &[u8; 32],
@@ -437,7 +458,7 @@ pub fn outbox(
         if batch.len() == max_items {
             break;
         }
-        bytes += item.encrypted_blob.len();
+        bytes += cordelia_core::protocol::entry_cost(item.encrypted_blob.len()) as usize;
         if !batch.is_empty() && bytes > max_bytes {
             break;
         }
@@ -711,28 +732,51 @@ pub fn channel_bytes(conn: &Connection, channel_id: &str) -> Result<u64, Cordeli
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
-/// The size of what one author holds in one slot of a channel: what a new
-/// revision by that author would replace.
-pub fn author_slot_bytes(
-    conn: &Connection,
-    channel_id: &str,
-    slot: &[u8; 32],
-    author: &[u8; 32],
-) -> Result<u64, CordeliaError> {
+/// What a channel's entries cost together: each its ciphertext and what an
+/// entry takes beyond it ([`cordelia_core::protocol::entry_cost`]). This is
+/// what counts against the most one channel may hold at a relay.
+pub fn channel_cost(conn: &Connection, channel_id: &str) -> Result<u64, CordeliaError> {
     conn.query_row(
-        "SELECT COALESCE(SUM(content_length), 0) FROM items
-         WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
-        params![channel_id, slot.as_slice(), author.as_slice()],
+        "SELECT COALESCE(SUM(content_length), 0) + COUNT(*) * ?2 FROM items WHERE channel_id = ?1",
+        params![
+            channel_id,
+            cordelia_core::protocol::ENTRY_OVERHEAD_BYTES as i64
+        ],
         |row| row.get::<_, i64>(0),
     )
     .map(|bytes| bytes.max(0) as u64)
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
-/// The total size of the given items of a channel, as stored. Unknown IDs
-/// count for nothing. Lets a node see whether a fetch can be answered in
-/// one message before it reads the items.
-pub fn total_bytes_by_ids(
+/// The cost of what one author holds in one slot of a channel: what a new
+/// revision by that author would replace.
+pub fn author_slot_cost(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<u64, CordeliaError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(content_length), 0) + COUNT(*) * ?4 FROM items
+         WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
+        params![
+            channel_id,
+            slot.as_slice(),
+            author.as_slice(),
+            cordelia_core::protocol::ENTRY_OVERHEAD_BYTES as i64
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|bytes| bytes.max(0) as u64)
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
+/// What the given items of a channel cost together
+/// ([`cordelia_core::protocol::entry_cost`]), which is at least what they
+/// take in a message. Unknown IDs count for nothing. Lets a node see
+/// whether a fetch can be answered in one message before it reads the
+/// items.
+pub fn total_cost_by_ids(
     conn: &Connection,
     channel_id: &str,
     item_ids: &[String],
@@ -743,7 +787,7 @@ pub fn total_bytes_by_ids(
     let mut total = 0u64;
     for item_id in item_ids {
         match stmt.query_row(params![channel_id, item_id], |row| row.get::<_, i64>(0)) {
-            Ok(bytes) => total += bytes.max(0) as u64,
+            Ok(bytes) => total += cordelia_core::protocol::entry_cost(bytes.max(0) as usize),
             Err(rusqlite::Error::QueryReturnedNoRows) => {}
             Err(e) => return Err(CordeliaError::Storage(e.to_string())),
         }
@@ -1285,10 +1329,17 @@ mod tests {
             vec!["ci_m2"]
         );
 
-        // Byte bound: blobs are 100 bytes each; a 150-byte batch holds one,
-        // and a batch always holds at least one.
+        // The bound on a batch counts each entry as its ciphertext (100
+        // bytes here) and what an entry takes beyond it, as a relay does:
+        // a batch that may cost what two entries cost holds two, and one
+        // byte less holds one. A batch always holds at least one.
+        let two = 2 * cordelia_core::protocol::entry_cost(100) as usize;
         assert_eq!(
-            ids(outbox(&conn, &me, 10, 150, &none).unwrap()),
+            ids(outbox(&conn, &me, 10, two, &none).unwrap()),
+            vec!["ci_m1", "ci_m2"]
+        );
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, two - 1, &none).unwrap()),
             vec!["ci_m1"]
         );
         assert_eq!(
@@ -1429,18 +1480,109 @@ mod tests {
         insert_item(&conn, &a).unwrap();
         insert_item(&conn, &b).unwrap();
         let ids = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        // Test items are 100 bytes each. Unknown items, and items of
+        // Test items are 100 bytes each, and each counts as that and what
+        // an entry takes beyond its ciphertext. Unknown items, and items of
         // another channel, count for nothing.
+        let one = cordelia_core::protocol::entry_cost(100);
         assert_eq!(
-            total_bytes_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_b"])).unwrap(),
-            200
+            total_cost_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_b"])).unwrap(),
+            2 * one
         );
         assert_eq!(
-            total_bytes_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_zz"])).unwrap(),
-            100
+            total_cost_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_zz"])).unwrap(),
+            one
         );
         assert_eq!(
-            total_bytes_by_ids(&conn, "other", &ids(&["ci_a"])).unwrap(),
+            total_cost_by_ids(&conn, "other", &ids(&["ci_a"])).unwrap(),
+            0
+        );
+    }
+
+    /// T3. One size for every entry means every field of it. An entry whose
+    /// ID, channel, type, time or parent is over the size it must fit in is
+    /// not stored, however small its content.
+    #[test]
+    fn an_entry_with_a_field_over_its_size_is_not_stored() {
+        use cordelia_core::protocol::{
+            MAX_CHANNEL_ID_LEN, MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN, MAX_TIMESTAMP_LEN,
+        };
+        let conn = setup();
+        let long = |len: usize| -> &'static str { Box::leak("x".repeat(len).into_boxed_str()) };
+        let too_large = |item: &NewItem| {
+            matches!(
+                insert_item(&conn, item),
+                Err(CordeliaError::TooLarge { .. })
+            )
+        };
+
+        assert!(too_large(&test_item(
+            long(MAX_ITEM_ID_LEN + 1),
+            "2026-01-01T00:01:00Z"
+        )));
+
+        let mut item = test_item("ci_channel", "2026-01-01T00:01:00Z");
+        item.channel_id = long(MAX_CHANNEL_ID_LEN + 1);
+        assert!(too_large(&item));
+
+        let mut item = test_item("ci_type", "2026-01-01T00:01:00Z");
+        item.item_type = long(MAX_ITEM_TYPE_LEN + 1);
+        assert!(too_large(&item));
+
+        assert!(too_large(&test_item(
+            "ci_time",
+            long(MAX_TIMESTAMP_LEN + 1)
+        )));
+
+        let mut item = test_item("ci_parent", "2026-01-01T00:01:00Z");
+        item.parent_id = Some(long(MAX_ITEM_ID_LEN + 1));
+        assert!(too_large(&item));
+
+        // Each field at its largest is stored.
+        let mut item = test_item(long(MAX_ITEM_ID_LEN), long(MAX_TIMESTAMP_LEN));
+        item.item_type = long(MAX_ITEM_TYPE_LEN);
+        item.parent_id = Some(long(MAX_ITEM_ID_LEN));
+        assert!(insert_item(&conn, &item).unwrap());
+    }
+
+    /// T3. What a channel's entries cost counts each entry as its ciphertext
+    /// and what an entry takes beyond it, so that many small entries count
+    /// for what they take.
+    #[test]
+    fn a_channels_cost_counts_what_each_entry_takes() {
+        use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, entry_cost};
+        let conn = setup();
+        assert_eq!(channel_cost(&conn, "ch1").unwrap(), 0);
+        for (n, hash) in [&[0xB0u8; 32], &[0xB1u8; 32], &[0xB2u8; 32]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut item = test_item(&format!("ci_{n}"), "2026-01-01T00:01:00Z");
+            item.content_hash = hash;
+            item.encrypted_blob = &[7u8; 3];
+            assert!(insert_item(&conn, &item).unwrap());
+        }
+        // Nine bytes of ciphertext, and three entries.
+        assert_eq!(channel_bytes(&conn, "ch1").unwrap(), 9);
+        assert_eq!(
+            channel_cost(&conn, "ch1").unwrap(),
+            9 + 3 * ENTRY_OVERHEAD_BYTES as u64
+        );
+        assert_eq!(channel_cost(&conn, "ch1").unwrap(), 3 * entry_cost(3));
+
+        // What one author holds under one name costs the same way.
+        let (author, slot) = ([0xAAu8; 32], [0x51u8; 32]);
+        let mut named = test_item("ci_named", "2026-01-01T00:02:00Z");
+        named.author_id = &author;
+        named.content_hash = &[0x99; 32];
+        named.slot = Some(&slot);
+        named.rev = Some(1);
+        assert!(insert_item(&conn, &named).unwrap());
+        assert_eq!(
+            author_slot_cost(&conn, "ch1", &slot, &author).unwrap(),
+            entry_cost(named.encrypted_blob.len())
+        );
+        assert_eq!(
+            author_slot_cost(&conn, "ch1", &[0u8; 32], &author).unwrap(),
             0
         );
     }

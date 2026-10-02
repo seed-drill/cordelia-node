@@ -193,6 +193,14 @@ impl PeerRateLimiter {
         }
     }
 
+    /// Whether nothing is counted in any window: no request, and no bytes.
+    pub fn is_idle(&mut self) -> bool {
+        self.writes.count() == 0
+            && self.syncs.count() == 0
+            && self.peer_shares.count() == 0
+            && self.write_bytes.total() == 0
+    }
+
     /// Whether a breach was recorded within the window for counting them.
     pub fn has_recent_breach(&self) -> bool {
         self.first_breach

@@ -1639,6 +1639,7 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | Parameter | Value | Enforcement |
 |-----------|-------|-------------|
 | `max_item_bytes` | 64 KB (65,536) | The device that writes the item, each relay, the device that receives it |
+| an item's other fields | ID and parent 64 bytes, channel 96, type 32, time 40 | The same; so an item as it travels is at most its ciphertext and 1 KB (`ENTRY_OVERHEAD_BYTES`) |
 | `max_message_bytes` | 1 MB (1,048,576) | Wire codec (length prefix check) |
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 

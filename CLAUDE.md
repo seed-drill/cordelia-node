@@ -71,6 +71,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §5.3 |
 | `MAX_MESSAGE_BYTES` | 1MB | parameter-rationale.md §5.2 |
 | `MAX_ITEM_BYTES` | 64KB | parameter-rationale.md §4 |
+| `ENTRY_OVERHEAD_BYTES` | 1KB (counted for each entry, in every limit on bytes) | parameter-rationale.md §4 |
 | `QUIC_KEEPALIVE_INTERVAL_SECS` | 15s | network-protocol.md §2.1 |
 | `QUIC_MAX_IDLE_TIMEOUT_SECS` | 60s | network-protocol.md §2.1 |
 | `PING_INTERVAL_SECS` | 30s | network-protocol.md §4.2 |

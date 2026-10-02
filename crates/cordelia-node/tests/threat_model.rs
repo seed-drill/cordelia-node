@@ -1266,12 +1266,25 @@ async fn client_of(relay: &Node) -> Result<Client, String> {
 impl Client {
     /// An entry of `bytes` bytes, signed by this client, as it travels.
     fn entry(&self, bytes: usize) -> cordelia_network::messages::Item {
-        let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
-        let item_id = cordelia_storage::items::generate_item_id();
         // Distinct content for each entry.
         let mut blob = vec![7u8; bytes];
-        let tag = item_id.as_bytes();
+        let tag = cordelia_storage::items::generate_item_id();
+        let tag = tag.as_bytes();
         blob[..tag.len().min(bytes)].copy_from_slice(&tag[..tag.len().min(bytes)]);
+        self.entry_of(blob)
+    }
+
+    /// Close the connection, as a device that goes away does.
+    async fn close(self) {
+        self.conn.close(0u32.into(), b"done");
+        // Long enough for the relay to be told.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// An entry with this ciphertext, signed by this client.
+    fn entry_of(&self, blob: Vec<u8>) -> cordelia_network::messages::Item {
+        let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
+        let item_id = cordelia_storage::items::generate_item_id();
         let hash = cordelia_crypto::sha256(&blob);
         let published_at = "2026-10-02T00:00:00Z";
         let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
@@ -1390,6 +1403,113 @@ async fn t03_a_connection_may_push_two_megabytes_a_minute() {
     assert_eq!(client.push(&[client.entry(64)]).await.unwrap().stored, 1);
     let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
     assert_eq!(stats["items_stored"], 31, "{stats}");
+}
+
+/// T3. Small entries count for what they take. A connection's allowance
+/// counts each entry as its ciphertext and what an entry takes beyond it, a
+/// kilobyte. So fifteen kilobytes of ciphertext, in entries of eight bytes,
+/// use most of two megabytes, and the next push is refused.
+///
+/// The entries go in two pushes, so that a slow machine has time to check
+/// each one's signatures before the push times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_small_entries_count_for_what_they_take() {
+    use cordelia_core::protocol::{PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost};
+    const SMALL: usize = 8;
+    const HALF: u64 = 950;
+    const FIRST: u64 = 2 * HALF;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let client = client_of(&relay).await.expect("the client connects");
+    let stored = || -> u64 {
+        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
+            ["items_stored"]
+            .as_u64()
+            .unwrap()
+    };
+    let small = |from: u64, count: u64| -> Vec<_> {
+        (from..from + count)
+            .map(|n| client.entry_of(n.to_be_bytes().to_vec()))
+            .collect()
+    };
+
+    // What the first push costs is within the allowance; with the second
+    // it would be over.
+    assert!(FIRST * entry_cost(SMALL) <= PUSH_BYTES_PER_PEER_PER_MINUTE);
+    assert!((FIRST + 200) * entry_cost(SMALL) > PUSH_BYTES_PER_PEER_PER_MINUTE);
+
+    for half in 0..2 {
+        let ack = client.push(&small(half * HALF, HALF)).await.unwrap();
+        assert_eq!(u64::from(ack.stored), HALF, "{ack:?}");
+    }
+    assert!(
+        client.push(&small(FIRST, 200)).await.is_err(),
+        "small entries were taken past the allowance"
+    );
+    assert_eq!(stored(), FIRST);
+    // What is left of the allowance still takes a push that fits in it.
+    let ack = client.push(&small(FIRST, 100)).await.unwrap();
+    assert_eq!(ack.stored, 100, "{ack:?}");
+}
+
+/// T3. An address's allowance lasts as long as what was counted against it,
+/// whether or not its connections do. Five connections from one address
+/// push what the address may in a minute, and close. A new connection from
+/// that address, under a new key, is refused another megabyte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_an_addresss_allowance_outlasts_its_connections() {
+    use cordelia_core::protocol::{MAX_CONNECTIONS_PER_IP, MAX_ITEM_BYTES};
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let connected = || -> usize {
+        relay
+            .get("/api/v1/peers")
+            .and_then(|v| v["peers"].as_array().map(Vec::len))
+            .unwrap_or(usize::MAX)
+    };
+
+    // Fifteen entries of the largest size are just under a megabyte, and
+    // two such pushes are what one connection may send in a minute.
+    let megabyte =
+        |client: &Client| -> Vec<_> { (0..15).map(|_| client.entry(MAX_ITEM_BYTES)).collect() };
+    let mut clients = Vec::new();
+    for n in 0..MAX_CONNECTIONS_PER_IP {
+        let client = client_of(&relay)
+            .await
+            .unwrap_or_else(|e| panic!("connection {n} was refused: {e}"));
+        for push in 0..2 {
+            let ack = client.push(&megabyte(&client)).await.unwrap();
+            assert_eq!(ack.stored, 15, "connection {n}, push {push}: {ack:?}");
+        }
+        clients.push(client);
+    }
+
+    // They all close, and the relay tidies its counts.
+    for client in clients {
+        client.close().await;
+    }
+    wait_for("the relay sees them gone", &[&relay], 30, || {
+        (connected() == 0).then_some(())
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    // The address comes back under a new key. Its allowance for the minute
+    // is still used.
+    let again = client_of(&relay).await.expect("the address connects again");
+    assert!(
+        again.push(&megabyte(&again)).await.is_err(),
+        "the address had a fresh allowance after connecting again"
+    );
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(
+        stats["items_stored"],
+        30 * MAX_CONNECTIONS_PER_IP,
+        "{stats}"
+    );
 }
 
 /// T3. An address has its share of connections, and the next one is turned
