@@ -117,6 +117,10 @@ impl From<cordelia_core::CordeliaError> for ApiError {
             }
             cordelia_core::CordeliaError::NotAuthorised { context } => Self::Forbidden(context),
             cordelia_core::CordeliaError::Validation(msg) => Self::BadRequest(msg),
+            cordelia_core::CordeliaError::TooLarge { bytes, limit } => Self::PayloadTooLarge {
+                used_bytes: bytes as u64,
+                quota_bytes: limit as u64,
+            },
             cordelia_core::CordeliaError::ItemNotFound { item_id } => {
                 Self::NotFound(format!("item '{item_id}' not found"))
             }

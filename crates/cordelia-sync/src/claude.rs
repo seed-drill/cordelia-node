@@ -43,9 +43,12 @@ use crate::plan::{self, Action, Agreed, Content, Remote};
 /// Seconds between sync cycles.
 pub const CYCLE_SECS: u64 = 5;
 
-/// Largest memory file synced. Leaves room under the item size limit for
-/// JSON escaping and the envelope; larger files are reported, not synced.
-pub const MAX_FILE_BYTES: usize = 128 * 1024;
+/// A memory file larger than this cannot fit in an entry, whatever is in
+/// it, and is not read: it is reported as too large. A file under it may
+/// still not fit, since an entry also holds the file's name and its text
+/// is escaped; that is found when it is published, and reported the same
+/// way. Either way the file is left alone and nothing is deleted anywhere.
+pub const MAX_FILE_BYTES: usize = cordelia_core::protocol::MAX_ITEM_BYTES;
 
 /// How long a folder's project lookup (transcripts + git) is cached.
 const PROJECT_CACHE: Duration = Duration::from_secs(300);
@@ -90,8 +93,13 @@ pub struct FolderReport {
     /// a memory that lost to a concurrent edit, until someone merges it
     /// and deletes the file.
     pub conflict_files: Vec<String>,
-    /// Files present but not synced (unsafe name, not text, too large).
+    /// Files present but not synced: an unsafe name, not text, or a link.
     pub skipped: Vec<String>,
+    /// Files present but not synced because they do not fit in an entry
+    /// (64 KB as it travels). They are left as they are on this device, and
+    /// the other devices keep the last version that did fit.
+    #[serde(default)]
+    pub too_large: Vec<String>,
     /// When this device last received a memory under this name, and last
     /// sent one (RFC 3339).
     pub last_pulled_at: Option<String>,
@@ -760,18 +768,33 @@ fn lock(
         .map_err(|e| CordeliaError::Internal(format!("db lock: {e}")))
 }
 
-/// Read the syncable files of a memory folder. Symlinks, hidden files,
-/// unsafe names, non-UTF-8, and oversized files are skipped and listed. A
-/// folder that does not exist has no files; one that cannot be read is an
-/// error, never an empty folder.
-fn read_local(dir: &Path) -> std::io::Result<(HashMap<String, Content>, Vec<String>)> {
-    let mut files = HashMap::new();
-    let mut skipped = Vec::new();
+/// The files of a memory folder: those that can sync, and those that are
+/// there but cannot.
+#[derive(Default)]
+struct Local {
+    files: HashMap<String, Content>,
+    /// An unsafe name, not UTF-8 text, or a link.
+    skipped: Vec<String>,
+    /// Too large to fit in an entry.
+    too_large: Vec<String>,
+}
+
+/// Read the syncable files of a memory folder. Symlinks, unsafe names,
+/// non-UTF-8 and oversized files are left out and listed; hidden files are
+/// ignored. A folder that does not exist has no files; one that cannot be
+/// read is an error, never an empty folder.
+fn read_local(dir: &Path) -> std::io::Result<Local> {
+    let mut local = Local::default();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((files, skipped)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(local),
         Err(e) => return Err(e),
     };
+    let Local {
+        files,
+        skipped,
+        too_large,
+    } = &mut local;
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -787,8 +810,12 @@ fn read_local(dir: &Path) -> std::io::Result<(HashMap<String, Content>, Vec<Stri
             }
             continue;
         }
-        if !names::is_safe_file_name(&name) || meta.len() as usize > MAX_FILE_BYTES {
+        if !names::is_safe_file_name(&name) {
             skipped.push(name);
+            continue;
+        }
+        if meta.len() as usize > MAX_FILE_BYTES {
+            too_large.push(name);
             continue;
         }
         match std::fs::read(entry.path()).map(String::from_utf8) {
@@ -798,7 +825,7 @@ fn read_local(dir: &Path) -> std::io::Result<(HashMap<String, Content>, Vec<Stri
             _ => skipped.push(name),
         }
     }
-    Ok((files, skipped))
+    Ok(local)
 }
 
 /// Write `text` to `dir/name` atomically: temporary file, then rename. The
@@ -839,9 +866,18 @@ fn sync_folder(
 ) -> Result<FolderReport, CordeliaError> {
     let folder = dir.display().to_string();
     let mut report = FolderReport::default();
-    let (local, skipped) =
-        read_local(dir).map_err(|e| CordeliaError::Internal(format!("{}: {e}", dir.display())))?;
+    let Local {
+        files: local,
+        skipped,
+        too_large,
+    } = read_local(dir).map_err(|e| CordeliaError::Internal(format!("{}: {e}", dir.display())))?;
+    // A file that is there but cannot sync takes no part, in either
+    // direction. It is not gone, so it must not be planned as deleted,
+    // which would delete it on every other device; and nothing from the
+    // channel is written over it.
+    let apart: HashSet<String> = skipped.iter().chain(too_large.iter()).cloned().collect();
     report.skipped = skipped;
+    report.too_large = too_large;
 
     let (remote, deleted, agreed) = {
         let db = lock(state)?;
@@ -900,6 +936,9 @@ fn sync_folder(
     keys.dedup();
 
     for key in keys {
+        if apart.contains(key) {
+            continue;
+        }
         let seen = local.get(key).map(|c| c.hash);
         let actions = plan::plan(
             key,
@@ -1009,12 +1048,27 @@ fn apply(
         sync_state::save(&db, folder, channel, key, (hash, rev))
     };
 
-    match action {
-        Action::Publish(text) => {
-            let rev = publish(Some(&text))?;
-            record(Some(Content::new(text).hash), rev)?;
-            report.published += 1;
+    // An entry holds the file's name beside its text, and the text is
+    // escaped, so a file under MAX_FILE_BYTES can still be too large. It is
+    // then left as it is, like one that was never read.
+    let too_large = |report: &mut FolderReport| {
+        if !report.too_large.iter().any(|name| name == key) {
+            report.too_large.push(key.to_string());
         }
+    };
+
+    match action {
+        Action::Publish(text) => match publish(Some(&text)) {
+            Ok(rev) => {
+                record(Some(Content::new(text).hash), rev)?;
+                report.published += 1;
+            }
+            Err(CordeliaError::TooLarge { .. }) => {
+                too_large(report);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        },
         Action::PublishDelete => {
             let rev = publish(None)?;
             record(None, rev)?;
@@ -1042,10 +1096,20 @@ fn apply(
             report.conflicts += 1;
         }
         Action::Merge(text) => {
-            write_atomic(dir, key, &text).map_err(io)?;
-            let rev = publish(Some(&text))?;
-            record(Some(Content::new(text).hash), rev)?;
-            report.published += 1;
+            // Published before the file is written: if the merged text does
+            // not fit, the file stays as it was.
+            match publish(Some(&text)) {
+                Ok(rev) => {
+                    write_atomic(dir, key, &text).map_err(io)?;
+                    record(Some(Content::new(text).hash), rev)?;
+                    report.published += 1;
+                }
+                Err(CordeliaError::TooLarge { .. }) => {
+                    too_large(report);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Action::Record(a) => record(a.hash, a.rev)?,
     }

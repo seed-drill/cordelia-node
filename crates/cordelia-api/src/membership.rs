@@ -304,6 +304,12 @@ fn seal_and_send(
     channels::ensure_inbox(db, &inbox, recipient, false)?;
 
     let sealed = cs.seal(recipient).map_err(crypto_err)?;
+    if sealed.len() > cordelia_core::protocol::MAX_ITEM_BYTES {
+        return Err(CordeliaError::TooLarge {
+            bytes: sealed.len(),
+            limit: cordelia_core::protocol::MAX_ITEM_BYTES,
+        });
+    }
     let item_id = items::generate_item_id();
     let published_at = Utc::now().to_rfc3339();
     let content_hash = cordelia_crypto::sha256(&sealed);

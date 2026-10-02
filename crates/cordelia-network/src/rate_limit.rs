@@ -34,7 +34,7 @@ pub const BAN_WINDOW: Duration = Duration::from_secs(protocol::BAN_WINDOW_SECS);
 
 // ── Size limits (§9.3, sourced from protocol.rs) ───────────────────
 
-/// Max encrypted item size: 256KB (demand-model.md §2.3, parameter-rationale.md §4).
+/// Max encrypted item size: 64 KB (parameter-rationale.md §4).
 pub const MAX_ITEM_BYTES: usize = protocol::MAX_ITEM_BYTES;
 /// Max batch fetch size: 100 items per request (demand-model.md §3.1).
 pub const MAX_BATCH_SIZE: usize = protocol::MAX_BATCH_SIZE;

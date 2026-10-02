@@ -297,10 +297,15 @@ pub const COLD_MAX: u32 = 50;
 /// operations, small enough to bound memory per connection.
 pub const MAX_MESSAGE_BYTES: u32 = 1_048_576;
 
-/// Maximum encrypted item size: 256 KB (parameter-rationale.md §4, demand-model.md §2.3).
-/// Primitive: covers 99.9% of AI agent memory payloads per demand model.
-/// 256KB * 4 < 1MB wire frame.
-pub const MAX_ITEM_BYTES: usize = 262_144;
+/// The size every entry must fit in as it travels: 64 KB of ciphertext
+/// (parameter-rationale.md §4). One small size for everything, checked by
+/// the sender, by each relay and by the device that receives it. Small
+/// entries are what let limits on rate and storage mean something.
+pub const MAX_ITEM_BYTES: usize = 65_536;
+
+/// What sealing adds to an entry's content: the nonce and the tag of
+/// AES-256-GCM. An entry's content can be at most MAX_ITEM_BYTES less this.
+pub const ITEM_SEAL_OVERHEAD_BYTES: usize = 12 + 16;
 
 /// Maximum items per batch fetch (demand-model.md §3.1).
 /// Primitive: 100 items per batch; balances throughput against memory
@@ -367,10 +372,10 @@ pub const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 2;
 /// Rationale: parameter-rationale.md §4.
 pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
 
-/// Most encrypted bytes in one outbox push. Below MAX_MESSAGE_BYTES to leave
-/// room for per-item headers and CBOR framing; an item bigger than this
-/// (items are at most MAX_ITEM_BYTES) is still sent, alone.
-pub const OUTBOX_BATCH_MAX_BYTES: usize = 768 * 1024;
+/// Most encrypted bytes in one outbox push: three entries of the largest
+/// size. Well below MAX_MESSAGE_BYTES, so that the message limit can come
+/// down to 256 KB once every node sends batches this small.
+pub const OUTBOX_BATCH_MAX_BYTES: usize = 3 * MAX_ITEM_BYTES;
 
 /// Most items in one outbox push, bounding per-item header overhead.
 pub const OUTBOX_BATCH_MAX_ITEMS: usize = 500;
@@ -762,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_max_item_bytes_parameter_rationale_4() {
-        assert_eq!(MAX_ITEM_BYTES, 262_144); // 256 KB
+        assert_eq!(MAX_ITEM_BYTES, 65_536); // 64 KB
     }
 
     #[test]

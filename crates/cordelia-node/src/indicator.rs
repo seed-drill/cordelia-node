@@ -33,6 +33,8 @@ pub struct Facts {
     pub errors: Vec<String>,
     /// Conflict files waiting for someone to merge them.
     pub conflicts: Vec<String>,
+    /// Memory files that are too large to sync (full paths).
+    pub too_large: Vec<String>,
     /// Projects this device is waiting to be added to.
     pub projects_waiting: usize,
     /// Folders the last cycle synced or is waiting to sync.
@@ -114,6 +116,13 @@ pub fn derive(f: &Facts) -> (State, String) {
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
         return (Attention, format!("memory: {n} {}", plural(n, "conflict")));
+    }
+    if !f.too_large.is_empty() {
+        let n = f.too_large.len() as u64;
+        return (
+            Attention,
+            format!("memory: {n} {} too large", plural(n, "file")),
+        );
     }
     if f.peers_hot == 0 {
         return match f.outbox_waiting {
@@ -270,6 +279,11 @@ mod tests {
         assert_eq!(
             with(&|f| f.conflicts = vec!["a".into(), "b".into()]),
             (State::Attention, "memory: 2 conflicts".into())
+        );
+        // So does a file that has grown too large to sync.
+        assert_eq!(
+            with(&|f| f.too_large = vec!["a.md".into()]),
+            (State::Attention, "memory: 1 file too large".into())
         );
         // A conflict needs the person even while offline.
         assert_eq!(

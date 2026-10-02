@@ -98,6 +98,12 @@ pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaEr
             "slot and rev must be set together".into(),
         ));
     }
+    if item.encrypted_blob.len() > cordelia_core::protocol::MAX_ITEM_BYTES {
+        return Err(CordeliaError::TooLarge {
+            bytes: item.encrypted_blob.len(),
+            limit: cordelia_core::protocol::MAX_ITEM_BYTES,
+        });
+    }
     if item
         .rev
         .is_some_and(|rev| rev > cordelia_core::protocol::MAX_REV)

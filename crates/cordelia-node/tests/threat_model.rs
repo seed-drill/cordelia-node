@@ -1129,3 +1129,80 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
             .then_some(())
     });
 }
+
+/// T3. A relay refuses an entry over the size limit. A client pushes two
+/// entries, one of the largest size there is and one a byte larger. The
+/// relay stores the first, refuses the second, and says which and why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_refuses_an_entry_over_the_size_limit() {
+    use cordelia_core::protocol::MAX_ITEM_BYTES;
+    use cordelia_network::messages::{Item, REFUSED_TOO_LARGE};
+    use cordelia_network::{connection, item_sync, transport};
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+
+    let client = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
+    let entry = |bytes: usize| -> Item {
+        let blob = vec![7u8; bytes];
+        let hash = cordelia_crypto::sha256(&blob);
+        let item_id = cordelia_storage::items::generate_item_id();
+        let published_at = "2026-10-02T00:00:00Z";
+        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+            &client.public_key(),
+            channel,
+            &hash,
+            false,
+            &item_id,
+            1,
+            published_at,
+        )
+        .unwrap();
+        Item {
+            item_id,
+            channel_id: channel.into(),
+            item_type: "memory".into(),
+            content_length: blob.len() as u32,
+            encrypted_blob: blob,
+            content_hash: hash.to_vec(),
+            author_id: client.public_key().to_vec(),
+            signature: client.sign(&cbor).to_vec(),
+            key_version: 1,
+            published_at: published_at.into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        }
+    };
+    let (largest, over) = (entry(MAX_ITEM_BYTES), entry(MAX_ITEM_BYTES + 1));
+
+    let endpoint = transport::create_endpoint(&client, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let mut manager = connection::ConnectionManager::new(
+        client.clone(),
+        endpoint,
+        vec![],
+        vec!["personal".into()],
+        port,
+    );
+    let relay_id = manager
+        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
+        .await
+        .expect("the client connects");
+    let conn = manager.get_connection(&relay_id).unwrap().clone();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let ack = item_sync::send_push(&mut stream, &[largest.clone(), over.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(ack.stored, 1, "{ack:?}");
+    assert_eq!(ack.refused.len(), 1, "{ack:?}");
+    assert_eq!(ack.refused[0].item_id, over.item_id, "{ack:?}");
+    assert_eq!(ack.refused[0].why, REFUSED_TOO_LARGE, "{ack:?}");
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], 1, "{stats}");
+}

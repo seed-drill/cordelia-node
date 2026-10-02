@@ -141,7 +141,7 @@ Rate limiting and resource caps. Protects against DoS, Sybil attacks, and storag
 | `max_connections_per_ip` | integer | `5` | > 0 | Maximum connections from a single IP address. | network-protocol.md SS12.4 |
 | `max_connections_per_subnet` | integer | `20` | > 0 | Maximum connections from a single /24 subnet. | network-protocol.md SS12.4 |
 | `max_streams_per_connection` | integer | `64` | > 0 | Maximum concurrent QUIC streams per connection. | network-protocol.md SS12.4 |
-| `max_item_bytes` | integer | `262144` (256 KB) | > 0 | Maximum size of a single item in bytes. Enforced at API write, P2P receive, and outbound replication. | network-protocol.md SS9.2, SS12.4 |
+| `max_item_bytes` | integer | `65536` (64 KB) | > 0 | Maximum size of a single item in bytes, as it travels. The limit is compiled in (`MAX_ITEM_BYTES`) and checked by the sender, each relay and the receiving device; this setting is not read. | network-protocol.md SS9.2, SS12.4 |
 | `max_message_bytes` | integer | `1048576` (1 MB) | > 0 | Maximum wire message size. Messages exceeding this are rejected and the stream is reset. | network-protocol.md SS3.1, SS12.4 |
 | `writes_per_peer_per_minute` | integer | `10` | > 0 | Maximum writes accepted from a single peer per minute. | network-protocol.md SS12.4 |
 | `writes_per_channel_per_minute` | integer | `100` | > 0 | Maximum writes per channel per minute (aggregate across all peers). | network-protocol.md SS12.4 |
@@ -274,7 +274,7 @@ max_inbound_connections = 200              # Total inbound QUIC connections
 max_connections_per_ip = 5                 # Connections per IP
 max_connections_per_subnet = 20            # Connections per /24 subnet
 max_streams_per_connection = 64            # QUIC streams per connection
-max_item_bytes = 262144                    # 256 KB per item
+max_item_bytes = 65536                     # 64 KB per item
 max_message_bytes = 1048576                # 1 MB per wire message
 writes_per_peer_per_minute = 10            # Per-peer write rate
 writes_per_channel_per_minute = 100        # Per-channel write rate (aggregate)

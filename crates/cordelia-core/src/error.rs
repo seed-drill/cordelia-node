@@ -25,6 +25,10 @@ pub enum CordeliaError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// An entry that is over the size every entry must fit in as it travels.
+    #[error("entry is {bytes} bytes as it travels; the limit is {limit}")]
+    TooLarge { bytes: usize, limit: usize },
+
     #[error("crypto error: {0}")]
     Crypto(String),
 
