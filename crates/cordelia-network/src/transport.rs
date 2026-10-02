@@ -50,8 +50,17 @@ pub enum TransportError {
 pub fn generate_self_signed_cert(
     identity: &NodeIdentity,
 ) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
-    let bech32_pk = encode_public_key(&identity.public_key())
-        .map_err(|e| TransportError::CertGen(e.to_string()))?;
+    self_signed_cert_naming(identity, &identity.public_key())
+}
+
+/// A certificate signed with `identity`'s key whose Subject CN names
+/// `named`. A node always names its own key; the tests name another, to
+/// check that such a certificate is refused.
+fn self_signed_cert_naming(
+    identity: &NodeIdentity,
+    named: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
+    let bech32_pk = encode_public_key(named).map_err(|e| TransportError::CertGen(e.to_string()))?;
 
     // rcgen needs the Ed25519 seed in PKCS#8 DER format
     let pkcs8_der = ed25519_seed_to_pkcs8(identity.seed());
@@ -96,7 +105,13 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 /// Build a quinn ServerConfig that accepts self-signed Ed25519 certificates.
 pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportError> {
     let (cert_der, key_der) = generate_self_signed_cert(identity)?;
+    server_config_with_cert(cert_der, key_der)
+}
 
+fn server_config_with_cert(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<ServerConfig, TransportError> {
     let cert = CertificateDer::from(cert_der);
     let key = PrivatePkcs8KeyDer::from(key_der);
 
@@ -133,7 +148,13 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
 /// Build a quinn ClientConfig that accepts self-signed Ed25519 certificates.
 pub fn client_config(identity: &NodeIdentity) -> Result<ClientConfig, TransportError> {
     let (cert_der, key_der) = generate_self_signed_cert(identity)?;
+    client_config_with_cert(cert_der, key_der)
+}
 
+fn client_config_with_cert(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<ClientConfig, TransportError> {
     let cert = CertificateDer::from(cert_der);
     let key = PrivatePkcs8KeyDer::from(key_der);
 
@@ -194,18 +215,38 @@ pub fn create_client_endpoint(
     Ok(endpoint)
 }
 
-/// Extract the Ed25519 public key (node_id) from a peer's TLS certificate.
+/// Object identifier of Ed25519 keys (RFC 8410).
+const OID_ED25519: &str = "1.3.101.112";
+
+/// The node ID a peer's TLS certificate proves: the Ed25519 key the
+/// certificate carries.
 ///
-/// Parses the certificate's Subject CN, which must be a valid Bech32
-/// cordelia_pk1... string, and decodes it to raw 32-byte key.
+/// TLS checks that the peer holds the certificate's own key (its
+/// `CertificateVerify` signature is verified against it), so that key is the
+/// only identity a connection proves. The Subject CN repeats the key as a
+/// Bech32 `cordelia_pk1...` string. A peer writes its own CN, so the CN is
+/// never the source of the ID, and a certificate whose CN names a different
+/// key is refused.
 pub fn extract_peer_node_id(cert_chain: &[CertificateDer<'_>]) -> Result<[u8; 32], TransportError> {
     let cert = cert_chain
         .first()
         .ok_or_else(|| TransportError::IdentityBinding("no certificate in chain".into()))?;
 
-    // Parse X.509 to extract Subject CN
     let (_, parsed) = x509_parser::parse_x509_certificate(cert)
         .map_err(|e| TransportError::IdentityBinding(format!("X.509 parse failed: {e}")))?;
+
+    let spki = parsed.public_key();
+    if spki.algorithm.algorithm.to_id_string() != OID_ED25519 {
+        return Err(TransportError::IdentityBinding(
+            "certificate key is not Ed25519".into(),
+        ));
+    }
+    let key: [u8; 32] = spki
+        .subject_public_key
+        .data
+        .as_ref()
+        .try_into()
+        .map_err(|_| TransportError::IdentityBinding("certificate key is not 32 bytes".into()))?;
 
     let cn = parsed
         .subject()
@@ -214,12 +255,15 @@ pub fn extract_peer_node_id(cert_chain: &[CertificateDer<'_>]) -> Result<[u8; 32
         .ok_or_else(|| TransportError::IdentityBinding("no CN in certificate subject".into()))?
         .as_str()
         .map_err(|e| TransportError::IdentityBinding(format!("CN is not UTF-8: {e}")))?;
-
-    // Decode Bech32 cordelia_pk1... to raw bytes
-    let pk = cordelia_crypto::bech32::decode_public_key(cn)
+    let named = cordelia_crypto::bech32::decode_public_key(cn)
         .map_err(|e| TransportError::IdentityBinding(format!("invalid Bech32 CN: {e}")))?;
+    if named != key {
+        return Err(TransportError::IdentityBinding(
+            "certificate names a key other than its own".into(),
+        ));
+    }
 
-    Ok(pk)
+    Ok(key)
 }
 
 // ── Custom TLS verifiers ───────────────────────────────────────────
@@ -232,9 +276,10 @@ fn sig_verify_algos() -> &'static rustls::crypto::WebPkiSupportedAlgorithms {
     ALGOS.get_or_init(|| rustls::crypto::ring::default_provider().signature_verification_algorithms)
 }
 
-/// Server certificate verifier: accepts any self-signed Ed25519 cert
-/// with a valid cordelia_pk1... CN. Identity verification happens at
-/// the application layer (handshake §4.1.6).
+/// Server certificate verifier: accepts any self-signed Ed25519
+/// certificate that names its own key ([`extract_peer_node_id`]). TLS then
+/// proves the peer holds that key. Whether that key is the node the caller
+/// meant to reach is the caller's question.
 #[derive(Debug)]
 struct CordeliaServerVerifier;
 
@@ -275,8 +320,8 @@ impl rustls::client::danger::ServerCertVerifier for CordeliaServerVerifier {
     }
 }
 
-/// Client certificate verifier: accepts any self-signed Ed25519 cert
-/// with a valid cordelia_pk1... CN.
+/// Client certificate verifier: accepts any self-signed Ed25519
+/// certificate that names its own key ([`extract_peer_node_id`]).
 #[derive(Debug)]
 struct CordeliaClientVerifier;
 
@@ -346,6 +391,83 @@ mod tests {
         let cert = CertificateDer::from(cert_der);
         let extracted = extract_peer_node_id(&[cert]).unwrap();
         assert_eq!(extracted, id.public_key());
+    }
+
+    /// T19. A certificate signed with one key that names another is
+    /// refused: the name is the peer's own claim, and only the key is proved.
+    #[test]
+    fn a_certificate_that_names_another_key_is_refused() {
+        let own = NodeIdentity::generate().unwrap();
+        let victim = NodeIdentity::generate().unwrap();
+        let (cert_der, _) = self_signed_cert_naming(&own, &victim.public_key()).unwrap();
+        let err = extract_peer_node_id(&[CertificateDer::from(cert_der)]).unwrap_err();
+        assert!(
+            err.to_string().contains("names a key other than its own"),
+            "{err}"
+        );
+    }
+
+    /// T19. A node cannot connect under a key it does not hold: a listening
+    /// node refuses a client whose certificate names someone else's key.
+    #[tokio::test]
+    async fn a_client_that_names_another_key_cannot_connect() {
+        let server_id = NodeIdentity::generate().unwrap();
+        let attacker = NodeIdentity::generate().unwrap();
+        let victim = NodeIdentity::generate().unwrap();
+
+        let server = create_endpoint(&server_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let result = incoming.await;
+            server.close(0u32.into(), b"done");
+            result.is_ok()
+        });
+
+        let (cert, key) = self_signed_cert_naming(&attacker, &victim.public_key()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config_with_cert(cert, key).unwrap());
+        // In TLS 1.3 the client finishes first, so its side may briefly look
+        // connected; what matters is that the server never accepts it.
+        if let Ok(conn) = client.connect(server_addr, "cordelia").unwrap().await {
+            conn.closed().await;
+        }
+        assert!(
+            !accepted.await.unwrap(),
+            "the server accepted a client that named a key it does not hold"
+        );
+        client.close(0u32.into(), b"done");
+    }
+
+    /// T19. Nor can a node answer under a key it does not hold: a client
+    /// refuses a server whose certificate names someone else's key.
+    #[tokio::test]
+    async fn a_server_that_names_another_key_is_refused() {
+        let attacker = NodeIdentity::generate().unwrap();
+        let victim = NodeIdentity::generate().unwrap();
+        let client_id = NodeIdentity::generate().unwrap();
+
+        let (cert, key) = self_signed_cert_naming(&attacker, &victim.public_key()).unwrap();
+        let server = Endpoint::server(
+            server_config_with_cert(cert, key).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let _ = incoming.await;
+            }
+        });
+
+        let client = create_client_endpoint(&client_id, "127.0.0.1".parse().unwrap()).unwrap();
+        let result = client.connect(server_addr, "cordelia").unwrap().await;
+        assert!(
+            result.is_err(),
+            "the client connected to a server that named a key it does not hold"
+        );
+        client.close(0u32.into(), b"done");
+        serving.abort();
     }
 
     #[test]

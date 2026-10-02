@@ -23,6 +23,7 @@ belongs to something that is not built or designed in public yet.
 | T16 | A device that was removed | Read what is written after its removal, and keep writing | The channel's key changes on removal and goes only to the devices that remain. What a removed device writes afterwards is shown to nobody | tested |
 | T17 | Another program running as the same user | Read the node's files and memory, and call its local API | Nothing. Cordelia does not defend against this; real separation needs separate users or machines | not defended |
 | T18 | Anyone who carries or stores an entry | Move it to another channel, give it another name, present an old revision as a newer one, change its content, or forge its author | Each of these makes the entry fail its signature or fail to decrypt, and it is ignored | tested |
+| T19 | Someone who claims to be another device or relay | Connect, or answer, under another node's key, to take over its connection or be taken for it | A node's ID is the key its TLS certificate proves, so nobody can connect or answer under a key they do not hold. A device does not yet check which key answers at a relay's address | partly tested (#70) |
 
 ## Tests
 
@@ -41,6 +42,11 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-network/src/item_sync.rs`: `test_verify_item_signature`
 - `crates/cordelia-crypto/src/slots.rs`: `test_aad_binds_slot_and_rev`
 - `crates/cordelia-api/tests/entries.rs`: `only_members_writing_the_right_key_count`
+
+### T19
+- `crates/cordelia-network/src/transport.rs`: `a_certificate_that_names_another_key_is_refused`
+- `crates/cordelia-network/src/transport.rs`: `a_client_that_names_another_key_cannot_connect`
+- `crates/cordelia-network/src/transport.rs`: `a_server_that_names_another_key_is_refused`
 
 ## How CI checks this
 
