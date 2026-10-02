@@ -190,6 +190,13 @@ Personal nodes are outbound-only and there is no NAT traversal, so two devices a
 - **A device's network is its configured relays, and nothing else (2026-10-02).** It dials only those. It does not ask a relay for other peers' addresses, and learns of no relay from DNS, so a relay cannot send it anywhere. Each configured relay that is not connected is dialled again at a slowing pace: one governor tick, doubling, up to fifteen minutes while another relay is connected, and at least every half minute while none is. `cordelia peers` and `cordelia status --json` say which relays are not connected, since when, and why. Starting no longer waits on a relay that is unreachable.
 - **A device stores only what belongs in its own channels (2026-10-02).** A relay stores what anyone sends to a channel, since it cannot tell a channel's members from anyone else. A device can: it stores an entry only if it and the entry's author are both members of the channel, and it tells from the entry's header, before fetching the rest. Its own inbox takes anything, since an invitation comes from a key that is in no channel with it yet. So a stranger who knows a channel's ID can put entries at a relay, and none of them reaches a device's disk.
   - A member that a device has not heard of yet may already have written. When a state adds members, the device lists the channel again from the start and fetches what it refused.
+- **What one connection can cost a node is bounded (2026-10-02).**
+  - A peer may have 64 streams open at once, and may send two messages' worth that the node has not read. Before, it was 1,000 streams with a megabyte each.
+  - A connection may make 36 pushes a minute and push 2 MB of entries a minute. All the connections from one address share five times that: a key costs nothing to replace, and an address does. A request over a limit is refused at once.
+  - A peer that goes over three times in ten minutes is cut off, and its address is refused for 15 minutes. Before, going over was logged and nothing followed.
+  - An address that already has its five connections, or is refused, is turned away as its connection arrives, before the cost of a handshake.
+  - Signatures are checked before the database is held, so a peer cannot stall a node by keeping it busy checking.
+  - A device paces what it pushes to 1.5 MB a minute to each relay, so it is never the one refused. Two relays that list each other are not limited.
 - **Retention** for relays is not implemented yet (section 9).
 
 ### 4.7 Memory is the boundary (decided 2026-10-01)

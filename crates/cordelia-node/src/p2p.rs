@@ -14,6 +14,115 @@ pub enum GovEvent {
     ItemsDelivered(NodeId, u64),
     ChannelAnnounced(NodeId, String),
     ChannelWithdrawn(NodeId, String),
+    /// The peer kept going over its rate limits, from this address. Its
+    /// connection has been closed.
+    OverLimit(NodeId, std::net::IpAddr),
+}
+
+/// What each connection, and each address, has sent lately (§9.2).
+///
+/// A connection has its own allowance. All the connections from one address
+/// share MAX_CONNECTIONS_PER_IP times that, which is what makes the limits
+/// hold against a peer that reconnects or comes back under another key.
+#[derive(Default)]
+pub struct Rates {
+    by_peer: std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
+    by_address:
+        std::collections::HashMap<std::net::IpAddr, cordelia_network::rate_limit::PeerRateLimiter>,
+}
+
+/// A request that is over a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverLimit {
+    /// This is one breach too many: the peer is to be cut off.
+    pub cut_off: bool,
+}
+
+impl Rates {
+    fn both(
+        &mut self,
+        peer: &NodeId,
+        address: std::net::IpAddr,
+    ) -> [&mut cordelia_network::rate_limit::PeerRateLimiter; 2] {
+        use cordelia_network::rate_limit::PeerRateLimiter;
+        let per_address = cordelia_core::protocol::MAX_CONNECTIONS_PER_IP as u32;
+        [
+            self.by_peer.entry(peer.clone()).or_default(),
+            self.by_address
+                .entry(address)
+                .or_insert_with(|| PeerRateLimiter::for_connections(per_address)),
+        ]
+    }
+
+    fn over(limiters: [&mut cordelia_network::rate_limit::PeerRateLimiter; 2]) -> OverLimit {
+        let mut cut_off = false;
+        for limiter in limiters {
+            cut_off |= limiter.record_breach();
+        }
+        OverLimit { cut_off }
+    }
+
+    /// Count one stream of `protocol` opened by `peer` from `address`. A
+    /// request that is refused counts against neither allowance.
+    pub fn request(
+        &mut self,
+        peer: &NodeId,
+        address: std::net::IpAddr,
+        protocol: cordelia_network::messages::Protocol,
+    ) -> Result<(), OverLimit> {
+        use cordelia_network::messages::Protocol;
+        use cordelia_network::rate_limit::{PeerRateLimiter, RateCounter};
+        fn counter(limiter: &mut PeerRateLimiter, protocol: Protocol) -> Option<&mut RateCounter> {
+            match protocol {
+                Protocol::ItemPush => Some(&mut limiter.writes),
+                Protocol::ItemSync => Some(&mut limiter.syncs),
+                Protocol::PeerSharing => Some(&mut limiter.peer_shares),
+                _ => None,
+            }
+        }
+        let mut limiters = self.both(peer, address);
+        let over = limiters
+            .iter_mut()
+            .any(|limiter| counter(limiter, protocol).is_some_and(|c| c.would_exceed()));
+        if over {
+            return Err(Self::over(limiters));
+        }
+        for limiter in &mut limiters {
+            if let Some(counter) = counter(limiter, protocol) {
+                counter.check_and_record();
+            }
+        }
+        Ok(())
+    }
+
+    /// Count `bytes` of entries pushed by `peer` from `address`. A push
+    /// that is refused counts against neither allowance.
+    pub fn pushed(
+        &mut self,
+        peer: &NodeId,
+        address: std::net::IpAddr,
+        bytes: u64,
+    ) -> Result<(), OverLimit> {
+        let mut limiters = self.both(peer, address);
+        if limiters
+            .iter_mut()
+            .any(|limiter| limiter.write_bytes.room() < bytes)
+        {
+            return Err(Self::over(limiters));
+        }
+        for limiter in &mut limiters {
+            limiter.write_bytes.check_and_record(bytes);
+        }
+        Ok(())
+    }
+
+    /// Forget peers that are no longer connected, and addresses that have
+    /// no connection and no recent breach.
+    pub fn prune(&mut self, connected: &[NodeId], open: &[std::net::IpAddr]) {
+        self.by_peer.retain(|peer, _| connected.contains(peer));
+        self.by_address
+            .retain(|address, limiter| open.contains(address) || limiter.has_recent_breach());
+    }
 }
 
 /// Open a bidirectional QUIC stream with a standard 10s timeout.
@@ -37,15 +146,31 @@ async fn open_bi(
 /// with key `own`) stores only what belongs in its own channels: an entry
 /// in a channel it is a member of, written by a member of that channel;
 /// and what is sent to its own inbox.
+#[cfg(test)]
 pub fn store_item(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
     node_role: &str,
     own: &[u8; 32],
 ) -> Result<bool, &'static str> {
-    use cordelia_network::messages::{
-        REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
-    };
+    store_checked(db, item, &check_item(item)?, node_role, own)
+}
+
+/// An item that has passed every check that needs no database: its size,
+/// its hash, its signature and its shape.
+pub struct Checked {
+    author: [u8; 32],
+    hash: [u8; 32],
+    signature: [u8; 64],
+    slot: Option<[u8; 32]>,
+}
+
+/// Check an item before the database is touched: the checks cost a hash
+/// and a signature for each item, and a node that did them while holding
+/// its database would stop everything else for as long as a peer cared to
+/// keep it busy.
+pub fn check_item(item: &cordelia_network::messages::Item) -> Result<Checked, &'static str> {
+    use cordelia_network::messages::{REFUSED_INVALID, REFUSED_TOO_LARGE};
 
     // One size for every entry, at every hop: a relay and a device both
     // refuse a larger one, whoever sends it.
@@ -63,6 +188,37 @@ pub fn store_item(
         tracing::warn!(item = %item.item_id, "invalid item signature");
         return Err(REFUSED_INVALID);
     }
+    let (Ok(author), Ok(hash), Ok(signature)) = (
+        <[u8; 32]>::try_from(item.author_id.as_slice()),
+        <[u8; 32]>::try_from(item.content_hash.as_slice()),
+        <[u8; 64]>::try_from(item.signature.as_slice()),
+    ) else {
+        return Err(REFUSED_INVALID);
+    };
+    // Well-formed after verify_item_signature: 32 bytes, set with rev.
+    let slot: Option<[u8; 32]> = item
+        .slot
+        .as_ref()
+        .and_then(|s| s.as_slice().try_into().ok());
+    Ok(Checked {
+        author,
+        hash,
+        signature,
+        slot,
+    })
+}
+
+/// Store an item that [`check_item`] has passed.
+pub fn store_checked(
+    db: &rusqlite::Connection,
+    item: &cordelia_network::messages::Item,
+    checked: &Checked,
+    node_role: &str,
+    own: &[u8; 32],
+) -> Result<bool, &'static str> {
+    use cordelia_network::messages::{
+        REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
+    };
 
     // Relay: ensure channel row exists (no FK violation, BV-21)
     if node_role == "relay" {
@@ -72,41 +228,24 @@ pub fn store_item(
         );
     }
 
-    let author: [u8; 32] = match item.author_id.as_slice().try_into() {
-        Ok(a) => a,
-        Err(_) => return Err(REFUSED_INVALID),
-    };
-    if node_role == "personal" && !wanted_by_a_device(db, &item.channel_id, &author, own) {
+    if node_role == "personal" && !wanted_by_a_device(db, &item.channel_id, &checked.author, own) {
         tracing::debug!(item = %item.item_id, channel = %item.channel_id, "not written by a member of one of this device's channels; not stored");
         return Err(REFUSED_NOT_MEMBER);
     }
-    let hash: [u8; 32] = match item.content_hash.as_slice().try_into() {
-        Ok(h) => h,
-        Err(_) => return Err(REFUSED_INVALID),
-    };
-    let sig: [u8; 64] = match item.signature.as_slice().try_into() {
-        Ok(s) => s,
-        Err(_) => return Err(REFUSED_INVALID),
-    };
-    // Well-formed after verify_item_signature: 32 bytes, set with rev.
-    let slot: Option<[u8; 32]> = item
-        .slot
-        .as_ref()
-        .and_then(|s| s.as_slice().try_into().ok());
 
     let new_item = cordelia_storage::items::NewItem {
         item_id: &item.item_id,
         channel_id: &item.channel_id,
-        author_id: &author,
+        author_id: &checked.author,
         item_type: &item.item_type,
         published_at: &item.published_at,
         parent_id: item.parent_id.as_deref(),
         key_version: item.key_version as i64,
-        content_hash: &hash,
-        signature: &sig,
+        content_hash: &checked.hash,
+        signature: &checked.signature,
         encrypted_blob: &item.encrypted_blob,
         is_tombstone: item.is_tombstone,
-        slot: slot.as_ref(),
+        slot: checked.slot.as_ref(),
         rev: item.rev,
     };
 
@@ -163,6 +302,20 @@ fn wanted_by_a_device(
 struct OutboxRefusals {
     items: std::collections::HashMap<String, RefusedItem>,
     relays: std::collections::HashMap<NodeId, (u32, std::time::Instant)>,
+    /// What has been pushed to each relay in the last minute. A device
+    /// with a lot to send paces itself to OUTBOX_BYTES_PER_MINUTE, which is
+    /// under what a relay allows one connection, so that it is never the
+    /// one refused for going over.
+    sent: std::collections::HashMap<NodeId, cordelia_network::rate_limit::ByteCounter>,
+}
+
+/// How many bytes may go to a relay in the next push, given what went to
+/// it in the last minute: nothing if there is not room for one entry of
+/// the largest size, else up to a full batch.
+fn outbox_room(sent: &mut cordelia_network::rate_limit::ByteCounter) -> Option<usize> {
+    use cordelia_core::protocol::{MAX_ITEM_BYTES, OUTBOX_BATCH_MAX_BYTES};
+    let room = sent.room();
+    (room >= MAX_ITEM_BYTES as u64).then(|| OUTBOX_BATCH_MAX_BYTES.min(room as usize))
 }
 
 struct RefusedItem {
@@ -266,8 +419,8 @@ fn flush_outbox(
         return;
     }
     let now = std::time::Instant::now();
-    let (target, skip) = {
-        let held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+    let (target, skip, room) = {
+        let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
         // The next relay in turn that is not being left alone.
         let Some(target) = (0..relays.len())
             .map(|i| &relays[(*rotation + i) % relays.len()])
@@ -286,7 +439,18 @@ fn flush_outbox(
             .filter(|(_, item)| item.next_try > now)
             .map(|(id, _)| id.clone())
             .collect();
-        (target, skip)
+        // Paced: nothing more goes to a relay that has had its share for
+        // the minute.
+        let sent = held.sent.entry(target.clone()).or_insert_with(|| {
+            cordelia_network::rate_limit::ByteCounter::new(
+                std::time::Duration::from_secs(cordelia_core::protocol::RATE_WINDOW_SECS),
+                cordelia_core::protocol::OUTBOX_BYTES_PER_MINUTE,
+            )
+        });
+        let Some(room) = outbox_room(sent) else {
+            return;
+        };
+        (target, skip, room)
     };
     let Some(conn) = conn_mgr.get_connection(&target).cloned() else {
         return;
@@ -316,7 +480,7 @@ fn flush_outbox(
             &db,
             &pk,
             cordelia_core::protocol::OUTBOX_BATCH_MAX_ITEMS,
-            cordelia_core::protocol::OUTBOX_BATCH_MAX_BYTES,
+            room,
             &skip,
         )
         .unwrap_or_default()
@@ -326,6 +490,18 @@ fn flush_outbox(
         return;
     }
     *rotation = rotation.wrapping_add(1);
+    {
+        let bytes: u64 = batch.iter().map(|i| i.encrypted_blob.len() as u64).sum();
+        let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sent) = held.sent.get_mut(&target) {
+            // Recorded even if it is over (an entry from before the size
+            // limit): the relay counts it too.
+            if !sent.check_and_record(bytes) {
+                let rest = sent.room();
+                sent.check_and_record(rest);
+            }
+        }
+    }
 
     let ids: Vec<String> = batch.iter().map(|i| i.item_id.clone()).collect();
     let items: Vec<cordelia_network::messages::Item> = batch
@@ -434,11 +610,7 @@ pub fn post_connect(
     node_role: &str,
     repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
-    peer_rates: &std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
-        >,
-    >,
+    peer_rates: &std::sync::Arc<std::sync::Mutex<Rates>>,
     peer_states: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
     peer_relays: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
@@ -630,11 +802,16 @@ pub async fn p2p_loop(
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
     // Per-peer rate limiters, shared with handle_peer_streams tasks
-    let peer_rates: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
-        >,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let peer_rates: std::sync::Arc<std::sync::Mutex<Rates>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+    // Addresses refused for a time, after a peer there kept going over its
+    // limits. An address, since a key costs nothing to replace.
+    let mut refused_addresses: std::collections::HashMap<std::net::IpAddr, std::time::Instant> =
+        std::collections::HashMap::new();
+    // Inbound connections that have arrived and not finished their
+    // handshake. They count towards the limits for an address at once.
+    let arriving: std::sync::Arc<std::sync::Mutex<Vec<std::net::IpAddr>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Shared peer state map for protocol gating (connection-lifecycle.md §2.2 Option A).
     // Governor tick updates this; handle_peer_streams reads it to gate protocols by state.
@@ -843,10 +1020,42 @@ pub async fn p2p_loop(
             result = endpoint.accept() => {
                 match result {
                     Some(incoming) => {
+                        // Counted as it arrives, before the cost of a
+                        // handshake: an address that is refused for a time,
+                        // or already has its share of connections (open or
+                        // still arriving), is turned away here.
+                        let address = incoming.remote_address().ip();
+                        let refused = refused_addresses
+                            .get(&address)
+                            .is_some_and(|until| *until > std::time::Instant::now());
+                        let room = {
+                            let arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
+                            cordelia_network::rate_limit::ConnectionTracker::from_ips(
+                                conn_mgr
+                                    .inbound_ips(&NodeId([0u8; 32]))
+                                    .into_iter()
+                                    .chain(arriving.iter().copied()),
+                            )
+                            .would_allow(address)
+                        };
+                        if refused || !room {
+                            tracing::debug!(%address, refused, "turning an inbound connection away before the handshake");
+                            incoming.refuse();
+                            continue;
+                        }
+                        arriving.lock().unwrap_or_else(|e| e.into_inner()).push(address);
                         let ctx = connect_ctx.clone();
                         let tx = connect_tx.clone();
+                        let arriving = arriving.clone();
                         tokio::spawn(async move {
-                            match cordelia_network::connection::inbound_accept(&ctx, incoming).await {
+                            let accepted = cordelia_network::connection::inbound_accept(&ctx, incoming).await;
+                            {
+                                let mut arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(at) = arriving.iter().position(|a| *a == address) {
+                                    arriving.swap_remove(at);
+                                }
+                            }
+                            match accepted {
                                 Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "inbound accept failed");
@@ -961,6 +1170,21 @@ pub async fn p2p_loop(
 
                         if direction == Direction::Outbound {
                             gov_pending.remove(&addr);
+                        }
+                        // A peer that was cut off for going over its limits
+                        // is not taken back until its time is up, whichever
+                        // address it comes from.
+                        if direction == Direction::Inbound
+                            && governor
+                                .peer_info(&outcome.node_id)
+                                .is_some_and(|peer| peer.state.is_banned())
+                        {
+                            tracing::debug!(peer = %outcome.node_id, "refusing a peer that was cut off");
+                            outcome.conn.close(
+                                quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT),
+                                b"refused for a time",
+                            );
+                            continue;
                         }
 
                         match conn_mgr.register(outcome) {
@@ -1612,13 +1836,17 @@ pub async fn p2p_loop(
 
                                         let mut stored_count = 0u32;
                                         let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
+                                        // Checked before the database is held.
+                                        let checked: Vec<Result<Checked, &'static str>> = items.iter().map(check_item).collect();
                                         {
                                             let db = match sync_state.db.lock() {
                                                 Ok(db) => db,
                                                 Err(_) => break 'channels,
                                             };
-                                            for item in &items {
-                                                if let Ok(true) = store_item(&db, item, &role, &sync_state.identity.public_key()) {
+                                            let own = sync_state.identity.public_key();
+                                            for (item, checked) in items.iter().zip(checked) {
+                                                let outcome = checked.and_then(|checked| store_checked(&db, item, &checked, &role, &own));
+                                                if let Ok(true) = outcome {
                                                     stored_count += 1;
                                                     if is_relay_node {
                                                         newly_stored_items.push(item.clone());
@@ -1671,23 +1899,29 @@ pub async fn p2p_loop(
                 }
             }
 
+            // ── Events from the stream handlers ───────────────────────
+            // Taken as they arrive: a peer that is cut off must find its
+            // address refused at once, not at the next tick.
+            Some(event) = gov_rx.recv() => {
+                apply_gov_event(event, &mut governor, &mut conn_mgr, &mut refused_addresses);
+            }
+
             // ── Governor tick ─────────────────────────────────────────
             _ = gov_interval.tick() => {
-                // Drain event channels
                 while let Ok(event) = gov_rx.try_recv() {
-                    match event {
-                        GovEvent::ItemsDelivered(peer_id, count) => {
-                            governor.record_items_delivered(&peer_id, count);
-                        }
-                        GovEvent::ChannelAnnounced(peer_id, channel_id) => {
-                            governor.add_peer_channel(&peer_id, &channel_id);
-                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: added peer channel");
-                        }
-                        GovEvent::ChannelWithdrawn(peer_id, channel_id) => {
-                            governor.remove_peer_channel(&peer_id, &channel_id);
-                            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: removed peer channel");
-                        }
-                    }
+                    apply_gov_event(event, &mut governor, &mut conn_mgr, &mut refused_addresses);
+                }
+                // Forget addresses whose time is up, and the allowances of
+                // peers and addresses that have gone.
+                let now = std::time::Instant::now();
+                refused_addresses.retain(|_, until| *until > now);
+                {
+                    let connected = conn_mgr.connected_peers();
+                    let open = conn_mgr.inbound_ips(&NodeId([0u8; 32]));
+                    peer_rates
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .prune(&connected, &open);
                 }
                 while let Ok((peer_id, count)) = delivery_rx.try_recv() {
                     governor.record_items_delivered(&peer_id, count);
@@ -2129,6 +2363,65 @@ fn publish_relays(
     }
 }
 
+/// Act on an event from a stream handler.
+fn apply_gov_event(
+    event: GovEvent,
+    governor: &mut cordelia_network::governor::Governor,
+    conn_mgr: &mut cordelia_network::connection::ConnectionManager,
+    refused_addresses: &mut std::collections::HashMap<std::net::IpAddr, std::time::Instant>,
+) {
+    match event {
+        GovEvent::ItemsDelivered(peer_id, count) => {
+            governor.record_items_delivered(&peer_id, count);
+        }
+        GovEvent::ChannelAnnounced(peer_id, channel_id) => {
+            governor.add_peer_channel(&peer_id, &channel_id);
+            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: added peer channel");
+        }
+        GovEvent::ChannelWithdrawn(peer_id, channel_id) => {
+            governor.remove_peer_channel(&peer_id, &channel_id);
+            tracing::debug!(peer = %peer_id, channel = %channel_id, "gov: removed peer channel");
+        }
+        GovEvent::OverLimit(peer_id, address) => {
+            governor.ban_peer(
+                &peer_id,
+                "over the rate limit".into(),
+                cordelia_network::governor::BanTier::Transient,
+            );
+            conn_mgr.disconnect(&peer_id);
+            refused_addresses.insert(
+                address,
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(cordelia_core::protocol::BAN_TRANSIENT_SECS),
+            );
+        }
+    }
+}
+
+/// Refuse a stream that is over a limit: both halves are ended with
+/// ERR_RATE_LIMIT, so the peer fails at once.
+fn refuse_stream(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) {
+    let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
+    let _ = send.reset(code);
+    let _ = recv.stop(code);
+}
+
+/// Close the connection of a peer that kept going over its limits, and
+/// tell the loop, which refuses its address for a time.
+fn cut_off(
+    conn: &quinn::Connection,
+    peer_id: &NodeId,
+    address: std::net::IpAddr,
+    gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
+) {
+    tracing::warn!(peer = %peer_id, %address, "over its rate limits again and again; closing the connection and refusing the address for a time");
+    conn.close(
+        quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT),
+        b"over the rate limit",
+    );
+    let _ = gov_tx.send(GovEvent::OverLimit(peer_id.clone(), address));
+}
+
 /// Handle inbound protocol streams from a connected peer.
 /// Runs until the connection closes.
 #[allow(clippy::too_many_arguments)]
@@ -2140,11 +2433,7 @@ pub async fn handle_peer_streams(
     node_role: String,
     repush_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
-    peer_rates: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
-        >,
-    >,
+    peer_rates: std::sync::Arc<std::sync::Mutex<Rates>>,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
     peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
@@ -2188,27 +2477,38 @@ pub async fn handle_peer_streams(
         tracing::debug!(peer = %peer_id, protocol = proto_name, stream = stream_count, "stream opened (inbound)");
         let stream_start = std::time::Instant::now();
 
-        // Per-peer rate limit check (§9.2)
-        {
-            let mut rates = peer_rates.lock().unwrap_or_else(|e| e.into_inner());
-            let limiter = rates.entry(peer_id.clone()).or_default();
-            let allowed = match protocol {
-                cordelia_network::messages::Protocol::ItemPush => limiter.writes.check_and_record(),
-                cordelia_network::messages::Protocol::ItemSync => limiter.syncs.check_and_record(),
-                cordelia_network::messages::Protocol::PeerSharing => {
-                    limiter.peer_shares.check_and_record()
-                }
-                _ => true,
-            };
-            if !allowed {
-                let should_ban = limiter.record_breach();
-                tracing::warn!(peer = %peer_id, protocol = proto_name, ban = should_ban, "rate limit exceeded");
-                if should_ban {
-                    // Ban handled by governor on next tick (peer removed from hot set)
-                    tracing::warn!(peer = %peer_id, "banning peer for repeated rate limit breaches");
-                }
-                continue;
+        // Rate limits (§9.2): this connection's allowance, and its
+        // address's. A request over either is refused at once, so the peer
+        // does not wait for an answer that is not coming. A peer that keeps
+        // going over is cut off, and its address refused for a time.
+        //
+        // A relay this node was configured with is never cut off. Between
+        // two relays that list each other there is no limit at all: they
+        // are one operator's, and each passes on everything its devices
+        // send. A device still counts what its relay asks of it.
+        let address = conn.remote_address().ip();
+        let own_relay = peer_relays
+            .read()
+            .ok()
+            .is_some_and(|relays| relays.contains(&peer_id));
+        let unlimited = own_relay && node_role == "relay";
+        let over = if unlimited {
+            None
+        } else {
+            peer_rates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .request(&peer_id, address, protocol)
+                .err()
+        };
+        if let Some(over) = over {
+            tracing::warn!(peer = %peer_id, protocol = proto_name, cut_off = over.cut_off, "rate limit exceeded");
+            refuse_stream(&mut send, &mut recv);
+            if over.cut_off && !own_relay {
+                cut_off(&conn, &peer_id, address, &gov_tx);
+                break;
             }
+            continue;
         }
 
         // Protocol gating by peer state (§5.4.2, §7.2)
@@ -2246,7 +2546,7 @@ pub async fn handle_peer_streams(
                 continue;
             }
             cordelia_network::messages::Protocol::ItemPush => {
-                handle_inbound_push(
+                let over = handle_inbound_push(
                     &mut send,
                     &mut recv,
                     &peer_id,
@@ -2255,8 +2555,14 @@ pub async fn handle_peer_streams(
                     &repush_tx,
                     &delivery_tx,
                     &seen_table,
+                    (!unlimited).then_some(&peer_rates),
+                    address,
                 )
                 .await;
+                if over.is_some_and(|over| over.cut_off) && !own_relay {
+                    cut_off(&conn, &peer_id, address, &gov_tx);
+                    break;
+                }
             }
             cordelia_network::messages::Protocol::ItemSync => {
                 let is_swarm_peer = swarm_members
@@ -2313,19 +2619,46 @@ async fn handle_inbound_push(
     repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
-) {
+    peer_rates: Option<&std::sync::Arc<std::sync::Mutex<Rates>>>,
+    address: std::net::IpAddr,
+) -> Option<OverLimit> {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
-            return;
+            return None;
         }
     };
 
     let payload = match msg {
         cordelia_network::messages::WireMessage::PushPayload(p) => p,
-        _ => return,
+        _ => return None,
     };
+
+    // The bytes this push carries count against the connection's allowance
+    // and its address's. Over either, the push is refused whole: no answer,
+    // so a sender on any version keeps what it sent and offers it again.
+    let bytes: u64 = payload
+        .items
+        .iter()
+        .map(|item| item.encrypted_blob.len() as u64)
+        .sum();
+    let over = peer_rates.and_then(|rates| {
+        rates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pushed(peer_id, address, bytes)
+            .err()
+    });
+    if let Some(over) = over {
+        tracing::warn!(peer = %peer_id, bytes, cut_off = over.cut_off, "push over the byte allowance; refused");
+        refuse_stream(send, recv);
+        return Some(over);
+    }
+
+    // Checked before the database is held (see `check_item`).
+    let checked: Vec<Result<Checked, &'static str>> =
+        payload.items.iter().map(check_item).collect();
 
     // Track which items are newly stored (for selective re-push)
     let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
@@ -2333,13 +2666,16 @@ async fn handle_inbound_push(
     let (stored, dedup, rejected) = {
         let db = match state.db.lock() {
             Ok(db) => db,
-            Err(_) => return,
+            Err(_) => return None,
         };
+        let own = state.identity.public_key();
         let mut stored = 0u32;
         let mut dedup = 0u32;
         let mut rejected = 0u32;
-        for item in &payload.items {
-            match store_item(&db, item, node_role, &state.identity.public_key()) {
+        for (item, checked) in payload.items.iter().zip(checked) {
+            let outcome =
+                checked.and_then(|checked| store_checked(&db, item, &checked, node_role, &own));
+            match outcome {
                 Ok(true) => {
                     stored += 1;
                     newly_stored.push(item.clone());
@@ -2389,6 +2725,7 @@ async fn handle_inbound_push(
             refused,
         });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
+    None
 }
 
 async fn handle_inbound_sync(
@@ -3006,6 +3343,112 @@ mod tests {
         assert_eq!(
             store_item(&device, &later, "personal", &own),
             Err(REFUSED_NOT_MEMBER)
+        );
+    }
+
+    /// A device paces what it pushes to a relay: full batches while there is
+    /// room in the minute, then smaller ones, then nothing until there is
+    /// room for an entry of the largest size again.
+    #[test]
+    fn a_device_paces_what_it_pushes_to_a_relay() {
+        use cordelia_core::protocol::{
+            MAX_ITEM_BYTES, OUTBOX_BATCH_MAX_BYTES, OUTBOX_BYTES_PER_MINUTE,
+            PUSH_BYTES_PER_PEER_PER_MINUTE,
+        };
+        let mut sent = cordelia_network::rate_limit::ByteCounter::new(
+            std::time::Duration::from_secs(60),
+            OUTBOX_BYTES_PER_MINUTE,
+        );
+        let mut total = 0u64;
+        let mut pushes = 0;
+        while let Some(room) = outbox_room(&mut sent) {
+            assert!(room <= OUTBOX_BATCH_MAX_BYTES);
+            assert!(sent.check_and_record(room as u64));
+            total += room as u64;
+            pushes += 1;
+            assert!(pushes < 100, "never stops");
+        }
+        // It stops under what a relay allows a connection in a minute, with
+        // less than one entry's room left.
+        assert!(total <= OUTBOX_BYTES_PER_MINUTE);
+        assert!(total < PUSH_BYTES_PER_PEER_PER_MINUTE);
+        assert!(OUTBOX_BYTES_PER_MINUTE - total < MAX_ITEM_BYTES as u64);
+    }
+
+    /// T3. A connection has an allowance, and so does its address: the
+    /// connections from one address share five times what one may send. A
+    /// peer that reconnects, or comes back under another key, does not
+    /// start again from nothing. Going over three times cuts a peer off.
+    #[test]
+    fn limits_are_counted_for_a_connection_and_for_its_address() {
+        use cordelia_core::protocol::{
+            BAN_THRESHOLD, MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE,
+            WRITES_PER_PEER_PER_MINUTE,
+        };
+        use cordelia_network::messages::Protocol;
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let mut rates = Rates::default();
+        let peer = |n: u8| NodeId([n; 32]);
+
+        // One connection: its own allowance, then refusals, then cut off.
+        for _ in 0..WRITES_PER_PEER_PER_MINUTE {
+            assert_eq!(rates.request(&peer(1), address, Protocol::ItemPush), Ok(()));
+        }
+        for breach in 1..=BAN_THRESHOLD {
+            let over = rates
+                .request(&peer(1), address, Protocol::ItemPush)
+                .unwrap_err();
+            assert_eq!(over.cut_off, breach == BAN_THRESHOLD, "breach {breach}");
+        }
+
+        // The same address under new keys: each has its own allowance, until
+        // the address's share is used up.
+        let mut allowed = u64::from(WRITES_PER_PEER_PER_MINUTE);
+        let mut key = 2u8;
+        'address: loop {
+            for _ in 0..WRITES_PER_PEER_PER_MINUTE {
+                if rates
+                    .request(&peer(key), address, Protocol::ItemPush)
+                    .is_err()
+                {
+                    break 'address;
+                }
+                allowed += 1;
+            }
+            key += 1;
+            assert!(key < 50, "the address is never refused");
+        }
+        assert_eq!(
+            allowed,
+            u64::from(WRITES_PER_PEER_PER_MINUTE) * MAX_CONNECTIONS_PER_IP as u64
+        );
+        // Another address is not affected.
+        let elsewhere: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        assert_eq!(
+            rates.request(&peer(9), elsewhere, Protocol::ItemPush),
+            Ok(())
+        );
+
+        // Bytes: a connection may push so many in a minute.
+        let mut rates = Rates::default();
+        assert_eq!(
+            rates.pushed(&peer(1), address, PUSH_BYTES_PER_PEER_PER_MINUTE),
+            Ok(())
+        );
+        assert!(rates.pushed(&peer(1), address, 1).is_err());
+        // A peer that has gone is forgotten; its address's count is not.
+        rates.prune(&[], &[address]);
+        assert!(
+            rates
+                .pushed(&peer(1), address, PUSH_BYTES_PER_PEER_PER_MINUTE)
+                .is_ok(),
+            "a new connection has its own allowance"
+        );
+        assert!(
+            rates
+                .pushed(&peer(2), address, 4 * PUSH_BYTES_PER_PEER_PER_MINUTE)
+                .is_err(),
+            "the address's share is five connections' worth"
         );
     }
 

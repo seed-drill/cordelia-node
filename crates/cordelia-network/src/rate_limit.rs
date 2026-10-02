@@ -102,12 +102,60 @@ impl RateCounter {
     }
 }
 
+/// Sliding window counter for bytes.
+#[derive(Debug, Clone)]
+pub struct ByteCounter {
+    window: Duration,
+    max_bytes: u64,
+    events: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl ByteCounter {
+    pub fn new(window: Duration, max_bytes: u64) -> Self {
+        Self {
+            window,
+            max_bytes,
+            events: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// The bytes recorded within the window.
+    pub fn total(&mut self) -> u64 {
+        let now = Instant::now();
+        while self
+            .events
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= self.window)
+        {
+            self.events.pop_front();
+        }
+        self.events.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    /// How many more bytes fit in the window now.
+    pub fn room(&mut self) -> u64 {
+        self.max_bytes.saturating_sub(self.total())
+    }
+
+    /// Record `bytes`. Returns false, recording nothing, if that would take
+    /// the window over its limit.
+    pub fn check_and_record(&mut self, bytes: u64) -> bool {
+        if bytes > self.room() {
+            return false;
+        }
+        self.events.push_back((Instant::now(), bytes));
+        true
+    }
+}
+
 // ── Per-peer rate tracker ──────────────────────────────────────────
 
 /// Tracks rate limits for a single peer.
 #[derive(Debug)]
 pub struct PeerRateLimiter {
     pub writes: RateCounter,
+    /// Bytes of entries pushed.
+    pub write_bytes: ByteCounter,
     pub syncs: RateCounter,
     pub peer_shares: RateCounter,
     pub breach_count: u32,
@@ -122,14 +170,33 @@ impl Default for PeerRateLimiter {
 
 impl PeerRateLimiter {
     pub fn new() -> Self {
+        Self::for_connections(1)
+    }
+
+    /// The limits for `connections` connections together. Used for one
+    /// address: its connections share MAX_CONNECTIONS_PER_IP times what one
+    /// may send. Without it the limits on a connection mean little, since
+    /// a peer that reconnects, or connects under another key, starts again
+    /// from nothing; keys cost nothing, and addresses do.
+    pub fn for_connections(connections: u32) -> Self {
         let minute = Duration::from_secs(protocol::RATE_WINDOW_SECS);
         Self {
-            writes: RateCounter::new(minute, WRITES_PER_PEER_PER_MINUTE),
-            syncs: RateCounter::new(minute, SYNCS_PER_PEER_PER_MINUTE),
-            peer_shares: RateCounter::new(minute, PEER_SHARES_PER_PEER_PER_MINUTE),
+            writes: RateCounter::new(minute, WRITES_PER_PEER_PER_MINUTE * connections),
+            write_bytes: ByteCounter::new(
+                minute,
+                protocol::PUSH_BYTES_PER_PEER_PER_MINUTE * u64::from(connections),
+            ),
+            syncs: RateCounter::new(minute, SYNCS_PER_PEER_PER_MINUTE * connections),
+            peer_shares: RateCounter::new(minute, PEER_SHARES_PER_PEER_PER_MINUTE * connections),
             breach_count: 0,
             first_breach: None,
         }
+    }
+
+    /// Whether a breach was recorded within the window for counting them.
+    pub fn has_recent_breach(&self) -> bool {
+        self.first_breach
+            .is_some_and(|first| first.elapsed() <= BAN_WINDOW)
     }
 
     /// Record a rate limit breach. Returns true if peer should be banned.
@@ -256,6 +323,39 @@ mod tests {
         assert!(counter.check_and_record());
         assert!(counter.check_and_record());
         assert!(!counter.check_and_record()); // 4th exceeds limit
+    }
+
+    #[test]
+    fn bytes_are_counted_within_a_window() {
+        let mut bytes = ByteCounter::new(Duration::from_millis(80), 100);
+        assert_eq!(bytes.room(), 100);
+        assert!(bytes.check_and_record(60));
+        assert_eq!((bytes.total(), bytes.room()), (60, 40));
+        // Over the limit: refused, and nothing recorded.
+        assert!(!bytes.check_and_record(41));
+        assert_eq!(bytes.total(), 60);
+        assert!(bytes.check_and_record(40));
+        assert!(!bytes.check_and_record(1));
+        // What was recorded leaves the window in time.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(bytes.room(), 100);
+    }
+
+    #[test]
+    fn an_address_shares_the_allowance_of_its_connections() {
+        let one = PeerRateLimiter::new();
+        let mut five = PeerRateLimiter::for_connections(5);
+        assert!(!one.has_recent_breach());
+        for _ in 0..WRITES_PER_PEER_PER_MINUTE * 5 {
+            assert!(five.writes.check_and_record());
+        }
+        assert!(!five.writes.check_and_record());
+        assert_eq!(
+            five.write_bytes.room(),
+            5 * protocol::PUSH_BYTES_PER_PEER_PER_MINUTE
+        );
+        five.record_breach();
+        assert!(five.has_recent_breach());
     }
 
     #[test]

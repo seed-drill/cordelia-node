@@ -65,13 +65,25 @@ pub const QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 /// Primitive: 4x QUIC keepalive; tolerates 3 lost keepalives before closing.
 pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 60;
 
-/// Max concurrent bidirectional QUIC streams (network-protocol.md §2.1).
-/// Primitive: generous budget; actual protocol use is much lower.
-pub const QUIC_MAX_BIDI_STREAMS: u32 = 1000;
+/// Most bidirectional QUIC streams a peer may have open on one connection
+/// at once (network-protocol.md §2.1): MAX_CONCURRENT_STREAMS. A node
+/// handles one stream of a connection at a time, and each exchange is one
+/// stream, so real use is a handful.
+pub const QUIC_MAX_BIDI_STREAMS: u32 = MAX_CONCURRENT_STREAMS as u32;
 
-/// Max concurrent unidirectional QUIC streams (network-protocol.md §2.1).
-/// Primitive: matches bidi budget for symmetry.
-pub const QUIC_MAX_UNI_STREAMS: u32 = 1000;
+/// Unidirectional QUIC streams a peer may open: none. The protocol uses
+/// only bidirectional ones.
+pub const QUIC_MAX_UNI_STREAMS: u32 = 0;
+
+/// How much a peer may send on one stream before this node has read it:
+/// one message.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
+
+/// How much a peer may send on one connection, over all its streams,
+/// before this node has read it: two messages. This is what bounds the
+/// memory one connection can make a node hold. Left to QUIC's defaults
+/// there was no such bound: a thousand streams, each over a megabyte.
+pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 
 /// TLS certificate validity in days (network-protocol.md §2.2).
 /// Primitive: 1 year; self-signed certs, identity is the public key.
@@ -355,6 +367,19 @@ pub const MAX_CONCURRENT_STREAMS: usize = 64;
 pub const WRITES_PER_PEER_PER_MINUTE: u32 =
     RATE_LIMIT_HEADROOM * (60 / REPUSH_INTERVAL_SECS) as u32;
 
+/// How many bytes of entries one connection may push in a minute: 2 MB.
+/// The count of pushes alone bounds little, since a push can be a whole
+/// message. Rationale: parameter-rationale.md §4.
+pub const PUSH_BYTES_PER_PEER_PER_MINUTE: u64 = 2 * 1024 * 1024;
+
+/// How many bytes of entries a device pushes to one relay in a minute, at
+/// most: 1.5 MB, which leaves a quarter of a relay's allowance spare. A
+/// device with a lot to send paces itself, so that it is never the one
+/// refused.
+pub const OUTBOX_BYTES_PER_MINUTE: u64 = 3 * 512 * 1024;
+const _: () = assert!(OUTBOX_BYTES_PER_MINUTE < PUSH_BYTES_PER_PEER_PER_MINUTE);
+const _: () = assert!(OUTBOX_BATCH_MAX_BYTES as u64 <= OUTBOX_BYTES_PER_MINUTE);
+
 /// How often a personal node flushes its outbox: its own items that no
 /// relay has yet acknowledged, sent as one batched push (decision
 /// 2026-09-30-agent-memory-sync §4.4a).
@@ -557,6 +582,11 @@ pub const ERR_UNKNOWN_PROTOCOL: u32 = 0x02;
 /// QUIC application error: connection capacity exceeded (network-protocol.md §9.1).
 pub const ERR_CAPACITY: u32 = 0x01;
 
+/// QUIC application error: over a rate limit. A stream is reset with it
+/// when a request is over the limit, and the connection is closed with it
+/// when the peer keeps going over.
+pub const ERR_RATE_LIMIT: u32 = 0x03;
+
 // ── Bootstrap ────────────────────────────────────────────────────────
 
 /// The default relays, compiled into the binary (decision
@@ -643,12 +673,12 @@ mod tests {
 
     #[test]
     fn test_quic_max_bidi_streams_network_protocol_2_1() {
-        assert_eq!(QUIC_MAX_BIDI_STREAMS, 1000);
+        assert_eq!(QUIC_MAX_BIDI_STREAMS, 64);
     }
 
     #[test]
     fn test_quic_max_uni_streams_network_protocol_2_1() {
-        assert_eq!(QUIC_MAX_UNI_STREAMS, 1000);
+        assert_eq!(QUIC_MAX_UNI_STREAMS, 0);
     }
 
     #[test]

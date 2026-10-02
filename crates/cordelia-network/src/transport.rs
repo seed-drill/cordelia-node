@@ -102,6 +102,30 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
     der
 }
 
+/// The transport settings of every connection, in either direction:
+/// keep-alive and idle timeout, and what a peer may make this node hold.
+///
+/// - A peer may have QUIC_MAX_BIDI_STREAMS streams open at once, and no
+///   unidirectional ones.
+/// - It may send one message's worth on a stream, and two on the whole
+///   connection, before this node has read it. So one connection can make
+///   a node buffer two megabytes, whatever the peer does.
+fn transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(
+        protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
+    )));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
+            .unwrap(),
+    ));
+    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
+    transport.stream_receive_window(protocol::QUIC_STREAM_RECEIVE_WINDOW.into());
+    transport.receive_window(protocol::QUIC_RECEIVE_WINDOW.into());
+    transport
+}
+
 /// Build a quinn ServerConfig that accepts self-signed Ed25519 certificates.
 pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportError> {
     let (cert_der, key_der) = generate_self_signed_cert(identity)?;
@@ -125,16 +149,7 @@ fn server_config_with_cert(
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(
-        protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
-    )));
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
-            .unwrap(),
-    ));
-    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
-    transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
+    let transport = transport_config();
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -169,16 +184,7 @@ fn client_config_with_cert(
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(
-        protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
-    )));
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
-            .unwrap(),
-    ));
-    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
-    transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
+    let transport = transport_config();
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -405,6 +411,83 @@ mod tests {
             err.to_string().contains("names a key other than its own"),
             "{err}"
         );
+    }
+
+    /// Two nodes, connected: the client's end and the server's.
+    async fn connected() -> (quinn::Connection, quinn::Connection, Endpoint, Endpoint) {
+        let server_id = NodeIdentity::generate().unwrap();
+        let client_id = NodeIdentity::generate().unwrap();
+        let server = create_endpoint(&server_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = create_endpoint(&client_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_end = client
+            .connect(server_addr, "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_end = accepting.await.unwrap();
+        (client_end, server_end, client, server)
+    }
+
+    /// T3. A peer can have 64 streams open on one connection at once. The
+    /// next one waits.
+    #[tokio::test]
+    async fn a_connection_holds_at_most_64_streams_open() {
+        let (client, server, _c, _s) = connected().await;
+        // The other end takes each stream and keeps it open.
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok(stream) = server.accept_bi().await {
+                held.push(stream);
+            }
+        });
+
+        let brief = Duration::from_millis(500);
+        let mut open = Vec::new();
+        for n in 0..protocol::QUIC_MAX_BIDI_STREAMS {
+            let (mut send, recv) = tokio::time::timeout(brief, client.open_bi())
+                .await
+                .unwrap_or_else(|_| panic!("stream {n} did not open"))
+                .unwrap();
+            send.write_all(b"x").await.unwrap();
+            open.push((send, recv));
+        }
+        assert!(
+            tokio::time::timeout(brief, client.open_bi()).await.is_err(),
+            "one more stream than the limit opened"
+        );
+        // Nor a unidirectional one: the protocol has none.
+        assert!(
+            tokio::time::timeout(brief, client.open_uni())
+                .await
+                .is_err(),
+            "a unidirectional stream opened"
+        );
+        holding.abort();
+    }
+
+    /// T3. One connection cannot make a node hold more than two messages'
+    /// worth that it has not read, however many streams the peer uses.
+    #[tokio::test]
+    async fn a_connection_buffers_at_most_two_unread_messages() {
+        let (client, _server_reads_nothing, _c, _s) = connected().await;
+        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize];
+
+        // Four streams, a message's worth on each: four megabytes offered.
+        let mut streams = Vec::new();
+        let mut taken = 0;
+        for _ in 0..4 {
+            let (mut send, recv) = client.open_bi().await.unwrap();
+            let sent =
+                tokio::time::timeout(Duration::from_millis(1500), send.write_all(&message)).await;
+            taken += usize::from(matches!(sent, Ok(Ok(()))));
+            streams.push((send, recv));
+        }
+        assert_eq!(taken, 2, "the connection took {taken} megabytes unread");
     }
 
     /// T19. A node cannot connect under a key it does not hold: a listening
