@@ -2020,37 +2020,49 @@ async fn t03_a_channel_a_relay_dropped_comes_back_when_there_is_room() {
     assert_eq!(client.listed(&older).await, usize::from(names));
 }
 
-/// T3. What a peer lists is the peer's to write, so a relay bounds it. A
-/// peer says it holds three thousand channels, one of them with an ID far
-/// longer than a channel's can be. The relay asks about so many and no
-/// more in one pass, and never about the long one.
+/// T3. What a peer lists is the peer's to write, so a relay bounds it. One
+/// peer says it holds three thousand channels: the relay asks about so many
+/// and no more in one pass. Another lists a few channels and one with an ID
+/// far longer than a channel's can be: the relay asks about the few, and
+/// never about the long one. (Among three thousand the long one would be
+/// asked about only by chance.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t03_a_relay_asks_a_peer_about_only_so_many_channels() {
     use cordelia_core::protocol::{MAX_CHANNEL_ID_LEN, MAX_CHANNELS_ASKED_OF_A_PEER};
+    const FEW: usize = 10;
+    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
 
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let peer = client_of(&relay).await.expect("the peer connects");
 
-    let mut lists: Vec<String> = (0..3000)
-        .map(|n| format!("grp_550e8400-e29b-41d4-a716-{n:012}"))
-        .collect();
+    let many = client_of(&relay).await.expect("the first peer connects");
+    let held_many = Held {
+        lists: Some((0..3000).map(channel).collect()),
+        ..Held::default()
+    };
+    many.serve(held_many.clone());
+    let pass = wait_for("the relay asks the first peer", &[&relay], 60, || {
+        held_many.passes().into_iter().next()
+    });
+    assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER);
+
+    let few = client_of(&relay).await.expect("the second peer connects");
+    let mut lists: Vec<String> = (0..FEW).map(channel).collect();
     lists.push("x".repeat(50_000));
-    let held = Held {
+    let held_few = Held {
         lists: Some(lists),
         ..Held::default()
     };
-    peer.serve(held.clone());
-
-    let pass = wait_for("the relay asks the peer", &[&relay], 60, || {
-        held.passes().into_iter().next()
+    few.serve(held_few.clone());
+    let pass = wait_for("the relay asks the second peer", &[&relay], 60, || {
+        held_few.passes().into_iter().next()
     });
-    assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER);
     assert!(
         pass.listed.iter().all(|id| id.len() <= MAX_CHANNEL_ID_LEN),
         "the relay asked about a channel with an ID no channel has"
     );
+    assert_eq!(pass.listed.len(), FEW);
 }
 
 /// What a relay's log says it keeps for its peers (places in their lists,
