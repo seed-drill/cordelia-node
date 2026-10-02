@@ -193,12 +193,28 @@ impl Node {
     }
 }
 
+/// A port for a test node, free for TCP (its HTTP API) and UDP (QUIC).
+///
+/// It is taken from below the range the system gives to outgoing
+/// connections, and one test process never gives the same one out twice.
+/// A port found by binding port 0 and letting go is in that range, so by
+/// the time the node binds it, some client's connection may have been
+/// given the same number, and the node fails to start. A test that starts
+/// a node late (a relay that comes up after its device) hit that in CI.
 pub fn free_port() -> u16 {
-    // Reserve the same number for TCP (HTTP) and UDP (QUIC) where possible.
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 10_000;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    // Each test binary starts somewhere of its own, so that binaries run
+    // one after another do not walk over each other's lingering sockets.
+    let start = (std::process::id() % u32::from(COUNT)) as u16;
     loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
+        let port = FIRST + (start + n) % COUNT;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok()
+        {
             return port;
         }
     }
