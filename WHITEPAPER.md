@@ -201,11 +201,12 @@ key they do not hold. Two roles matter in v1:
   Peer selection follows the hot/warm/cold governor model of Cardano's P2P
   networking layer.
 - **A relay is a cache with a cap.** Every device holds its channels whole. A
-  relay asks each device that connects to it which channels it holds, and
-  fetches what it lacks. So nothing is lost for good when a relay is
-  rebuilt, or drops a channel to make room. At its storage cap a relay takes
-  no channel it does not already hold, and makes room by dropping the
-  channels it came to hold most recently.
+  relay asks each device connected to it which channels it holds, when the
+  device connects and every ten minutes after, and fetches what it lacks. So
+  nothing is lost for good when a relay is rebuilt, or drops a channel to
+  make room. At its storage cap a relay takes no channel it does not already
+  hold, and makes room by dropping the channels it came to hold most
+  recently.
 
 Two mechanisms carry items between them:
 
@@ -367,6 +368,7 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | Largest synced memory file | what fits in one entry | `cordelia-sync` |
 | One channel at a relay | 16 MB | `MAX_CHANNEL_BYTES_AT_RELAY` |
 | A relay in total | 1 GiB unless its operator sets it | `max_storage_bytes` |
+| A relay asks a device what it holds | when it connects, then every 10 min | `RELAY_ASK_AGAIN_SECS` |
 | Deleted-key retention | 90 days | `KEYED_TOMBSTONE_RETENTION_DAYS` |
 | Adapter cycle | 5 s | `cordelia-sync` `CYCLE_SECS` |
 | Pending invites kept | 100 | `MAX_PENDING_INVITES` |

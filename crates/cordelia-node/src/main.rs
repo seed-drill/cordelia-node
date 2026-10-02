@@ -928,7 +928,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids, config.node.max_storage_bytes).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400))).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────

@@ -436,6 +436,51 @@ dozen channels the first time they sync; 16 an hour covers that. One
 address can then make a relay take at most 256MB an hour, so filling the
 default 1GB takes it four hours, or several addresses.
 
+### relay_ask_again_secs = 600
+
+**Rationale:** A relay is a cache, and its devices are where the entries
+are. It asks each peer connected to it which channels it holds and fetches
+what it lacks: its hot peers every sync cycle (as a rule, the relays it
+lists), and every other peer when it connects and then this often after it
+has fetched all the peer holds. The same wait passes before a relay takes
+again a channel it dropped to make room, and doubles each time the channel
+is dropped again (relay_dropped_wait_doublings = 5, so up to 32 times):
+a channel that is dropped each time it is taken does not fit.
+
+**Derivation:** A device sends what it writes as it writes it, so asking is
+only for what the relay lost, dropped or had no room for. Ten minutes is
+the longest a device waits before it offers again what a relay refused
+(outbox_refused_retry_max_secs), so whichever of the two has the entry, the
+other hears of it within that time. It costs a device one small exchange
+every ten minutes: the list of its channels, and one request for each.
+Without the wait before a dropped channel is taken again, a relay at its
+cap would fetch the channel, drop it, and fetch it again every cycle.
+
+What a relay fetches from a device counts as what the device may push
+does (push_bytes_per_peer_per_minute, and five times that for the address),
+in an allowance of its own, so that what a relay asks for is never held
+against what the device sends. A connection can therefore make a relay take
+4MB a minute in all, pushed and fetched, and an address 20MB. When the
+allowance for fetching is used up the relay asks again one rate window
+later, so a relay that was rebuilt fills from a device at up to 2MB a
+minute. An entry's size is not known until it is fetched: the relay asks
+for a whole page only while the allowance has room for the most a page can
+cost, and otherwise for as many entries as would fit at the largest size,
+so small entries come more slowly near the end of each minute.
+
+### max_channels_asked_of_a_peer = 1024
+
+**Rationale:** What a peer lists when a relay asks which channels it holds
+is the peer's to write. Without a bound it could have a relay make a
+request, and keep a place, for each of any number of names. Only IDs that
+could be a channel's are taken (max_channel_id_len), and this many in one
+pass.
+
+**Derivation:** A person's device holds tens of channels. One that holds
+more than this is asked about a different part of them each time. A place
+is two short strings and a number, and is kept only while the peer is
+connected, so 200 connections cost a relay at most about 20MB.
+
 ### limits for an address = 5 x the limits for a connection
 
 **Rationale:** A connection's allowance is counted for the key that

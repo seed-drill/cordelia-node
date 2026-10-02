@@ -124,8 +124,9 @@ config; 1 GiB if not set). At the cap it takes no channel it does not already
 hold, and it makes room for the channels it holds by dropping the ones it
 came to hold most recently. Nothing is lost by that: every device holds its
 channels whole, and the relay fetches a dropped channel again when it has
-room, from the relays it lists and from each device when that device next
-connects. A relay that stays full needs a larger cap.
+room, from the relays it lists and from its devices, which it asks when they
+connect and every ten minutes after. A relay that stays full needs a larger
+cap.
 
 The same counts are on the node's `/api/v1/metrics` (Prometheus format,
 127.0.0.1:9473, bearer token in `node-token` on the data volume) as
@@ -157,9 +158,13 @@ each device's config, for a relay of your own.
 
 The database on that volume can be lost, and nothing is lost for good. A
 relay is a cache: it fetches what it lacks from the relays it lists, and from
-each device when the device connects. It takes at most 16 new channels an
-hour from one address, so a device with more channels than that fills it
-over several connections.
+its devices, which it asks when they connect and every ten minutes after. It
+takes at most 16 new channels an hour from one address, and 2 MB a minute
+from one device, so a large refill takes a while.
+
+Up to 0.2.0-alpha.4 a relay asked only its hot peers. Two relays that list
+each other are each other's hot peer, so their devices were not asked. With
+relays on such a version, do not rebuild them all at once.
 
 ## 7. Your own relay
 

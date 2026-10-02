@@ -557,7 +557,7 @@ SyncChannelListResponse {
 }
 ```
 
-Phase 0 runs on every relay sync cycle, on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
+A relay asks its hot peers on every sync cycle. It asks every other peer connected to it when that peer connects and every `relay_ask_again_secs` after, and asks a peer that is not a relay it lists only for the channels the peer listed: at most 1,024 of them, each an ID that could be a channel's (decision record §4.6). Phase 0 runs on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
 
 Phase 1-4 (per-channel sync):
 1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync

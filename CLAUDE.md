@@ -92,6 +92,8 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `SYNC_PAGE_STEPS` | 100, 14, 3, 1 | parameter-rationale.md §4 |
 | `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
 | `OUTBOX_REFUSED_RETRY_MAX_SECS` | 600s | parameter-rationale.md §4 |
+| `RELAY_ASK_AGAIN_SECS` | 600s | parameter-rationale.md §4 |
+| `MAX_CHANNELS_ASKED_OF_A_PEER` | 1024 | parameter-rationale.md §4 |
 | `STATE_OFFER_RETRY_BASE_SECS`, `STATE_OFFER_RETRY_MAX_SECS` | 60s, 6h | parameter-rationale.md §4 |
 | `MAX_STATE_KEYS` | 1024 | parameter-rationale.md §4 |
 | `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 | decision 2026-09-30 §4.4 |

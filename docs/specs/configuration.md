@@ -130,6 +130,7 @@ Anti-entropy sync intervals, tombstone retention, and batch sizing for the Item-
 | `sync_interval_batch_secs` | integer | `900` | > 0 | Anti-entropy pull interval for batch channels (seconds). 15 minutes default. | network-protocol.md SS12.3 |
 | `tombstone_retention_days` | integer | `7` | > 0 | Days to retain tombstoned items before physical deletion. Must be long enough for all peers to observe the tombstone. | network-protocol.md SS12.3 |
 | `max_batch_size` | integer | `100` | 1-10000 | Maximum items per FetchRequest/PushPayload message. | network-protocol.md SS9.2, SS12.3 |
+| `relay_ask_again_secs` | integer | `600` | 1-86400 (a value outside is taken as the nearest) | Relays only. How long a relay waits before it asks a device again which channels it holds, and before it takes again a channel it dropped to make room. | parameter-rationale.md SS4 |
 
 ### 2.6 `[limits]`
 
@@ -267,6 +268,7 @@ sync_interval_realtime_secs = 60           # Anti-entropy interval for realtime 
 sync_interval_batch_secs = 900             # Anti-entropy interval for batch channels (15 min)
 tombstone_retention_days = 7               # Days to keep tombstones
 max_batch_size = 100                       # Items per FetchRequest/PushPayload
+relay_ask_again_secs = 600                 # A relay asks its devices what they hold this often
 
 # --- Rate Limits ---
 [limits]
