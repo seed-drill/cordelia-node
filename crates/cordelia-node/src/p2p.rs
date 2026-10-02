@@ -24,7 +24,6 @@ pub enum GovEvent {
 /// A connection has its own allowance. All the connections from one address
 /// share MAX_CONNECTIONS_PER_IP times that, which is what makes the limits
 /// hold against a peer that reconnects or comes back under another key.
-#[derive(Default)]
 pub struct Rates {
     by_peer: std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
     by_address:
@@ -33,8 +32,29 @@ pub struct Rates {
     /// before, within the last hour.
     new_channels:
         std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
+    /// The channels a relay dropped to make room: when, and how many times
+    /// running.
+    dropped: std::collections::HashMap<String, (std::time::Instant, u32)>,
+    /// How long a relay leaves a channel it dropped before it takes it
+    /// again, the first time.
+    ask_again: std::time::Duration,
     /// The most a relay's database may hold (its operator's setting).
     relay_max_bytes: u64,
+}
+
+impl Default for Rates {
+    fn default() -> Self {
+        Self {
+            by_peer: Default::default(),
+            by_address: Default::default(),
+            new_channels: Default::default(),
+            dropped: Default::default(),
+            ask_again: std::time::Duration::from_secs(
+                cordelia_core::protocol::RELAY_ASK_AGAIN_SECS,
+            ),
+            relay_max_bytes: 0,
+        }
+    }
 }
 
 /// A request that is over a limit.
@@ -51,6 +71,13 @@ impl Rates {
             relay_max_bytes,
             ..Self::default()
         }
+    }
+
+    /// With `ask_again` as the wait before a relay takes again a channel it
+    /// dropped.
+    pub fn ask_again(mut self, ask_again: std::time::Duration) -> Self {
+        self.ask_again = ask_again;
+        self
     }
 
     fn both(
@@ -130,22 +157,82 @@ impl Rates {
         Ok(())
     }
 
-    /// Count a channel that `address` is making a relay hold for the first
-    /// time. False, counting nothing, if the address has had its share for
-    /// the hour (NEW_CHANNELS_PER_ADDRESS_PER_HOUR). A channel costs
-    /// nothing to make, so without this one address could make a relay
-    /// hold any number of them.
-    pub fn new_channel(&mut self, address: std::net::IpAddr) -> bool {
+    /// How many bytes of entries a relay may still fetch from `peer` at
+    /// `address` in this window: as many as the peer may push in one, for
+    /// the connection and for its address.
+    pub fn fetch_room(&mut self, peer: &NodeId, address: std::net::IpAddr) -> u64 {
+        self.both(peer, address)
+            .iter_mut()
+            .map(|limiter| limiter.fetch_bytes.room())
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Count `bytes` of entries a relay fetched from `peer`. It is the
+    /// relay that asked, so going over is no breach by the peer.
+    pub fn fetched(&mut self, peer: &NodeId, address: std::net::IpAddr, bytes: u64) {
+        for limiter in self.both(peer, address) {
+            limiter.fetch_bytes.record(bytes);
+        }
+    }
+
+    /// Whether `address` may make a relay hold a channel it does not hold:
+    /// false if it has had its share for the hour
+    /// (NEW_CHANNELS_PER_ADDRESS_PER_HOUR). Counts nothing.
+    pub fn may_add_channel(&mut self, address: std::net::IpAddr) -> bool {
         let hour = std::time::Duration::from_secs(3600);
-        let made = self.new_channels.entry(address).or_default();
+        let Some(made) = self.new_channels.get_mut(&address) else {
+            return true;
+        };
         while made.front().is_some_and(|at| at.elapsed() >= hour) {
             made.pop_front();
         }
-        if made.len() >= cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
+        made.len() < cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR
+    }
+
+    /// Count a channel that `address` is making a relay hold for the first
+    /// time. False, counting nothing, if the address has had its share for
+    /// the hour. A channel costs nothing to make, so without this one
+    /// address could make a relay hold any number of them.
+    pub fn new_channel(&mut self, address: std::net::IpAddr) -> bool {
+        if !self.may_add_channel(address) {
             return false;
         }
-        made.push_back(std::time::Instant::now());
+        self.new_channels
+            .entry(address)
+            .or_default()
+            .push_back(std::time::Instant::now());
         true
+    }
+
+    /// A relay dropped `channel` to make room.
+    pub fn dropped(&mut self, channel: &str) {
+        let times = self.dropped.get(channel).map_or(0, |(_, times)| *times);
+        self.dropped.insert(
+            channel.to_string(),
+            (std::time::Instant::now(), times.saturating_add(1)),
+        );
+    }
+
+    /// How long a channel that was dropped `times` times running is left
+    /// before it is taken again: `ask_again`, doubled each time, up to
+    /// RELAY_DROPPED_WAIT_DOUBLINGS times.
+    fn dropped_wait(&self, times: u32) -> std::time::Duration {
+        let doublings = times
+            .saturating_sub(1)
+            .min(cordelia_core::protocol::RELAY_DROPPED_WAIT_DOUBLINGS);
+        self.ask_again.saturating_mul(1 << doublings)
+    }
+
+    /// Whether a relay dropped `channel` to make room too lately to take it
+    /// again. Without the wait, a relay at its cap would fetch the channel
+    /// from a peer, drop it, and fetch it again, without end. A channel
+    /// that is dropped again each time it is taken does not fit, so the
+    /// wait doubles each time.
+    pub fn dropped_lately(&mut self, channel: &str) -> bool {
+        self.dropped
+            .get(channel)
+            .is_some_and(|(at, times)| at.elapsed() < self.dropped_wait(*times))
     }
 
     /// Forget peers that are no longer connected, and addresses that have
@@ -161,6 +248,10 @@ impl Rates {
         let hour = std::time::Duration::from_secs(3600);
         self.new_channels
             .retain(|_, made| made.back().is_some_and(|at| at.elapsed() < hour));
+        // A dropped channel is remembered for twice its longest wait, so
+        // that one dropped again soon after it was taken counts as running.
+        let longest = self.dropped_wait(u32::MAX).saturating_mul(2);
+        self.dropped.retain(|_, (at, _)| at.elapsed() < longest);
     }
 }
 
@@ -192,7 +283,7 @@ pub fn store_item(
     node_role: &str,
     own: &[u8; 32],
 ) -> Result<bool, &'static str> {
-    let mut room = RelayRoom::new(u64::MAX, None);
+    let mut room = RelayRoom::new(u64::MAX, None, None);
     let room = (node_role == "relay").then_some(&mut room);
     store_checked(db, item, &check_item(item)?, node_role, own, room)
 }
@@ -209,35 +300,79 @@ pub fn store_item(
 /// - One channel may hold only so much, and one address may make it hold
 ///   only so many new channels in an hour.
 ///
-/// A relay fetches again from its devices what it dropped, once it has
-/// room: each device answers its relay with the channels it holds. It
-/// asks a device again when that device next connects, and not before
-/// (#92).
+/// A relay fetches again what it dropped, or had no room for, once it has
+/// room. Each device answers its relay with the channels it holds, and the
+/// relay asks every device connected to it, when it connects and every
+/// RELAY_ASK_AGAIN_SECS after. A channel it dropped is left for that long
+/// before it is taken again, and is then listed again from the start.
 pub struct RelayRoom<'a> {
     /// The most the relay's database may hold, in bytes.
     pub max_bytes: u64,
     /// The most one channel may hold, in bytes of entries.
     pub max_channel_bytes: u64,
-    /// The address the item came from, with the counts of new channels for
-    /// each address. `None` when it came from a relay this one lists,
-    /// which is not limited.
-    pub source: Option<(std::net::IpAddr, &'a std::sync::Mutex<Rates>)>,
+    /// The relay's counts: the new channels of each address, and the
+    /// channels dropped lately.
+    pub rates: Option<&'a std::sync::Mutex<Rates>>,
+    /// The address the item came from. `None` when it came from a relay
+    /// this one lists, which is not limited.
+    pub address: Option<std::net::IpAddr>,
     /// What each channel holds, for the channels met while handling one
     /// batch, so that it is added up once a batch and not once an item.
     pub channel_bytes: std::collections::HashMap<String, u64>,
+    /// The channels dropped while handling this batch. The caller has them
+    /// listed again from the start, from every peer.
+    pub dropped: Vec<String>,
 }
 
 impl<'a> RelayRoom<'a> {
     pub fn new(
         max_bytes: u64,
-        source: Option<(std::net::IpAddr, &'a std::sync::Mutex<Rates>)>,
+        rates: Option<&'a std::sync::Mutex<Rates>>,
+        address: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
             max_bytes,
             max_channel_bytes: cordelia_core::protocol::MAX_CHANNEL_BYTES_AT_RELAY,
-            source,
+            rates,
+            address,
             channel_bytes: std::collections::HashMap::new(),
+            dropped: Vec::new(),
         }
+    }
+
+    fn rates(&self) -> Option<std::sync::MutexGuard<'a, Rates>> {
+        self.rates
+            .map(|rates| rates.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Whether the relay would take `channel_id`, which it does not hold,
+    /// as far as room goes. Counts nothing, so a relay can ask before it
+    /// fetches what it would then refuse.
+    pub fn takes_new_channel(
+        &self,
+        db: &rusqlite::Connection,
+        channel_id: &str,
+    ) -> Result<(), &'static str> {
+        use cordelia_network::messages::{REFUSED_FULL, REFUSED_STORAGE};
+        let used = cordelia_storage::db::used_bytes(db).map_err(|_| REFUSED_STORAGE)?;
+        if used >= self.max_bytes {
+            tracing::debug!(channel = %channel_id, used, "at the storage cap; not taking a channel this relay does not hold");
+            return Err(REFUSED_FULL);
+        }
+        let Some(mut rates) = self.rates() else {
+            return Ok(());
+        };
+        if rates.dropped_lately(channel_id) {
+            tracing::debug!(channel = %channel_id, "dropped to make room a short while ago; not taking it again yet");
+            return Err(REFUSED_FULL);
+        }
+        if let Some(address) = self.address
+            && !rates.may_add_channel(address)
+        {
+            tracing::debug!(channel = %channel_id, %address, "this address has made the relay hold enough new channels for now");
+            return Err(REFUSED_FULL);
+        }
+        Ok(())
     }
 
     /// Whether the relay takes this item, as far as room goes. Makes the
@@ -255,20 +390,13 @@ impl<'a> RelayRoom<'a> {
         let bytes = cordelia_core::protocol::entry_cost(item.encrypted_blob.len());
 
         if !channels::exists(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)? {
-            // A channel the relay does not hold: only if there is room,
-            // and the address has not made it hold too many lately.
-            let used = cordelia_storage::db::used_bytes(db).map_err(|_| REFUSED_STORAGE)?;
-            if used >= self.max_bytes {
-                tracing::debug!(channel = %item.channel_id, used, "at the storage cap; not taking a channel this relay does not hold");
-                return Err(REFUSED_FULL);
-            }
-            if let Some((address, rates)) = &self.source
-                && !rates
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .new_channel(*address)
+            // A channel the relay does not hold: only if there is room, it
+            // was not dropped a moment ago, and the address has not made
+            // the relay hold too many lately.
+            self.takes_new_channel(db, &item.channel_id)?;
+            if let (Some(address), Some(mut rates)) = (self.address, self.rates())
+                && !rates.new_channel(address)
             {
-                tracing::debug!(channel = %item.channel_id, %address, "this address has made the relay hold enough new channels for now");
                 return Err(REFUSED_FULL);
             }
             // Relay: ensure channel row exists (no FK violation, BV-21)
@@ -323,10 +451,505 @@ impl<'a> RelayRoom<'a> {
                 }
             }
             self.channel_bytes.remove(&newest);
+            if let Some(mut rates) = self.rates() {
+                rates.dropped(&newest);
+            }
             kept &= newest != written;
+            self.dropped.push(newest);
         }
         kept
     }
+}
+
+/// The peers a relay asks this cycle which channels they hold, beyond its
+/// hot peers: each connected peer whose time has come, which is at once
+/// for one that has just connected. When a fetch from a peer ends, it says
+/// when the peer is asked next ([`next_ask`]). Peers that have gone are
+/// forgotten.
+///
+/// A relay fetches from its hot peers every cycle. Two relays that list
+/// each other are each other's hot peer, so every device is warm at both.
+/// Without this, such a relay would never ask a device what it holds, and
+/// what both relays lost, or dropped to make room, would not come back to
+/// them though their devices hold it (decision 2026-09-30 §4.6).
+fn peers_to_ask(
+    connected: &[NodeId],
+    hot: &[NodeId],
+    ask_next: &mut std::collections::HashMap<NodeId, std::time::Instant>,
+    now: std::time::Instant,
+) -> Vec<NodeId> {
+    ask_next.retain(|peer, _| connected.contains(peer));
+    connected
+        .iter()
+        .filter(|peer| !hot.contains(peer))
+        .filter(|peer| ask_next.get(*peer).is_none_or(|at| now >= *at))
+        .cloned()
+        .collect()
+}
+
+/// Forget what is kept for each peer and channel (a place in the peer's
+/// list, a page size) for the peers that are no longer connected.
+fn forget_gone<V>(kept: &mut std::collections::HashMap<(NodeId, String), V>, connected: &[NodeId]) {
+    let here: std::collections::HashSet<&NodeId> = connected.iter().collect();
+    kept.retain(|(peer, _), _| here.contains(peer));
+}
+
+/// How a fetch from a peer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetched {
+    /// Everything the peer lists was gone through.
+    All,
+    /// The peer's allowance for the minute is used: there is more to
+    /// fetch when it has room again.
+    AllowanceUsed,
+    /// There is more to fetch now: a channel with more pages than one pass
+    /// takes, or a page that has to be asked for in smaller parts.
+    More,
+    /// The peer did not answer, or not as it should.
+    Failed,
+}
+
+/// When a relay asks a peer again which channels it holds, after a fetch
+/// from it that ended as `fetched`. `None` is the next cycle.
+///
+/// - All of it fetched: after `every`. A device sends what it writes as it
+///   writes it, so this is only for what the relay lost, dropped or had no
+///   room for.
+/// - Its allowance used, or no proper answer: after one rate window, which
+///   is when the allowance has room again.
+/// - More to fetch now: the next cycle, or a channel of many small entries
+///   would come back a few hundred entries every `every`.
+fn next_ask(
+    fetched: Fetched,
+    every: std::time::Duration,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let window = std::time::Duration::from_secs(cordelia_core::protocol::RATE_WINDOW_SECS);
+    match fetched {
+        Fetched::All => Some(now + every),
+        Fetched::AllowanceUsed | Fetched::Failed => Some(now + window),
+        Fetched::More => None,
+    }
+}
+
+/// The channels to fetch from a peer: this node's `own`, and those the
+/// peer `listed`, each once.
+///
+/// What a peer lists is the peer's to write, so it is bounded here: only
+/// IDs that could be a channel's (of the size an ID may be, and printable),
+/// and at most `most` of them. A peer could otherwise have a relay ask
+/// about, and keep a place in, any number of channels with names of any
+/// length. A peer with more channels than `most` is asked about a
+/// different part of them each time, since a set has no order.
+fn channels_to_ask(own: Vec<String>, listed: Vec<String>, most: usize) -> Vec<String> {
+    let mut channels: std::collections::HashSet<String> = own.into_iter().collect();
+    let listed: std::collections::HashSet<String> = listed
+        .into_iter()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= cordelia_core::protocol::MAX_CHANNEL_ID_LEN
+                && id.bytes().all(|b| b.is_ascii_graphic())
+        })
+        .collect();
+    channels.extend(listed.into_iter().take(most));
+    channels.into_iter().collect()
+}
+
+/// A fetch running from one peer. While it lives, no other is started
+/// from that peer.
+struct Fetching {
+    peers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<NodeId>>>,
+    peer: NodeId,
+}
+
+impl Fetching {
+    /// `None` if a fetch from `peer` is already running.
+    fn begin(
+        peers: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<NodeId>>>,
+        peer: &NodeId,
+    ) -> Option<Self> {
+        peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer.clone())
+            .then(|| Self {
+                peers: peers.clone(),
+                peer: peer.clone(),
+            })
+    }
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        self.peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.peer);
+    }
+}
+
+/// What a fetch from one peer needs.
+struct FetchFrom {
+    conn: quinn::Connection,
+    target: NodeId,
+    state: web::Data<cordelia_api::state::AppState>,
+    role: String,
+    /// The channels to fetch whatever the peer lists: a device's own, and
+    /// a relay's when it fetches from a relay it lists.
+    channels: Vec<String>,
+    /// A relay first asks the peer which channels it holds.
+    ask_what_it_holds: bool,
+    /// A relay's fetch from a peer that is not a relay it lists: bounded
+    /// as what the peer may push is, and held to what was asked for.
+    limited: bool,
+    address: std::net::IpAddr,
+    rates: std::sync::Arc<std::sync::Mutex<Rates>>,
+    cursors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>>,
+    cursor_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    page_steps:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(NodeId, String), usize>>>,
+    repush_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
+    seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
+}
+
+/// Fetch from one peer what this node lacks: one stream, every channel in
+/// turn (§4.5). Returns how it ended, and how many items were stored.
+///
+/// Each channel is paged by the peer's arrival sequence from this node's
+/// place in it (§4.4a), at most `PAGES` pages a pass. The place moves only
+/// when a page has been stored, so a failure asks for the page again.
+async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
+    use cordelia_core::protocol::{MAX_ITEM_BYTES, SYNC_PAGE_STEPS, entry_cost};
+    use cordelia_network::item_sync;
+    use std::sync::atomic::Ordering;
+    const PAGES: usize = 10;
+    /// The most a page can cost: what it is fetched in is one message, and
+    /// it holds DEFAULT_SYNC_LIMIT entries at most.
+    const FULL_PAGE_COST: u64 = cordelia_core::protocol::MAX_MESSAGE_BYTES as u64
+        + entry_cost(0) * cordelia_core::protocol::DEFAULT_SYNC_LIMIT as u64;
+
+    let FetchFrom {
+        conn,
+        target,
+        state,
+        role,
+        channels,
+        ask_what_it_holds,
+        limited,
+        address,
+        rates,
+        cursors,
+        cursor_epoch,
+        page_steps,
+        repush_tx,
+        seen_table,
+    } = from;
+    let is_relay_node = role == "relay";
+    let lock_rates = || rates.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (mut send, mut recv) = match open_bi(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(peer = %target, error = %e, "sync open_bi failed");
+            return (Fetched::Failed, 0);
+        }
+    };
+    if let Err(e) = cordelia_network::codec::write_protocol_byte(
+        &mut send,
+        cordelia_network::messages::Protocol::ItemSync,
+    )
+    .await
+    {
+        tracing::debug!(peer = %target, error = %e, "sync protocol byte failed");
+        return (Fetched::Failed, 0);
+    }
+
+    // Phase 0 (§4.5): a relay asks the peer which channels it holds.
+    let channels = if ask_what_it_holds {
+        let listed = match item_sync::send_channel_list_request(&mut send, &mut recv).await {
+            Ok(resp) => resp.channel_ids,
+            Err(e) => {
+                tracing::debug!(peer = %target, error = %e, "phase0 channel list request failed");
+                if limited {
+                    return (Fetched::Failed, 0);
+                }
+                Vec::new()
+            }
+        };
+        let most = if limited {
+            cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER
+        } else {
+            usize::MAX
+        };
+        channels_to_ask(channels, listed, most)
+    } else {
+        channels
+    };
+    if channels.is_empty() {
+        let _ = send.finish();
+        return (Fetched::All, 0);
+    }
+    tracing::debug!(peer = %target, channels = channels.len(), "pull-sync starting");
+
+    let max_bytes = lock_rates().relay_max_bytes;
+    let mut fetched = Fetched::All;
+    let mut total_stored: u64 = 0;
+    'channels: for ch_id in &channels {
+        let cursor_key = (target.clone(), ch_id.clone());
+        // A relay does not ask for a channel it does not hold while it has
+        // no room for it, so it does not fetch what it would then refuse.
+        if is_relay_node {
+            let Ok(db) = state.db.lock() else {
+                fetched = Fetched::Failed;
+                break 'channels;
+            };
+            let room = RelayRoom::new(max_bytes, Some(&*rates), limited.then_some(address));
+            if !cordelia_storage::channels::exists(&db, ch_id).unwrap_or(true)
+                && room.takes_new_channel(&db, ch_id).is_err()
+            {
+                continue 'channels;
+            }
+        }
+        let mut caught_up = false;
+        for _page in 0..PAGES {
+            // How many entries the peer's allowance has room for now: a
+            // whole page if it has room for the most a page can cost, and
+            // otherwise as many as would fit if each were of the largest
+            // size. An entry's size is not known until it is fetched.
+            let fit = if limited {
+                let room = lock_rates().fetch_room(&target, address);
+                if room >= FULL_PAGE_COST {
+                    u64::MAX
+                } else {
+                    room / entry_cost(MAX_ITEM_BYTES)
+                }
+            } else {
+                u64::MAX
+            };
+            if fit == 0 {
+                fetched = Fetched::AllowanceUsed;
+                break 'channels;
+            }
+            // Places may be forgotten while this page is on its way (the
+            // peer connected again, or the channel is to be listed from
+            // the start). Then this page's place is not put back.
+            let epoch = cursor_epoch.load(Ordering::Acquire);
+            let after = cursors
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&cursor_key).copied())
+                .unwrap_or(0);
+            let step = page_steps
+                .lock()
+                .ok()
+                .and_then(|p| p.get(&cursor_key).copied())
+                .unwrap_or(0)
+                .min(SYNC_PAGE_STEPS.len() - 1);
+            let limit = SYNC_PAGE_STEPS[step].min(u32::try_from(fit).unwrap_or(u32::MAX));
+            let resp = match item_sync::send_sync_page(&mut send, &mut recv, ch_id, after, limit)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed");
+                    fetched = Fetched::Failed;
+                    break 'channels;
+                }
+            };
+            // A peer that is held to what was asked for answers with no
+            // more than the page asked for, and with that channel's
+            // entries only.
+            if limited
+                && (resp.items.len() > limit as usize
+                    || resp.items.iter().any(|h| h.channel_id != *ch_id))
+            {
+                tracing::debug!(peer = %target, channel = %ch_id, listed = resp.items.len(), asked = limit, "a page that was not the one asked for");
+                fetched = Fetched::Failed;
+                break 'channels;
+            }
+
+            // The page is not passed if the relay had no room for the
+            // channel: it is asked for again.
+            let mut not_taken = false;
+            if !resp.items.is_empty() {
+                let known = {
+                    let Ok(db) = state.db.lock() else {
+                        fetched = Fetched::Failed;
+                        break 'channels;
+                    };
+                    let offered: Vec<String> =
+                        resp.items.iter().map(|h| h.item_id.clone()).collect();
+                    cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
+                };
+                let mut fetch_ids = item_sync::compute_fetch_list(&resp.items, &known);
+                // A device can tell from an entry's header whether it will
+                // store it, and does not fetch the rest of one it will not.
+                if role == "personal" {
+                    let own = state.identity.public_key();
+                    if let Ok(db) = state.db.lock() {
+                        fetch_ids.retain(|id| {
+                            resp.items
+                                .iter()
+                                .find(|h| &h.item_id == id)
+                                .is_some_and(|h| {
+                                    <[u8; 32]>::try_from(h.author_id.as_slice()).is_ok_and(
+                                        |author| {
+                                            wanted_by_a_device(&db, &h.channel_id, &author, &own)
+                                        },
+                                    )
+                                })
+                        });
+                    }
+                }
+                if !fetch_ids.is_empty() {
+                    if let Err(e) = item_sync::send_fetch_request(&mut send, &fetch_ids).await {
+                        tracing::debug!(peer = %target, error = %e, "fetch request failed");
+                        fetched = Fetched::Failed;
+                        break 'channels; // Stream corrupted
+                    }
+                    let mut items = match item_sync::read_fetch_response(&mut recv).await {
+                        Ok(items) => items,
+                        Err(e) => {
+                            // The page's entries could not be fetched in
+                            // one message: ask for fewer next time.
+                            tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
+                            if let Ok(mut p) = page_steps.lock() {
+                                p.insert(
+                                    cursor_key.clone(),
+                                    (step + 1).min(SYNC_PAGE_STEPS.len() - 1),
+                                );
+                            }
+                            fetched = Fetched::More;
+                            break 'channels;
+                        }
+                    };
+
+                    // Everything the peer sent counts against its
+                    // allowance, asked for or not.
+                    if limited {
+                        let cost: u64 = items
+                            .iter()
+                            .map(|i| entry_cost(i.encrypted_blob.len()))
+                            .sum();
+                        lock_rates().fetched(&target, address, cost);
+                    }
+                    // Only what was asked for is looked at: those entries,
+                    // of this channel, each once.
+                    {
+                        let mut wanted: std::collections::HashSet<&str> =
+                            fetch_ids.iter().map(String::as_str).collect();
+                        items.retain(|i| {
+                            i.channel_id == *ch_id && wanted.remove(i.item_id.as_str())
+                        });
+                    }
+
+                    let mut stored_count = 0u32;
+                    let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
+                    // Checked before the database is held.
+                    let checked: Vec<Result<Checked, &'static str>> =
+                        items.iter().map(check_item).collect();
+                    {
+                        let Ok(db) = state.db.lock() else {
+                            fetched = Fetched::Failed;
+                            break 'channels;
+                        };
+                        let own = state.identity.public_key();
+                        let mut room =
+                            RelayRoom::new(max_bytes, Some(&*rates), limited.then_some(address));
+                        let mut no_room = false;
+                        // One transaction for the page, as for a push.
+                        let Ok(batch) = db.unchecked_transaction() else {
+                            fetched = Fetched::Failed;
+                            break 'channels;
+                        };
+                        for (item, checked) in items.iter().zip(checked) {
+                            let room = is_relay_node.then_some(&mut room);
+                            let outcome = checked.and_then(|checked| {
+                                store_checked(&db, item, &checked, &role, &own, room)
+                            });
+                            match outcome {
+                                Ok(true) => {
+                                    stored_count += 1;
+                                    if is_relay_node {
+                                        newly_stored_items.push(item.clone());
+                                    }
+                                }
+                                Err(why) if why == cordelia_network::messages::REFUSED_FULL => {
+                                    no_room = true
+                                }
+                                _ => {}
+                            }
+                        }
+                        let held = cordelia_storage::channels::exists(&db, ch_id).unwrap_or(true);
+                        // A page that could not be stored is not passed: it
+                        // is asked for again.
+                        if let Err(e) = batch.commit() {
+                            tracing::warn!(peer = %target, error = %e, "could not store a fetched page");
+                            fetched = Fetched::Failed;
+                            break 'channels;
+                        }
+                        if is_relay_node {
+                            not_taken = no_room && !held;
+                            // What the relay dropped to make room is listed
+                            // again from the start, from every peer.
+                            if !room.dropped.is_empty()
+                                && let Ok(mut relist) = state.relist.lock()
+                            {
+                                relist.extend(room.dropped.drain(..));
+                            }
+                        }
+                    }
+                    // Epidemic forwarding: a relay queues what it fetched
+                    // to be pushed on, with where it came from.
+                    if is_relay_node && !newly_stored_items.is_empty() {
+                        if let Ok(mut st) = seen_table.write() {
+                            for item in &newly_stored_items {
+                                let hash: [u8; 32] =
+                                    item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                                st.record_sender(&hash, &target);
+                            }
+                        }
+                        for item in newly_stored_items {
+                            let _ = repush_tx.send((item, target.clone()));
+                        }
+                    }
+                    if stored_count > 0 {
+                        tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync page complete");
+                        total_stored += stored_count as u64;
+                    }
+                }
+            }
+
+            if not_taken {
+                continue 'channels;
+            }
+            // A peer without arrival paging answers once, the old way.
+            let Some(last_seq) = resp.last_seq else {
+                caught_up = true;
+                break;
+            };
+            if cursor_epoch.load(Ordering::Acquire) == epoch
+                && let Ok(mut c) = cursors.lock()
+            {
+                c.insert(cursor_key.clone(), last_seq);
+            }
+            if !resp.has_more {
+                // Caught up here: back to full pages.
+                if let Ok(mut p) = page_steps.lock() {
+                    p.remove(&cursor_key);
+                }
+                caught_up = true;
+                break;
+            }
+        }
+        // More pages than one pass takes: the rest in the next.
+        if !caught_up && fetched == Fetched::All {
+            fetched = Fetched::More;
+        }
+    }
+    // FIN: signal end of batch to server
+    let _ = send.finish();
+    (fetched, total_stored)
 }
 
 /// An item that has passed every check that needs no database: its size,
@@ -968,6 +1591,7 @@ pub async fn p2p_loop(
     relay_addrs: RelayAddrs,
     trusted_peer_ids: Vec<NodeId>,
     max_storage_bytes: u64,
+    relay_ask_again: std::time::Duration,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -1001,8 +1625,9 @@ pub async fn p2p_loop(
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
     // Per-peer rate limiters, shared with handle_peer_streams tasks
-    let peer_rates: std::sync::Arc<std::sync::Mutex<Rates>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Rates::new(max_storage_bytes)));
+    let peer_rates: std::sync::Arc<std::sync::Mutex<Rates>> = std::sync::Arc::new(
+        std::sync::Mutex::new(Rates::new(max_storage_bytes).ask_again(relay_ask_again)),
+    );
     // Addresses refused for a time, after a peer there kept going over its
     // limits. An address, since a key costs nothing to replace.
     let mut refused_addresses: std::collections::HashMap<std::net::IpAddr, std::time::Instant> =
@@ -1049,6 +1674,22 @@ pub async fn p2p_loop(
     let sync_page_steps: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<(NodeId, String), usize>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Counts each time places are forgotten (a peer connected again, or a
+    // channel is to be listed again from the start). A fetch that was
+    // under way when that happened does not put its place back.
+    let cursor_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // When a relay next asks each peer that is not one of its hot peers
+    // which channels it holds (see `peers_to_ask`).
+    let ask_next: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // The peers a fetch is running from. One at a time from each: a peer
+    // that answers slowly must not have fetches pile up behind it.
+    let fetching: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<NodeId>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
@@ -1403,6 +2044,12 @@ pub async fn p2p_loop(
                                 // everything it stores from now on.
                                 if let Ok(mut cursors) = sync_cursors.lock() {
                                     cursors.retain(|(peer, _), _| peer != &node_id);
+                                    cursor_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                }
+                                // A relay asks a peer that has just connected
+                                // which channels it holds.
+                                if let Ok(mut ask_next) = ask_next.lock() {
+                                    ask_next.remove(&node_id);
                                 }
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
@@ -1876,6 +2523,7 @@ pub async fn p2p_loop(
                     && let Ok(mut cursors) = sync_cursors.lock()
                 {
                     cursors.retain(|(_, channel), _| !changed.contains(channel));
+                    cursor_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
@@ -1916,208 +2564,78 @@ pub async fn p2p_loop(
 
                 let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();
+                // A relay keeps a place, and a page size, only for peers
+                // that are connected. Without this a peer could connect
+                // under key after key and leave a relay holding a place for
+                // each.
+                if let Ok(mut cursors) = sync_cursors.lock() {
+                    forget_gone(&mut cursors, &peers);
+                }
+                if let Ok(mut steps) = sync_page_steps.lock() {
+                    forget_gone(&mut steps, &peers);
+                }
+                // A relay also asks the peers that are not among its hot
+                // peers, which is where its devices are: less often, since
+                // a device sends what it writes as it writes it.
+                let others = if is_relay {
+                    let mut ask_next = ask_next.lock().unwrap_or_else(|e| e.into_inner());
+                    peers_to_ask(&peers, &hot, &mut ask_next, std::time::Instant::now())
+                } else {
+                    Vec::new()
+                };
                 sync_cycles_completed += 1;
-                tracing::info!(hot_peers = hot.len(), total_peers = peers.len(), local_channels = local_channels.len(), cycle = sync_cycles_completed, "pull-sync cycle");
-                for target in &hot {
-                    if let Some(conn) = conn_mgr.get_connection(target) {
-                    let conn = conn.clone();
-                    let sync_state = state.clone();
-                    let sync_local = local_channels.clone();
-                    let target = target.clone();
-                    let gtx = gov_tx.clone();
-                    let role = node_role.clone();
-                    let do_phase0 = is_relay;
-                    let is_relay_node = is_relay;
-                    let rtx = repush_tx.clone();
-                    let seen_ref = seen_table.clone();
-                    let cursors = sync_cursors.clone();
-                    let page_steps = sync_page_steps.clone();
-                    let room_rates = peer_rates.clone();
+                tracing::info!(hot_peers = hot.len(), asked = others.len(), total_peers = peers.len(), local_channels = local_channels.len(), cycle = sync_cycles_completed, "pull-sync cycle");
+                for target in hot.iter().chain(&others) {
+                    let Some(conn) = conn_mgr.get_connection(target) else {
+                        continue;
+                    };
+                    // One fetch at a time from each peer.
+                    let Some(fetch) = Fetching::begin(&fetching, target) else {
+                        continue;
+                    };
                     // What a relay this node lists hands over is not counted
                     // against an address.
                     let from_listed_relay = governor
-                        .peer_info(&target)
+                        .peer_info(target)
                         .is_some_and(|peer| peer.is_relay);
-                    let source_address = conn.remote_address().ip();
+                    // What a relay fetches from any other peer is bounded as
+                    // what that peer may push is, and is only what the peer
+                    // says it holds.
+                    let limited = is_relay && !from_listed_relay;
+                    let from = FetchFrom {
+                        conn: conn.clone(),
+                        target: target.clone(),
+                        state: state.clone(),
+                        role: node_role.clone(),
+                        channels: if limited { Vec::new() } else { local_channels.clone() },
+                        ask_what_it_holds: is_relay,
+                        limited,
+                        address: conn.remote_address().ip(),
+                        rates: peer_rates.clone(),
+                        cursors: sync_cursors.clone(),
+                        cursor_epoch: cursor_epoch.clone(),
+                        page_steps: sync_page_steps.clone(),
+                        repush_tx: repush_tx.clone(),
+                        seen_table: seen_table.clone(),
+                    };
+                    let gtx = gov_tx.clone();
+                    let ask_next = ask_next.clone();
                     tokio::spawn(async move {
-                        // Batched sync (§4.5): one stream per peer, all channels.
-                        // Open one (send, recv) pair, write protocol byte once.
-                        let (mut send, mut recv) = match open_bi(&conn).await {
-                            Ok(s) => s,
-                            Err(e) => { tracing::debug!(peer = %target, error = %e, "sync open_bi failed"); return; }
-                        };
-                        if let Err(e) = cordelia_network::codec::write_protocol_byte(&mut send, cordelia_network::messages::Protocol::ItemSync).await {
-                            tracing::debug!(peer = %target, error = %e, "sync protocol byte failed");
-                            return;
-                        }
-
-                        // Phase 0: relay channel discovery (§4.5)
-                        // Ask peer "what channels do you have?", merge with local.
-                        let sync_channels = if do_phase0 {
-                            let discovered = match cordelia_network::item_sync::send_channel_list_request(&mut send, &mut recv).await {
-                                Ok(resp) => resp.channel_ids,
-                                Err(e) => {
-                                    tracing::debug!(peer = %target, error = %e, "phase0 channel list request failed");
-                                    Vec::new()
-                                }
+                        let _fetch = fetch;
+                        let target = from.target.clone();
+                        let (fetched, stored) = fetch_from(from).await;
+                        // When a relay asks this peer again.
+                        if is_relay && let Ok(mut ask_next) = ask_next.lock() {
+                            match next_ask(fetched, relay_ask_again, std::time::Instant::now()) {
+                                Some(at) => ask_next.insert(target.clone(), at),
+                                None => ask_next.remove(&target),
                             };
-                            if !discovered.is_empty() {
-                                tracing::debug!(peer = %target, discovered = discovered.len(), "phase0: discovered channels");
-                            }
-                            // Merge: local stored + peer discovered (deduplicated)
-                            let mut merged: std::collections::HashSet<String> = sync_local.into_iter().collect();
-                            for ch in discovered {
-                                merged.insert(ch);
-                            }
-                            merged.into_iter().collect::<Vec<_>>()
-                        } else {
-                            sync_local
-                        };
-
-                        if sync_channels.is_empty() { return; }
-                        tracing::debug!(peer = %target, channels = sync_channels.len(), "pull-sync starting");
-
-                        // Loop channels on one stream. Each channel is paged by the
-                        // peer's arrival sequence from our cursor (§4.4a), at most
-                        // SYNC_PAGES_PER_CYCLE pages per cycle; the cursor moves only
-                        // after a page is fully processed, so a failure retries it.
-                        const SYNC_PAGES_PER_CYCLE: usize = 10;
-                        let mut total_stored: u64 = 0;
-                        'channels: for ch_id in &sync_channels {
-                            let cursor_key = (target.clone(), ch_id.clone());
-                            for _page in 0..SYNC_PAGES_PER_CYCLE {
-                                let after = cursors.lock().ok().and_then(|c| c.get(&cursor_key).copied()).unwrap_or(0);
-                                let steps = cordelia_core::protocol::SYNC_PAGE_STEPS;
-                                let step = page_steps.lock().ok().and_then(|p| p.get(&cursor_key).copied()).unwrap_or(0).min(steps.len() - 1);
-                                // The page's entries could not be fetched in one
-                                // message: ask for fewer next time.
-                                let fewer_next_time = || {
-                                    if let Ok(mut p) = page_steps.lock() {
-                                        p.insert(cursor_key.clone(), (step + 1).min(steps.len() - 1));
-                                    }
-                                };
-                                let resp = match cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, ch_id, after, steps[step]).await {
-                                    Ok(r) => r,
-                                    Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); break 'channels; }
-                                };
-
-                                if !resp.items.is_empty() {
-                                    let known = {
-                                        let db = match sync_state.db.lock() {
-                                            Ok(db) => db,
-                                            Err(_) => break 'channels,
-                                        };
-                                        let offered: Vec<String> = resp.items.iter().map(|h| h.item_id.clone()).collect();
-                                        cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
-                                    };
-                                    let mut fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
-                                    // A device can tell from an entry's header
-                                    // whether it will store it, and does not
-                                    // fetch the rest of one it will not.
-                                    if role == "personal" {
-                                        let own = sync_state.identity.public_key();
-                                        if let Ok(db) = sync_state.db.lock() {
-                                            fetch_ids.retain(|id| {
-                                                resp.items.iter().find(|h| &h.item_id == id).is_some_and(|h| {
-                                                    <[u8; 32]>::try_from(h.author_id.as_slice()).is_ok_and(|author| {
-                                                        wanted_by_a_device(&db, &h.channel_id, &author, &own)
-                                                    })
-                                                })
-                                            });
-                                        }
-                                    }
-                                    if !fetch_ids.is_empty() {
-                                        if let Err(e) = cordelia_network::item_sync::send_fetch_request(&mut send, &fetch_ids).await {
-                                            tracing::debug!(peer = %target, error = %e, "fetch request failed");
-                                            break 'channels; // Stream corrupted
-                                        }
-                                        let items = match cordelia_network::item_sync::read_fetch_response(&mut recv).await {
-                                            Ok(items) => items,
-                                            Err(e) => {
-                                                tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
-                                                fewer_next_time();
-                                                break 'channels;
-                                            }
-                                        };
-
-                                        let mut stored_count = 0u32;
-                                        let mut newly_stored_items: Vec<cordelia_network::messages::Item> = Vec::new();
-                                        // Checked before the database is held.
-                                        let checked: Vec<Result<Checked, &'static str>> = items.iter().map(check_item).collect();
-                                        {
-                                            let db = match sync_state.db.lock() {
-                                                Ok(db) => db,
-                                                Err(_) => break 'channels,
-                                            };
-                                            let own = sync_state.identity.public_key();
-                                            let max_bytes = room_rates.lock().unwrap_or_else(|e| e.into_inner()).relay_max_bytes;
-                                            let mut room = RelayRoom::new(
-                                                max_bytes,
-                                                (!from_listed_relay).then_some((source_address, &*room_rates)),
-                                            );
-                                            // One transaction for the page,
-                                            // as for a push.
-                                            let Ok(batch) = db.unchecked_transaction() else { break 'channels };
-                                            for (item, checked) in items.iter().zip(checked) {
-                                                let room = is_relay_node.then_some(&mut room);
-                                                let outcome = checked.and_then(|checked| store_checked(&db, item, &checked, &role, &own, room));
-                                                if let Ok(true) = outcome {
-                                                    stored_count += 1;
-                                                    if is_relay_node {
-                                                        newly_stored_items.push(item.clone());
-                                                    }
-                                                }
-                                            }
-                                            // A page that could not be stored
-                                            // is not passed: it is asked for
-                                            // again.
-                                            if let Err(e) = batch.commit() {
-                                                tracing::warn!(peer = %target, error = %e, "could not store a fetched page");
-                                                break 'channels;
-                                            }
-                                        }
-                                        // Epidemic forwarding: relay queues sync-discovered items
-                                        // for repush, recording sync source in seen table.
-                                        if is_relay_node && !newly_stored_items.is_empty() {
-                                            if let Ok(mut st) = seen_ref.write() {
-                                                for item in &newly_stored_items {
-                                                    let hash: [u8; 32] = item.content_hash.as_slice().try_into().unwrap_or([0u8; 32]);
-                                                    st.record_sender(&hash, &target);
-                                                }
-                                            }
-                                            for item in newly_stored_items {
-                                                let _ = rtx.send((item, target.clone()));
-                                            }
-                                        }
-                                        if stored_count > 0 {
-                                            tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync page complete");
-                                            total_stored += stored_count as u64;
-                                        }
-                                    }
-                                }
-
-                                // A peer without arrival paging answers once, the old way.
-                                let Some(last_seq) = resp.last_seq else { break };
-                                if let Ok(mut c) = cursors.lock() {
-                                    c.insert(cursor_key.clone(), last_seq);
-                                }
-                                if !resp.has_more {
-                                    // Caught up here: back to full pages.
-                                    if let Ok(mut p) = page_steps.lock() {
-                                        p.remove(&cursor_key);
-                                    }
-                                    break;
-                                }
-                            }
                         }
-                        // FIN: signal end of batch to server
-                        let _ = send.finish();
                         // One GovEvent per peer (not per channel)
-                        if total_stored > 0 {
-                            let _ = gtx.send(GovEvent::ItemsDelivered(target.clone(), total_stored));
+                        if stored > 0 {
+                            let _ = gtx.send(GovEvent::ItemsDelivered(target, stored));
                         }
                     });
-                    }
                 }
             }
 
@@ -2903,7 +3421,7 @@ async fn handle_inbound_push(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .relay_max_bytes;
-        let mut room = RelayRoom::new(max_bytes, limited.then_some((address, &**peer_rates)));
+        let mut room = RelayRoom::new(max_bytes, Some(&**peer_rates), limited.then_some(address));
         let mut stored = 0u32;
         let mut dedup = 0u32;
         let mut rejected = 0u32;
@@ -2941,6 +3459,13 @@ async fn handle_inbound_push(
         if let Err(e) = batch.commit() {
             tracing::warn!(peer = %peer_id, error = %e, "could not store a push");
             return None;
+        }
+        // What the relay dropped to make room is listed again from the
+        // start, from every peer.
+        if !room.dropped.is_empty()
+            && let Ok(mut relist) = state.relist.lock()
+        {
+            relist.extend(room.dropped.drain(..));
         }
         (stored, dedup, rejected)
     };
@@ -3749,7 +4274,7 @@ mod tests {
         const ENTRY: usize = 60_000;
         let db = cordelia_storage::db::open_in_memory().unwrap();
         let empty = cordelia_storage::db::used_bytes(&db).unwrap();
-        let mut room = RelayRoom::new(empty + 400_000, None);
+        let mut room = RelayRoom::new(empty + 400_000, None, None);
 
         // The first channel, then newer ones, one entry each, until the
         // relay will take no more.
@@ -3806,7 +4331,7 @@ mod tests {
         let db = cordelia_storage::db::open_in_memory().unwrap();
 
         // One channel: two entries fit in its share, a third does not.
-        let mut room = RelayRoom::new(u64::MAX, None);
+        let mut room = RelayRoom::new(u64::MAX, None, None);
         room.max_channel_bytes = 150_000;
         let full = channel(100);
         assert_eq!(relay_store(&db, &mut room, &full, 60_000), Ok(true));
@@ -3823,7 +4348,7 @@ mod tests {
         // New channels from one address.
         let rates = std::sync::Mutex::new(Rates::default());
         let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
-        let mut room = RelayRoom::new(u64::MAX, Some((address, &rates)));
+        let mut room = RelayRoom::new(u64::MAX, Some(&rates), Some(address));
         for n in 0..NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
             assert_eq!(
                 relay_store(&db, &mut room, &channel(200 + n), 100),
@@ -3839,9 +4364,9 @@ mod tests {
         assert_eq!(relay_store(&db, &mut room, &channel(200), 100), Ok(true));
         // Another address, and a relay this one lists, are not affected.
         let elsewhere: std::net::IpAddr = "192.0.2.8".parse().unwrap();
-        let mut room = RelayRoom::new(u64::MAX, Some((elsewhere, &rates)));
+        let mut room = RelayRoom::new(u64::MAX, Some(&rates), Some(elsewhere));
         assert_eq!(relay_store(&db, &mut room, &channel(301), 100), Ok(true));
-        let mut room = RelayRoom::new(u64::MAX, None);
+        let mut room = RelayRoom::new(u64::MAX, None, None);
         assert_eq!(relay_store(&db, &mut room, &channel(302), 100), Ok(true));
     }
 
@@ -3854,7 +4379,7 @@ mod tests {
         use cordelia_network::messages::REFUSED_FULL;
         const SMALL: usize = 8;
         let db = cordelia_storage::db::open_in_memory().unwrap();
-        let mut room = RelayRoom::new(u64::MAX, None);
+        let mut room = RelayRoom::new(u64::MAX, None, None);
         // Room for a hundred of them, and half of one more.
         room.max_channel_bytes = 100 * entry_cost(SMALL) + entry_cost(SMALL) / 2;
         let small = channel(400);
@@ -3867,7 +4392,7 @@ mod tests {
         );
         // The next push finds the same: what the channel holds is counted
         // the same way when it is read back.
-        let mut next = RelayRoom::new(u64::MAX, None);
+        let mut next = RelayRoom::new(u64::MAX, None, None);
         next.max_channel_bytes = room.max_channel_bytes;
         assert_eq!(
             relay_store(&db, &mut next, &small, SMALL),
@@ -3907,6 +4432,330 @@ mod tests {
         assert!(rates.pushed(&peer(60), address, 1).is_err());
         // The quiet address was forgotten.
         assert!(!rates.by_address.contains_key(&quiet));
+    }
+
+    /// A relay asks every peer connected to it which channels it holds, not
+    /// only its hot peers: a peer that has just connected at once, and then
+    /// when the fetch from it says. Two relays that list each other are
+    /// each other's hot peer, so this is how a relay comes to ask its
+    /// devices.
+    #[test]
+    fn a_relay_asks_the_peers_that_are_not_hot_when_they_connect_and_again_later() {
+        use std::time::{Duration, Instant};
+        let peer = |n: u8| NodeId([n; 32]);
+        let (relay, a, b) = (peer(1), peer(2), peer(3));
+        let every = Duration::from_secs(600);
+        let window = Duration::from_secs(cordelia_core::protocol::RATE_WINDOW_SECS);
+        let start = Instant::now();
+        let connected = vec![relay.clone(), a.clone(), b.clone()];
+        let hot = vec![relay.clone()];
+        let mut ask_next = std::collections::HashMap::new();
+
+        // Both devices at the first cycle; the hot peer is fetched from
+        // every cycle and is not among them.
+        assert_eq!(
+            peers_to_ask(&connected, &hot, &mut ask_next, start),
+            vec![a.clone(), b.clone()]
+        );
+
+        // The fetch from A got all of it: A is asked again after the wait.
+        // B's allowance ran out: B is asked when it has room again.
+        ask_next.insert(a.clone(), next_ask(Fetched::All, every, start).unwrap());
+        ask_next.insert(
+            b.clone(),
+            next_ask(Fetched::AllowanceUsed, every, start).unwrap(),
+        );
+        assert!(
+            peers_to_ask(
+                &connected,
+                &hot,
+                &mut ask_next,
+                start + Duration::from_secs(10)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            peers_to_ask(&connected, &hot, &mut ask_next, start + window),
+            vec![b.clone()]
+        );
+        ask_next.insert(
+            b.clone(),
+            next_ask(Fetched::All, every, start + window).unwrap(),
+        );
+        assert!(
+            peers_to_ask(
+                &connected,
+                &hot,
+                &mut ask_next,
+                start + every - Duration::from_secs(1)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            peers_to_ask(&connected, &hot, &mut ask_next, start + every),
+            vec![a.clone()]
+        );
+
+        // More to fetch now is the next cycle; no proper answer waits a
+        // window, as a used allowance does.
+        assert_eq!(next_ask(Fetched::More, every, start), None);
+        assert_eq!(
+            next_ask(Fetched::Failed, every, start),
+            Some(start + window)
+        );
+        assert_eq!(next_ask(Fetched::All, every, start), Some(start + every));
+
+        // A peer that has gone is forgotten, and asked as soon as it is back.
+        let later = start + every + window;
+        ask_next.insert(b.clone(), later + every);
+        assert!(peers_to_ask(std::slice::from_ref(&relay), &hot, &mut ask_next, later).is_empty());
+        assert_eq!(
+            peers_to_ask(&connected, &hot, &mut ask_next, later),
+            vec![a.clone(), b.clone()]
+        );
+
+        // A relay whose hot peer is a device asks its other devices too.
+        let mut ask_next = std::collections::HashMap::new();
+        assert_eq!(
+            peers_to_ask(
+                &[a.clone(), b.clone()],
+                std::slice::from_ref(&a),
+                &mut ask_next,
+                start
+            ),
+            vec![b]
+        );
+    }
+
+    /// T3. What a peer lists is the peer's to write, so a relay bounds it:
+    /// only IDs that could be a channel's, each once, and so many of them.
+    /// A peer cannot have a relay ask about, and keep a place in, any
+    /// number of channels with names of any length.
+    #[test]
+    fn what_a_peer_lists_is_bounded_before_a_relay_asks_about_it() {
+        use cordelia_core::protocol::{MAX_CHANNEL_ID_LEN, MAX_CHANNELS_ASKED_OF_A_PEER};
+        let good = |n: usize| channel(n);
+
+        // An ID that is too long, one with a space, one that is not text a
+        // channel's ID could be, and an empty one are dropped; one listed
+        // twice is asked about once.
+        let listed = vec![
+            good(1),
+            "x".repeat(MAX_CHANNEL_ID_LEN + 1),
+            "grp_with a space".to_string(),
+            "grp_\u{7}bell".to_string(),
+            String::new(),
+            good(1),
+            "x".repeat(MAX_CHANNEL_ID_LEN),
+        ];
+        let mut asked = channels_to_ask(Vec::new(), listed, usize::MAX);
+        asked.sort();
+        let mut expected = vec![good(1), "x".repeat(MAX_CHANNEL_ID_LEN)];
+        expected.sort();
+        assert_eq!(asked, expected);
+
+        // However many a peer lists, only so many are asked about.
+        let many: Vec<String> = (0..5 * MAX_CHANNELS_ASKED_OF_A_PEER).map(good).collect();
+        let asked = channels_to_ask(Vec::new(), many.clone(), MAX_CHANNELS_ASKED_OF_A_PEER);
+        assert_eq!(asked.len(), MAX_CHANNELS_ASKED_OF_A_PEER);
+        assert!(asked.iter().all(|id| many.contains(id)));
+
+        // This node's own channels are asked about whatever the peer lists.
+        let asked = channels_to_ask(vec![good(9_999_999)], many, 0);
+        assert_eq!(asked, vec![good(9_999_999)]);
+    }
+
+    /// T3. A relay keeps a place in a peer's list only while the peer is
+    /// connected. A peer cannot connect under key after key and leave a
+    /// relay holding a place for each.
+    #[test]
+    fn a_place_in_a_peers_list_is_forgotten_when_the_peer_goes() {
+        let peer = |n: u8| NodeId([n; 32]);
+        let mut places = std::collections::HashMap::new();
+        for n in 1..=3u8 {
+            for c in 0..4 {
+                places.insert((peer(n), channel(c)), u64::from(n));
+            }
+        }
+        forget_gone(&mut places, &[peer(2)]);
+        assert_eq!(places.len(), 4);
+        assert!(places.keys().all(|(p, _)| *p == peer(2)));
+        forget_gone(&mut places, &[]);
+        assert!(places.is_empty());
+    }
+
+    /// One fetch at a time from each peer: a peer that answers slowly does
+    /// not have fetches pile up behind it.
+    #[test]
+    fn one_fetch_at_a_time_runs_from_each_peer() {
+        let peer = |n: u8| NodeId([n; 32]);
+        let fetching = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let first = Fetching::begin(&fetching, &peer(1)).expect("the first begins");
+        assert!(Fetching::begin(&fetching, &peer(1)).is_none());
+        // Another peer is not held up, and its fetch ends here.
+        assert!(Fetching::begin(&fetching, &peer(2)).is_some());
+        assert!(Fetching::begin(&fetching, &peer(2)).is_some());
+        drop(first);
+        assert!(Fetching::begin(&fetching, &peer(1)).is_some());
+    }
+
+    /// T3. What a relay fetches from a peer is bounded as what the peer may
+    /// push is: so many bytes a minute for the connection, and five times
+    /// that for its address. It is counted apart from what the peer pushes,
+    /// so a relay that asks a device for its channels never makes the
+    /// device's own pushes a breach.
+    #[test]
+    fn what_a_relay_fetches_from_a_peer_is_bounded_as_what_the_peer_may_push_is() {
+        use cordelia_core::protocol::{MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE};
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let peer = |n: u8| NodeId([n; 32]);
+        let mut rates = Rates::default();
+
+        assert_eq!(
+            rates.fetch_room(&peer(1), address),
+            PUSH_BYTES_PER_PEER_PER_MINUTE
+        );
+        rates.fetched(&peer(1), address, PUSH_BYTES_PER_PEER_PER_MINUTE - 1000);
+        assert_eq!(rates.fetch_room(&peer(1), address), 1000);
+        rates.fetched(&peer(1), address, 1000);
+        assert_eq!(rates.fetch_room(&peer(1), address), 0);
+
+        // Other connections from the address have room of their own, until
+        // the address has had its share.
+        for n in 2..=MAX_CONNECTIONS_PER_IP as u8 {
+            assert_eq!(
+                rates.fetch_room(&peer(n), address),
+                PUSH_BYTES_PER_PEER_PER_MINUTE,
+                "{n}"
+            );
+            rates.fetched(&peer(n), address, PUSH_BYTES_PER_PEER_PER_MINUTE);
+        }
+        assert_eq!(rates.fetch_room(&peer(100), address), 0);
+
+        // What the relay fetched is not held against what the peer pushes.
+        assert_eq!(
+            rates.pushed(&peer(1), address, PUSH_BYTES_PER_PEER_PER_MINUTE),
+            Ok(())
+        );
+
+        // The address's allowance outlasts its connections, as for pushes:
+        // closing them all does not give it more to be fetched. (An address
+        // from which only fetching was counted, to be sure of that.)
+        let fetched_from: std::net::IpAddr = "192.0.2.9".parse().unwrap();
+        for n in 1..=MAX_CONNECTIONS_PER_IP as u8 {
+            rates.fetched(&peer(n), fetched_from, PUSH_BYTES_PER_PEER_PER_MINUTE);
+        }
+        rates.prune(&[], &[]);
+        assert_eq!(rates.fetch_room(&peer(200), fetched_from), 0);
+    }
+
+    /// A relay can say whether it would take a channel it does not hold
+    /// without counting it, so that it does not fetch what it would then
+    /// refuse: not at its cap, and not from an address that has had its
+    /// share of new channels.
+    #[test]
+    fn a_relay_says_whether_it_has_room_for_a_channel_without_counting_it() {
+        use cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR;
+        use cordelia_network::messages::REFUSED_FULL;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let rates = std::sync::Mutex::new(Rates::default());
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let mut room = RelayRoom::new(u64::MAX, Some(&rates), Some(address));
+
+        // Asking uses none of the address's allowance.
+        for n in 0..10 * NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
+            assert_eq!(
+                room.takes_new_channel(&db, &channel(500 + n)),
+                Ok(()),
+                "{n}"
+            );
+        }
+        for n in 0..NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
+            assert_eq!(
+                relay_store(&db, &mut room, &channel(500 + n), 100),
+                Ok(true),
+                "{n}"
+            );
+        }
+        // The address has had its share.
+        assert_eq!(
+            room.takes_new_channel(&db, &channel(600)),
+            Err(REFUSED_FULL)
+        );
+        // A relay this one lists is not limited by it.
+        let listed = RelayRoom::new(u64::MAX, Some(&rates), None);
+        assert_eq!(listed.takes_new_channel(&db, &channel(600)), Ok(()));
+        // At the cap, nobody's new channel is taken.
+        let used = cordelia_storage::db::used_bytes(&db).unwrap();
+        let full = RelayRoom::new(used, Some(&rates), None);
+        assert_eq!(
+            full.takes_new_channel(&db, &channel(600)),
+            Err(REFUSED_FULL)
+        );
+    }
+
+    /// A channel that a relay dropped to make room is noted, so that it is
+    /// listed again from the start, and it is not taken again until a wait
+    /// has passed. Without the wait, a relay at its cap would fetch the
+    /// channel from a peer, drop it, and fetch it again, without end.
+    #[test]
+    fn a_channel_a_relay_dropped_is_left_for_a_while_before_it_is_taken_again() {
+        use cordelia_network::messages::REFUSED_FULL;
+        const ENTRY: usize = 60_000;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let empty = cordelia_storage::db::used_bytes(&db).unwrap();
+        let rates = std::sync::Mutex::new(Rates::default());
+        let mut room = RelayRoom::new(empty + 400_000, Some(&rates), None);
+
+        // An older channel and a newer one; the older one grows until the
+        // newer one is dropped.
+        let (older, newer) = (channel(700), channel(701));
+        assert_eq!(relay_store(&db, &mut room, &older, ENTRY), Ok(true));
+        assert_eq!(relay_store(&db, &mut room, &newer, ENTRY), Ok(true));
+        assert!(room.dropped.is_empty());
+        for write in 0..10 {
+            assert_eq!(
+                relay_store(&db, &mut room, &older, ENTRY),
+                Ok(true),
+                "{write}"
+            );
+            if !room.dropped.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(room.dropped, vec![newer.clone()]);
+        assert_eq!(holds(&db, &newer), 0);
+
+        // It is not taken again yet, even by a relay with room for it.
+        let mut roomy = RelayRoom::new(u64::MAX, Some(&rates), None);
+        assert_eq!(roomy.takes_new_channel(&db, &newer), Err(REFUSED_FULL));
+        assert_eq!(
+            relay_store(&db, &mut roomy, &newer, ENTRY),
+            Err(REFUSED_FULL)
+        );
+        // Another channel is.
+        assert_eq!(relay_store(&db, &mut roomy, &channel(702), ENTRY), Ok(true));
+
+        // Once the wait has passed, it is.
+        let mut rates = Rates::default().ask_again(std::time::Duration::ZERO);
+        rates.dropped(&newer);
+        assert!(!rates.dropped_lately(&newer));
+        let mut rates = Rates::default();
+        rates.dropped(&newer);
+        assert!(rates.dropped_lately(&newer));
+        assert!(!rates.dropped_lately(&older));
+
+        // A channel that is dropped again each time it is taken does not
+        // fit: the wait doubles each time, up to 32 times the first.
+        let first = std::time::Duration::from_secs(cordelia_core::protocol::RELAY_ASK_AGAIN_SECS);
+        assert_eq!(rates.dropped_wait(1), first);
+        assert_eq!(rates.dropped_wait(2), 2 * first);
+        assert_eq!(rates.dropped_wait(3), 4 * first);
+        assert_eq!(rates.dropped_wait(6), 32 * first);
+        assert_eq!(rates.dropped_wait(60), 32 * first);
+        rates.dropped(&newer);
+        rates.dropped(&newer);
+        assert_eq!(rates.dropped.get(&newer).map(|(_, times)| *times), Some(3));
     }
 
     /// A device paces what it pushes to a relay: full batches while there is

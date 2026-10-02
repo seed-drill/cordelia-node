@@ -593,6 +593,142 @@ fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
     }
 }
 
+/// The topology we run: two relays that list each other. Each keeps the
+/// other as its hot peer, so the devices are warm at both. Both relays lose
+/// their databases while the devices are away.
+///
+/// A relay is a cache, and its devices are where the entries are: it asks
+/// each device that connects which channels it holds, and fetches what it
+/// lacks, whether or not it counts that device among its hot peers. A device
+/// added afterwards, which has only the relays to fetch from, gets what was
+/// written before.
+#[test]
+fn relays_that_list_each_other_are_filled_again_by_their_devices() {
+    let mut r1 = node("relay1", "relay", None);
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let mut r2 = node_with_relays(
+        "relay2",
+        "relay",
+        &[(format!("localhost:{}", r1.p2p), Some(key_of(&r1)))],
+    );
+    r1.add_relay(&format!("localhost:{}", r2.p2p), Some(&key_of(&r2)));
+    let (r1_key, r2_key) = (key_of(&r1), key_of(&r2));
+    let meshed = |r1: &Node, r2: &Node| {
+        (peer_keys(r1).contains(&r2_key) && peer_keys(r2).contains(&r1_key)).then_some(())
+    };
+    r1.start();
+    wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
+    r2.start();
+    wait_for("relay2 healthy", &[&r1, &r2], 30, || healthy(&r2));
+    wait_for("the relays mesh", &[&r1, &r2], 60, || meshed(&r1, &r2));
+
+    let both = [
+        format!("localhost:{}", r1.p2p),
+        format!("localhost:{}", r2.p2p),
+    ];
+    let mut a = node_with_bootnodes("a", "personal", &both);
+    let mut b = node_with_bootnodes("b", "personal", &both);
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        let all = [&r1, &r2, &a, &b];
+        wait_for("device healthy", &all, 30, || healthy(n));
+        wait_for("device reaches both relays", &all, 60, || {
+            (peer_keys(n).len() == 2).then_some(())
+        });
+    }
+    let personal = pair(&a, &b, "b", &[&r1, &r2, &a, &b]);
+    let publish = |n: &Node, key: &str, text: &str| {
+        n.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
+        )
+    };
+    let reads = |n: &Node, key: &str, text: &str| {
+        n.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        )["entries"]
+            .as_array()?
+            .iter()
+            .any(|e| e["key"] == key && e["content"]["text"] == text)
+            .then_some(())
+    };
+    for n in 0..5 {
+        publish(&a, &format!("before-{n}.md"), "before");
+    }
+    wait_for("b reads what a wrote", &[&r1, &r2, &a, &b], 90, || {
+        reads(&b, "before-4.md", "before")
+    });
+
+    // The devices are away, and both relays come back with nothing. They
+    // find each other first, so each has its hot peer before a device
+    // connects.
+    a.stop();
+    b.stop();
+    r1.stop();
+    r2.stop();
+    for relay in [&r1, &r2] {
+        for file in ["cordelia.db", "cordelia.db-wal", "cordelia.db-shm"] {
+            let _ = std::fs::remove_file(relay.data_dir().join(file));
+        }
+    }
+    r1.start();
+    wait_for("relay1 healthy again", &[&r1], 30, || healthy(&r1));
+    r2.start();
+    wait_for("relay2 healthy again", &[&r1, &r2], 30, || healthy(&r2));
+    wait_for("the relays mesh again", &[&r1, &r2], 120, || {
+        meshed(&r1, &r2)
+    });
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        let all = [&r1, &r2, &a, &b];
+        wait_for("device healthy again", &all, 30, || healthy(n));
+        wait_for("device reaches both relays again", &all, 120, || {
+            (peer_keys(n).len() == 2).then_some(())
+        });
+    }
+    // What this test is about: each relay's hot peer is the other relay,
+    // and no device is a hot peer of either.
+    for relay in [&r1, &r2] {
+        // A relay's own list is a moment behind its devices'.
+        let peers = wait_for(
+            "the relay lists both devices",
+            &[&r1, &r2, &a, &b],
+            30,
+            || {
+                let listed = relay.get("/api/v1/peers")?;
+                let peers = listed["peers"].as_array()?.clone();
+                (peers.len() == 3).then_some(peers)
+            },
+        );
+        for peer in &peers {
+            assert_eq!(peer["state"] == "hot", peer["role"] == "relay", "{peer}");
+        }
+    }
+
+    // A device added now has only the relays to fetch from.
+    let mut d = node_with_bootnodes("d", "personal", &both);
+    d.start();
+    let all = [&r1, &r2, &a, &b, &d];
+    wait_for("d healthy", &all, 30, || healthy(&d));
+    wait_for("d reaches both relays", &all, 60, || {
+        (peer_keys(&d).len() == 2).then_some(())
+    });
+    pair(&a, &d, "d", &all);
+    wait_for(
+        "the new device reads what was written before the relays lost their databases",
+        &all,
+        120,
+        || {
+            (0..5)
+                .all(|n| reads(&d, &format!("before-{n}.md"), "before").is_some())
+                .then_some(())
+        },
+    );
+}
+
 /// A channel holds more than fits in one message. A device that fetches it
 /// still gets all of it: when a relay cannot answer a request for a whole
 /// page of entries in one message, the device asks for fewer at a time.

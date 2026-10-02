@@ -1230,6 +1230,47 @@ async fn t03_a_relay_refuses_an_entry_over_the_size_limit() {
     assert_eq!(stats["items_stored"], 1, "{stats}");
 }
 
+/// What a client holds as a device holds its channels, how its answers may
+/// depart from an honest device's, and what the relay has asked it.
+#[derive(Clone, Default)]
+struct Held {
+    /// The entries held. A test may add to them while the relay is
+    /// connected.
+    items: Arc<Mutex<Vec<cordelia_network::messages::Item>>>,
+    /// What it answers when asked which channels it holds, if not the
+    /// channels of the entries held.
+    lists: Option<Vec<String>>,
+    /// Entries nobody asked for, added to each answer to a fetch.
+    unasked: Vec<cordelia_network::messages::Item>,
+    /// Answer a request for a page with every entry of the channel,
+    /// whatever size of page was asked for.
+    ignores_page_size: bool,
+    /// What the relay asked, one for each time it asked what is held.
+    passes: Arc<Mutex<Vec<Pass>>>,
+}
+
+/// What a relay asked in one pass over what a client holds.
+#[derive(Clone, Default)]
+struct Pass {
+    /// The channel of each request for a list of entries.
+    listed: Vec<String>,
+    /// How many requests for entries.
+    fetches: usize,
+}
+
+impl Held {
+    fn of(items: Vec<cordelia_network::messages::Item>) -> Self {
+        Self {
+            items: Arc::new(Mutex::new(items)),
+            ..Self::default()
+        }
+    }
+
+    fn passes(&self) -> Vec<Pass> {
+        self.passes.lock().unwrap().clone()
+    }
+}
+
 /// A client of a relay that is not a node: it connects as any node may, and
 /// pushes whatever the test gives it.
 struct Client {
@@ -1561,7 +1602,15 @@ async fn t03_an_address_is_turned_away_once_it_has_its_share_of_connections() {
 impl Client {
     /// An entry of `bytes` bytes in `channel`, signed by this client.
     fn entry_in(&self, channel: &str, bytes: usize) -> cordelia_network::messages::Item {
-        let mut item = self.entry(bytes);
+        self.resigned_in(self.entry(bytes), channel)
+    }
+
+    /// `item` moved to `channel` and signed again by this client.
+    fn resigned_in(
+        &self,
+        mut item: cordelia_network::messages::Item,
+        channel: &str,
+    ) -> cordelia_network::messages::Item {
         let hash: [u8; 32] = item.content_hash.clone().try_into().unwrap();
         let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
             &self.identity.public_key(),
@@ -1576,6 +1625,135 @@ impl Client {
         item.channel_id = channel.into();
         item.signature = self.identity.sign(&cbor).to_vec();
         item
+    }
+
+    /// An entry under a name: `slot` at revision `rev`, of `bytes` bytes,
+    /// in `channel`, signed by this client. A later revision replaces an
+    /// earlier one of the same slot.
+    fn keyed_in(
+        &self,
+        channel: &str,
+        slot: [u8; 32],
+        rev: u64,
+        bytes: usize,
+    ) -> cordelia_network::messages::Item {
+        let mut item = self.entry(bytes);
+        let hash: [u8; 32] = item.content_hash.clone().try_into().unwrap();
+        let cbor = cordelia_crypto::signing::ItemMetadata {
+            author_id: &self.identity.public_key(),
+            channel_id: channel,
+            content_hash: &hash,
+            is_tombstone: false,
+            item_id: &item.item_id,
+            key_version: 1,
+            published_at: &item.published_at,
+            slot: Some(&slot),
+            rev: Some(rev),
+        }
+        .encode()
+        .unwrap();
+        item.channel_id = channel.into();
+        item.slot = Some(slot.to_vec());
+        item.rev = Some(rev);
+        item.signature = self.identity.sign(&cbor).to_vec();
+        item
+    }
+
+    /// Hold entries as a device holds its channels, and answer the relay
+    /// when it asks: which channels, what each lists, and the entries.
+    /// `held` says what is held and how the answers may depart from what an
+    /// honest device gives, and records what the relay asked.
+    fn serve(&self, held: Held) {
+        use cordelia_network::codec;
+        use cordelia_network::messages::{
+            FetchResponse, ItemHeader, SyncChannelListResponse, SyncResponse,
+        };
+        let conn = self.conn.clone();
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                if !matches!(
+                    codec::read_protocol_byte(&mut recv).await,
+                    Ok(Protocol::ItemSync)
+                ) {
+                    continue;
+                }
+                let mut pass = Pass::default();
+                while let Ok(msg) = codec::read_frame(&mut recv).await {
+                    let items = held.items.lock().unwrap().clone();
+                    let answer = match msg {
+                        WireMessage::SyncChannelListRequest(_) => {
+                            let channel_ids = held.lists.clone().unwrap_or_else(|| {
+                                let ids: BTreeSet<String> =
+                                    items.iter().map(|i| i.channel_id.clone()).collect();
+                                ids.into_iter().collect()
+                            });
+                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                                channel_ids,
+                            })
+                        }
+                        // An entry's place in its channel's list is its
+                        // place among the entries held, from 1.
+                        WireMessage::SyncRequest(req) => {
+                            pass.listed.push(req.channel_id.clone());
+                            let after = req.after_seq.unwrap_or(0);
+                            let of: Vec<(u64, &cordelia_network::messages::Item)> = items
+                                .iter()
+                                .filter(|i| i.channel_id == req.channel_id)
+                                .zip(1u64..)
+                                .map(|(i, seq)| (seq, i))
+                                .collect();
+                            let most = if held.ignores_page_size {
+                                usize::MAX
+                            } else {
+                                req.limit as usize
+                            };
+                            let page: Vec<&(u64, &cordelia_network::messages::Item)> = of
+                                .iter()
+                                .filter(|(seq, _)| *seq > after)
+                                .take(most)
+                                .collect();
+                            let last = page.last().map_or(after, |(seq, _)| *seq);
+                            WireMessage::SyncResponse(SyncResponse {
+                                items: page
+                                    .iter()
+                                    .map(|(_, i)| ItemHeader {
+                                        item_id: i.item_id.clone(),
+                                        channel_id: i.channel_id.clone(),
+                                        item_type: i.item_type.clone(),
+                                        content_hash: i.content_hash.clone(),
+                                        author_id: i.author_id.clone(),
+                                        signature: i.signature.clone(),
+                                        key_version: i.key_version,
+                                        published_at: i.published_at.clone(),
+                                        is_tombstone: i.is_tombstone,
+                                        parent_id: i.parent_id.clone(),
+                                        slot: i.slot.clone(),
+                                        rev: i.rev,
+                                    })
+                                    .collect(),
+                                has_more: of.last().is_some_and(|(seq, _)| *seq > last),
+                                last_seq: Some(last),
+                            })
+                        }
+                        WireMessage::FetchRequest(req) => {
+                            pass.fetches += 1;
+                            let mut answer: Vec<_> = items
+                                .iter()
+                                .filter(|i| req.item_ids.contains(&i.item_id))
+                                .cloned()
+                                .collect();
+                            answer.extend(held.unasked.iter().cloned());
+                            WireMessage::FetchResponse(FetchResponse { items: answer })
+                        }
+                        _ => break,
+                    };
+                    if codec::write_frame(&mut send, &answer).await.is_err() {
+                        break;
+                    }
+                }
+                held.passes.lock().unwrap().push(pass);
+            }
+        });
     }
 
     /// How many entries of `channel` the relay lists.
@@ -1656,4 +1834,355 @@ async fn t03_a_full_relay_keeps_what_it_held_first() {
         2,
         "an older channel was dropped"
     );
+}
+
+/// What a relay's database holds, from `cordelia stats`: how many entries,
+/// and their bytes.
+fn relay_holds(relay: &Node) -> (u64, u64) {
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    (
+        stats["items_stored"].as_u64().unwrap(),
+        stats["content_bytes_stored"].as_u64().unwrap(),
+    )
+}
+
+/// T3. What a relay fetches from a peer is bounded as what the peer may
+/// push is, and a fetch stores only what was asked for. A device holds
+/// three megabytes of entries that its relay lacks. The relay has another
+/// peer as its hot peer, as two relays that list each other have, so the
+/// device is not one of its hot peers.
+///
+/// The relay asks the device all the same when the device connects, takes
+/// no more than a connection may push in a minute, and takes the rest once
+/// the minute has passed. The device adds entries that were not asked for
+/// to every answer; the relay stores none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_fetches_from_a_peer_no_faster_than_the_peer_may_push() {
+    use cordelia_core::protocol::PUSH_BYTES_PER_PEER_PER_MINUTE;
+    const ENTRY: usize = 30_000;
+    const ENTRIES: usize = 100;
+    let total = (ENTRY * ENTRIES) as u64;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    // The relay's one hot place goes to the first peer that connects.
+    let mut first = node("first", "personal", Some(relay.p2p));
+    first.start();
+    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
+    wait_for("first connected", &[&relay, &first], 60, || {
+        has_hot_peer(&first)
+    });
+    assert_eq!(relay_holds(&relay), (0, 0));
+
+    let device = client_of(&relay).await.expect("the device connects");
+    let channel = "grp_550e8400-e29b-41d4-a716-446655440077";
+    let held = Held {
+        // Five entries of another size that are never listed.
+        unasked: (0..5).map(|_| device.entry_in(channel, 2_000)).collect(),
+        ..Held::of(
+            (0..ENTRIES)
+                .map(|_| device.entry_in(channel, ENTRY))
+                .collect(),
+        )
+    };
+    device.serve(held);
+
+    // The relay asks the device, and takes what a connection may push in a
+    // minute, and no more for now.
+    wait_for("the relay fetches from the device", &[&relay], 40, || {
+        (relay_holds(&relay).1 > 0).then_some(())
+    });
+    let mut most = 0;
+    for _ in 0..20 {
+        let (entries, bytes) = relay_holds(&relay);
+        // Only what was asked for is stored: every entry is one of those
+        // the device listed.
+        assert_eq!(bytes, entries * ENTRY as u64, "an entry nobody asked for");
+        most = most.max(bytes);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(
+        most <= PUSH_BYTES_PER_PEER_PER_MINUTE,
+        "the relay fetched {most} bytes within the minute"
+    );
+    assert!(most < total, "{most}");
+
+    // Once the minute has passed it takes the rest.
+    wait_for("the relay fetches the rest", &[&relay], 150, || {
+        (relay_holds(&relay) == (ENTRIES as u64, total)).then_some(())
+    });
+}
+
+/// T3. Nothing is lost when a relay drops a channel to make room. A relay
+/// holds an older channel and a newer one, which it fetched from a device.
+/// The older one grows, and the relay drops the newer one. While there is
+/// no room, the relay tries the newer channel again and drops it again.
+/// Then the older one shrinks. The relay asks the device again, lists the
+/// newer channel from the start, and holds all of it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_channel_a_relay_dropped_comes_back_when_there_is_room() {
+    const LARGE: usize = 60_000;
+    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
+    let (older, newer) = (channel(0), channel(1));
+    let name = |n: u8| [n; 32];
+
+    let relay = node("relay", "relay", None);
+    relay.max_storage_bytes(1_000_000);
+    relay.relay_ask_again_secs(3);
+    let mut relay = relay;
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let client = client_of(&relay).await.expect("the client connects");
+
+    // The older channel, written under names so that it can shrink later.
+    let ack = client
+        .push(&[client.keyed_in(&older, name(0), 1, LARGE)])
+        .await
+        .unwrap();
+    assert_eq!(ack.stored, 1, "{ack:?}");
+
+    // The newer channel is held by the client as a device holds one: more
+    // small entries than one page lists, then a few large ones. So it
+    // takes the relay two pages to list it, and the large ones come in the
+    // second. The relay asks, and fetches it.
+    const SMALL: u64 = 120;
+    const HELD: u64 = SMALL + 8;
+    client.serve(Held::of(
+        (0..HELD)
+            .map(|n| client.entry_in(&newer, if n < SMALL { 100 } else { 11_000 }))
+            .collect(),
+    ));
+    wait_for("the relay fetches the newer channel", &[&relay], 40, || {
+        (relay_holds(&relay).0 == 1 + HELD).then_some(())
+    });
+
+    // The older channel grows until the relay has dropped the newer one.
+    let mut names = 1u8;
+    loop {
+        let ack = client
+            .push(&[client.keyed_in(&older, name(names), 1, LARGE)])
+            .await
+            .unwrap();
+        assert_eq!(ack.stored, 1, "{ack:?}");
+        names += 1;
+        if relay_holds(&relay).0 == u64::from(names) {
+            break;
+        }
+        assert!(names < 20, "the relay never dropped the newer channel");
+    }
+    assert_eq!(client.listed(&newer).await, 0);
+
+    // There is room for the newer channel's first page and not for all
+    // of it. The relay tries it again, and drops it again when the large
+    // entries of the second page do not fit: by then its place had moved
+    // past the first page.
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+    // The older channel shrinks: each name gets a small entry in place of
+    // its large one.
+    for n in 0..names {
+        let ack = client
+            .push(&[client.keyed_in(&older, name(n), 2, 1_000)])
+            .await
+            .unwrap();
+        assert_eq!(ack.stored, 1, "{ack:?}");
+    }
+
+    // The relay asks the device again, and the newer channel is back, whole.
+    wait_for("the newer channel is back", &[&relay], 90, || {
+        (relay_holds(&relay).0 == u64::from(names) + HELD).then_some(())
+    });
+    assert_eq!(client.listed(&older).await, usize::from(names));
+}
+
+/// T3. What a peer lists is the peer's to write, so a relay bounds it. A
+/// peer says it holds three thousand channels, one of them with an ID far
+/// longer than a channel's can be. The relay asks about so many and no
+/// more in one pass, and never about the long one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_asks_a_peer_about_only_so_many_channels() {
+    use cordelia_core::protocol::{MAX_CHANNEL_ID_LEN, MAX_CHANNELS_ASKED_OF_A_PEER};
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let peer = client_of(&relay).await.expect("the peer connects");
+
+    let mut lists: Vec<String> = (0..3000)
+        .map(|n| format!("grp_550e8400-e29b-41d4-a716-{n:012}"))
+        .collect();
+    lists.push("x".repeat(50_000));
+    let held = Held {
+        lists: Some(lists),
+        ..Held::default()
+    };
+    peer.serve(held.clone());
+
+    let pass = wait_for("the relay asks the peer", &[&relay], 60, || {
+        held.passes().into_iter().next()
+    });
+    assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER);
+    assert!(
+        pass.listed.iter().all(|id| id.len() <= MAX_CHANNEL_ID_LEN),
+        "the relay asked about a channel with an ID no channel has"
+    );
+}
+
+/// T3. A relay does not fetch what it has no room for. A device holds
+/// twenty channels, and one address may make a relay hold sixteen new
+/// channels in an hour. The relay fetches sixteen. For the other four it
+/// asks for nothing, in that pass or the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_does_not_fetch_what_it_has_no_room_for() {
+    use cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR;
+    const CHANNELS: usize = 20;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let device = client_of(&relay).await.expect("the device connects");
+    let held = Held::of(
+        (0..CHANNELS)
+            .map(|n| device.entry_in(&format!("grp_550e8400-e29b-41d4-a716-{n:012}"), 100))
+            .collect(),
+    );
+    device.serve(held.clone());
+
+    wait_for("the relay asks the device twice", &[&relay], 60, || {
+        (held.passes().len() >= 2).then_some(())
+    });
+    let passes = held.passes();
+    assert_eq!(
+        relay_holds(&relay).0,
+        NEW_CHANNELS_PER_ADDRESS_PER_HOUR as u64
+    );
+    // One request for entries for each channel it took, and none since.
+    assert_eq!(passes[0].fetches, NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
+    assert_eq!(passes[0].listed.len(), NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
+    assert_eq!(passes[1].fetches, 0);
+    assert_eq!(passes[1].listed.len(), NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
+}
+
+/// A relay that asks a device for what it lacks gets all of it without
+/// long waits, though it asks a device again only every ten minutes. Two
+/// devices, neither one of the relay's hot peers:
+///
+/// - one holds a channel whose entries do not fit in one message at the
+///   size of page the relay first asks for;
+/// - one holds a channel with more entries than one pass takes.
+///
+/// Each time, the relay comes back at the next cycle for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_fetches_all_a_device_holds_without_long_waits() {
+    const LARGE: usize = 30;
+    const SMALL: usize = 1100;
+    let large = "grp_550e8400-e29b-41d4-a716-000000000001";
+    let long = "grp_550e8400-e29b-41d4-a716-000000000002";
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    // The relay's one hot place goes to the first peer that connects.
+    let mut first = node("first", "personal", Some(relay.p2p));
+    first.start();
+    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
+    wait_for("first connected", &[&relay, &first], 60, || {
+        has_hot_peer(&first)
+    });
+
+    // Thirty entries that are more than a megabyte together: the first
+    // request for them cannot be answered, and the relay asks for fewer.
+    let device = client_of(&relay).await.expect("the device connects");
+    device.serve(Held::of(
+        (0..LARGE).map(|_| device.entry_in(large, 40_000)).collect(),
+    ));
+    wait_for("the relay holds the large entries", &[&relay], 45, || {
+        (relay_holds(&relay).0 == LARGE as u64).then_some(())
+    });
+
+    // Eleven hundred small entries: more than the ten pages one pass takes.
+    let other = client_of(&relay).await.expect("the other device connects");
+    other.serve(Held::of(
+        (0..SMALL as u64)
+            .map(|n| other.resigned_in(other.entry_of(n.to_be_bytes().to_vec()), long))
+            .collect(),
+    ));
+    wait_for(
+        "the relay holds the long channel too",
+        &[&relay],
+        50,
+        || (relay_holds(&relay).0 == (LARGE + SMALL) as u64).then_some(()),
+    );
+}
+
+/// A relay asks a device again every so often, without the device
+/// connecting again: an entry the device comes to hold later is fetched.
+/// The device is not one of the relay's hot peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_asks_a_device_again_every_so_often() {
+    let channel = "grp_550e8400-e29b-41d4-a716-000000000003";
+    let relay = node("relay", "relay", None);
+    relay.relay_ask_again_secs(5);
+    let mut relay = relay;
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut first = node("first", "personal", Some(relay.p2p));
+    first.start();
+    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
+    wait_for("first connected", &[&relay, &first], 60, || {
+        has_hot_peer(&first)
+    });
+
+    let device = client_of(&relay).await.expect("the device connects");
+    let held = Held::of(vec![device.entry_in(channel, 1_000)]);
+    device.serve(held.clone());
+    wait_for(
+        "the relay fetches what the device holds",
+        &[&relay],
+        40,
+        || (relay_holds(&relay).0 == 1).then_some(()),
+    );
+
+    // The device comes to hold one more. The relay asks again, and has it.
+    held.items
+        .lock()
+        .unwrap()
+        .push(device.entry_in(channel, 1_000));
+    wait_for(
+        "the relay asks again and fetches the new entry",
+        &[&relay],
+        40,
+        || (relay_holds(&relay).0 == 2).then_some(()),
+    );
+}
+
+/// T3. A peer that answers a request for a page with more than the page
+/// asked for is not fetched from: the size of a page is how a relay keeps
+/// what it takes within the peer's allowance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_page_longer_than_the_one_asked_for_is_not_taken() {
+    let channel = "grp_550e8400-e29b-41d4-a716-000000000004";
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let peer = client_of(&relay).await.expect("the peer connects");
+
+    // More entries than the largest page a relay asks for.
+    let entries = 3 * cordelia_core::protocol::DEFAULT_SYNC_LIMIT / 2;
+    let held = Held {
+        ignores_page_size: true,
+        ..Held::of((0..entries).map(|_| peer.entry_in(channel, 100)).collect())
+    };
+    peer.serve(held.clone());
+    wait_for("the relay asks the peer", &[&relay], 60, || {
+        (!held.passes().is_empty()).then_some(())
+    });
+    let pass = &held.passes()[0];
+    assert_eq!(pass.listed, vec![channel.to_string()]);
+    assert_eq!(
+        pass.fetches, 0,
+        "the relay fetched from a page it did not ask for"
+    );
+    assert_eq!(relay_holds(&relay), (0, 0));
 }

@@ -137,6 +137,11 @@ impl ByteCounter {
         self.max_bytes.saturating_sub(self.total())
     }
 
+    /// Record `bytes`, whether or not they fit.
+    pub fn record(&mut self, bytes: u64) {
+        self.events.push_back((Instant::now(), bytes));
+    }
+
     /// Record `bytes`. Returns false, recording nothing, if that would take
     /// the window over its limit.
     pub fn check_and_record(&mut self, bytes: u64) -> bool {
@@ -156,6 +161,10 @@ pub struct PeerRateLimiter {
     pub writes: RateCounter,
     /// Bytes of entries pushed.
     pub write_bytes: ByteCounter,
+    /// Bytes of entries a relay fetched from the peer: the same allowance
+    /// as for what the peer pushes, counted apart, so that what a relay
+    /// asks for is never held against what the peer sends.
+    pub fetch_bytes: ByteCounter,
     pub syncs: RateCounter,
     pub peer_shares: RateCounter,
     pub breach_count: u32,
@@ -186,6 +195,10 @@ impl PeerRateLimiter {
                 minute,
                 protocol::PUSH_BYTES_PER_PEER_PER_MINUTE * u64::from(connections),
             ),
+            fetch_bytes: ByteCounter::new(
+                minute,
+                protocol::PUSH_BYTES_PER_PEER_PER_MINUTE * u64::from(connections),
+            ),
             syncs: RateCounter::new(minute, SYNCS_PER_PEER_PER_MINUTE * connections),
             peer_shares: RateCounter::new(minute, PEER_SHARES_PER_PEER_PER_MINUTE * connections),
             breach_count: 0,
@@ -199,6 +212,7 @@ impl PeerRateLimiter {
             && self.syncs.count() == 0
             && self.peer_shares.count() == 0
             && self.write_bytes.total() == 0
+            && self.fetch_bytes.total() == 0
     }
 
     /// Whether a breach was recorded within the window for counting them.

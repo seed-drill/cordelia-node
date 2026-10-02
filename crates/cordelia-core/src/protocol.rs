@@ -472,6 +472,30 @@ pub const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 2;
 /// Rationale: parameter-rationale.md §4.
 pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
 
+/// How long a relay waits before it asks a device again which channels it
+/// holds, and before it takes again a channel it dropped to make room.
+///
+/// A device sends what it writes as it writes it, so a relay asks only for
+/// what it lost, dropped or had no room for. The wait is the one a device
+/// keeps before it offers again what a relay refused: whichever of the two
+/// has the entry, the other hears of it within ten minutes.
+/// Rationale: parameter-rationale.md §4.
+pub const RELAY_ASK_AGAIN_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// How many times the wait before a relay takes again a channel it dropped
+/// may double. A channel that is dropped again each time it is taken does
+/// not fit: the wait grows from RELAY_ASK_AGAIN_SECS to 32 times that (over
+/// five hours), so that trying it costs less and less.
+pub const RELAY_DROPPED_WAIT_DOUBLINGS: u32 = 5;
+
+/// The most channels a relay asks one peer about in one pass, of those the
+/// peer lists. The list is the peer's to write: without a bound it could
+/// have a relay make a request, and keep a place, for each of any number
+/// of names. A person's device holds tens of channels. One that holds more
+/// than this is asked about a different part of them each time.
+/// Rationale: parameter-rationale.md §4.
+pub const MAX_CHANNELS_ASKED_OF_A_PEER: usize = 1024;
+
 /// The most one outbox push may cost ([`entry_cost`]): three entries of
 /// the largest size. Well below MAX_MESSAGE_BYTES, so that the message
 /// limit can come down to 256 KB once every node sends batches this small.

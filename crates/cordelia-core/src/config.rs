@@ -125,6 +125,9 @@ pub struct ReplicationConfig {
     pub sync_interval_batch_secs: u32,
     pub tombstone_retention_days: u32,
     pub max_batch_size: u32,
+    /// How long a relay waits before it asks a device again which channels
+    /// it holds, and before it takes again a channel it dropped.
+    pub relay_ask_again_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +239,7 @@ impl Default for ReplicationConfig {
             sync_interval_batch_secs: protocol::BATCH_SYNC_INTERVAL_SECS as u32,
             tombstone_retention_days: protocol::TOMBSTONE_RETENTION_DAYS,
             max_batch_size: protocol::MAX_BATCH_SIZE as u32,
+            relay_ask_again_secs: protocol::RELAY_ASK_AGAIN_SECS,
         }
     }
 }

@@ -186,6 +186,15 @@ impl Node {
         .unwrap();
     }
 
+    /// How long this relay waits before it asks a device again which
+    /// channels it holds, and before it takes again a channel it dropped.
+    /// For before the node starts.
+    pub fn relay_ask_again_secs(&self, secs: u64) {
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        config.push_str(&format!("\n[replication]\nrelay_ask_again_secs = {secs}\n"));
+        std::fs::write(self.config(), config).unwrap();
+    }
+
     pub fn log_tail(&self) -> String {
         let log = std::fs::read_to_string(self.log()).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
