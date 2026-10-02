@@ -7,6 +7,12 @@ use cordelia_core::CordeliaError;
 /// Key under which the ID of this node's personal channel is stored.
 pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
 
+/// The device whose offer of its personal channel this device has decided
+/// to take, and when it decided: `<hex key> <unix seconds>`. Set by
+/// `cordelia accept` on a device that is not in use; cleared when the offer
+/// is taken. Nothing a device is sent can set it.
+pub const ACCEPTED_PERSONAL_FROM: &str = "membership.accepted_personal_from";
+
 /// Claude Code directory to sync; sync is off when absent.
 pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 

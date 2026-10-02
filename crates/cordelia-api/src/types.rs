@@ -375,6 +375,11 @@ pub struct InboxSummaryResponse {
     pub pending: usize,
     pub superseded: usize,
     pub invalid: usize,
+    /// States kept because they name a key that is not yet known as one of
+    /// this person's devices.
+    pub held: usize,
+    /// What the person should be told.
+    pub notes: Vec<String>,
 }
 
 #[derive(Deserialize)]

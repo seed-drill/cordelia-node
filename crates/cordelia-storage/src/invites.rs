@@ -32,6 +32,13 @@ pub enum InviteStatus {
     Invalid,
     /// Valid, but not newer than the state this node already applied.
     Superseded,
+    /// Valid and from one of this person's devices, but it names a key this
+    /// device does not know as one of them. Reconsidered each time the
+    /// inbox is processed: the key may be a device this one has not heard
+    /// of yet. If it never becomes one, the state is never applied. Stored
+    /// as pending (the table has no value of its own for it); what tells
+    /// the two apart is who sent it.
+    Held,
 }
 
 impl InviteStatus {
@@ -42,6 +49,7 @@ impl InviteStatus {
             Self::Rejected => "rejected",
             Self::Invalid => "invalid",
             Self::Superseded => "superseded",
+            Self::Held => "pending",
         }
     }
 }
@@ -64,7 +72,8 @@ pub fn record(
     status: InviteStatus,
 ) -> Result<(), CordeliaError> {
     let now = Utc::now().to_rfc3339();
-    let decided_at = (status != InviteStatus::Pending).then(|| now.clone());
+    let waiting = matches!(status, InviteStatus::Pending | InviteStatus::Held);
+    let decided_at = (!waiting).then(|| now.clone());
     conn.execute(
         "INSERT INTO invites (item_id, inviter, channel_id, status, received_at, decided_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -86,8 +95,9 @@ pub fn record(
 }
 
 /// Invite items in `inbox_channel_id` that still need processing: never
-/// seen, or pending (a pending invite is reconsidered once its sender is
-/// trusted). Oldest first.
+/// seen, pending (reconsidered once its sender is trusted) or held
+/// (reconsidered once the keys it names are this person's devices). Oldest
+/// first.
 pub fn unprocessed(
     conn: &Connection,
     inbox_channel_id: &str,

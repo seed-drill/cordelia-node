@@ -26,6 +26,8 @@ fn summary_response(s: membership::InboxSummary) -> InboxSummaryResponse {
         pending: s.pending,
         superseded: s.superseded,
         invalid: s.invalid,
+        held: s.held,
+        notes: s.notes,
     }
 }
 
