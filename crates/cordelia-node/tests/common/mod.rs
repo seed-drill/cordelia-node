@@ -123,24 +123,21 @@ impl Node {
         self.child = Some(child);
     }
 
-    /// Stop the node as a service manager would (SIGTERM), so it closes
-    /// its connections on the way out.
-    ///
-    /// Tell the node to stop, with SIGTERM, as a service manager does.
+    /// Tell the node to stop with SIGTERM, as a service manager does, so
+    /// that it closes its connections on the way out.
     pub fn stop(&mut self) {
         self.stop_with("TERM");
     }
 
     /// Tell the node to stop with `signal` (TERM, INT or QUIT). A node that
-    /// is told to stop exits within a bounded time, with success, and with
-    /// every part of it stopped in time. One that does not exit is killed.
-    /// Either way the test fails with the node's log: a node that never
-    /// exits would otherwise hang the whole run, and one that gave up on a
-    /// part of itself would pass unnoticed.
+    /// is told to stop exits within a bounded time, and with success, which
+    /// it has only if every part of it stopped in time and without
+    /// failing. One that does not exit is killed. Either way the test fails
+    /// with the node's log: a node that never exits would otherwise hang
+    /// the whole run, and one that gave up on a part of itself would pass
+    /// unnoticed.
     pub fn stop_with(&mut self, signal: &str) {
         use cordelia_core::protocol::{NODE_STOP_TIMEOUT_SECS, STREAM_TIMEOUT_SECS};
-        use std::os::unix::process::ExitStatusExt;
-        const SIGTERM: i32 = 15;
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -170,11 +167,7 @@ impl Node {
                 self.log_tail()
             );
         };
-        // Ended by the signal itself is as good: it came before the node
-        // listened for it.
-        let exited_well = status.success() || status.signal() == Some(SIGTERM);
-        let log = std::fs::read_to_string(self.log()).unwrap_or_default();
-        if !exited_well || log.contains("did not stop in time") {
+        if !status.success() {
             panic!(
                 "{} did not stop as it should ({status})\n{}",
                 self.name,

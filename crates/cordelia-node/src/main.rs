@@ -939,9 +939,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         })
         .bind(&listen_addr)?
         // Only this node handles the signals that stop it, and it tells
-        // the server how to stop (below). Left to handle SIGTERM itself,
-        // the server would stop gracefully.
+        // the server to stop (below), so that one deadline covers both.
         .disable_signals()
+        // A request being answered when the server is told to stop has one
+        // stream timeout to finish; then its connection is closed.
+        .shutdown_timeout(cordelia_core::protocol::STREAM_TIMEOUT_SECS)
         .run();
 
         let server_handle = server.handle();
@@ -961,15 +963,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             },
             move || {
                 let _ = p2p_shutdown_tx.send(true);
-                // The server is stopped at once, not gracefully. A graceful
-                // stop waits for every worker to answer, and in the server
-                // this node is built with a worker can leave without
-                // answering, so that the wait never ends (#99). Nothing is
-                // lost by it: a request to the API is handled in one step,
-                // so a connection is dropped before its request is handled
-                // or after, never in the middle. The server's own future
-                // says when it has stopped.
-                tokio::spawn(server_handle.stop(false));
+                // Gracefully: a request being handled finishes, so the
+                // process never ends in the middle of one. actix-server
+                // before 2.9.1 could wait for ever here (#99). The server's
+                // own future says when it has stopped.
+                tokio::spawn(server_handle.stop(true));
             },
             std::time::Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS),
         )
@@ -1007,18 +1005,33 @@ struct Stopped<S, P> {
     p2p: Option<P>,
 }
 
-impl<E: std::fmt::Display, P> Stopped<Result<(), E>, P> {
-    /// What the node exits with. A node that was told to stop, and whose
-    /// HTTP server did not fail, has done what was asked of it, though a
-    /// part did not finish in time. A node that stopped because one of its
-    /// parts ended has failed: whatever runs it starts it again.
+impl<E: std::fmt::Display, F: std::fmt::Display> Stopped<Result<(), E>, Result<(), F>> {
+    /// What the node exits with: success only if it was told to stop, and
+    /// both its parts stopped in time and without failing.
+    ///
+    /// A node that stopped because one of its parts ended has failed, and
+    /// whatever runs it starts it again. One that gave up on a part did
+    /// stop, but not cleanly, and says so.
     fn result(self) -> anyhow::Result<()> {
+        let mut wrong = Vec::new();
         if !self.told {
-            anyhow::bail!("a part of the node ended, though the node was not told to stop");
+            wrong
+                .push("a part of the node ended, though the node was not told to stop".to_string());
         }
         match self.server {
-            Some(Err(e)) => Err(anyhow::anyhow!("the HTTP server failed: {e}")),
-            _ => Ok(()),
+            None => wrong.push("the HTTP server did not stop in time".into()),
+            Some(Err(e)) => wrong.push(format!("the HTTP server failed: {e}")),
+            Some(Ok(())) => {}
+        }
+        match self.p2p {
+            None => wrong.push("the P2P loop did not stop in time".into()),
+            Some(Err(e)) => wrong.push(format!("the P2P loop failed: {e}")),
+            Some(Ok(())) => {}
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(wrong.join("; ")))
         }
     }
 }
@@ -2396,7 +2409,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
 
 // ── Signal handling ───────────────────────────────────────────────
 
-/// Wait for SIGINT (Ctrl+C) or SIGTERM (systemd/launchctl stop).
+/// Wait for SIGINT (Ctrl+C), SIGTERM (systemd, launchd, Docker) or SIGQUIT.
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
@@ -2508,7 +2521,10 @@ mod tests {
         assert!(stopped.told);
         assert!(stopped.server.is_none(), "the server never finished");
         assert_eq!(stopped.p2p, Some(Ok(())));
-        assert!(stopped.result().is_ok(), "the node was told to stop");
+        assert!(
+            stopped.result().is_err(),
+            "a node that gave up on a part did not stop cleanly"
+        );
 
         // Nor does the peer-to-peer loop.
         let (stopped, took) = tokio::time::timeout(DAY, run_parts(secs(5), secs(1), None))
@@ -2599,20 +2615,35 @@ mod tests {
         }
     }
 
-    /// What a node exits with: success only if it was told to stop and its
-    /// HTTP server did not fail.
+    /// What a node exits with: success only if it was told to stop, and
+    /// both its parts stopped in time and without failing.
     #[test]
-    fn a_node_exits_with_a_failure_unless_it_was_told_to_stop() {
-        let stopped = |told, server| Stopped::<Result<(), String>, ()> {
-            told,
-            server,
-            p2p: Some(()),
-        };
-        assert!(stopped(true, Some(Ok(()))).result().is_ok());
-        assert!(stopped(true, None).result().is_ok());
-        assert!(stopped(true, Some(Err("bind".into()))).result().is_err());
-        assert!(stopped(false, Some(Ok(()))).result().is_err());
-        assert!(stopped(false, None).result().is_err());
+    fn a_node_exits_with_a_failure_unless_it_stopped_cleanly() {
+        type Ended = Option<Result<(), String>>;
+        let stopped = |told, server: Ended, p2p: Ended| Stopped { told, server, p2p };
+        let ok = || Some(Ok(()));
+        let failed = || Some(Err("it broke".to_string()));
+        assert!(stopped(true, ok(), ok()).result().is_ok());
+        for (told, server, p2p) in [
+            (false, ok(), ok()),
+            (true, None, ok()),
+            (true, ok(), None),
+            (true, failed(), ok()),
+            (true, ok(), failed()),
+            (false, None, failed()),
+        ] {
+            let why = stopped(told, server.clone(), p2p.clone()).result();
+            assert!(why.is_err(), "{told} {server:?} {p2p:?}");
+        }
+        // It says what went wrong.
+        let why = stopped(false, failed(), ok())
+            .result()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("not told to stop") && why.contains("it broke"),
+            "{why}"
+        );
     }
 
     use super::*;

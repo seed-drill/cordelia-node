@@ -395,37 +395,46 @@ fn a_node_stops_on_each_signal_that_tells_it_to() {
     }
 }
 
-/// A node that is told to stop does not wait for a request to its local
-/// API that a client has begun and not finished. The client has sent the
-/// request's head and not its body, so the server would wait for the rest
-/// for as long as the client keeps the connection open; a server stopped
-/// gracefully would wait half a minute for it.
+/// A node that is told to stop gives a request it is answering one stream
+/// timeout to finish, and no more, whichever signal tells it. A client has
+/// sent a request's head and not all its body, to a route that reads the
+/// body, so the server waits for the rest for as long as the client keeps
+/// the connection open. The node waits for it (it does not end in the
+/// middle of a request) and then closes it, where actix's own default would
+/// wait half a minute. (Left to handle SIGINT itself, actix would not wait
+/// at all.)
 #[test]
-fn a_node_told_to_stop_does_not_wait_for_a_request_left_open() {
+fn a_node_told_to_stop_gives_an_open_request_one_stream_timeout() {
     use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
     use std::io::Write;
 
-    let mut n = node("relay", "relay", None);
-    n.start();
-    wait_for("node healthy", &[&n], 30, || healthy(&n));
+    for signal in ["TERM", "INT"] {
+        let mut n = node("relay", "relay", None);
+        n.start();
+        wait_for("node healthy", &[&n], 30, || healthy(&n));
 
-    let mut held = std::net::TcpStream::connect(("127.0.0.1", n.http)).unwrap();
-    let head = format!(
-        "POST /api/v1/channels/list HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{",
-        n.token()
-    );
-    held.write_all(head.as_bytes()).unwrap();
-    held.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+        let mut held = std::net::TcpStream::connect(("127.0.0.1", n.http)).unwrap();
+        let head = format!(
+            "POST /api/v1/channels/publish HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{\"channel\":",
+            n.token()
+        );
+        held.write_all(head.as_bytes()).unwrap();
+        held.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
 
-    let told = Instant::now();
-    n.stop();
-    let took = told.elapsed();
-    assert!(
-        took < Duration::from_secs(STREAM_TIMEOUT_SECS / 2),
-        "the node took {took:?} to exit"
-    );
-    drop(held);
+        let told = Instant::now();
+        n.stop_with(signal);
+        let took = told.elapsed();
+        assert!(
+            took >= Duration::from_secs(STREAM_TIMEOUT_SECS - 1),
+            "SIG{signal}: the node did not wait for the request it was answering: it exited after {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(STREAM_TIMEOUT_SECS + 5),
+            "SIG{signal}: the node took {took:?} to exit"
+        );
+        drop(held);
+    }
 }
 
 /// A device with two relays, one of them down. It says so, with the reason,

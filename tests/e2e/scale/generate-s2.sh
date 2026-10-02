@@ -233,7 +233,7 @@ for i in $(seq 0 $((BOOTNODES - 1))); do
       - ./configs/${name}.toml:/config/config.toml:ro
       - ../../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    stop_grace_period: 30s
+    stop_grace_period: 45s
 ${networks_block}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9473/api/v1/health"]
@@ -264,7 +264,7 @@ for i in $(seq 0 $((RELAYS - 1))); do
       - ./configs/${name}.toml:/config/config.toml:ro
       - ../../entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    stop_grace_period: 30s
+    stop_grace_period: 45s
     networks:
       internet:
         ipv4_address: ${internet_ip}
@@ -300,7 +300,7 @@ for z in $(seq 1 "$NUM_ZONES"); do
       - ../../entrypoint.sh:/entrypoint.sh:ro
       - ../keys:/data/cordelia/channel-keys
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    stop_grace_period: 30s
+    stop_grace_period: 45s
     networks:
       home-${z}:
         ipv4_address: ${ip}

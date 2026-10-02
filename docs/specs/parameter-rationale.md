@@ -593,28 +593,30 @@ peer crash (QUIC idle timeout was the only backstop).
 **Rationale:** A node that is told to stop exits within a bounded time,
 whatever one of its parts is waiting for. Once it has been told, it waits
 this long at most, for its HTTP server and its peer-to-peer loop together,
-and then exits without what has not finished. Work that cannot be
-interrupted (a sync cycle, a database write) is then given one more
-STREAM_TIMEOUT, and is left as a crash would leave it. So a node exits
+and then exits without what has not finished, with a failure. Work that
+cannot be interrupted (a sync cycle, a database write) is then given one
+more STREAM_TIMEOUT, and is left as a crash would leave it. So a node exits
 within 40 seconds of being told, and as a rule within a second.
 
-The HTTP server is stopped at once, not gracefully. A request to the local
-API is handled in one step, so a connection is dropped before its request
-is handled or after, never in the middle. A graceful stop waits for every
-worker of the server to answer, and in actix-server 2.6 a worker can leave
-without answering, so that the wait never ends (#99).
+The HTTP server is stopped gracefully: a request it is answering is given
+one STREAM_TIMEOUT to finish, and then its connection is closed. So the
+process does not end in the middle of a request, some of which (removing a
+device, rotating a key) make several writes. Before 2.9.1, actix-server
+could wait for ever in a graceful stop: a worker could leave without
+answering the stop request (#99). The node is built with a later one, and
+its own bound covers the rest.
 
 A node whose HTTP server or peer-to-peer loop ends without its being told
 to stop stops the other, and exits with a failure, so that whatever runs it
 starts it again. It does not run on without a part, looking alive.
 
-**Derivation:** The peer-to-peer loop may be in the middle of a stream
-operation when it is told (one STREAM_TIMEOUT at most), and then gives its
-peers one STREAM_TIMEOUT to hear that it is closing; the third is margin.
-systemd kills a node that has not exited after a minute and a half, so a
-node that waited for ever would make every restart and upgrade take that
-long. launchd (20 seconds) and Docker (10 seconds, unless a grace period
-is set) kill sooner; that is what a crash is, and loses nothing written.
+**Derivation:** The HTTP server gives a request it is answering one
+STREAM_TIMEOUT, and the peer-to-peer loop gives its peers one to hear that
+it is closing, side by side; the rest is margin. systemd kills a node that
+has not exited after a minute and a half, so a node that waited for ever
+would make every restart and upgrade take that long. launchd (20 seconds)
+and Docker (10 seconds, unless a grace period is set) kill sooner; that is
+what a crash is, and loses nothing written.
 
 ---
 
