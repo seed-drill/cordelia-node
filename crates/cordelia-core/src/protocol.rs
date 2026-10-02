@@ -438,6 +438,25 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 /// edit; 90 days covers a laptop left in a drawer for a season.
 pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
 
+/// The largest revision an entry may carry: 2^53 - 1.
+/// A revision is chosen by whoever writes the entry. Unbounded, one writer
+/// could set it so high that the next revision overflows and the name can
+/// never be written again. This bound is exact in a signed 64-bit column
+/// and as a JSON number, and is checked wherever an entry is verified.
+/// Rationale: parameter-rationale.md §4.
+pub const MAX_REV: u64 = (1 << 53) - 1;
+
+/// The largest membership epoch a channel state may carry: 2^53 - 1, for
+/// the same reason as [`MAX_REV`].
+pub const MAX_EPOCH: u64 = (1 << 53) - 1;
+
+/// How far a channel's membership epoch may move in one state. A state
+/// carries the whole list, so skipping epochs is harmless and happens when
+/// a device was offline, but a member must not be able to jump straight to
+/// [`MAX_EPOCH`] and so stop the list from ever changing again. At this
+/// step that takes 2^33 states. Rationale: parameter-rationale.md §4.
+pub const MAX_EPOCH_STEP: u64 = 1 << 20;
+
 /// How often nodes collect expired keyed tombstones. Hourly is plenty
 /// against a 90-day retention.
 pub const TOMBSTONE_GC_INTERVAL_SECS: u64 = 3600;

@@ -667,3 +667,159 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     });
     assert_eq!(seen["role"], "node", "{seen}");
 }
+
+/// The newest entry a stopped node holds in `channel`, as it would travel:
+/// what anyone carrying it sees.
+fn newest_entry_on_disk(n: &Node, channel: &str) -> cordelia_network::messages::Item {
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT item_id, item_type, encrypted_blob, content_hash, author_id, signature,
+                key_version, published_at, slot, rev
+         FROM items WHERE channel_id = ?1 AND slot IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        [channel],
+        |row| {
+            let blob: Vec<u8> = row.get(2)?;
+            Ok(cordelia_network::messages::Item {
+                item_id: row.get(0)?,
+                channel_id: channel.to_string(),
+                item_type: row.get(1)?,
+                content_length: blob.len() as u32,
+                encrypted_blob: blob,
+                content_hash: row.get(3)?,
+                author_id: row.get(4)?,
+                signature: row.get(5)?,
+                key_version: row.get(6)?,
+                published_at: row.get(7)?,
+                is_tombstone: false,
+                parent_id: None,
+                slot: row.get(8)?,
+                rev: row.get::<_, Option<i64>>(9)?.map(|r| r as u64),
+            })
+        },
+    )
+    .unwrap()
+}
+
+/// T2. A stranger who knows a channel's ID and has seen one of its entries
+/// in transit stores a copy of it at the relay before the entry itself
+/// arrives: the same ciphertext, in the same slot, under the stranger's own
+/// key and with the highest revision there is. The relay still stores the
+/// entry, the channel's other device still reads it, and both devices go on
+/// writing that name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices() {
+    use cordelia_network::{connection, item_sync, transport};
+    const NAME: &str = "t02-notes.md";
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
+    let entries_of = |n: &Node| {
+        n.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        )["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let reads = |n: &Node, text: &str| {
+        entries_of(n)
+            .iter()
+            .any(|e| e["key"] == NAME && e["content"]["text"] == text)
+            .then_some(())
+    };
+
+    // A writes an entry while the relay is away, so the entry waits on A.
+    // A then stops, so that the stranger's copy gets to the relay first.
+    relay.stop();
+    a.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": personal, "key": NAME, "content": { "text": "one" } }),
+    );
+    a.stop();
+    let entry = newest_entry_on_disk(&a, &personal);
+    assert_eq!(entry.rev, Some(1));
+
+    // The copy: the stranger's key and signature on the same ciphertext.
+    let stranger = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let slot: [u8; 32] = entry.slot.clone().unwrap().try_into().unwrap();
+    let hash: [u8; 32] = entry.content_hash.clone().try_into().unwrap();
+    let rev = cordelia_core::protocol::MAX_REV;
+    let item_id = cordelia_storage::items::generate_item_id();
+    let cbor = cordelia_crypto::signing::ItemMetadata {
+        author_id: &stranger.public_key(),
+        channel_id: &personal,
+        content_hash: &hash,
+        is_tombstone: false,
+        item_id: &item_id,
+        key_version: entry.key_version as i64,
+        published_at: &entry.published_at,
+        slot: Some(&slot),
+        rev: Some(rev),
+    }
+    .encode()
+    .unwrap();
+    let copy = cordelia_network::messages::Item {
+        item_id,
+        author_id: stranger.public_key().to_vec(),
+        signature: stranger.sign(&cbor).to_vec(),
+        rev: Some(rev),
+        ..entry.clone()
+    };
+
+    relay.start();
+    wait_for("relay healthy again", &[&relay, &b], 30, || healthy(&relay));
+    let endpoint = transport::create_endpoint(&stranger, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let mut manager = connection::ConnectionManager::new(
+        stranger,
+        endpoint,
+        vec![],
+        vec!["personal".into()],
+        port,
+    );
+    let relay_id = manager
+        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
+        .await
+        .expect("the stranger connects, as any node may");
+    let conn = manager.get_connection(&relay_id).unwrap().clone();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let ack = item_sync::send_push(&mut stream, &[copy]).await.unwrap();
+    assert_eq!(
+        ack.stored, 1,
+        "the copy has to be at the relay first, or this proves nothing: {ack:?}"
+    );
+
+    // A comes back and sends the entry itself. B reads it, so the relay
+    // stored it beside the copy and passed it on.
+    a.start();
+    let all = [&relay, &a, &b];
+    wait_for("a healthy again", &all, 30, || healthy(&a));
+    wait_for("b reads a's entry", &all, 120, || reads(&b, "one"));
+
+    // The name is not out of reach: B writes it again as the next revision,
+    // and A reads that.
+    let published = b.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": personal, "key": NAME, "content": { "text": "two" } }),
+    );
+    assert_eq!(published["rev"], 2, "{published}");
+    wait_for("a reads b's edit", &all, 120, || reads(&a, "two"));
+}

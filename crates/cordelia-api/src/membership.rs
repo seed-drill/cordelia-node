@@ -343,12 +343,23 @@ fn publish_state(
     Ok(sent)
 }
 
+/// The epoch of a channel's next change.
+fn next_epoch(db: &Connection, channel_id: &str) -> Result<u64, CordeliaError> {
+    let (epoch, _) = channels::epoch(db, channel_id)?;
+    if epoch >= cordelia_core::protocol::MAX_EPOCH {
+        return Err(CordeliaError::Validation(
+            "this channel's members can no longer be changed: it has reached the limit on changes"
+                .into(),
+        ));
+    }
+    Ok(epoch + 1)
+}
+
 /// Advance a channel's epoch after a local change, keeping its key state.
 fn bump_epoch(state: &AppState, db: &Connection, channel_id: &str) -> Result<u64, CordeliaError> {
     let pk = state.identity.public_key();
     let ch = channels::get_by_id(db, channel_id)?;
-    let (epoch, _) = channels::epoch(db, channel_id)?;
-    let next = epoch + 1;
+    let next = next_epoch(db, channel_id)?;
     let psk_hash = ch.psk_hash.unwrap_or_else(|| {
         psk::read_psk(&state.home_dir, channel_id)
             .map(|k| cordelia_crypto::sha256(&k).to_vec())
@@ -363,7 +374,7 @@ fn bump_epoch(state: &AppState, db: &Connection, channel_id: &str) -> Result<u64
 fn rotate_key(state: &AppState, db: &Connection, channel_id: &str) -> Result<(), CordeliaError> {
     let pk = state.identity.public_key();
     let ch = channels::get_by_id(db, channel_id)?;
-    let (epoch, _) = channels::epoch(db, channel_id)?;
+    let next = next_epoch(db, channel_id)?;
     let new_version = u32::try_from(ch.key_version + 1)
         .map_err(|_| CordeliaError::Internal("key version out of range".into()))?;
     let new_key = cordelia_crypto::generate_psk().map_err(crypto_err)?;
@@ -374,7 +385,7 @@ fn rotate_key(state: &AppState, db: &Connection, channel_id: &str) -> Result<(),
     channels::set_state(
         db,
         channel_id,
-        epoch + 1,
+        next,
         &pk,
         new_version,
         &cordelia_crypto::sha256(&new_key),
@@ -757,16 +768,46 @@ pub fn list_devices(state: &AppState) -> Result<Vec<DeviceInfo>, CordeliaError> 
 pub fn list_pending(state: &AppState) -> Result<Vec<invites::PendingInvite>, CordeliaError> {
     let db = lock(state)?;
     let pk = state.identity.public_key();
-    // What waits for `accept` is what came from a key this device has not
-    // accepted. Anything else that waits is from one of this person's own
-    // devices and waits for another reason (see `process_one`).
+    waiting_for_accept(&db, &pk)
+}
+
+/// The invitations that wait for `accept`, oldest first: those from a key
+/// this device has not accepted. Anything else that waits is from one of
+/// this person's own devices and waits for another reason (see
+/// `process_one`).
+fn waiting_for_accept(
+    db: &Connection,
+    pk: &[u8; 32],
+) -> Result<Vec<invites::PendingInvite>, CordeliaError> {
     let mut waiting = Vec::new();
-    for invite in invites::pending(&db)? {
-        if !is_trusted_sender(&db, &pk, &invite.inviter)? {
+    for invite in invites::pending(db)? {
+        if !is_trusted_sender(db, pk, &invite.inviter)? {
             waiting.push(invite);
         }
     }
     Ok(waiting)
+}
+
+/// Keep at most [`invites::MAX_PENDING_INVITES`] invitations waiting for
+/// `accept`, rejecting the oldest beyond that, so a stranger who knows this
+/// device's key cannot grow the list without limit.
+///
+/// Only what waits for `accept` is counted or rejected. A state that one of
+/// this person's own devices sent, and that is held, is left alone: what
+/// strangers send must not push it out.
+fn cap_waiting_invites(db: &Connection, pk: &[u8; 32]) -> Result<usize, CordeliaError> {
+    let waiting = waiting_for_accept(db, pk)?;
+    let over = waiting.len().saturating_sub(invites::MAX_PENDING_INVITES);
+    for invite in &waiting[..over] {
+        invites::record(
+            db,
+            &invite.item_id,
+            &invite.inviter,
+            &invite.channel_id,
+            InviteStatus::Rejected,
+        )?;
+    }
+    Ok(over)
 }
 
 /// Process new and pending invites in this node's inbox.
@@ -809,7 +850,7 @@ pub fn process_inbox(state: &AppState) -> Result<InboxSummary, CordeliaError> {
             break;
         }
     }
-    invites::enforce_pending_cap(&db)?;
+    cap_waiting_invites(&db, &state.identity.public_key())?;
 
     if !summary.applied.is_empty() || summary.pending > 0 {
         tracing::info!(
@@ -864,6 +905,13 @@ fn process_one(
             let (epoch, epoch_author) = channels::epoch(db, &channel_id)?;
             if (cs.epoch, &cs.sender[..]) <= (epoch, epoch_author.as_slice()) {
                 return Ok((InviteStatus::Superseded, channel_id));
+            }
+            // One change moves the epoch by one, and a device that was away
+            // may skip some. A state that moves it further than that is an
+            // attempt to use the numbers up, so that the members could
+            // never be changed again.
+            if cs.epoch - epoch > cordelia_core::protocol::MAX_EPOCH_STEP {
+                return invalid("state moves the epoch further than one change may");
             }
             let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id.as_str());
             if !is_personal && names_a_stranger(db, &pk, &cs)? {

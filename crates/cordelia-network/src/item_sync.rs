@@ -279,6 +279,12 @@ pub fn verify_item_signature(item: &Item) -> bool {
     if slot.is_some() != item.rev.is_some() {
         return false;
     }
+    if item
+        .rev
+        .is_some_and(|rev| rev > cordelia_core::protocol::MAX_REV)
+    {
+        return false;
+    }
     let Ok(cbor) = cordelia_crypto::signing::ItemMetadata {
         author_id: &author,
         channel_id: &item.channel_id,
@@ -622,6 +628,27 @@ mod tests {
         let mut short_slot = slotted;
         short_slot.slot = Some(vec![0x5A; 31]);
         assert!(!verify_item_signature(&short_slot));
+    }
+
+    /// T2. A revision over the limit does not verify, even with a good
+    /// signature, so no node stores it or passes it on.
+    #[test]
+    fn a_revision_over_the_limit_does_not_verify() {
+        use cordelia_core::protocol::MAX_REV;
+        let id = cordelia_crypto::NodeIdentity::generate().unwrap();
+        let slot = Some([0x5A; 32]);
+
+        assert!(verify_item_signature(&signed_item(
+            &id,
+            slot,
+            Some(MAX_REV)
+        )));
+        for rev in [MAX_REV + 1, i64::MAX as u64, u64::MAX] {
+            assert!(
+                !verify_item_signature(&signed_item(&id, slot, Some(rev))),
+                "{rev}"
+            );
+        }
     }
 
     #[test]

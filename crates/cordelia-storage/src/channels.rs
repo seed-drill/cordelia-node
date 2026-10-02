@@ -241,6 +241,10 @@ pub fn ensure_group(
 }
 
 /// A channel's membership epoch and the author of the state that set it.
+///
+/// A stored value outside 0..=MAX_EPOCH can only have been written before
+/// the limit existed. It reads as zero, so that the channel's members can
+/// put it right with their next change.
 pub fn epoch(conn: &Connection, channel_id: &str) -> Result<(u64, Vec<u8>), CordeliaError> {
     conn.query_row(
         "SELECT epoch, epoch_author FROM channels WHERE channel_id = ?1",
@@ -248,7 +252,11 @@ pub fn epoch(conn: &Connection, channel_id: &str) -> Result<(u64, Vec<u8>), Cord
         |row| {
             let epoch: i64 = row.get(0)?;
             let author: Option<Vec<u8>> = row.get(1)?;
-            Ok((epoch.max(0) as u64, author.unwrap_or_default()))
+            let epoch = u64::try_from(epoch)
+                .ok()
+                .filter(|e| *e <= cordelia_core::protocol::MAX_EPOCH)
+                .unwrap_or(0);
+            Ok((epoch, author.unwrap_or_default()))
         },
     )
     .map_err(|e| match e {
@@ -260,7 +268,8 @@ pub fn epoch(conn: &Connection, channel_id: &str) -> Result<(u64, Vec<u8>), Cord
 }
 
 /// Record the channel state applied to a channel: epoch, its author, the
-/// current key version, and the current key's hash.
+/// current key version, and the current key's hash. An epoch over
+/// MAX_EPOCH is refused.
 pub fn set_state(
     conn: &Connection,
     channel_id: &str,
@@ -269,6 +278,11 @@ pub fn set_state(
     key_version: u32,
     psk_hash: &[u8],
 ) -> Result<(), CordeliaError> {
+    if epoch > cordelia_core::protocol::MAX_EPOCH {
+        return Err(CordeliaError::Validation(
+            "membership epoch is over the limit".into(),
+        ));
+    }
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE channels SET epoch = ?1, epoch_author = ?2, key_version = ?3, psk_hash = ?4,
@@ -866,6 +880,33 @@ mod tests {
 
     fn test_psk() -> [u8; 32] {
         [0xABu8; 32]
+    }
+
+    /// T20. An epoch over the limit is not stored, and one that an earlier
+    /// version stored reads as zero and not as a huge or wrapped number.
+    #[test]
+    fn an_epoch_over_the_limit_is_neither_stored_nor_read() {
+        use cordelia_core::protocol::MAX_EPOCH;
+        let conn = db::open_in_memory().unwrap();
+        let ch = "grp_550e8400-e29b-41d4-a716-446655440000";
+        ensure_group(&conn, ch, None, "realtime", &test_creator()).unwrap();
+        let author = [0x07u8; 32];
+
+        set_state(&conn, ch, MAX_EPOCH, &author, 1, &[0x01; 32]).unwrap();
+        assert_eq!(epoch(&conn, ch).unwrap().0, MAX_EPOCH);
+        for over in [MAX_EPOCH + 1, i64::MAX as u64, u64::MAX] {
+            assert!(set_state(&conn, ch, over, &author, 1, &[0x01; 32]).is_err());
+            assert_eq!(epoch(&conn, ch).unwrap().0, MAX_EPOCH, "{over}");
+        }
+
+        for stored in [-1i64, i64::MIN, i64::MAX, MAX_EPOCH as i64 + 1] {
+            conn.execute(
+                "UPDATE channels SET epoch = ?1 WHERE channel_id = ?2",
+                params![stored, ch],
+            )
+            .unwrap();
+            assert_eq!(epoch(&conn, ch).unwrap().0, 0, "{stored}");
+        }
     }
 
     #[test]

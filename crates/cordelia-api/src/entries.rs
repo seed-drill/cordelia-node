@@ -113,6 +113,11 @@ pub fn publish(
 
     let slot = slot_id(&slot_key(state, channel_id)?, key);
     let rev = items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1;
+    if rev > cordelia_core::protocol::MAX_REV {
+        return Err(CordeliaError::Validation(format!(
+            "{key} has reached the revision limit and cannot be written again in this channel"
+        )));
+    }
     let channel = channels::get_by_id(db, channel_id)?;
 
     let plaintext = serde_json::to_vec(&serde_json::json!({

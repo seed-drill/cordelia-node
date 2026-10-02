@@ -93,7 +93,9 @@ pub struct ChannelState {
     pub creator: [u8; 32],
     /// Ed25519 key of the node that sealed this state.
     pub sender: [u8; 32],
-    /// Monotonic per channel; receivers ignore states that are not newer.
+    /// Monotonic per channel; receivers ignore states that are not newer,
+    /// and states that move it further than one change may. At most
+    /// `MAX_EPOCH`.
     pub epoch: u64,
     /// Current key version; must be present in `keys`.
     pub key_version: u32,
@@ -132,6 +134,9 @@ impl ChannelState {
         }
         if self.mode != "realtime" && self.mode != "batch" {
             return invalid("mode must be 'realtime' or 'batch'");
+        }
+        if self.epoch > cordelia_core::protocol::MAX_EPOCH {
+            return invalid("epoch is over the limit");
         }
         if self.current_key().is_none() {
             return invalid("key ring lacks the current key version");
@@ -482,6 +487,36 @@ mod tests {
 
         // Invalid states cannot even be sealed.
         assert!(not_group.seal(&recipient.public_key()).is_err());
+    }
+
+    /// T20. A state whose epoch is over the limit is not valid: it can be
+    /// neither sealed nor, sealed some other way, opened.
+    #[test]
+    fn an_epoch_over_the_limit_is_not_a_valid_state() {
+        use cordelia_core::protocol::MAX_EPOCH;
+        let sender = NodeIdentity::generate().unwrap();
+        let recipient = NodeIdentity::generate().unwrap();
+
+        let mut state = sample(&sender, &recipient);
+        state.epoch = MAX_EPOCH;
+        let sealed = state.seal(&recipient.public_key()).unwrap();
+        assert_eq!(
+            ChannelState::open(&recipient, &sealed).unwrap().epoch,
+            MAX_EPOCH
+        );
+
+        for epoch in [MAX_EPOCH + 1, i64::MAX as u64, u64::MAX] {
+            state.epoch = epoch;
+            assert!(state.validate().is_err(), "{epoch}");
+            assert!(state.seal(&recipient.public_key()).is_err(), "{epoch}");
+
+            // Sealed without the check, as a hostile sender would.
+            let to = x25519_pub_from_ed25519_pub(&recipient.public_key());
+            let sealed = ecies_encrypt(&to, &state.to_cbor().unwrap())
+                .unwrap()
+                .to_bytes();
+            assert!(ChannelState::open(&recipient, &sealed).is_err(), "{epoch}");
+        }
     }
 
     #[test]

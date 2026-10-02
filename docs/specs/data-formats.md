@@ -172,11 +172,11 @@ CREATE INDEX idx_items_content_hash      ON items(content_hash);
 
 **Notes:**
 - `item_id` uses ULID (Crockford Base32, 26 chars) prefixed with `ci_`. ULIDs are monotonic within the same millisecond on the same node.
-- `content_hash` is SHA-256 of the `encrypted_blob` column value (computed over ciphertext, not plaintext). Used for deduplication: `INSERT OR IGNORE` with content_hash check.
+- `content_hash` is SHA-256 of the `encrypted_blob` column value (computed over ciphertext, not plaintext). Used for deduplication (below).
 - `received_at` is local-only. Not signed. Not replicated. Used for local diagnostics and GC.
 - `key_version = 0` is reserved for items not encrypted with the channel PSK. See §4.
 
-**Deduplication:** On insert, check for existing item with same `channel_id + content_hash`. If found, skip (first-observed wins). This handles replication convergence where the same item arrives from multiple peers.
+**Deduplication:** On insert, check for an existing item with the same `channel_id`, `content_hash` and `author_id`. If found, skip. This handles replication convergence where the same item arrives from multiple peers. The author is part of the check so that a copy of an item under another key cannot keep the item itself out (decision 2026-09-30 §4.3).
 
 ### 3.5 dm_peers
 

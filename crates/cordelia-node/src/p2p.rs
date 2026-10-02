@@ -969,11 +969,16 @@ pub async fn p2p_loop(
             // ── Keyed tombstone GC (§4.4) ─────────────────────────────
             _ = gc_interval.tick() => {
                 let gc_state = state.clone();
+                // Only a personal node holds its channels' member lists.
+                // Any other node sweeps a key only when every author has
+                // deleted it.
+                let members_known = node_role == "personal";
                 tokio::task::spawn_blocking(move || {
                     let Ok(db) = gc_state.db.lock() else { return };
                     match cordelia_storage::items::gc_keyed_tombstones(
                         &db,
                         cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+                        members_known,
                     ) {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),

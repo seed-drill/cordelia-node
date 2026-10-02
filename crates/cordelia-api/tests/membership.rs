@@ -846,3 +846,164 @@ fn t10_a_state_that_names_a_strangers_key_is_held_until_it_is_a_device() {
     assert!(summary.applied.contains(&project), "{summary:?}");
     assert!(b.members(&project).iter().any(|(k, _)| *k == extra.pk()));
 }
+
+// ── Numbers are bounded, and strangers displace nothing (T13, T20) ──────
+
+/// The state `from` would send for `channel` at `epoch`, with `members`.
+fn state_at(
+    from: &Node,
+    channel: &str,
+    epoch: u64,
+    members: &[[u8; 32]],
+    personal: bool,
+) -> ChannelState {
+    let key_version = from.key_version(channel) as u32;
+    ChannelState {
+        channel_id: channel.to_string(),
+        name: None,
+        mode: "realtime".into(),
+        creator: from.pk(),
+        sender: from.pk(),
+        epoch,
+        key_version,
+        keys: vec![(key_version, from.key(channel))],
+        slot_key: psk::read_slot_key(&from.state.home_dir, channel).unwrap(),
+        members: members
+            .iter()
+            .map(|key| StateMember {
+                key: *key,
+                role: MemberRole::Owner,
+            })
+            .collect(),
+        personal,
+    }
+}
+
+fn epoch_of(n: &Node, channel: &str) -> u64 {
+    channels::epoch(&n.state.db.lock().unwrap(), channel)
+        .unwrap()
+        .0
+}
+
+/// T20. One of your devices, taken over, sends states that jump the
+/// counter that orders changes to a channel's members, to use the numbers
+/// up so that the list can never change again (and it can never be
+/// removed). They are refused, and the list goes on changing.
+#[test]
+fn t20_no_state_can_put_a_channels_members_beyond_change() {
+    use cordelia_core::protocol::{MAX_EPOCH, MAX_EPOCH_STEP};
+    let (a, b, personal) = paired();
+    let held = epoch_of(&b, &personal);
+    let both = [a.pk(), b.pk()];
+
+    // Further than one change may move it, up to the largest valid number.
+    for epoch in [held + MAX_EPOCH_STEP + 1, MAX_EPOCH] {
+        deliver_crafted(
+            &a.state.identity,
+            &b,
+            &state_at(&a, &personal, epoch, &both, true),
+        );
+        let summary = membership::process_inbox(&b.state).unwrap();
+        assert_eq!(summary.invalid, 1, "{epoch}: {summary:?}");
+        assert_eq!(epoch_of(&b, &personal), held, "{epoch}");
+    }
+    // Over the limit: not a state at all. Sealed without the sender's check.
+    for epoch in [MAX_EPOCH + 1, u64::MAX] {
+        let cs = state_at(&a, &personal, epoch, &both, true);
+        let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&b.pk());
+        let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &cs.to_cbor().unwrap())
+            .unwrap()
+            .to_bytes();
+        insert_signed(&a.state.identity, &b, sealed);
+        let summary = membership::process_inbox(&b.state).unwrap();
+        assert_eq!(summary.invalid, 1, "{epoch}: {summary:?}");
+        assert_eq!(epoch_of(&b, &personal), held, "{epoch}");
+    }
+
+    // The list still changes: from the other device, and from this one.
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    relay(&a, &b);
+    membership::process_inbox(&b.state).unwrap();
+    assert!(b.members(&personal).iter().any(|(k, _)| *k == c.pk()));
+    membership::remove_device(&b.state, &c.pk()).unwrap();
+    assert!(!b.members(&personal).iter().any(|(k, _)| *k == c.pk()));
+
+    // A state that skips as far as one change may is taken: a device that
+    // was away has missed some.
+    let held = epoch_of(&b, &personal);
+    deliver_crafted(
+        &a.state.identity,
+        &b,
+        &state_at(&a, &personal, held + MAX_EPOCH_STEP, &both, true),
+    );
+    let summary = membership::process_inbox(&b.state).unwrap();
+    assert_eq!(summary.applied, vec![personal.clone()], "{summary:?}");
+    assert_eq!(epoch_of(&b, &personal), held + MAX_EPOCH_STEP);
+}
+
+/// An offer of a personal channel from a key nobody here has heard of.
+fn offer_from_a_stranger(to: &Node) {
+    let stranger = NodeIdentity::generate().unwrap();
+    let cs = ChannelState {
+        channel_id: naming::group_channel_id(),
+        name: None,
+        mode: "realtime".into(),
+        creator: stranger.public_key(),
+        sender: stranger.public_key(),
+        epoch: 1,
+        key_version: 1,
+        keys: vec![(1, [0x01; 32])],
+        slot_key: [0x02; 32],
+        members: [stranger.public_key(), to.pk()]
+            .iter()
+            .map(|key| StateMember {
+                key: *key,
+                role: MemberRole::Owner,
+            })
+            .collect(),
+        personal: true,
+    };
+    deliver_crafted(&stranger, to, &cs);
+}
+
+/// T13. A stranger who knows a device's key can fill its list of waiting
+/// invitations, which keeps only so many. That must not push out a state
+/// that one of the person's own devices sent and that the device is
+/// holding: the cap counts, and drops, only what strangers sent.
+#[test]
+fn t13_invitations_from_strangers_do_not_push_out_what_your_own_devices_sent() {
+    let (a, b, personal) = paired();
+    let project = membership::create_project_group(&a.state, "github.com/acme/app").unwrap();
+    join_project(&a, &b, &personal, &project);
+    let extra = node();
+
+    // A state from A that B holds: it names a device B has not heard of.
+    let held = epoch_of(&b, &project);
+    let members = [a.pk(), b.pk(), extra.pk()];
+    deliver_crafted(
+        &a.state.identity,
+        &b,
+        &state_at(&a, &project, held + 1, &members, false),
+    );
+    assert_eq!(membership::process_inbox(&b.state).unwrap().held, 1);
+
+    // Then more invitations from strangers than the list keeps.
+    for _ in 0..invites::MAX_PENDING_INVITES + 5 {
+        offer_from_a_stranger(&b);
+    }
+    let summary = membership::process_inbox(&b.state).unwrap();
+    assert_eq!(summary.held, 1, "{summary:?}");
+    assert_eq!(
+        membership::list_pending(&b.state).unwrap().len(),
+        invites::MAX_PENDING_INVITES,
+        "the list of strangers' invitations is capped"
+    );
+
+    // The held state is still there, and applies once the device is known.
+    membership::add_device(&a.state, &extra.pk(), None).unwrap();
+    relay(&a, &b);
+    let summary = membership::process_inbox(&b.state).unwrap();
+    assert!(summary.applied.contains(&project), "{summary:?}");
+    assert!(b.members(&project).iter().any(|(k, _)| *k == extra.pk()));
+}
