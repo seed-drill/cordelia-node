@@ -55,8 +55,21 @@ pub struct AppState {
     /// The relays this node was configured with and whether each is
     /// connected, refreshed by the P2P loop.
     pub relays: std::sync::RwLock<Vec<RelaySnapshot>>,
+    /// Items written here that a relay refused to store, refreshed by the
+    /// P2P loop. They stay in the outbox and are offered again.
+    pub outbox_refused: std::sync::RwLock<Vec<RefusedSnapshot>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
+}
+
+/// An item of this node's that a relay refused, for status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedSnapshot {
+    pub item_id: String,
+    /// The relay's reason, as a short code ("invalid", "storage").
+    pub why: String,
+    /// How many times in a row it has been refused.
+    pub refusals: u32,
 }
 
 /// How the settings handlers and the sync adapter's loop keep in step.

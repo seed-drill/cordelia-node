@@ -667,7 +667,13 @@ PushAck {
     stored:              u32    // Items successfully stored
     dedup_dropped:       u32    // Items dropped as duplicates (same item_id + content_hash)
     policy_rejected:     u32    // Items rejected by access policy or rate limit
-    verification_failed: u32    // Items rejected due to invalid signature or content_hash mismatch
+    verification_failed: u32    // Items the receiver did not store: invalid, or it could not store them
+    refused:             [{ item_id: tstr, why: tstr }]
+                                // Optional (0.2.0-alpha.4): which items were not stored, and why
+                                // ("invalid", "storage"). Omitted when empty. The sender keeps
+                                // these in its outbox and offers them again. A receiver without
+                                // this field only counts them, and the sender then takes nothing
+                                // in the push as delivered.
 }
 ```
 

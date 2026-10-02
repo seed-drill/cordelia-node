@@ -6,6 +6,12 @@
 /// (it runs every `cordelia_sync::claude::CYCLE_SECS`).
 pub const STALE_REPORT_SECS: i64 = 60;
 
+/// How many times in a row relays must refuse an item before status asks
+/// for attention. A relay that is briefly unable to store (it is being
+/// restarted, its disk is being cleared) refuses once or twice, and the
+/// item is delivered within seconds.
+pub const REFUSALS_BEFORE_ATTENTION: u64 = 3;
+
 /// What the state is derived from.
 #[derive(Debug, Default, Clone)]
 pub struct Facts {
@@ -15,8 +21,11 @@ pub struct Facts {
     pub running: bool,
     pub role: String,
     pub peers_hot: u64,
-    /// Items written here that no relay has acknowledged yet.
+    /// Items written here that no relay has stored yet.
     pub outbox_waiting: u64,
+    /// Of those, the ones relays keep refusing ([`REFUSALS_BEFORE_ATTENTION`]
+    /// times in a row or more). They are still offered, now and then.
+    pub outbox_refused: u64,
     /// `cordelia sync claude` is on.
     pub sync_enabled: bool,
     /// Age of the last sync cycle's report; `None` before the first cycle.
@@ -111,6 +120,10 @@ pub fn derive(f: &Facts) -> (State, String) {
             0 => (Offline, "memory offline".into()),
             n => (Offline, format!("memory offline, {n} waiting")),
         };
+    }
+    if f.outbox_refused > 0 {
+        let n = f.outbox_refused;
+        return (Attention, format!("memory: {n} not taken by a relay"));
     }
     if f.outbox_waiting > 0 {
         return (Syncing, format!("memory sending {}", f.outbox_waiting));
@@ -280,6 +293,14 @@ mod tests {
         assert_eq!(
             with(&|f| f.outbox_waiting = 4),
             (State::Syncing, "memory sending 4".into())
+        );
+        // Relays keep refusing one of them: that needs the person.
+        assert_eq!(
+            with(&|f| {
+                f.outbox_waiting = 4;
+                f.outbox_refused = 1;
+            }),
+            (State::Attention, "memory: 1 not taken by a relay".into())
         );
         assert_eq!(
             with(&|f| f.projects_waiting = 1),

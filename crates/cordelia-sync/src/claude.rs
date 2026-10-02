@@ -1070,6 +1070,7 @@ mod tests {
             announce_tx: None,
             peers: Default::default(),
             relays: Default::default(),
+            outbox_refused: Default::default(),
             sync_control: Default::default(),
         }
     }

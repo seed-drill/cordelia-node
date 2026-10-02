@@ -374,16 +374,28 @@ fn t01_a_relay_holds_nothing_it_can_read() {
 
 /// A stand-in for a relay. It completes the handshake as a relay does, and
 /// records what each node that connects does: the protocol of every stream
-/// it opens, and what it says when announcing channels.
+/// it opens, what it says when announcing channels, and the items of each
+/// push.
 struct StandIn {
     port: u16,
     /// The stand-in's own key, as a device would be configured with it.
     key: String,
     told: Arc<Mutex<Vec<ChannelDescriptor>>>,
     streams: Arc<Mutex<Vec<Protocol>>>,
+    /// The item IDs of each push, in the order the pushes arrived.
+    pushes: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
+/// How a stand-in answers its `n`th push (from 1), given the items in it.
+type PushAnswer =
+    Arc<dyn Fn(usize, &[String]) -> cordelia_network::messages::PushAck + Send + Sync>;
+
+/// A stand-in relay that answers no push.
 fn stand_in_relay() -> StandIn {
+    stand_in(None)
+}
+
+fn stand_in(answer: Option<PushAnswer>) -> StandIn {
     use cordelia_network::{codec, connection, transport};
 
     let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
@@ -400,23 +412,45 @@ fn stand_in_relay() -> StandIn {
     let ctx = manager.connect_context();
     let told = Arc::new(Mutex::new(Vec::new()));
     let streams = Arc::new(Mutex::new(Vec::new()));
+    let pushes = Arc::new(Mutex::new(Vec::new()));
 
-    let (record, opened) = (told.clone(), streams.clone());
+    let (record, opened, pushed) = (told.clone(), streams.clone(), pushes.clone());
     tokio::spawn(async move {
         let _manager = manager; // keeps the endpoint's context alive
         while let Some(incoming) = endpoint.accept().await {
             let (ctx, record, opened) = (ctx.clone(), record.clone(), opened.clone());
+            let (pushed, answer) = (pushed.clone(), answer.clone());
             tokio::spawn(async move {
                 let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
                     return;
                 };
-                while let Ok((_send, mut recv)) = outcome.conn.accept_bi().await {
+                while let Ok((mut send, mut recv)) = outcome.conn.accept_bi().await {
                     let (record, opened) = (record.clone(), opened.clone());
+                    let (pushed, answer) = (pushed.clone(), answer.clone());
                     tokio::spawn(async move {
                         let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
                             return;
                         };
                         opened.lock().unwrap().push(protocol);
+                        if protocol == Protocol::ItemPush {
+                            let Some(answer) = answer else { return };
+                            let Ok(WireMessage::PushPayload(payload)) =
+                                codec::read_frame(&mut recv).await
+                            else {
+                                return;
+                            };
+                            let ids: Vec<String> =
+                                payload.items.iter().map(|i| i.item_id.clone()).collect();
+                            let n = {
+                                let mut pushed = pushed.lock().unwrap();
+                                pushed.push(ids.clone());
+                                pushed.len()
+                            };
+                            let ack = WireMessage::PushAck(answer(n, &ids));
+                            let _ = codec::write_frame(&mut send, &ack).await;
+                            let _ = send.finish();
+                            return;
+                        }
                         if protocol != Protocol::ChannelAnnounce {
                             return;
                         }
@@ -435,6 +469,7 @@ fn stand_in_relay() -> StandIn {
         key,
         told,
         streams,
+        pushes,
     }
 }
 
@@ -920,4 +955,85 @@ fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
     wait_for("d reads a's edit", &all, 90, || {
         (reads(&d).get("edited.md") == Some(&text("by a again"))).then_some(())
     });
+}
+
+/// T16. A relay's refusal is not delivery. A device's relay refuses an item:
+/// first as a relay from before 0.2.0-alpha.4 does, with a count and no
+/// list; then with the list. Each time the item stays in the device's
+/// outbox and is offered again. Only when the relay stores it does the
+/// outbox empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
+    use cordelia_network::messages::{PushAck, REFUSED_STORAGE, Refusal};
+
+    let relay = stand_in(Some(Arc::new(|n, ids: &[String]| match n {
+        1 => PushAck {
+            verification_failed: ids.len() as u32,
+            ..Default::default()
+        },
+        2 => PushAck {
+            verification_failed: ids.len() as u32,
+            refused: ids
+                .iter()
+                .map(|id| Refusal {
+                    item_id: id.clone(),
+                    why: REFUSED_STORAGE.into(),
+                })
+                .collect(),
+            ..Default::default()
+        },
+        _ => PushAck {
+            stored: ids.len() as u32,
+            ..Default::default()
+        },
+    })));
+    let pushes = relay.pushes.clone();
+    let mut a = node_with_relays(
+        "a",
+        "personal",
+        &[(format!("127.0.0.1:{}", relay.port), Some(relay.key.clone()))],
+    );
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    let status = |n: &Node| n.get("/api/v1/status").unwrap_or_default();
+
+    // Adding a device writes one item for the relay: the offer to it.
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    a.cli(&["add-device", &other]);
+
+    // Refused twice: the item is still waiting, and status says a relay
+    // refused it and why.
+    let refused = wait_for("status shows the refusal", &[&a], 60, || {
+        let s = status(&a);
+        let refused = s["outbox_refused"].as_array()?.first()?.clone();
+        (s["outbox_waiting"].as_u64()? >= 1).then_some(refused)
+    });
+    assert_eq!(refused["why"], REFUSED_STORAGE, "{refused}");
+    let item = refused["item_id"].as_str().unwrap().to_string();
+    {
+        let pushes = pushes.lock().unwrap();
+        assert!(pushes.len() >= 2, "{pushes:?}");
+        assert!(
+            pushes[0].contains(&item) && pushes[1].contains(&item),
+            "{pushes:?}"
+        );
+    }
+
+    // Offered a third time and stored: nothing waits any more.
+    wait_for(
+        "the outbox empties once the relay stores it",
+        &[&a],
+        60,
+        || {
+            let s = status(&a);
+            (s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty()).then_some(())
+        },
+    );
+    let pushes = pushes.lock().unwrap();
+    assert!(
+        pushes.iter().filter(|ids| ids.contains(&item)).count() >= 3,
+        "{pushes:?}"
+    );
 }

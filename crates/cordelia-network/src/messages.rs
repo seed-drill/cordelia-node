@@ -268,13 +268,34 @@ pub struct PushPayload {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushAck {
     pub stored: u32,
     pub dedup_dropped: u32,
     pub policy_rejected: u32,
     pub verification_failed: u32,
+    /// The items of this push that the receiver neither stored nor already
+    /// held, and why. A sender keeps those and offers them again; without
+    /// the list it could not tell which they were. Omitted when empty, so
+    /// an answer with nothing refused is unchanged on the wire. A receiver
+    /// older than 0.2.0-alpha.4 never sends it and only counts them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refusal>,
 }
+
+/// One item a receiver refused to store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub item_id: String,
+    /// A short code for status to show: [`REFUSED_INVALID`] or
+    /// [`REFUSED_STORAGE`].
+    pub why: String,
+}
+
+/// The item is not valid: its hash, its signature or its shape.
+pub const REFUSED_INVALID: &str = "invalid";
+/// The receiver could not store it (its disk, or its database).
+pub const REFUSED_STORAGE: &str = "storage";
 
 // ── PSK-Exchange (0x07, §4.7) ──────────────────────────────────────
 
@@ -354,4 +375,66 @@ pub enum WireMessage {
     // Pairing
     PairingRequest(PairingRequest),
     PairingResponse(PairingResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).unwrap();
+        buf
+    }
+
+    /// The answer to a push as nodes before 0.2.0-alpha.4 know it.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct OlderPushAck {
+        stored: u32,
+        dedup_dropped: u32,
+        policy_rejected: u32,
+        verification_failed: u32,
+    }
+
+    /// The list of refused items is an addition that older nodes never
+    /// notice: an answer with nothing refused is the same bytes as before,
+    /// an older sender reads an answer that carries the list, and a newer
+    /// sender reads an older receiver's answer as carrying none.
+    #[test]
+    fn the_list_of_refused_items_is_compatible_both_ways() {
+        let older = OlderPushAck {
+            stored: 2,
+            dedup_dropped: 1,
+            policy_rejected: 0,
+            verification_failed: 1,
+        };
+        let nothing_refused = PushAck {
+            stored: 2,
+            dedup_dropped: 1,
+            verification_failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(encode(&nothing_refused), encode(&older));
+
+        let with_list = PushAck {
+            refused: vec![Refusal {
+                item_id: "ci_x".into(),
+                why: REFUSED_STORAGE.into(),
+            }],
+            ..nothing_refused.clone()
+        };
+        let read_by_older: OlderPushAck =
+            ciborium::from_reader(encode(&with_list).as_slice()).unwrap();
+        assert_eq!(read_by_older, older);
+        // The same inside the message envelope, as it travels.
+        let framed = encode(&WireMessage::PushAck(with_list.clone()));
+        let WireMessage::PushAck(read) = ciborium::from_reader(framed.as_slice()).unwrap() else {
+            panic!("not a push answer");
+        };
+        assert_eq!(read.refused, with_list.refused);
+
+        let read_by_newer: PushAck = ciborium::from_reader(encode(&older).as_slice()).unwrap();
+        assert!(read_by_newer.refused.is_empty());
+        assert_eq!(read_by_newer.verification_failed, 1);
+    }
 }

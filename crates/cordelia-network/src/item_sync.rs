@@ -454,9 +454,7 @@ mod tests {
                 assert_eq!(received.len(), 2);
                 PushAck {
                     stored: 2,
-                    dedup_dropped: 0,
-                    policy_rejected: 0,
-                    verification_failed: 0,
+                    ..Default::default()
                 }
             })
             .await

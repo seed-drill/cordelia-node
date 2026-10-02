@@ -395,11 +395,15 @@ pub fn outbox_len(conn: &Connection, author: &[u8; 32]) -> Result<u64, CordeliaE
 /// This node's outbox: items authored by `author` in network-scope channels
 /// that no relay has acknowledged yet, oldest first. Bounded by count and
 /// total encrypted bytes, but always at least one item if any are pending.
+/// Items whose ID is in `skip` are left out (those a relay refused, which
+/// wait before they are offered again), and do not count towards the
+/// bounds.
 pub fn outbox(
     conn: &Connection,
     author: &[u8; 32],
     max_items: usize,
     max_bytes: usize,
+    skip: &std::collections::HashSet<String>,
 ) -> Result<Vec<StoredItem>, CordeliaError> {
     let mut stmt = conn
         .prepare(&format!(
@@ -412,7 +416,7 @@ pub fn outbox(
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let rows = stmt
         .query_map(
-            params![author.as_slice(), max_items as i64],
+            params![author.as_slice(), (max_items + skip.len()) as i64],
             stored_item_from_row,
         )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
@@ -421,6 +425,12 @@ pub fn outbox(
     let mut bytes = 0usize;
     for row in rows {
         let item = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        if skip.contains(&item.item_id) {
+            continue;
+        }
+        if batch.len() == max_items {
+            break;
+        }
         bytes += item.encrypted_blob.len();
         if !batch.is_empty() && bytes > max_bytes {
             break;
@@ -428,6 +438,30 @@ pub fn outbox(
         batch.push(item);
     }
     Ok(batch)
+}
+
+/// Which of `item_ids` are still in `author`'s outbox.
+pub fn still_in_outbox(
+    conn: &Connection,
+    author: &[u8; 32],
+    item_ids: &[String],
+) -> Result<std::collections::HashSet<String>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM items
+             WHERE item_id = ?1 AND author_id = ?2 AND relayed_at IS NULL",
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut waiting = std::collections::HashSet::new();
+    for id in item_ids {
+        let found = stmt
+            .exists(params![id, author.as_slice()])
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        if found {
+            waiting.insert(id.clone());
+        }
+    }
+    Ok(waiting)
 }
 
 /// Record that a relay acknowledged these items.
@@ -1167,21 +1201,39 @@ mod tests {
         insert_item(&conn, &mine2).unwrap();
 
         let ids = |v: Vec<StoredItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+        let none = std::collections::HashSet::new();
         assert_eq!(
-            ids(outbox(&conn, &me, 10, 1 << 20).unwrap()),
+            ids(outbox(&conn, &me, 10, 1 << 20, &none).unwrap()),
             vec!["ci_m1", "ci_m2"]
+        );
+
+        // An item that is waiting after a refusal is left out, and does
+        // not use up the batch: the next one goes in its place.
+        let waiting = ["ci_m1".to_string()].into();
+        assert_eq!(
+            ids(outbox(&conn, &me, 1, 1 << 20, &waiting).unwrap()),
+            vec!["ci_m2"]
         );
 
         // Byte bound: blobs are 100 bytes each; a 150-byte batch holds one,
         // and a batch always holds at least one.
-        assert_eq!(ids(outbox(&conn, &me, 10, 150).unwrap()), vec!["ci_m1"]);
-        assert_eq!(ids(outbox(&conn, &me, 10, 1).unwrap()), vec!["ci_m1"]);
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 150, &none).unwrap()),
+            vec!["ci_m1"]
+        );
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 1, &none).unwrap()),
+            vec!["ci_m1"]
+        );
 
         // Three items wait for a relay; two of them are ours.
         assert_eq!(outbox_len(&conn, &me).unwrap(), 2);
 
         mark_relayed(&conn, &["ci_m1".to_string()]).unwrap();
-        assert_eq!(ids(outbox(&conn, &me, 10, 1 << 20).unwrap()), vec!["ci_m2"]);
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 1 << 20, &none).unwrap()),
+            vec!["ci_m2"]
+        );
         assert_eq!(outbox_len(&conn, &me).unwrap(), 1);
     }
 

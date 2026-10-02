@@ -37,6 +37,7 @@ fn node() -> Node {
         announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),
+        outbox_refused: Default::default(),
         sync_control: Default::default(),
     };
     membership::ensure_own_inbox(&state).unwrap();
