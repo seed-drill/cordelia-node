@@ -533,15 +533,14 @@ pub fn item_owner(
     }
 }
 
-/// The highest revision stored for a slot from anyone who is, or has been,
-/// a member of the channel. The next revision a member writes follows from
-/// this.
+/// The highest revision stored for a slot by the channel's current
+/// members. The next revision a member writes follows from this.
 ///
-/// - It does not count what someone who was never in the channel has
-///   stored there, or a stranger could put the revision out of reach.
-/// - It does count a member that has since been removed. Other devices may
-///   have taken that member's revision as the current one, and a lower
-///   number would never reach them.
+/// What anyone else stored there does not count: not a stranger, and not a
+/// device that has been removed. Otherwise either could put the revision
+/// out of reach. A removed device's last entries are published again by
+/// the devices that remain, just before it stops counting (see
+/// `entries::take_over` in cordelia-api), so the number does not go back.
 pub fn max_rev(
     conn: &Connection,
     channel_id: &str,
@@ -552,8 +551,47 @@ pub fn max_rev(
             "SELECT MAX(rev) FROM items
              WHERE channel_id = ?1 AND slot = ?2
                AND author_id IN (SELECT entity_key FROM channel_members
-                                 WHERE channel_id = ?1)",
+                                 WHERE channel_id = ?1 AND posture = 'active')",
             params![channel_id, slot.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(rev.map(|r| r.max(0) as u64))
+}
+
+/// [`max_rev`], leaving one member out: the highest revision the channel's
+/// other current members stored for a slot.
+pub fn max_rev_except(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+    except: &[u8; 32],
+) -> Result<Option<u64>, CordeliaError> {
+    let rev: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(rev) FROM items
+             WHERE channel_id = ?1 AND slot = ?2 AND author_id != ?3
+               AND author_id IN (SELECT entity_key FROM channel_members
+                                 WHERE channel_id = ?1 AND posture = 'active')",
+            params![channel_id, slot.as_slice(), except.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(rev.map(|r| r.max(0) as u64))
+}
+
+/// The revision one author has stored for a slot, if any.
+pub fn author_rev(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Option<u64>, CordeliaError> {
+    let rev: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(rev) FROM items
+             WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
+            params![channel_id, slot.as_slice(), author.as_slice()],
             |row| row.get(0),
         )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
@@ -1302,9 +1340,9 @@ mod tests {
         max_rev(conn, "ch1", slot).unwrap()
     }
 
-    /// T2. The next revision of a name follows from what the channel's
-    /// members stored. What a key that was never a member stored there does
-    /// not count, so it cannot put the revision out of reach.
+    /// T2, T16. The next revision of a name follows from what the channel's
+    /// current members stored. What a stranger or a removed device stored
+    /// there does not count, so neither can put the revision out of reach.
     #[test]
     fn a_strangers_revision_does_not_count_towards_the_next_one() {
         use cordelia_core::protocol::MAX_REV;
@@ -1325,10 +1363,11 @@ mod tests {
         insert_item(&conn, &slotted("ci_b", &b, &slot, 6, &[0x03; 32])).unwrap();
         assert_eq!(max_rev_of(&conn, &slot), Some(6));
 
-        // A member that is removed still counts: other devices may hold
-        // its revision as the current one.
+        // A member that is removed stops counting, whatever it stored.
         crate::channels::remove_member(&conn, "ch1", &b).unwrap();
-        assert_eq!(max_rev_of(&conn, &slot), Some(6));
+        assert_eq!(max_rev_of(&conn, &slot), Some(4));
+        insert_item(&conn, &slotted("ci_b2", &b, &slot, MAX_REV, &[0x04; 32])).unwrap();
+        assert_eq!(max_rev_of(&conn, &slot), Some(4));
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item

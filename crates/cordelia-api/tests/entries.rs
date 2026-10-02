@@ -332,6 +332,203 @@ fn a_removed_device_can_no_longer_write() {
     );
 }
 
+fn delete(n: &Node, channel: &str, key: &str) -> u64 {
+    let db = n.state.db.lock().unwrap();
+    entries::publish(
+        &n.state,
+        &db,
+        channel,
+        &Write {
+            key,
+            content: &serde_json::Value::Null,
+            metadata: None,
+            item_type: "memory",
+            deleted: true,
+        },
+    )
+    .unwrap()
+    .rev
+}
+
+/// What a channel holds as `n` reads it: each key with its text (`None`
+/// for a deleted key), its revision and its author.
+fn holds(n: &Node, channel: &str) -> Vec<(String, Option<String>, u64, [u8; 32])> {
+    let db = n.state.db.lock().unwrap();
+    entries::current(&n.state, &db, channel)
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            let text = (!e.current.deleted)
+                .then(|| e.current.content["text"].as_str().unwrap().to_string());
+            (e.key, text, e.current.rev, e.current.author)
+        })
+        .collect()
+}
+
+/// Make `new` another device of `owner`'s, and tell `others` (devices
+/// already there) about it.
+fn join(owner: &Node, new: &Node, others: &[&Node]) {
+    membership::add_device(&owner.state, &new.pk(), None).unwrap();
+    relay(owner, new, &naming::inbox_channel_id(&new.pk()));
+    membership::accept(&new.state, &owner.pk(), None).unwrap();
+    for other in others {
+        relay(owner, other, &naming::inbox_channel_id(&other.pk()));
+        membership::process_inbox(&other.state).unwrap();
+    }
+}
+
+/// T16. The channel keeps what a removed device last wrote: the device
+/// that removes it publishes those entries again under its own name, at
+/// the same revisions. A file the removed device edited last keeps its
+/// edit, a file only it wrote is still there, and a file it deleted stays
+/// deleted, for the devices that remain and for one added later.
+#[test]
+fn t16_what_a_removed_device_last_wrote_is_kept() {
+    let (a, b, ch) = paired();
+    a.write(&ch, "edited.md", "by a");
+    a.write(&ch, "deleted.md", "by a");
+    a.write(&ch, "untouched.md", "by a");
+    relay(&a, &b, &ch);
+    assert_eq!(b.write(&ch, "edited.md", "by b"), 2);
+    assert_eq!(delete(&b, &ch, "deleted.md"), 2);
+    assert_eq!(b.write(&ch, "created.md", "by b"), 1);
+    relay(&b, &a, &ch);
+
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+
+    let expect = vec![
+        (
+            "created.md".to_string(),
+            Some("by b".to_string()),
+            1,
+            a.pk(),
+        ),
+        ("deleted.md".to_string(), None, 2, a.pk()),
+        ("edited.md".to_string(), Some("by b".to_string()), 2, a.pk()),
+        (
+            "untouched.md".to_string(),
+            Some("by a".to_string()),
+            1,
+            a.pk(),
+        ),
+    ];
+    assert_eq!(holds(&a, &ch), expect);
+
+    // A device added afterwards gets the same.
+    let c = node();
+    join(&a, &c, &[]);
+    relay(&a, &c, &ch);
+    assert_eq!(holds(&c, &ch), expect);
+
+    // And the next edit is the next revision.
+    assert_eq!(a.write(&ch, "edited.md", "by a again"), 3);
+}
+
+/// T16. A removed device stores the highest revision there is under a
+/// name, with the keys it still holds. That neither shows nor counts: the
+/// devices that remain go on writing the name.
+#[test]
+fn t16_a_removed_device_cannot_put_a_name_out_of_reach() {
+    let (a, b, ch) = paired();
+    a.write(&ch, "notes.md", "one");
+    relay(&a, &b, &ch);
+    let slot_key = psk::read_slot_key(&a.state.home_dir, &ch).unwrap();
+    let old_key = psk::read_psk(&a.state.home_dir, &ch).unwrap();
+
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+    inject(
+        &a,
+        &b.state.identity,
+        &ch,
+        slot_id(&slot_key, "notes.md"),
+        cordelia_core::protocol::MAX_REV,
+        old_key,
+        json!({ "key": "notes.md", "content": { "text": "after removal" } }),
+    );
+
+    assert_eq!(a.read(&ch), vec![("notes.md".into(), "one".into(), 1, 0)]);
+    assert_eq!(a.write(&ch, "notes.md", "two"), 2);
+    assert_eq!(a.read(&ch), vec![("notes.md".into(), "two".into(), 2, 0)]);
+}
+
+/// T16. A device, while still a member, gives a name a revision that
+/// editing never reaches, to use the numbers up. When it is removed, what
+/// it wrote is kept at an ordinary revision, and the name stays writable.
+#[test]
+fn t16_a_revision_meant_to_use_the_numbers_up_is_not_kept() {
+    use cordelia_core::protocol::MAX_REV;
+    let (a, b, ch) = paired();
+    assert_eq!(a.write(&ch, "notes.md", "one"), 1);
+    relay(&a, &b, &ch);
+    let slot_key = psk::read_slot_key(&a.state.home_dir, &ch).unwrap();
+    let key = psk::read_psk(&a.state.home_dir, &ch).unwrap();
+    inject(
+        &a,
+        &b.state.identity,
+        &ch,
+        slot_id(&slot_key, "notes.md"),
+        MAX_REV,
+        key,
+        json!({ "key": "notes.md", "content": { "text": "by b" } }),
+    );
+    // B is a member, so this is the channel's value for now.
+    assert_eq!(
+        a.read(&ch),
+        vec![("notes.md".into(), "by b".into(), MAX_REV, 0)]
+    );
+
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+    assert_eq!(a.read(&ch), vec![("notes.md".into(), "by b".into(), 2, 0)]);
+    assert_eq!(a.write(&ch, "notes.md", "three"), 3);
+}
+
+/// T16. Only the device that removes takes over what the removed device
+/// wrote, with what it holds at that moment. A device that learns of the
+/// removal later holds something newer from the removed device: it cannot
+/// tell whether that was written before the removal or after it, so it
+/// does not make it the channel's value.
+#[test]
+fn t16_what_a_removed_device_writes_afterwards_is_not_adopted_later() {
+    let (a, b, ch) = paired();
+    let r = node();
+    join(&a, &r, &[&b]);
+    relay(&a, &r, &ch);
+    assert_eq!(r.write(&ch, "notes.md", "before"), 1);
+    relay(&r, &a, &ch);
+    relay(&r, &b, &ch);
+
+    membership::remove_device(&a.state, &r.pk()).unwrap();
+    // R writes on. B has not heard of the removal yet, so it reads that.
+    assert_eq!(r.write(&ch, "notes.md", "after"), 2);
+    relay(&r, &b, &ch);
+    assert_eq!(b.read(&ch), vec![("notes.md".into(), "after".into(), 2, 0)]);
+
+    // B hears of the removal, and receives what A published again.
+    relay(&a, &b, &naming::inbox_channel_id(&b.pk()));
+    relay(&a, &b, &ch);
+    membership::process_inbox(&b.state).unwrap();
+    assert_eq!(
+        holds(&b, &ch),
+        vec![(
+            "notes.md".to_string(),
+            Some("before".to_string()),
+            1,
+            a.pk()
+        )]
+    );
+    // B publishes nothing of R's.
+    relay(&b, &a, &ch);
+    assert_eq!(
+        holds(&a, &ch),
+        vec![(
+            "notes.md".to_string(),
+            Some("before".to_string()),
+            1,
+            a.pk()
+        )]
+    );
+}
+
 #[test]
 fn items_from_before_a_key_rotation_still_read() {
     let (a, b, ch) = paired();

@@ -54,6 +54,7 @@ pub struct Version {
     pub deleted: bool,
     pub content: Value,
     pub metadata: Option<Value>,
+    pub item_type: String,
     content_hash: Vec<u8>,
 }
 
@@ -88,13 +89,24 @@ fn slot_key(state: &AppState, channel_id: &str) -> Result<[u8; 32], CordeliaErro
 }
 
 /// Publish a new revision of `key` in `channel_id`: the next revision after
-/// the highest this node holds for the slot, from any author. A tombstone
-/// revision (`deleted`) records that the key was deleted (§4.4).
+/// the highest this node holds for the slot from the channel's members. A
+/// tombstone revision (`deleted`) records that the key was deleted (§4.4).
 pub fn publish(
     state: &AppState,
     db: &Connection,
     channel_id: &str,
     write: &Write,
+) -> Result<Published, CordeliaError> {
+    publish_at(state, db, channel_id, write, None)
+}
+
+/// [`publish`], at a given revision when `at` is set.
+fn publish_at(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    write: &Write,
+    at: Option<u64>,
 ) -> Result<Published, CordeliaError> {
     let Write {
         key,
@@ -112,7 +124,10 @@ pub fn publish(
     }
 
     let slot = slot_id(&slot_key(state, channel_id)?, key);
-    let rev = items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1;
+    let rev = match at {
+        Some(rev) => rev,
+        None => items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1,
+    };
     if rev > cordelia_core::protocol::MAX_REV {
         return Err(CordeliaError::Validation(format!(
             "{key} has reached the revision limit and cannot be written again in this channel"
@@ -272,6 +287,7 @@ pub fn current(
             deleted: item.is_tombstone,
             content: envelope.get("content").cloned().unwrap_or(Value::Null),
             metadata: envelope.get("metadata").cloned().filter(|m| !m.is_null()),
+            item_type: item.item_type.clone(),
             content_hash: item.content_hash.clone(),
         };
         slots
@@ -300,4 +316,68 @@ pub fn current(
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(entries)
+}
+
+/// Publish again, under this device's name, every key in `channel_id` whose
+/// current value was written by `leaving`: its content, or its delete.
+/// Returns how many were published.
+///
+/// Called by the device that removes `leaving` from the channel, just
+/// before it does, while `leaving`'s entries still count. Once it is
+/// removed they count for nothing, so without this the channel would go
+/// back to whatever the others last wrote: a file it edited would revert
+/// for a new device, and a file it deleted would come back.
+///
+/// Each entry is published at the revision `leaving` gave it, so it takes
+/// that entry's place exactly: a device that already holds the entry sees
+/// no change, and one that is behind sees a newer revision. Two cases
+/// differ:
+///
+/// - This device already has a revision that high for the key (it lost a
+///   tie to `leaving`): the next one up is used.
+/// - `leaving`'s revision is in the upper half of the range, which editing
+///   never reaches. That is an attempt to use the numbers up. The entry is
+///   published at the next revision after the remaining members' instead,
+///   which keeps its content and gives the name its revisions back.
+///
+/// A key that cannot be published again (it has grown past a limit, say)
+/// is skipped with a warning; the removal goes ahead.
+pub fn take_over(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    leaving: &[u8; 32],
+) -> Result<usize, CordeliaError> {
+    let pk = state.identity.public_key();
+    let slot_key = slot_key(state, channel_id)?;
+    let mut taken = 0;
+    for entry in current(state, db, channel_id)? {
+        if &entry.current.author != leaving {
+            continue;
+        }
+        let slot = slot_id(&slot_key, &entry.key);
+        let own = items::author_rev(db, channel_id, &slot, &pk)?;
+        let at = if entry.current.rev > cordelia_core::protocol::MAX_REV / 2 {
+            let others = items::max_rev_except(db, channel_id, &slot, leaving)?;
+            others.unwrap_or(0) + 1
+        } else {
+            entry.current.rev.max(own.map_or(0, |rev| rev + 1))
+        };
+        let write = Write {
+            key: &entry.key,
+            content: &entry.current.content,
+            metadata: entry.current.metadata.as_ref(),
+            item_type: &entry.current.item_type,
+            deleted: entry.current.deleted,
+        };
+        match publish_at(state, db, channel_id, &write, Some(at)) {
+            Ok(_) => taken += 1,
+            Err(e) => tracing::warn!(
+                channel = %channel_id,
+                error = %e,
+                "could not publish again an entry that a removed device last wrote"
+            ),
+        }
+    }
+    Ok(taken)
 }

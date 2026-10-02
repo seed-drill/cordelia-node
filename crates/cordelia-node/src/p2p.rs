@@ -1225,6 +1225,16 @@ pub async fn p2p_loop(
                 };
                 // Personal nodes with no subscribed channels: nothing to sync
                 if local_channels.is_empty() && node_role != "relay" { continue; }
+                // The inbox first. A device that removes another publishes
+                // again what that device last wrote, and then sends the
+                // removal. Fetching the removal before the channels means
+                // that whenever it is seen, those entries are fetched in the
+                // same pass, before it is applied.
+                let mut local_channels = local_channels;
+                local_channels.sort_by_key(|id| {
+                    cordelia_storage::naming::ChannelType::from_id(id)
+                        != cordelia_storage::naming::ChannelType::Inbox
+                });
 
                 let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();

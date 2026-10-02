@@ -92,6 +92,13 @@ Without a trust check, anyone who knows your public key could add you to a chann
 
 **Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. **As built:** since devices join only the projects they have (4.5), the remover may not be in every project channel. Each device that sees a device dropped from the personal channel therefore removes it from the project channels the remover is not in. Of a channel's remaining owners, the one with the lowest key acts, so two devices never rotate the same channel at once. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
 
+**What a removed device wrote.** Once a device is removed, its entries count for nothing: not when a name is read, not towards a name's next revision, not in the sweep of old deletes. So that the channel keeps what it held:
+
+- Just before it removes a device, the removing device publishes again, under its own name, every entry whose current value the removed device wrote: its content, or its delete. It uses the revision the removed device gave the entry, so the new entry takes the old one's place exactly. A device that already holds the entry sees no change; a device that is behind, or is added later, gets it.
+- Only the removing device does this, with what it holds at that moment. A device that learns of the removal later may hold something newer from the removed device. It cannot tell whether that was written before the removal or after it, so it does not publish it. Its sync adapter keeps that version beside the file as a conflict file (4.5), and the file takes the channel's value.
+- A revision in the upper half of the range is never reached by editing. An entry that carries one is published again at the next revision after the remaining members', which keeps its content and gives the name its revisions back.
+- A device fetches its inbox before its other channels, so whenever it sees a removal it fetches the re-published entries in the same pass, before the removal is applied.
+
 **Roles.** All of a person's devices are equal: any device can add, revoke and rotate, so a device's membership in its person's channels is `owner`.
 
 ### 4.2 Invite-only channels only; no keepers
@@ -105,8 +112,8 @@ A memory file is edited, not appended to. Items gain an optional `slot` and `rev
 - **Slot:** `slot = HMAC-SHA256(slot_key, "cordelia:slot:v1:" || logical_key)`.
   - `logical_key` is the file's key within its channel (4.5). Relays can match slots without learning file names.
   - `slot_key` is a random 32-byte key per channel. It is created with the channel, sent in the channel state next to the key ring, and **never rotated**. If slots were derived from the channel key, every rotation would move every file to a new slot. A revoked device keeps the slot key, which tells it only whether two items are the same file.
-- **Rev:** a per-slot counter. The writer sets `rev` to one more than the highest rev that a member of the channel has stored for the slot. Wall clocks play no part, so clock skew between machines does no harm.
-  - What someone outside the channel stored in the slot does not count, so a stranger cannot put a name's rev out of reach.
+- **Rev:** a per-slot counter. The writer sets `rev` to one more than the highest rev that a current member of the channel has stored for the slot. Wall clocks play no part, so clock skew between machines does no harm.
+  - What anyone else stored in the slot does not count, so neither a stranger nor a removed device can put a name's rev out of reach.
   - A rev is at most 2^53 - 1 (`MAX_REV`). This is checked wherever an item is verified, so no node stores a larger one or passes it on.
 - **Signature and encryption both cover the slot and rev.** The signed metadata envelope gains `slot` and `rev`, present only on slotted items, so existing items and test vector TV-C1 are unchanged. The item's AES-GCM associated data becomes `channel_id || slot || rev`. A relay can neither relabel an item into another slot nor replay an old revision as a new one.
 
