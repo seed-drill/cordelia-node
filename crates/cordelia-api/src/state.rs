@@ -58,6 +58,11 @@ pub struct AppState {
     /// Items written here that a relay refused to store, refreshed by the
     /// P2P loop. They stay in the outbox and are offered again.
     pub outbox_refused: std::sync::RwLock<Vec<RefusedSnapshot>>,
+    /// Channels whose members have changed since the P2P loop last looked.
+    /// A device stores only what a channel's members wrote, so entries by
+    /// a member it had not heard of yet were refused; the loop lists these
+    /// channels again from the start, and fetches what it lacks.
+    pub relist: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
 }

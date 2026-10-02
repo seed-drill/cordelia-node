@@ -32,12 +32,20 @@ async fn open_bi(
 ///
 /// `Ok(false)` means the node already holds it. `Err` carries the reason it
 /// was refused, as the code a push's answer gives the sender.
+///
+/// A relay stores whatever is valid. A device (`node_role` "personal",
+/// with key `own`) stores only what belongs in its own channels: an entry
+/// in a channel it is a member of, written by a member of that channel;
+/// and what is sent to its own inbox.
 pub fn store_item(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
     node_role: &str,
+    own: &[u8; 32],
 ) -> Result<bool, &'static str> {
-    use cordelia_network::messages::{REFUSED_INVALID, REFUSED_STORAGE, REFUSED_TOO_LARGE};
+    use cordelia_network::messages::{
+        REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
+    };
 
     // One size for every entry, at every hop: a relay and a device both
     // refuse a larger one, whoever sends it.
@@ -68,6 +76,10 @@ pub fn store_item(
         Ok(a) => a,
         Err(_) => return Err(REFUSED_INVALID),
     };
+    if node_role == "personal" && !wanted_by_a_device(db, &item.channel_id, &author, own) {
+        tracing::debug!(item = %item.item_id, channel = %item.channel_id, "not written by a member of one of this device's channels; not stored");
+        return Err(REFUSED_NOT_MEMBER);
+    }
     let hash: [u8; 32] = match item.content_hash.as_slice().try_into() {
         Ok(h) => h,
         Err(_) => return Err(REFUSED_INVALID),
@@ -108,6 +120,37 @@ pub fn store_item(
                 _ => REFUSED_STORAGE,
             })
         }
+    }
+}
+
+/// Whether a device with key `own` stores an item of `channel_id` written
+/// by `author` (decision 2026-09-30 §4.6).
+///
+/// - One of its own channels: both it and the author are members now. A
+///   relay stores what anyone sends to a channel, so without this a
+///   stranger who knows the channel's ID could fill the device's disk
+///   through the relay.
+/// - Its own inbox: anything, since an invitation comes from a key that is
+///   in no channel with it yet.
+/// - Another node's inbox: nothing. A device writes to those, and has no
+///   use for what others write there.
+/// - The older kinds of channel (named and direct), which have no member
+///   list of this kind: as before.
+fn wanted_by_a_device(
+    db: &rusqlite::Connection,
+    channel_id: &str,
+    author: &[u8; 32],
+    own: &[u8; 32],
+) -> bool {
+    use cordelia_storage::channels::is_member;
+    use cordelia_storage::naming::ChannelType;
+    match ChannelType::from_id(channel_id) {
+        ChannelType::Group => {
+            is_member(db, channel_id, own).unwrap_or(false)
+                && is_member(db, channel_id, author).unwrap_or(false)
+        }
+        ChannelType::Inbox => channel_id == cordelia_storage::naming::inbox_channel_id(own),
+        _ => true,
     }
 }
 
@@ -1398,6 +1441,19 @@ pub async fn p2p_loop(
                         }
                     });
                 }
+                // Channels whose members changed since the last pass are listed
+                // again from the start, from every peer: this device may have
+                // refused entries by a member it had not heard of yet.
+                let changed: Vec<String> = state
+                    .relist
+                    .lock()
+                    .map(|mut relist| relist.drain().collect())
+                    .unwrap_or_default();
+                if !changed.is_empty()
+                    && let Ok(mut cursors) = sync_cursors.lock()
+                {
+                    cursors.retain(|(_, channel), _| !changed.contains(channel));
+                }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
@@ -1524,7 +1580,22 @@ pub async fn p2p_loop(
                                         let offered: Vec<String> = resp.items.iter().map(|h| h.item_id.clone()).collect();
                                         cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
                                     };
-                                    let fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
+                                    let mut fetch_ids = cordelia_network::item_sync::compute_fetch_list(&resp.items, &known);
+                                    // A device can tell from an entry's header
+                                    // whether it will store it, and does not
+                                    // fetch the rest of one it will not.
+                                    if role == "personal" {
+                                        let own = sync_state.identity.public_key();
+                                        if let Ok(db) = sync_state.db.lock() {
+                                            fetch_ids.retain(|id| {
+                                                resp.items.iter().find(|h| &h.item_id == id).is_some_and(|h| {
+                                                    <[u8; 32]>::try_from(h.author_id.as_slice()).is_ok_and(|author| {
+                                                        wanted_by_a_device(&db, &h.channel_id, &author, &own)
+                                                    })
+                                                })
+                                            });
+                                        }
+                                    }
                                     if !fetch_ids.is_empty() {
                                         if let Err(e) = cordelia_network::item_sync::send_fetch_request(&mut send, &fetch_ids).await {
                                             tracing::debug!(peer = %target, error = %e, "fetch request failed");
@@ -1547,7 +1618,7 @@ pub async fn p2p_loop(
                                                 Err(_) => break 'channels,
                                             };
                                             for item in &items {
-                                                if let Ok(true) = store_item(&db, item, &role) {
+                                                if let Ok(true) = store_item(&db, item, &role, &sync_state.identity.public_key()) {
                                                     stored_count += 1;
                                                     if is_relay_node {
                                                         newly_stored_items.push(item.clone());
@@ -2268,7 +2339,7 @@ async fn handle_inbound_push(
         let mut dedup = 0u32;
         let mut rejected = 0u32;
         for item in &payload.items {
-            match store_item(&db, item, node_role) {
+            match store_item(&db, item, node_role, &state.identity.public_key()) {
                 Ok(true) => {
                     stored += 1;
                     newly_stored.push(item.clone());
@@ -2811,9 +2882,19 @@ mod tests {
         });
     }
 
+    const A_CHANNEL: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+
     /// An item of `blob`, signed by `id`, as it arrives from another node.
     fn arriving(
         id: &cordelia_crypto::identity::NodeIdentity,
+        blob: Vec<u8>,
+    ) -> cordelia_network::messages::Item {
+        arriving_in(id, A_CHANNEL, blob)
+    }
+
+    fn arriving_in(
+        id: &cordelia_crypto::identity::NodeIdentity,
+        channel: &str,
         blob: Vec<u8>,
     ) -> cordelia_network::messages::Item {
         let hash = cordelia_crypto::sha256(&blob);
@@ -2821,7 +2902,7 @@ mod tests {
         let published_at = "2026-10-02T00:00:00Z";
         let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
             &id.public_key(),
-            "grp_550e8400-e29b-41d4-a716-446655440000",
+            channel,
             &hash,
             false,
             &item_id,
@@ -2831,7 +2912,7 @@ mod tests {
         .unwrap();
         cordelia_network::messages::Item {
             item_id,
-            channel_id: "grp_550e8400-e29b-41d4-a716-446655440000".into(),
+            channel_id: channel.into(),
             item_type: "memory".into(),
             content_length: blob.len() as u32,
             encrypted_blob: blob,
@@ -2859,13 +2940,73 @@ mod tests {
         let over = arriving(&id, vec![7; MAX_ITEM_BYTES + 1]);
         for role in ["relay", "personal"] {
             assert_eq!(
-                store_item(&db, &over, role),
+                store_item(&db, &over, role, &[0x0E; 32]),
                 Err(REFUSED_TOO_LARGE),
                 "{role}"
             );
         }
         let largest = arriving(&id, vec![7; MAX_ITEM_BYTES]);
-        assert_eq!(store_item(&db, &largest, "relay"), Ok(true));
+        assert_eq!(store_item(&db, &largest, "relay", &[0x0E; 32]), Ok(true));
+    }
+
+    /// T2. A device stores only what belongs in its own channels: an entry
+    /// that a member of one of them wrote, and what is sent to its own
+    /// inbox. A relay stores all of it.
+    #[test]
+    fn a_device_stores_only_what_members_of_its_channels_wrote() {
+        use cordelia_crypto::identity::NodeIdentity;
+        use cordelia_network::messages::REFUSED_NOT_MEMBER;
+        use cordelia_storage::{channels, naming};
+        const NOT_MINE: &str = "grp_660e8400-e29b-41d4-a716-446655440000";
+
+        let (me, friend, stranger) = (
+            NodeIdentity::generate().unwrap(),
+            NodeIdentity::generate().unwrap(),
+            NodeIdentity::generate().unwrap(),
+        );
+        let own = me.public_key();
+        let device = cordelia_storage::db::open_in_memory().unwrap();
+        // A channel this device and a friend are in; one it is not in; its
+        // own inbox; and the friend's inbox, which it writes to.
+        channels::ensure_group(&device, A_CHANNEL, None, "realtime", &own).unwrap();
+        channels::add_member(&device, A_CHANNEL, &own, "owner").unwrap();
+        channels::add_member(&device, A_CHANNEL, &friend.public_key(), "owner").unwrap();
+        channels::ensure_group(&device, NOT_MINE, None, "realtime", &friend.public_key()).unwrap();
+        channels::add_member(&device, NOT_MINE, &friend.public_key(), "owner").unwrap();
+        let my_inbox = naming::inbox_channel_id(&own);
+        let their_inbox = naming::inbox_channel_id(&friend.public_key());
+        channels::ensure_inbox(&device, &my_inbox, &own, true).unwrap();
+        channels::ensure_inbox(&device, &their_inbox, &friend.public_key(), false).unwrap();
+
+        let cases = [
+            (&friend, A_CHANNEL, Ok(true)),
+            (&stranger, A_CHANNEL, Err(REFUSED_NOT_MEMBER)),
+            (&friend, NOT_MINE, Err(REFUSED_NOT_MEMBER)),
+            (&stranger, my_inbox.as_str(), Ok(true)),
+            (&stranger, their_inbox.as_str(), Err(REFUSED_NOT_MEMBER)),
+        ];
+        let relay = cordelia_storage::db::open_in_memory().unwrap();
+        for (n, (author, channel, expected)) in cases.into_iter().enumerate() {
+            let item = arriving_in(author, channel, vec![n as u8; 40]);
+            assert_eq!(
+                store_item(&device, &item, "personal", &own),
+                expected,
+                "case {n}: {channel}"
+            );
+            assert_eq!(
+                store_item(&relay, &item, "relay", &own),
+                Ok(true),
+                "case {n}"
+            );
+        }
+
+        // A member that is removed is no longer one whose entries are stored.
+        channels::remove_member(&device, A_CHANNEL, &friend.public_key()).unwrap();
+        let later = arriving_in(&friend, A_CHANNEL, vec![9; 40]);
+        assert_eq!(
+            store_item(&device, &later, "personal", &own),
+            Err(REFUSED_NOT_MEMBER)
+        );
     }
 
     /// A refused item is offered again at a slowing pace, up to ten

@@ -1197,7 +1197,17 @@ fn apply(
         .iter()
         .map(|m| (m.key, m.role.as_str()))
         .collect();
+    // A member this device had not heard of may already have written to
+    // the channel, and this device refused those entries: it stores only
+    // what members wrote. Have the channel listed again.
+    let mut joined = false;
+    for (key, _) in &members {
+        joined |= !channels::is_member(db, channel_id, key)?;
+    }
     channels::replace_members(db, channel_id, &members)?;
+    if joined && let Ok(mut relist) = state.relist.lock() {
+        relist.insert(channel_id.clone());
+    }
     channels::set_state(
         db,
         channel_id,

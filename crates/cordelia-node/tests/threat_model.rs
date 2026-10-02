@@ -810,6 +810,7 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
     }
     .encode()
     .unwrap();
+    let copy_author = stranger.public_key();
     let copy = cordelia_network::messages::Item {
         item_id,
         author_id: stranger.public_key().to_vec(),
@@ -857,6 +858,28 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
     );
     assert_eq!(published["rev"], 2, "{published}");
     wait_for("a reads b's edit", &all, 120, || reads(&a, "two"));
+
+    // The relay holds the stranger's copy: it cannot tell a channel's
+    // members from anyone else. The devices do not: a device stores only
+    // what members of its channels wrote.
+    let stranger_key = copy_author;
+    let held_by = |n: &mut Node| -> i64 {
+        n.stop();
+        let db = rusqlite::Connection::open_with_flags(
+            n.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM items WHERE author_id = ?1",
+            [stranger_key.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(held_by(&mut relay), 1, "the copy never reached the relay");
+    assert_eq!(held_by(&mut a), 0, "a stored what a stranger wrote");
+    assert_eq!(held_by(&mut b), 0, "b stored what a stranger wrote");
 }
 
 /// T16. A device is removed. What it last wrote is still in the channel

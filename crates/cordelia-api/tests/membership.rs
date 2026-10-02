@@ -35,6 +35,7 @@ fn node() -> Node {
         peers: Default::default(),
         relays: Default::default(),
         outbox_refused: Default::default(),
+        relist: Default::default(),
         sync_control: Default::default(),
     };
     membership::ensure_own_inbox(&state).unwrap();
@@ -1218,4 +1219,23 @@ fn t20_no_state_can_run_the_key_version_out() {
     // And B can still be removed.
     membership::remove_device(&a.state, &b.pk()).unwrap();
     assert_eq!(a.key_version(&personal), 3);
+}
+
+/// A device stores only what members of a channel wrote, so it has refused
+/// anything a member it had not heard of wrote there. When a state adds
+/// members, the channel is marked to be listed again from the start.
+#[test]
+fn a_channel_is_listed_again_when_its_members_change() {
+    let (a, b, personal) = paired();
+    b.state.relist.lock().unwrap().clear();
+    let marked = |n: &Node| n.state.relist.lock().unwrap().contains(&personal);
+
+    // A state that changes nothing about who is in the channel.
+    deliver(&a, &b);
+    assert!(!marked(&b));
+
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    deliver(&a, &b);
+    assert!(marked(&b), "b was not told to list the channel again");
 }

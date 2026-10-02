@@ -52,6 +52,7 @@ impl Device {
             peers: Default::default(),
             relays: Default::default(),
             outbox_refused: Default::default(),
+            relist: Default::default(),
             sync_control: Default::default(),
         };
         membership::ensure_own_inbox(&state).unwrap();
