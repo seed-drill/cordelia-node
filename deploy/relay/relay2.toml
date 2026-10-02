@@ -10,6 +10,9 @@ entity_id = "relay2"
 http_port = 9473
 p2p_port = 9474
 data_dir = "/data/cordelia"
+# The most this relay's database may hold. At the cap it takes no channel it
+# does not already hold, and makes room by dropping the newest. 1 GiB if unset.
+# max_storage_bytes = 1073741824
 
 [api]
 # The local API stays on loopback; nothing but QUIC is exposed.

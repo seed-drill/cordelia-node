@@ -152,9 +152,10 @@ a relay storing all channels accumulates ~300MB/day = ~100GB/year.
 **max_item_bytes derivation:** The largest persona-driven item is 50KB
 (Agent Swarm state snapshot). With encryption overhead (~40 bytes IV +
 tag) and CBOR encoding (~100 bytes metadata), the encrypted item is
-~51KB. **256KB max provides 5x headroom for text-only use cases.**
-Phase 1 excludes images/media. Increasing to 1MB+ in Phase 2 (for
-media support) is a non-breaking change. Decreasing would be breaking.
+~51KB, which **the 64KB max holds.** The limit was 256KB (5x headroom)
+until 0.2.0-alpha.3; it came down so that limits on rate and storage mean
+something whatever an item carries (parameter-rationale.md §4). v1 carries
+text only.
 
 ### 2.4 Bandwidth Requirements
 
@@ -208,7 +209,7 @@ and Agent Swarm should rely on push path (ensure hot_min_relays >= 1).
 |-----------|-------------|-------|-----------|
 | writes_per_peer_per_minute | Enterprise peak (20/60s) + headroom | 10 | Handles all personal personas with 3-5x margin |
 | writes_per_channel_per_minute | Enterprise concurrent (20 × 5 users) | 100 | Handles 5 concurrent publishers at peak |
-| max_item_bytes | 95th percentile text memory ~50KB. 5x headroom. No images/media in Phase 1. | 256KB | Covers all text use cases. Increasing later is non-breaking; decreasing is breaking. |
+| max_item_bytes | 95th percentile text memory ~50KB. No images/media in Phase 1. | 64KB | Covers the text use cases, and is small enough for rate and storage limits to bound what one peer can cost (parameter-rationale.md §4). |
 | max_batch_size | Agent Swarm burst (100 items) | 100 | Single fetch can retrieve one burst |
 
 ### 3.2 From Bandwidth and Role

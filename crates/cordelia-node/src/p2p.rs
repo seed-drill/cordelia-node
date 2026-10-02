@@ -206,7 +206,9 @@ pub fn store_item(
 ///   only so many new channels in an hour.
 ///
 /// A relay fetches again from its devices what it dropped, once it has
-/// room: each device answers its relay with the channels it holds.
+/// room: each device answers its relay with the channels it holds. It
+/// asks a device again when that device next connects, and not before
+/// (#92).
 pub struct RelayRoom<'a> {
     /// The most the relay's database may hold, in bytes.
     pub max_bytes: u64,

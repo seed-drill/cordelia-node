@@ -15,7 +15,8 @@ use crate::state::AppState;
 use crate::types::*;
 use crate::verify::verify_item_signature;
 
-/// Max item size: 256 KB (parameter-rationale.md §4, sourced from protocol.rs).
+/// The most an item's content can be: 64 KB as it travels, less what sealing
+/// adds (parameter-rationale.md §4, sourced from protocol.rs).
 const MAX_CONTENT_BYTES: usize =
     cordelia_core::protocol::MAX_ITEM_BYTES - cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES;
 /// Max listen query limit (channels-api.md §3, sourced from protocol.rs).

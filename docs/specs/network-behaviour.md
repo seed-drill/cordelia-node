@@ -27,7 +27,7 @@ Publisher (P1)                    Relay (R1)                    Subscriber (P2)
 1. API receives publish
    - Validate auth (node-token)
    - Validate channel exists
-   - Validate item size <= 256KB
+   - Validate item size <= 64KB
 
 2. Encrypt content
    - Load PSK for channel

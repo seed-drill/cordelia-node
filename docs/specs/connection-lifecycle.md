@@ -229,7 +229,7 @@ peer_conn.governor_state: Arc<AtomicU8>  // 0=Cold, 1=Warm, 2=Hot
 | MAX_CONNECTIONS_PER_IP (5) | `accept_incoming` pre-check | Before QUIC handshake |
 | MAX_CONNECTIONS_PER_SUBNET (20) | `accept_incoming` pre-check | Before QUIC handshake |
 | MAX_MESSAGE_BYTES (1MB) | `read_frame` in codec | On every frame read |
-| MAX_ITEM_BYTES (256KB) | Publish API handler | On item creation |
+| MAX_ITEM_BYTES (64KB) | Publish API handler; item-push and item-sync handlers | On item creation, and before an item received from a peer is stored |
 | Rate limits (writes/min) | Protocol handler | On each inbound message |
 
 ### 3.2 ConnectionTracker Integration
