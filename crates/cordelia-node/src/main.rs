@@ -1504,14 +1504,23 @@ fn cmd_accept(config_path: &str, key: &str, name: Option<String>) -> anyhow::Res
         serde_json::json!({ "key": key, "name": name }),
     )?;
     let joined = resp["applied"].as_array().map(Vec::len).unwrap_or(0);
+    let notes: Vec<&str> = resp["notes"]
+        .as_array()
+        .map(|notes| notes.iter().filter_map(|n| n.as_str()).collect())
+        .unwrap_or_default();
     println!("Trusted {}.", name.as_deref().unwrap_or(key));
     if joined > 0 {
         println!(
             "Joined {joined} channel{}.",
             if joined == 1 { "" } else { "s" }
         );
-    } else {
-        println!("Its invites have not arrived yet; they will be applied as they do.");
+    } else if notes.is_empty() {
+        println!(
+            "Its invites have not arrived yet. They will be applied when they do, within the next hour."
+        );
+    }
+    for note in notes {
+        println!("{note}");
     }
     Ok(())
 }
@@ -1571,7 +1580,11 @@ fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
         );
     }
     println!();
-    println!("To join, trust the sender: cordelia accept <from>");
+    println!("These are from keys this device has not accepted.");
+    println!(
+        "Accept one only if it is another of your own devices, and you added this device \
+         from it: cordelia accept <from>"
+    );
     Ok(())
 }
 

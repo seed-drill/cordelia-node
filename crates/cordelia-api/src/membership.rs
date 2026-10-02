@@ -51,6 +51,12 @@ pub struct InboxSummary {
     pub pending: usize,
     pub superseded: usize,
     pub invalid: usize,
+    /// States from this person's devices that name a key this device does
+    /// not know as one of them, kept until it does.
+    pub held: usize,
+    /// What the person should know: why something they asked for did not
+    /// happen.
+    pub notes: Vec<String>,
 }
 
 /// A device of this person, for display.
@@ -125,19 +131,56 @@ fn ensure_personal_channel(state: &AppState, db: &Connection) -> Result<String, 
     Ok(ch.channel_id)
 }
 
-/// Whether invites from `sender` are applied without asking.
+/// Whether invites from `sender` are applied without asking: it is trusted
+/// as one of this person's devices, by `add-device` or `accept`, or it is
+/// in the personal channel. Trust of any other kind does not count.
 fn is_trusted_sender(
     db: &Connection,
     pk: &[u8; 32],
     sender: &[u8; 32],
 ) -> Result<bool, CordeliaError> {
-    if trust::is_trusted(db, sender)? {
+    if trust::is_trusted_as(db, sender, TrustKind::Device)? {
         return Ok(true);
     }
     match personal_channel(db, pk)? {
         Some(personal) => channels::is_member(db, &personal, sender),
         None => Ok(false),
     }
+}
+
+/// Whether `key` is one of this person's devices: this device, or a member
+/// of the personal channel.
+fn is_own_device(db: &Connection, pk: &[u8; 32], key: &[u8; 32]) -> Result<bool, CordeliaError> {
+    if key == pk {
+        return Ok(true);
+    }
+    match personal_channel(db, pk)? {
+        Some(personal) => channels::is_member(db, &personal, key),
+        None => Ok(false),
+    }
+}
+
+/// Why this device keeps the personal channel it has, if it does: it is in
+/// use. A device with other devices in its personal channel, or one that is
+/// syncing, is never moved into another personal channel by anything it is
+/// sent, whoever sent it. Moving it would put its memory in someone else's
+/// channel.
+fn why_personal_channel_stays(
+    db: &Connection,
+    pk: &[u8; 32],
+) -> Result<Option<&'static str>, CordeliaError> {
+    if let Some(own) = personal_channel(db, pk)?
+        && channels::member_count(db, &own)? > 1
+    {
+        return Ok(Some("it already has other devices in its personal channel"));
+    }
+    let set = |key: &str| -> Result<bool, CordeliaError> {
+        Ok(meta::get(db, key)?.is_some_and(|v| !v.is_empty() && v != "[]"))
+    };
+    if set(meta::SYNC_CLAUDE_DIR)? || set(meta::SYNC_CLAUDE_MAPPINGS)? {
+        return Ok(Some("it is syncing memory under its own personal channel"));
+    }
+    Ok(None)
 }
 
 /// Read a channel's slot key, creating one for channels made before slot
@@ -162,15 +205,24 @@ fn build_state(
     let pk = state.identity.public_key();
     let ch = channels::get_by_id(db, channel_id)?;
     let (epoch, _) = channels::epoch(db, channel_id)?;
-    let members = channels::list_active_members(db, channel_id)?
-        .into_iter()
-        .map(|(key, role)| {
-            Ok(StateMember {
-                key,
-                role: MemberRole::parse(&role).map_err(crypto_err)?,
-            })
-        })
-        .collect::<Result<Vec<_>, CordeliaError>>()?;
+    let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id);
+    let mut members = Vec::new();
+    for (key, role) in channels::list_active_members(db, channel_id)? {
+        // One of this person's own channels lists only their devices. A key
+        // that got into the list some other way is left out of what this
+        // node sends, so it is neither handed the keys nor vouched for.
+        if !is_personal && !is_own_device(db, &pk, &key)? {
+            tracing::warn!(
+                channel = %channel_id,
+                "leaving a key that is not one of this person's devices out of the channel's state"
+            );
+            continue;
+        }
+        members.push(StateMember {
+            key,
+            role: MemberRole::parse(&role).map_err(crypto_err)?,
+        });
+    }
     let key_version = u32::try_from(ch.key_version)
         .map_err(|_| CordeliaError::Internal("key version out of range".into()))?;
 
@@ -198,6 +250,17 @@ fn send_state(
     cs: &ChannelState,
 ) -> Result<(), CordeliaError> {
     let pk = state.identity.public_key();
+    // Every channel in v1 is this person's own. Sealing a state hands over
+    // every key the channel has had, and with them everything written so
+    // far, so the check is here, where the keys leave: only to one of this
+    // person's devices (decision 2026-09-30 §4.7).
+    if !is_own_device(db, &pk, recipient)? {
+        return Err(CordeliaError::Validation(
+            "that key is not one of your devices, and a channel of your own is only ever \
+             handed to your own devices"
+                .into(),
+        ));
+    }
     let inbox = naming::inbox_channel_id(recipient);
     channels::ensure_inbox(db, &inbox, recipient, false)?;
 
@@ -267,6 +330,13 @@ fn publish_state(
     let cs = build_state(state, db, channel_id)?;
     let mut sent = 0;
     for member in cs.members.iter().filter(|m| m.key != pk) {
+        if !is_own_device(db, &pk, &member.key)? {
+            tracing::warn!(
+                channel = %channel_id,
+                "a member of this channel is not one of this person's devices; not sending it the channel's keys"
+            );
+            continue;
+        }
         send_state(state, db, &member.key, &cs)?;
         sent += 1;
     }
@@ -514,12 +584,60 @@ pub fn accept(
             "that is this device's own key".into(),
         ));
     }
-    {
+    let stays = {
         let db = lock(state)?;
         ensure_own_inbox_locked(state, &db)?;
         trust::trust(&db, key, TrustKind::Device, label)?;
+        // Which personal channel this device belongs to is decided here, by
+        // the person's act on this device, and by nothing it is sent. A
+        // device that is in use stays where it is.
+        let pk = state.identity.public_key();
+        let stays = why_personal_channel_stays(&db, &pk)?;
+        if stays.is_none() {
+            meta::set(
+                &db,
+                meta::ACCEPTED_PERSONAL_FROM,
+                &format!("{} {}", hex::encode(key), Utc::now().timestamp()),
+            )?;
+        }
+        stays
+    };
+    let mut summary = process_inbox(state)?;
+    if let Some(why) = stays {
+        let note = staying_note(why);
+        if !summary.notes.contains(&note) {
+            summary.notes.push(note);
+        }
     }
-    process_inbox(state)
+    Ok(summary)
+}
+
+/// How long after `cordelia accept` the accepted device's offer of its
+/// personal channel is still taken. The offer travels through a relay and
+/// normally arrives within a minute; an hour covers a device that was
+/// added a little later, without leaving the decision open for good.
+const ACCEPTED_PERSONAL_SECS: i64 = 3600;
+
+/// Whether this device has decided, recently, to take the personal channel
+/// offered by `sender`.
+fn accepted_personal_from(db: &Connection, sender: &[u8; 32]) -> Result<bool, CordeliaError> {
+    let Some(value) = meta::get(db, meta::ACCEPTED_PERSONAL_FROM)? else {
+        return Ok(false);
+    };
+    let Some((key, at)) = value.split_once(' ') else {
+        return Ok(false);
+    };
+    let recent = at
+        .parse::<i64>()
+        .is_ok_and(|at| Utc::now().timestamp() - at <= ACCEPTED_PERSONAL_SECS);
+    Ok(recent && key == hex::encode(sender))
+}
+
+fn staying_note(why: &str) -> String {
+    format!(
+        "This device keeps its own personal channel, because {why}. To move it into \
+         another one, turn sync off here first (`cordelia sync off`), then accept again."
+    )
 }
 
 /// Remove one of this person's devices: revoke trust, remove it from every
@@ -638,7 +756,17 @@ pub fn list_devices(state: &AppState) -> Result<Vec<DeviceInfo>, CordeliaError> 
 /// Invites waiting for `accept`.
 pub fn list_pending(state: &AppState) -> Result<Vec<invites::PendingInvite>, CordeliaError> {
     let db = lock(state)?;
-    invites::pending(&db)
+    let pk = state.identity.public_key();
+    // What waits for `accept` is what came from a key this device has not
+    // accepted. Anything else that waits is from one of this person's own
+    // devices and waits for another reason (see `process_one`).
+    let mut waiting = Vec::new();
+    for invite in invites::pending(&db)? {
+        if !is_trusted_sender(&db, &pk, &invite.inviter)? {
+            waiting.push(invite);
+        }
+    }
+    Ok(waiting)
 }
 
 /// Process new and pending invites in this node's inbox.
@@ -647,21 +775,39 @@ pub fn process_inbox(state: &AppState) -> Result<InboxSummary, CordeliaError> {
     let inbox = ensure_own_inbox_locked(state, &db)?;
     let mut summary = InboxSummary::default();
 
-    for item in invites::unprocessed(&db, &inbox)? {
-        let (status, channel_id) = match process_one(state, &db, &item) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::warn!(item = %item.item_id, error = %e, "invite processing failed");
-                (InviteStatus::Invalid, String::new())
+    // A state that is held may apply once another one has (it names a
+    // device this one had not heard of yet), so look again for as long as
+    // that keeps happening.
+    loop {
+        let applied_before = summary.applied.len();
+        summary.pending = 0;
+        summary.held = 0;
+        for item in invites::unprocessed(&db, &inbox)? {
+            let mut note = None;
+            let (status, channel_id) = match process_one(state, &db, &item, &mut note) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!(item = %item.item_id, error = %e, "invite processing failed");
+                    (InviteStatus::Invalid, String::new())
+                }
+            };
+            match status {
+                InviteStatus::Accepted => summary.applied.push(channel_id.clone()),
+                InviteStatus::Pending => summary.pending += 1,
+                InviteStatus::Superseded => summary.superseded += 1,
+                InviteStatus::Invalid | InviteStatus::Rejected => summary.invalid += 1,
+                InviteStatus::Held => summary.held += 1,
             }
-        };
-        match status {
-            InviteStatus::Accepted => summary.applied.push(channel_id.clone()),
-            InviteStatus::Pending => summary.pending += 1,
-            InviteStatus::Superseded => summary.superseded += 1,
-            InviteStatus::Invalid | InviteStatus::Rejected => summary.invalid += 1,
+            if let Some(note) = note
+                && !summary.notes.contains(&note)
+            {
+                summary.notes.push(note);
+            }
+            invites::record(&db, &item.item_id, &item.author_id, &channel_id, status)?;
         }
-        invites::record(&db, &item.item_id, &item.author_id, &channel_id, status)?;
+        if summary.held == 0 || summary.applied.len() == applied_before {
+            break;
+        }
     }
     invites::enforce_pending_cap(&db)?;
 
@@ -682,6 +828,7 @@ fn process_one(
     state: &AppState,
     db: &Connection,
     item: &StoredItem,
+    note: &mut Option<String>,
 ) -> Result<(InviteStatus, String), CordeliaError> {
     let pk = state.identity.public_key();
     let invalid = |why: &str| {
@@ -718,7 +865,11 @@ fn process_one(
             if (cs.epoch, &cs.sender[..]) <= (epoch, epoch_author.as_slice()) {
                 return Ok((InviteStatus::Superseded, channel_id));
             }
-            apply(state, db, &cs, false)?;
+            let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id.as_str());
+            if !is_personal && names_a_stranger(db, &pk, &cs)? {
+                return Ok((InviteStatus::Held, channel_id));
+            }
+            apply(state, db, &cs, false, false)?;
             Ok((InviteStatus::Accepted, channel_id))
         }
         Err(CordeliaError::ChannelNotFound { .. }) => {
@@ -728,19 +879,66 @@ fn process_one(
             if !is_trusted_sender(db, &pk, &author)? {
                 return Ok((InviteStatus::Pending, channel_id));
             }
-            apply(state, db, &cs, true)?;
+            if cs.personal {
+                // An offer to join another personal channel. It is taken
+                // only if the person has just accepted this sender on this
+                // device, which they can do only while the device is not in
+                // use (see `accept`). Otherwise it waits.
+                if !accepted_personal_from(db, &author)? {
+                    tracing::warn!(
+                        "offered another personal channel without a recent accept of its sender; this device keeps its own"
+                    );
+                    if let Some(why) = why_personal_channel_stays(db, &pk)? {
+                        *note = Some(staying_note(why));
+                    }
+                    return Ok((InviteStatus::Pending, channel_id));
+                }
+                apply(state, db, &cs, true, true)?;
+                meta::set(db, meta::ACCEPTED_PERSONAL_FROM, "")?;
+                return Ok((InviteStatus::Accepted, channel_id));
+            }
+            if names_a_stranger(db, &pk, &cs)? {
+                return Ok((InviteStatus::Held, channel_id));
+            }
+            apply(state, db, &cs, true, false)?;
             Ok((InviteStatus::Accepted, channel_id))
         }
         Err(e) => Err(e),
     }
 }
 
-/// Apply a verified, newer channel state.
+/// Whether a state for one of this person's own channels (not the personal
+/// channel) names a key that is not one of this person's devices. Such a
+/// state is not applied: a channel of your own holds only your own devices,
+/// whatever one of them says (decision 2026-09-30 §4.7). The key may be a
+/// device this one has not heard of yet, so the state is kept and looked at
+/// again, not thrown away.
+fn names_a_stranger(
+    db: &Connection,
+    pk: &[u8; 32],
+    cs: &ChannelState,
+) -> Result<bool, CordeliaError> {
+    for member in &cs.members {
+        if !is_own_device(db, pk, &member.key)? {
+            tracing::warn!(
+                channel = %cs.channel_id,
+                "a state for one of this person's channels names a key that is not one of their devices; not applying it"
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Apply a verified, newer channel state. `adopt` makes it this device's
+/// personal channel: only for an offer this device has decided to take
+/// (see `process_one`), never because the state says so.
 fn apply(
     state: &AppState,
     db: &Connection,
     cs: &ChannelState,
     joining: bool,
+    adopt: bool,
 ) -> Result<(), CordeliaError> {
     let pk = state.identity.public_key();
     let channel_id = &cs.channel_id;
@@ -779,20 +977,16 @@ fn apply(
         &cordelia_crypto::sha256(current_key),
     )?;
 
-    if cs.personal
+    if adopt
+        && cs.personal
         && cs.role_of(&pk) == Some(MemberRole::Owner)
-        && trust::is_trusted(db, &cs.sender)?
+        && trust::is_trusted_as(db, &cs.sender, TrustKind::Device)?
+        && personal.as_deref() != Some(channel_id.as_str())
     {
-        // A device invite: adopt the inviter's personal channel, unless this
-        // node's own personal channel already has other devices in it.
-        let keep_own = match &personal {
-            Some(own) if own != channel_id => channels::member_count(db, own)? > 1,
-            _ => false,
-        };
-        if !keep_own && personal.as_deref() != Some(channel_id.as_str()) {
-            meta::set(db, meta::PERSONAL_CHANNEL_ID, channel_id)?;
-            tracing::info!(channel = %channel_id, "adopted personal channel");
-        }
+        // A device invite, taken by a device that is not in use: the
+        // inviter's personal channel becomes this device's.
+        meta::set(db, meta::PERSONAL_CHANNEL_ID, channel_id)?;
+        tracing::info!(channel = %channel_id, "adopted personal channel");
     }
 
     // A device dropped from the personal channel is no longer trusted here,

@@ -742,6 +742,19 @@ pub async fn group_invite(
     if role != "owner" {
         return Err(ApiError::Forbidden("only owner can invite".into()));
     }
+    // A channel of your own is handed only to your own devices (decision
+    // 2026-09-30 §4.7): this endpoint wraps the channel's key for whoever it
+    // is given, so it takes only a member of the personal channel.
+    let own_device =
+        match cordelia_storage::meta::get(&db, cordelia_storage::meta::PERSONAL_CHANNEL_ID)? {
+            Some(personal) => channels::is_member(&db, &personal, &peer_pk)?,
+            None => false,
+        };
+    if !own_device {
+        return Err(ApiError::Forbidden(
+            "that key is not one of your devices; a channel of your own is only ever handed to your own devices".into(),
+        ));
+    }
 
     // Add member
     channels::add_member(&db, &body.channel_id, &peer_pk, "member")?;

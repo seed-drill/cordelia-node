@@ -580,15 +580,35 @@ async fn test_group_lifecycle() {
     let peer = NodeIdentity::generate().unwrap();
     let peer_bech32 = cordelia_crypto::bech32::encode_public_key(&peer.public_key()).unwrap();
 
+    let invite = || {
+        test::TestRequest::post()
+            .uri("/api/v1/channels/group/invite")
+            .insert_header(auth_header())
+            .set_json(json!({
+                "channel_id": group_id,
+                "member": peer_bech32
+            }))
+            .to_request()
+    };
+    // T10. A key that is not one of this person's devices is refused: the
+    // invitation wraps the channel's key for whoever it names.
+    let resp = test::call_service(&app, invite()).await;
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(
+        body.to_string().contains("not one of your devices"),
+        "{body}"
+    );
+
+    // Once the key is one of this person's devices, it can be invited.
     let req = test::TestRequest::post()
-        .uri("/api/v1/channels/group/invite")
+        .uri("/api/v1/devices/add")
         .insert_header(auth_header())
-        .set_json(json!({
-            "channel_id": group_id,
-            "member": peer_bech32
-        }))
+        .set_json(json!({ "device": peer_bech32 }))
         .to_request();
     let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let resp = test::call_service(&app, invite()).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert!(body["ok"].as_bool().unwrap());

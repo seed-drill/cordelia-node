@@ -86,6 +86,23 @@ pub fn is_trusted(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaErr
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
+/// Whether `key` is explicitly trusted as `kind` and not revoked. Trust in a
+/// key is for one purpose: being trusted as a person never makes a key one
+/// of this person's devices.
+pub fn is_trusted_as(
+    conn: &Connection,
+    key: &[u8; 32],
+    kind: TrustKind,
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trusted_keys
+                       WHERE entity_key = ?1 AND kind = ?2 AND revoked_at IS NULL)",
+        params![key.as_slice(), kind.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
 /// The label recorded for `key`, if any.
 pub fn label(conn: &Connection, key: &[u8; 32]) -> Result<Option<String>, CordeliaError> {
     match conn.query_row(

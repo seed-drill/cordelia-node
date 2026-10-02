@@ -604,3 +604,245 @@ fn only_one_remaining_owner_rotates_a_project_after_a_removal() {
     assert_eq!(high.key(&project), low.key(&project));
     assert!(!high.members(&project).iter().any(|(k, _)| *k == c.pk()));
 }
+
+// ── Which personal channel a device belongs to (threat model T13) ─────
+
+fn syncing(n: &Node, on: bool) {
+    let db = n.state.db.lock().unwrap();
+    meta::set(
+        &db,
+        meta::SYNC_CLAUDE_DIR,
+        if on { "/home/x/.claude" } else { "" },
+    )
+    .unwrap();
+}
+
+/// T13. A device that is syncing is not moved into another personal channel
+/// by `accept`: the person is told why, the offer waits, and it is taken
+/// only once they turn sync off and accept again.
+#[test]
+fn t13_a_device_that_is_syncing_keeps_its_personal_channel() {
+    let other = node();
+    let mine = node();
+    let own = membership::personal_channel_id(&mine.state).unwrap();
+    syncing(&mine, true);
+
+    let theirs = membership::add_device(&other.state, &mine.pk(), None)
+        .unwrap()
+        .personal_channel_id;
+    relay(&other, &mine);
+    let summary = membership::accept(&mine.state, &other.pk(), None).unwrap();
+
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(summary.pending, 1, "{summary:?}");
+    assert_eq!(summary.notes.len(), 1, "{summary:?}");
+    assert!(summary.notes[0].contains("keeps its own"), "{summary:?}");
+    assert!(
+        summary.notes[0].contains("cordelia sync off"),
+        "{summary:?}"
+    );
+    assert_eq!(mine.personal().as_deref(), Some(own.as_str()));
+    // It holds none of the other channel's keys.
+    assert!(psk::read_psk(&mine.state.home_dir, &theirs).is_err());
+
+    // Turning sync off is not enough by itself: the offer is taken on the
+    // person's act, not when the device happens to be idle.
+    syncing(&mine, false);
+    let summary = membership::process_inbox(&mine.state).unwrap();
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(mine.personal().as_deref(), Some(own.as_str()));
+
+    let summary = membership::accept(&mine.state, &other.pk(), None).unwrap();
+    assert_eq!(summary.applied, vec![theirs.clone()], "{summary:?}");
+    assert_eq!(mine.personal().as_deref(), Some(theirs.as_str()));
+}
+
+/// T13. The decision is made when the person accepts. Turning sync on
+/// afterwards, before the offer has arrived, does not stop the device from
+/// joining: that is the order people do it in.
+#[test]
+fn t13_turning_sync_on_after_accepting_does_not_stop_the_join() {
+    let other = node();
+    let mine = node();
+
+    let summary = membership::accept(&mine.state, &other.pk(), None).unwrap();
+    assert!(
+        summary.applied.is_empty() && summary.notes.is_empty(),
+        "{summary:?}"
+    );
+    syncing(&mine, true);
+
+    let theirs = membership::add_device(&other.state, &mine.pk(), None)
+        .unwrap()
+        .personal_channel_id;
+    relay(&other, &mine);
+    let summary = membership::process_inbox(&mine.state).unwrap();
+    assert_eq!(summary.applied, vec![theirs.clone()], "{summary:?}");
+    assert_eq!(mine.personal().as_deref(), Some(theirs.as_str()));
+}
+
+/// T13. An accept is honoured for an hour. An offer that arrives long
+/// after it, from the same key, waits for the person to accept again.
+#[test]
+fn t13_an_offer_long_after_the_accept_waits() {
+    let other = node();
+    let mine = node();
+    membership::accept(&mine.state, &other.pk(), None).unwrap();
+    {
+        let db = mine.state.db.lock().unwrap();
+        let two_hours_ago = chrono::Utc::now().timestamp() - 7200;
+        meta::set(
+            &db,
+            meta::ACCEPTED_PERSONAL_FROM,
+            &format!("{} {two_hours_ago}", hex::encode(other.pk())),
+        )
+        .unwrap();
+    }
+
+    let theirs = membership::add_device(&other.state, &mine.pk(), None)
+        .unwrap()
+        .personal_channel_id;
+    relay(&other, &mine);
+    let summary = membership::process_inbox(&mine.state).unwrap();
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(summary.pending, 1, "{summary:?}");
+    assert_ne!(mine.personal().as_deref(), Some(theirs.as_str()));
+}
+
+/// T13. A device that already has other devices is never moved either.
+#[test]
+fn t13_a_device_with_other_devices_keeps_its_personal_channel() {
+    let (_a, b, personal) = paired();
+    let other = node();
+
+    let theirs = membership::add_device(&other.state, &b.pk(), None)
+        .unwrap()
+        .personal_channel_id;
+    relay(&other, &b);
+    let summary = membership::accept(&b.state, &other.pk(), None).unwrap();
+
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(summary.pending, 1, "{summary:?}");
+    assert!(summary.notes[0].contains("other devices"), "{summary:?}");
+    assert_eq!(b.personal().as_deref(), Some(personal.as_str()));
+    assert!(psk::read_psk(&b.state.home_dir, &theirs).is_err());
+}
+
+/// T13. Trust in a key is for one purpose. A key trusted as a person is not
+/// one of this person's devices: what it offers is not applied, and it
+/// cannot make its channel this device's personal channel.
+#[test]
+fn t13_trust_in_a_person_does_not_make_a_key_a_device() {
+    let other = node();
+    let mine = node();
+    {
+        let db = mine.state.db.lock().unwrap();
+        trust::trust(&db, &other.pk(), trust::TrustKind::Person, None).unwrap();
+    }
+
+    let theirs = membership::add_device(&other.state, &mine.pk(), None)
+        .unwrap()
+        .personal_channel_id;
+    relay(&other, &mine);
+    let summary = membership::process_inbox(&mine.state).unwrap();
+
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(summary.pending, 1, "{summary:?}");
+    assert_ne!(mine.personal().as_deref(), Some(theirs.as_str()));
+    assert!(psk::read_psk(&mine.state.home_dir, &theirs).is_err());
+}
+
+// ── A channel of your own holds only your own devices (T10, T20) ──────
+
+/// How many items `from` has stored for `to`'s inbox: what it has sealed
+/// to that key.
+fn sealed_for(from: &Node, to: &Node) -> usize {
+    let db = from.state.db.lock().unwrap();
+    items::query_sync(&db, &naming::inbox_channel_id(&to.pk()), None, 10_000)
+        .unwrap()
+        .len()
+}
+
+/// T10. A channel's keys are never sealed to a key that is not one of this
+/// person's devices, even if that key has got into the channel's member
+/// list: handing over the keys hands over everything written so far.
+#[test]
+fn t10_a_channels_keys_are_sealed_only_to_your_own_devices() {
+    let (a, b, personal) = paired();
+    let project = membership::create_project_group(&a.state, "github.com/acme/app").unwrap();
+    let outsider = node();
+
+    // The outsider's key is put straight into the member list, as a bug or
+    // an older endpoint might.
+    {
+        let db = a.state.db.lock().unwrap();
+        channels::add_member(&db, &project, &outsider.pk(), "owner").unwrap();
+    }
+    // B joins the project, which makes A send the channel's state out.
+    join_project(&a, &b, &personal, &project);
+
+    assert_eq!(
+        sealed_for(&a, &outsider),
+        0,
+        "A sealed the channel's keys to an outsider"
+    );
+    assert!(b.members(&project).iter().any(|(k, _)| *k == b.pk()));
+}
+
+/// T10, T20. A state for one of your own channels that names a key which is
+/// not one of your devices is not applied, even from one of your devices:
+/// a device that has been taken over cannot slip a second key in. The state
+/// is kept, and applies if that key becomes one of your devices.
+#[test]
+fn t10_a_state_that_names_a_strangers_key_is_held_until_it_is_a_device() {
+    let (a, b, personal) = paired();
+    let project = membership::create_project_group(&a.state, "github.com/acme/app").unwrap();
+    join_project(&a, &b, &personal, &project);
+    let before = b.members(&project);
+    let extra = node();
+
+    // One of this person's devices (A) sends a state for the project that
+    // adds a key which is not one of their devices.
+    let owner = |key: [u8; 32]| StateMember {
+        key,
+        role: MemberRole::Owner,
+    };
+    let epoch = {
+        let db = a.state.db.lock().unwrap();
+        channels::epoch(&db, &project).unwrap().0
+    };
+    let key_version = a.key_version(&project);
+    let slipped = ChannelState {
+        channel_id: project.clone(),
+        name: None,
+        mode: "realtime".into(),
+        creator: a.pk(),
+        sender: a.pk(),
+        epoch: epoch + 1,
+        key_version: key_version as u32,
+        keys: vec![(key_version as u32, a.key(&project))],
+        slot_key: psk::read_slot_key(&a.state.home_dir, &project).unwrap(),
+        members: vec![owner(a.pk()), owner(b.pk()), owner(extra.pk())],
+        personal: false,
+    };
+    deliver_crafted(&a.state.identity, &b, &slipped);
+    let summary = membership::process_inbox(&b.state).unwrap();
+
+    assert!(summary.applied.is_empty(), "{summary:?}");
+    assert_eq!(summary.held, 1, "{summary:?}");
+    assert_eq!(
+        b.members(&project),
+        before,
+        "the extra key must not be a member"
+    );
+    // It is not shown as an invitation waiting for `accept`.
+    assert!(membership::list_pending(&b.state).unwrap().is_empty());
+
+    // If the key is in fact a new device of this person, B learns of it
+    // through the personal channel, and the state it kept then applies.
+    membership::add_device(&a.state, &extra.pk(), None).unwrap();
+    relay(&a, &b);
+    let summary = membership::process_inbox(&b.state).unwrap();
+    assert!(summary.applied.contains(&project), "{summary:?}");
+    assert!(b.members(&project).iter().any(|(k, _)| *k == extra.pk()));
+}
