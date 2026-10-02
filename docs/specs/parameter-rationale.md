@@ -349,6 +349,19 @@ that no member can send a key version so large that none could follow it.
 A ring that reaches the bound sends its newest keys, so that a removal can
 always be sent.
 
+### sync_page_steps = 100, 14, 3, 1
+
+**Rationale:** How many entries a node asks a peer to list in one page,
+and so fetch in one request. The answer to a fetch is one message. A
+hundred entries of the largest size are six times what a message holds, so
+when a fetch fails the node asks for the next number down, for that peer
+and channel, and goes back to 100 once it has caught up there.
+
+**Derivation:** 14 entries of 64 KB, with a kilobyte of header each, fit in
+one 1 MB message (checked at compile time). 3 covers entries written
+before 0.2.0-alpha.4, which could be 256 KB. 1 always fits. Most pages
+hold small entries and never leave 100.
+
 ### outbox_refused_retry_max = 600s
 
 **Rationale:** An item that a relay refused stays in the outbox and is

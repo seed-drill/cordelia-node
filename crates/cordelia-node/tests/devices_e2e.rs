@@ -518,6 +518,56 @@ fn a_relay_that_lost_its_database_still_carries_what_is_written_next() {
     );
 }
 
+/// A channel holds more than fits in one message. A device that fetches it
+/// still gets all of it: when a relay cannot answer a request for a whole
+/// page of entries in one message, the device asks for fewer at a time.
+#[test]
+fn a_channel_larger_than_one_message_still_syncs() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
+
+    // B is away while A writes twenty entries of 60 KB: 1.2 MB, more than
+    // one message holds, and all within one page of the channel's list.
+    b.stop();
+    let text = "x".repeat(60_000);
+    for n in 0..20 {
+        a.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "key": format!("big-{n:02}.md"), "content": { "text": text } }),
+        );
+    }
+    wait_for("a's entries reached the relay", &[&relay, &a], 120, || {
+        (a.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
+    });
+
+    b.start();
+    let all = [&relay, &a, &b];
+    wait_for("b healthy again", &all, 30, || healthy(&b));
+    wait_for("b holds all twenty entries", &all, 180, || {
+        let held = b.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        )["entries"]
+            .as_array()?
+            .iter()
+            .filter(|e| e["key"].as_str().is_some_and(|k| k.starts_with("big-")))
+            .count();
+        (held == 20).then_some(())
+    });
+}
+
 /// A personal node only dials out. It starts and reaches its relay while
 /// something else holds its configured P2P port, so it cannot be listening
 /// there; told to listen, the same node needs the port and cannot start.

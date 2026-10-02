@@ -82,6 +82,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `CHURN_INTERVAL_SECS` | 3600s | parameter-rationale.md §3 |
 | `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
+| `SYNC_PAGE_STEPS` | 100, 14, 3, 1 | parameter-rationale.md §4 |
 | `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
 | `OUTBOX_REFUSED_RETRY_MAX_SECS` | 600s | parameter-rationale.md §4 |
 | `STATE_OFFER_RETRY_BASE_SECS`, `STATE_OFFER_RETRY_MAX_SECS` | 60s, 6h | parameter-rationale.md §4 |

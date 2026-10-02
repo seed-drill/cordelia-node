@@ -435,6 +435,25 @@ pub const CHANNEL_RESPONDER_OFFSET_SECS: u64 = PEER_SHARE_INTERVAL_SECS / 2;
 /// Primitive: 100 headers per response; matches MAX_BATCH_SIZE.
 pub const DEFAULT_SYNC_LIMIT: u32 = 100;
 
+/// How many entries a node asks a peer to list in one page, and so fetch
+/// in one request. It starts with the first number. A page's entries come
+/// back in one message, and a hundred large ones do not fit in it, so
+/// when a fetch fails the node asks for the next number down, for that
+/// peer and channel, until it has caught up there:
+///
+/// - 14: fourteen entries of the largest size fit in one message.
+/// - 3: entries written before 0.2.0-alpha.4 could be 256 KB.
+/// - 1: whatever is left.
+///
+/// Without this a channel with more than a message's worth of entries in
+/// one page could never be fetched: the same request failed for ever.
+pub const SYNC_PAGE_STEPS: [u32; 4] = [DEFAULT_SYNC_LIMIT, 14, 3, 1];
+
+// Checked at compile time: fourteen entries of the largest size, with a
+// kilobyte of header each, fit in one message; so do three old ones.
+const _: () = assert!(14 * (MAX_ITEM_BYTES + 1024) <= MAX_MESSAGE_BYTES as usize);
+const _: () = assert!(3 * (262_144 + 1024) <= MAX_MESSAGE_BYTES as usize);
+
 /// Max items per fetch request (network-protocol.md §4.5).
 /// Primitive: 100 items; matches MAX_BATCH_SIZE.
 pub const MAX_FETCH_ITEMS: usize = 100;
