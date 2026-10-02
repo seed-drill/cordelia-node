@@ -1437,3 +1437,103 @@ async fn t03_an_address_is_turned_away_once_it_has_its_share_of_connections() {
     });
     drop(again);
 }
+
+impl Client {
+    /// An entry of `bytes` bytes in `channel`, signed by this client.
+    fn entry_in(&self, channel: &str, bytes: usize) -> cordelia_network::messages::Item {
+        let mut item = self.entry(bytes);
+        let hash: [u8; 32] = item.content_hash.clone().try_into().unwrap();
+        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+            &self.identity.public_key(),
+            channel,
+            &hash,
+            false,
+            &item.item_id,
+            1,
+            &item.published_at,
+        )
+        .unwrap();
+        item.channel_id = channel.into();
+        item.signature = self.identity.sign(&cbor).to_vec();
+        item
+    }
+
+    /// How many entries of `channel` the relay lists.
+    async fn listed(&self, channel: &str) -> usize {
+        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
+        cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+            .await
+            .unwrap();
+        cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
+            .await
+            .map(|page| page.items.len())
+            .unwrap_or(0)
+    }
+}
+
+/// T3. A relay has a storage cap, and keeps what it held first. A client
+/// fills a relay with channels. Once it is full, a new channel is refused.
+/// The first channel can still be written to, and room is made for it by
+/// dropping the newest: everything the first channel held is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_full_relay_keeps_what_it_held_first() {
+    use cordelia_core::protocol::MAX_ITEM_BYTES;
+    use cordelia_network::messages::REFUSED_FULL;
+    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
+    let stats = |relay: &Node| -> serde_json::Value {
+        serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap()
+    };
+
+    let relay = node("relay", "relay", None);
+    let cap = 1_000_000;
+    relay.max_storage_bytes(cap);
+    let mut relay = relay;
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    assert_eq!(stats(&relay)["storage_max_bytes"], cap);
+    let client = client_of(&relay).await.expect("the client connects");
+
+    // The first channel, then newer ones, two entries each, until the
+    // relay refuses one for lack of room.
+    let two = |ch: &str| {
+        vec![
+            client.entry_in(ch, MAX_ITEM_BYTES),
+            client.entry_in(ch, MAX_ITEM_BYTES),
+        ]
+    };
+    assert_eq!(client.push(&two(&channel(0))).await.unwrap().stored, 2);
+    let mut newer = Vec::new();
+    loop {
+        let next = channel(newer.len() + 1);
+        let ack = client.push(&two(&next)).await.unwrap();
+        if ack.stored == 2 {
+            newer.push(next);
+            assert!(newer.len() < 12, "the relay is never full");
+            continue;
+        }
+        assert!(!ack.refused.is_empty(), "{ack:?}");
+        assert!(ack.refused.iter().all(|r| r.why == REFUSED_FULL), "{ack:?}");
+        break;
+    }
+    assert!(newer.len() >= 2, "{}", newer.len());
+    assert!(stats(&relay)["storage_used_bytes"].as_u64().unwrap() <= cap);
+    assert_eq!(client.listed(&channel(newer.len() + 1)).await, 0);
+
+    // The first channel is written to again. The relay takes it, stays
+    // within its cap, and has dropped the newest channel to do so; the
+    // first channel holds everything it was sent.
+    let ack = client.push(&two(&channel(0))).await.unwrap();
+    assert_eq!(ack.stored, 2, "{ack:?}");
+    assert!(stats(&relay)["storage_used_bytes"].as_u64().unwrap() <= cap);
+    assert_eq!(client.listed(&channel(0)).await, 4);
+    assert_eq!(
+        client.listed(newer.last().unwrap()).await,
+        0,
+        "the newest was kept"
+    );
+    assert_eq!(
+        client.listed(&newer[0]).await,
+        2,
+        "an older channel was dropped"
+    );
+}

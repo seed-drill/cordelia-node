@@ -450,13 +450,18 @@ fn a_relay_that_is_down_is_shown_and_found_when_it_comes_up() {
 }
 
 /// A relay loses its database (it was rebuilt) while two devices stay up.
-/// What a device writes afterwards still reaches the other one through
-/// that relay. A device keeps its place in each channel's list at a relay;
-/// the rebuilt relay starts its list again, so a place kept from before
-/// would skip everything it stores from then on. The place lasts only as
-/// long as the connection.
+///
+/// - What a device writes afterwards still reaches the other one through
+///   that relay. A device keeps its place in each channel's list at a
+///   relay; the rebuilt relay starts its list again, so a place kept from
+///   before would skip everything it stores from then on. The place lasts
+///   only as long as the connection.
+/// - What was written before is put back. A relay is a cache: it asks the
+///   devices that connect to it which channels they hold, and fetches what
+///   it lacks. So a device added afterwards, which has only the relay to
+///   fetch from, gets all of it.
 #[test]
-fn a_relay_that_lost_its_database_still_carries_what_is_written_next() {
+fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -515,6 +520,26 @@ fn a_relay_that_lost_its_database_still_carries_what_is_written_next() {
         &all,
         90,
         || reads(&b, "after.md", "after"),
+    );
+
+    // A relay is a cache. It fetches again from its devices what it lost:
+    // a device added now, which has only the relay to fetch from, gets all
+    // of it.
+    let mut d = node("d", "personal", Some(relay.p2p));
+    d.start();
+    let all = [&relay, &a, &b, &d];
+    wait_for("d healthy", &all, 30, || healthy(&d));
+    wait_for("d connected to the relay", &all, 60, || has_hot_peer(&d));
+    pair(&a, &d, "d", &all);
+    wait_for(
+        "the new device reads what was written before the relay lost its database",
+        &all,
+        120,
+        || {
+            (0..5)
+                .all(|n| reads(&d, &format!("before-{n}.md"), "before").is_some())
+                .then_some(())
+        },
     );
 }
 

@@ -389,6 +389,21 @@ whole skills folder is 4MB, which takes about three minutes to send the
 first time. From one address, with its five connections, a relay takes at
 most 10MB a minute.
 
+### max_channel_bytes_at_relay = 16MB, new_channels_per_address_per_hour = 16
+
+**Rationale:** A relay's total storage is its operator's setting
+(max_storage_bytes, 1GB by default). Within it, one channel may hold only
+so much, and one address may make the relay hold only so many channels it
+did not hold before. A channel costs nothing to make, so without the
+second a single address could make a relay hold any number of them.
+
+**Derivation:** After two days of use one of our devices holds 49KB across
+five channels, and our whole skills folder is 4MB: 16MB is several times
+the largest channel we expect. A person with a dozen projects makes a
+dozen channels the first time they sync; 16 an hour covers that. One
+address can then make a relay take at most 256MB an hour, so filling the
+default 1GB takes it four hours, or several addresses.
+
 ### limits for an address = 5 x the limits for a connection
 
 **Rationale:** A connection's allowance is counted for the key that

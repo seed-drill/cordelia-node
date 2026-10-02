@@ -57,7 +57,7 @@ Core node settings: ports, storage location, storage quota.
 | `http_port` | integer | `9473` | 1-65535 | REST API port (TCP, localhost only). | operations.md SS5.1 |
 | `p2p_port` | integer | `9474` | 1-65535 | P2P transport port (UDP, QUIC). | operations.md SS5.1 |
 | `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700). | operations.md SS5.1 |
-| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | Local storage limit in bytes. Publishes are rejected when exceeded. | operations.md SS5.1 |
+| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay's database may hold. At the cap a relay takes no channel it does not already hold, and makes room for the ones it holds by dropping the newest (decision 2026-09-30 §4.6). Not applied on a personal node. | operations.md SS5.1 |
 
 ### 2.3 `[network]`
 
