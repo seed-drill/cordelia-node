@@ -9,6 +9,9 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use cordelia_network::messages::{ChannelDescriptor, Protocol, WireMessage};
 
 use common::*;
 
@@ -367,4 +370,114 @@ fn t01_a_relay_holds_nothing_it_can_read() {
         !files_containing(a.dir.path(), LABEL).is_empty(),
         "the label should be on the device that gave it"
     );
+}
+
+/// A stand-in for a relay. It completes the handshake as a relay does, and
+/// records what each node that connects tells it when announcing channels.
+/// Returns the port it listens on and what it has been told so far.
+fn stand_in_relay() -> (u16, Arc<Mutex<Vec<ChannelDescriptor>>>) {
+    use cordelia_network::{codec, connection, transport};
+
+    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let manager = connection::ConnectionManager::new(
+        identity,
+        endpoint.clone(),
+        vec![],
+        vec!["relay".into()],
+        port,
+    );
+    let ctx = manager.connect_context();
+    let told = Arc::new(Mutex::new(Vec::new()));
+
+    let record = told.clone();
+    tokio::spawn(async move {
+        let _manager = manager; // keeps the endpoint's context alive
+        while let Some(incoming) = endpoint.accept().await {
+            let (ctx, record) = (ctx.clone(), record.clone());
+            tokio::spawn(async move {
+                let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
+                    return;
+                };
+                while let Ok((_send, mut recv)) = outcome.conn.accept_bi().await {
+                    let record = record.clone();
+                    tokio::spawn(async move {
+                        if !matches!(
+                            codec::read_protocol_byte(&mut recv).await,
+                            Ok(Protocol::ChannelAnnounce)
+                        ) {
+                            return;
+                        }
+                        while let Ok(WireMessage::ChannelJoined(joined)) =
+                            codec::read_frame(&mut recv).await
+                        {
+                            record.lock().unwrap().push(joined.descriptor);
+                        }
+                    });
+                }
+            });
+        }
+    });
+    (port, told)
+}
+
+/// T1. A device tells a relay a channel's ID and nothing else about it. A
+/// real node, with its personal channel and a project mapped under a name,
+/// connects to a stand-in relay that records every announcement. None
+/// carries a name, a date, a key version or anything derived from a key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t01_a_device_tells_a_relay_only_a_channels_id() {
+    const PROJECT: &str = "t01-canary-project-name";
+
+    let (port, told) = stand_in_relay();
+    let mut a = node("a", "personal", Some(port));
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+
+    // Sync on, and one folder mapped under a name: the node now has its
+    // personal channel and a channel for the project.
+    let folder = a.home().join("notes");
+    std::fs::create_dir_all(&folder).unwrap();
+    let memory = claude_folder(&a.home(), &folder);
+    std::fs::write(memory.join("idea.md"), "A thought.\n").unwrap();
+    let claude_dir = a.home().join(".claude");
+    a.cli(&["sync", "claude", "--dir", claude_dir.to_str().unwrap()]);
+    a.cli(&["sync", "map", folder.to_str().unwrap(), PROJECT]);
+    let channels = wait_for("the node has both channels", &[&a], 60, || {
+        let ids = groups(&a);
+        (ids.len() >= 2).then_some(ids)
+    });
+
+    // The relay hears of each of them.
+    let heard = wait_for("the relay is told of both channels", &[&a], 60, || {
+        let told = told.lock().unwrap().clone();
+        channels
+            .iter()
+            .all(|id| told.iter().any(|d| &d.channel_id == id))
+            .then_some(told)
+    });
+
+    for d in &heard {
+        let what = format!("the announcement of {}", d.channel_id);
+        assert_eq!(d.channel_name, None, "{what} carries a name");
+        assert_eq!(d.created_at, "", "{what} says when the channel was made");
+        assert_eq!(d.key_version, 0, "{what} carries a key version");
+        assert!(
+            d.psk_hash.iter().all(|b| *b == 0),
+            "{what} carries something derived from the channel's key"
+        );
+        assert_eq!((d.access.as_str(), d.mode.as_str()), ("", ""), "{what}");
+        // Whatever the fields are called, the name is nowhere in it.
+        let bytes = serde_json::to_vec(d).unwrap();
+        for needle in [PROJECT, "personal", "project:"] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "{what} contains {needle:?}"
+            );
+        }
+        // It is still an announcement a relay accepts.
+        cordelia_network::channel_announce::validate_descriptor(d).unwrap();
+    }
 }

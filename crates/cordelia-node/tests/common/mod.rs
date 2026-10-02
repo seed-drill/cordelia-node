@@ -316,3 +316,30 @@ pub fn groups(n: &Node) -> Vec<String> {
         .filter_map(|g| g["channel_id"].as_str().map(String::from))
         .collect()
 }
+
+/// The folder Claude Code keeps for a session started in `dir`.
+pub fn claude_project(home: &std::path::Path, dir: &std::path::Path) -> PathBuf {
+    let name: String = dir
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    home.join(".claude/projects").join(name)
+}
+
+/// Record a Claude Code session started in `cwd` under `home`; returns the
+/// memory folder of its project folder (created).
+pub fn claude_folder(home: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
+    let folder = claude_project(home, cwd);
+    std::fs::create_dir_all(folder.join("memory")).unwrap();
+    std::fs::write(
+        folder.join("session.jsonl"),
+        format!(
+            "{{\"cwd\":{:?},\"type\":\"user\"}}\n",
+            cwd.display().to_string()
+        ),
+    )
+    .unwrap();
+    folder.join("memory")
+}

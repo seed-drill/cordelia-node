@@ -473,32 +473,6 @@ fn cli_reports_when_the_node_is_not_running() {
 
 /// Claude Code's folder under `home` for `dir`, named as Claude Code names
 /// it: every character that is not a letter or a digit becomes `-`.
-fn claude_project(home: &std::path::Path, dir: &std::path::Path) -> PathBuf {
-    let name: String = dir
-        .display()
-        .to_string()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    home.join(".claude/projects").join(name)
-}
-
-/// Record a Claude Code session started in `cwd` under `home`; returns the
-/// memory folder of its project folder (created).
-fn claude_folder(home: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
-    let folder = claude_project(home, cwd);
-    std::fs::create_dir_all(folder.join("memory")).unwrap();
-    std::fs::write(
-        folder.join("session.jsonl"),
-        format!(
-            "{{\"cwd\":{:?},\"type\":\"user\"}}\n",
-            cwd.display().to_string()
-        ),
-    )
-    .unwrap();
-    folder.join("memory")
-}
-
 fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
     let repo = home.join(rel);
     std::fs::create_dir_all(&repo).unwrap();
