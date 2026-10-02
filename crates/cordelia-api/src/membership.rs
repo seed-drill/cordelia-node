@@ -673,6 +673,7 @@ pub fn remove_device(
         if !channels::is_member(&db, &ch.channel_id, device)? {
             continue;
         }
+        keep_what_it_wrote(state, &db, &ch.channel_id, device);
         channels::remove_member(&db, &ch.channel_id, device)?;
         rotate_key(state, &db, &ch.channel_id)?;
         publish_state(state, &db, &ch.channel_id)?;
@@ -682,6 +683,33 @@ pub fn remove_device(
     Ok(RemoveDeviceOutcome {
         channels_rotated: rotated,
     })
+}
+
+/// Publish again, as this device, what `leaving` last wrote in a channel,
+/// just before this device removes it there (see
+/// [`crate::entries::take_over`]). A failure is logged and does not stop
+/// the removal: taking a device out matters more than keeping what it
+/// wrote.
+///
+/// Only the device that removes does this, with what it holds at that
+/// moment. A device that learns of the removal later does not: it cannot
+/// tell what the removed device wrote before its removal from what it
+/// wrote afterwards. Anything it holds that the remover did not is kept on
+/// that device as a conflict file (cordelia-sync, `plan`).
+fn keep_what_it_wrote(state: &AppState, db: &Connection, channel_id: &str, leaving: &[u8; 32]) {
+    match crate::entries::take_over(state, db, channel_id, leaving) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            channel = %channel_id,
+            entries = n,
+            "published again what a removed device last wrote"
+        ),
+        Err(e) => tracing::warn!(
+            channel = %channel_id,
+            error = %e,
+            "could not publish again what a removed device last wrote"
+        ),
+    }
 }
 
 /// Finish removing `gone` from this person's channels after `remover`
@@ -717,6 +745,7 @@ fn remove_where_remover_absent(
         if acting != Some(pk) {
             continue; // another remaining owner acts
         }
+        keep_what_it_wrote(state, db, &id, gone);
         channels::remove_member(db, &id, gone)?;
         rotate_key(state, db, &id)?;
         publish_state(state, db, &id)?;

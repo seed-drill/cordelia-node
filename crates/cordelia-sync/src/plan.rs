@@ -10,9 +10,16 @@
 //!   already have) goes in the file, and this device's version is kept
 //!   beside it as a conflict file, which syncs like any other file. An edit
 //!   beats a delete, whichever side made it. `MEMORY.md` is merged instead.
-//! - This device lost a same-revision race (another device published the
-//!   same revision concurrently and won): as above, our version becomes a
-//!   conflict file, or is merged into `MEMORY.md`.
+//! - The channel's version does not follow from what this folder agreed:
+//!   treated as both having changed, so this device's version is kept as
+//!   above. That is so when
+//!   - another device published the same revision concurrently and won; or
+//!   - the channel has gone back to a lower revision, because the entry
+//!     that was agreed no longer counts (the device that wrote it was
+//!     removed, and nothing replaced what it wrote).
+//! - Only the channel's revision moved, not its content (an entry is
+//!   published again when the device that wrote it is removed): note the
+//!   revision, and touch nothing.
 //!
 //! Nothing is ever dropped silently: every losing edit ends up in a file.
 
@@ -86,15 +93,30 @@ pub fn plan(
         None => local.is_some(),
         Some(a) => local_hash != a.hash,
     };
+    // The channel has changed when its content differs from what was
+    // agreed, at whatever revision.
     let remote_changed = match (remote, agreed) {
         (None, _) => false,
         (Some(_), None) => true,
-        (Some(r), Some(a)) => r.rev > a.rev || (r.rev == a.rev && remote_hash != a.hash),
+        (Some(_), Some(a)) => remote_hash != a.hash,
+    };
+    // Its version follows from what was agreed only at a higher revision.
+    let follows = match (remote, agreed) {
+        (Some(r), Some(a)) => r.rev > a.rev,
+        _ => true,
     };
     let is_index = key == memory_md::INDEX_FILE;
 
     match (local_changed, remote_changed) {
-        (false, false) => vec![],
+        // Nothing to move. If the channel's revision moved all the same,
+        // note where it is now.
+        (false, false) => match (remote, agreed) {
+            (Some(r), Some(a)) if r.rev != a.rev => vec![Action::Record(Agreed {
+                hash: a.hash,
+                rev: r.rev,
+            })],
+            _ => vec![],
+        },
 
         (true, false) => match local {
             Some(c) => vec![Action::Publish(c.text.clone())],
@@ -111,39 +133,39 @@ pub fn plan(
 
         (false, true) => {
             let r = remote.expect("remote_changed implies remote");
-            // Same revision as ours but different content: another device
-            // won a concurrent publish. Keep our version before pulling.
-            let lost_race = agreed.is_some_and(|a| a.rev == r.rev) && local.is_some();
-            match &r.content {
-                None => {
-                    if local.is_some() {
-                        vec![Action::RemoveFile { rev: r.rev }]
-                    } else {
-                        vec![Action::Record(Agreed {
-                            hash: None,
-                            rev: r.rev,
-                        })]
-                    }
-                }
-                Some(c) if lost_race && is_index => {
-                    let ours = &local.expect("lost_race implies local").text;
+            match (&r.content, local) {
+                (None, None) => vec![Action::Record(Agreed {
+                    hash: None,
+                    rev: r.rev,
+                })],
+                (None, Some(_)) if follows => vec![Action::RemoveFile { rev: r.rev }],
+                // A delete that does not follow from this device's version
+                // was made without seeing it: the edit wins.
+                (None, Some(l)) => vec![Action::Publish(l.text.clone())],
+                (Some(c), None) => vec![Action::Pull {
+                    text: c.text.clone(),
+                    rev: r.rev,
+                }],
+                (Some(c), Some(_)) if follows => vec![Action::Pull {
+                    text: c.text.clone(),
+                    rev: r.rev,
+                }],
+                // Content that does not follow from this device's version:
+                // keep ours before taking the channel's.
+                (Some(c), Some(l)) if is_index => {
                     vec![Action::Merge(memory_md::merge(
                         &c.text,
-                        ours,
+                        &l.text,
                         deleted_files,
                     ))]
                 }
-                Some(c) if lost_race => vec![
-                    Action::SaveConflict(local.expect("lost_race implies local").text.clone()),
+                (Some(c), Some(l)) => vec![
+                    Action::SaveConflict(l.text.clone()),
                     Action::Pull {
                         text: c.text.clone(),
                         rev: r.rev,
                     },
                 ],
-                Some(c) => vec![Action::Pull {
-                    text: c.text.clone(),
-                    rev: r.rev,
-                }],
             }
         }
 
@@ -414,6 +436,114 @@ mod tests {
             vec![Action::Merge(
                 "- [C](c.md) theirs\n- [B](b.md) mine\n".into()
             )]
+        );
+    }
+
+    #[test]
+    fn a_revision_that_moves_without_new_content_is_only_noted() {
+        // An entry is published again, with the same content, when the
+        // device that wrote it is removed. Nothing is written to the file.
+        let a = agreed(2, "x");
+        for rev in [5, 1] {
+            assert_eq!(
+                plan(
+                    "n.md",
+                    Some(&c("x")),
+                    Some(&live(rev, "x")),
+                    Some(&a),
+                    &none()
+                ),
+                vec![Action::Record(Agreed {
+                    hash: Some(c("x").hash),
+                    rev
+                })]
+            );
+        }
+        // Deleted, and the delete published again.
+        let deleted = Agreed { hash: None, rev: 2 };
+        assert_eq!(
+            plan("n.md", None, Some(&gone(5)), Some(&deleted), &none()),
+            vec![Action::Record(Agreed { hash: None, rev: 5 })]
+        );
+        // An edit made here on top of that content is a plain edit.
+        assert_eq!(
+            plan(
+                "n.md",
+                Some(&c("y")),
+                Some(&live(5, "x")),
+                Some(&a),
+                &none()
+            ),
+            vec![Action::Publish("y".into())]
+        );
+    }
+
+    #[test]
+    fn a_channel_that_has_gone_back_keeps_this_devices_version() {
+        // This folder agreed revision 9, written by a device that has since
+        // been removed. Its entry no longer counts, and nothing replaced
+        // it, so the channel shows an older revision again.
+        let a = agreed(9, "last");
+        assert_eq!(
+            plan(
+                "n.md",
+                Some(&c("last")),
+                Some(&live(4, "older")),
+                Some(&a),
+                &none()
+            ),
+            vec![
+                Action::SaveConflict("last".into()),
+                Action::Pull {
+                    text: "older".into(),
+                    rev: 4
+                },
+            ]
+        );
+        // The index is merged.
+        let a = agreed(9, "- [A](a.md) x\n- [B](b.md) last\n");
+        assert_eq!(
+            plan(
+                memory_md::INDEX_FILE,
+                Some(&c("- [A](a.md) x\n- [B](b.md) last\n")),
+                Some(&live(4, "- [A](a.md) x\n")),
+                Some(&a),
+                &none()
+            ),
+            vec![Action::Merge("- [A](a.md) x\n- [B](b.md) last\n".into())]
+        );
+        // The older revision is a delete: the file stays, and is published.
+        let a = agreed(9, "last");
+        assert_eq!(
+            plan("n.md", Some(&c("last")), Some(&gone(4)), Some(&a), &none()),
+            vec![Action::Publish("last".into())]
+        );
+        // This folder agreed a delete, and the channel shows the file again:
+        // an edit beats a delete, so it comes back.
+        let deleted = Agreed { hash: None, rev: 9 };
+        assert_eq!(
+            plan(
+                "n.md",
+                None,
+                Some(&live(4, "older")),
+                Some(&deleted),
+                &none()
+            ),
+            vec![Action::Pull {
+                text: "older".into(),
+                rev: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn losing_a_same_revision_race_to_a_delete_keeps_the_edit() {
+        // We published "mine" at rev 2; another device published a delete
+        // at rev 2 and won the tie. An edit beats a delete.
+        let a = agreed(2, "mine");
+        assert_eq!(
+            plan("n.md", Some(&c("mine")), Some(&gone(2)), Some(&a), &none()),
+            vec![Action::Publish("mine".into())]
         );
     }
 

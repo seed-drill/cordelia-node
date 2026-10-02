@@ -823,3 +823,101 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
     assert_eq!(published["rev"], 2, "{published}");
     wait_for("a reads b's edit", &all, 120, || reads(&a, "two"));
 }
+
+/// T16. A device is removed. What it last wrote is still in the channel
+/// for the device that removed it and for one added afterwards: a file it
+/// edited keeps its edit, a file it created is there, and a file it deleted
+/// stays deleted. What it writes after its removal reaches nobody, and the
+/// names it wrote stay writable.
+#[test]
+fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut r = node("r", "personal", Some(relay.p2p));
+    let mut d = node("d", "personal", Some(relay.p2p));
+    for n in [&mut a, &mut r, &mut d] {
+        n.start();
+    }
+    let all = [&relay, &a, &r, &d];
+    for n in [&a, &r, &d] {
+        wait_for("node healthy", &all, 30, || healthy(n));
+        wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
+    }
+    let personal = pair(&a, &r, "r", &all);
+
+    let publish = |n: &Node, key: &str, text: &str| {
+        n.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
+        )
+    };
+    // What a node reads for each name: its text, or `None` once deleted.
+    let reads = |n: &Node| -> BTreeMap<String, Option<String>> {
+        n.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        )["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let text = e["content"]["text"].as_str().map(String::from);
+                Some((e["key"].as_str()?.to_string(), text))
+            })
+            .collect()
+    };
+    let text = |s: &str| Some(s.to_string());
+    let held: BTreeMap<String, Option<String>> = [
+        ("created.md".to_string(), text("by r")),
+        ("deleted.md".to_string(), None),
+        ("edited.md".to_string(), text("by r")),
+    ]
+    .into();
+
+    // A writes two files. R edits one, deletes the other and creates a third.
+    publish(&a, "edited.md", "by a");
+    publish(&a, "deleted.md", "by a");
+    wait_for("r reads a's files", &all, 90, || {
+        (reads(&r).len() == 2).then_some(())
+    });
+    publish(&r, "edited.md", "by r");
+    r.post(
+        "/api/v1/channels/delete-key",
+        serde_json::json!({ "channel": personal, "key": "deleted.md" }),
+    );
+    publish(&r, "created.md", "by r");
+    wait_for("a reads what r wrote", &all, 90, || {
+        (reads(&a) == held).then_some(())
+    });
+
+    // A removes R. R is not told, and writes on.
+    let r_key = r.cli(&["id"]).trim().to_string();
+    a.cli(&["remove-device", &r_key]);
+    assert_eq!(reads(&a), held, "removing r changed what the channel holds");
+    publish(&r, "edited.md", "after removal");
+    publish(&r, "created.md", "after removal");
+
+    // A device added afterwards gets what the channel held.
+    pair(&a, &d, "d", &all);
+    wait_for(
+        "the new device reads what the channel held",
+        &all,
+        120,
+        || (reads(&d) == held).then_some(()),
+    );
+    // Long enough for what R wrote afterwards to have reached both: it is
+    // at the relay, and they fetch from it every ten seconds.
+    std::thread::sleep(std::time::Duration::from_secs(25));
+    assert_eq!(reads(&a), held, "a shows what r wrote after its removal");
+    assert_eq!(reads(&d), held, "d shows what r wrote after its removal");
+
+    // The names stay writable, at the next revision: what R stored after
+    // its removal does not count on the device that knew it either.
+    let published = publish(&a, "edited.md", "by a again");
+    assert_eq!(published["rev"], 3, "{published}");
+    wait_for("d reads a's edit", &all, 90, || {
+        (reads(&d).get("edited.md") == Some(&text("by a again"))).then_some(())
+    });
+}
