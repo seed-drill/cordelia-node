@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cordelia install script
 # Usage: curl -fsSL https://github.com/seed-drill/cordelia-node/releases/latest/download/install.sh | sh
-#        Pre-release: CORDELIA_VERSION=v0.2.0-alpha.4 sh install.sh
+#        Pre-release: CORDELIA_VERSION=v0.2.0-alpha.5 sh install.sh
 #
 # Detects platform/architecture, downloads binary from GitHub Releases,
 # verifies SHA-256 checksum, installs to ~/.cordelia/bin/, sets up
@@ -53,7 +53,7 @@ resolve_version() {
             | grep '"tag_name"' | head -1 | cut -d'"' -f4) || true
         if [ -z "$VERSION" ]; then
             echo "Error: could not determine the latest release of ${REPO}."
-            echo "  If only pre-releases exist, pin one: CORDELIA_VERSION=v0.2.0-alpha.4 sh install.sh"
+            echo "  If only pre-releases exist, pin one: CORDELIA_VERSION=v0.2.0-alpha.5 sh install.sh"
             echo "  Releases: https://github.com/${REPO}/releases"
             exit 1
         fi
