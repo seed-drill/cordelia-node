@@ -317,6 +317,32 @@ many items were written. Before the outbox, each write was its own push and
 a burst of 150 writes tripped the limit 467 times, losing most items.
 Checked at compile time in protocol.rs.
 
+### state_offer_retry_base = 60s, state_offer_retry_max = 6h
+
+**Rationale:** A channel state (a change to a channel's members or keys)
+is offered again to a member that has not been seen to hold it: this long
+after it was first sent, doubling after each offer, up to the maximum.
+
+**Derivation:** A state travels through a relay, and the member fetches
+every 10 seconds and answers within the next 10. A minute is well past the
+time an answer normally takes, so the first repeat is not wasted. A member
+that is away is offered the state 4 times a day at the maximum: each is a
+push of one small item, which a relay that still holds it answers at once.
+Six hours bounds how long a member that has just come back waits if its
+relay lost the state while it was away.
+
+### max_state_keys = 1024
+
+**Rationale:** The most keys a channel state carries, and the furthest a
+state may move a channel's key version. A removal adds one key and moves
+the version by one.
+
+**Derivation:** No person removes a thousand devices. The bound exists so
+that a hostile payload cannot make a node allocate without limit, and so
+that no member can send a key version so large that none could follow it.
+A ring that reaches the bound sends its newest keys, so that a removal can
+always be sent.
+
 ### outbox_refused_retry_max = 600s
 
 **Rationale:** An item that a relay refused stays in the outbox and is

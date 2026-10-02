@@ -7,7 +7,7 @@
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, specs/search-indexing.md, specs/identity.md
 
-> **v1 status (2026-09-30).** The schema is at version 6. Migrations since
+> **v1 status (2026-09-30).** The schema is at version 8. Migrations since
 > this spec, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md):
 >
 > - **v4:** `channels` admits type `inbox` and gains `epoch` and
@@ -15,6 +15,9 @@
 > - **v5:** `items` gains `seq` (arrival order), `slot`, `rev` and
 >   `relayed_at` (the outbox), with a `counters` table.
 > - **v6:** `sync_files`, the adapter's record of each file it has synced.
+> - **v7:** `peer_sightings`, a relay's keyed-hash record for usage counts.
+> - **v8:** `state_offers`, the newest channel state sent to each member of
+>   each channel, kept until the member is seen to hold it (decision §4.1).
 >
 > PSK envelope items (§4) are replaced by sealed channel states, items of type
 > `invite` in inbox channels (decision §4.1). The search index (`search-indexing.md`,

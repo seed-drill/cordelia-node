@@ -440,6 +440,19 @@ pub fn outbox(
     Ok(batch)
 }
 
+/// Put an item back in the outbox, so that it is pushed to a relay again
+/// (a relay that already holds it answers so). Returns false if the item
+/// is not stored here any more.
+pub fn mark_unrelayed(conn: &Connection, item_id: &str) -> Result<bool, CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE items SET relayed_at = NULL WHERE item_id = ?1",
+            params![item_id],
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    Ok(changed > 0)
+}
+
 /// Which of `item_ids` are still in `author`'s outbox.
 pub fn still_in_outbox(
     conn: &Connection,

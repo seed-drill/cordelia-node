@@ -44,7 +44,7 @@ pub const CHANNEL_STATE_VERSION: u64 = 1;
 /// Upper bounds applied when decoding, so a hostile payload cannot make a
 /// node allocate without limit. Far above anything v1 needs.
 const MAX_MEMBERS: usize = 1024;
-const MAX_KEYS: usize = 1024;
+const MAX_KEYS: usize = cordelia_core::protocol::MAX_STATE_KEYS;
 
 /// A member's role within a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

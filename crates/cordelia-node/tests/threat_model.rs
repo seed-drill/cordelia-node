@@ -1037,3 +1037,95 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
         "{pushes:?}"
     );
 }
+
+/// T16. A removal reaches the devices that remain even when the relay loses
+/// it. One device is away while another removes a third, and the relay then
+/// loses everything it held. The device that removed goes on offering the
+/// change, the one that was away applies it when it is back, and answers;
+/// until then `cordelia devices` on the remover shows it as not confirmed.
+#[test]
+fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    let mut r = node("r", "personal", Some(relay.p2p));
+    for n in [&mut a, &mut b, &mut r] {
+        n.start();
+    }
+    for n in [&a, &b, &r] {
+        wait_for("node healthy", &[&relay, &a, &b, &r], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b, &r], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let (b_key, r_key) = (key_of(&b), key_of(&r));
+    // The devices a node lists, by key.
+    let devices = |n: &Node| -> BTreeMap<String, serde_json::Value> {
+        n.post("/api/v1/devices/list", serde_json::json!({}))["devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| Some((d["key"].as_str()?.to_string(), d.clone())))
+            .collect()
+    };
+    let status = |n: &Node| n.get("/api/v1/status").unwrap_or_default();
+
+    pair(&a, &b, "b", &[&relay, &a, &b, &r]);
+    pair(&a, &r, "r", &[&relay, &a, &b, &r]);
+    wait_for("b knows r as a device", &[&relay, &a, &b, &r], 90, || {
+        devices(&b).get(&r_key)?["in_personal_channel"]
+            .as_bool()?
+            .then_some(())
+    });
+    wait_for(
+        "b and r have confirmed to a",
+        &[&relay, &a, &b, &r],
+        90,
+        || {
+            let listed = devices(&a);
+            [&b_key, &r_key]
+                .iter()
+                .all(|key| listed[*key]["unconfirmed_since"].is_null())
+                .then_some(())
+        },
+    );
+
+    // B goes away. A removes R, and the relay has it.
+    b.stop();
+    a.cli(&["remove-device", &r_key]);
+    wait_for("the removal reached the relay", &[&relay, &a], 60, || {
+        (status(&a)["outbox_waiting"] == 0).then_some(())
+    });
+    // The relay loses everything it held.
+    relay.stop();
+    for file in ["cordelia.db", "cordelia.db-wal", "cordelia.db-shm"] {
+        let _ = std::fs::remove_file(relay.data_dir().join(file));
+    }
+    relay.start();
+    wait_for("relay healthy again", &[&relay, &a], 30, || healthy(&relay));
+
+    // B is back, and has not heard: it still counts R as a device. A shows
+    // that B has not confirmed.
+    b.start();
+    let all = [&relay, &a, &b, &r];
+    wait_for("b healthy again", &all, 30, || healthy(&b));
+    assert!(devices(&b).contains_key(&r_key), "b heard of the removal");
+    assert!(
+        devices(&a)[&b_key]["unconfirmed_since"].is_string(),
+        "a does not show b as waiting: {:?}",
+        devices(&a)
+    );
+
+    // A offers the removal again. B applies it and answers.
+    wait_for("b drops r", &all, 240, || {
+        (!devices(&b).contains_key(&r_key)).then_some(())
+    });
+    wait_for("a hears that b holds it", &all, 120, || {
+        devices(&a)[&b_key]["unconfirmed_since"]
+            .is_null()
+            .then_some(())
+    });
+}

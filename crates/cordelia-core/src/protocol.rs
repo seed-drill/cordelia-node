@@ -465,6 +465,25 @@ pub const MAX_EPOCH: u64 = (1 << 53) - 1;
 /// step that takes 2^33 states. Rationale: parameter-rationale.md §4.
 pub const MAX_EPOCH_STEP: u64 = 1 << 20;
 
+/// How far a channel's key version may move in one state, and the most
+/// keys a state's key ring may hold. A removal moves the version by one.
+/// A device that was away may have missed some, so a state may skip
+/// versions, but never more than this, and never more than its epoch
+/// moved. Without a bound a member could send the largest version there
+/// is, after which no key could follow it and no device could be removed.
+pub const MAX_STATE_KEYS: usize = 1024;
+
+/// How long after a channel state was sent to a member it is offered again,
+/// if the member has not been seen to hold it: this long after the first
+/// time, doubling after each offer, up to STATE_OFFER_RETRY_MAX_SECS.
+/// Rationale: parameter-rationale.md §4.
+pub const STATE_OFFER_RETRY_BASE_SECS: u64 = 60;
+
+/// The longest wait between two offers of the same channel state. A member
+/// that is away for weeks is offered it four times a day, each a push of
+/// one small item that a relay which already has it answers at once.
+pub const STATE_OFFER_RETRY_MAX_SECS: u64 = 6 * 3600;
+
 /// How often nodes collect expired keyed tombstones. Hourly is plenty
 /// against a 90-day retention.
 pub const TOMBSTONE_GC_INTERVAL_SECS: u64 = 3600;

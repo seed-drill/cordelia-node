@@ -76,6 +76,8 @@ This replaces seed-sharing pairing ([`identity.md`](../specs/identity.md) §6). 
 - The item's signature must verify, and the sender named inside the ciphertext must equal the item's author, so a state can't be re-signed by someone else and replayed as theirs.
 - A state is applied only if it is newer than the one held (by epoch, then author key) and comes from an owner of the channel.
 - The epoch is bounded. It is at most 2^53 - 1 (`MAX_EPOCH`), and one state can move it by at most 2^20 (`MAX_EPOCH_STEP`). A device that was away may have missed some changes, so a state may skip epochs. But no member can use the numbers up, after which the list could never change again.
+- The key version is bounded in the same way. A removal moves it by one, with the epoch. So a state may not move it back, nor further than its epoch moved, nor by more than a state has room for keys (1,024, `MAX_STATE_KEYS`). Otherwise a member could send the largest version there is, and no device could be removed afterwards.
+- A state holds at most 1,024 keys. A channel that has had more sends the newest ones. Devices that hold the older keys keep them; a device added later cannot read what was written under the ones left out. Without this, a ring that had been filled could not be sent at all, and no device could be removed.
 - A state for a channel the node doesn't know is applied only if the sender is trusted.
 - Channel IDs must be exactly `grp_<lowercase uuid>`.
 
@@ -91,6 +93,14 @@ Without a trust check, anyone who knows your public key could add you to a chann
 **Personal channel.** A `grp_` channel that holds the device roster and the map from name to channel (4.5). Until 0.2.0-alpha.3 it also held home memory. A node creates one on first use, and a device that accepts a `device` invite adopts the inviter's personal channel as its own.
 
 **Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. **As built:** since devices join only the projects they have (4.5), the remover may not be in every project channel. Each device that sees a device dropped from the personal channel therefore removes it from the project channels the remover is not in. Of a channel's remaining owners, the one with the lowest key acts, so two devices never rotate the same channel at once. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
+
+**A change is offered until each member holds it.** Sending a state once is not enough: a relay can lose it, and a member may be away for weeks. A removal that a device never receives leaves it trusting the removed device.
+
+- The device that sends a state remembers it, for each member it was sent to, until that member is seen to hold it.
+- A member that applies a state answers its sender with its own state for the channel, which carries the epoch it now holds. Any state from a member at that epoch or a later one counts as the answer. (An answer is not itself waited for, or two devices would answer each other for ever.)
+- Until the answer comes, the sender offers the state again: after 1 minute, then 2, then 4, up to every 6 hours. Offering again puts the same item back in the outbox. A relay that still holds it says so; one that lost it stores it again. Nothing new is written.
+- `cordelia devices` shows a device that has not confirmed a change for ten minutes or more.
+- A device on a version before 0.2.0-alpha.4 applies states and never answers, so it shows as not confirmed until it is upgraded.
 
 **What a removed device wrote.** Once a device is removed, its entries count for nothing: not when a name is read, not towards a name's next revision, not in the sweep of old deletes. So that the channel keeps what it held:
 

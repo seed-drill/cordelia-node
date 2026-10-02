@@ -1558,6 +1558,12 @@ fn cmd_remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
             "their keys"
         }
     );
+    if rotated > 0 {
+        println!(
+            "Your other devices are told through the relays, and the change is offered again \
+             until each of them confirms it. `cordelia devices` shows any that has not."
+        );
+    }
     Ok(())
 }
 
@@ -1567,15 +1573,35 @@ fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
         let key = d["key"].as_str().unwrap_or_default();
         let name = d["name"].as_str().unwrap_or("");
         let marker = if d["this_device"].as_bool() == Some(true) {
-            "  (this device)"
+            "  (this device)".to_string()
         } else if d["in_personal_channel"].as_bool() != Some(true) {
-            "  (waiting to join)"
+            "  (waiting to join)".to_string()
         } else {
-            ""
+            // A change this device made (a device added or removed) that
+            // the other has not confirmed. It is offered again until it
+            // does; a few minutes are normal, since it goes through a relay.
+            match unconfirmed_for(&d["unconfirmed_since"]) {
+                Some(secs) if secs >= UNCONFIRMED_SHOWN_AFTER_SECS => format!(
+                    "  (has not confirmed a change sent {})",
+                    indicator::ago(secs)
+                ),
+                _ => String::new(),
+            }
         };
         println!("{key}  {name}{marker}");
     }
     Ok(())
+}
+
+/// How long a change may go unconfirmed before `cordelia devices` says so.
+/// It travels through a relay, and the other device looks every ten
+/// seconds, so a minute or two means nothing.
+const UNCONFIRMED_SHOWN_AFTER_SECS: i64 = 600;
+
+/// Seconds since the time in a device's `unconfirmed_since`, if it has one.
+fn unconfirmed_for(since: &serde_json::Value) -> Option<i64> {
+    let at = chrono::DateTime::parse_from_rfc3339(since.as_str()?).ok()?;
+    Some((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds())
 }
 
 fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
