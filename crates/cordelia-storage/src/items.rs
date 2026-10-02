@@ -700,6 +700,28 @@ pub fn get_items_by_ids(
     Ok(items)
 }
 
+/// The total size of the given items of a channel, as stored. Unknown IDs
+/// count for nothing. Lets a node see whether a fetch can be answered in
+/// one message before it reads the items.
+pub fn total_bytes_by_ids(
+    conn: &Connection,
+    channel_id: &str,
+    item_ids: &[String],
+) -> Result<u64, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT content_length FROM items WHERE channel_id = ?1 AND item_id = ?2")
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    let mut total = 0u64;
+    for item_id in item_ids {
+        match stmt.query_row(params![channel_id, item_id], |row| row.get::<_, i64>(0)) {
+            Ok(bytes) => total += bytes.max(0) as u64,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(CordeliaError::Storage(e.to_string())),
+        }
+    }
+    Ok(total)
+}
+
 /// Look up which of the given item IDs are already stored.
 ///
 /// Returns item_id -> (content_hash, published_at), the shape
@@ -1366,6 +1388,32 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["ci_f1", "ci_f2", "ci_k1", "ci_k2"]);
         assert_eq!(gc_keyed_tombstones(&conn, 90, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_size_of_a_fetch_is_known_before_it_is_read() {
+        let conn = setup();
+        let mut a = test_item("ci_a", "2026-01-01T00:01:00Z");
+        a.content_hash = &[0x0A; 32];
+        let mut b = test_item("ci_b", "2026-01-01T00:02:00Z");
+        b.content_hash = &[0x0B; 32];
+        insert_item(&conn, &a).unwrap();
+        insert_item(&conn, &b).unwrap();
+        let ids = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        // Test items are 100 bytes each. Unknown items, and items of
+        // another channel, count for nothing.
+        assert_eq!(
+            total_bytes_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_b"])).unwrap(),
+            200
+        );
+        assert_eq!(
+            total_bytes_by_ids(&conn, "ch1", &ids(&["ci_a", "ci_zz"])).unwrap(),
+            100
+        );
+        assert_eq!(
+            total_bytes_by_ids(&conn, "other", &ids(&["ci_a"])).unwrap(),
+            0
+        );
     }
 
     /// T2. The same ciphertext stored by another author does not stop an

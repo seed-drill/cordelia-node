@@ -623,6 +623,14 @@ pub async fn p2p_loop(
         std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // How many entries to ask for in one page, per (peer, channel): an index
+    // into SYNC_PAGE_STEPS. It moves down when a fetch fails (the page's
+    // entries did not fit in one message) and goes back once the channel
+    // is caught up with that peer.
+    let sync_page_steps: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(NodeId, String), usize>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Delivery feedback channel
     let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, u64)>();
 
@@ -1444,6 +1452,7 @@ pub async fn p2p_loop(
                     let rtx = repush_tx.clone();
                     let seen_ref = seen_table.clone();
                     let cursors = sync_cursors.clone();
+                    let page_steps = sync_page_steps.clone();
                     tokio::spawn(async move {
                         // Batched sync (§4.5): one stream per peer, all channels.
                         // Open one (send, recv) pair, write protocol byte once.
@@ -1492,7 +1501,16 @@ pub async fn p2p_loop(
                             let cursor_key = (target.clone(), ch_id.clone());
                             for _page in 0..SYNC_PAGES_PER_CYCLE {
                                 let after = cursors.lock().ok().and_then(|c| c.get(&cursor_key).copied()).unwrap_or(0);
-                                let resp = match cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, ch_id, after, cordelia_core::protocol::DEFAULT_SYNC_LIMIT).await {
+                                let steps = cordelia_core::protocol::SYNC_PAGE_STEPS;
+                                let step = page_steps.lock().ok().and_then(|p| p.get(&cursor_key).copied()).unwrap_or(0).min(steps.len() - 1);
+                                // The page's entries could not be fetched in one
+                                // message: ask for fewer next time.
+                                let fewer_next_time = || {
+                                    if let Ok(mut p) = page_steps.lock() {
+                                        p.insert(cursor_key.clone(), (step + 1).min(steps.len() - 1));
+                                    }
+                                };
+                                let resp = match cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, ch_id, after, steps[step]).await {
                                     Ok(r) => r,
                                     Err(e) => { tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed"); break 'channels; }
                                 };
@@ -1514,7 +1532,11 @@ pub async fn p2p_loop(
                                         }
                                         let items = match cordelia_network::item_sync::read_fetch_response(&mut recv).await {
                                             Ok(items) => items,
-                                            Err(e) => { tracing::debug!(peer = %target, error = %e, "fetch response failed"); break 'channels; }
+                                            Err(e) => {
+                                                tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
+                                                fewer_next_time();
+                                                break 'channels;
+                                            }
                                         };
 
                                         let mut stored_count = 0u32;
@@ -1558,7 +1580,13 @@ pub async fn p2p_loop(
                                 if let Ok(mut c) = cursors.lock() {
                                     c.insert(cursor_key.clone(), last_seq);
                                 }
-                                if !resp.has_more { break; }
+                                if !resp.has_more {
+                                    // Caught up here: back to full pages.
+                                    if let Ok(mut p) = page_steps.lock() {
+                                        p.remove(&cursor_key);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         // FIN: signal end of batch to server
@@ -2447,12 +2475,30 @@ async fn handle_inbound_sync(
 
         // Read next frame: FetchRequest (for this channel), SyncRequest (next channel), or EOF
         match cordelia_network::codec::read_frame(recv).await {
-            Ok(cordelia_network::messages::WireMessage::FetchRequest(freq)) => {
+            Ok(cordelia_network::messages::WireMessage::FetchRequest(mut freq)) => {
+                freq.item_ids
+                    .truncate(cordelia_core::protocol::MAX_BATCH_SIZE);
                 let fetch_items = {
                     let db = match state.db.lock() {
                         Ok(db) => db,
                         Err(_) => break,
                     };
+                    // An answer is one message. If these items do not fit in
+                    // one, end the stream now: the peer learns at once, and
+                    // asks for fewer. (Reading them all first, only to find
+                    // that they cannot be sent, cost a megabyte a request.)
+                    let bytes = cordelia_storage::items::total_bytes_by_ids(
+                        &db,
+                        &current_req.channel_id,
+                        &freq.item_ids,
+                    )
+                    .unwrap_or(0);
+                    let room = u64::from(cordelia_core::protocol::MAX_MESSAGE_BYTES)
+                        .saturating_sub(1024 * freq.item_ids.len() as u64);
+                    if bytes > room {
+                        tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, asked = freq.item_ids.len(), bytes, "fetch does not fit in one message; ending the stream");
+                        break;
+                    }
                     cordelia_storage::items::get_items_by_ids(
                         &db,
                         &current_req.channel_id,
