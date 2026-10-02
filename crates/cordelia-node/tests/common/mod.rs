@@ -46,6 +46,17 @@ impl Node {
         self.dir.path().join("node.log")
     }
 
+    /// Add a relay to this node's configuration: where to dial and, if
+    /// given, the key that must answer there. For before the node starts.
+    pub fn add_relay(&self, addr: &str, key: Option<&str>) {
+        let key = key.map(|k| format!("key = \"{k}\"\n")).unwrap_or_default();
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        config.push_str(&format!(
+            "\n[[network.bootnodes]]\naddr = \"{addr}\"\n{key}"
+        ));
+        std::fs::write(self.config(), config).unwrap();
+    }
+
     pub fn token(&self) -> String {
         std::fs::read_to_string(self.data_dir().join("node-token"))
             .unwrap()

@@ -23,7 +23,7 @@ belongs to something that is not built or designed in public yet.
 | T16 | A device that was removed | Read what is written after its removal, and keep writing | The channel's key changes on removal and goes only to the devices that remain. What a removed device writes afterwards is shown to nobody | tested |
 | T17 | Another program running as the same user | Read the node's files and memory, and call its local API | Nothing. Cordelia does not defend against this; real separation needs separate users or machines | not defended |
 | T18 | Anyone who carries or stores an entry | Move it to another channel, give it another name, present an old revision as a newer one, change its content, or forge its author | Each of these makes the entry fail its signature or fail to decrypt, and it is ignored | tested |
-| T19 | Someone who claims to be another device or relay, or answers for a relay's name | Connect, or answer, under another node's key, to take over its connection or be taken for it; pose as a device's relay and send the device elsewhere | A node's ID is the key its TLS certificate proves, so nobody can connect or answer under a key they do not hold. A device knows its relays by name and key, refuses any other key at a relay's address, and dials nothing but its configured relays. A relay does not yet know the relays it works with by key | partly tested (#70) |
+| T19 | Someone who claims to be another device or relay, or answers for a relay's name | Connect, or answer, under another node's key, to take over its connection or be taken for it; pose as a device's relay and send the device elsewhere; say it is a relay, to be sent what relays are sent | A node's ID is the key its TLS certificate proves, so nobody can connect or answer under a key they do not hold. A node knows its relays by name and key, refuses any other key at a relay's address, and dials nothing but its configured relays. Being a relay is a matter of configuration: a node that merely says it is one is an ordinary peer, and is not told which channels a node holds | tested |
 
 ## Tests
 
@@ -52,6 +52,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/threat_model.rs`: `t19_a_device_refuses_another_key_at_its_relays_address`
 - `crates/cordelia-node/tests/threat_model.rs`: `t19_a_device_asks_no_peer_for_addresses_to_dial`
 - `crates/cordelia-network/src/bootstrap.rs`: `a_configured_relay_has_the_key_it_was_given_or_the_default_one`
+- `crates/cordelia-node/tests/threat_model.rs`: `t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one`
 
 ## How CI checks this
 
