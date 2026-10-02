@@ -93,17 +93,19 @@ pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
 // TIMING PRIMITIVES -- the small set of values everything else derives from
 // ══════════════════════════════════════════════════════════════════════
 
-/// Timeout for all QUIC stream read/write operations in seconds (parameter-rationale.md §5.3).
+/// Timeout for all QUIC stream read/write operations in seconds (parameter-rationale.md §6).
 /// Primitive: single-digit-second responsiveness; covers cross-continent RTT + processing.
 /// One value, one layer (codec). If a single read or write takes longer, the peer is unresponsive.
 pub const STREAM_TIMEOUT_SECS: u64 = 10;
 
-/// How long a node that is told to stop waits for its parts to finish,
-/// at most, before it exits without them (parameter-rationale.md §6).
-/// Derived: three stream timeouts. Closing connections and finishing local
-/// API requests each get one; the rest is margin. A node that waited for
-/// ever for one of its parts would be killed by its service manager after
-/// a minute and a half, and an upgrade would take that long.
+/// How long a node that is told to stop waits for its parts to finish, in
+/// all, before it exits without them (parameter-rationale.md §6).
+/// Derived: three stream timeouts. The peer-to-peer loop may be in the
+/// middle of a stream operation when it is told, and then gives its peers
+/// one to hear that it is closing; the third is margin. The HTTP server is
+/// stopped at once. A node that waited for ever for one of its parts would
+/// be killed by systemd after a minute and a half, and an upgrade would
+/// take that long.
 pub const NODE_STOP_TIMEOUT_SECS: u64 = 3 * STREAM_TIMEOUT_SECS;
 
 /// Governor tick interval in seconds (network-behaviour.md §5.1).
@@ -815,7 +817,7 @@ mod tests {
         assert_eq!(TLS_CERT_VALIDITY_DAYS, 365);
     }
 
-    // Stream I/O (parameter-rationale.md §5.3)
+    // Stream I/O (parameter-rationale.md §6)
     #[test]
     fn test_stream_timeout_parameter_rationale_5_3() {
         assert_eq!(STREAM_TIMEOUT_SECS, 10);

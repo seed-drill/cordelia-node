@@ -381,21 +381,40 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     deliver(&a, &b, "last", &[&r1, &r2, &a, &b]);
 }
 
-/// A node that is told to stop exits, though a client of its local API
-/// has begun a request and never finished it.
+/// A node stops on each signal that tells it to: SIGINT, as at a terminal,
+/// and SIGQUIT, which would otherwise end it with a core holding its keys.
+/// (SIGTERM is how every other test stops a node.) Each time it exits with
+/// success, in time, and with every part of it stopped.
 #[test]
-fn a_node_told_to_stop_exits_though_a_request_is_held_open() {
+fn a_node_stops_on_each_signal_that_tells_it_to() {
+    for signal in ["INT", "QUIT"] {
+        let mut n = node("relay", "relay", None);
+        n.start();
+        wait_for("node healthy", &[&n], 30, || healthy(&n));
+        n.stop_with(signal);
+    }
+}
+
+/// A node that is told to stop does not wait for a request to its local
+/// API that a client has begun and not finished. The client has sent the
+/// request's head and not its body, so the server would wait for the rest
+/// for as long as the client keeps the connection open; a server stopped
+/// gracefully would wait half a minute for it.
+#[test]
+fn a_node_told_to_stop_does_not_wait_for_a_request_left_open() {
     use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
     use std::io::Write;
-    use std::time::{Duration, Instant};
 
     let mut n = node("relay", "relay", None);
     n.start();
     wait_for("node healthy", &[&n], 30, || healthy(&n));
 
     let mut held = std::net::TcpStream::connect(("127.0.0.1", n.http)).unwrap();
-    held.write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n")
-        .unwrap();
+    let head = format!(
+        "POST /api/v1/channels/list HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{",
+        n.token()
+    );
+    held.write_all(head.as_bytes()).unwrap();
     held.flush().unwrap();
     std::thread::sleep(Duration::from_millis(500));
 
@@ -403,7 +422,7 @@ fn a_node_told_to_stop_exits_though_a_request_is_held_open() {
     n.stop();
     let took = told.elapsed();
     assert!(
-        took < Duration::from_secs(STREAM_TIMEOUT_SECS + 8),
+        took < Duration::from_secs(STREAM_TIMEOUT_SECS / 2),
         "the node took {took:?} to exit"
     );
     drop(held);

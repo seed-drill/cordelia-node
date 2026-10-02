@@ -126,35 +126,61 @@ impl Node {
     /// Stop the node as a service manager would (SIGTERM), so it closes
     /// its connections on the way out.
     ///
-    /// A node that is told to stop exits within a bounded time. One that
-    /// does not is killed, and the test fails with its log: a node that
-    /// never exits would otherwise hang the whole run.
+    /// Tell the node to stop, with SIGTERM, as a service manager does.
     pub fn stop(&mut self) {
+        self.stop_with("TERM");
+    }
+
+    /// Tell the node to stop with `signal` (TERM, INT or QUIT). A node that
+    /// is told to stop exits within a bounded time, with success, and with
+    /// every part of it stopped in time. One that does not exit is killed.
+    /// Either way the test fails with the node's log: a node that never
+    /// exits would otherwise hang the whole run, and one that gave up on a
+    /// part of itself would pass unnoticed.
+    pub fn stop_with(&mut self, signal: &str) {
+        use cordelia_core::protocol::{NODE_STOP_TIMEOUT_SECS, STREAM_TIMEOUT_SECS};
+        use std::os::unix::process::ExitStatusExt;
+        const SIGTERM: i32 = 15;
         let Some(mut child) = self.child.take() else {
             return;
         };
         let _ = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
+            .args([&format!("-{signal}"), &child.id().to_string()])
             .status();
-        let allowed = Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS + 15);
+        // The node's own bound, the stream timeout it then gives work that
+        // cannot be interrupted, and a margin.
+        let allowed = Duration::from_secs(NODE_STOP_TIMEOUT_SECS + STREAM_TIMEOUT_SECS + 5);
         let told = Instant::now();
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(status)) => break Some(status),
                 Ok(None) if told.elapsed() < allowed => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                _ => break,
+                _ => break None,
             }
+        };
+        let Some(status) = status else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{} did not exit within {}s of being told to stop\n{}",
+                self.name,
+                allowed.as_secs(),
+                self.log_tail()
+            );
+        };
+        // Ended by the signal itself is as good: it came before the node
+        // listened for it.
+        let exited_well = status.success() || status.signal() == Some(SIGTERM);
+        let log = std::fs::read_to_string(self.log()).unwrap_or_default();
+        if !exited_well || log.contains("did not stop in time") {
+            panic!(
+                "{} did not stop as it should ({status})\n{}",
+                self.name,
+                self.log_tail()
+            );
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!(
-            "{} did not exit within {}s of being told to stop\n{}",
-            self.name,
-            allowed.as_secs(),
-            self.log_tail()
-        );
     }
 
     /// Kill the node outright, as a crash or power loss would: its peers

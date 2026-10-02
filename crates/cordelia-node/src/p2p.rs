@@ -3011,11 +3011,13 @@ pub async fn p2p_loop(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!("P2P loop shutting down");
+                    // Peers are told, and given one stream timeout to hear
+                    // it. One that does not is left to time out.
                     if tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
                         conn_mgr.shutdown_and_wait(),
                     ).await.is_err() {
-                        tracing::warn!("shutdown_and_wait timed out (30s), forcing close");
+                        tracing::warn!("closing the connections took longer than a stream timeout; not waiting for it");
                     }
                     break;
                 }

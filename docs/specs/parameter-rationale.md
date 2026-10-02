@@ -592,15 +592,29 @@ peer crash (QUIC idle timeout was the only backstop).
 
 **Rationale:** A node that is told to stop exits within a bounded time,
 whatever one of its parts is waiting for. Once it has been told, it waits
-this long at most for its HTTP server, and for its peer-to-peer loop, and
-then exits without them. The HTTP server gives a request that is still
-open one STREAM_TIMEOUT to finish.
+this long at most, for its HTTP server and its peer-to-peer loop together,
+and then exits without what has not finished. Work that cannot be
+interrupted (a sync cycle, a database write) is then given one more
+STREAM_TIMEOUT, and is left as a crash would leave it. So a node exits
+within 40 seconds of being told, and as a rule within a second.
 
-**Derivation:** Closing connections and finishing local API requests each
-take well under one STREAM_TIMEOUT; three is margin. A service manager
-kills a node that has not exited after a minute and a half, so a node that
-waited for ever would make every restart and upgrade take that long. One
-did not exit at all in a test: its HTTP server never finished stopping.
+The HTTP server is stopped at once, not gracefully. A request to the local
+API is handled in one step, so a connection is dropped before its request
+is handled or after, never in the middle. A graceful stop waits for every
+worker of the server to answer, and in actix-server 2.6 a worker can leave
+without answering, so that the wait never ends (#99).
+
+A node whose HTTP server or peer-to-peer loop ends without its being told
+to stop stops the other, and exits with a failure, so that whatever runs it
+starts it again. It does not run on without a part, looking alive.
+
+**Derivation:** The peer-to-peer loop may be in the middle of a stream
+operation when it is told (one STREAM_TIMEOUT at most), and then gives its
+peers one STREAM_TIMEOUT to hear that it is closing; the third is margin.
+systemd kills a node that has not exited after a minute and a half, so a
+node that waited for ever would make every restart and upgrade take that
+long. launchd (20 seconds) and Docker (10 seconds, unless a grace period
+is set) kill sooner; that is what a crash is, and loses nothing written.
 
 ---
 

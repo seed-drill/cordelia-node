@@ -938,77 +938,144 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
                 .configure(cordelia_api::configure_routes)
         })
         .bind(&listen_addr)?
-        // This node handles the signals that stop it (below), and tells
-        // the server to stop. A request still open then has one stream
-        // timeout to finish.
+        // Only this node handles the signals that stop it, and it tells
+        // the server how to stop (below). Left to handle SIGTERM itself,
+        // the server would stop gracefully.
         .disable_signals()
-        .shutdown_timeout(cordelia_core::protocol::STREAM_TIMEOUT_SECS)
         .run();
 
         let server_handle = server.handle();
-
-        // Spawn signal handler for graceful shutdown
         let p2p_shutdown_tx = p2p_shutdown.0;
-        let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            tracing::info!("shutdown signal received, stopping");
-            let _ = p2p_shutdown_tx.send(true);
-            let _ = stopping_tx.send(());
-            server_handle.stop(true).await;
-        });
 
         tracing::info!("P2P layer ready, accepting connections");
 
-        // A node that is told to stop exits within a bounded time,
-        // whatever one of its parts is waiting for.
-        let stop_timeout =
-            std::time::Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS);
-        let result = match finished_or_stopped(server, stopping_rx, stop_timeout).await {
-            Some(result) => result.map_err(|e| anyhow::anyhow!(e)),
-            None => {
-                tracing::warn!("the HTTP server did not stop in time; exiting without it");
-                Ok(())
-            }
-        };
+        // The node runs until it is told to stop, or one of its parts ends
+        // by itself. Then every part is told to stop, and the node waits
+        // for them a bounded time, whatever one of them is waiting for.
+        let stopped = run_until_stopped(
+            server,
+            p2p_handle,
+            async {
+                shutdown_signal().await;
+                tracing::info!("shutdown signal received, stopping");
+            },
+            move || {
+                let _ = p2p_shutdown_tx.send(true);
+                // The server is stopped at once, not gracefully. A graceful
+                // stop waits for every worker to answer, and in the server
+                // this node is built with a worker can leave without
+                // answering, so that the wait never ends (#99). Nothing is
+                // lost by it: a request to the API is handled in one step,
+                // so a connection is dropped before its request is handled
+                // or after, never in the middle. The server's own future
+                // says when it has stopped.
+                tokio::spawn(server_handle.stop(false));
+            },
+            std::time::Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS),
+        )
+        .await;
 
-        // Wait for P2P loop to finish
-        if tokio::time::timeout(stop_timeout, p2p_handle).await.is_err() {
-            tracing::warn!("the P2P loop did not stop in time; exiting without it");
+        match &stopped.server {
+            None => tracing::warn!("the HTTP server did not stop in time; exiting without it"),
+            Some(Err(e)) => tracing::error!(error = %e, "the HTTP server failed"),
+            Some(Ok(())) => {}
         }
-        tracing::info!("P2P shutdown complete");
-
-        result
+        match &stopped.p2p {
+            None => tracing::warn!("the P2P loop did not stop in time; exiting without it"),
+            Some(Err(e)) => tracing::error!(error = %e, "the P2P loop failed"),
+            Some(Ok(())) => tracing::info!("P2P shutdown complete"),
+        }
+        stopped.result()
     });
-    // Tasks still running are dropped; work that cannot be interrupted
-    // (a database write) is given a moment.
+    // Tasks still running are dropped. Work that cannot be interrupted (a
+    // sync cycle, a database write) is given one stream timeout to finish,
+    // and is then left as a crash would leave it.
     runtime.shutdown_timeout(std::time::Duration::from_secs(
         cordelia_core::protocol::STREAM_TIMEOUT_SECS,
     ));
     result
 }
 
-/// Wait for `running`, a part of the node that runs until the node is told
-/// to stop. Once the node has been told (`told`), wait `at_most` longer and
-/// no more: `None` if `running` had not finished by then.
+/// How a node's run ended.
+struct Stopped<S, P> {
+    /// Whether the node was told to stop. If it was not, one of its parts
+    /// ended by itself, and that stopped the node.
+    told: bool,
+    /// What the HTTP server finished with, if it finished in time.
+    server: Option<S>,
+    /// What the peer-to-peer loop finished with, if it finished in time.
+    p2p: Option<P>,
+}
+
+impl<E: std::fmt::Display, P> Stopped<Result<(), E>, P> {
+    /// What the node exits with. A node that was told to stop, and whose
+    /// HTTP server did not fail, has done what was asked of it, though a
+    /// part did not finish in time. A node that stopped because one of its
+    /// parts ended has failed: whatever runs it starts it again.
+    fn result(self) -> anyhow::Result<()> {
+        if !self.told {
+            anyhow::bail!("a part of the node ended, though the node was not told to stop");
+        }
+        match self.server {
+            Some(Err(e)) => Err(anyhow::anyhow!("the HTTP server failed: {e}")),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Run a node's two parts until the node is told to stop (`told`), or one
+/// of them ends by itself. Then tell them to stop (`stop`), and wait for
+/// what is still running: `at_most` in all, and no more.
 ///
 /// A node that waited for ever for one of its parts would never exit. One
-/// did: its HTTP server did not finish stopping (#99).
-async fn finished_or_stopped<F: std::future::Future>(
-    running: F,
-    told: tokio::sync::oneshot::Receiver<()>,
+/// did: its HTTP server never finished stopping (#99). And a node that ran
+/// on without one of its parts would look alive and do nothing.
+async fn run_until_stopped<S, P>(
+    server: impl std::future::Future<Output = S>,
+    p2p: impl std::future::Future<Output = P>,
+    told: impl std::future::Future<Output = ()>,
+    stop: impl FnOnce(),
     at_most: std::time::Duration,
-) -> Option<F::Output> {
-    let out_of_time = async {
-        // Never, if the node is never told to stop.
-        if told.await.is_err() {
-            std::future::pending::<()>().await;
+) -> Stopped<S, P> {
+    tokio::pin!(server, p2p, told);
+    let (mut server_out, mut p2p_out) = (None, None);
+    let was_told = tokio::select! {
+        biased;
+        _ = &mut told => true,
+        out = &mut server => {
+            server_out = Some(out);
+            false
         }
-        tokio::time::sleep(at_most).await;
+        out = &mut p2p => {
+            p2p_out = Some(out);
+            false
+        }
     };
-    tokio::select! {
-        output = running => Some(output),
-        _ = out_of_time => None,
+    if !was_told {
+        let part = if server_out.is_some() {
+            "HTTP server"
+        } else {
+            "P2P loop"
+        };
+        tracing::error!(
+            part,
+            "a part of the node ended, though the node was not told to stop; stopping the node"
+        );
+    }
+    stop();
+    let out_of_time = tokio::time::sleep(at_most);
+    tokio::pin!(out_of_time);
+    while server_out.is_none() || p2p_out.is_none() {
+        tokio::select! {
+            out = &mut server, if server_out.is_none() => server_out = Some(out),
+            out = &mut p2p, if p2p_out.is_none() => p2p_out = Some(out),
+            _ = &mut out_of_time => break,
+        }
+    }
+    Stopped {
+        told: was_told,
+        server: server_out,
+        p2p: p2p_out,
     }
 }
 
@@ -2335,12 +2402,17 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        // SIGQUIT stops the node as the others do. Left alone it would end
+        // the process with a core, and the node's keys are in its memory.
+        let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
 
         tokio::select! {
             _ = ctrl_c => { tracing::info!("received SIGINT"); }
             _ = sigterm.recv() => { tracing::info!("received SIGTERM"); }
+            _ = sigquit.recv() => { tracing::info!("received SIGQUIT"); }
         }
     }
 
@@ -2367,59 +2439,180 @@ fn init_tracing(level: &str) {
 
 #[cfg(test)]
 mod tests {
-    /// A node that is told to stop exits within a bounded time, whatever
-    /// one of its parts is waiting for. A part that never finishes is
-    /// waited for only so long once the node has been told to stop; until
-    /// then it is left to run.
-    #[tokio::test]
-    async fn a_part_that_never_finishes_is_waited_for_only_so_long() {
-        use std::time::{Duration, Instant};
-        let never = std::future::pending::<u8>;
-        let at_most = Duration::from_millis(200);
+    /// A part of a node, for these tests: it runs until it is told to stop,
+    /// and then takes `to_stop` to finish, or never does.
+    async fn part(
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        to_stop: Option<std::time::Duration>,
+    ) -> Result<(), String> {
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        match to_stop {
+            Some(time) => tokio::time::sleep(time).await,
+            None => std::future::pending::<()>().await,
+        }
+        Ok(())
+    }
 
-        // A part that finishes is waited for.
-        let (_tell, told) = tokio::sync::oneshot::channel();
-        assert_eq!(
-            finished_or_stopped(async { 7u8 }, told, at_most).await,
-            Some(7)
-        );
-
-        // Told to stop, and the part never finishes: given up on after the
-        // time allowed, and not before.
-        let (tell, told) = tokio::sync::oneshot::channel();
-        tell.send(()).unwrap();
-        let began = Instant::now();
-        let given_up = tokio::time::timeout(
-            Duration::from_secs(10),
-            finished_or_stopped(never(), told, at_most),
+    /// Run two such parts as a node does. The node is told to stop after
+    /// `told_after`, if at all. The parts take `server` and `p2p` to stop.
+    /// Returns how the run ended and how long it took.
+    async fn run_parts(
+        told_after: Option<std::time::Duration>,
+        server: Option<std::time::Duration>,
+        p2p: Option<std::time::Duration>,
+    ) -> (
+        Stopped<Result<(), String>, Result<(), String>>,
+        std::time::Duration,
+    ) {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let began = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            part(stop_rx.clone(), server),
+            part(stop_rx, p2p),
+            async {
+                match told_after {
+                    Some(time) => tokio::time::sleep(time).await,
+                    None => std::future::pending::<()>().await,
+                }
+            },
+            move || {
+                let _ = stop_tx.send(true);
+            },
+            AT_MOST,
         )
-        .await
-        .expect("a part that never finishes was waited for without end");
-        assert_eq!(given_up, None);
-        assert!(began.elapsed() >= at_most, "{:?}", began.elapsed());
+        .await;
+        (stopped, began.elapsed())
+    }
 
-        // Not told to stop: the part is left to run, however long.
-        let (_tell, told) = tokio::sync::oneshot::channel();
-        assert!(
-            tokio::time::timeout(
-                4 * at_most,
-                finished_or_stopped(never(), told, Duration::ZERO)
-            )
+    const AT_MOST: std::time::Duration = std::time::Duration::from_secs(30);
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+    fn secs(n: u64) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(n))
+    }
+
+    /// A node that is told to stop exits within a bounded time, whatever
+    /// one of its parts is waiting for: a part that never finishes is
+    /// waited for only so long, and the node says which part it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_told_to_stop_waits_for_its_parts_only_so_long() {
+        // The HTTP server never finishes stopping.
+        let (stopped, took) = tokio::time::timeout(DAY, run_parts(secs(5), None, secs(1)))
             .await
-            .is_err(),
-            "a part was given up on though the node was not told to stop"
-        );
-        // Nor when nothing is left that could tell it.
-        let (tell, told) = tokio::sync::oneshot::channel::<()>();
-        drop(tell);
-        assert!(
-            tokio::time::timeout(
-                4 * at_most,
-                finished_or_stopped(never(), told, Duration::ZERO)
-            )
+            .expect("a part that never finishes was waited for without end");
+        assert_eq!(took, secs(5).unwrap() + AT_MOST);
+        assert!(stopped.told);
+        assert!(stopped.server.is_none(), "the server never finished");
+        assert_eq!(stopped.p2p, Some(Ok(())));
+        assert!(stopped.result().is_ok(), "the node was told to stop");
+
+        // Nor does the peer-to-peer loop.
+        let (stopped, took) = tokio::time::timeout(DAY, run_parts(secs(5), secs(1), None))
             .await
-            .is_err()
+            .expect("a part that never finishes was waited for without end");
+        assert_eq!(took, secs(5).unwrap() + AT_MOST);
+        assert_eq!(stopped.server, Some(Ok(())));
+        assert!(stopped.p2p.is_none(), "the loop never finished");
+
+        // Parts that finish are waited for, and no longer.
+        let (stopped, took) = run_parts(secs(5), secs(2), secs(1)).await;
+        assert_eq!(took, secs(7).unwrap());
+        assert_eq!((stopped.server, stopped.p2p), (Some(Ok(())), Some(Ok(()))));
+    }
+
+    /// The time a node waits is for both parts together, counted from when
+    /// it is told to stop: a part does not get the whole of it again after
+    /// the other has finished.
+    #[tokio::test(start_paused = true)]
+    async fn the_time_to_stop_is_for_the_whole_node() {
+        let (stopped, took) = tokio::time::timeout(DAY, run_parts(secs(5), secs(20), None))
+            .await
+            .unwrap();
+        assert_eq!(took, secs(5).unwrap() + AT_MOST);
+        assert_eq!(stopped.server, Some(Ok(())));
+        assert!(stopped.p2p.is_none());
+    }
+
+    /// A node that is not told to stop runs on, however long, and its parts
+    /// are not told to stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_is_not_told_to_stop_runs_on() {
+        assert!(
+            tokio::time::timeout(DAY, run_parts(None, secs(1), secs(1)))
+                .await
+                .is_err(),
+            "a node stopped though it was not told to"
         );
+    }
+
+    /// A node whose part ends by itself stops: the other part is told to
+    /// stop, and the node exits with a failure, so that whatever runs it
+    /// starts it again. A node that ran on without its peer-to-peer loop
+    /// would answer its local API and sync nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_whose_part_ends_by_itself_stops() {
+        for which in ["the peer-to-peer loop", "the HTTP server"] {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let ends = async {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Err::<(), String>("it broke".into())
+            };
+            let other = part(stop_rx.clone(), secs(1));
+            let began = tokio::time::Instant::now();
+            let run = async {
+                let stop = move || {
+                    let _ = stop_tx.send(true);
+                };
+                let never = std::future::pending::<()>();
+                if which == "the HTTP server" {
+                    run_until_stopped(ends, other, never, stop, AT_MOST).await
+                } else {
+                    let stopped = run_until_stopped(other, ends, never, stop, AT_MOST).await;
+                    Stopped {
+                        told: stopped.told,
+                        server: stopped.p2p,
+                        p2p: stopped.server,
+                    }
+                }
+            };
+            let stopped = tokio::time::timeout(DAY, run)
+                .await
+                .unwrap_or_else(|_| panic!("the node ran on though {which} had ended"));
+            // The part that ended is in `server` here, whichever it was.
+            assert_eq!(began.elapsed(), secs(11).unwrap(), "{which}");
+            assert!(!stopped.told, "{which}");
+            assert_eq!(stopped.server, Some(Err("it broke".into())), "{which}");
+            assert_eq!(
+                stopped.p2p,
+                Some(Ok(())),
+                "{which}: the other part was told to stop"
+            );
+            assert!(*stop_rx.borrow(), "{which}");
+            assert!(
+                stopped.result().is_err(),
+                "{which}: the node must exit with a failure"
+            );
+        }
+    }
+
+    /// What a node exits with: success only if it was told to stop and its
+    /// HTTP server did not fail.
+    #[test]
+    fn a_node_exits_with_a_failure_unless_it_was_told_to_stop() {
+        let stopped = |told, server| Stopped::<Result<(), String>, ()> {
+            told,
+            server,
+            p2p: Some(()),
+        };
+        assert!(stopped(true, Some(Ok(()))).result().is_ok());
+        assert!(stopped(true, None).result().is_ok());
+        assert!(stopped(true, Some(Err("bind".into()))).result().is_err());
+        assert!(stopped(false, Some(Ok(()))).result().is_err());
+        assert!(stopped(false, None).result().is_err());
     }
 
     use super::*;

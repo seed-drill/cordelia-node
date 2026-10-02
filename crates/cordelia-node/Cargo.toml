@@ -32,3 +32,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A clock that tests can run ahead, for the waits in a node's stopping.
+tokio = { workspace = true, features = ["test-util"] }

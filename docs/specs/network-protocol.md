@@ -146,14 +146,14 @@ These parameters apply to both client and server transport configs on the quinn 
 
 **Incoming connection accept:** The `incoming.await` call (QUIC/TLS handshake for inbound connections) MUST have a 10-second timeout. Without this, a stalled handshake blocks the accept loop and prevents ALL other protocol operations on the node. (See BV-23.)
 
-**Endpoint shutdown lifecycle:** On SIGTERM or graceful shutdown, the node MUST:
+**Endpoint shutdown lifecycle:** On SIGTERM, SIGINT or SIGQUIT, the node MUST:
 1. Call `endpoint.close()` to send CONNECTION_CLOSE to all peers
-2. Call `endpoint.wait_idle()` to drain in-flight streams and release the UDP socket
-3. Only then exit the process
+2. Call `endpoint.wait_idle()` to drain in-flight streams and release the UDP socket, for at most one STREAM_TIMEOUT
+3. Only then exit the process, within NODE_STOP_TIMEOUT of being told in all (parameter-rationale.md §6)
 
 Without `wait_idle()`, the UDP socket may not be released before the OS recycles the port. The next process on the same IP:port may receive stale QUIC packets from peers that haven't processed the CONNECTION_CLOSE yet, causing `open_bi()` hangs (MAX_STREAMS not granted on confused connection state).
 
-Docker containers SHOULD set `stop_grace_period: 30s` to allow time for `wait_idle()`.
+Docker containers SHOULD set `stop_grace_period: 40s` (NODE_STOP_TIMEOUT and one STREAM_TIMEOUT), so that a node is not killed before its own bound. The relay's `deploy/relay/compose.yml` does.
 
 **Host kernel tuning for QUIC/UDP:** Production and test hosts running QUIC nodes MUST apply:
 ```
