@@ -1229,3 +1229,211 @@ async fn t03_a_relay_refuses_an_entry_over_the_size_limit() {
     let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
     assert_eq!(stats["items_stored"], 1, "{stats}");
 }
+
+/// A client of a relay that is not a node: it connects as any node may, and
+/// pushes whatever the test gives it.
+struct Client {
+    identity: Arc<cordelia_crypto::identity::NodeIdentity>,
+    conn: quinn::Connection,
+    _manager: cordelia_network::connection::ConnectionManager,
+}
+
+/// Connect a new client, with a key of its own, to `relay`.
+async fn client_of(relay: &Node) -> Result<Client, String> {
+    use cordelia_network::{connection, transport};
+    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let mut manager = connection::ConnectionManager::new(
+        identity.clone(),
+        endpoint,
+        vec![],
+        vec!["personal".into()],
+        port,
+    );
+    let relay_id = manager
+        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
+        .await
+        .map_err(|e| e.to_string())?;
+    let conn = manager.get_connection(&relay_id).unwrap().clone();
+    Ok(Client {
+        identity,
+        conn,
+        _manager: manager,
+    })
+}
+
+impl Client {
+    /// An entry of `bytes` bytes, signed by this client, as it travels.
+    fn entry(&self, bytes: usize) -> cordelia_network::messages::Item {
+        let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
+        let item_id = cordelia_storage::items::generate_item_id();
+        // Distinct content for each entry.
+        let mut blob = vec![7u8; bytes];
+        let tag = item_id.as_bytes();
+        blob[..tag.len().min(bytes)].copy_from_slice(&tag[..tag.len().min(bytes)]);
+        let hash = cordelia_crypto::sha256(&blob);
+        let published_at = "2026-10-02T00:00:00Z";
+        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+            &self.identity.public_key(),
+            channel,
+            &hash,
+            false,
+            &item_id,
+            1,
+            published_at,
+        )
+        .unwrap();
+        cordelia_network::messages::Item {
+            item_id,
+            channel_id: channel.into(),
+            item_type: "memory".into(),
+            content_length: blob.len() as u32,
+            encrypted_blob: blob,
+            content_hash: hash.to_vec(),
+            author_id: self.identity.public_key().to_vec(),
+            signature: self.identity.sign(&cbor).to_vec(),
+            key_version: 1,
+            published_at: published_at.into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        }
+    }
+
+    /// Push `items` in one push. `Err` if the relay did not answer it.
+    async fn push(
+        &self,
+        items: &[cordelia_network::messages::Item],
+    ) -> Result<cordelia_network::messages::PushAck, String> {
+        let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| e.to_string())?;
+        let mut stream = tokio::io::join(&mut recv, &mut send);
+        cordelia_network::item_sync::send_push(&mut stream, items)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// T3. A peer that keeps going over its rate is cut off, and its address is
+/// refused for a time. A client pushes as fast as it can: what is within
+/// the rate is stored, the next pushes are refused at once, and at the
+/// third the relay closes the connection. The client cannot come back,
+/// under the same key or a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_peer_over_its_rate_is_cut_off_and_refused_for_a_time() {
+    use cordelia_core::protocol::{BAN_THRESHOLD, ERR_RATE_LIMIT, WRITES_PER_PEER_PER_MINUTE};
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let client = client_of(&relay).await.expect("the client connects");
+
+    let mut stored = 0;
+    let mut refused = 0;
+    for _ in 0..WRITES_PER_PEER_PER_MINUTE + BAN_THRESHOLD {
+        match client.push(&[client.entry(64)]).await {
+            Ok(ack) => stored += ack.stored,
+            Err(_) => refused += 1,
+        }
+    }
+    assert_eq!(
+        stored, WRITES_PER_PEER_PER_MINUTE,
+        "what is within the rate is stored"
+    );
+    assert_eq!(refused, BAN_THRESHOLD, "the rest is refused");
+
+    // The relay closed the connection, and says why.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), client.conn.closed())
+        .await
+        .expect("the relay did not close the connection");
+    match closed {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(
+                close.error_code,
+                quinn::VarInt::from_u32(ERR_RATE_LIMIT),
+                "{close:?}"
+            );
+        }
+        other => panic!("closed for another reason: {other:?}"),
+    }
+    // It is not let back in: not under a new key either, since it is the
+    // address that is refused.
+    assert!(
+        client_of(&relay).await.is_err(),
+        "the address was let back in"
+    );
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], WRITES_PER_PEER_PER_MINUTE, "{stats}");
+}
+
+/// T3. A connection may push two megabytes of entries a minute. A third
+/// megabyte is refused, and nothing of it is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_connection_may_push_two_megabytes_a_minute() {
+    use cordelia_core::protocol::MAX_ITEM_BYTES;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let client = client_of(&relay).await.expect("the client connects");
+
+    // Fifteen entries of the largest size: 960 KB a push.
+    let megabyte = || -> Vec<_> { (0..15).map(|_| client.entry(MAX_ITEM_BYTES)).collect() };
+    assert_eq!(client.push(&megabyte()).await.unwrap().stored, 15);
+    assert_eq!(client.push(&megabyte()).await.unwrap().stored, 15);
+    assert!(
+        client.push(&megabyte()).await.is_err(),
+        "a third megabyte was taken"
+    );
+    // A small push still fits in what is left of the allowance.
+    assert_eq!(client.push(&[client.entry(64)]).await.unwrap().stored, 1);
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], 31, "{stats}");
+}
+
+/// T3. An address has its share of connections, and the next one is turned
+/// away as it arrives, before the cost of a handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_an_address_is_turned_away_once_it_has_its_share_of_connections() {
+    use cordelia_core::protocol::MAX_CONNECTIONS_PER_IP;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+
+    let mut clients = Vec::new();
+    for n in 0..MAX_CONNECTIONS_PER_IP {
+        clients.push(
+            client_of(&relay)
+                .await
+                .unwrap_or_else(|e| panic!("connection {n} was refused: {e}")),
+        );
+    }
+    assert!(
+        client_of(&relay).await.is_err(),
+        "one more connection than an address's share was accepted"
+    );
+    // It was turned away as it arrived: the relay did no handshake with it.
+    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
+    assert!(
+        log.contains("turning an inbound connection away before the handshake"),
+        "the relay did not turn it away on arrival"
+    );
+    assert!(
+        !log.contains("rejecting: connection limit exceeded"),
+        "the relay shook hands with it first"
+    );
+    // When one goes, there is room again.
+    let gone = clients.pop().unwrap();
+    gone.conn.close(0u32.into(), b"done");
+    drop(gone);
+    let again = wait_for("room for another connection", &[&relay], 30, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(client_of(&relay))
+                .ok()
+        })
+    });
+    drop(again);
+}

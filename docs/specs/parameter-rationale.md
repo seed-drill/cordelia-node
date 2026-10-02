@@ -55,18 +55,30 @@ Other operations (push, sync, peer-sharing) are delayed. Not recommended.
 
 **If you decrease to 3s:** May reject legitimate connections on slow networks.
 
-### max_concurrent_bidi_streams = 1000
+### max_concurrent_bidi_streams = 64, no unidirectional streams
 
-**Rationale:** Maximum bidirectional streams per QUIC connection. Each protocol
-operation (push, sync, peer-share) opens one stream. With 7 protocols, a
-busy peer might have 10-20 concurrent operations. 1000 provides headroom
-for burst traffic without exhaustion.
+**Rationale:** How many streams a peer may have open on one connection at
+once. Each exchange (a push, a sync, an announcement) is one stream, and a
+node handles one stream of a connection at a time, so real use is a
+handful. The protocol uses no unidirectional streams, so a peer may open
+none.
 
-**Reference:** Quinn default is 100. We increased to 1000 after BV-22 showed
-that unclosed streams could exhaust the limit.
+**History:** It was 1000, raised from Quinn's 100 after BV-22, where
+streams that were never closed used the allowance up. Those are closed
+now. 1000 streams, each with its own buffer, let one connection hold
+over a gigabyte of a node's memory.
 
-**If you decrease to 100:** Risk of open_bi hanging under burst load
-(many concurrent push + sync operations).
+### stream_receive_window = 1MB, receive_window = 2MB
+
+**Rationale:** How much a peer may send before this node has read it: one
+message on a stream, and two messages on a whole connection. The second
+is what bounds the memory one connection can make a node hold. Quinn's
+default has no limit for the connection.
+
+**Derivation:** An exchange is one message each way, so one message per
+stream is enough. Two for the connection lets a second exchange begin
+while the first is being read. With 200 connections a relay holds at
+most 400MB unread.
 
 ---
 
@@ -361,6 +373,35 @@ and channel, and goes back to 100 once it has caught up there.
 one 1 MB message (checked at compile time). 3 covers entries written
 before 0.2.0-alpha.4, which could be 256 KB. 1 always fits. Most pages
 hold small entries and never leave 100.
+
+### push_bytes_per_peer_per_minute = 2MB, outbox_bytes_per_minute = 1.5MB
+
+**Rationale:** The count of pushes a minute bounds little by itself, since
+one push can be a whole message. So a connection may also push only so
+many bytes of entries a minute. A push that would go over is refused
+whole, with no answer, so a sender on any version keeps what it sent.
+
+A device paces itself to 1.5MB a minute to each relay, a quarter under
+what a relay allows, so that it is never the one refused.
+
+**Derivation:** Two days of our own use is 49KB across five channels. Our
+whole skills folder is 4MB, which takes about three minutes to send the
+first time. From one address, with its five connections, a relay takes at
+most 10MB a minute.
+
+### limits for an address = 5 x the limits for a connection
+
+**Rationale:** A connection's allowance is counted for the key that
+connected. A key costs nothing, so a peer that reconnects under a new one
+would start again from nothing. An address is what an outsider has to
+spend. So all the connections from one address share
+max_connections_per_ip times what one connection may send, counted for the
+address whatever keys it uses.
+
+A peer that goes over three times in ten minutes is cut off, and its
+address is refused for 15 minutes (ban_transient). Two relays that list
+each other are not limited: they are one operator's, and each passes on
+everything its devices send.
 
 ### outbox_refused_retry_max = 600s
 
