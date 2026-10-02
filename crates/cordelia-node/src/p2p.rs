@@ -609,8 +609,9 @@ pub async fn p2p_loop(
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
 
     // Pull-sync cursors (§4.4a): per (peer, channel), the peer's arrival
-    // sequence of the last item we have processed. In memory: after a
-    // restart each channel is re-listed once, and only unknown items fetched.
+    // sequence of the last item we have processed. In memory, and for one
+    // connection: after a restart, or when a peer connects again, each
+    // channel is re-listed once, and only unknown items fetched.
     let sync_cursors: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -914,6 +915,14 @@ pub async fn p2p_loop(
                                     "connected via peer-sharing"
                                 };
                                 tracing::info!(peer = %node_id, peers = count, "{}", dir_label);
+                                // The peer may have lost or replaced its database
+                                // since the last connection (a relay that was
+                                // rebuilt). Its arrival sequence then starts again,
+                                // and a position kept from before would skip
+                                // everything it stores from now on.
+                                if let Ok(mut cursors) = sync_cursors.lock() {
+                                    cursors.retain(|(peer, _), _| peer != &node_id);
+                                }
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
