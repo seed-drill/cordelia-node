@@ -381,9 +381,6 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     deliver(&a, &b, "last", &[&r1, &r2, &a, &b]);
 }
 
-/// A personal node only dials out. It starts and reaches its relay while
-/// something else holds its configured P2P port, so it cannot be listening
-/// there; told to listen, the same node needs the port and cannot start.
 /// A device with two relays, one of them down. It says so, with the reason,
 /// and goes on trying at a slowing pace; when the relay comes up it is
 /// connected again without a restart.
@@ -452,6 +449,78 @@ fn a_relay_that_is_down_is_shown_and_found_when_it_comes_up() {
     assert!(!said.contains("not connected"), "{said}");
 }
 
+/// A relay loses its database (it was rebuilt) while two devices stay up.
+/// What a device writes afterwards still reaches the other one through
+/// that relay. A device keeps its place in each channel's list at a relay;
+/// the rebuilt relay starts its list again, so a place kept from before
+/// would skip everything it stores from then on. The place lasts only as
+/// long as the connection.
+#[test]
+fn a_relay_that_lost_its_database_still_carries_what_is_written_next() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
+    let publish = |n: &Node, key: &str, text: &str| {
+        n.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
+        )
+    };
+    let reads = |n: &Node, key: &str, text: &str| {
+        n.post(
+            "/api/v1/channels/entries",
+            serde_json::json!({ "channel": personal }),
+        )["entries"]
+            .as_array()?
+            .iter()
+            .any(|e| e["key"] == key && e["content"]["text"] == text)
+            .then_some(())
+    };
+
+    // Enough goes through the relay for B's place in the channel's list to
+    // be well past where the rebuilt relay will start again.
+    for n in 0..5 {
+        publish(&a, &format!("before-{n}.md"), "before");
+    }
+    wait_for("b reads what a wrote", &[&relay, &a, &b], 90, || {
+        reads(&b, "before-4.md", "before")
+    });
+
+    // The relay comes back with nothing. Both devices find it again.
+    relay.stop();
+    for file in ["cordelia.db", "cordelia.db-wal", "cordelia.db-shm"] {
+        let _ = std::fs::remove_file(relay.data_dir().join(file));
+    }
+    relay.start();
+    let all = [&relay, &a, &b];
+    wait_for("relay healthy again", &all, 30, || healthy(&relay));
+    for n in [&a, &b] {
+        wait_for("connected to the relay again", &all, 90, || has_hot_peer(n));
+    }
+
+    publish(&a, "after.md", "after");
+    wait_for(
+        "b reads what a wrote after the relay lost its database",
+        &all,
+        90,
+        || reads(&b, "after.md", "after"),
+    );
+}
+
+/// A personal node only dials out. It starts and reaches its relay while
+/// something else holds its configured P2P port, so it cannot be listening
+/// there; told to listen, the same node needs the port and cannot start.
 #[test]
 fn a_personal_node_listens_on_nothing() {
     let mut relay = node("relay", "relay", None);
