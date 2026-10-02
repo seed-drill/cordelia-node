@@ -345,6 +345,20 @@ pub fn build_descriptor_signing_payload(desc: &ChannelDescriptor) -> Vec<u8> {
     buf
 }
 
+/// What a node says when it announces a channel to a peer: the channel's
+/// ID, signed by the node, and nothing that describes the channel.
+///
+/// The descriptor's other fields stay in the wire format and are left
+/// empty. A relay needs none of them, and is to learn channel IDs, sizes
+/// and timing and nothing else (decision 2026-09-30 §5). A channel's name
+/// in particular says what it is for: a project's is its repository.
+pub fn announcement(
+    identity: &cordelia_crypto::identity::NodeIdentity,
+    channel_id: &str,
+) -> ChannelDescriptor {
+    create_signed_descriptor(identity, channel_id, None, "", "", &[0u8; 32], 0, "")
+}
+
 /// Create and sign a channel descriptor.
 #[allow(clippy::too_many_arguments)]
 pub fn create_signed_descriptor(
@@ -381,6 +395,23 @@ mod tests {
     use crate::codec::read_frame;
     use cordelia_crypto::identity::NodeIdentity;
     use sha2::{Digest, Sha256};
+
+    /// T1. An announcement carries the channel's ID and the announcer's
+    /// signature, and no field that describes the channel.
+    #[test]
+    fn an_announcement_says_nothing_about_the_channel_but_its_id() {
+        let id = NodeIdentity::generate().unwrap();
+        let d = announcement(&id, "grp_0f3c");
+        assert_eq!(d.channel_id, "grp_0f3c");
+        assert_eq!(d.creator_id, id.public_key().to_vec());
+        assert_eq!(d.channel_name, None);
+        assert_eq!((d.access.as_str(), d.mode.as_str()), ("", ""));
+        assert_eq!(d.created_at, "");
+        assert_eq!(d.key_version, 0);
+        assert_eq!(d.psk_hash, vec![0u8; 32]);
+        // A relay still accepts it, including one that predates this.
+        validate_descriptor(&d).unwrap();
+    }
 
     fn make_test_descriptor(identity: &NodeIdentity) -> ChannelDescriptor {
         let psk = [0xAA; 32];

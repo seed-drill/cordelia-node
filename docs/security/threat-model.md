@@ -18,7 +18,7 @@ belongs to something that is not built or designed in public yet.
 
 | # | Who | What they can try | What must hold | State |
 |---|---|---|---|---|
-| T1 | A relay's operator, or anyone who takes a relay's disk | Read what the relay stores and logs | A relay holds ciphertext, sizes, times, channel IDs and device keys. It never holds an entry's name, its content, or a label | tested |
+| T1 | A relay's operator, or anyone who takes a relay's disk | Read what the relay is told, stores and logs | A relay is told a channel's ID and nothing else about the channel. It holds ciphertext, sizes, times, channel IDs and device keys, and never an entry's name, its content, or a label. Each entry still travels with its type in clear, such as memory or invite | partly tested (#61) |
 | T13 | A stranger who knows a device's public key | Add that device to a channel of their own, so that it syncs its memory to them; or replace the members or keys of a channel the device is in | A device joins only a channel offered by a device it was told to trust, and takes changes to a channel only from that channel's members | tested |
 | T16 | A device that was removed | Read what is written after its removal, and keep writing | The channel's key changes on removal and goes only to the devices that remain. What a removed device writes afterwards is shown to nobody | tested |
 | T17 | Another program running as the same user | Read the node's files and memory, and call its local API | Nothing. Cordelia does not defend against this; real separation needs separate users or machines | not defended |
@@ -29,6 +29,8 @@ belongs to something that is not built or designed in public yet.
 
 ### T1
 - `crates/cordelia-node/tests/threat_model.rs`: `t01_a_relay_holds_nothing_it_can_read`
+- `crates/cordelia-node/tests/threat_model.rs`: `t01_a_device_tells_a_relay_only_a_channels_id`
+- `crates/cordelia-network/src/channel_announce.rs`: `an_announcement_says_nothing_about_the_channel_but_its_id`
 
 ### T13
 - `crates/cordelia-api/tests/membership.rs`: `stranger_cannot_join_or_change_channels`

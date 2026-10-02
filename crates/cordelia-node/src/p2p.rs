@@ -2166,21 +2166,9 @@ async fn send_channel_announcements(
         .map_err(|e| format!("write protocol byte: {e}"))?;
 
     for ch in &channels {
-        let psk_hash: [u8; 32] = ch
-            .psk_hash
-            .as_ref()
-            .and_then(|h| h.as_slice().try_into().ok())
-            .unwrap_or([0u8; 32]);
-        let descriptor = cordelia_network::channel_announce::create_signed_descriptor(
-            &state.identity,
-            &ch.channel_id,
-            ch.channel_name.as_deref(),
-            &ch.access,
-            &ch.mode,
-            &psk_hash,
-            ch.key_version as u32,
-            &ch.created_at,
-        );
+        // The ID and nothing else: a relay is not told a channel's name.
+        let descriptor =
+            cordelia_network::channel_announce::announcement(&state.identity, &ch.channel_id);
         if let Err(e) = cordelia_network::channel_announce::send_channel_joined(
             &mut send,
             &ch.channel_id,
