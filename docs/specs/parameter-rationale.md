@@ -317,6 +317,19 @@ many items were written. Before the outbox, each write was its own push and
 a burst of 150 writes tripped the limit 467 times, losing most items.
 Checked at compile time in protocol.rs.
 
+### outbox_refused_retry_max = 600s
+
+**Rationale:** An item that a relay refused stays in the outbox and is
+offered again, to the next relay in turn. The wait doubles from the flush
+interval after each refusal in a row (4s, 8s, 16s, ...) and stops growing
+here.
+
+**Derivation:** A relay refuses for a passing reason (it is restarting, its
+disk is full) or a lasting one (the item is not valid for it). The first
+few retries, seconds apart, cover the passing kind. For the lasting kind,
+one small push every ten minutes costs nothing, and delivers the item
+within ten minutes of the reason going away.
+
 ### outbox_batch_max_bytes = 768KB, outbox_batch_max_items = 500
 
 **Rationale:** One outbox push must fit in max_message_bytes with room for

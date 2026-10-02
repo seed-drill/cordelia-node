@@ -413,11 +413,14 @@ mod tests {
             WireMessage::FetchRequest(FetchRequest { item_ids: vec![] }),
             WireMessage::FetchResponse(FetchResponse { items: vec![] }),
             WireMessage::PushPayload(PushPayload { items: vec![] }),
+            WireMessage::PushAck(PushAck::default()),
             WireMessage::PushAck(PushAck {
-                stored: 0,
-                dedup_dropped: 0,
-                policy_rejected: 0,
-                verification_failed: 0,
+                verification_failed: 1,
+                refused: vec![Refusal {
+                    item_id: "ci_x".into(),
+                    why: REFUSED_INVALID.into(),
+                }],
+                ..Default::default()
             }),
             WireMessage::PskRequest(PskRequest {
                 channel_id: "test".into(),

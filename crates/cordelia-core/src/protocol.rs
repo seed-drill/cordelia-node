@@ -359,6 +359,14 @@ pub const WRITES_PER_PEER_PER_MINUTE: u32 =
 /// a burst of writes can never trip the relay's limit.
 pub const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 2;
 
+/// The longest an outbox item that a relay refused waits before it is
+/// offered again (to the next relay in turn). The wait doubles from the
+/// flush interval after each refusal, so an item no relay will take costs
+/// one small push every ten minutes, and one that a relay refused for a
+/// passing reason (a full disk) is delivered soon after the reason goes.
+/// Rationale: parameter-rationale.md §4.
+pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
+
 /// Most encrypted bytes in one outbox push. Below MAX_MESSAGE_BYTES to leave
 /// room for per-item headers and CBOR framing; an item bigger than this
 /// (items are at most MAX_ITEM_BYTES) is still sent, alone.

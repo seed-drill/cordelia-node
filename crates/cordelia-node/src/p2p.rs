@@ -29,20 +29,25 @@ async fn open_bi(
 
 /// Store a network Item into the local SQLite database.
 /// Shared between push receive and pull-sync paths (deduplicated per connection-lifecycle.md).
+///
+/// `Ok(false)` means the node already holds it. `Err` carries the reason it
+/// was refused, as the code a push's answer gives the sender.
 pub fn store_item(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
     node_role: &str,
-) -> Result<bool, ()> {
+) -> Result<bool, &'static str> {
+    use cordelia_network::messages::{REFUSED_INVALID, REFUSED_STORAGE};
+
     if !cordelia_network::item_sync::verify_content_hash(item) {
         tracing::warn!(item = %item.item_id, "content hash mismatch");
-        return Err(());
+        return Err(REFUSED_INVALID);
     }
     // Relays too: storage keeps the newest revision per (slot, author), which
     // only holds if the author cannot be forged (decision 2026-09-30 §4.3).
     if !cordelia_network::item_sync::verify_item_signature(item) {
         tracing::warn!(item = %item.item_id, "invalid item signature");
-        return Err(());
+        return Err(REFUSED_INVALID);
     }
 
     // Relay: ensure channel row exists (no FK violation, BV-21)
@@ -55,15 +60,15 @@ pub fn store_item(
 
     let author: [u8; 32] = match item.author_id.as_slice().try_into() {
         Ok(a) => a,
-        Err(_) => return Err(()),
+        Err(_) => return Err(REFUSED_INVALID),
     };
     let hash: [u8; 32] = match item.content_hash.as_slice().try_into() {
         Ok(h) => h,
-        Err(_) => return Err(()),
+        Err(_) => return Err(REFUSED_INVALID),
     };
     let sig: [u8; 64] = match item.signature.as_slice().try_into() {
         Ok(s) => s,
-        Err(_) => return Err(()),
+        Err(_) => return Err(REFUSED_INVALID),
     };
     // Well-formed after verify_item_signature: 32 bytes, set with rev.
     let slot: Option<[u8; 32]> = item
@@ -91,23 +96,114 @@ pub fn store_item(
         Ok(inserted) => Ok(inserted),
         Err(e) => {
             tracing::debug!(item = %item.item_id, error = %e, "store failed");
-            Err(())
+            Err(match e {
+                cordelia_core::CordeliaError::Validation(_) => REFUSED_INVALID,
+                _ => REFUSED_STORAGE,
+            })
         }
     }
 }
 
-/// Send this node's outbox (own items no relay has acknowledged) to one hot
-/// relay as a single push, and mark the items relayed once that relay has
-/// accounted for every one of them (decision 2026-09-30 §4.4a). Relays
-/// forward to each other, so one acknowledgement is enough. Rotates across
-/// hot relays so one unhelpful relay cannot stall the outbox; anything not
-/// acknowledged is simply sent again on a later flush.
+/// Outbox items that a relay refused, and relays that refused something
+/// without saying what. Both wait before they are tried again, a little
+/// longer each time, so that one item no relay will take, or one relay
+/// that takes nothing, costs a small push now and then and holds up
+/// nothing else.
+#[derive(Default)]
+struct OutboxRefusals {
+    items: std::collections::HashMap<String, RefusedItem>,
+    relays: std::collections::HashMap<NodeId, (u32, std::time::Instant)>,
+}
+
+struct RefusedItem {
+    refusals: u32,
+    next_try: std::time::Instant,
+    why: String,
+}
+
+/// How long to wait after the `refusals`-th refusal in a row: the flush
+/// interval doubled each time, up to OUTBOX_REFUSED_RETRY_MAX_SECS.
+fn refused_wait(refusals: u32) -> std::time::Duration {
+    let secs = cordelia_core::protocol::OUTBOX_FLUSH_INTERVAL_SECS
+        .saturating_mul(1u64 << refusals.min(16))
+        .min(cordelia_core::protocol::OUTBOX_REFUSED_RETRY_MAX_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// What a relay's answer to an outbox push means for the items sent.
+#[derive(Debug, PartialEq, Eq)]
+enum Pushed {
+    /// The relay stored `delivered` or already held them, and refused
+    /// `refused`.
+    Answered {
+        delivered: Vec<String>,
+        refused: Vec<cordelia_network::messages::Refusal>,
+    },
+    /// The relay did not account for every item, or refused some without
+    /// saying which (a relay from before the list existed). Nothing in the
+    /// push can be taken as delivered.
+    Unknown,
+}
+
+/// Read a relay's answer to a push of `ids`. An item counts as delivered
+/// only if the relay stored it or already held it: a refusal is not
+/// delivery, whatever the reason.
+fn outbox_outcome(ids: &[String], ack: &cordelia_network::messages::PushAck) -> Pushed {
+    let rejected = u64::from(ack.policy_rejected) + u64::from(ack.verification_failed);
+    let accounted = u64::from(ack.stored) + u64::from(ack.dedup_dropped) + rejected;
+    let mut refused: Vec<cordelia_network::messages::Refusal> = Vec::new();
+    for r in &ack.refused {
+        if ids.contains(&r.item_id) && !refused.iter().any(|seen| seen.item_id == r.item_id) {
+            refused.push(r.clone());
+        }
+    }
+    if accounted != ids.len() as u64 || refused.len() as u64 != rejected {
+        return Pushed::Unknown;
+    }
+    let delivered = ids
+        .iter()
+        .filter(|id| !refused.iter().any(|r| &r.item_id == *id))
+        .cloned()
+        .collect();
+    Pushed::Answered { delivered, refused }
+}
+
+/// Tell status which outbox items relays are refusing.
+fn publish_refused(state: &cordelia_api::state::AppState, refusals: &OutboxRefusals) {
+    let mut refused: Vec<cordelia_api::state::RefusedSnapshot> = refusals
+        .items
+        .iter()
+        .map(|(item_id, item)| cordelia_api::state::RefusedSnapshot {
+            item_id: item_id.clone(),
+            why: item.why.clone(),
+            refusals: item.refusals,
+        })
+        .collect();
+    refused.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    if let Ok(mut shown) = state.outbox_refused.write() {
+        *shown = refused;
+    }
+}
+
+/// Send this node's outbox (own items no relay has stored yet) to one hot
+/// relay as a single push, and mark as relayed the items that relay stored
+/// or already held (decision 2026-09-30 §4.4a). Relays forward to each
+/// other, so one relay storing an item is enough.
+///
+/// - An item the relay refused stays in the outbox, and is offered again
+///   after a wait, to the next relay in turn. A refusal is never taken for
+///   delivery: a relay that cannot store (a full disk) must not make this
+///   device believe its writes are safe.
+/// - A relay that refused something without saying what is left alone for
+///   a while, and the others are used.
+/// - Anything not answered for is simply sent again on a later flush.
 fn flush_outbox(
     state: &web::Data<cordelia_api::state::AppState>,
     governor: &cordelia_network::governor::Governor,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
     in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     rotation: &mut usize,
+    refusals: &std::sync::Arc<std::sync::Mutex<OutboxRefusals>>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -119,7 +215,29 @@ fn flush_outbox(
     if relays.is_empty() {
         return;
     }
-    let target = relays[*rotation % relays.len()].clone();
+    let now = std::time::Instant::now();
+    let (target, skip) = {
+        let held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+        // The next relay in turn that is not being left alone.
+        let Some(target) = (0..relays.len())
+            .map(|i| &relays[(*rotation + i) % relays.len()])
+            .find(|relay| {
+                held.relays
+                    .get(*relay)
+                    .is_none_or(|(_, until)| *until <= now)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let skip: std::collections::HashSet<String> = held
+            .items
+            .iter()
+            .filter(|(_, item)| item.next_try > now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        (target, skip)
+    };
     let Some(conn) = conn_mgr.get_connection(&target).cloned() else {
         return;
     };
@@ -132,11 +250,24 @@ fn flush_outbox(
             in_flight.store(false, Ordering::Release);
             return;
         };
+        let pk = state.identity.public_key();
+        // Forget refusals of items that are no longer waiting: replaced by
+        // a newer revision, or removed.
+        let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.items.is_empty() {
+            let ids: Vec<String> = held.items.keys().cloned().collect();
+            let waiting =
+                cordelia_storage::items::still_in_outbox(&db, &pk, &ids).unwrap_or_default();
+            held.items.retain(|id, _| waiting.contains(id));
+            publish_refused(state, &held);
+        }
+        drop(held);
         cordelia_storage::items::outbox(
             &db,
-            &state.identity.public_key(),
+            &pk,
             cordelia_core::protocol::OUTBOX_BATCH_MAX_ITEMS,
             cordelia_core::protocol::OUTBOX_BATCH_MAX_BYTES,
+            &skip,
         )
         .unwrap_or_default()
     };
@@ -169,6 +300,7 @@ fn flush_outbox(
 
     let state = state.clone();
     let in_flight = in_flight.clone();
+    let refusals = refusals.clone();
     tokio::spawn(async move {
         let result = async {
             let (mut send, mut recv) = open_bi(&conn).await?;
@@ -179,25 +311,59 @@ fn flush_outbox(
         }
         .await;
         match result {
-            Ok(ack) => {
-                let accounted =
-                    ack.stored + ack.dedup_dropped + ack.policy_rejected + ack.verification_failed;
-                if accounted as usize == ids.len() {
-                    if ack.policy_rejected + ack.verification_failed > 0 {
+            Ok(ack) => match outbox_outcome(&ids, &ack) {
+                Pushed::Answered { delivered, refused } => {
+                    if let Ok(db) = state.db.lock() {
+                        let _ = cordelia_storage::items::mark_relayed(&db, &delivered);
+                    }
+                    let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+                    held.relays.remove(&target);
+                    for id in &delivered {
+                        held.items.remove(id);
+                    }
+                    for refusal in refused {
+                        let item =
+                            held.items
+                                .entry(refusal.item_id.clone())
+                                .or_insert(RefusedItem {
+                                    refusals: 0,
+                                    next_try: std::time::Instant::now(),
+                                    why: String::new(),
+                                });
+                        item.refusals += 1;
+                        item.next_try = std::time::Instant::now() + refused_wait(item.refusals);
+                        item.why = refusal.why;
                         tracing::warn!(
                             relay = %target,
-                            rejected = ack.policy_rejected + ack.verification_failed,
-                            "relay rejected outbox items; not retrying them"
+                            item = %refusal.item_id,
+                            why = %item.why,
+                            refusals = item.refusals,
+                            "a relay refused an item; it stays in the outbox and is offered again"
                         );
                     }
-                    if let Ok(db) = state.db.lock() {
-                        let _ = cordelia_storage::items::mark_relayed(&db, &ids);
-                    }
-                    tracing::debug!(relay = %target, items = ids.len(), stored = ack.stored, "outbox delivered");
-                } else {
-                    tracing::debug!(relay = %target, items = ids.len(), accounted, "outbox partially acknowledged; will resend");
+                    publish_refused(&state, &held);
+                    tracing::debug!(relay = %target, items = ids.len(), delivered = delivered.len(), stored = ack.stored, "outbox answered");
                 }
-            }
+                Pushed::Unknown => {
+                    let mut held = refusals.lock().unwrap_or_else(|e| e.into_inner());
+                    let refusals_in_a_row = held.relays.get(&target).map_or(0, |(n, _)| *n) + 1;
+                    held.relays.insert(
+                        target.clone(),
+                        (
+                            refusals_in_a_row,
+                            std::time::Instant::now() + refused_wait(refusals_in_a_row),
+                        ),
+                    );
+                    tracing::warn!(
+                        relay = %target,
+                        items = ids.len(),
+                        stored = ack.stored,
+                        held = ack.dedup_dropped,
+                        refused = u64::from(ack.policy_rejected) + u64::from(ack.verification_failed),
+                        "a relay did not say which items it stored; nothing is taken as delivered, and it is left alone for a while"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::debug!(relay = %target, items = ids.len(), error = %e, "outbox push failed; will resend")
             }
@@ -527,6 +693,7 @@ pub async fn p2p_loop(
     outbox_interval.tick().await;
     let mut last_outbox_flush = std::time::Instant::now() - outbox_interval_dur;
     let outbox_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let outbox_refusals = std::sync::Arc::new(std::sync::Mutex::new(OutboxRefusals::default()));
     let mut outbox_rotation: usize = 0;
 
     // Expired keyed tombstones (decision 2026-09-30 §4.4), on every node.
@@ -955,14 +1122,14 @@ pub async fn p2p_loop(
                 while push_rx.try_recv().is_ok() {}
                 if last_outbox_flush.elapsed() >= outbox_interval_dur {
                     last_outbox_flush = std::time::Instant::now();
-                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
                 }
             }
 
             _ = outbox_interval.tick() => {
                 if node_role == "personal" && last_outbox_flush.elapsed() >= outbox_interval_dur {
                     last_outbox_flush = std::time::Instant::now();
-                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation);
+                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
                 }
             }
 
@@ -2039,6 +2206,7 @@ async fn handle_inbound_push(
 
     // Track which items are newly stored (for selective re-push)
     let mut newly_stored: Vec<cordelia_network::messages::Item> = Vec::new();
+    let mut refused: Vec<cordelia_network::messages::Refusal> = Vec::new();
     let (stored, dedup, rejected) = {
         let db = match state.db.lock() {
             Ok(db) => db,
@@ -2054,7 +2222,13 @@ async fn handle_inbound_push(
                     newly_stored.push(item.clone());
                 }
                 Ok(false) => dedup += 1,
-                Err(_) => rejected += 1,
+                Err(why) => {
+                    rejected += 1;
+                    refused.push(cordelia_network::messages::Refusal {
+                        item_id: item.item_id.clone(),
+                        why: why.into(),
+                    });
+                }
             }
         }
         (stored, dedup, rejected)
@@ -2089,6 +2263,7 @@ async fn handle_inbound_push(
             dedup_dropped: dedup,
             policy_rejected: 0,
             verification_failed: rejected,
+            refused,
         });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
 }
@@ -2471,5 +2646,111 @@ mod tests {
         assert_eq!(secs(40, false), BACKOFF_BASE_SECS);
         // Never zero, whatever the tick.
         assert_eq!(relay_backoff(1, 0, true).as_secs(), 1);
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn refusal(id: &str) -> cordelia_network::messages::Refusal {
+        cordelia_network::messages::Refusal {
+            item_id: id.into(),
+            why: cordelia_network::messages::REFUSED_STORAGE.into(),
+        }
+    }
+
+    /// T16. An item counts as delivered only if the relay stored it or
+    /// already held it. An item the relay refused stays in the outbox.
+    #[test]
+    fn a_relays_refusal_is_not_delivery() {
+        use cordelia_network::messages::PushAck;
+        let sent = ids(&["a", "b", "c"]);
+
+        // Everything stored or already held: everything delivered.
+        let ack = PushAck {
+            stored: 2,
+            dedup_dropped: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            outbox_outcome(&sent, &ack),
+            Pushed::Answered {
+                delivered: sent.clone(),
+                refused: vec![]
+            }
+        );
+
+        // One refused: the other two are delivered, and it is not.
+        let ack = PushAck {
+            stored: 2,
+            verification_failed: 1,
+            refused: vec![refusal("b")],
+            ..Default::default()
+        };
+        assert_eq!(
+            outbox_outcome(&sent, &ack),
+            Pushed::Answered {
+                delivered: ids(&["a", "c"]),
+                refused: vec![refusal("b")]
+            }
+        );
+
+        // A relay from before the list existed says how many it refused,
+        // not which: nothing is taken as delivered.
+        let ack = PushAck {
+            stored: 2,
+            verification_failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(outbox_outcome(&sent, &ack), Pushed::Unknown);
+    }
+
+    /// An answer that does not add up is not trusted for any item.
+    #[test]
+    fn an_answer_that_does_not_add_up_delivers_nothing() {
+        use cordelia_network::messages::PushAck;
+        let sent = ids(&["a", "b", "c"]);
+        let unknown = |ack: PushAck| assert_eq!(outbox_outcome(&sent, &ack), Pushed::Unknown);
+
+        // Not every item answered for.
+        unknown(PushAck {
+            stored: 1,
+            ..Default::default()
+        });
+        // More refused than listed, by listing one twice.
+        unknown(PushAck {
+            stored: 1,
+            verification_failed: 2,
+            refused: vec![refusal("b"), refusal("b")],
+            ..Default::default()
+        });
+        // An item that was not in the push.
+        unknown(PushAck {
+            stored: 2,
+            verification_failed: 1,
+            refused: vec![refusal("z")],
+            ..Default::default()
+        });
+        // Numbers chosen to overflow.
+        unknown(PushAck {
+            stored: u32::MAX,
+            dedup_dropped: u32::MAX,
+            policy_rejected: u32::MAX,
+            verification_failed: 6,
+            ..Default::default()
+        });
+    }
+
+    /// A refused item is offered again at a slowing pace, up to ten
+    /// minutes apart.
+    #[test]
+    fn a_refused_item_is_offered_again_at_a_slowing_pace() {
+        use cordelia_core::protocol::OUTBOX_REFUSED_RETRY_MAX_SECS;
+        let secs = |refusals| refused_wait(refusals).as_secs();
+        assert_eq!(secs(1), 4);
+        assert_eq!(secs(2), 8);
+        assert_eq!(secs(3), 16);
+        assert_eq!(secs(9), OUTBOX_REFUSED_RETRY_MAX_SECS);
+        assert_eq!(secs(u32::MAX), OUTBOX_REFUSED_RETRY_MAX_SECS);
     }
 }

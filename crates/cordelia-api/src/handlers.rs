@@ -1449,6 +1449,19 @@ pub async fn status(
         .map(|c| c.len())
         .unwrap_or(0);
     let outbox_waiting = cordelia_storage::items::outbox_len(&db, &pk).unwrap_or(0);
+    // Of those, the ones a relay refused: they wait, and are offered again.
+    let outbox_refused: Vec<serde_json::Value> = state
+        .outbox_refused
+        .read()
+        .map(|refused| {
+            refused
+                .iter()
+                .map(|r| {
+                    serde_json::json!({ "item_id": r.item_id, "why": r.why, "refusals": r.refusals })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
@@ -1458,5 +1471,6 @@ pub async fn status(
         "channels_subscribed": channels,
         "sync_errors": sync_errors,
         "outbox_waiting": outbox_waiting,
+        "outbox_refused": outbox_refused,
     })))
 }

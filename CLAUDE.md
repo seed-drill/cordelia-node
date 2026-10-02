@@ -83,6 +83,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
 | `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
+| `OUTBOX_REFUSED_RETRY_MAX_SECS` | 600s | parameter-rationale.md §4 |
 | `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 | decision 2026-09-30 §4.4 |
 | `MAX_REV`, `MAX_EPOCH` | 2^53 - 1 | parameter-rationale.md §4 |
 | `MAX_EPOCH_STEP` | 2^20 | parameter-rationale.md §4 |

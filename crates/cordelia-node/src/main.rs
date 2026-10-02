@@ -389,6 +389,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             if status.facts.outbox_waiting > 0 {
                 details.push(format!("Waiting to send: {}", status.facts.outbox_waiting));
             }
+            if status.facts.outbox_refused > 0 {
+                details.push(format!(
+                    "Not taken by a relay: {}",
+                    status.facts.outbox_refused
+                ));
+            }
         }
         if let Some(sync) = &status.sync {
             if let Some(folders) = sync["report"]["folders"].as_array()
@@ -443,6 +449,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 "warm": live["peers_warm"],
             });
             out["outbox_waiting"] = live["outbox_waiting"].clone();
+            out["outbox_refused"] = live["outbox_refused"].clone();
         }
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
@@ -619,6 +626,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     out.facts.running = true;
     out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
     out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
+    out.facts.outbox_refused = live["outbox_refused"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["refusals"].as_u64() >= Some(indicator::REFUSALS_BEFORE_ATTENTION))
+        .count() as u64;
     out.live = Some(live);
 
     if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {
@@ -786,6 +799,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         announce_tx: Some(announce_tx),
         peers: Default::default(),
         relays: Default::default(),
+        outbox_refused: Default::default(),
         sync_control: Default::default(),
     });
 
