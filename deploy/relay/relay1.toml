@@ -22,7 +22,12 @@ listen_addr = "0.0.0.0:9474"
 role = "relay"
 dns_discovery = ""
 
-# The other relay, so the two form a mesh and forward to each other.
+# The other relay, so the two form a mesh and forward to each other. A
+# relay works only with the relays listed here: it forwards to them and tells
+# them which channels it holds, and no other node that says it is a relay.
+# The default relays' keys are compiled into the binary. For a relay of your
+# own, give its key as well: key = "cordelia_pk1..." (what `cordelia id`
+# prints on that relay).
 [[network.bootnodes]]
 addr = "relay2.cordelia.seeddrill.ai:9474"
 

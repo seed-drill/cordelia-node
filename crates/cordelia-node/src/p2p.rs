@@ -246,14 +246,14 @@ pub fn post_connect(
             (false, false)
         });
 
-    // A personal node's relays are the ones it was configured with: being
-    // a relay is a property of a configured key, not of what a peer says
-    // about itself in the handshake.
-    let is_relay = if node_role == "personal" {
-        is_configured_relay(relay_addrs, conn_mgr, node_id)
-    } else {
-        says_relay
-    };
+    // A node's relays are the ones it was configured with: being a relay
+    // is a property of a configured key (or, for a relay configured without
+    // one, of its address), never of what a peer says about itself in the
+    // handshake. A stranger that says "relay" is an ordinary peer.
+    let is_relay = is_configured_relay(relay_addrs, conn_mgr, node_id, says_relay);
+    if says_relay && !is_relay {
+        tracing::info!(peer = %node_id, "peer says it is a relay but is not one of ours; treating it as an ordinary peer");
+    }
 
     // Step 2: Add to governor
     governor.add_peer(node_id.clone(), vec![], vec![]);
@@ -850,9 +850,10 @@ pub async fn p2p_loop(
             // (a) Request addresses from a peer whose cooldown has expired (spawned).
             // (b) Spawn up to CONNECTS_PER_CYCLE candidates from the cache.
             //
-            // Not for a personal node: its network is the relays it was
-            // configured with, and it dials no address a peer hands it.
-            _ = peer_share_interval.tick(), if node_role != "personal" => {
+            // Not for a personal node or a relay: their network is the
+            // relays they were configured with, and they dial no address a
+            // peer hands them.
+            _ = peer_share_interval.tick(), if node_role != "personal" && node_role != "relay" => {
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
@@ -1754,22 +1755,27 @@ fn any_relay_connected(
         .unwrap_or(false)
 }
 
-/// Whether `node_id` is one of the relays this node was configured with:
-/// its key is a configured relay's key, or, for a relay configured without
-/// a key, it is the node connected at that relay's address.
+/// Whether `node_id` is one of the relays this node was configured with.
+///
+/// With a key configured, the relay is the node with that key. Without one
+/// it can only be told by address: the node at the relay's address, or one
+/// that connected from the relay's IP and says it is a relay (a relay
+/// behind address translation does not keep its port). That weaker rule is
+/// why a relay configured without a key is warned about at start.
 fn is_configured_relay(
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
     node_id: &NodeId,
+    says_relay: bool,
 ) -> bool {
     let Ok(relays) = relay_addrs.read() else {
         return false;
     };
+    let remote = conn_mgr.get_connection(node_id).map(|c| c.remote_address());
     relays.iter().any(|r| match r.key {
         Some(key) => key == node_id.0,
-        None => conn_mgr
-            .get_connection(node_id)
-            .is_some_and(|c| c.remote_address() == r.addr),
+        None => remote
+            .is_some_and(|remote| remote == r.addr || (says_relay && remote.ip() == r.addr.ip())),
     })
 }
 
@@ -1835,7 +1841,7 @@ pub async fn handle_peer_streams(
         >,
     >,
     peer_states: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<NodeId, u8>>>,
-    _peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
+    peer_relays: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
     swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
@@ -1953,12 +1959,17 @@ pub async fn handle_peer_streams(
                     .ok()
                     .map(|m| m.contains(&peer_id))
                     .unwrap_or(false);
+                let is_relay_peer = peer_relays
+                    .read()
+                    .ok()
+                    .map(|relays| relays.contains(&peer_id))
+                    .unwrap_or(false);
                 handle_inbound_sync(
                     &mut send,
                     &mut recv,
                     &peer_id,
                     &state,
-                    &node_role,
+                    is_relay_peer,
                     is_swarm_peer,
                 )
                 .await;
@@ -2072,7 +2083,7 @@ async fn handle_inbound_sync(
     recv: &mut quinn::RecvStream,
     peer_id: &NodeId,
     state: &web::Data<cordelia_api::state::AppState>,
-    _node_role: &str,
+    is_relay_peer: bool,
     is_swarm_peer: bool,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
@@ -2088,7 +2099,11 @@ async fn handle_inbound_sync(
     // then read the next message as a normal SyncRequest.
     let mut current_req = match msg {
         cordelia_network::messages::WireMessage::SyncChannelListRequest(_) => {
-            let channel_ids = {
+            // Which channels a node holds is told only to its own relays.
+            // Anyone else gets an empty list.
+            let channel_ids = if !(is_relay_peer || is_swarm_peer) {
+                Vec::new()
+            } else {
                 let db = match state.db.lock() {
                     Ok(db) => db,
                     Err(_) => return,

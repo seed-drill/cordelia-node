@@ -261,7 +261,13 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     // reaches both, and a device that reaches only one. Everything is
     // judged by items arriving, not by what the nodes say about themselves.
     let mut r1 = node("relay1", "relay", None);
-    let mut r2 = node_with_bootnodes("relay2", "relay", &[format!("localhost:{}", r1.p2p)]);
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let mut r2 = node_with_relays(
+        "relay2",
+        "relay",
+        &[(format!("localhost:{}", r1.p2p), Some(key_of(&r1)))],
+    );
+    r1.add_relay(&format!("localhost:{}", r2.p2p), Some(&key_of(&r2)));
     r1.start();
     wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
     r2.start();

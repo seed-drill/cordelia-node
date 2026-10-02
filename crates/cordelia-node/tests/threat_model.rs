@@ -585,3 +585,85 @@ async fn t19_a_device_asks_no_peer_for_addresses_to_dial() {
         "the device asked its relay for other peers' addresses: {opened:?}"
     );
 }
+
+/// T19. Being a relay is a property of configuration. A stranger that
+/// connects to a relay and says it is a relay is treated as an ordinary
+/// peer: the relay does not tell it which channels it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
+    use cordelia_network::{codec, connection, item_sync, transport};
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let relay_key = relay.cli(&["id"]).trim().to_string();
+    let relay_addr = format!("127.0.0.1:{}", relay.p2p);
+
+    // A device gives the relay something to hold.
+    let mut a = node_with_relays("a", "personal", &[(relay_addr.clone(), Some(relay_key))]);
+    a.start();
+    let all = [&relay, &a];
+    wait_for("node healthy", &all, 30, || healthy(&a));
+    wait_for("connected to the relay", &all, 60, || has_hot_peer(&a));
+    let folder = a.home().join("notes");
+    std::fs::create_dir_all(&folder).unwrap();
+    let memory = claude_folder(&a.home(), &folder);
+    std::fs::write(memory.join("idea.md"), "A thought.\n").unwrap();
+    a.cli(&[
+        "sync",
+        "claude",
+        "--dir",
+        a.home().join(".claude").to_str().unwrap(),
+    ]);
+    a.cli(&["sync", "map", folder.to_str().unwrap(), "t19-notes"]);
+    wait_for("the relay holds the device's entries", &all, 90, || {
+        let stats: serde_json::Value =
+            serde_json::from_str(&relay.cli(&["stats", "--json"])).ok()?;
+        (stats["items_stored"].as_u64()? > 0).then_some(())
+    });
+
+    // The stranger: its own key, and "relay" in its handshake.
+    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let stranger_key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
+    let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let mut manager =
+        connection::ConnectionManager::new(identity, endpoint, vec![], vec!["relay".into()], port);
+    let relay_id = manager
+        .connect_to(relay_addr.parse().unwrap())
+        .await
+        .expect("the stranger connects, as any node may");
+    let conn = manager.get_connection(&relay_id).unwrap().clone();
+
+    // It asks which channels the relay holds, as one relay asks another.
+    let listed = wait_for("the relay answers the stranger", &all, 30, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+                    .await
+                    .ok()?;
+                item_sync::send_channel_list_request(&mut send, &mut recv)
+                    .await
+                    .ok()
+            })
+        })
+    });
+    assert!(
+        listed.channel_ids.is_empty(),
+        "the relay told a stranger which channels it holds: {:?}",
+        listed.channel_ids
+    );
+
+    // And the relay does not count it as a relay.
+    let seen = wait_for("the relay lists the stranger", &all, 30, || {
+        let peers: serde_json::Value =
+            serde_json::from_str(&relay.cli(&["peers", "--json"])).ok()?;
+        peers["peers"]
+            .as_array()?
+            .iter()
+            .find(|p| p["key"] == stranger_key.as_str())
+            .cloned()
+    });
+    assert_eq!(seen["role"], "node", "{seen}");
+}
