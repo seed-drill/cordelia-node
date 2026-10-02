@@ -1261,6 +1261,8 @@ struct Pass {
     listed: Vec<String>,
     /// How many requests for entries.
     fetches: usize,
+    /// The entries asked for, by ID, in the order asked.
+    asked: Vec<String>,
 }
 
 impl Held {
@@ -1758,6 +1760,7 @@ impl Client {
                         }
                         WireMessage::FetchRequest(req) => {
                             pass.fetches += 1;
+                            pass.asked.extend(req.item_ids.iter().cloned());
                             let mut answer: Vec<_> = items
                                 .iter()
                                 .filter(|i| req.item_ids.contains(&i.item_id))
@@ -2082,8 +2085,8 @@ fn places_kept(relay: &Node) -> Vec<u64> {
 /// T3. A relay keeps nothing for names a peer makes up. A peer says it
 /// holds a thousand channels, different ones each time it is asked, and
 /// answers each request with an empty page that says there is more. The
-/// relay asks about each name once, and keeps a place in none of them: a
-/// place is kept only in a channel the relay holds.
+/// relay asks about each name once, and keeps a place in none of them:
+/// nothing is kept where a peer lists nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t03_a_relay_keeps_nothing_for_names_a_peer_makes_up() {
     use cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER;
@@ -2111,6 +2114,116 @@ async fn t03_a_relay_keeps_nothing_for_names_a_peer_makes_up() {
     assert!(
         kept.iter().all(|places| *places == 0),
         "the relay kept places for names a peer made up: {kept:?}"
+    );
+    assert_eq!(relay_holds(&relay), (0, 0));
+}
+
+/// T3. A relay gets past what it will not store. A device holds a channel
+/// that begins with more than a page of entries the relay refuses (their
+/// signatures are not good), then one whose header shows a field over its
+/// size, then entries that are as they should be. It holds a second channel
+/// with nothing in it that the relay takes.
+///
+/// The relay ends up with every entry that is as it should be. It asks for
+/// each of the others once, not once a page or once a pass, and never for
+/// the one whose header shows it will be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_gets_past_what_it_will_not_store() {
+    use cordelia_core::protocol::MAX_ITEM_TYPE_LEN;
+    const REFUSED: usize = 120;
+    const GOOD: usize = 30;
+    let mixed = "grp_550e8400-e29b-41d4-a716-000000000001";
+    let refused_only = "grp_550e8400-e29b-41d4-a716-000000000002";
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let device = client_of(&relay).await.expect("the device connects");
+
+    let not_good = |channel: &str| {
+        let mut item = device.entry_in(channel, 100);
+        item.signature[0] ^= 1;
+        item
+    };
+    let mut long_type = device.entry_in(mixed, 100);
+    long_type.item_type = "x".repeat(MAX_ITEM_TYPE_LEN + 1);
+    let mut items: Vec<_> = (0..REFUSED).map(|_| not_good(mixed)).collect();
+    items.push(long_type.clone());
+    items.extend((0..GOOD).map(|_| device.entry_in(mixed, 100)));
+    items.extend((0..REFUSED + GOOD).map(|_| not_good(refused_only)));
+    let held = Held::of(items);
+    device.serve(held.clone());
+
+    wait_for("the relay asks the device twice", &[&relay], 90, || {
+        (held.passes().len() >= 2).then_some(())
+    });
+    let passes = held.passes();
+    assert_eq!(
+        relay_holds(&relay).0,
+        GOOD as u64,
+        "the relay did not get past what it will not store"
+    );
+    let asked: Vec<&String> = passes.iter().flat_map(|pass| &pass.asked).collect();
+    assert!(
+        !asked.contains(&&long_type.item_id),
+        "asked for an entry whose header shows it will be refused"
+    );
+    let distinct: BTreeSet<&String> = asked.iter().copied().collect();
+    assert_eq!(
+        (asked.len(), distinct.len()),
+        (2 * (REFUSED + GOOD), 2 * (REFUSED + GOOD)),
+        "each entry is asked for once"
+    );
+    assert!(
+        passes[1].asked.is_empty(),
+        "asked again for {} entries it had been through",
+        passes[1].asked.len()
+    );
+}
+
+/// T3. A relay keeps only so many places for one peer. A peer lists more
+/// channels than a relay asks about in one pass, each with an entry the
+/// relay fetches and refuses, so that there is a place to keep in each.
+/// Over three passes the relay asks about more channels than it may keep
+/// places for, and keeps no more than it may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_keeps_only_so_many_places_for_a_peer() {
+    use cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER;
+    const CHANNELS: usize = MAX_CHANNELS_ASKED_OF_A_PEER + 200;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let peer = client_of(&relay).await.expect("the peer connects");
+    let held = Held::of(
+        (0..CHANNELS)
+            .map(|n| {
+                let mut item = peer.entry_in(&format!("grp_550e8400-e29b-41d4-a716-{n:012}"), 8);
+                item.signature[0] ^= 1;
+                item
+            })
+            .collect(),
+    );
+    peer.serve(held.clone());
+
+    wait_for(
+        "the relay asks the peer three times",
+        &[&relay],
+        180,
+        || (held.passes().len() >= 3).then_some(()),
+    );
+    let passes = held.passes();
+    let asked_about: BTreeSet<&String> = passes.iter().flat_map(|pass| &pass.listed).collect();
+    assert!(
+        asked_about.len() > MAX_CHANNELS_ASKED_OF_A_PEER,
+        "asked about {} channels",
+        asked_about.len()
+    );
+    let kept = places_kept(&relay);
+    assert_eq!(
+        kept.iter().max(),
+        Some(&(MAX_CHANNELS_ASKED_OF_A_PEER as u64)),
+        "{kept:?}"
     );
     assert_eq!(relay_holds(&relay), (0, 0));
 }
