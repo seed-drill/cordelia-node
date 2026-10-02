@@ -420,7 +420,11 @@ impl<'a> RelayRoom<'a> {
             None => 0,
         };
         let after = held.saturating_sub(replaced) + bytes;
-        if after > self.max_channel_bytes {
+        // A write that does not make the channel hold more is always
+        // taken: an edit or a delete in place of something as large. So a
+        // channel that is over its share (it was counted another way when
+        // it was written) can still be changed, and can shrink.
+        if after > self.max_channel_bytes && after > held {
             tracing::debug!(channel = %item.channel_id, held, "this channel holds as much as one channel may");
             return Err(REFUSED_FULL);
         }
@@ -487,11 +491,81 @@ fn peers_to_ask(
         .collect()
 }
 
-/// Forget what is kept for each peer and channel (a place in the peer's
-/// list, a page size) for the peers that are no longer connected.
-fn forget_gone<V>(kept: &mut std::collections::HashMap<(NodeId, String), V>, connected: &[NodeId]) {
-    let here: std::collections::HashSet<&NodeId> = connected.iter().collect();
-    kept.retain(|(peer, _), _| here.contains(peer));
+/// What a node keeps for each peer and channel it fetches from: its place
+/// in the peer's list of the channel, or the size of page it asks for
+/// there.
+///
+/// It is bounded for each peer, and forgotten when the peer goes. What a
+/// peer lists is the peer's to write: without the bound a peer could list
+/// new names in every pass, and have a relay keep something for each.
+struct Kept<V> {
+    by_peer: std::collections::HashMap<NodeId, std::collections::HashMap<String, V>>,
+    /// Counts each time channels are forgotten for every peer, to be listed
+    /// again from the start. A fetch that was under way when that happened
+    /// does not put its place back.
+    relisted: u64,
+}
+
+impl<V> Default for Kept<V> {
+    fn default() -> Self {
+        Self {
+            by_peer: std::collections::HashMap::new(),
+            relisted: 0,
+        }
+    }
+}
+
+impl<V: Copy> Kept<V> {
+    fn get(&self, peer: &NodeId, channel: &str) -> Option<V> {
+        self.by_peer.get(peer)?.get(channel).copied()
+    }
+
+    /// Keep `value` for `peer` and `channel`. A peer has at most `most`
+    /// channels kept: one more is not kept, and false is returned.
+    fn set(&mut self, peer: &NodeId, channel: &str, value: V, most: usize) -> bool {
+        let kept = self.by_peer.entry(peer.clone()).or_default();
+        if !kept.contains_key(channel) && kept.len() >= most {
+            return false;
+        }
+        kept.insert(channel.to_string(), value);
+        true
+    }
+
+    fn remove(&mut self, peer: &NodeId, channel: &str) {
+        if let Some(kept) = self.by_peer.get_mut(peer) {
+            kept.remove(channel);
+        }
+    }
+
+    /// Forget everything kept for `peer`.
+    fn forget_peer(&mut self, peer: &NodeId) {
+        self.by_peer.remove(peer);
+    }
+
+    /// Forget everything kept for peers that are no longer connected.
+    fn forget_gone(&mut self, connected: &[NodeId]) {
+        let here: std::collections::HashSet<&NodeId> = connected.iter().collect();
+        self.by_peer.retain(|peer, _| here.contains(peer));
+    }
+
+    /// Forget what is kept for `channels`, for every peer.
+    fn forget_channels(&mut self, channels: &[String]) {
+        for kept in self.by_peer.values_mut() {
+            kept.retain(|channel, _| !channels.contains(channel));
+        }
+        self.relisted += 1;
+    }
+
+    /// How many channels are kept for `peer`.
+    #[cfg(test)]
+    fn kept_for(&self, peer: &NodeId) -> usize {
+        self.by_peer.get(peer).map_or(0, |kept| kept.len())
+    }
+
+    /// How many are kept in all.
+    fn total(&self) -> usize {
+        self.by_peer.values().map(|kept| kept.len()).sum()
+    }
 }
 
 /// How a fetch from a peer ended.
@@ -588,6 +662,26 @@ impl Drop for Fetching {
     }
 }
 
+/// The most a page can cost: what it is fetched in is one message, and it
+/// holds DEFAULT_SYNC_LIMIT entries at most.
+const FULL_PAGE_COST: u64 = cordelia_core::protocol::MAX_MESSAGE_BYTES as u64
+    + cordelia_core::protocol::entry_cost(0) * cordelia_core::protocol::DEFAULT_SYNC_LIMIT as u64;
+
+// Checked at compile time: one answer counts for less than a connection may
+// be fetched from in a minute, so a connection that sends one, whatever is
+// in it, cannot use up what its address may be fetched from.
+const _: () = assert!(FULL_PAGE_COST <= cordelia_core::protocol::PUSH_BYTES_PER_PEER_PER_MINUTE);
+
+/// What one answer to a fetch counts as against the peer's allowance, when
+/// the entries in it cost `cost` together: at most what a page can cost.
+///
+/// An answer is one message whatever it holds. Counting each of thousands
+/// of empty entries in full would let one connection use up, with one
+/// answer, the allowance of every device at its address.
+fn counted_for_an_answer(cost: u64) -> u64 {
+    cost.min(FULL_PAGE_COST)
+}
+
 /// What a fetch from one peer needs.
 struct FetchFrom {
     conn: quinn::Connection,
@@ -604,10 +698,8 @@ struct FetchFrom {
     limited: bool,
     address: std::net::IpAddr,
     rates: std::sync::Arc<std::sync::Mutex<Rates>>,
-    cursors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>>,
-    cursor_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    page_steps:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(NodeId, String), usize>>>,
+    cursors: std::sync::Arc<std::sync::Mutex<Kept<u64>>>,
+    page_steps: std::sync::Arc<std::sync::Mutex<Kept<usize>>>,
     repush_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
 }
@@ -621,12 +713,7 @@ struct FetchFrom {
 async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
     use cordelia_core::protocol::{MAX_ITEM_BYTES, SYNC_PAGE_STEPS, entry_cost};
     use cordelia_network::item_sync;
-    use std::sync::atomic::Ordering;
     const PAGES: usize = 10;
-    /// The most a page can cost: what it is fetched in is one message, and
-    /// it holds DEFAULT_SYNC_LIMIT entries at most.
-    const FULL_PAGE_COST: u64 = cordelia_core::protocol::MAX_MESSAGE_BYTES as u64
-        + entry_cost(0) * cordelia_core::protocol::DEFAULT_SYNC_LIMIT as u64;
 
     let FetchFrom {
         conn,
@@ -639,7 +726,6 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
         address,
         rates,
         cursors,
-        cursor_epoch,
         page_steps,
         repush_tx,
         seen_table,
@@ -694,8 +780,14 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
     let max_bytes = lock_rates().relay_max_bytes;
     let mut fetched = Fetched::All;
     let mut total_stored: u64 = 0;
+    // How many channels of this peer a place, and a page size, is kept
+    // for. A relay it lists holds as many channels as this node does.
+    let most = if limited {
+        cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER
+    } else {
+        usize::MAX
+    };
     'channels: for ch_id in &channels {
-        let cursor_key = (target.clone(), ch_id.clone());
         // A relay does not ask for a channel it does not hold while it has
         // no room for it, so it does not fetch what it would then refuse.
         if is_relay_node {
@@ -730,19 +822,17 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                 fetched = Fetched::AllowanceUsed;
                 break 'channels;
             }
-            // Places may be forgotten while this page is on its way (the
-            // peer connected again, or the channel is to be listed from
-            // the start). Then this page's place is not put back.
-            let epoch = cursor_epoch.load(Ordering::Acquire);
-            let after = cursors
+            // A channel may be set to be listed again from the start
+            // while this page is on its way. Then this page's place is not
+            // put back.
+            let (after, relisted) = cursors
                 .lock()
-                .ok()
-                .and_then(|c| c.get(&cursor_key).copied())
-                .unwrap_or(0);
+                .map(|c| (c.get(&target, ch_id).unwrap_or(0), c.relisted))
+                .unwrap_or((0, 0));
             let step = page_steps
                 .lock()
                 .ok()
-                .and_then(|p| p.get(&cursor_key).copied())
+                .and_then(|p| p.get(&target, ch_id))
                 .unwrap_or(0)
                 .min(SYNC_PAGE_STEPS.len() - 1);
             let limit = SYNC_PAGE_STEPS[step].min(u32::try_from(fit).unwrap_or(u32::MAX));
@@ -771,6 +861,8 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
             // The page is not passed if the relay had no room for the
             // channel: it is asked for again.
             let mut not_taken = false;
+            // Whether this node holds the channel, once that is known.
+            let mut held: Option<bool> = None;
             if !resp.items.is_empty() {
                 let known = {
                     let Ok(db) = state.db.lock() else {
@@ -782,6 +874,22 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                     cordelia_storage::items::known_items(&db, &offered).unwrap_or_default()
                 };
                 let mut fetch_ids = item_sync::compute_fetch_list(&resp.items, &known);
+                // An entry that would be refused for the size of a field is
+                // not fetched.
+                fetch_ids.retain(|id| {
+                    resp.items
+                        .iter()
+                        .find(|h| &h.item_id == id)
+                        .is_some_and(|h| {
+                            cordelia_core::protocol::entry_fields_fit(
+                                &h.item_id,
+                                &h.channel_id,
+                                &h.item_type,
+                                &h.published_at,
+                                h.parent_id.as_deref(),
+                            )
+                        })
+                });
                 // A device can tell from an entry's header whether it will
                 // store it, and does not fetch the rest of one it will not.
                 if role == "personal" {
@@ -814,10 +922,13 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                             // one message: ask for fewer next time.
                             tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
                             if let Ok(mut p) = page_steps.lock() {
-                                p.insert(
-                                    cursor_key.clone(),
-                                    (step + 1).min(SYNC_PAGE_STEPS.len() - 1),
-                                );
+                                let fewer = (step + 1).min(SYNC_PAGE_STEPS.len() - 1);
+                                // A peer that has as many kept as it may
+                                // starts again from full pages.
+                                if !p.set(&target, ch_id, fewer, most) {
+                                    p.forget_peer(&target);
+                                    p.set(&target, ch_id, fewer, most);
+                                }
                             }
                             fetched = Fetched::More;
                             break 'channels;
@@ -831,7 +942,7 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                             .iter()
                             .map(|i| entry_cost(i.encrypted_blob.len()))
                             .sum();
-                        lock_rates().fetched(&target, address, cost);
+                        lock_rates().fetched(&target, address, counted_for_an_answer(cost));
                     }
                     // Only what was asked for is looked at: those entries,
                     // of this channel, each once.
@@ -880,7 +991,8 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                                 _ => {}
                             }
                         }
-                        let held = cordelia_storage::channels::exists(&db, ch_id).unwrap_or(true);
+                        let holds = cordelia_storage::channels::exists(&db, ch_id).unwrap_or(true);
+                        held = Some(holds);
                         // A page that could not be stored is not passed: it
                         // is asked for again.
                         if let Err(e) = batch.commit() {
@@ -889,7 +1001,7 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                             break 'channels;
                         }
                         if is_relay_node {
-                            not_taken = no_room && !held;
+                            not_taken = no_room && !holds;
                             // What the relay dropped to make room is listed
                             // again from the start, from every peer.
                             if !room.dropped.is_empty()
@@ -928,15 +1040,26 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                 caught_up = true;
                 break;
             };
-            if cursor_epoch.load(Ordering::Acquire) == epoch
+            // A relay keeps a place only in a channel it holds. A name
+            // that holds nothing here has no place to keep, and a peer
+            // cannot have a relay remember names it makes up.
+            let keeps_place = !limited
+                || held.unwrap_or_else(|| {
+                    state.db.lock().ok().is_some_and(|db| {
+                        cordelia_storage::channels::exists(&db, ch_id).unwrap_or(false)
+                    })
+                });
+            if keeps_place
                 && let Ok(mut c) = cursors.lock()
+                && c.relisted == relisted
             {
-                c.insert(cursor_key.clone(), last_seq);
+                c.set(&target, ch_id, last_seq, most);
             }
-            if !resp.has_more {
+            // A page with nothing in it is the end, whatever it says.
+            if !resp.has_more || resp.items.is_empty() {
                 // Caught up here: back to full pages.
                 if let Ok(mut p) = page_steps.lock() {
-                    p.remove(&cursor_key);
+                    p.remove(&target, ch_id);
                 }
                 caught_up = true;
                 break;
@@ -1663,22 +1786,15 @@ pub async fn p2p_loop(
     // sequence of the last item we have processed. In memory, and for one
     // connection: after a restart, or when a peer connects again, each
     // channel is re-listed once, and only unknown items fetched.
-    let sync_cursors: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<(NodeId, String), u64>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let sync_cursors: std::sync::Arc<std::sync::Mutex<Kept<u64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Kept::default()));
 
     // How many entries to ask for in one page, per (peer, channel): an index
     // into SYNC_PAGE_STEPS. It moves down when a fetch fails (the page's
     // entries did not fit in one message) and goes back once the channel
     // is caught up with that peer.
-    let sync_page_steps: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<(NodeId, String), usize>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
-    // Counts each time places are forgotten (a peer connected again, or a
-    // channel is to be listed again from the start). A fetch that was
-    // under way when that happened does not put its place back.
-    let cursor_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sync_page_steps: std::sync::Arc<std::sync::Mutex<Kept<usize>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Kept::default()));
 
     // When a relay next asks each peer that is not one of its hot peers
     // which channels it holds (see `peers_to_ask`).
@@ -2043,8 +2159,7 @@ pub async fn p2p_loop(
                                 // and a position kept from before would skip
                                 // everything it stores from now on.
                                 if let Ok(mut cursors) = sync_cursors.lock() {
-                                    cursors.retain(|(peer, _), _| peer != &node_id);
-                                    cursor_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                    cursors.forget_peer(&node_id);
                                 }
                                 // A relay asks a peer that has just connected
                                 // which channels it holds.
@@ -2522,8 +2637,7 @@ pub async fn p2p_loop(
                 if !changed.is_empty()
                     && let Ok(mut cursors) = sync_cursors.lock()
                 {
-                    cursors.retain(|(_, channel), _| !changed.contains(channel));
-                    cursor_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    cursors.forget_channels(&changed);
                 }
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
@@ -2568,11 +2682,14 @@ pub async fn p2p_loop(
                 // that are connected. Without this a peer could connect
                 // under key after key and leave a relay holding a place for
                 // each.
+                let mut places = 0;
                 if let Ok(mut cursors) = sync_cursors.lock() {
-                    forget_gone(&mut cursors, &peers);
+                    cursors.forget_gone(&peers);
+                    places += cursors.total();
                 }
                 if let Ok(mut steps) = sync_page_steps.lock() {
-                    forget_gone(&mut steps, &peers);
+                    steps.forget_gone(&peers);
+                    places += steps.total();
                 }
                 // A relay also asks the peers that are not among its hot
                 // peers, which is where its devices are: less often, since
@@ -2584,7 +2701,7 @@ pub async fn p2p_loop(
                     Vec::new()
                 };
                 sync_cycles_completed += 1;
-                tracing::info!(hot_peers = hot.len(), asked = others.len(), total_peers = peers.len(), local_channels = local_channels.len(), cycle = sync_cycles_completed, "pull-sync cycle");
+                tracing::info!(hot_peers = hot.len(), asked = others.len(), total_peers = peers.len(), local_channels = local_channels.len(), places, cycle = sync_cycles_completed, "pull-sync cycle");
                 for target in hot.iter().chain(&others) {
                     let Some(conn) = conn_mgr.get_connection(target) else {
                         continue;
@@ -2613,7 +2730,6 @@ pub async fn p2p_loop(
                         address: conn.remote_address().ip(),
                         rates: peer_rates.clone(),
                         cursors: sync_cursors.clone(),
-                        cursor_epoch: cursor_epoch.clone(),
                         page_steps: sync_page_steps.clone(),
                         repush_tx: repush_tx.clone(),
                         seen_table: seen_table.clone(),
@@ -4260,6 +4376,67 @@ mod tests {
         format!("grp_550e8400-e29b-41d4-a716-{n:012}")
     }
 
+    /// Store at a relay an entry under a name: `name` at revision `rev`, of
+    /// `bytes` bytes, by one author. A later revision replaces an earlier.
+    fn relay_store_named(
+        db: &rusqlite::Connection,
+        room: &mut RelayRoom,
+        channel: &str,
+        name: [u8; 32],
+        rev: u64,
+        bytes: usize,
+    ) -> Result<bool, &'static str> {
+        thread_local! {
+            static AUTHOR: cordelia_crypto::identity::NodeIdentity =
+                cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        }
+        let mut blob = vec![9u8; bytes];
+        blob[..8].copy_from_slice(&rev.to_be_bytes());
+        blob[8..16].copy_from_slice(&name[..8]);
+        let hash = cordelia_crypto::sha256(&blob);
+        let item_id = cordelia_storage::items::generate_item_id();
+        let published_at = "2026-10-02T00:00:00Z";
+        let item = AUTHOR.with(|author| {
+            let cbor = cordelia_crypto::signing::ItemMetadata {
+                author_id: &author.public_key(),
+                channel_id: channel,
+                content_hash: &hash,
+                is_tombstone: false,
+                item_id: &item_id,
+                key_version: 1,
+                published_at,
+                slot: Some(&name),
+                rev: Some(rev),
+            }
+            .encode()
+            .unwrap();
+            cordelia_network::messages::Item {
+                item_id: item_id.clone(),
+                channel_id: channel.into(),
+                item_type: "memory".into(),
+                content_length: blob.len() as u32,
+                encrypted_blob: blob.clone(),
+                content_hash: hash.to_vec(),
+                author_id: author.public_key().to_vec(),
+                signature: author.sign(&cbor).to_vec(),
+                key_version: 1,
+                published_at: published_at.into(),
+                is_tombstone: false,
+                parent_id: None,
+                slot: Some(name.to_vec()),
+                rev: Some(rev),
+            }
+        });
+        store_checked(
+            db,
+            &item,
+            &check_item(&item)?,
+            "relay",
+            &[0u8; 32],
+            Some(room),
+        )
+    }
+
     fn holds(db: &rusqlite::Connection, channel: &str) -> u64 {
         cordelia_storage::items::channel_bytes(db, channel).unwrap()
     }
@@ -4399,6 +4576,60 @@ mod tests {
             Err(REFUSED_FULL)
         );
         assert_eq!(holds(&db, &small), 100 * SMALL as u64);
+    }
+
+    /// T3. A write that does not make a channel hold more is always taken.
+    /// So a channel that is over its share, because it was written before
+    /// each entry counted for what it takes, can still be changed, and can
+    /// shrink. Without this every write to it would be refused for good,
+    /// edits and deletes among them.
+    #[test]
+    fn a_channel_over_its_share_can_still_be_changed() {
+        use cordelia_core::protocol::entry_cost;
+        use cordelia_network::messages::REFUSED_FULL;
+        const ENTRY: usize = 10_000;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let over = channel(800);
+        let name = |n: u8| [n; 32];
+
+        // Three entries under names, taken when there was room for them.
+        let mut room = RelayRoom::new(u64::MAX, None, None);
+        for n in 0..3 {
+            assert_eq!(
+                relay_store_named(&db, &mut room, &over, name(n), 1, ENTRY),
+                Ok(true),
+                "{n}"
+            );
+        }
+
+        // Now a channel may hold only one such entry: this one holds three.
+        let mut room = RelayRoom::new(u64::MAX, None, None);
+        room.max_channel_bytes = entry_cost(ENTRY);
+        // Another name is refused, and so is an edit larger than what it
+        // replaces.
+        assert_eq!(
+            relay_store_named(&db, &mut room, &over, name(9), 1, 100),
+            Err(REFUSED_FULL)
+        );
+        assert_eq!(
+            relay_store_named(&db, &mut room, &over, name(0), 2, ENTRY + 1),
+            Err(REFUSED_FULL)
+        );
+        // An edit of the same size is taken, and a smaller one.
+        assert_eq!(
+            relay_store_named(&db, &mut room, &over, name(0), 2, ENTRY),
+            Ok(true)
+        );
+        assert_eq!(
+            relay_store_named(&db, &mut room, &over, name(1), 2, 100),
+            Ok(true)
+        );
+        // It has shrunk by that much, and is still over: still no new name.
+        assert_eq!(holds(&db, &over), (2 * ENTRY + 100) as u64);
+        assert_eq!(
+            relay_store_named(&db, &mut room, &over, name(9), 1, 100),
+            Err(REFUSED_FULL)
+        );
     }
 
     /// T3. An address's allowance lasts as long as what was counted against
@@ -4565,23 +4796,71 @@ mod tests {
         assert_eq!(asked, vec![good(9_999_999)]);
     }
 
-    /// T3. A relay keeps a place in a peer's list only while the peer is
-    /// connected. A peer cannot connect under key after key and leave a
-    /// relay holding a place for each.
+    /// T3. What a relay keeps for a peer it fetches from is bounded for
+    /// each peer, and forgotten when the peer goes. A peer cannot list new
+    /// names in every pass, or connect under key after key, and leave a
+    /// relay keeping something for each.
     #[test]
-    fn a_place_in_a_peers_list_is_forgotten_when_the_peer_goes() {
+    fn what_is_kept_for_a_peer_is_bounded_and_forgotten_when_it_goes() {
         let peer = |n: u8| NodeId([n; 32]);
-        let mut places = std::collections::HashMap::new();
-        for n in 1..=3u8 {
-            for c in 0..4 {
-                places.insert((peer(n), channel(c)), u64::from(n));
-            }
+        let mut places: Kept<u64> = Kept::default();
+
+        // So many channels for one peer, and no more. One that is kept
+        // already can still be moved.
+        for c in 0..4 {
+            assert!(places.set(&peer(1), &channel(c), 7, 4));
         }
-        forget_gone(&mut places, &[peer(2)]);
-        assert_eq!(places.len(), 4);
-        assert!(places.keys().all(|(p, _)| *p == peer(2)));
-        forget_gone(&mut places, &[]);
-        assert!(places.is_empty());
+        assert!(!places.set(&peer(1), &channel(4), 7, 4));
+        assert!(places.set(&peer(1), &channel(0), 8, 4));
+        assert_eq!(places.kept_for(&peer(1)), 4);
+        assert_eq!(places.get(&peer(1), &channel(0)), Some(8));
+        assert_eq!(places.get(&peer(1), &channel(4)), None);
+        // Another peer has its own.
+        assert!(places.set(&peer(2), &channel(4), 9, 4));
+        assert!(places.set(&peer(3), &channel(0), 9, 4));
+
+        // A channel that is to be listed again is forgotten for every
+        // peer, and that is counted: a fetch under way does not put its
+        // place back.
+        let before = places.relisted;
+        places.forget_channels(&[channel(0)]);
+        assert_eq!(places.get(&peer(1), &channel(0)), None);
+        assert_eq!(places.get(&peer(3), &channel(0)), None);
+        assert_eq!(places.get(&peer(1), &channel(1)), Some(7));
+        assert_eq!(places.relisted, before + 1);
+
+        // A peer that connects again starts from nothing, and that is not
+        // counted: one peer's connecting must not cost every other fetch
+        // its place.
+        places.forget_peer(&peer(1));
+        assert_eq!(places.kept_for(&peer(1)), 0);
+        assert_eq!(places.get(&peer(2), &channel(4)), Some(9));
+        assert_eq!(places.relisted, before + 1);
+
+        // Peers that are no longer connected are forgotten.
+        places.set(&peer(1), &channel(1), 7, 4);
+        places.forget_gone(&[peer(2)]);
+        assert_eq!(places.kept_for(&peer(1)), 0);
+        assert_eq!(places.kept_for(&peer(3)), 0);
+        assert_eq!(places.get(&peer(2), &channel(4)), Some(9));
+        assert_eq!(places.relisted, before + 1);
+    }
+
+    /// T3. One answer to a fetch counts for at most what a page can cost,
+    /// whatever it holds. Otherwise one connection could use up, with one
+    /// answer full of empty entries, what every device at its address may
+    /// be fetched from in a minute.
+    #[test]
+    fn one_answer_to_a_fetch_counts_for_at_most_a_page() {
+        use cordelia_core::protocol::{MAX_ITEM_BYTES, entry_cost};
+        // A page of entries counts for what they cost.
+        let page = 14 * entry_cost(MAX_ITEM_BYTES);
+        assert_eq!(counted_for_an_answer(page), page);
+        assert_eq!(counted_for_an_answer(0), 0);
+        // Seven thousand empty entries in one message count for a page.
+        let empty = 7_000 * entry_cost(0);
+        assert!(empty > FULL_PAGE_COST);
+        assert_eq!(counted_for_an_answer(empty), FULL_PAGE_COST);
     }
 
     /// One fetch at a time from each peer: a peer that answers slowly does

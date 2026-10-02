@@ -451,10 +451,12 @@ a channel that is dropped each time it is taken does not fit.
 only for what the relay lost, dropped or had no room for. Ten minutes is
 the longest a device waits before it offers again what a relay refused
 (outbox_refused_retry_max_secs), so whichever of the two has the entry, the
-other hears of it within that time. It costs a device one small exchange
-every ten minutes: the list of its channels, and one request for each.
-Without the wait before a dropped channel is taken again, a relay at its
-cap would fetch the channel, drop it, and fetch it again every cycle.
+other hears of it in about that time, and in up to twice that for a
+channel that was dropped. When a device connects, the relay lists each of
+its channels from the start. After that it costs a device one small
+exchange every ten minutes: the list of its channels, and one request for
+each. Without the wait before a dropped channel is taken again, a relay at
+its cap would fetch the channel, drop it, and fetch it again every cycle.
 
 What a relay fetches from a device counts as what the device may push
 does (push_bytes_per_peer_per_minute, and five times that for the address),
@@ -477,9 +479,14 @@ could be a channel's are taken (max_channel_id_len), and this many in one
 pass.
 
 **Derivation:** A person's device holds tens of channels. One that holds
-more than this is asked about a different part of them each time. A place
-is two short strings and a number, and is kept only while the peer is
-connected, so 200 connections cost a relay at most about 20MB.
+more than this is asked about a different part of them each time.
+
+What a relay keeps for a peer is bounded too. It keeps a place in a
+peer's list, and a page size, for at most this many channels of one peer,
+and only while the peer is connected. It keeps a place only in a channel
+it holds, so names a peer makes up cost it nothing. A place is a short
+string and a number: 200 connections with 1,024 channels each would cost
+a relay about 30MB.
 
 ### limits for an address = 5 x the limits for a connection
 
@@ -508,7 +515,7 @@ few retries, seconds apart, cover the passing kind. For the lasting kind,
 one small push every ten minutes costs nothing, and delivers the item
 within ten minutes of the reason going away.
 
-### outbox_batch_max_bytes = 192KB, outbox_batch_max_items = 500
+### outbox_batch_max_bytes = 195KB, outbox_batch_max_items = 500
 
 **Rationale:** One outbox push costs at most what three entries of the
 largest size cost (195KB with entry_overhead_bytes). That is far inside

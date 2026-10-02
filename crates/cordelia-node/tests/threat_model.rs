@@ -1245,6 +1245,11 @@ struct Held {
     /// Answer a request for a page with every entry of the channel,
     /// whatever size of page was asked for.
     ignores_page_size: bool,
+    /// Each time it is asked which channels it holds, answer with this
+    /// many names made up for the occasion, never the same twice. And
+    /// answer each request for a page of one with an empty page that says
+    /// there is more.
+    makes_up_names: usize,
     /// What the relay asked, one for each time it asked what is held.
     passes: Arc<Mutex<Vec<Pass>>>,
 }
@@ -1681,6 +1686,22 @@ impl Client {
                 while let Ok(msg) = codec::read_frame(&mut recv).await {
                     let items = held.items.lock().unwrap().clone();
                     let answer = match msg {
+                        WireMessage::SyncChannelListRequest(_) if held.makes_up_names > 0 => {
+                            let passes = held.passes.lock().unwrap().len();
+                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                                channel_ids: (0..held.makes_up_names)
+                                    .map(|n| format!("grp_made-up-{passes:06}-{n:06}"))
+                                    .collect(),
+                            })
+                        }
+                        WireMessage::SyncRequest(req) if held.makes_up_names > 0 => {
+                            pass.listed.push(req.channel_id.clone());
+                            WireMessage::SyncResponse(SyncResponse {
+                                items: Vec::new(),
+                                has_more: true,
+                                last_seq: Some(req.after_seq.unwrap_or(0) + 1),
+                            })
+                        }
                         WireMessage::SyncChannelListRequest(_) => {
                             let channel_ids = held.lists.clone().unwrap_or_else(|| {
                                 let ids: BTreeSet<String> =
@@ -2027,6 +2048,71 @@ async fn t03_a_relay_asks_a_peer_about_only_so_many_channels() {
         pass.listed.iter().all(|id| id.len() <= MAX_CHANNEL_ID_LEN),
         "the relay asked about a channel with an ID no channel has"
     );
+}
+
+/// What a relay's log says it keeps for its peers (places in their lists,
+/// and page sizes), at each cycle.
+fn places_kept(relay: &Node) -> Vec<u64> {
+    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
+    // The log has colour codes around each field's name.
+    let mut plain = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+        .lines()
+        .filter(|line| line.contains("pull-sync cycle"))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("places="))
+                .and_then(|n| n.parse().ok())
+        })
+        .collect()
+}
+
+/// T3. A relay keeps nothing for names a peer makes up. A peer says it
+/// holds a thousand channels, different ones each time it is asked, and
+/// answers each request with an empty page that says there is more. The
+/// relay asks about each name once, and keeps a place in none of them: a
+/// place is kept only in a channel the relay holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t03_a_relay_keeps_nothing_for_names_a_peer_makes_up() {
+    use cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER;
+
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let peer = client_of(&relay).await.expect("the peer connects");
+    let held = Held {
+        makes_up_names: MAX_CHANNELS_ASKED_OF_A_PEER,
+        ..Held::default()
+    };
+    peer.serve(held.clone());
+
+    wait_for("the relay asks the peer three times", &[&relay], 90, || {
+        (held.passes().len() >= 3).then_some(())
+    });
+    for (n, pass) in held.passes().iter().enumerate() {
+        // Once about each name: an empty page is the end, whatever it says.
+        assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER, "pass {n}");
+        assert_eq!(pass.fetches, 0, "pass {n}");
+    }
+    let kept = places_kept(&relay);
+    assert!(kept.len() >= 3, "{kept:?}");
+    assert!(
+        kept.iter().all(|places| *places == 0),
+        "the relay kept places for names a peer made up: {kept:?}"
+    );
+    assert_eq!(relay_holds(&relay), (0, 0));
 }
 
 /// T3. A relay does not fetch what it has no room for. A device holds
