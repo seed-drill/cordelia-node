@@ -14,6 +14,10 @@
 > from an owner). The [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.1 and §4.3 give the defences,
 > and the tests in `crates/cordelia-api/tests/` and
 > `crates/cordelia-storage/src/items.rs` cover them.
+>
+> The figures below use the limits of March 2026 (items of 256 KB, 100 writes
+> a minute to a channel). The limits now, what each one bounds and the tests
+> that hold them are in the [threat model](../security/threat-model.md), T3.
 
 ---
 

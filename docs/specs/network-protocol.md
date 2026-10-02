@@ -1638,13 +1638,13 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 
 | Parameter | Value | Enforcement |
 |-----------|-------|-------------|
-| `max_item_bytes` | 256 KB (262,144) | API write, P2P receive, outbound replication |
+| `max_item_bytes` | 64 KB (65,536) | The device that writes the item, each relay, the device that receives it |
 | `max_message_bytes` | 1 MB (1,048,576) | Wire codec (length prefix check) |
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 
-Items exceeding `max_item_bytes` are rejected at all boundaries. The 256 KB limit is consistent with the REST API (channels-api.md §3.2) and SDK (sdk-api-reference.md). Phase 1 is text-only AI memory; 95th percentile ~50KB, so 256KB provides 5x headroom. No images/media. Increasing later is non-breaking.
+Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
 
-The `max_message_bytes` of 1 MB accommodates a batch of up to 4 max-size items, or ~100 typical items (~10 KB each). The wire codec rejects messages exceeding this before any parsing occurs.
+The `max_message_bytes` of 1 MB accommodates 14 max-size items with their headers, or ~100 typical items (~10 KB each). A sender keeps a push to 192 KB (`OUTBOX_BATCH_MAX_BYTES`), and a node that fetches asks for fewer items when a page's would not fit (`SYNC_PAGE_STEPS`). The wire codec rejects messages exceeding this before any parsing occurs.
 
 ### 9.4 Backpressure Model
 
@@ -1895,7 +1895,7 @@ max_inbound_connections = 200
 max_connections_per_ip = 5
 max_connections_per_subnet = 20         # /24
 max_streams_per_connection = 64
-max_item_bytes = 262144                 # 256 KB
+max_item_bytes = 65536                  # 64 KB
 max_message_bytes = 1048576             # 1 MB
 writes_per_peer_per_minute = 10
 writes_per_channel_per_minute = 100

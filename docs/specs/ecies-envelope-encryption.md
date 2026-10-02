@@ -392,7 +392,7 @@ Steps:
 | IV size | 96 bits (12 bytes), random per item |
 | Auth tag size | 128 bits (16 bytes) |
 | AAD | channel_id (UTF-8 bytes) -- binds ciphertext to its channel |
-| Max plaintext | No protocol limit. Practical limit: SQLite row size (~1GB). Recommended: <256KB. |
+| Max plaintext | 65,508 bytes: an item is at most 64 KB as it travels (`MAX_ITEM_BYTES`), and the IV and tag take 28 of them. |
 
 ### 5.5 AAD Binding
 

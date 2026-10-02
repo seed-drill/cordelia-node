@@ -15,10 +15,10 @@ Code's memory.
 
 **Pre-release (October 2026).** v1 is built and tested, including end-to-end
 tests with real processes over QUIC through a relay. Two relays are running,
-and `v0.2.0-alpha.3` is the current pre-release, for macOS and Linux:
+and `v0.2.0-alpha.4` is the current pre-release, for macOS and Linux:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.3 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.4 sh
 ```
 
 It is an alpha: expect rough edges, and keep your own backup of anything you
@@ -41,6 +41,10 @@ desktop$ cordelia add-device cordelia_pk1... --name laptop
          #   On the other device, run: cordelia accept cordelia_pk1...
 laptop$  cordelia accept cordelia_pk1...
 ```
+
+Pair a new machine before you turn sync on there. `accept` moves a device
+into the other device's set only while it is not in use: a device that
+already syncs, or already has other devices, stays where it is, and says so.
 
 Then turn on sync on both, and say what to sync:
 
@@ -77,9 +81,16 @@ with what your other devices have, and deletes nothing. The device stays a
 member of the name's channel (its node still receives the encrypted items)
 until you remove the device; leaving a channel is not built yet.
 
+A memory file syncs if it fits in one entry, which holds 64 KB. A larger
+file, or one that is not plain text, is left as it is on the machine that has
+it, and your other machines keep the last version that did sync;
+`cordelia sync status` names it.
+
 Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device everywhere and rotates keys),
-`cordelia sync off`.
+`cordelia sync off`. Removing a device keeps what it last wrote. The change
+is offered to your other devices until each has it, and `cordelia devices`
+shows any that has not confirmed.
 
 ### Status
 
@@ -87,14 +98,16 @@ Other commands: `cordelia devices`, `cordelia invites`,
 memory sync. For status bars:
 
 - `cordelia status --line` prints one short line: `● memory synced`,
-  `◐ memory sending 3`, `○ memory offline`, `▲ memory: 1 conflict`, and so on.
-  It prints nothing on a machine where Cordelia is not set up.
+  `◐ memory sending 3`, `○ memory offline`, `▲ memory: 1 conflict`,
+  `▲ memory: 1 file too large`, `▲ memory: 1 not taken by a relay`, and so
+  on. It prints nothing on a machine where Cordelia is not set up.
 - `cordelia status --json` gives the same `state` (`synced`, `syncing`,
   `offline`, `attention`, `off`, `stopped`) and `summary`, with everything a
   panel or an agent needs: the connected relays, your devices, each folder
   that syncs and its name, what was found and is not syncing, what your
-  other devices sync, items waiting to reach a relay, last change, and the
-  conflict files waiting to be merged.
+  other devices sync, items waiting to reach a relay and any that a relay
+  refused, last change, the conflict files waiting to be merged, and the
+  files that are too large to sync.
 
 To show it in Claude Code, add this to `~/.claude/settings.json` (use the full
 path, e.g. `~/.cordelia/bin/cordelia`, if `cordelia` is not on the `PATH`
@@ -175,10 +188,17 @@ sync (`/api/v1/sync/*`).
 
 Relays and relay operators see channel IDs, device public keys, and item sizes,
 types and timing; never content, file names, member lists, or keys. The node
-on your machine dials out to the relays (UDP 9474) and listens only on its
-local API (127.0.0.1): nothing on a network you join can connect to it. See
-[WHITEPAPER.md §4](WHITEPAPER.md#4-security-model) for the full model and its
-limits. To report a vulnerability privately, email hello@seeddrill.ai.
+on your machine dials out to the relays it was configured with, which it
+knows by name and by key (UDP 9474), and listens only on its local API
+(127.0.0.1): nothing on a network you join can connect to it.
+
+- [docs/security/threat-model.md](docs/security/threat-model.md) says what
+  Cordelia defends against and what it does not, and names the tests that
+  prove each claim. CI fails if a claim loses its test.
+- [WHITEPAPER.md §4](WHITEPAPER.md#4-security-model) has the full model and
+  its limits.
+
+To report a vulnerability privately, email hello@seeddrill.ai.
 
 ## License
 

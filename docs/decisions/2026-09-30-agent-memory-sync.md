@@ -202,8 +202,8 @@ Personal nodes are outbound-only and there is no NAT traversal, so two devices a
   - A write that takes it over the cap makes it drop the channels it came to hold most recently, until it is under. If the channel written to is the newest, that is the one dropped. So what was there first is never pushed out by what came later, and a flood of new channels cannot displace anyone's.
   - One channel may hold 16 MB. One address may make a relay hold 16 new channels an hour. Two relays that list each other are not counted.
   - A device whose entry is refused for lack of room keeps it, offers it to its other relay, and says so in status.
-  - Nothing is lost when a relay drops a channel or is rebuilt: every device holds its channels whole, and a relay asks the devices that connect to it which channels they hold and fetches what it lacks, when it has room.
-  - An open relay can still be filled by someone patient with many addresses. It stays correct; the answers are a larger cap, retention, and closing the relay to the keys its operator lists.
+  - Nothing is lost when a relay drops a channel or is rebuilt: every device holds its channels whole, and a relay asks the devices that connect to it which channels they hold and fetches what it lacks, when it has room. **As built (0.2.0-alpha.4):** a relay asks a device again for a channel it dropped, or had no room for, when that device next connects, and not before ([#92](https://github.com/seed-drill/cordelia-node/issues/92)).
+  - An open relay can still be filled: one address can make it take 256 MB an hour, and many addresses more. It then takes no new channel, and stays correct; the answers are a larger cap, retention, and closing the relay to the keys its operator lists.
 - **Retention** for relays is not implemented yet (section 9).
 
 ### 4.7 Memory is the boundary (decided 2026-10-01)

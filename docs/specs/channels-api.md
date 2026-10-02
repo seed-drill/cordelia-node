@@ -268,7 +268,7 @@ Node-internal types are written by the node itself (during subscribe, PSK rotati
 - `400` if content is missing or not valid JSON
 - `404` if channel not found
 - `403` if caller is not a member
-- `413` if serialized content exceeds 256KB
+- `413` if the item would exceed 64 KB as it travels: its serialized content plus the 28 bytes that encryption adds
 
 **Notes:**
 - The `author` field is the publisher's Ed25519 public key in Bech32 encoding. The REST API uses `author` (short form); the wire protocol and CBOR signed envelope use `author_id` (raw 32-byte key). The SDK transforms `author` to camelCase. This deliberate rename (author_id -> author) simplifies the developer-facing API.

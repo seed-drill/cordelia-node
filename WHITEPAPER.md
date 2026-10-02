@@ -108,7 +108,8 @@ A node applies an invitation only from a key it **trusts**:
   by the iMac without another `accept`.
 
 Anything else waits in `cordelia invites` until accepted (capped at 100,
-oldest dropped first). Without this, anyone who learned a node's public key
+oldest dropped first; nothing a person's own devices sent is dropped to make
+room). Without this, anyone who learned a node's public key
 could add it to a channel whose content would land in the agent's memory
 folder.
 
@@ -186,26 +187,38 @@ revision by another author become current again.
 
 ### 3.4 Network
 
-Nodes talk QUIC (RFC 9000, TLS 1.3, the device key as the certificate subject)
-with CBOR messages. Two roles matter in v1:
+Nodes talk QUIC (RFC 9000, TLS 1.3) with CBOR messages. A node's identity is
+the key its TLS certificate carries, so nobody can connect or answer under a
+key they do not hold. Two roles matter in v1:
 
 - **Personal nodes** run on people's devices. They only dial out, so they work
-  behind NAT and firewalls, and connect to relays. A personal node opens no
-  listening port: nothing on a network the device joins can connect to it.
+  behind NAT and firewalls. A personal node dials the relays it was configured
+  with and nothing else. It knows each by name and by key, and refuses any
+  other key at a relay's address. It opens no listening port: nothing on a
+  network the device joins can connect to it.
 - **Relays** accept connections, store the ciphertext they receive, and forward
-  it to the other relays they know, with a seen-table so nothing loops. Relays
-  are also the addresses personal nodes dial first. Peer selection follows the
-  hot/warm/cold governor model of Cardano's P2P networking layer.
+  it to the relays their operator lists, with a seen-table so nothing loops.
+  Peer selection follows the hot/warm/cold governor model of Cardano's P2P
+  networking layer.
+- **A relay is a cache with a cap.** Every device holds its channels whole. A
+  relay asks each device that connects to it which channels it holds, and
+  fetches what it lacks. So nothing is lost for good when a relay is
+  rebuilt, or drops a channel to make room. At its storage cap a relay takes
+  no channel it does not already hold, and makes room by dropping the
+  channels it came to hold most recently.
 
 Two mechanisms carry items between them:
 
 - **Outbox.** A node's own items stay marked as not relayed until a relay
-  acknowledges storing them. The node flushes its outbox as a single push at most
-  every 2 seconds, which stays within a relay's per-peer write limit however many
-  items were written, and resends anything unacknowledged, across restarts.
+  has stored them. The node flushes its outbox as a single push at most
+  every 2 seconds, which stays within a relay's limits however many items
+  were written, and resends anything a relay did not store, across restarts.
+  A relay that refuses an item says which and why, and the node offers it
+  again after a wait, to the next relay in turn.
 - **Pull sync.** Every 10 seconds a personal node pulls each of its channels from
   its relays, paging by the relay's own arrival order (a sequence number that
   never goes backwards), so no item is skipped whatever its author's clock said.
+  A device stores only what members of its own channels wrote.
 
 ### 3.5 The Claude Code adapter
 
@@ -254,7 +267,9 @@ Two mechanisms carry items between them:
    accepted from other devices: no separators, no `..`, no hidden files. Before
    replacing or removing a file, the adapter re-reads it; if the agent wrote to it
    during the cycle, the change is deferred to the next cycle instead of
-   overwritten.
+   overwritten. A file that does not fit in one entry (64 KB), or is not
+   plain text, takes no part in sync: it is left as it is, reported, and
+   deleted nowhere.
 
 ## 4. Security model
 
@@ -270,7 +285,13 @@ is never shared between people: an agent reads its memory as its own notes, so
 another person's text there would act with the agent's authority (decision
 record §4.7). A removed device keeps what it already had but cannot read
 anything written after the key rotation that removal triggers, and its later
-writes are ignored because it is no longer a member.
+writes are ignored because it is no longer a member. What it wrote before is
+kept: the device that removes it publishes those entries again.
+
+The threats Cordelia defends against, the ones it does not, and the tests
+that prove each claim are in
+[docs/security/threat-model.md](docs/security/threat-model.md). CI fails if a
+claim loses its test.
 
 **On a person's own machines**, memory is as protected as their disk: the agent's
 memory files are plaintext, as they are without Cordelia, and the node's data
@@ -280,12 +301,13 @@ readable only by the user).
 | Threat | Mitigation |
 |---|---|
 | Relay compromise | Relays hold ciphertext only; no keys. Signatures stop them forging or relabelling items. |
-| Stranger writes to a channel | Items from non-members are ignored; per-author storage stops them evicting members' items. |
-| Stranger invites a device | Invitations apply only from trusted keys; others wait for `accept`. |
-| Lost or stolen device | `remove-device` from any other device removes it everywhere and rotates keys. A device only ever held keys for the projects it had. |
-| Replayed old channel state | Epoch ordering: stale states are ignored. |
+| Someone answers for a relay's name, or claims another node's key | A node's identity is the key its certificate carries. Devices know their relays by key and refuse any other. |
+| Stranger writes to a channel | Items from non-members are ignored, and devices do not store them; no storage rule lets one author's items hide, displace or sweep away another's. |
+| Stranger invites a device | Invitations apply only from trusted keys; others wait for `accept`. A channel of your own is only ever handed to your own devices. |
+| Lost or stolen device | `remove-device` from any other device removes it everywhere and rotates keys. The change is offered until every remaining device confirms it. A device only ever held keys for the projects it had. |
+| Replayed old channel state | Epoch ordering: stale states are ignored. Epochs, key versions and revisions are bounded, so none can be run out. |
 | Malicious file names | Only plain names are written, only inside the memory folder. |
-| Burst writes, floods | Outbox batching within relay limits; per-peer rate limits; pending invites capped. |
+| Burst writes, floods | One size for every entry (64 KB), checked at every hop. Limits for a connection and for its address; a peer that keeps going over is cut off. A storage cap at relays that keeps what was there first. Pending invites capped. |
 
 **Non-goals for v1.** Hiding that communication happens (traffic metadata is
 visible to relays); protecting a device that is itself compromised; resisting a
@@ -339,9 +361,12 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 |---|---|---|
 | Pull-sync interval | 10 s | `REALTIME_SYNC_INTERVAL_SECS` |
 | Outbox flush interval | 2 s | `OUTBOX_FLUSH_INTERVAL_SECS` |
-| Relay write limit per peer | 36 / min | `WRITES_PER_PEER_PER_MINUTE` |
-| Largest item | 256 KB | `MAX_ITEM_BYTES` |
-| Largest synced memory file | 128 KB | `cordelia-sync` `MAX_FILE_BYTES` |
+| Relay write limit per connection | 36 pushes and 2 MB / min | `WRITES_PER_PEER_PER_MINUTE`, `PUSH_BYTES_PER_PEER_PER_MINUTE` |
+| The same, for one address | 5 times a connection's | `MAX_CONNECTIONS_PER_IP` |
+| Largest entry, as it travels | 64 KB | `MAX_ITEM_BYTES` |
+| Largest synced memory file | what fits in one entry | `cordelia-sync` |
+| One channel at a relay | 16 MB | `MAX_CHANNEL_BYTES_AT_RELAY` |
+| A relay in total | 1 GiB unless its operator sets it | `max_storage_bytes` |
 | Deleted-key retention | 90 days | `KEYED_TOMBSTONE_RETENTION_DAYS` |
 | Adapter cycle | 5 s | `cordelia-sync` `CYCLE_SECS` |
 | Pending invites kept | 100 | `MAX_PENDING_INVITES` |

@@ -50,7 +50,7 @@ cp deploy/relay/relay.env.example deploy/relay/.env
 Then edit `deploy/relay/.env`:
 
 - `RELAY=relay1` or `RELAY=relay2`.
-- **A release (preferred):** `CORDELIA_VERSION` (e.g. `v0.2.0-alpha.1`) and
+- **A release (preferred):** `CORDELIA_VERSION` (e.g. `v0.2.0-alpha.4`) and
   `CORDELIA_SHA256`, the sha256 of `cordelia-linux-amd64` from that release's
   page (its `.sha256` file). The image build downloads the binary and refuses
   it if the hash differs.
@@ -115,8 +115,17 @@ It runs hardened:
 what the relay holds and how much it is used, as counts only:
 
 - items stored and their encrypted size, and the database size;
+- how much storage is in use and how much is allowed;
 - distinct peers seen in the last day and week, relays counted apart;
 - channels that received an item in the last day and week.
+
+**Storage.** A relay holds at most `max_storage_bytes` (under `[node]` in its
+config; 1 GiB if not set). At the cap it takes no channel it does not already
+hold, and it makes room for the channels it holds by dropping the ones it
+came to hold most recently. Nothing is lost by that: every device holds its
+channels whole, and the relay fetches a dropped channel again when it has
+room, from the relays it lists and from each device when that device next
+connects. A relay that stays full needs a larger cap.
 
 The same counts are on the node's `/api/v1/metrics` (Prometheus format,
 127.0.0.1:9473, bearer token in `node-token` on the data volume) as
@@ -136,9 +145,21 @@ Change the pin in `deploy/relay/.env` (a new `CORDELIA_VERSION` and its
 docker compose -f deploy/relay/compose.yml up -d --build
 ```
 
+Read the release's upgrade notes first: a release may ask for devices to be
+upgraded before relays.
+
 The identity stays on the `cordelia-relay1-data` volume. Do not delete that
-volume: a relay with a new identity still works, since nodes find relays by
-name, but there is no reason to change it.
+volume, and keep a copy of the key somewhere safe. Devices know a relay by
+its name and by its key, and refuse any other key at its address. A relay
+that comes back with a new identity is refused by every device until they
+are told the new key: a new release, for the default relays; the `key` in
+each device's config, for a relay of your own.
+
+The database on that volume can be lost, and nothing is lost for good. A
+relay is a cache: it fetches what it lacks from the relays it lists, and from
+each device when the device connects. It takes at most 16 new channels an
+hour from one address, so a device with more channels than that fills it
+over several connections.
 
 ## 7. Your own relay
 
@@ -146,8 +167,19 @@ Copy `relay1.toml`, change `entity_id`, and list whichever relays yours
 should mesh with under `[[network.bootnodes]]`. With none listed, it stands
 alone: a relay never dials relays it was not told about. Run the same image with your
 file mounted and `CORDELIA_CONFIG` pointing at it. Then add your relay's
-`host:9474` under `[[network.bootnodes]]` in the config of each node that
-should use it. A relay can only ever see ciphertext, whoever runs it.
+`host:9474` and its key (what `cordelia id` prints on the relay) under
+`[[network.bootnodes]]` in the config of each node that should use it:
+
+```toml
+[[network.bootnodes]]
+addr = "relay.example.org:9474"
+key = "cordelia_pk1..."
+```
+
+Without a `key`, a node accepts whichever node answers at that address, and
+warns of it when it starts.
+
+A relay can only ever see ciphertext, whoever runs it.
 
 ## Fly.io (optional)
 
