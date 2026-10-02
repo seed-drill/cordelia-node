@@ -32,6 +32,7 @@ fn test_state() -> web::Data<AppState> {
         peers: Default::default(),
         relays: Default::default(),
         outbox_refused: Default::default(),
+        relist: Default::default(),
         sync_control: Default::default(),
     })
 }
