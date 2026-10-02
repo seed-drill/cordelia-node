@@ -195,15 +195,33 @@ pub fn node_with_bootnode(name: &'static str, role: &str, bootnode: Option<Strin
 
 /// A node with these bootnodes (`host:port` each).
 pub fn node_with_bootnodes(name: &'static str, role: &str, bootnode_addrs: &[String]) -> Node {
+    let relays: Vec<(String, Option<String>)> =
+        bootnode_addrs.iter().map(|a| (a.clone(), None)).collect();
+    node_with_relays(name, role, &relays)
+}
+
+/// A node with these relays: `host:port`, and the key that must answer
+/// there if one is given.
+pub fn node_with_relays(
+    name: &'static str,
+    role: &str,
+    relays: &[(String, Option<String>)],
+) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
     let mut p2p = free_port();
     while p2p == http {
         p2p = free_port();
     }
-    let bootnodes: String = bootnode_addrs
+    let bootnodes: String = relays
         .iter()
-        .map(|addr| format!("[[network.bootnodes]]\naddr = \"{addr}\"\n"))
+        .map(|(addr, key)| {
+            let key = key
+                .as_ref()
+                .map(|k| format!("key = \"{k}\"\n"))
+                .unwrap_or_default();
+            format!("[[network.bootnodes]]\naddr = \"{addr}\"\n{key}")
+        })
         .collect();
     let (hot_min, hot_max) = if role == "relay" { (1, 10) } else { (1, 2) };
     let config = format!(
@@ -342,4 +360,17 @@ pub fn claude_folder(home: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
     )
     .unwrap();
     folder.join("memory")
+}
+
+/// Where a node stands with each relay it was configured with, from
+/// `cordelia peers --json`.
+pub fn relays_of(n: &Node) -> Vec<serde_json::Value> {
+    let out = n.command(&["peers", "--json"]);
+    if !out.status.success() {
+        return Vec::new();
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v["relays"].as_array().cloned())
+        .unwrap_or_default()
 }

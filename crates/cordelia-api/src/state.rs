@@ -52,6 +52,9 @@ pub struct AppState {
     pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// The peers this node is connected to, refreshed on each governor tick.
     pub peers: std::sync::RwLock<Vec<PeerSnapshot>>,
+    /// The relays this node was configured with and whether each is
+    /// connected, refreshed by the P2P loop.
+    pub relays: std::sync::RwLock<Vec<RelaySnapshot>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
 }
@@ -98,6 +101,23 @@ pub struct PeerSnapshot {
     pub connected_secs: u64,
     /// Seconds since anything was last heard from the peer.
     pub idle_secs: u64,
+}
+
+/// One configured relay, as `cordelia peers` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RelaySnapshot {
+    /// The name the relay is dialled at (`host:port`).
+    pub host: String,
+    /// The key it must answer with (bech32), if one is configured.
+    pub key: Option<String>,
+    /// `connected`, `connecting`, `unreachable` or `wrong key`.
+    pub state: String,
+    /// Seconds since the attempts that are failing began.
+    pub unreachable_secs: Option<u64>,
+    /// Seconds since the last attempt.
+    pub last_tried_secs: Option<u64>,
+    /// Why the last attempt failed.
+    pub error: Option<String>,
 }
 
 impl AppState {

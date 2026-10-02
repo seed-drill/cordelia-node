@@ -45,6 +45,8 @@ pub struct NetworkConfig {
     pub listen_addr: String,
     pub role: String,
     pub push_policy: String,
+    /// No longer used: a node learns of no relay from DNS. Kept so that
+    /// configurations that set it still load.
     pub dns_discovery: String,
     #[serde(default)]
     pub bootnodes: Vec<BootnodeConfig>,
@@ -76,7 +78,13 @@ impl NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootnodeConfig {
+    /// Where the relay is dialled: `host:port`.
     pub addr: String,
+    /// The relay's public key (`cordelia_pk1...`). When set, any other key
+    /// answering at `addr` is refused. The default relays' keys are
+    /// compiled in and need not be given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Trusted peer for Personal Area Network (§8.2.2).
@@ -181,11 +189,13 @@ impl Default for NetworkConfig {
             listen_addr: format!("0.0.0.0:{}", protocol::P2P_PORT),
             role: "personal".into(),
             push_policy: "subscribers_only".into(),
-            dns_discovery: protocol::SRV_RECORD.into(),
+            dns_discovery: String::new(),
             bootnodes: protocol::FALLBACK_PEERS
                 .iter()
-                .map(|addr| BootnodeConfig {
+                .zip(protocol::FALLBACK_PEER_KEYS)
+                .map(|(addr, key)| BootnodeConfig {
                     addr: (*addr).into(),
+                    key: Some((*key).into()),
                 })
                 .collect(),
             trusted_peers: Vec::new(),
