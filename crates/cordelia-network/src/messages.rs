@@ -288,7 +288,8 @@ pub struct PushAck {
 pub struct Refusal {
     pub item_id: String,
     /// A short code for status to show: [`REFUSED_INVALID`],
-    /// [`REFUSED_STORAGE`], [`REFUSED_TOO_LARGE`] or [`REFUSED_NOT_MEMBER`].
+    /// [`REFUSED_STORAGE`], [`REFUSED_TOO_LARGE`], [`REFUSED_NOT_MEMBER`] or
+    /// [`REFUSED_FULL`].
     pub why: String,
 }
 
@@ -301,6 +302,11 @@ pub const REFUSED_TOO_LARGE: &str = "too_large";
 /// The receiver is a device, and the item is not one a member of one of
 /// its channels wrote.
 pub const REFUSED_NOT_MEMBER: &str = "not_member";
+/// The receiver is a relay with no room: it is at its storage cap and does
+/// not hold this channel, or the channel has reached what one channel may
+/// hold, or the sender's address has made it hold enough new channels for
+/// now.
+pub const REFUSED_FULL: &str = "full";
 
 // ── PSK-Exchange (0x07, §4.7) ──────────────────────────────────────
 

@@ -340,6 +340,15 @@ pub const MAX_CHANNEL_NAME_LEN: usize = 63;
 /// Primitive: default storage budget per node; configurable.
 pub const MAX_STORAGE_BYTES: u64 = 1_073_741_824;
 
+/// The most one channel may hold at a relay: 16 MB. A channel is cheap to
+/// make, so the relay's total is what bounds storage; this keeps one
+/// channel from being most of it. Rationale: parameter-rationale.md §4.
+pub const MAX_CHANNEL_BYTES_AT_RELAY: u64 = 16 * 1024 * 1024;
+
+/// How many channels one address may make a relay hold for the first time
+/// in an hour. Rationale: parameter-rationale.md §4.
+pub const NEW_CHANNELS_PER_ADDRESS_PER_HOUR: usize = 16;
+
 // ── Connection limits (network-protocol.md §9.1) ────────────────────
 
 /// Maximum inbound connections.

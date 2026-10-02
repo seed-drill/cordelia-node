@@ -535,6 +535,57 @@ pub fn list_stored_channel_ids(conn: &Connection) -> Result<Vec<String>, Cordeli
     Ok(ids)
 }
 
+/// Whether this node has a row for the channel.
+pub fn exists(conn: &Connection, channel_id: &str) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?1)",
+        params![channel_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
+/// The channel a relay came to hold most recently. When a relay is over
+/// its cap it makes room by dropping this one, so that what was there
+/// first is never pushed out by what came later.
+pub fn newest_stored(conn: &Connection) -> Result<Option<String>, CordeliaError> {
+    match conn.query_row(
+        "SELECT channel_id FROM channels
+         WHERE channel_id IN (SELECT DISTINCT channel_id FROM items)
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CordeliaError::Storage(e.to_string())),
+    }
+}
+
+/// Drop a channel that a relay stores: its items, and its row. Returns how
+/// many items went. For relays, which hold no keys or members for it.
+pub fn drop_stored(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    conn.execute(
+        "DELETE FROM search_content WHERE channel_id = ?1",
+        params![channel_id],
+    )
+    .map_err(storage)?;
+    let items = conn
+        .execute(
+            "DELETE FROM items WHERE channel_id = ?1",
+            params![channel_id],
+        )
+        .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM channels WHERE channel_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM channel_members WHERE channel_id = ?1)",
+        params![channel_id],
+    )
+    .map_err(storage)?;
+    Ok(items)
+}
+
 /// Create a local-scope channel (ephemeral, never forwarded to relay mesh).
 ///
 /// Uses a protocol-prefixed channel ID. The `channel_id` must be provided

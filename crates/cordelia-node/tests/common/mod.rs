@@ -172,6 +172,20 @@ impl Node {
         resp.body_mut().read_json().unwrap()
     }
 
+    /// Set `max_storage_bytes` for this node, before it is started: the
+    /// most a relay's database may hold.
+    pub fn max_storage_bytes(&self, bytes: u64) {
+        let config = std::fs::read_to_string(self.config()).unwrap();
+        let (before, after) = config
+            .split_once("[network]")
+            .expect("the config has a [network] section after [node]");
+        std::fs::write(
+            self.config(),
+            format!("{before}max_storage_bytes = {bytes}\n\n[network]{after}"),
+        )
+        .unwrap();
+    }
+
     pub fn log_tail(&self) -> String {
         let log = std::fs::read_to_string(self.log()).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();

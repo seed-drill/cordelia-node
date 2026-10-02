@@ -29,6 +29,12 @@ pub struct Rates {
     by_peer: std::collections::HashMap<NodeId, cordelia_network::rate_limit::PeerRateLimiter>,
     by_address:
         std::collections::HashMap<std::net::IpAddr, cordelia_network::rate_limit::PeerRateLimiter>,
+    /// When each address made a relay hold a channel it did not hold
+    /// before, within the last hour.
+    new_channels:
+        std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
+    /// The most a relay's database may hold (its operator's setting).
+    relay_max_bytes: u64,
 }
 
 /// A request that is over a limit.
@@ -39,6 +45,14 @@ pub struct OverLimit {
 }
 
 impl Rates {
+    /// For a node whose database, if it is a relay, may hold `relay_max_bytes`.
+    pub fn new(relay_max_bytes: u64) -> Self {
+        Self {
+            relay_max_bytes,
+            ..Self::default()
+        }
+    }
+
     fn both(
         &mut self,
         peer: &NodeId,
@@ -116,12 +130,33 @@ impl Rates {
         Ok(())
     }
 
+    /// Count a channel that `address` is making a relay hold for the first
+    /// time. False, counting nothing, if the address has had its share for
+    /// the hour (NEW_CHANNELS_PER_ADDRESS_PER_HOUR). A channel costs
+    /// nothing to make, so without this one address could make a relay
+    /// hold any number of them.
+    pub fn new_channel(&mut self, address: std::net::IpAddr) -> bool {
+        let hour = std::time::Duration::from_secs(3600);
+        let made = self.new_channels.entry(address).or_default();
+        while made.front().is_some_and(|at| at.elapsed() >= hour) {
+            made.pop_front();
+        }
+        if made.len() >= cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
+            return false;
+        }
+        made.push_back(std::time::Instant::now());
+        true
+    }
+
     /// Forget peers that are no longer connected, and addresses that have
     /// no connection and no recent breach.
     pub fn prune(&mut self, connected: &[NodeId], open: &[std::net::IpAddr]) {
         self.by_peer.retain(|peer, _| connected.contains(peer));
         self.by_address
             .retain(|address, limiter| open.contains(address) || limiter.has_recent_breach());
+        let hour = std::time::Duration::from_secs(3600);
+        self.new_channels
+            .retain(|_, made| made.back().is_some_and(|at| at.elapsed() < hour));
     }
 }
 
@@ -153,7 +188,137 @@ pub fn store_item(
     node_role: &str,
     own: &[u8; 32],
 ) -> Result<bool, &'static str> {
-    store_checked(db, item, &check_item(item)?, node_role, own)
+    let mut room = RelayRoom::new(u64::MAX, None);
+    let room = (node_role == "relay").then_some(&mut room);
+    store_checked(db, item, &check_item(item)?, node_role, own, room)
+}
+
+/// What a relay needs to decide whether it has room for an item (decision
+/// 2026-09-30 §4.6). A relay is a cache with a cap:
+///
+/// - At its cap it takes no channel that it does not already hold.
+/// - A write that takes it over its cap makes it drop the channels it
+///   came to hold most recently, until it is under. If the channel written
+///   to is the newest, that is the one dropped, and the write is refused.
+///   So what was there first is never pushed out by what came later, and
+///   a flood of new channels cannot displace anyone's.
+/// - One channel may hold only so much, and one address may make it hold
+///   only so many new channels in an hour.
+///
+/// A relay fetches again from its devices what it dropped, once it has
+/// room: each device answers its relay with the channels it holds.
+pub struct RelayRoom<'a> {
+    /// The most the relay's database may hold, in bytes.
+    pub max_bytes: u64,
+    /// The most one channel may hold, in bytes of entries.
+    pub max_channel_bytes: u64,
+    /// The address the item came from, with the counts of new channels for
+    /// each address. `None` when it came from a relay this one lists,
+    /// which is not limited.
+    pub source: Option<(std::net::IpAddr, &'a std::sync::Mutex<Rates>)>,
+    /// What each channel holds, for the channels met while handling one
+    /// batch, so that it is added up once a batch and not once an item.
+    pub channel_bytes: std::collections::HashMap<String, u64>,
+}
+
+impl<'a> RelayRoom<'a> {
+    pub fn new(
+        max_bytes: u64,
+        source: Option<(std::net::IpAddr, &'a std::sync::Mutex<Rates>)>,
+    ) -> Self {
+        Self {
+            max_bytes,
+            max_channel_bytes: cordelia_core::protocol::MAX_CHANNEL_BYTES_AT_RELAY,
+            source,
+            channel_bytes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether the relay takes this item, as far as room goes. Makes the
+    /// channel's row if it is a channel the relay will now hold.
+    fn admit(
+        &mut self,
+        db: &rusqlite::Connection,
+        item: &cordelia_network::messages::Item,
+        checked: &Checked,
+    ) -> Result<(), &'static str> {
+        use cordelia_network::messages::{REFUSED_FULL, REFUSED_STORAGE};
+        use cordelia_storage::{channels, items};
+        let bytes = item.encrypted_blob.len() as u64;
+
+        if !channels::exists(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)? {
+            // A channel the relay does not hold: only if there is room,
+            // and the address has not made it hold too many lately.
+            let used = cordelia_storage::db::used_bytes(db).map_err(|_| REFUSED_STORAGE)?;
+            if used >= self.max_bytes {
+                tracing::debug!(channel = %item.channel_id, used, "at the storage cap; not taking a channel this relay does not hold");
+                return Err(REFUSED_FULL);
+            }
+            if let Some((address, rates)) = &self.source
+                && !rates
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .new_channel(*address)
+            {
+                tracing::debug!(channel = %item.channel_id, %address, "this address has made the relay hold enough new channels for now");
+                return Err(REFUSED_FULL);
+            }
+            // Relay: ensure channel row exists (no FK violation, BV-21)
+            let _ = db.execute(
+                "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at) VALUES (?1, 'named', 'realtime', 'open', X'00', datetime('now'), datetime('now'))",
+                rusqlite::params![item.channel_id],
+            );
+            self.channel_bytes.insert(item.channel_id.clone(), 0);
+        }
+
+        // What the channel would hold with this item, less what the item
+        // replaces (the same author's older revision of the same name).
+        let held = match self.channel_bytes.get(&item.channel_id) {
+            Some(held) => *held,
+            None => items::channel_bytes(db, &item.channel_id).map_err(|_| REFUSED_STORAGE)?,
+        };
+        let replaced = match &checked.slot {
+            Some(slot) => {
+                items::author_slot_bytes(db, &item.channel_id, slot, &checked.author).unwrap_or(0)
+            }
+            None => 0,
+        };
+        let after = held.saturating_sub(replaced) + bytes;
+        if after > self.max_channel_bytes {
+            tracing::debug!(channel = %item.channel_id, held, "this channel holds as much as one channel may");
+            return Err(REFUSED_FULL);
+        }
+        self.channel_bytes.insert(item.channel_id.clone(), after);
+        Ok(())
+    }
+
+    /// After a write to `written`: if the relay is over its cap, drop the
+    /// channels it came to hold most recently until it is not. Returns
+    /// false if `written` was itself among them: it was the newest, so the
+    /// write did not stay.
+    fn make_room(&mut self, db: &rusqlite::Connection, written: &str) -> bool {
+        use cordelia_storage::channels;
+        let mut kept = true;
+        while cordelia_storage::db::used_bytes(db).is_ok_and(|used| used > self.max_bytes) {
+            let Ok(Some(newest)) = channels::newest_stored(db) else {
+                break;
+            };
+            match channels::drop_stored(db, &newest) {
+                Ok(items) => tracing::warn!(
+                    channel = %newest,
+                    items,
+                    "over the storage cap: dropped the channel this relay came to hold most recently"
+                ),
+                Err(e) => {
+                    tracing::warn!(channel = %newest, error = %e, "could not drop a channel to make room");
+                    break;
+                }
+            }
+            self.channel_bytes.remove(&newest);
+            kept &= newest != written;
+        }
+        kept
+    }
 }
 
 /// An item that has passed every check that needs no database: its size,
@@ -208,24 +373,22 @@ pub fn check_item(item: &cordelia_network::messages::Item) -> Result<Checked, &'
     })
 }
 
-/// Store an item that [`check_item`] has passed.
+/// Store an item that [`check_item`] has passed. A relay passes its
+/// [`RelayRoom`]; a device passes none.
 pub fn store_checked(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
     checked: &Checked,
     node_role: &str,
     own: &[u8; 32],
+    mut room: Option<&mut RelayRoom>,
 ) -> Result<bool, &'static str> {
     use cordelia_network::messages::{
         REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
     };
 
-    // Relay: ensure channel row exists (no FK violation, BV-21)
-    if node_role == "relay" {
-        let _ = db.execute(
-            "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at) VALUES (?1, 'named', 'realtime', 'open', X'00', datetime('now'), datetime('now'))",
-            rusqlite::params![item.channel_id],
-        );
+    if let Some(room) = room.as_deref_mut() {
+        room.admit(db, item, checked)?;
     }
 
     if node_role == "personal" && !wanted_by_a_device(db, &item.channel_id, &checked.author, own) {
@@ -250,7 +413,15 @@ pub fn store_checked(
     };
 
     match cordelia_storage::items::insert_item(db, &new_item) {
-        Ok(inserted) => Ok(inserted),
+        Ok(inserted) => {
+            if inserted
+                && let Some(room) = room
+                && !room.make_room(db, &item.channel_id)
+            {
+                return Err(cordelia_network::messages::REFUSED_FULL);
+            }
+            Ok(inserted)
+        }
         Err(e) => {
             tracing::debug!(item = %item.item_id, error = %e, "store failed");
             Err(match e {
@@ -769,6 +940,7 @@ pub async fn p2p_loop(
     gov_config: cordelia_core::config::GovernorConfig,
     relay_addrs: RelayAddrs,
     trusted_peer_ids: Vec<NodeId>,
+    max_storage_bytes: u64,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -803,7 +975,7 @@ pub async fn p2p_loop(
 
     // Per-peer rate limiters, shared with handle_peer_streams tasks
     let peer_rates: std::sync::Arc<std::sync::Mutex<Rates>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+        std::sync::Arc::new(std::sync::Mutex::new(Rates::new(max_storage_bytes)));
     // Addresses refused for a time, after a peer there kept going over its
     // limits. An address, since a key costs nothing to replace.
     let mut refused_addresses: std::collections::HashMap<std::net::IpAddr, std::time::Instant> =
@@ -1733,6 +1905,13 @@ pub async fn p2p_loop(
                     let seen_ref = seen_table.clone();
                     let cursors = sync_cursors.clone();
                     let page_steps = sync_page_steps.clone();
+                    let room_rates = peer_rates.clone();
+                    // What a relay this node lists hands over is not counted
+                    // against an address.
+                    let from_listed_relay = governor
+                        .peer_info(&target)
+                        .is_some_and(|peer| peer.is_relay);
+                    let source_address = conn.remote_address().ip();
                     tokio::spawn(async move {
                         // Batched sync (§4.5): one stream per peer, all channels.
                         // Open one (send, recv) pair, write protocol byte once.
@@ -1844,8 +2023,14 @@ pub async fn p2p_loop(
                                                 Err(_) => break 'channels,
                                             };
                                             let own = sync_state.identity.public_key();
+                                            let max_bytes = room_rates.lock().unwrap_or_else(|e| e.into_inner()).relay_max_bytes;
+                                            let mut room = RelayRoom::new(
+                                                max_bytes,
+                                                (!from_listed_relay).then_some((source_address, &*room_rates)),
+                                            );
                                             for (item, checked) in items.iter().zip(checked) {
-                                                let outcome = checked.and_then(|checked| store_checked(&db, item, &checked, &role, &own));
+                                                let room = is_relay_node.then_some(&mut room);
+                                                let outcome = checked.and_then(|checked| store_checked(&db, item, &checked, &role, &own, room));
                                                 if let Ok(true) = outcome {
                                                     stored_count += 1;
                                                     if is_relay_node {
@@ -2555,7 +2740,8 @@ pub async fn handle_peer_streams(
                     &repush_tx,
                     &delivery_tx,
                     &seen_table,
-                    (!unlimited).then_some(&peer_rates),
+                    &peer_rates,
+                    !unlimited,
                     address,
                 )
                 .await;
@@ -2619,7 +2805,8 @@ async fn handle_inbound_push(
     repush_tx: &tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     delivery_tx: &tokio::sync::mpsc::UnboundedSender<(NodeId, u64)>,
     seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
-    peer_rates: Option<&std::sync::Arc<std::sync::Mutex<Rates>>>,
+    peer_rates: &std::sync::Arc<std::sync::Mutex<Rates>>,
+    limited: bool,
     address: std::net::IpAddr,
 ) -> Option<OverLimit> {
     let msg = match cordelia_network::codec::read_frame(recv).await {
@@ -2643,13 +2830,15 @@ async fn handle_inbound_push(
         .iter()
         .map(|item| item.encrypted_blob.len() as u64)
         .sum();
-    let over = peer_rates.and_then(|rates| {
-        rates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pushed(peer_id, address, bytes)
-            .err()
-    });
+    let over = limited
+        .then(|| {
+            peer_rates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pushed(peer_id, address, bytes)
+                .err()
+        })
+        .flatten();
     if let Some(over) = over {
         tracing::warn!(peer = %peer_id, bytes, cut_off = over.cut_off, "push over the byte allowance; refused");
         refuse_stream(send, recv);
@@ -2669,12 +2858,20 @@ async fn handle_inbound_push(
             Err(_) => return None,
         };
         let own = state.identity.public_key();
+        // A relay has only so much room (see `RelayRoom`). What a relay it
+        // lists sends it is not counted against an address.
+        let max_bytes = peer_rates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .relay_max_bytes;
+        let mut room = RelayRoom::new(max_bytes, limited.then_some((address, &**peer_rates)));
         let mut stored = 0u32;
         let mut dedup = 0u32;
         let mut rejected = 0u32;
         for (item, checked) in payload.items.iter().zip(checked) {
-            let outcome =
-                checked.and_then(|checked| store_checked(&db, item, &checked, node_role, &own));
+            let room = (node_role == "relay").then_some(&mut room);
+            let outcome = checked
+                .and_then(|checked| store_checked(&db, item, &checked, node_role, &own, room));
             match outcome {
                 Ok(true) => {
                     stored += 1;
@@ -3344,6 +3541,148 @@ mod tests {
             store_item(&device, &later, "personal", &own),
             Err(REFUSED_NOT_MEMBER)
         );
+    }
+
+    /// A relay's database, how much it holds when empty, and a way to
+    /// store one entry of `bytes` in `channel` with the room it is given.
+    fn relay_store(
+        db: &rusqlite::Connection,
+        room: &mut RelayRoom,
+        channel: &str,
+        bytes: usize,
+    ) -> Result<bool, &'static str> {
+        thread_local! {
+            static AUTHOR: cordelia_crypto::identity::NodeIdentity =
+                cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        }
+        // Distinct content each time, so nothing is taken for a duplicate.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut blob = vec![7u8; bytes];
+        blob[..8].copy_from_slice(&n.to_be_bytes());
+        let item = AUTHOR.with(|author| arriving_in(author, channel, blob));
+        store_checked(
+            db,
+            &item,
+            &check_item(&item)?,
+            "relay",
+            &[0u8; 32],
+            Some(room),
+        )
+    }
+
+    fn channel(n: usize) -> String {
+        format!("grp_550e8400-e29b-41d4-a716-{n:012}")
+    }
+
+    fn holds(db: &rusqlite::Connection, channel: &str) -> u64 {
+        cordelia_storage::items::channel_bytes(db, channel).unwrap()
+    }
+
+    /// T3. A relay has a storage cap. At the cap it takes no channel it
+    /// does not hold. A write to a channel it holds is taken, and room is
+    /// made by dropping the channel it came to hold most recently: what
+    /// was there first is never pushed out by what came later.
+    #[test]
+    fn a_full_relay_keeps_what_it_held_first() {
+        use cordelia_network::messages::REFUSED_FULL;
+        const ENTRY: usize = 60_000;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let empty = cordelia_storage::db::used_bytes(&db).unwrap();
+        let mut room = RelayRoom::new(empty + 400_000, None);
+
+        // The first channel, then newer ones, one entry each, until the
+        // relay will take no more.
+        let first = channel(0);
+        assert_eq!(relay_store(&db, &mut room, &first, ENTRY), Ok(true));
+        let mut newer = Vec::new();
+        loop {
+            let next = channel(newer.len() + 1);
+            match relay_store(&db, &mut room, &next, ENTRY) {
+                Ok(true) => newer.push(next),
+                Err(REFUSED_FULL) => break,
+                other => panic!("unexpected: {other:?}"),
+            }
+            assert!(newer.len() < 50, "the relay is never full");
+        }
+        assert!(newer.len() >= 3, "{}", newer.len());
+        let used = cordelia_storage::db::used_bytes(&db).unwrap();
+        assert!(used <= room.max_bytes, "{used} > {}", room.max_bytes);
+        // The channel that was refused, or was the newest when the cap was
+        // passed, is not held; all the others are.
+        let refused = channel(newer.len() + 1);
+        assert_eq!(holds(&db, &refused), 0);
+
+        // The first channel grows. Each write is taken, and the newest
+        // channels go, newest first; the first channel is never touched.
+        let mut dropped = 0;
+        for write in 1..=4 {
+            assert_eq!(
+                relay_store(&db, &mut room, &first, ENTRY),
+                Ok(true),
+                "write {write}"
+            );
+            assert_eq!(holds(&db, &first), (ENTRY * (write + 1)) as u64);
+            let used = cordelia_storage::db::used_bytes(&db).unwrap();
+            assert!(used <= room.max_bytes, "{used} > {}", room.max_bytes);
+            // Whatever was dropped is a suffix of the newer channels.
+            let held: Vec<bool> = newer.iter().map(|c| holds(&db, c) > 0).collect();
+            let kept = held.iter().take_while(|h| **h).count();
+            assert!(
+                held[kept..].iter().all(|h| !h),
+                "not newest first: {held:?}"
+            );
+            dropped = newer.len() - kept;
+        }
+        assert!(dropped >= 3, "nothing made room: {dropped}");
+    }
+
+    /// T3. One channel may hold only so much at a relay, and one address
+    /// may make a relay hold only so many new channels in an hour.
+    #[test]
+    fn a_relay_limits_one_channel_and_new_channels_from_one_address() {
+        use cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR;
+        use cordelia_network::messages::REFUSED_FULL;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+
+        // One channel: two entries fit in its share, a third does not.
+        let mut room = RelayRoom::new(u64::MAX, None);
+        room.max_channel_bytes = 150_000;
+        let full = channel(100);
+        assert_eq!(relay_store(&db, &mut room, &full, 60_000), Ok(true));
+        assert_eq!(relay_store(&db, &mut room, &full, 60_000), Ok(true));
+        assert_eq!(
+            relay_store(&db, &mut room, &full, 60_000),
+            Err(REFUSED_FULL)
+        );
+        assert_eq!(holds(&db, &full), 120_000);
+        // A smaller one still fits, and another channel is unaffected.
+        assert_eq!(relay_store(&db, &mut room, &full, 20_000), Ok(true));
+        assert_eq!(relay_store(&db, &mut room, &channel(101), 60_000), Ok(true));
+
+        // New channels from one address.
+        let rates = std::sync::Mutex::new(Rates::default());
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let mut room = RelayRoom::new(u64::MAX, Some((address, &rates)));
+        for n in 0..NEW_CHANNELS_PER_ADDRESS_PER_HOUR {
+            assert_eq!(
+                relay_store(&db, &mut room, &channel(200 + n), 100),
+                Ok(true),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            relay_store(&db, &mut room, &channel(300), 100),
+            Err(REFUSED_FULL)
+        );
+        // A channel it already made the relay hold is still written to.
+        assert_eq!(relay_store(&db, &mut room, &channel(200), 100), Ok(true));
+        // Another address, and a relay this one lists, are not affected.
+        let elsewhere: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let mut room = RelayRoom::new(u64::MAX, Some((elsewhere, &rates)));
+        assert_eq!(relay_store(&db, &mut room, &channel(301), 100), Ok(true));
+        let mut room = RelayRoom::new(u64::MAX, None);
+        assert_eq!(relay_store(&db, &mut room, &channel(302), 100), Ok(true));
     }
 
     /// A device paces what it pushes to a relay: full batches while there is

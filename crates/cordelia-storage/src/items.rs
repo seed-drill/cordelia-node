@@ -700,6 +700,35 @@ pub fn get_items_by_ids(
     Ok(items)
 }
 
+/// What a channel holds on this node, in bytes of entries.
+pub fn channel_bytes(conn: &Connection, channel_id: &str) -> Result<u64, CordeliaError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(content_length), 0) FROM items WHERE channel_id = ?1",
+        params![channel_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|bytes| bytes.max(0) as u64)
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
+/// The size of what one author holds in one slot of a channel: what a new
+/// revision by that author would replace.
+pub fn author_slot_bytes(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<u64, CordeliaError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(content_length), 0) FROM items
+         WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
+        params![channel_id, slot.as_slice(), author.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|bytes| bytes.max(0) as u64)
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
+}
+
 /// The total size of the given items of a channel, as stored. Unknown IDs
 /// count for nothing. Lets a node see whether a fetch can be answered in
 /// one message before it reads the items.

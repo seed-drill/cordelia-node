@@ -85,6 +85,8 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `QUIC_MAX_BIDI_STREAMS` | 64 | parameter-rationale.md §1 |
 | `QUIC_RECEIVE_WINDOW` | 2MB a connection | parameter-rationale.md §1 |
 | `PUSH_BYTES_PER_PEER_PER_MINUTE` | 2MB | parameter-rationale.md §4 |
+| `MAX_CHANNEL_BYTES_AT_RELAY` | 16MB | parameter-rationale.md §4 |
+| `NEW_CHANNELS_PER_ADDRESS_PER_HOUR` | 16 | parameter-rationale.md §4 |
 | `OUTBOX_BYTES_PER_MINUTE` | 1.5MB | parameter-rationale.md §4 |
 | `SYNC_PAGE_STEPS` | 100, 14, 3, 1 | parameter-rationale.md §4 |
 | `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |

@@ -928,7 +928,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids, config.node.max_storage_bytes).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -1188,10 +1188,17 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?.len();
     let usage = cordelia_storage::usage::snapshot(&conn, chrono::Utc::now().timestamp())?;
+    // What a relay's storage cap counts, and the cap: the database's pages
+    // in use, which fall when a channel is dropped (the file does not
+    // shrink).
+    let used = cordelia_storage::db::used_bytes(&conn)?;
+    let cap = config.node.max_storage_bytes;
 
     if json {
         let out = serde_json::json!({
             "database_bytes": db_size,
+            "storage_used_bytes": used,
+            "storage_max_bytes": cap,
             "channels_subscribed": channels,
             "items_stored": usage.items_stored,
             "content_bytes_stored": usage.bytes_stored,
@@ -1209,6 +1216,13 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     }
 
     println!("Database:         {}", format_bytes(db_size));
+    if config.network.role == "relay" {
+        println!(
+            "Storage:          {} in use of {} allowed",
+            format_bytes(used),
+            format_bytes(cap)
+        );
+    }
     println!(
         "Stored:           {} items, {} of encrypted content",
         usage.items_stored,
