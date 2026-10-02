@@ -141,12 +141,14 @@ fn publish_at(
         "metadata": if deleted { None } else { metadata.cloned() },
     }))
     .map_err(|e| CordeliaError::Internal(e.to_string()))?;
-    if plaintext.len() > cordelia_core::protocol::MAX_ITEM_BYTES {
-        return Err(CordeliaError::Validation(format!(
-            "item is {} bytes; the limit is {}",
-            plaintext.len(),
-            cordelia_core::protocol::MAX_ITEM_BYTES
-        )));
+    // Checked here as well as by every node that carries it: the entry as
+    // it travels is its content plus what sealing adds.
+    let sealed_len = plaintext.len() + cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES;
+    if sealed_len > cordelia_core::protocol::MAX_ITEM_BYTES {
+        return Err(CordeliaError::TooLarge {
+            bytes: sealed_len,
+            limit: cordelia_core::protocol::MAX_ITEM_BYTES,
+        });
     }
 
     let channel_key = psk::read_psk(&state.home_dir, channel_id)?;

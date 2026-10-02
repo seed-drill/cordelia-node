@@ -287,8 +287,8 @@ pub struct PushAck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refusal {
     pub item_id: String,
-    /// A short code for status to show: [`REFUSED_INVALID`] or
-    /// [`REFUSED_STORAGE`].
+    /// A short code for status to show: [`REFUSED_INVALID`],
+    /// [`REFUSED_STORAGE`] or [`REFUSED_TOO_LARGE`].
     pub why: String,
 }
 
@@ -296,6 +296,8 @@ pub struct Refusal {
 pub const REFUSED_INVALID: &str = "invalid";
 /// The receiver could not store it (its disk, or its database).
 pub const REFUSED_STORAGE: &str = "storage";
+/// The item is over the size every entry must fit in.
+pub const REFUSED_TOO_LARGE: &str = "too_large";
 
 // ── PSK-Exchange (0x07, §4.7) ──────────────────────────────────────
 

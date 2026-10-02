@@ -333,6 +333,49 @@ fn a_removed_device_can_no_longer_write() {
     );
 }
 
+/// T3. An entry is at most 64 KB as it travels. The device that writes it
+/// refuses a larger one, and says how large it was.
+#[test]
+fn t03_an_entry_over_the_size_limit_is_not_written() {
+    use cordelia_core::protocol::{ITEM_SEAL_OVERHEAD_BYTES, MAX_ITEM_BYTES};
+    let (a, _b, ch) = paired();
+    let write = |text: &str| {
+        let db = a.state.db.lock().unwrap();
+        entries::publish(
+            &a.state,
+            &db,
+            &ch,
+            &Write {
+                key: "notes.md",
+                content: &json!(text),
+                metadata: None,
+                item_type: "memory",
+                deleted: false,
+            },
+        )
+    };
+    // The entry's content is {"content":"...","key":"notes.md","metadata":null}.
+    let envelope =
+        serde_json::to_vec(&json!({ "key": "notes.md", "content": "", "metadata": null }))
+            .unwrap()
+            .len();
+    let fits = MAX_ITEM_BYTES - ITEM_SEAL_OVERHEAD_BYTES - envelope;
+
+    write(&"x".repeat(fits)).unwrap();
+    let stored = {
+        let db = a.state.db.lock().unwrap();
+        items::slotted_items(&db, &ch).unwrap()
+    };
+    assert_eq!(stored[0].encrypted_blob.len(), MAX_ITEM_BYTES);
+
+    match write(&"x".repeat(fits + 1)) {
+        Err(cordelia_core::CordeliaError::TooLarge { bytes, limit }) => {
+            assert_eq!((bytes, limit), (MAX_ITEM_BYTES + 1, MAX_ITEM_BYTES));
+        }
+        other => panic!("expected a refusal for size, got {other:?}"),
+    }
+}
+
 fn delete(n: &Node, channel: &str, key: &str) -> u64 {
     let db = n.state.db.lock().unwrap();
     entries::publish(

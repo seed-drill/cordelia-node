@@ -252,7 +252,7 @@ NTP. Too strict for Phase 1.
 ### writes_per_peer_per_minute = 10
 
 **Rationale:** Maximum Item-Push messages a single peer can send per minute.
-At 256KB max item size, this limits inbound bandwidth per peer to 2.5MB/min.
+At 64KB max item size, this limits inbound bandwidth per peer to 640KB/min.
 
 **Derivation:** A typical AI agent memory write rate is ~1-10 items/min.
 10/min provides 10x headroom for burst traffic.
@@ -268,14 +268,20 @@ all peers. Prevents a single busy channel from consuming all relay resources.
 **Derivation:** 10 publishers × 10 items/min = 100 items/channel/min.
 Supports up to 10 concurrent publishers at maximum rate.
 
-### max_item_bytes = 256KB
+### max_item_bytes = 64KB
 
-**Rationale:** Maximum size of a single encrypted item. Phase 1 is text-only
-AI memory. 95th percentile ~50KB. 256KB = 5x headroom. No images/media.
-Increasing later is non-breaking.
+**Rationale:** The size every entry must fit in as it travels, ciphertext
+included: 65,536 bytes. It is checked by the device that writes the entry,
+by each relay, and by the device that receives it. Cordelia does not care
+what an entry carries, so it has to resist misuse by structure: one small
+size for everything is what lets limits on rate and storage mean something.
 
-**Reference:** GitHub Gist max 10MB. Slack message max 40KB. We chose
-256KB as appropriate for Phase 1 text-only AI agent use cases.
+**Derivation:** 64 KB holds every memory file we have, and 93% of the
+files in our skills folder. A relay that accepts 36 pushes a minute from a
+peer then takes at most a few megabytes a minute from it. Until
+0.2.0-alpha.3 the limit was 256 KB, checked only by the sender. A file of
+64 to 128 KB synced then, and does not now: it is reported, and left as it
+is.
 
 ### max_message_bytes = 1MB
 
@@ -356,12 +362,12 @@ few retries, seconds apart, cover the passing kind. For the lasting kind,
 one small push every ten minutes costs nothing, and delivers the item
 within ten minutes of the reason going away.
 
-### outbox_batch_max_bytes = 768KB, outbox_batch_max_items = 500
+### outbox_batch_max_bytes = 192KB, outbox_batch_max_items = 500
 
-**Rationale:** One outbox push must fit in max_message_bytes with room for
-per-item headers and CBOR framing (768KB + 128KB <= 1MB, checked at compile
-time). An item larger than the byte bound (items are at most
-max_item_bytes) is sent alone. The item bound caps header overhead.
+**Rationale:** One outbox push holds at most three entries of the largest
+size. That is far inside max_message_bytes today (checked at compile time),
+and is small enough that max_message_bytes can come down to 256KB once
+every node sends batches this small. The item bound caps header overhead.
 
 ---
 

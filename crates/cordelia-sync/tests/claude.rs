@@ -1405,3 +1405,89 @@ fn a_repository_appearing_above_a_mapped_folder_is_reported() {
     let error = report.folders[0].error.as_deref().expect("reported");
     assert!(error.contains(&workspace.display().to_string()), "{error}");
 }
+
+/// A file that grows past what an entry can carry is not carried, and is
+/// not taken for deleted: the other device keeps the version it has. The
+/// device with the large file keeps it, says so, and takes nothing over
+/// it. When the file fits again, it syncs again.
+#[test]
+fn a_file_that_grows_too_large_is_left_alone_and_deleted_nowhere() {
+    let (mut a, mut b) = paired();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    std::fs::write(a_mem.join("notes.md"), "small\n").unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("small\n"));
+
+    let big = "x".repeat(cordelia_sync::claude::MAX_FILE_BYTES + 1);
+    std::fs::write(a_mem.join("notes.md"), &big).unwrap();
+    let (report, _) = settle_reporting(&mut a, &mut b);
+    assert_eq!(
+        read(&b_mem, "notes.md").as_deref(),
+        Some("small\n"),
+        "the other device lost the file"
+    );
+    assert_eq!(read(&a_mem, "notes.md").map(|t| t.len()), Some(big.len()));
+    // A says which file it is not carrying.
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let too_large: Vec<&String> = report.folders.iter().flat_map(|f| &f.too_large).collect();
+    assert_eq!(too_large, vec!["notes.md"]);
+
+    // An edit on the other device is not written over the large file.
+    std::fs::write(b_mem.join("notes.md"), "edited on b\n").unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "notes.md").map(|t| t.len()), Some(big.len()));
+
+    // Small again: it takes part again. Both sides changed meanwhile, so
+    // the channel's version goes in the file and A's is kept beside it.
+    std::fs::write(a_mem.join("notes.md"), "small again\n").unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "notes.md").as_deref(), Some("edited on b\n"));
+    assert!(
+        files(&a_mem).iter().any(|f| f.contains(".conflict-")),
+        "{:?}",
+        files(&a_mem)
+    );
+}
+
+/// A file can be under the size limit and still not fit in an entry: an
+/// entry holds its name too, and its text is escaped. It is found when it
+/// is published, and treated the same way: left alone, reported, and
+/// deleted nowhere.
+#[test]
+fn a_file_that_does_not_fit_once_escaped_is_left_alone_too() {
+    let (mut a, mut b) = paired();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    std::fs::write(a_mem.join("quotes.md"), "small\n").unwrap();
+    settle(&mut a, &mut b);
+
+    // 40 KB of quotation marks is 80 KB once escaped.
+    let quotes = "\"".repeat(40_000);
+    assert!(quotes.len() < cordelia_sync::claude::MAX_FILE_BYTES);
+    std::fs::write(a_mem.join("quotes.md"), &quotes).unwrap();
+    let (report, _) = settle_reporting(&mut a, &mut b);
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let too_large: Vec<&String> = report.folders.iter().flat_map(|f| &f.too_large).collect();
+    assert_eq!(too_large, vec!["quotes.md"]);
+    assert_eq!(read(&b_mem, "quotes.md").as_deref(), Some("small\n"));
+    assert_eq!(read(&a_mem, "quotes.md"), Some(quotes));
+}
+
+/// A file that stops being plain text (here, replaced by a link) is not
+/// taken for deleted either.
+#[cfg(unix)]
+#[test]
+fn a_file_replaced_by_a_link_is_deleted_nowhere() {
+    let (mut a, mut b) = paired();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    std::fs::write(a_mem.join("notes.md"), "kept\n").unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("kept\n"));
+
+    std::fs::remove_file(a_mem.join("notes.md")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", a_mem.join("notes.md")).unwrap();
+    let (report, _) = settle_reporting(&mut a, &mut b);
+    assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("kept\n"));
+    let skipped: Vec<&String> = report.folders.iter().flat_map(|f| &f.skipped).collect();
+    assert_eq!(skipped, vec!["notes.md"]);
+}

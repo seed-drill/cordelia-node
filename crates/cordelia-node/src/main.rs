@@ -413,6 +413,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         for c in &status.facts.conflicts {
             details.push(format!("Conflict: {c}"));
         }
+        for file in &status.facts.too_large {
+            details.push(format!("Too large to sync: {file}"));
+        }
         for e in &status.facts.errors {
             details.push(format!("Error: {e}"));
         }
@@ -470,6 +473,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                         "last_published_at": f["last_published_at"],
                         "error": f["error"],
                         "conflicts": f["conflict_files"],
+                        "too_large": f["too_large"],
                     })
                 })
                 .collect();
@@ -656,6 +660,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
             out.facts.folders = folders.len();
             for f in folders {
                 out.facts.conflicts.extend(strings(&f["conflict_files"]));
+                let folder = f["folder"].as_str().unwrap_or_default();
+                out.facts.too_large.extend(
+                    strings(&f["too_large"])
+                        .into_iter()
+                        .map(|name| format!("{folder}/memory/{name}")),
+                );
                 if f["waiting"].as_bool().unwrap_or(false) {
                     out.facts.projects_waiting += 1;
                 }
@@ -2138,6 +2148,13 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         for s in list(&f["skipped"]) {
             println!(
                 "  not synced (not a plain text file Cordelia can carry): {}/memory/{}",
+                short_path(&text(&f["folder"])),
+                text(&s)
+            );
+        }
+        for s in list(&f["too_large"]) {
+            println!(
+                "  not synced (too large: an entry carries at most 64 KB): {}/memory/{}",
                 short_path(&text(&f["folder"])),
                 text(&s)
             );

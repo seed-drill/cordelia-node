@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(config.node.p2p_port, protocol::P2P_PORT);
         assert_eq!(config.api.bind_address, "127.0.0.1");
         assert_eq!(config.logging.level, "info");
-        // D2 fix: max_item_bytes = 256KB (was 1MB)
+        // max_item_bytes follows the protocol constant (64 KB)
         assert_eq!(
             config.limits.max_item_bytes,
             protocol::MAX_ITEM_BYTES as u64

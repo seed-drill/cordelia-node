@@ -915,7 +915,7 @@ async fn test_publish_not_member() {
 
 // ── Size limit enforcement (parameter-rationale.md §4) ────────────
 
-/// T5-11 (HIGH): Publish rejects items exceeding MAX_ITEM_BYTES (256KB).
+/// T5-11 (HIGH): Publish rejects items exceeding MAX_ITEM_BYTES (64 KB).
 #[actix_web::test]
 async fn test_publish_oversized_item_rejected() {
     let state = test_state();
@@ -934,9 +934,9 @@ async fn test_publish_oversized_item_rejected() {
         .to_request();
     test::call_service(&app, req).await;
 
-    // Create content that exceeds 256KB (262,144 bytes) when serialized.
+    // Create content that exceeds 64 KB (65,536 bytes) when serialized.
     // The handler serializes {"content": ..., "metadata": ...} and checks length.
-    let oversized_content = "X".repeat(270_000);
+    let oversized_content = "X".repeat(70_000);
 
     let req = test::TestRequest::post()
         .uri("/api/v1/channels/publish")
@@ -955,8 +955,11 @@ async fn test_publish_oversized_item_rejected() {
 
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(body["error"]["code"], "payload_too_large");
-    assert!(body["error"]["used_bytes"].as_u64().unwrap() > 262_144);
-    assert_eq!(body["error"]["quota_bytes"], 262_144);
+    // What the content may be: the entry size less what sealing adds.
+    let limit = (cordelia_core::protocol::MAX_ITEM_BYTES
+        - cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES) as u64;
+    assert!(body["error"]["used_bytes"].as_u64().unwrap() > limit);
+    assert_eq!(body["error"]["quota_bytes"], limit);
 }
 
 /// T5-12: Publish just under MAX_ITEM_BYTES succeeds.
@@ -978,8 +981,8 @@ async fn test_publish_just_under_size_limit_succeeds() {
         .to_request();
     test::call_service(&app, req).await;
 
-    // 250KB string: safely under 256KB even with JSON envelope overhead
-    let content = "Y".repeat(250_000);
+    // 60 KB string: safely under 64 KB even with JSON envelope overhead
+    let content = "Y".repeat(60_000);
 
     let req = test::TestRequest::post()
         .uri("/api/v1/channels/publish")
@@ -990,7 +993,11 @@ async fn test_publish_just_under_size_limit_succeeds() {
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "item under 256KB limit should succeed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "item under the 64 KB limit should succeed"
+    );
 }
 
 // ── WP13: Metrics ─────────────────────────────────────────────────

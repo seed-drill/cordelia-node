@@ -37,8 +37,14 @@ pub fn store_item(
     item: &cordelia_network::messages::Item,
     node_role: &str,
 ) -> Result<bool, &'static str> {
-    use cordelia_network::messages::{REFUSED_INVALID, REFUSED_STORAGE};
+    use cordelia_network::messages::{REFUSED_INVALID, REFUSED_STORAGE, REFUSED_TOO_LARGE};
 
+    // One size for every entry, at every hop: a relay and a device both
+    // refuse a larger one, whoever sends it.
+    if item.encrypted_blob.len() > cordelia_core::protocol::MAX_ITEM_BYTES {
+        tracing::warn!(item = %item.item_id, bytes = item.encrypted_blob.len(), "item over the size limit");
+        return Err(REFUSED_TOO_LARGE);
+    }
     if !cordelia_network::item_sync::verify_content_hash(item) {
         tracing::warn!(item = %item.item_id, "content hash mismatch");
         return Err(REFUSED_INVALID);
@@ -98,6 +104,7 @@ pub fn store_item(
             tracing::debug!(item = %item.item_id, error = %e, "store failed");
             Err(match e {
                 cordelia_core::CordeliaError::Validation(_) => REFUSED_INVALID,
+                cordelia_core::CordeliaError::TooLarge { .. } => REFUSED_TOO_LARGE,
                 _ => REFUSED_STORAGE,
             })
         }
@@ -2756,6 +2763,63 @@ mod tests {
             verification_failed: 6,
             ..Default::default()
         });
+    }
+
+    /// An item of `blob`, signed by `id`, as it arrives from another node.
+    fn arriving(
+        id: &cordelia_crypto::identity::NodeIdentity,
+        blob: Vec<u8>,
+    ) -> cordelia_network::messages::Item {
+        let hash = cordelia_crypto::sha256(&blob);
+        let item_id = cordelia_storage::items::generate_item_id();
+        let published_at = "2026-10-02T00:00:00Z";
+        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+            &id.public_key(),
+            "grp_550e8400-e29b-41d4-a716-446655440000",
+            &hash,
+            false,
+            &item_id,
+            1,
+            published_at,
+        )
+        .unwrap();
+        cordelia_network::messages::Item {
+            item_id,
+            channel_id: "grp_550e8400-e29b-41d4-a716-446655440000".into(),
+            item_type: "memory".into(),
+            content_length: blob.len() as u32,
+            encrypted_blob: blob,
+            content_hash: hash.to_vec(),
+            author_id: id.public_key().to_vec(),
+            signature: id.sign(&cbor).to_vec(),
+            key_version: 1,
+            published_at: published_at.into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        }
+    }
+
+    /// T3. A node refuses an entry over the size limit, whoever sends it:
+    /// a relay that is pushed one, and a device whose relay hands it one.
+    #[test]
+    fn an_entry_over_the_size_limit_is_refused_by_whoever_is_sent_it() {
+        use cordelia_core::protocol::MAX_ITEM_BYTES;
+        use cordelia_network::messages::REFUSED_TOO_LARGE;
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let id = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+
+        let over = arriving(&id, vec![7; MAX_ITEM_BYTES + 1]);
+        for role in ["relay", "personal"] {
+            assert_eq!(
+                store_item(&db, &over, role),
+                Err(REFUSED_TOO_LARGE),
+                "{role}"
+            );
+        }
+        let largest = arriving(&id, vec![7; MAX_ITEM_BYTES]);
+        assert_eq!(store_item(&db, &largest, "relay"), Ok(true));
     }
 
     /// A refused item is offered again at a slowing pace, up to ten
