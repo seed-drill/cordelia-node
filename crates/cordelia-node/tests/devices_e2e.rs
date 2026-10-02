@@ -381,6 +381,34 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     deliver(&a, &b, "last", &[&r1, &r2, &a, &b]);
 }
 
+/// A node that is told to stop exits, though a client of its local API
+/// has begun a request and never finished it.
+#[test]
+fn a_node_told_to_stop_exits_though_a_request_is_held_open() {
+    use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let mut n = node("relay", "relay", None);
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+
+    let mut held = std::net::TcpStream::connect(("127.0.0.1", n.http)).unwrap();
+    held.write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    held.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let told = Instant::now();
+    n.stop();
+    let took = told.elapsed();
+    assert!(
+        took < Duration::from_secs(STREAM_TIMEOUT_SECS + 8),
+        "the node took {took:?} to exit"
+    );
+    drop(held);
+}
+
 /// A device with two relays, one of them down. It says so, with the reason,
 /// and goes on trying at a slowing pace; when the relay comes up it is
 /// connected again without a restart.

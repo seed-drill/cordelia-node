@@ -98,6 +98,14 @@ pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
 /// One value, one layer (codec). If a single read or write takes longer, the peer is unresponsive.
 pub const STREAM_TIMEOUT_SECS: u64 = 10;
 
+/// How long a node that is told to stop waits for its parts to finish,
+/// at most, before it exits without them (parameter-rationale.md §6).
+/// Derived: three stream timeouts. Closing connections and finishing local
+/// API requests each get one; the rest is margin. A node that waited for
+/// ever for one of its parts would be killed by its service manager after
+/// a minute and a half, and an upgrade would take that long.
+pub const NODE_STOP_TIMEOUT_SECS: u64 = 3 * STREAM_TIMEOUT_SECS;
+
 /// Governor tick interval in seconds (network-behaviour.md §5.1).
 /// Primitive: resolution of the governor state machine. Matches stream timeout --
 /// no point ticking faster than we can complete a stream operation.

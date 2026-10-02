@@ -588,6 +588,20 @@ fixed the handshake case only). Session 92 added STREAM_TIMEOUT to all stream
 operations after `test_chaos_disconnect_during_sync` exposed a 60s hang on
 peer crash (QUIC idle timeout was the only backstop).
 
+### NODE_STOP_TIMEOUT = 30s (3 x STREAM_TIMEOUT)
+
+**Rationale:** A node that is told to stop exits within a bounded time,
+whatever one of its parts is waiting for. Once it has been told, it waits
+this long at most for its HTTP server, and for its peer-to-peer loop, and
+then exits without them. The HTTP server gives a request that is still
+open one STREAM_TIMEOUT to finish.
+
+**Derivation:** Closing connections and finishing local API requests each
+take well under one STREAM_TIMEOUT; three is margin. A service manager
+kills a node that has not exited after a minute and a half, so a node that
+waited for ever would make every restart and upgrade take that long. One
+did not exit at all in a test: its HTTP server never finished stopping.
+
 ---
 
 ## 7. P2P Select Loop Parameters

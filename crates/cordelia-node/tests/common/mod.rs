@@ -125,13 +125,36 @@ impl Node {
 
     /// Stop the node as a service manager would (SIGTERM), so it closes
     /// its connections on the way out.
+    ///
+    /// A node that is told to stop exits within a bounded time. One that
+    /// does not is killed, and the test fails with its log: a node that
+    /// never exits would otherwise hang the whole run.
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
-            let _ = child.wait();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let allowed = Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS + 15);
+        let told = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if told.elapsed() < allowed => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => break,
+            }
         }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "{} did not exit within {}s of being told to stop\n{}",
+            self.name,
+            allowed.as_secs(),
+            self.log_tail()
+        );
     }
 
     /// Kill the node outright, as a crash or power loss would: its peers
