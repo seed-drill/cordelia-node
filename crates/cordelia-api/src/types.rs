@@ -401,6 +401,10 @@ pub struct DeviceEntry {
     pub this_device: bool,
     pub in_personal_channel: bool,
     pub explicitly_trusted: bool,
+    /// When this device sent the oldest change that the other device has
+    /// not confirmed yet (RFC 3339). Absent when it has confirmed them all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_since: Option<String>,
 }
 
 #[derive(Serialize)]

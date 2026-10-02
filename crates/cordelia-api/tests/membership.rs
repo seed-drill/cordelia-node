@@ -12,7 +12,7 @@ use cordelia_api::membership;
 use cordelia_api::state::AppState;
 use cordelia_crypto::channel_state::{ChannelState, MemberRole, StateMember};
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_storage::{channels, invites, items, meta, naming, psk, trust};
+use cordelia_storage::{channels, invites, items, meta, naming, offers, psk, trust};
 
 struct Node {
     state: AppState,
@@ -931,7 +931,10 @@ fn t20_no_state_can_put_a_channels_members_beyond_change() {
     assert!(!b.members(&personal).iter().any(|(k, _)| *k == c.pk()));
 
     // A state that skips as far as one change may is taken: a device that
-    // was away has missed some.
+    // was away has missed some. (A first hears of B's change, so that its
+    // state carries the key B moved the channel to.)
+    relay(&b, &a);
+    membership::process_inbox(&a.state).unwrap();
     let held = epoch_of(&b, &personal);
     deliver_crafted(
         &a.state.identity,
@@ -1007,4 +1010,212 @@ fn t13_invitations_from_strangers_do_not_push_out_what_your_own_devices_sent() {
     let summary = membership::process_inbox(&b.state).unwrap();
     assert!(summary.applied.contains(&project), "{summary:?}");
     assert!(b.members(&project).iter().any(|(k, _)| *k == extra.pk()));
+}
+
+// ── A change is offered until each member holds it (T16, T20) ───────────
+
+/// The members that have not confirmed something `n` sent them.
+fn unconfirmed(n: &Node) -> Vec<[u8; 32]> {
+    let db = n.state.db.lock().unwrap();
+    let mut members: Vec<[u8; 32]> = offers::unconfirmed(&db)
+        .unwrap()
+        .into_iter()
+        .map(|offer| offer.member)
+        .collect();
+    members.sort();
+    members.dedup();
+    members
+}
+
+/// Everything `from` sent `to` arrives, and `to` acts on it.
+fn deliver(from: &Node, to: &Node) {
+    relay(from, to);
+    membership::process_inbox(&to.state).unwrap();
+}
+
+/// As if a relay had stored everything `n` has written so far: its outbox
+/// is empty.
+fn all_relayed(n: &Node) {
+    let db = n.state.db.lock().unwrap();
+    let waiting = items::outbox(&db, &n.pk(), 10_000, usize::MAX, &Default::default()).unwrap();
+    let ids: Vec<String> = waiting.into_iter().map(|i| i.item_id).collect();
+    items::mark_relayed(&db, &ids).unwrap();
+}
+
+fn outbox_len(n: &Node) -> u64 {
+    items::outbox_len(&n.state.db.lock().unwrap(), &n.pk()).unwrap()
+}
+
+/// A change to a channel's members waits, on the device that made it, until
+/// each other member is seen to hold it. A member that applies it answers,
+/// and `cordelia devices` shows who has not.
+#[test]
+fn a_change_waits_until_each_member_confirms_it() {
+    let (a, b, _personal) = paired();
+    // B joined and answered; once A hears, nothing waits.
+    assert_eq!(unconfirmed(&a), vec![b.pk()]);
+    deliver(&b, &a);
+    assert!(unconfirmed(&a).is_empty());
+
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    let mut both = vec![b.pk(), c.pk()];
+    both.sort();
+    assert_eq!(unconfirmed(&a), both);
+
+    // B applies the change and answers. C has not accepted yet.
+    deliver(&a, &b);
+    deliver(&b, &a);
+    assert_eq!(unconfirmed(&a), vec![c.pk()]);
+    let devices = membership::list_devices(&a.state).unwrap();
+    let since = |key: [u8; 32]| {
+        devices
+            .iter()
+            .find(|d| d.key == key)
+            .unwrap()
+            .unconfirmed_since
+    };
+    assert!(since(c.pk()).is_some());
+    assert_eq!(since(b.pk()), None);
+
+    // Answers are not themselves waited for, or two devices would answer
+    // each other for ever.
+    assert!(unconfirmed(&b).is_empty());
+    deliver(&a, &b);
+    deliver(&b, &a);
+    assert!(unconfirmed(&b).is_empty());
+    assert_eq!(unconfirmed(&a), vec![c.pk()]);
+}
+
+/// T16. A device is removed, and the relay loses the change before another
+/// device fetches it. The device that removed it offers the change again,
+/// at a slowing pace, until the other device answers that it holds it.
+#[test]
+fn t16_a_removal_is_offered_again_until_the_others_hold_it() {
+    let (a, b, r, personal) = three_devices();
+    deliver(&b, &a);
+    deliver(&r, &a);
+    assert!(unconfirmed(&a).is_empty());
+
+    let now = chrono::Utc::now().timestamp();
+    membership::remove_device(&a.state, &r.pk()).unwrap();
+    assert_eq!(unconfirmed(&a), vec![b.pk()]);
+    // A relay answered for it, and then lost it: B never gets it.
+    all_relayed(&a);
+    assert_eq!(outbox_len(&a), 0);
+
+    // Not offered again at once...
+    assert_eq!(membership::offer_again(&a.state, now + 30).unwrap(), 0);
+    assert_eq!(outbox_len(&a), 0);
+    // ...but after a minute, the same item goes back into the outbox.
+    assert_eq!(membership::offer_again(&a.state, now + 61).unwrap(), 1);
+    assert_eq!(outbox_len(&a), 1);
+    // The pace slows: next, two minutes after that.
+    all_relayed(&a);
+    assert_eq!(
+        membership::offer_again(&a.state, now + 61 + 119).unwrap(),
+        0
+    );
+    assert_eq!(
+        membership::offer_again(&a.state, now + 61 + 121).unwrap(),
+        1
+    );
+
+    // B receives it, drops R, and answers. A stops offering.
+    assert!(b.members(&personal).iter().any(|(k, _)| *k == r.pk()));
+    deliver(&a, &b);
+    assert!(!b.members(&personal).iter().any(|(k, _)| *k == r.pk()));
+    deliver(&b, &a);
+    assert!(unconfirmed(&a).is_empty());
+    all_relayed(&a);
+    assert_eq!(
+        membership::offer_again(&a.state, now + 1_000_000).unwrap(),
+        0
+    );
+    assert_eq!(outbox_len(&a), 0);
+}
+
+/// T20. One of your devices, taken over, fills a channel's key ring: a
+/// state holds only so many keys. The next removal would not fit in a
+/// state, and so could not be sent. It is sent with the oldest keys left
+/// out, and the device is removed all the same.
+#[test]
+fn t20_a_full_key_ring_does_not_stop_a_removal() {
+    let most = cordelia_core::protocol::MAX_STATE_KEYS as u32;
+    let (a, b, c, personal) = three_devices();
+    let all = [a.pk(), b.pk(), c.pk()];
+    let held = epoch_of(&a, &personal);
+
+    let mut full = state_at(&b, &personal, held + u64::from(most) - 1, &all, true);
+    full.key_version = most;
+    full.keys = (1..=most)
+        .map(|v| {
+            (
+                v,
+                if v == 1 {
+                    a.key(&personal)
+                } else {
+                    [v as u8; 32]
+                },
+            )
+        })
+        .collect();
+    deliver_crafted(&b.state.identity, &a, &full);
+    let summary = membership::process_inbox(&a.state).unwrap();
+    assert_eq!(summary.applied, vec![personal.clone()], "{summary:?}");
+    assert_eq!(a.key_version(&personal), i64::from(most));
+
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+    assert_eq!(a.key_version(&personal), i64::from(most) + 1);
+    // The other device can open what A sent, and drops B.
+    deliver(&a, &c);
+    assert!(!c.members(&personal).iter().any(|(k, _)| *k == b.pk()));
+    assert_eq!(c.key(&personal), a.key(&personal));
+}
+
+/// T20. One of your devices, taken over, sends a state whose key version
+/// is the largest there is, so that no key could follow it and no device
+/// could be removed. A state may move the key version only as far as its
+/// changes can, and never back.
+#[test]
+fn t20_no_state_can_run_the_key_version_out() {
+    let most = cordelia_core::protocol::MAX_STATE_KEYS as u32;
+    let (a, b, personal) = paired();
+    let both = [a.pk(), b.pk()];
+    let held = epoch_of(&a, &personal);
+    let real = a.key(&personal);
+    let refused = |key_version: u32, epoch: u64| {
+        let mut cs = state_at(&b, &personal, epoch, &both, true);
+        cs.key_version = key_version;
+        cs.keys = vec![(1, real), (key_version, [0x55; 32])];
+        cs.keys.dedup_by_key(|(v, _)| *v);
+        deliver_crafted(&b.state.identity, &a, &cs);
+        let summary = membership::process_inbox(&a.state).unwrap();
+        assert_eq!(summary.invalid, 1, "{key_version} at {epoch}: {summary:?}");
+        assert_eq!(a.key_version(&personal), 1, "{key_version} at {epoch}");
+        assert_eq!(a.key(&personal), real);
+    };
+    // The largest version; two versions in one change; more versions than
+    // a state has room for keys, however far the epoch moves.
+    refused(u32::MAX, held + 1);
+    refused(3, held + 1);
+    refused(most + 2, held + 100_000);
+
+    // A removes a third device, which moves the key on. A state that goes
+    // back to the old version is refused too.
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_eq!(a.key_version(&personal), 2);
+    let moved_on = a.key(&personal);
+    let mut back = state_at(&b, &personal, epoch_of(&a, &personal) + 1, &both, true);
+    back.key_version = 1;
+    back.keys = vec![(1, real)];
+    deliver_crafted(&b.state.identity, &a, &back);
+    assert_eq!(membership::process_inbox(&a.state).unwrap().invalid, 1);
+    assert_eq!((a.key_version(&personal), a.key(&personal)), (2, moved_on));
+
+    // And B can still be removed.
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+    assert_eq!(a.key_version(&personal), 3);
 }

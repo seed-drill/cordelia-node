@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -260,6 +260,23 @@ CREATE INDEX IF NOT EXISTS idx_peer_sightings_last ON peer_sightings(last_seen);
 CREATE INDEX IF NOT EXISTS idx_items_received ON items(received_at);
 "#;
 
+/// Migration v8: the newest channel state this node has sent to each member
+/// of each channel, kept until that member is seen to hold it
+/// (`crate::offers`, decision 2026-09-30 §4.1). Times are Unix seconds.
+const MIGRATION_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS state_offers (
+    channel_id      TEXT NOT NULL,
+    member          BLOB NOT NULL,
+    epoch           INTEGER NOT NULL,
+    item_id         TEXT NOT NULL,
+    sent_at         INTEGER NOT NULL,
+    last_offered_at INTEGER NOT NULL,
+    offers          INTEGER NOT NULL DEFAULT 1,
+    confirmed_at    INTEGER,
+    PRIMARY KEY (channel_id, member)
+);
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -317,6 +334,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v7 (usage counts)");
         conn.execute_batch(MIGRATION_V7)?;
         conn.pragma_update(None, "user_version", 7)?;
+    }
+
+    if current < 8 {
+        tracing::info!("applying migration v8 (channel states sent, until confirmed)");
+        conn.execute_batch(MIGRATION_V8)?;
+        conn.pragma_update(None, "user_version", 8)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;

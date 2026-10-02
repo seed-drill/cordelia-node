@@ -8,6 +8,7 @@ pub mod invites;
 pub mod items;
 pub mod meta;
 pub mod naming;
+pub mod offers;
 pub mod psk;
 pub mod schema;
 pub mod search;

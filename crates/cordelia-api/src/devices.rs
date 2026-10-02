@@ -91,6 +91,10 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
                 this_device: d.this_device,
                 in_personal_channel: d.in_personal_channel,
                 explicitly_trusted: d.explicitly_trusted,
+                unconfirmed_since: d
+                    .unconfirmed_since
+                    .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+                    .map(|at| at.to_rfc3339()),
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;

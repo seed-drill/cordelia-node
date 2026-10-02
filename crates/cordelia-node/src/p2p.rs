@@ -1373,6 +1373,14 @@ pub async fn p2p_loop(
                         if let Err(e) = cordelia_api::membership::process_join_requests(&inbox_state) {
                             tracing::warn!(error = %e, "join request processing failed");
                         }
+                        // Offer again the channel states that a member has
+                        // not confirmed (decision 2026-09-30 §4.1).
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs() as i64);
+                        if let Err(e) = cordelia_api::membership::offer_again(&inbox_state, now) {
+                            tracing::warn!(error = %e, "offering channel states again failed");
+                        }
                     });
                 }
                 let peers = conn_mgr.connected_peers();

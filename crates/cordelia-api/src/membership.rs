@@ -20,7 +20,7 @@ use cordelia_crypto::signing;
 use cordelia_storage::invites::{self, InviteStatus};
 use cordelia_storage::items::{self, StoredItem};
 use cordelia_storage::trust::{self, TrustKind};
-use cordelia_storage::{channels, meta, naming, psk};
+use cordelia_storage::{channels, meta, naming, offers, psk};
 
 use crate::state::{AppState, PushItem};
 use crate::verify::verify_item_signature;
@@ -69,6 +69,10 @@ pub struct DeviceInfo {
     pub in_personal_channel: bool,
     /// Explicitly trusted via `add-device` or `accept`.
     pub explicitly_trusted: bool,
+    /// When this device sent the oldest change to a channel's members or
+    /// keys that the other device has not yet been seen to hold (Unix
+    /// seconds). `None` when it holds everything this device sent it.
+    pub unconfirmed_since: Option<i64>,
 }
 
 fn lock(state: &AppState) -> Result<std::sync::MutexGuard<'_, Connection>, CordeliaError> {
@@ -225,6 +229,21 @@ fn build_state(
     }
     let key_version = u32::try_from(ch.key_version)
         .map_err(|_| CordeliaError::Internal("key version out of range".into()))?;
+    // A state holds only so many keys. Past that the oldest are left out of
+    // what is sent: otherwise a ring that has been filled could not be
+    // sent at all, and no device could be removed from the channel. Devices
+    // that already hold the older keys keep them. A device added later
+    // cannot read what was written under the ones left out.
+    let mut keys = psk::export_key_ring(&state.home_dir, channel_id, ch.key_version)?;
+    let most = cordelia_core::protocol::MAX_STATE_KEYS;
+    if keys.len() > most {
+        tracing::warn!(
+            channel = %channel_id,
+            left_out = keys.len() - most,
+            "this channel has had more keys than a state holds; the oldest are not sent"
+        );
+        keys.drain(..keys.len() - most);
+    }
 
     Ok(ChannelState {
         channel_id: channel_id.to_string(),
@@ -234,21 +253,41 @@ fn build_state(
         sender: pk,
         epoch,
         key_version,
-        keys: psk::export_key_ring(&state.home_dir, channel_id, ch.key_version)?,
+        keys,
         slot_key: slot_key(state, channel_id)?,
         members,
         personal: personal_channel(db, &pk)?.as_deref() == Some(channel_id),
     })
 }
 
-/// Seal `cs` to `recipient` and publish it into the recipient's inbox:
-/// stored locally (so relays can also pull it) and pushed to hot relays.
+/// Hand `cs` to `recipient`, and remember that it was sent until the
+/// recipient is seen to hold it (see [`offer_again`]).
 fn send_state(
     state: &AppState,
     db: &Connection,
     recipient: &[u8; 32],
     cs: &ChannelState,
 ) -> Result<(), CordeliaError> {
+    let item_id = seal_and_send(state, db, recipient, cs)?;
+    offers::record(
+        db,
+        &cs.channel_id,
+        recipient,
+        cs.epoch,
+        &item_id,
+        Utc::now().timestamp(),
+    )
+}
+
+/// Seal `cs` to `recipient` and publish it into the recipient's inbox:
+/// stored locally (so relays can also pull it) and pushed to hot relays.
+/// Returns the item that carries it.
+fn seal_and_send(
+    state: &AppState,
+    db: &Connection,
+    recipient: &[u8; 32],
+    cs: &ChannelState,
+) -> Result<String, CordeliaError> {
     let pk = state.identity.public_key();
     // Every channel in v1 is this person's own. Sealing a state hands over
     // every key the channel has had, and with them everything written so
@@ -302,7 +341,7 @@ fn send_state(
     if let Some(tx) = &state.push_tx {
         let _ = tx.send(PushItem {
             channel_id: inbox,
-            item_id,
+            item_id: item_id.clone(),
             encrypted_blob: sealed,
             content_hash: content_hash.to_vec(),
             author_id: pk.to_vec(),
@@ -317,7 +356,87 @@ fn send_state(
             exclude_peer: None,
         });
     }
-    Ok(())
+    Ok(item_id)
+}
+
+/// Tell `sender` that this device now holds the state it sent: send back
+/// this device's own view of the channel, which carries the epoch it holds.
+/// The sender takes that as confirmation and stops offering.
+///
+/// It is this device's state like any other, so nothing new travels. It is
+/// not remembered as something to confirm in turn, or two devices would
+/// answer each other for ever. A failure is only logged: the sender offers
+/// again, and this device answers again.
+fn answer(state: &AppState, db: &Connection, channel_id: &str, sender: &[u8; 32]) {
+    let sent =
+        build_state(state, db, channel_id).and_then(|cs| seal_and_send(state, db, sender, &cs));
+    if let Err(e) = sent {
+        tracing::warn!(channel = %channel_id, error = %e, "could not confirm a channel state to its sender");
+    }
+}
+
+/// How long after its `offers`-th offer a state that is still not
+/// confirmed is offered again.
+fn offer_wait(offers: u32) -> i64 {
+    use cordelia_core::protocol::{STATE_OFFER_RETRY_BASE_SECS, STATE_OFFER_RETRY_MAX_SECS};
+    STATE_OFFER_RETRY_BASE_SECS
+        .saturating_mul(1u64 << offers.saturating_sub(1).min(32))
+        .min(STATE_OFFER_RETRY_MAX_SECS) as i64
+}
+
+/// Offer again every channel state that was sent to a member and that the
+/// member has not been seen to hold, once its wait has passed. Returns how
+/// many were offered. `now` is Unix seconds.
+///
+/// The item that carries the state goes back into the outbox, so it is
+/// pushed to a relay again. A relay that still has it says so; one that
+/// lost it, or refused it the first time, stores it. Nothing new is
+/// written, so a member that is away for a month costs a handful of small
+/// pushes a day and nothing on the relays.
+///
+/// This is what makes a removal reach every remaining device: until each
+/// of them answers, the device that removed keeps offering it, and
+/// `cordelia devices` says which have not answered.
+pub fn offer_again(state: &AppState, now: i64) -> Result<usize, CordeliaError> {
+    let pk = state.identity.public_key();
+    let db = lock(state)?;
+    let mut offered = 0;
+    for offer in offers::unconfirmed(&db)? {
+        // Only while both are still in the channel.
+        let both_members = channels::is_member(&db, &offer.channel_id, &offer.member)
+            .unwrap_or(false)
+            && channels::is_member(&db, &offer.channel_id, &pk).unwrap_or(false);
+        if !both_members {
+            offers::forget(&db, &offer.channel_id, &offer.member)?;
+            continue;
+        }
+        if now - offer.last_offered_at < offer_wait(offer.offers) {
+            continue;
+        }
+        if items::mark_unrelayed(&db, &offer.item_id)? {
+            offers::offered_again(&db, &offer.channel_id, &offer.member, now)?;
+        } else {
+            // The item is no longer stored here: send the channel as it is.
+            let cs = build_state(state, &db, &offer.channel_id)?;
+            let item_id = seal_and_send(state, &db, &offer.member, &cs)?;
+            offers::forget(&db, &offer.channel_id, &offer.member)?;
+            offers::record(
+                &db,
+                &offer.channel_id,
+                &offer.member,
+                cs.epoch,
+                &item_id,
+                now,
+            )?;
+        }
+        tracing::info!(
+            channel = %offer.channel_id,
+            offers = offer.offers + 1,
+            "a member has not confirmed a channel state; offering it again"
+        );
+        offered += 1;
+    }
+    Ok(offered)
 }
 
 /// Send this node's current state of a channel to every other member.
@@ -675,6 +794,7 @@ pub fn remove_device(
         }
         keep_what_it_wrote(state, &db, &ch.channel_id, device);
         channels::remove_member(&db, &ch.channel_id, device)?;
+        offers::forget(&db, &ch.channel_id, device)?;
         rotate_key(state, &db, &ch.channel_id)?;
         publish_state(state, &db, &ch.channel_id)?;
         rotated.push(ch.channel_id);
@@ -747,6 +867,7 @@ fn remove_where_remover_absent(
         }
         keep_what_it_wrote(state, db, &id, gone);
         channels::remove_member(db, &id, gone)?;
+        offers::forget(db, &id, gone)?;
         rotate_key(state, db, &id)?;
         publish_state(state, db, &id)?;
         tracing::info!(channel = %id, "removed a device the remover could not reach, keys rotated");
@@ -780,6 +901,7 @@ pub fn list_devices(state: &AppState) -> Result<Vec<DeviceInfo>, CordeliaError> 
         }
     }
 
+    let waiting = offers::unconfirmed(&db)?;
     keys.into_iter()
         .map(|key| {
             Ok(DeviceInfo {
@@ -788,6 +910,11 @@ pub fn list_devices(state: &AppState) -> Result<Vec<DeviceInfo>, CordeliaError> 
                 this_device: key == pk,
                 in_personal_channel: personal_members.contains(&key),
                 explicitly_trusted: explicit.iter().any(|t| t.key == key),
+                unconfirmed_since: waiting
+                    .iter()
+                    .filter(|offer| offer.member == key)
+                    .map(|offer| offer.sent_at)
+                    .min(),
             })
         })
         .collect()
@@ -931,6 +1058,9 @@ fn process_one(
             if channels::get_member_role(db, &channel_id, &author)?.as_deref() != Some("owner") {
                 return invalid("sender is not an owner of the channel");
             }
+            // A state from a member shows which epoch it holds. That
+            // confirms what this device sent it, if it was waiting to hear.
+            offers::confirm(db, &channel_id, &author, cs.epoch, Utc::now().timestamp())?;
             let (epoch, epoch_author) = channels::epoch(db, &channel_id)?;
             if (cs.epoch, &cs.sender[..]) <= (epoch, epoch_author.as_slice()) {
                 return Ok((InviteStatus::Superseded, channel_id));
@@ -942,11 +1072,26 @@ fn process_one(
             if cs.epoch - epoch > cordelia_core::protocol::MAX_EPOCH_STEP {
                 return invalid("state moves the epoch further than one change may");
             }
+            // A removal moves the key version by one, with the epoch. So
+            // the version never goes back, never moves further than the
+            // epoch did, and never further than a state has room for keys.
+            // Otherwise a member could send the largest version there is,
+            // and no device could be removed afterwards.
+            let moved = i64::from(cs.key_version) - existing.key_version;
+            let room = (cs.epoch - epoch).min(cordelia_core::protocol::MAX_STATE_KEYS as u64);
+            if moved < 0 || moved as u64 > room {
+                return invalid("state moves the key version further than its changes can");
+            }
             let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id.as_str());
             if !is_personal && names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
             apply(state, db, &cs, false, false)?;
+            // A change, not only a tie between two devices at one epoch:
+            // tell its sender that this device holds it.
+            if cs.epoch > epoch && cs.role_of(&pk).is_some() {
+                answer(state, db, &channel_id, &author);
+            }
             Ok((InviteStatus::Accepted, channel_id))
         }
         Err(CordeliaError::ChannelNotFound { .. }) => {
@@ -972,12 +1117,14 @@ fn process_one(
                 }
                 apply(state, db, &cs, true, true)?;
                 meta::set(db, meta::ACCEPTED_PERSONAL_FROM, "")?;
+                answer(state, db, &channel_id, &author);
                 return Ok((InviteStatus::Accepted, channel_id));
             }
             if names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
             apply(state, db, &cs, true, false)?;
+            answer(state, db, &channel_id, &author);
             Ok((InviteStatus::Accepted, channel_id))
         }
         Err(e) => Err(e),
