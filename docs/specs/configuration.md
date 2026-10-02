@@ -69,7 +69,7 @@ P2P networking: listen address, node role, push policy, bootnode addresses, DNS 
 | `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket (it still listens if it has `trusted_peers`). Set `true` on a personal node that others dial directly, such as a swarm lead. | decision 2026-09-30 §4.6 |
 | `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"`, `"keeper"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. | network-protocol.md SS8, SS12.2 |
 | `push_policy` | string | `"subscribers_only"` | `"subscribers_only"`, `"pull_only"` | Push behaviour for personal nodes. `subscribers_only`: push items to hot peers subscribed to the channel. `pull_only`: never push; peers must pull via Item-Sync. Trade-off: `pull_only` increases latency (bounded by `replication.sync_interval_realtime_secs`). | network-protocol.md SS8.1.1, SS12.2 |
-| `dns_discovery` | string | `"_cordelia._udp.seeddrill.ai"` | DNS SRV name | SRV record for bootnode discovery. Transport is QUIC (UDP), so the SRV record uses `_udp` per network-protocol.md SS10.2. | operations.md SS5.1 (note: corrected from `_tcp` to `_udp` per network-protocol.md SS10.2) |
+| `dns_discovery` | string | `""` | any | **No longer used (2026-10-02).** A node learns of no relay from DNS: its relays are the ones it is configured with. The setting is still read, so that older configurations load. | decision 2026-09-30 §4.6 |
 
 **Port precedence:** If both `node.p2p_port` and `network.listen_addr` are set, the port in `listen_addr` MUST match `p2p_port`. If they disagree, the node logs an error and refuses to start. If only `node.p2p_port` is set, `listen_addr` defaults to `0.0.0.0:<p2p_port>`. If only `listen_addr` is set, `p2p_port` is derived from it. This ensures a single source of truth for the P2P port.
 
@@ -77,15 +77,17 @@ P2P networking: listen address, node role, push policy, bootnode addresses, DNS 
 
 ```toml
 [[network.bootnodes]]
-addr = "boot1.cordelia.seeddrill.ai:9474"
+addr = "relay1.cordelia.seeddrill.ai:9474"
 
 [[network.bootnodes]]
-addr = "boot2.cordelia.seeddrill.ai:9474"
+addr = "relay.example.org:9474"
+key = "cordelia_pk1..."
 ```
 
 | Parameter | Type | Default | Description | Source |
 |-----------|------|---------|-------------|--------|
-| `addr` | string | (required) | Bootnode address as `<hostname>:<port>`. Phase 1 ships with two Seed Drill-operated bootnodes. | network-protocol.md SS10.1, SS12.2 |
+| `addr` | string | (required) | The relay's address as `<hostname>:<port>`. With none configured, a personal node uses the two default relays. | decision 2026-09-30 §4.6 |
+| `key` | string | unset | The relay's public key (`cordelia_pk1...`, as `cordelia id` prints on the relay). When set, any other key answering at `addr` is refused. The default relays' keys are compiled in and need not be given. Without a key, whichever node answers is accepted, and the node warns at start. A key that does not parse stops the node from starting. | decision 2026-09-30 §4.6 |
 
 **Contradiction resolved:** operations.md SS5.1 uses a flat string array (`bootnodes = ["host:port", ...]`) and places governor parameters under `[network]`. network-protocol.md SS12.2 uses `[[network.bootnodes]]` array-of-tables and places governor parameters under `[governor]`. This document follows network-protocol.md SS12.2 as canonical: bootnodes use array-of-tables (extensible for future fields like `role`, `priority`), and governor parameters live under `[governor]` (SS2.4 below).
 
@@ -226,14 +228,14 @@ max_storage_bytes = 1073741824             # 1 GB local storage limit
 listen_addr = "0.0.0.0:9474"              # P2P listen address (UDP, QUIC)
 role = "personal"                          # "personal" | "bootnode" | "relay" | "keeper"
 push_policy = "subscribers_only"           # "subscribers_only" | "pull_only"
-dns_discovery = "_cordelia._udp.seeddrill.ai"  # SRV record for bootnode discovery
 
-# Bootnodes (array-of-tables for extensibility)
+# Relays: where to dial, and the key that must answer there. The default
+# relays' keys are compiled in.
 [[network.bootnodes]]
-addr = "boot1.cordelia.seeddrill.ai:9474"
+addr = "relay1.cordelia.seeddrill.ai:9474"
 
 [[network.bootnodes]]
-addr = "boot2.cordelia.seeddrill.ai:9474"
+addr = "relay2.cordelia.seeddrill.ai:9474"
 
 # --- Governor ---
 # Peer management targets and timing. Controls Hot/Warm/Cold peer lifecycle.

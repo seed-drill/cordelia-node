@@ -496,6 +496,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             let timeout = std::time::Duration::from_secs(1);
             if let Ok(peers) = local_api(&config, false, "/api/v1/peers", timeout) {
                 out["peers"]["list"] = peers["peers"].clone();
+                out["peers"]["relays"] = peers["relays"].clone();
             }
             if let Ok(devices) = local_api(&config, true, "/api/v1/devices/list", timeout) {
                 out["devices"] = devices["devices"].clone();
@@ -784,6 +785,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         push_tx: Some(push_tx),
         announce_tx: Some(announce_tx),
         peers: Default::default(),
+        relays: Default::default(),
         sync_control: Default::default(),
     });
 
@@ -824,7 +826,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let roles = vec![config.network.role.clone()];
         let allow_private = config.network.allow_private_addresses;
         let is_bootnode = config.network.role == "bootnode";
-        let mut conn_mgr = cordelia_network::connection::ConnectionManager::new(
+        let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
             vec![], // channel IDs loaded later from DB
@@ -832,45 +834,36 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             advertised_port,
         );
 
-        // ── Bootstrap: resolve and connect to bootnodes ──────────────
-        // Bootnodes skip this step (they are the bootstrap target).
-        if !is_bootnode {
-            let bootnode_addrs: Vec<String> = config
+        // ── The relays this node dials ───────────────────────────────
+        // Its configured relays or, for a personal node that names none,
+        // the default ones, each with the key that must answer (decision
+        // 2026-09-30 §4.6). The P2P loop dials them and keeps trying the
+        // ones that are not connected, so starting never waits on a relay
+        // that is unreachable. Bootnodes dial nobody.
+        let relays = if is_bootnode {
+            Vec::new()
+        } else {
+            let configured: Vec<(String, Option<String>)> = config
                 .network
                 .bootnodes
                 .iter()
-                .map(|b| b.addr.clone())
+                .map(|b| (b.addr.clone(), b.key.clone()))
                 .collect();
-            let bootnodes = cordelia_network::bootstrap::resolve_all_bootnodes(
-                &bootnode_addrs,
+            cordelia_network::bootstrap::configured_relays(
+                &configured,
                 config.network.role == "personal",
-            );
-            tracing::info!(count = bootnodes.len(), "bootnodes resolved");
-
-            for bn in &bootnodes {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
-                    conn_mgr.connect_to(bn.addr),
-                ).await {
-                    Ok(Ok(node_id)) => {
-                        tracing::info!(bootnode = %bn.host, peer = %node_id, "connected to bootnode");
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(bootnode = %bn.host, error = %e, "failed to connect to bootnode");
-                    }
-                    Err(_) => {
-                        tracing::warn!(bootnode = %bn.host, "bootnode connection timed out (10s)");
-                    }
-                }
+            )
+            .map_err(|e| anyhow::anyhow!("network.bootnodes: {e}"))?
+        };
+        for relay in &relays {
+            if relay.key.is_none() {
+                tracing::warn!(
+                    relay = %relay.host,
+                    "no key is configured for this relay: whichever node answers there is accepted"
+                );
             }
-        } else {
-            tracing::info!("bootnode role: skipping bootstrap");
         }
-
-        // Update peer counts in shared state
-        let hot_count = conn_mgr.connection_count() as u64;
-        state.peers_hot.store(hot_count, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(peers = hot_count, "bootstrap complete");
+        tracing::info!(count = relays.len(), "relays configured");
 
         // ── P2P background loop ─────────────────────────────────────
         // Owns the ConnectionManager. Accepts inbound connections and
@@ -902,22 +895,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             tokio::spawn(run_sync_loop(state.clone()));
         }
 
-        // Bootnodes are names (the defaults are relay1/relay2 by DNS), so
-        // they are resolved again while the node runs, not only at startup.
-        let bootstrap_addrs = p2p::BootstrapAddrs::default();
-        if !is_bootnode {
-            let names: Vec<String> = config.network.bootnodes.iter().map(|b| b.addr.clone()).collect();
-            tokio::spawn(p2p::keep_bootnodes_resolved(
-                cordelia_network::bootstrap::bootstrap_hosts(
-                    &names,
-                    config.network.role == "personal",
-                ),
-                bootstrap_addrs.clone(),
-            ));
+        // Relays are configured by name, so the names are resolved again
+        // while the node runs, not only at startup.
+        let relay_addrs = p2p::RelayAddrs::default();
+        if !relays.is_empty() {
+            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone()));
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), bootstrap_addrs, trusted_peer_ids).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -1054,26 +1040,60 @@ fn cmd_peers(config_path: &str, json: bool) -> anyhow::Result<()> {
     let peers = resp["peers"].as_array().cloned().unwrap_or_default();
     if peers.is_empty() {
         println!("No peers connected.");
-        return Ok(());
-    }
-    println!(
-        "{:<67} {:<8} {:<5} {:<22} {:>10} {:>9}",
-        "KEY", "ROLE", "STATE", "ADDRESS", "CONNECTED", "IDLE"
-    );
-    for p in &peers {
-        let text = |k: &str| p[k].as_str().unwrap_or("-");
-        let secs = |k: &str| format_uptime(p[k].as_u64().unwrap_or(0));
+    } else {
         println!(
             "{:<67} {:<8} {:<5} {:<22} {:>10} {:>9}",
-            text("key"),
-            text("role"),
-            text("state"),
-            text("address"),
-            secs("connected_secs"),
-            secs("idle_secs"),
+            "KEY", "ROLE", "STATE", "ADDRESS", "CONNECTED", "IDLE"
         );
+        for p in &peers {
+            let text = |k: &str| p[k].as_str().unwrap_or("-");
+            let secs = |k: &str| format_uptime(p[k].as_u64().unwrap_or(0));
+            println!(
+                "{:<67} {:<8} {:<5} {:<22} {:>10} {:>9}",
+                text("key"),
+                text("role"),
+                text("state"),
+                text("address"),
+                secs("connected_secs"),
+                secs("idle_secs"),
+            );
+        }
+    }
+    // A configured relay that is not connected is the answer to "why does
+    // this device have fewer relays than that one".
+    let missing: Vec<&serde_json::Value> = resp["relays"]
+        .as_array()
+        .map(|relays| {
+            relays
+                .iter()
+                .filter(|r| r["state"] != "connected")
+                .collect()
+        })
+        .unwrap_or_default();
+    if !missing.is_empty() {
+        println!("\nConfigured relays that are not connected:");
+        for r in missing {
+            println!("  {}", relay_line(r));
+        }
     }
     Ok(())
+}
+
+/// One line saying where a configured relay stands.
+fn relay_line(r: &serde_json::Value) -> String {
+    let host = r["host"].as_str().unwrap_or("-");
+    let ago = |k: &str| r[k].as_u64().map(format_uptime);
+    let mut line = format!("{host}  {}", r["state"].as_str().unwrap_or("-"));
+    if let Some(t) = ago("unreachable_secs") {
+        line.push_str(&format!(" for {t}"));
+    }
+    if let Some(t) = ago("last_tried_secs") {
+        line.push_str(&format!(", last tried {t} ago"));
+    }
+    if let Some(why) = r["error"].as_str() {
+        line.push_str(&format!(" ({why})"));
+    }
+    line
 }
 
 // ── cordelia channels ─────────────────────────────────────────────

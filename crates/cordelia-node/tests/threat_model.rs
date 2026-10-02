@@ -373,12 +373,21 @@ fn t01_a_relay_holds_nothing_it_can_read() {
 }
 
 /// A stand-in for a relay. It completes the handshake as a relay does, and
-/// records what each node that connects tells it when announcing channels.
-/// Returns the port it listens on and what it has been told so far.
-fn stand_in_relay() -> (u16, Arc<Mutex<Vec<ChannelDescriptor>>>) {
+/// records what each node that connects does: the protocol of every stream
+/// it opens, and what it says when announcing channels.
+struct StandIn {
+    port: u16,
+    /// The stand-in's own key, as a device would be configured with it.
+    key: String,
+    told: Arc<Mutex<Vec<ChannelDescriptor>>>,
+    streams: Arc<Mutex<Vec<Protocol>>>,
+}
+
+fn stand_in_relay() -> StandIn {
     use cordelia_network::{codec, connection, transport};
 
     let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let manager = connection::ConnectionManager::new(
@@ -390,23 +399,25 @@ fn stand_in_relay() -> (u16, Arc<Mutex<Vec<ChannelDescriptor>>>) {
     );
     let ctx = manager.connect_context();
     let told = Arc::new(Mutex::new(Vec::new()));
+    let streams = Arc::new(Mutex::new(Vec::new()));
 
-    let record = told.clone();
+    let (record, opened) = (told.clone(), streams.clone());
     tokio::spawn(async move {
         let _manager = manager; // keeps the endpoint's context alive
         while let Some(incoming) = endpoint.accept().await {
-            let (ctx, record) = (ctx.clone(), record.clone());
+            let (ctx, record, opened) = (ctx.clone(), record.clone(), opened.clone());
             tokio::spawn(async move {
                 let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
                     return;
                 };
                 while let Ok((_send, mut recv)) = outcome.conn.accept_bi().await {
-                    let record = record.clone();
+                    let (record, opened) = (record.clone(), opened.clone());
                     tokio::spawn(async move {
-                        if !matches!(
-                            codec::read_protocol_byte(&mut recv).await,
-                            Ok(Protocol::ChannelAnnounce)
-                        ) {
+                        let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
+                            return;
+                        };
+                        opened.lock().unwrap().push(protocol);
+                        if protocol != Protocol::ChannelAnnounce {
                             return;
                         }
                         while let Ok(WireMessage::ChannelJoined(joined)) =
@@ -419,7 +430,12 @@ fn stand_in_relay() -> (u16, Arc<Mutex<Vec<ChannelDescriptor>>>) {
             });
         }
     });
-    (port, told)
+    StandIn {
+        port,
+        key,
+        told,
+        streams,
+    }
 }
 
 /// T1. A device tells a relay a channel's ID and nothing else about it. A
@@ -430,8 +446,9 @@ fn stand_in_relay() -> (u16, Arc<Mutex<Vec<ChannelDescriptor>>>) {
 async fn t01_a_device_tells_a_relay_only_a_channels_id() {
     const PROJECT: &str = "t01-canary-project-name";
 
-    let (port, told) = stand_in_relay();
-    let mut a = node("a", "personal", Some(port));
+    let relay = stand_in_relay();
+    let told = relay.told.clone();
+    let mut a = node("a", "personal", Some(relay.port));
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
@@ -480,4 +497,91 @@ async fn t01_a_device_tells_a_relay_only_a_channels_id() {
         // It is still an announcement a relay accepts.
         cordelia_network::channel_announce::validate_descriptor(d).unwrap();
     }
+}
+
+/// T19. A device knows its relays by key. When another key answers at a
+/// relay's address, the device refuses it, stays without that relay, and
+/// says why. With the right key configured the same relay is accepted.
+#[test]
+fn t19_a_device_refuses_another_key_at_its_relays_address() {
+    let mut real = node("real", "relay", None);
+    let mut other = node("other", "relay", None);
+    real.start();
+    other.start();
+    wait_for("relays healthy", &[&real, &other], 30, || {
+        healthy(&real).and(healthy(&other))
+    });
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let at_other = format!("127.0.0.1:{}", other.p2p);
+
+    // This device was told that the relay at `other`'s address has `real`'s
+    // key: what it would see if someone else answered for its relay's name.
+    let mut fooled = node_with_relays(
+        "fooled",
+        "personal",
+        &[(at_other.clone(), Some(key_of(&real)))],
+    );
+    fooled.start();
+    let all = [&real, &other, &fooled];
+    wait_for("node healthy", &all, 30, || healthy(&fooled));
+    let relay = wait_for("the device refuses the key that answered", &all, 60, || {
+        relays_of(&fooled)
+            .into_iter()
+            .find(|r| r["state"] == "wrong key")
+    });
+    assert_eq!(relay["host"], at_other.as_str(), "{relay}");
+    assert!(
+        relay["error"]
+            .as_str()
+            .unwrap()
+            .contains("another key answered"),
+        "{relay}"
+    );
+    assert!(
+        has_hot_peer(&fooled).is_none(),
+        "it must not use that relay"
+    );
+    let said = fooled.cli(&["peers"]);
+    assert!(said.contains("No peers connected."), "{said}");
+    assert!(said.contains("wrong key"), "{said}");
+
+    // With the key that really is at that address, the relay is accepted.
+    let mut told_right = node_with_relays("right", "personal", &[(at_other, Some(key_of(&other)))]);
+    told_right.start();
+    let all = [&real, &other, &told_right];
+    wait_for("node healthy", &all, 30, || healthy(&told_right));
+    wait_for("the device connects to its relay", &all, 60, || {
+        has_hot_peer(&told_right)
+    });
+    wait_for("it reports the relay connected", &all, 30, || {
+        (relays_of(&told_right)[0]["state"] == "connected").then_some(())
+    });
+}
+
+/// T19. A device's network is the relays it was configured with. It does
+/// not ask a relay for the addresses of other peers, so a relay cannot send
+/// it anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t19_a_device_asks_no_peer_for_addresses_to_dial() {
+    let relay = stand_in_relay();
+    let mut a = node_with_relays(
+        "a",
+        "personal",
+        &[(format!("127.0.0.1:{}", relay.port), Some(relay.key.clone()))],
+    );
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    // The device is at work with this relay: it opens streams to it.
+    wait_for("the device talks to the relay", &[&a], 60, || {
+        (!relay.streams.lock().unwrap().is_empty()).then_some(())
+    });
+
+    // Long enough for several of the rounds in which it used to ask.
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    let opened = relay.streams.lock().unwrap().clone();
+    assert!(
+        !opened.contains(&Protocol::PeerSharing),
+        "the device asked its relay for other peers' addresses: {opened:?}"
+    );
 }

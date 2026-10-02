@@ -30,6 +30,7 @@ fn test_state() -> web::Data<AppState> {
         push_tx: None,
         announce_tx: None,
         peers: Default::default(),
+        relays: Default::default(),
         sync_control: Default::default(),
     })
 }

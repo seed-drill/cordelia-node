@@ -19,7 +19,7 @@ all node logs, the telemetry is insufficient.
 |-------|---------|----------------------|---------|
 | ERROR | Unrecoverable failures requiring operator action | Always | DB corruption, bind failure |
 | WARN | Recoverable failures that may indicate problems | Always | Bootnode timeout, stream limit hit |
-| INFO | Lifecycle events (startup, connect, disconnect) | Default | "connected to bootnode", "bootstrap complete" |
+| INFO | Lifecycle events (startup, connect, disconnect) | Default | "relays configured", "handshake complete (outbound)" |
 | DEBUG | Per-operation tracing (item-level, stream-level) | On request | "push delivered", "sync request served" |
 | TRACE | Wire-level detail (frame bytes, CBOR dumps) | Never in production | Frame hex dumps |
 
@@ -128,11 +128,11 @@ DEBUG served peer-share request   peer=<node_id> count=<N>
 ### 3.4 Bootstrap (§10.3)
 
 ```
-INFO  bootnodes resolved          count=<N> config=<N> dns=<N> fallback=<N>
-INFO  connected to bootnode       bootnode=<addr> peer=<node_id>
-WARN  failed to connect to bootnode bootnode=<addr> error=<msg>
-WARN  bootnode connection timed out bootnode=<addr> timeout_secs=10
-INFO  bootstrap complete          peers=<N>
+INFO  relays configured           count=<N>
+WARN  no key is configured for this relay: whichever node answers there is accepted  relay=<host>
+INFO  relay addresses updated     addrs=[<host>=<addr>, ...]
+DEBUG dialling relay              relay=<host> addr=<addr>
+WARN  another key answered at a relay's address; refusing it  relay=<host> answered=<node_id>
 ```
 
 ---

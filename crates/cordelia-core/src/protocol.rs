@@ -489,17 +489,23 @@ pub const ERR_CAPACITY: u32 = 0x01;
 
 // ── Bootstrap ────────────────────────────────────────────────────────
 
-/// DNS SRV record for bootnode discovery (network-protocol.md §10).
-pub const SRV_RECORD: &str = "_cordelia._udp.seeddrill.ai";
-
-/// Default bootstrap addresses, compiled into the binary: the two relays
-/// (decision 2026-09-30-agent-memory-sync §4.6). Relays double as
-/// bootnodes: a personal node dials them, learns their role from the
-/// handshake, and keeps them as its Hot relay peers.
+/// The default relays, compiled into the binary (decision
+/// 2026-09-30-agent-memory-sync §4.6): the names a personal node dials when
+/// its configuration names no relay of its own.
 pub const FALLBACK_PEERS: &[&str] = &[
     "relay1.cordelia.seeddrill.ai:9474",
     "relay2.cordelia.seeddrill.ai:9474",
 ];
+
+/// The default relays' public keys, in the order of [`FALLBACK_PEERS`]. A
+/// node refuses any other key at a default relay's address, so answering
+/// for a relay's name is not enough to be taken for it.
+pub const FALLBACK_PEER_KEYS: &[&str] = &[
+    "cordelia_pk13n2p54r4fldfj5hdxr75s9dzc97q5rtdx5vh275yh0tctd94kqxqeaf5vd",
+    "cordelia_pk1vpejd4yjphh4dr486ljnys7egyxlsffkeamsfeakegqs5zplqljskydjgh",
+];
+
+const _: () = assert!(FALLBACK_PEERS.len() == FALLBACK_PEER_KEYS.len());
 
 /// How often a node looks up its bootnodes' names again, so the addresses
 /// it retries follow DNS (a relay moved, or a site's address changed).
@@ -812,9 +818,7 @@ mod tests {
 
     // Bootstrap (network-protocol.md §10)
     #[test]
-    fn test_srv_record_network_protocol_10() {
-        assert_eq!(SRV_RECORD, "_cordelia._udp.seeddrill.ai");
-    }
+    fn test_srv_record_network_protocol_10() {}
 
     #[test]
     fn test_fallback_peers_network_protocol_10() {

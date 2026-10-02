@@ -1277,7 +1277,8 @@ pub async fn metrics(
 
 // ── GET /api/v1/peers ──────────────────────────────────────────────
 
-/// The peers this node is connected to (`cordelia peers`).
+/// The peers this node is connected to, and the relays it was configured
+/// with, connected or not (`cordelia peers`).
 pub async fn peers(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
     let peers = state
@@ -1285,7 +1286,12 @@ pub async fn peers(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
         .read()
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .clone();
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "peers": peers })))
+    let relays = state
+        .relays
+        .read()
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .clone();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "peers": peers, "relays": relays })))
 }
 
 /// Extract a privacy-safe label from a channel_id (first 8 hex chars after any prefix).

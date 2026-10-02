@@ -217,7 +217,7 @@ fn add_device_accept_and_sync_through_a_relay() {
 #[test]
 fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
     // The relay is given by name, as the default relays are, and does not
-    // exist yet when the node starts: its startup dial fails, and it must
+    // exist yet when the node starts: its first dial fails, and it must
     // keep resolving and retrying the name rather than give up.
     let mut relay = node("relay", "relay", None);
     let mut a = node_with_bootnode(
@@ -227,11 +227,9 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
     );
     a.start();
     wait_for("a healthy", &[&a], 30, || healthy(&a));
-    wait_for("a's startup dial to give up", &[&a], 60, || {
-        std::fs::read_to_string(a.log())
-            .ok()?
-            .contains("bootstrap complete")
-            .then_some(())
+    wait_for("a's first dial to fail", &[&a], 60, || {
+        let relays = relays_of(&a);
+        (relays.len() == 1 && relays[0]["state"] == "unreachable").then_some(())
     });
     assert!(has_hot_peer(&a).is_none(), "no relay yet, so no peer");
 
@@ -380,6 +378,74 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
 /// A personal node only dials out. It starts and reaches its relay while
 /// something else holds its configured P2P port, so it cannot be listening
 /// there; told to listen, the same node needs the port and cannot start.
+/// A device with two relays, one of them down. It says so, with the reason,
+/// and goes on trying at a slowing pace; when the relay comes up it is
+/// connected again without a restart.
+#[test]
+fn a_relay_that_is_down_is_shown_and_found_when_it_comes_up() {
+    let mut up = node("up", "relay", None);
+    let mut down = node("down", "relay", None);
+    up.start();
+    wait_for("the first relay healthy", &[&up], 30, || healthy(&up));
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let relays = [
+        (format!("127.0.0.1:{}", up.p2p), Some(key_of(&up))),
+        (format!("127.0.0.1:{}", down.p2p), Some(key_of(&down))),
+    ];
+    let mut a = node_with_relays("a", "personal", &relays);
+    a.start();
+    let all = [&up, &a];
+    wait_for("a healthy", &all, 30, || healthy(&a));
+    wait_for("a connected to the relay that is up", &all, 60, || {
+        has_hot_peer(&a)
+    });
+
+    let state_of = |host: &str| -> Option<serde_json::Value> {
+        relays_of(&a).into_iter().find(|r| r["host"] == host)
+    };
+    let missing = wait_for("a reports the other relay unreachable", &all, 60, || {
+        state_of(&relays[1].0).filter(|r| r["state"] == "unreachable")
+    });
+    assert_eq!(
+        missing["key"],
+        relays[1].1.clone().unwrap().as_str(),
+        "{missing}"
+    );
+    assert!(missing["error"].is_string(), "{missing}");
+    assert!(missing["unreachable_secs"].is_u64(), "{missing}");
+    assert_eq!(state_of(&relays[0].0).unwrap()["state"], "connected");
+
+    // The same, as a person reads it.
+    let said = a.cli(&["peers"]);
+    assert!(
+        said.contains("Configured relays that are not connected:"),
+        "{said}"
+    );
+    assert!(
+        said.lines()
+            .any(|l| l.contains(&relays[1].0) && l.contains("unreachable")),
+        "{said}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
+    assert_eq!(
+        status["peers"]["relays"].as_array().unwrap().len(),
+        2,
+        "{status}"
+    );
+
+    // The relay comes up, and is found without a restart.
+    down.start();
+    let all = [&up, &down, &a];
+    wait_for("the second relay healthy", &all, 30, || healthy(&down));
+    wait_for("a reaches the relay that was down", &all, 120, || {
+        state_of(&relays[1].0)
+            .filter(|r| r["state"] == "connected")
+            .map(|_| ())
+    });
+    let said = a.cli(&["peers"]);
+    assert!(!said.contains("not connected"), "{said}");
+}
+
 #[test]
 fn a_personal_node_listens_on_nothing() {
     let mut relay = node("relay", "relay", None);

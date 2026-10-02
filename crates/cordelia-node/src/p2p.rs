@@ -228,9 +228,10 @@ pub fn post_connect(
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
     swarm_members: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
+    relay_addrs: &RelayAddrs,
 ) {
     // Step 1: Extract peer roles from handshake
-    let (is_relay, is_bootnode) = conn_mgr
+    let (says_relay, is_bootnode) = conn_mgr
         .get_peer(node_id)
         .map(|pc| {
             let roles = &pc.handshake.peer_roles;
@@ -244,6 +245,15 @@ pub fn post_connect(
             tracing::warn!(peer = %node_id, "post_connect: get_peer returned None");
             (false, false)
         });
+
+    // A personal node's relays are the ones it was configured with: being
+    // a relay is a property of a configured key, not of what a peer says
+    // about itself in the handshake.
+    let is_relay = if node_role == "personal" {
+        is_configured_relay(relay_addrs, conn_mgr, node_id)
+    } else {
+        says_relay
+    };
 
     // Step 2: Add to governor
     governor.add_peer(node_id.clone(), vec![], vec![]);
@@ -369,7 +379,7 @@ pub async fn p2p_loop(
     allow_private_addresses: bool,
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
-    bootstrap_addrs: BootstrapAddrs,
+    relay_addrs: RelayAddrs,
     trusted_peer_ids: Vec<NodeId>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
@@ -462,6 +472,7 @@ pub async fn p2p_loop(
             &gov_tx,
             &swarm_members,
             &seen_table,
+            &relay_addrs,
         );
     }
     governor.tick();
@@ -546,6 +557,13 @@ pub async fn p2p_loop(
     repush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     repush_interval.tick().await;
 
+    // The configured relays: each one that is not connected is dialled
+    // again, at a slowing pace (see `relay_backoff`).
+    let mut relay_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut relay_tries: std::collections::HashMap<String, RelayTry> =
+        std::collections::HashMap::new();
+
     // Peer-share has two independent concerns:
     // (a) Request addresses from peers (subject to per-peer cooldown for rate limits)
     // (b) Connect to discovered candidates (every cycle from cached addresses)
@@ -625,6 +643,38 @@ pub async fn p2p_loop(
 
                         if direction == Direction::Outbound {
                             in_flight.remove(&addr);
+                            // A configured relay must answer with its key.
+                            let dialled = relay_addrs
+                                .read()
+                                .ok()
+                                .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
+                            if let Some(relay) = dialled {
+                                let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
+                                let tried = relay_tries.entry(relay.host.clone()).or_default();
+                                match relay.key {
+                                    Some(key) if key != outcome.node_id.0 => {
+                                        tracing::warn!(
+                                            relay = %relay.host,
+                                            answered = %outcome.node_id,
+                                            "another key answered at a relay's address; refusing it"
+                                        );
+                                        outcome.conn.close(0u32.into(), b"not the relay");
+                                        tried.failed(
+                                            "another key answered at this address".into(),
+                                            true,
+                                            p2p_gov_tick_secs,
+                                            any_connected,
+                                        );
+                                        continue;
+                                    }
+                                    // Keep the count of failures until the
+                                    // connection has lasted (see the relay
+                                    // tick), so a relay that accepts and
+                                    // drops at once is not redialled every
+                                    // second.
+                                    _ => tried.connected_at = Some(std::time::Instant::now()),
+                                }
+                            }
                         }
 
                         // Connection tracker check FIRST (inbound only, §3.1).
@@ -701,6 +751,7 @@ pub async fn p2p_loop(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
                                     &peer_relays, &gov_tx, &swarm_members, &seen_table,
+                                    &relay_addrs,
                                 );
                             }
                             Err(e) => {
@@ -714,6 +765,19 @@ pub async fn p2p_loop(
                             governor.mark_dial_failed(&nid);
                         }
                         tracing::debug!(addr = %addr, error = %error, "outbound connect failed");
+                        let dialled = relay_addrs
+                            .read()
+                            .ok()
+                            .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
+                        if let Some(relay) = dialled {
+                            let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
+                            relay_tries.entry(relay.host).or_default().failed(
+                                error,
+                                false,
+                                p2p_gov_tick_secs,
+                                any_connected,
+                            );
+                        }
                     }
                 }
             }
@@ -728,10 +792,67 @@ pub async fn p2p_loop(
                 }
             }
 
+            // ── Configured relays ─────────────────────────────────────
+            // Dial each configured relay that is not connected and is due
+            // another attempt, and publish where each one stands.
+            _ = relay_interval.tick() => {
+                let relays = relay_addrs.read().map(|r| r.clone()).unwrap_or_default();
+                let now = std::time::Instant::now();
+                let settled = std::time::Duration::from_secs(p2p_gov_tick_secs.max(1));
+                let any_connected = relays.iter().any(|r| relay_connected(&conn_mgr, r));
+                for relay in &relays {
+                    if relay_connected(&conn_mgr, relay) {
+                        // Forget earlier failures once the connection has lasted.
+                        if relay_tries
+                            .get(&relay.host)
+                            .is_some_and(|t| t.connected_at.is_none_or(|at| at.elapsed() >= settled))
+                        {
+                            relay_tries.remove(&relay.host);
+                        }
+                        continue;
+                    }
+                    if in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT {
+                        continue;
+                    }
+                    let tried = relay_tries.entry(relay.host.clone()).or_default();
+                    if let Some(at) = tried.connected_at.take()
+                        && at.elapsed() < settled
+                    {
+                        // It connected and was gone again at once: a failure
+                        // like any other, so the pace keeps slowing.
+                        tried.failed(
+                            "the relay closed the connection at once".into(),
+                            false,
+                            p2p_gov_tick_secs,
+                            any_connected,
+                        );
+                    }
+                    if tried.next_try.is_some_and(|at| now < at) {
+                        continue;
+                    }
+                    tried.last_tried = Some(now);
+                    in_flight.insert(relay.addr);
+                    let ctx = connect_ctx.clone();
+                    let tx = connect_tx.clone();
+                    let addr = relay.addr;
+                    tracing::debug!(relay = %relay.host, %addr, "dialling relay");
+                    tokio::spawn(async move {
+                        match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                            Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
+                            Err(e) => { let _ = tx.send(Err((addr, e.to_string()))); }
+                        }
+                    });
+                }
+                publish_relays(&state, &relays, &relay_tries, &conn_mgr);
+            }
+
             // ── Peer-sharing (spawn discovery + connects) ─────────────
             // (a) Request addresses from a peer whose cooldown has expired (spawned).
             // (b) Spawn up to CONNECTS_PER_CYCLE candidates from the cache.
-            _ = peer_share_interval.tick() => {
+            //
+            // Not for a personal node: its network is the relays it was
+            // configured with, and it dials no address a peer hands it.
+            _ = peer_share_interval.tick(), if node_role != "personal" => {
                 let peers = conn_mgr.connected_peers();
                 if peers.is_empty() { continue; }
 
@@ -1384,41 +1505,6 @@ pub async fn p2p_loop(
                 publish_peers(&state, &connected, &conn_mgr);
                 sightings.note(&state, &connected);
 
-                // Bootstrap retry: if no relay in hot set, retry bootstrap
-                // addresses (§8.3: bootnode connection is transient, but the
-                // config may include relay addresses that failed on first attempt).
-                let has_hot_relay = governor.hot_peers().iter()
-                    .any(|p| governor.peer_info(p).map(|i| i.is_relay).unwrap_or(false));
-                let retry_addrs = bootstrap_addrs.read().map(|a| a.clone()).unwrap_or_default();
-                if !has_hot_relay && !retry_addrs.is_empty() && node_role != "bootnode" {
-                    for addr in &retry_addrs {
-                        if in_flight.len() >= MAX_IN_FLIGHT || in_flight.contains(addr) {
-                            continue;
-                        }
-                        if conn_mgr.connected_peers().iter().any(|p| {
-                            conn_mgr.get_connection(p)
-                                .map(|c| c.remote_address() == *addr)
-                                .unwrap_or(false)
-                        }) {
-                            continue; // already connected to this address
-                        }
-                        in_flight.insert(*addr);
-                        let ctx = connect_ctx.clone();
-                        let tx = connect_tx.clone();
-                        let addr = *addr;
-                        tracing::info!(%addr, "retrying bootstrap address (no hot relay)");
-                        tokio::spawn(async move {
-                            match cordelia_network::connection::outbound_connect(&ctx, addr).await {
-                                Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
-                                Err(e) => {
-                                    tracing::debug!(%addr, error = %e, "bootstrap retry failed");
-                                    let _ = tx.send(Err((addr, e.to_string())));
-                                }
-                            }
-                        });
-                    }
-                }
-
                 tracing::info!(hot, warm, cold, banned, "gov: tick complete");
             }
 
@@ -1548,27 +1634,36 @@ impl Sightings {
     }
 }
 
-/// The resolved addresses of a node's bootnodes, which the P2P loop dials
-/// while it has no hot relay. [`keep_bootnodes_resolved`] keeps it current.
-pub type BootstrapAddrs = std::sync::Arc<std::sync::RwLock<Vec<std::net::SocketAddr>>>;
+/// The relays a node was configured with, resolved to addresses. The P2P
+/// loop dials each one that is not connected; [`keep_relays_resolved`] keeps
+/// the addresses current.
+pub type RelayAddrs =
+    std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::bootstrap::RelayAddr>>>;
 
-/// Look up the bootnode names now, then again every
+/// Look up the relays' names now, then again every
 /// `BOOTNODE_RESOLVE_INTERVAL_SECS` (every `BOOTNODE_RESOLVE_RETRY_SECS`
 /// while none resolves), and publish the addresses to `addrs`. Names, not
 /// addresses, are the configuration: a node that started offline, or whose
 /// relay changed address, still reaches it. The last good list is kept
 /// while lookups fail.
-pub async fn keep_bootnodes_resolved(hosts: Vec<String>, addrs: BootstrapAddrs) {
+pub async fn keep_relays_resolved(
+    relays: Vec<cordelia_network::bootstrap::Relay>,
+    addrs: RelayAddrs,
+) {
     use cordelia_core::protocol::{BOOTNODE_RESOLVE_INTERVAL_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
     loop {
-        let resolved = cordelia_network::bootstrap::resolve_hosts(&hosts).await;
+        let resolved = cordelia_network::bootstrap::resolve_relays(&relays).await;
         let have_any = if resolved.is_empty() {
             addrs.read().map(|a| !a.is_empty()).unwrap_or(false)
         } else {
             if let Ok(mut current) = addrs.write()
                 && *current != resolved
             {
-                tracing::info!(addrs = ?resolved, "bootnode addresses updated");
+                let list: Vec<String> = resolved
+                    .iter()
+                    .map(|r| format!("{}={}", r.host, r.addr))
+                    .collect();
+                tracing::info!(addrs = ?list, "relay addresses updated");
                 *current = resolved;
             }
             true
@@ -1579,6 +1674,147 @@ pub async fn keep_bootnodes_resolved(hosts: Vec<String>, addrs: BootstrapAddrs) 
             BOOTNODE_RESOLVE_RETRY_SECS
         };
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    }
+}
+
+/// Where a node stands with one configured relay that is not connected.
+#[derive(Debug, Default)]
+struct RelayTry {
+    /// Failures in a row.
+    failures: u32,
+    /// Not before this.
+    next_try: Option<std::time::Instant>,
+    last_tried: Option<std::time::Instant>,
+    /// When the failures in a row began.
+    since: Option<std::time::Instant>,
+    error: Option<String>,
+    /// The last failure was another key answering at the relay's address.
+    wrong_key: bool,
+    /// When the latest connection was made, until it has lasted a tick.
+    connected_at: Option<std::time::Instant>,
+}
+
+impl RelayTry {
+    fn failed(&mut self, error: String, wrong_key: bool, tick_secs: u64, another_connected: bool) {
+        let now = std::time::Instant::now();
+        self.failures = self.failures.saturating_add(1);
+        self.since.get_or_insert(now);
+        self.error = Some(error);
+        self.wrong_key = wrong_key;
+        self.next_try = Some(now + relay_backoff(self.failures, tick_secs, another_connected));
+    }
+}
+
+// The pace below needs the cut-off cap to be the shorter one.
+const _: () =
+    assert!(cordelia_core::protocol::BACKOFF_BASE_SECS < cordelia_core::protocol::BACKOFF_MAX_SECS);
+
+/// How long to wait before dialling a configured relay again after
+/// `failures` failures in a row: one governor tick, doubling each time.
+///
+/// While another relay is connected nothing is waiting on this one, so the
+/// wait grows to BACKOFF_MAX_SECS. While none is, the node is cut off and
+/// keeps trying at least every BACKOFF_BASE_SECS.
+fn relay_backoff(failures: u32, tick_secs: u64, another_connected: bool) -> std::time::Duration {
+    use cordelia_core::protocol::{BACKOFF_BASE_SECS, BACKOFF_MAX_SECS};
+    let cap = if another_connected {
+        BACKOFF_MAX_SECS
+    } else {
+        BACKOFF_BASE_SECS
+    };
+    let doubled = tick_secs
+        .max(1)
+        .saturating_mul(1u64 << failures.saturating_sub(1).min(16));
+    std::time::Duration::from_secs(doubled.min(cap).max(1))
+}
+
+/// Whether a configured relay is connected: by its key if one is
+/// configured, otherwise by the address it was dialled at.
+fn relay_connected(
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    relay: &cordelia_network::bootstrap::RelayAddr,
+) -> bool {
+    match relay.key {
+        Some(key) => conn_mgr.is_connected(&NodeId(key)),
+        None => conn_mgr.connected_peers().iter().any(|p| {
+            conn_mgr
+                .get_connection(p)
+                .is_some_and(|c| c.remote_address() == relay.addr)
+        }),
+    }
+}
+
+fn any_relay_connected(
+    relay_addrs: &RelayAddrs,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> bool {
+    relay_addrs
+        .read()
+        .map(|relays| relays.iter().any(|r| relay_connected(conn_mgr, r)))
+        .unwrap_or(false)
+}
+
+/// Whether `node_id` is one of the relays this node was configured with:
+/// its key is a configured relay's key, or, for a relay configured without
+/// a key, it is the node connected at that relay's address.
+fn is_configured_relay(
+    relay_addrs: &RelayAddrs,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    node_id: &NodeId,
+) -> bool {
+    let Ok(relays) = relay_addrs.read() else {
+        return false;
+    };
+    relays.iter().any(|r| match r.key {
+        Some(key) => key == node_id.0,
+        None => conn_mgr
+            .get_connection(node_id)
+            .is_some_and(|c| c.remote_address() == r.addr),
+    })
+}
+
+/// Publish where each configured relay stands, for `cordelia peers` and
+/// `cordelia status`.
+fn publish_relays(
+    state: &cordelia_api::state::AppState,
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    tries: &std::collections::HashMap<String, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) {
+    let list: Vec<cordelia_api::state::RelaySnapshot> = relays
+        .iter()
+        .map(|relay| {
+            let tried = tries.get(&relay.host);
+            let connected = relay_connected(conn_mgr, relay);
+            let failing = tried.filter(|t| t.failures > 0 && !connected);
+            let state = if connected {
+                "connected"
+            } else {
+                match failing {
+                    Some(t) if t.wrong_key => "wrong key",
+                    Some(_) => "unreachable",
+                    None => "connecting",
+                }
+            };
+            cordelia_api::state::RelaySnapshot {
+                host: relay.host.clone(),
+                key: relay
+                    .key
+                    .and_then(|k| cordelia_crypto::bech32::encode_public_key(&k).ok()),
+                state: state.into(),
+                unreachable_secs: failing.and_then(|t| t.since).map(|t| t.elapsed().as_secs()),
+                last_tried_secs: tried
+                    .filter(|_| !connected)
+                    .and_then(|t| t.last_tried)
+                    .map(|t| t.elapsed().as_secs()),
+                error: failing.and_then(|t| t.error.clone()),
+            }
+        })
+        .collect();
+    if let Ok(mut current) = state.relays.write()
+        && *current != list
+    {
+        *current = list;
     }
 }
 
@@ -2184,4 +2420,26 @@ async fn send_channel_announcements(
     let _ = send.finish();
     tracing::debug!(channels = channels.len(), "sent channel announcements");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relay that keeps failing is dialled less and less often: up to a
+    /// quarter of an hour apart while another relay is connected, and at
+    /// least every half minute while none is.
+    #[test]
+    fn a_failing_relay_is_dialled_at_a_slowing_pace() {
+        use cordelia_core::protocol::{BACKOFF_BASE_SECS, BACKOFF_MAX_SECS};
+        let secs = |failures, another| relay_backoff(failures, 10, another).as_secs();
+        assert_eq!(secs(1, true), 10);
+        assert_eq!(secs(2, true), 20);
+        assert_eq!(secs(3, true), 40);
+        assert_eq!(secs(40, true), BACKOFF_MAX_SECS);
+        assert_eq!(secs(1, false), 10);
+        assert_eq!(secs(40, false), BACKOFF_BASE_SECS);
+        // Never zero, whatever the tick.
+        assert_eq!(relay_backoff(1, 0, true).as_secs(), 1);
+    }
 }

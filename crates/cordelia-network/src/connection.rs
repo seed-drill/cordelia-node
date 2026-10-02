@@ -366,16 +366,24 @@ fn extract_node_id_from_conn(conn: &Connection) -> Result<[u8; 32], ConnectionEr
 
 /// Perform outbound connect: QUIC + handshake. No state mutation.
 /// Safe to call from a spawned task.
+///
+/// Gives up after STREAM_TIMEOUT_SECS if nothing answers. Left to QUIC, an
+/// address that never answers would hold the attempt for a minute.
 pub async fn outbound_connect(
     ctx: &ConnectContext,
     addr: SocketAddr,
 ) -> Result<ConnectOutcome, ConnectionError> {
-    let conn = ctx
+    let connecting = ctx
         .endpoint
         .connect(addr, "cordelia")
-        .map_err(|e| ConnectionError::Quinn(e.to_string()))?
-        .await
         .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
+        connecting,
+    )
+    .await
+    .map_err(|_| ConnectionError::Quinn("timed out".into()))?
+    .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
 
     let peer_node_id = extract_node_id_from_conn(&conn)?;
     let node_id = NodeId(peer_node_id);
