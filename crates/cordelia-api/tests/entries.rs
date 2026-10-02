@@ -287,6 +287,35 @@ fn only_members_writing_the_right_key_count() {
     assert_eq!(a.read(&ch).len(), 1);
 }
 
+/// T2. Someone who was never in the channel stores an entry under a name's
+/// slot with the highest revision there is. It is not read, and it does not
+/// put the name out of reach: the channel's members go on writing it.
+#[test]
+fn a_strangers_revision_does_not_stop_a_member_writing() {
+    let (a, b, ch) = paired();
+    assert_eq!(a.write(&ch, "notes.md", "one"), 1);
+    let slot_key = psk::read_slot_key(&a.state.home_dir, &ch).unwrap();
+    let channel_key = psk::read_psk(&a.state.home_dir, &ch).unwrap();
+    let slot = slot_id(&slot_key, "notes.md");
+
+    let stranger = NodeIdentity::generate().unwrap();
+    inject(
+        &a,
+        &stranger,
+        &ch,
+        slot,
+        cordelia_core::protocol::MAX_REV,
+        channel_key,
+        json!({ "key": "notes.md", "content": { "text": "evil" } }),
+    );
+    assert_eq!(a.read(&ch), vec![("notes.md".into(), "one".into(), 1, 0)]);
+
+    assert_eq!(a.write(&ch, "notes.md", "two"), 2);
+    relay(&a, &b, &ch);
+    assert_eq!(b.read(&ch), vec![("notes.md".into(), "two".into(), 2, 0)]);
+    assert_eq!(b.write(&ch, "notes.md", "three"), 3);
+}
+
 #[test]
 fn a_removed_device_can_no_longer_write() {
     let (a, b, ch) = paired();

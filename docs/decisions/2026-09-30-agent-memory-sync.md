@@ -75,6 +75,7 @@ This replaces seed-sharing pairing ([`identity.md`](../specs/identity.md) §6). 
 
 - The item's signature must verify, and the sender named inside the ciphertext must equal the item's author, so a state can't be re-signed by someone else and replayed as theirs.
 - A state is applied only if it is newer than the one held (by epoch, then author key) and comes from an owner of the channel.
+- The epoch is bounded. It is at most 2^53 - 1 (`MAX_EPOCH`), and one state can move it by at most 2^20 (`MAX_EPOCH_STEP`). A device that was away may have missed some changes, so a state may skip epochs. But no member can use the numbers up, after which the list could never change again.
 - A state for a channel the node doesn't know is applied only if the sender is trusted.
 - Channel IDs must be exactly `grp_<lowercase uuid>`.
 
@@ -104,10 +105,17 @@ A memory file is edited, not appended to. Items gain an optional `slot` and `rev
 - **Slot:** `slot = HMAC-SHA256(slot_key, "cordelia:slot:v1:" || logical_key)`.
   - `logical_key` is the file's key within its channel (4.5). Relays can match slots without learning file names.
   - `slot_key` is a random 32-byte key per channel. It is created with the channel, sent in the channel state next to the key ring, and **never rotated**. If slots were derived from the channel key, every rotation would move every file to a new slot. A revoked device keeps the slot key, which tells it only whether two items are the same file.
-- **Rev:** a per-slot counter. The writer sets `rev = highest rev seen for this slot + 1`. Wall clocks play no part, so clock skew between machines does no harm.
+- **Rev:** a per-slot counter. The writer sets `rev` to one more than the highest rev that a member of the channel has stored for the slot. Wall clocks play no part, so clock skew between machines does no harm.
+  - What someone outside the channel stored in the slot does not count, so a stranger cannot put a name's rev out of reach.
+  - A rev is at most 2^53 - 1 (`MAX_REV`). This is checked wherever an item is verified, so no node stores a larger one or passes it on.
 - **Signature and encryption both cover the slot and rev.** The signed metadata envelope gains `slot` and `rev`, present only on slotted items, so existing items and test vector TV-C1 are unchanged. The item's AES-GCM associated data becomes `channel_id || slot || rev`. A relay can neither relabel an item into another slot nor replay an old revision as a new one.
 
 **Storage keeps the newest rev per `(channel_id, slot, author)`, not per slot.** Relays see slot values but can't tell members from strangers. Under a per-slot rule, anyone who can reach a relay could publish junk with a higher rev into your slot, and the relay would throw your real item away. Keyed by author, an attacker can only replace their own entries. This needs **every node, relays included, to verify an item's signature before storing it.**
+
+**No storage rule compares one author's items with another's.** That holds for every rule a node applies when it stores:
+
+- A node skips an item only when it already holds the same ciphertext from the same author. If the author did not matter, a copy of your item under someone else's key, stored first, would keep your item out.
+- The sweep of old deletes (4.4) never lets one author's delete remove another author's content from a relay.
 
 **Readers resolve per slot.** Among items whose author is an active member of the channel, which decrypt, and whose key maps back to the slot, the highest `rev` wins, with ties going to the higher `content_hash`. The losing version of a tie is reported as a conflict, and the device that wrote it keeps it as `<file>.conflict-<tag>.md` (the tag is the start of its key), so neither machine's edit is lost.
 
@@ -115,7 +123,12 @@ This is the same idea as Nostr's addressable events (NIP-01, kinds 30000-39999).
 
 ### 4.4 Deletes that replicate
 
-A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`), so a laptop that has been in a drawer doesn't bring deleted files back; after that, an hourly sweep drops the key's whole slot history. `delete-item` now checks the item's channel and that the caller wrote it.
+A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`), so a laptop that has been in a drawer doesn't bring deleted files back; after that, an hourly sweep drops the key's whole slot history. What counts as deleted depends on what the node can know:
+
+- A device knows the channel's members. A key is deleted when the newest rev among them is a delete.
+- A relay does not, and stores what anyone sends. It drops a key only when every author's newest rev of it is a delete older than 90 days. So a key that one device deleted, and another device still has content for, stays on the relay. That costs a relay some space, and it means a stranger's delete can never erase a member's file there.
+
+`delete-item` now checks the item's channel and that the caller wrote it.
 
 ### 4.4a Fixes to sync and verification that 4.1-4.4 depend on
 

@@ -15,9 +15,11 @@ use crate::items::{self, ITEM_COLUMNS, StoredItem};
 /// Item type of a sealed channel state in an inbox.
 pub const INVITE_ITEM_TYPE: &str = "invite";
 
-/// Most pending invites kept; beyond this the oldest are rejected, so a
-/// stranger who knows this node's key cannot grow the list without limit.
-pub const MAX_PENDING_INVITES: i64 = 100;
+/// Most invites kept waiting for `accept`; beyond this the oldest are
+/// rejected, so a stranger who knows this node's key cannot grow the list
+/// without limit. Applied where the inbox is processed, which knows who
+/// sent each one.
+pub const MAX_PENDING_INVITES: usize = 100;
 
 /// Decision recorded for an invite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,24 +159,6 @@ pub fn pending(conn: &Connection) -> Result<Vec<PendingInvite>, CordeliaError> {
     Ok(out)
 }
 
-/// Reject the oldest pending invites beyond [`MAX_PENDING_INVITES`].
-/// Returns how many were rejected.
-pub fn enforce_pending_cap(conn: &Connection) -> Result<usize, CordeliaError> {
-    let now = Utc::now().to_rfc3339();
-    let rejected = conn
-        .execute(
-            "UPDATE invites SET status = 'rejected', decided_at = ?1
-             WHERE item_id IN (
-                 SELECT item_id FROM invites WHERE status = 'pending'
-                 ORDER BY received_at DESC, item_id DESC
-                 LIMIT -1 OFFSET ?2
-             )",
-            params![now, MAX_PENDING_INVITES],
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    Ok(rejected)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,16 +216,5 @@ mod tests {
         let pend = pending(&conn).unwrap();
         assert_eq!(pend.len(), 1);
         assert_eq!(pend[0].channel_id, "grp_b");
-    }
-
-    #[test]
-    fn test_pending_cap_rejects_oldest() {
-        let conn = db::open_in_memory().unwrap();
-        for i in 0..(MAX_PENDING_INVITES + 3) {
-            let id = format!("ci_{i:04}");
-            record(&conn, &id, &[0x0B; 32], "grp_x", InviteStatus::Pending).unwrap();
-        }
-        assert_eq!(enforce_pending_cap(&conn).unwrap(), 3);
-        assert_eq!(pending(&conn).unwrap().len() as i64, MAX_PENDING_INVITES);
     }
 }

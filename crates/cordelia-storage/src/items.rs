@@ -80,9 +80,11 @@ impl<'a> NewItem<'a> {
 
 /// Insert an item.
 ///
-/// Returns false, storing nothing, if the channel already holds an item
-/// with the same content hash, or, for a slotted item, if the same author
-/// already has an equal or newer revision in that slot. Storing a slotted
+/// Returns false, storing nothing, if the channel already holds an item by
+/// the same author with the same content hash, or, for a slotted item, if
+/// the same author already has an equal or newer revision in that slot.
+/// Nothing here compares one author's items with another's: an item stored
+/// by one author can neither hide nor displace another author's. Storing a slotted
 /// item deletes that author's older revisions of the slot: storage keeps
 /// the newest revision per (channel, slot, author), never per slot alone,
 /// so no one can overwrite another author's item (§4.3).
@@ -96,14 +98,27 @@ pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaEr
             "slot and rev must be set together".into(),
         ));
     }
+    if item
+        .rev
+        .is_some_and(|rev| rev > cordelia_core::protocol::MAX_REV)
+    {
+        return Err(CordeliaError::Validation(
+            "revision is over the limit".into(),
+        ));
+    }
 
     conn.execute_batch("SAVEPOINT insert_item")
         .map_err(storage)?;
     let result = (|| -> Result<bool, CordeliaError> {
         let duplicate: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM items WHERE channel_id = ?1 AND content_hash = ?2)",
-                params![item.channel_id, item.content_hash],
+                "SELECT EXISTS(SELECT 1 FROM items
+                               WHERE channel_id = ?1 AND content_hash = ?2 AND author_id = ?3)",
+                params![
+                    item.channel_id,
+                    item.content_hash,
+                    item.author_id.as_slice()
+                ],
                 |row| row.get(0),
             )
             .map_err(storage)?;
@@ -191,7 +206,8 @@ pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaEr
     result
 }
 
-/// Revisions are u64 on the wire and i64 in SQLite; clamp rather than wrap.
+/// Revisions are u64 on the wire and i64 in SQLite. Nothing over MAX_REV is
+/// stored (see `insert_item`), so this never clamps in practice.
 fn rev_to_sql(rev: u64) -> i64 {
     i64::try_from(rev).unwrap_or(i64::MAX)
 }
@@ -427,19 +443,51 @@ pub fn mark_relayed(conn: &Connection, item_ids: &[String]) -> Result<(), Cordel
     Ok(())
 }
 
-/// Drop the whole history of every key whose newest revision is a
-/// tombstone that arrived more than `retention_days` ago (decision
-/// 2026-09-30 §4.4). Removing only the tombstone would let a lower
-/// revision by another author become current again, so the slot goes as a
-/// whole. Returns the number of items removed.
-pub fn gc_keyed_tombstones(conn: &Connection, retention_days: u32) -> Result<usize, CordeliaError> {
+/// Drop the whole history of every key that was deleted more than
+/// `retention_days` ago (decision 2026-09-30 §4.4). Removing only the
+/// delete would let a lower revision by another author become current
+/// again, so the slot goes as a whole. Returns the number of items removed.
+///
+/// What counts as deleted depends on what this node can know, because a
+/// delete from someone outside the channel must not sweep away what its
+/// members wrote:
+///
+/// - With `members_known` (a device, which holds each channel's member
+///   list): the newest revision among the channel's members is a delete
+///   that arrived before the cut-off.
+/// - Without (a relay, which holds no member list and stores what anyone
+///   sends): every author's newest revision of the key is a delete that
+///   arrived before the cut-off. A key that some author still has content
+///   for stays, whoever else has deleted it.
+pub fn gc_keyed_tombstones(
+    conn: &Connection,
+    retention_days: u32,
+    members_known: bool,
+) -> Result<usize, CordeliaError> {
     let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
     let cutoff = format!("-{retention_days} days");
-    let expired = "SELECT i.channel_id, i.slot FROM items i
+    let expired = if members_known {
+        "SELECT i.channel_id, i.slot FROM items i
          WHERE i.slot IS NOT NULL AND i.is_tombstone = 1
            AND i.received_at < datetime('now', ?1)
+           AND i.author_id IN (SELECT m.entity_key FROM channel_members m
+                               WHERE m.channel_id = i.channel_id AND m.posture = 'active')
            AND i.rev = (SELECT MAX(j.rev) FROM items j
-                        WHERE j.channel_id = i.channel_id AND j.slot = i.slot)";
+                        WHERE j.channel_id = i.channel_id AND j.slot = i.slot
+                          AND j.author_id IN (SELECT m.entity_key FROM channel_members m
+                                              WHERE m.channel_id = j.channel_id
+                                                AND m.posture = 'active'))"
+    } else {
+        "SELECT s.channel_id, s.slot
+         FROM (SELECT DISTINCT channel_id, slot FROM items WHERE slot IS NOT NULL) s
+         WHERE NOT EXISTS (
+             SELECT 1 FROM items i
+             WHERE i.channel_id = s.channel_id AND i.slot = s.slot
+               AND i.rev = (SELECT MAX(j.rev) FROM items j
+                            WHERE j.channel_id = i.channel_id AND j.slot = i.slot
+                              AND j.author_id = i.author_id)
+               AND NOT (i.is_tombstone = 1 AND i.received_at < datetime('now', ?1)))"
+    };
 
     conn.execute_batch("SAVEPOINT gc_tombstones")
         .map_err(storage)?;
@@ -485,7 +533,15 @@ pub fn item_owner(
     }
 }
 
-/// The highest revision stored for a slot, from any author.
+/// The highest revision stored for a slot from anyone who is, or has been,
+/// a member of the channel. The next revision a member writes follows from
+/// this.
+///
+/// - It does not count what someone who was never in the channel has
+///   stored there, or a stranger could put the revision out of reach.
+/// - It does count a member that has since been removed. Other devices may
+///   have taken that member's revision as the current one, and a lower
+///   number would never reach them.
 pub fn max_rev(
     conn: &Connection,
     channel_id: &str,
@@ -493,7 +549,10 @@ pub fn max_rev(
 ) -> Result<Option<u64>, CordeliaError> {
     let rev: Option<i64> = conn
         .query_row(
-            "SELECT MAX(rev) FROM items WHERE channel_id = ?1 AND slot = ?2",
+            "SELECT MAX(rev) FROM items
+             WHERE channel_id = ?1 AND slot = ?2
+               AND author_id IN (SELECT entity_key FROM channel_members
+                                 WHERE channel_id = ?1)",
             params![channel_id, slot.as_slice()],
             |row| row.get(0),
         )
@@ -1088,10 +1147,37 @@ mod tests {
         assert_eq!(outbox_len(&conn, &me).unwrap(), 1);
     }
 
+    /// Store, long ago, a revision of `slot` by `author`: content, or a
+    /// delete.
+    fn old(
+        conn: &Connection,
+        id: &str,
+        author: &[u8; 32],
+        slot: &[u8; 32],
+        rev: u64,
+        deleted: bool,
+    ) {
+        let hash = cordelia_crypto::sha256(id.as_bytes());
+        let mut item = slotted(id, author, slot, rev, &hash);
+        item.is_tombstone = deleted;
+        assert!(insert_item(conn, &item).unwrap());
+        conn.execute(
+            "UPDATE items SET received_at = datetime('now', '-100 days') WHERE item_id = ?1",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    fn member(conn: &Connection, key: &[u8; 32]) {
+        crate::channels::add_member(conn, "ch1", key, "owner").unwrap();
+    }
+
     #[test]
     fn test_gc_drops_whole_history_of_expired_deleted_keys() {
         let conn = setup();
         let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        member(&conn, &a);
+        member(&conn, &b);
         let (deleted_slot, live_slot, fresh_slot) = ([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]);
 
         // Deleted key: A wrote rev 1, B deleted it at rev 2, long ago.
@@ -1112,12 +1198,137 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(gc_keyed_tombstones(&conn, 90).unwrap(), 2);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, true).unwrap(), 2);
         let mut left = ids(&conn);
         left.sort();
         // A's older revision went too: otherwise it would become current.
         assert_eq!(left, vec!["ci_f1", "ci_l1"]);
-        assert_eq!(gc_keyed_tombstones(&conn, 90).unwrap(), 0);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, true).unwrap(), 0);
+    }
+
+    /// T2. On a device, a delete by a key that is not a member sweeps
+    /// nothing, however high its revision. A member's delete still does,
+    /// and takes what the stranger stored under that name with it.
+    #[test]
+    fn a_strangers_delete_sweeps_nothing_from_a_device() {
+        let conn = setup();
+        let (a, stranger) = ([0xA1u8; 32], [0x5Eu8; 32]);
+        member(&conn, &a);
+        let (kept, deleted) = ([0x01u8; 32], [0x02u8; 32]);
+
+        old(&conn, "ci_k1", &a, &kept, 3, false);
+        old(&conn, "ci_k2", &stranger, &kept, 9, true);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, true).unwrap(), 0);
+        assert_eq!(ids(&conn).len(), 2);
+
+        // The member's own delete, with a stranger's content beside it.
+        old(&conn, "ci_d1", &a, &deleted, 4, true);
+        old(&conn, "ci_d2", &stranger, &deleted, 9, false);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, true).unwrap(), 2);
+        let mut left = ids(&conn);
+        left.sort();
+        assert_eq!(left, vec!["ci_k1", "ci_k2"]);
+    }
+
+    /// T2. A relay holds no member list, so it cannot tell whose delete
+    /// counts. It sweeps a name only when every author's newest revision of
+    /// it is an old delete, so one author's delete never takes another
+    /// author's content.
+    #[test]
+    fn one_authors_delete_sweeps_nothing_of_anothers_from_a_relay() {
+        let conn = setup();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let (kept, deleted, fresh) = ([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]);
+
+        // B deleted the name at a higher revision; A still has content.
+        old(&conn, "ci_k1", &a, &kept, 3, false);
+        old(&conn, "ci_k2", &b, &kept, 9, true);
+        // Both deleted this one, long ago.
+        old(&conn, "ci_d1", &a, &deleted, 4, true);
+        old(&conn, "ci_d2", &b, &deleted, 5, true);
+        // Both deleted this one too, but B only just now.
+        old(&conn, "ci_f1", &a, &fresh, 1, true);
+        let mut recent = slotted("ci_f2", &b, &fresh, 2, &[0x32; 32]);
+        recent.is_tombstone = true;
+        insert_item(&conn, &recent).unwrap();
+
+        assert_eq!(gc_keyed_tombstones(&conn, 90, false).unwrap(), 2);
+        let mut left = ids(&conn);
+        left.sort();
+        assert_eq!(left, vec!["ci_f1", "ci_f2", "ci_k1", "ci_k2"]);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, false).unwrap(), 0);
+    }
+
+    /// T2. The same ciphertext stored by another author does not stop an
+    /// entry being stored, whichever of the two arrives first.
+    #[test]
+    fn a_copy_by_another_author_does_not_keep_an_entry_out() {
+        let conn = setup();
+        let (a, copier, other, slot) = ([0xA1u8; 32], [0x5Eu8; 32], [0x5Fu8; 32], [0x51u8; 32]);
+        let hash = [0x77u8; 32];
+
+        // The copies arrive first: one in the same slot, one as a plain item.
+        assert!(insert_item(&conn, &slotted("ci_copy1", &copier, &slot, 7, &hash)).unwrap());
+        let mut plain = test_item("ci_copy2", "2026-01-01T00:01:00Z");
+        plain.author_id = &other;
+        plain.content_hash = &hash;
+        assert!(insert_item(&conn, &plain).unwrap());
+
+        assert!(insert_item(&conn, &slotted("ci_real", &a, &slot, 1, &hash)).unwrap());
+        assert!(ids(&conn).contains(&"ci_real".to_string()));
+
+        // The same item from the same author is still stored only once.
+        assert!(!insert_item(&conn, &slotted("ci_again", &a, &slot, 2, &hash)).unwrap());
+    }
+
+    /// T2. A revision over the limit is not stored.
+    #[test]
+    fn a_revision_over_the_limit_is_not_stored() {
+        use cordelia_core::protocol::MAX_REV;
+        let conn = setup();
+        let (a, slot) = ([0xA1u8; 32], [0x51u8; 32]);
+        for rev in [MAX_REV + 1, i64::MAX as u64, u64::MAX] {
+            assert!(
+                insert_item(&conn, &slotted("ci_over", &a, &slot, rev, &[0x01; 32])).is_err(),
+                "{rev}"
+            );
+        }
+        assert!(ids(&conn).is_empty());
+        assert!(insert_item(&conn, &slotted("ci_max", &a, &slot, MAX_REV, &[0x02; 32])).unwrap());
+        assert_eq!(max_rev_of(&conn, &slot), None, "not a member: not counted");
+    }
+
+    fn max_rev_of(conn: &Connection, slot: &[u8; 32]) -> Option<u64> {
+        max_rev(conn, "ch1", slot).unwrap()
+    }
+
+    /// T2. The next revision of a name follows from what the channel's
+    /// members stored. What a key that was never a member stored there does
+    /// not count, so it cannot put the revision out of reach.
+    #[test]
+    fn a_strangers_revision_does_not_count_towards_the_next_one() {
+        use cordelia_core::protocol::MAX_REV;
+        let conn = setup();
+        let (a, b, stranger, slot) = ([0xA1u8; 32], [0xB2u8; 32], [0x5Eu8; 32], [0x51u8; 32]);
+        member(&conn, &a);
+        member(&conn, &b);
+
+        assert_eq!(max_rev_of(&conn, &slot), None);
+        insert_item(
+            &conn,
+            &slotted("ci_s", &stranger, &slot, MAX_REV, &[0x01; 32]),
+        )
+        .unwrap();
+        assert_eq!(max_rev_of(&conn, &slot), None);
+
+        insert_item(&conn, &slotted("ci_a", &a, &slot, 4, &[0x02; 32])).unwrap();
+        insert_item(&conn, &slotted("ci_b", &b, &slot, 6, &[0x03; 32])).unwrap();
+        assert_eq!(max_rev_of(&conn, &slot), Some(6));
+
+        // A member that is removed still counts: other devices may hold
+        // its revision as the current one.
+        crate::channels::remove_member(&conn, "ch1", &b).unwrap();
+        assert_eq!(max_rev_of(&conn, &slot), Some(6));
     }
 
     // T3-3 (MEDIUM): Tombstone nonexistent item

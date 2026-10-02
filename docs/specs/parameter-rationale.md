@@ -283,6 +283,30 @@ Increasing later is non-breaking.
 plus CBOR overhead. 1MB allows batch fetch of up to 4 items at maximum
 size, or 100+ typical items in a single FetchResponse.
 
+### max_rev = 2^53 - 1, max_epoch = 2^53 - 1
+
+**Rationale:** A keyed item's revision and a channel state's epoch are
+counters that the writer sets. Unbounded, they are stored in a signed 64-bit
+column: a value near the top overflows on the next increment, and one above
+it wraps. Either way the name, or the member list, could never be written
+again. The bound is checked wherever an item or a state is verified, so a
+larger value is neither stored nor passed on.
+
+**Derivation:** 2^53 - 1 is the largest integer that is exact both in a
+signed 64-bit column and as a JSON number, so the API can carry it. At one
+revision a second it lasts 285 million years.
+
+### max_epoch_step = 2^20
+
+**Rationale:** A state carries the whole member list, so a device that was
+away can skip the epochs it missed. But a member who could jump straight to
+max_epoch would freeze the list for everyone: no later state could be newer.
+So one state may move the epoch by at most this much.
+
+**Derivation:** No device misses a million changes to a channel's members.
+Reaching max_epoch at this step takes 2^33 states, each of which every other
+member has to receive and apply first.
+
 ### outbox_flush_interval = 2s
 
 **Rationale:** A personal node's own items stay in an outbox until a relay
