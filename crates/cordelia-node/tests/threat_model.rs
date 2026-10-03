@@ -2287,7 +2287,10 @@ async fn a_relay_asks_for_whole_pages_again_once_caught_up() {
     // fetched has left the minute it counts against the device: until then
     // the relay asks for fewer for that reason. It asks for them a whole
     // page at a time.
-    tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(
+        cordelia_core::protocol::RATE_WINDOW_SECS + 1,
+    ))
+    .await;
     let before = held.passes().len();
     held.items
         .lock()

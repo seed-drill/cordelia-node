@@ -485,10 +485,12 @@ What a relay keeps for a peer is bounded too. It keeps a place in a
 peer's list, and a page size, for at most this many channels of a peer
 that is not a relay it lists: when it has that many, a caught-up channel's
 place makes room before one that is still being fetched, so a long channel
-keeps its place from one pass to the next. Nothing is kept where a peer
-lists nothing, and what is kept for a peer is forgotten at the first cycle
-after it has gone. A place is a channel's ID and three numbers, under 200 bytes:
-200 connections with 1,024 channels each would cost a relay about 40MB.
+keeps its place from one pass to the next unless more than this many of
+the peer's channels are being fetched at once. Nothing is kept where a
+peer lists nothing, and what is kept for a peer is forgotten at the first
+cycle after it has gone. A place is a channel's ID and a few numbers, with
+what the table around it takes, at most about 230 bytes: 200 connections
+with 1,024 channels each would cost a relay about 46MB.
 
 ### limits for an address = 5 x the limits for a connection
 
