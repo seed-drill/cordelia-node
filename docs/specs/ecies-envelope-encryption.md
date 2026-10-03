@@ -247,6 +247,10 @@ Inputs:
   recipient_xpk : X25519 public key (32 bytes)
   plaintext_psk : Channel PSK to wrap (32 bytes)
 
+A recipient known by an Ed25519 key has recipient_xpk derived from it
+(§2.2). There is none for bytes that are not a point on the curve, or for
+a point of small order, and nothing is sealed to either.
+
 Steps:
   1. Generate ephemeral X25519 keypair:
        eph_sk = CSPRNG(32 bytes)
@@ -254,6 +258,8 @@ Steps:
 
   2. ECDH key agreement:
        shared_secret = X25519(eph_sk, recipient_xpk)    -- 32 bytes
+       If shared_secret is all zero: fail. The recipient's key is of
+       small order, and the secret would be the same for everyone.
 
   3. Key derivation (HKDF-SHA256):
        salt = 0x00 * 32                                  -- 32 zero bytes
@@ -278,6 +284,8 @@ Inputs:
 
 Steps:
   1. shared_secret = X25519(recipient_sk, eph_pk)
+     If shared_secret is all zero: reject. The envelope was sealed under
+     a secret anyone can work out.
   2. Derive wrapping_key (same HKDF as §4.2 step 3)
   3. plaintext_psk = AES-256-GCM-Decrypt(wrapping_key, iv, ct, tag, aad="")
   4. If tag verification fails: reject (authentication failure)

@@ -148,6 +148,13 @@ fn ecies_seal(
     let recipient = PublicKey::from(*recipient_pk);
 
     let shared = eph_secret.diffie_hellman(&recipient);
+    // A key of small order (all zero among them) gives the same secret to
+    // everyone. Sealing under it would seal to nobody in particular.
+    if !shared.was_contributory() {
+        return Err(CryptoError::EncryptionFailed(
+            "the recipient's key gives no secret of its own".into(),
+        ));
+    }
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
 
@@ -183,6 +190,11 @@ pub fn ecies_decrypt(
     let eph_pk = PublicKey::from(envelope.ephemeral_pk);
 
     let shared = secret.diffie_hellman(&eph_pk);
+    // An envelope whose ephemeral key is of small order was sealed under a
+    // secret anyone can work out: it proves nothing about who sealed it.
+    if !shared.was_contributory() {
+        return Err(CryptoError::DecryptionFailed);
+    }
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
 
@@ -207,6 +219,54 @@ pub fn ecies_decrypt(
 mod tests {
     use super::*;
     use crate::identity::x25519_from_ed25519_seed;
+
+    /// T20. A secret agreed with a key of small order is the same for
+    /// everyone: all zero. Nothing is sealed under it, and an envelope that
+    /// was sealed under it is not opened.
+    #[test]
+    fn a_secret_anyone_can_work_out_seals_and_opens_nothing() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let mut small: Vec<[u8; 32]> = EIGHT_TORSION
+            .iter()
+            .map(|point| point.to_montgomery().to_bytes())
+            .collect();
+        small.push([0u8; 32]);
+        for key in &small {
+            assert!(
+                ecies_encrypt(key, b"a channel's key").is_err(),
+                "{key:02x?}"
+            );
+        }
+
+        // An envelope made by someone who holds no key at all: its
+        // ephemeral key is of small order, so the secret is all zero for
+        // whoever opens it. Without the check, every recipient opens it.
+        let iv = [7u8; IV_LEN];
+        let wrapping_key = hkdf_sha256(&[0u8; 32], &[], HKDF_INFO).unwrap();
+        let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &wrapping_key).unwrap());
+        let mut in_out = b"forged".to_vec();
+        key.seal_in_place_append_tag(
+            Nonce::try_assume_unique_for_key(&iv).unwrap(),
+            Aad::empty(),
+            &mut in_out,
+        )
+        .unwrap();
+        let tag_start = in_out.len() - TAG_LEN;
+        let forged = EciesEnvelope {
+            ephemeral_pk: [0u8; 32],
+            iv,
+            ciphertext: in_out[..tag_start].to_vec(),
+            auth_tag: in_out[tag_start..].try_into().unwrap(),
+        };
+        for seed in [[1u8; 32], [2u8; 32]] {
+            let (recipient_sk, _) = x25519_from_ed25519_seed(&seed);
+            assert!(matches!(
+                ecies_decrypt(&recipient_sk, &forged),
+                Err(CryptoError::DecryptionFailed)
+            ));
+        }
+    }
 
     #[test]
     fn test_hkdf_sha256_tv() {

@@ -178,13 +178,21 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 ///
 /// This is the Edwards-to-Montgomery conversion: u = (1 + y) / (1 - y) mod p.
 /// Used when we have only the peer's Ed25519 public key (no seed access).
-pub fn x25519_pub_from_ed25519_pub(ed_pk: &[u8; 32]) -> [u8; 32] {
+///
+/// `None` when there is no key to derive: the bytes are not a point on the
+/// curve, or the point is one of small order. A secret agreed with either
+/// is the same for everyone (all zero), so whatever was sealed to it could
+/// be opened by anyone.
+pub fn x25519_pub_from_ed25519_pub(ed_pk: &[u8; 32]) -> Option<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
-    let compressed = CompressedEdwardsY(*ed_pk);
-    match compressed.decompress() {
-        Some(point) => point.to_montgomery().to_bytes(),
-        None => [0u8; 32], // Invalid Ed25519 point
-    }
+    let point = CompressedEdwardsY(*ed_pk).decompress()?;
+    (!point.is_small_order()).then(|| point.to_montgomery().to_bytes())
+}
+
+/// Whether `ed_pk` can be a device's public key: something can be sealed
+/// to it (see [`x25519_pub_from_ed25519_pub`]).
+pub fn is_usable_public_key(ed_pk: &[u8; 32]) -> bool {
+    x25519_pub_from_ed25519_pub(ed_pk).is_some()
 }
 
 /// Wrap a raw 32-byte Ed25519 seed in PKCS#8 v1 DER for ring.
@@ -393,8 +401,9 @@ mod tests {
         let id = NodeIdentity::generate().unwrap();
         let ed_pk = id.public_key();
         let x_pub_from_seed = id.x25519_public_key();
-        let x_pub_from_birational = x25519_pub_from_ed25519_pub(&ed_pk);
+        let x_pub_from_birational = x25519_pub_from_ed25519_pub(&ed_pk).unwrap();
         assert_eq!(x_pub_from_seed, x_pub_from_birational);
+        assert!(is_usable_public_key(&ed_pk));
     }
 
     // T1-1: Known test vector (TV1 from spec)
@@ -404,23 +413,42 @@ mod tests {
             .unwrap();
         let id = NodeIdentity::from_seed(seed.try_into().unwrap()).unwrap();
         let ed_pk = id.public_key();
-        let x_pub = x25519_pub_from_ed25519_pub(&ed_pk);
+        let x_pub = x25519_pub_from_ed25519_pub(&ed_pk).unwrap();
         assert_eq!(
             hex::encode(x_pub),
             "d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e"
         );
     }
 
-    // T3-5 (LOW): Arbitrary bytes produce a result without panicking
+    /// T20. Bytes that are not a point on the curve, and the eight points
+    /// of small order, are no device's key: there is no key to seal to. A
+    /// secret agreed with any of them is all zero, whoever agrees it.
     #[test]
-    fn test_x25519_pub_from_ed25519_pub_arbitrary_input() {
-        // Any 32-byte input should produce a 32-byte output (no panic)
-        // -- either a valid X25519 key or [0u8; 32] for invalid points
-        for byte in [0x00, 0x42, 0xFF] {
-            let input = [byte; 32];
-            let result = x25519_pub_from_ed25519_pub(&input);
-            assert_eq!(result.len(), 32);
+    fn a_key_that_is_not_a_point_or_is_of_small_order_is_no_key() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+        use curve25519_dalek::edwards::CompressedEdwardsY;
+
+        for point in EIGHT_TORSION {
+            let key = point.compress().to_bytes();
+            assert_eq!(x25519_pub_from_ed25519_pub(&key), None, "{key:02x?}");
+            assert!(!is_usable_public_key(&key));
         }
+        // About half of all byte strings are not a point: find some.
+        let not_points: Vec<[u8; 32]> = (0u8..=255)
+            .map(|b| {
+                let mut key = [0x42; 32];
+                key[0] = b;
+                key
+            })
+            .filter(|key| CompressedEdwardsY(*key).decompress().is_none())
+            .collect();
+        assert!(not_points.len() > 64, "{}", not_points.len());
+        for key in not_points {
+            assert_eq!(x25519_pub_from_ed25519_pub(&key), None);
+            assert!(!is_usable_public_key(&key));
+        }
+        // What the earlier code sealed to for all of those.
+        assert!(!is_usable_public_key(&[0u8; 32]));
     }
 
     // T3-4 (MEDIUM): Identity file wrong size

@@ -36,7 +36,7 @@ use ciborium::Value;
 
 use crate::CryptoError;
 use crate::ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt};
-use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
+use crate::identity::{NodeIdentity, is_usable_public_key, x25519_pub_from_ed25519_pub};
 
 /// Payload format version.
 pub const CHANNEL_STATE_VERSION: u64 = 1;
@@ -162,6 +162,12 @@ impl ChannelState {
         }
         if self.role_of(&self.sender) != Some(MemberRole::Owner) {
             return invalid("sender must be an owner in the member list");
+        }
+        // A member is a key the channel's keys are sealed to. Bytes that
+        // are not a usable key can be sealed to only under a secret anyone
+        // can work out.
+        if self.members.iter().any(|m| !is_usable_public_key(&m.key)) {
+            return invalid("member list holds a key that is not a usable public key");
         }
         if self.members.len() > MAX_MEMBERS || self.keys.len() > MAX_KEYS {
             return invalid("channel state exceeds size limits");
@@ -316,7 +322,9 @@ impl ChannelState {
     pub fn seal(&self, recipient_ed25519: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
         self.validate()?;
         let plaintext = self.to_cbor()?;
-        let recipient_x25519 = x25519_pub_from_ed25519_pub(recipient_ed25519);
+        let recipient_x25519 = x25519_pub_from_ed25519_pub(recipient_ed25519).ok_or_else(|| {
+            CryptoError::InvalidMessage("the recipient's key is not a usable public key".into())
+        })?;
         Ok(ecies_encrypt(&recipient_x25519, &plaintext)?.to_bytes())
     }
 
@@ -518,11 +526,52 @@ mod tests {
             assert!(state.seal(&recipient.public_key()).is_err(), "{epoch}");
 
             // Sealed without the check, as a hostile sender would.
-            let to = x25519_pub_from_ed25519_pub(&recipient.public_key());
+            let to = x25519_pub_from_ed25519_pub(&recipient.public_key()).unwrap();
             let sealed = ecies_encrypt(&to, &state.to_cbor().unwrap())
                 .unwrap()
                 .to_bytes();
             assert!(ChannelState::open(&recipient, &sealed).is_err(), "{epoch}");
+        }
+    }
+
+    /// T20. A member is a key the channel's keys are sealed to. A state
+    /// that lists bytes which are not a usable key is not valid, and no
+    /// state is sealed to such a key: the secret it would be sealed under
+    /// is one anyone can work out.
+    #[test]
+    fn a_member_whose_key_is_not_usable_is_not_a_valid_state() {
+        let sender = NodeIdentity::generate().unwrap();
+        let recipient = NodeIdentity::generate().unwrap();
+        let not_a_point = (0u8..=255)
+            .map(|b| {
+                let mut key = [0x42; 32];
+                key[0] = b;
+                key
+            })
+            .find(|key| !is_usable_public_key(key))
+            .unwrap();
+        // Two points of small order: the identity, and the all-zero bytes.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+
+        let state = sample(&sender, &recipient);
+        assert!(state.validate().is_ok());
+        for bad in [not_a_point, identity, [0u8; 32]] {
+            assert!(state.seal(&bad).is_err(), "{bad:02x?}");
+
+            let mut listed = sample(&sender, &recipient);
+            listed.members.push(StateMember {
+                key: bad,
+                role: MemberRole::Owner,
+            });
+            assert!(listed.validate().is_err(), "{bad:02x?}");
+            assert!(listed.seal(&recipient.public_key()).is_err());
+            // Sealed without the check, as a hostile sender would.
+            let to = x25519_pub_from_ed25519_pub(&recipient.public_key()).unwrap();
+            let sealed = ecies_encrypt(&to, &listed.to_cbor().unwrap())
+                .unwrap()
+                .to_bytes();
+            assert!(ChannelState::open(&recipient, &sealed).is_err());
         }
     }
 
@@ -541,7 +590,7 @@ mod tests {
         assert!(state.validate().is_err());
         assert!(state.seal(&recipient.public_key()).is_err());
 
-        let to = x25519_pub_from_ed25519_pub(&recipient.public_key());
+        let to = x25519_pub_from_ed25519_pub(&recipient.public_key()).unwrap();
         let sealed = ecies_encrypt(&to, &state.to_cbor().unwrap())
             .unwrap()
             .to_bytes();

@@ -669,6 +669,19 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
     Ok(added)
 }
 
+/// Refuse bytes that cannot be a device's key: not a point on the curve,
+/// or a point of small order. Nothing can be sealed to such a key except
+/// under a secret that anyone can work out, so it is never made a device,
+/// never trusted, and never sealed to.
+fn not_a_device_key(key: &[u8; 32]) -> Result<(), CordeliaError> {
+    if cordelia_crypto::identity::is_usable_public_key(key) {
+        return Ok(());
+    }
+    Err(CordeliaError::Validation(
+        "that is not a device's key: check it against `cordelia id` on the other device".into(),
+    ))
+}
+
 /// Add another of this person's devices: trust it, and make it an owner of
 /// the personal channel (created if needed), whose new epoch goes to every
 /// member. It joins project channels on its own, as it finds those projects
@@ -685,6 +698,7 @@ pub fn add_device(
             "that is this device's own key".into(),
         ));
     }
+    not_a_device_key(device)?;
 
     let db = lock(state)?;
     ensure_own_inbox_locked(state, &db)?;
@@ -720,6 +734,7 @@ pub fn accept(
             "that is this device's own key".into(),
         ));
     }
+    not_a_device_key(key)?;
     let stays = {
         let db = lock(state)?;
         ensure_own_inbox_locked(state, &db)?;

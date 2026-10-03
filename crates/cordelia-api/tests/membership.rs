@@ -912,7 +912,7 @@ fn t20_no_state_can_put_a_channels_members_beyond_change() {
     // Over the limit: not a state at all. Sealed without the sender's check.
     for epoch in [MAX_EPOCH + 1, u64::MAX] {
         let cs = state_at(&a, &personal, epoch, &both, true);
-        let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&b.pk());
+        let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&b.pk()).unwrap();
         let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &cs.to_cbor().unwrap())
             .unwrap()
             .to_bytes();
@@ -1188,7 +1188,7 @@ fn t16_a_state_cannot_carry_the_key_a_removal_will_make() {
     let mut ahead = state_at(&c, &personal, epoch_of(&a, &personal) + 1, &all, true);
     ahead.keys.push((ahead.key_version + 1, chosen));
     // Sealed without the sender's check, as a hostile sender would.
-    let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&a.pk());
+    let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&a.pk()).unwrap();
     let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &ahead.to_cbor().unwrap())
         .unwrap()
         .to_bytes();
@@ -1243,6 +1243,67 @@ fn t16_a_key_waiting_for_the_next_version_is_not_used_by_a_removal() {
             assert!(ring.keys.iter().all(|e| e.psk_hex != hex::encode(waiting)));
         }
     }
+}
+
+/// T20. Bytes that are not a usable key (not a point on the curve, or a
+/// point of small order) are never a device. Sealing to such a key seals
+/// under a secret anyone can work out, so whatever it was sent could be
+/// read by anyone who fetched its inbox. It is not added, not accepted, not
+/// trusted and sent nothing, and a state that lists it is not a state.
+#[test]
+fn t20_a_key_that_nothing_can_be_sealed_to_is_never_a_device() {
+    let (a, b, personal) = paired();
+    let before = a.members(&personal);
+    let not_a_point = (0u8..=255)
+        .map(|n| {
+            let mut key = [0x42; 32];
+            key[0] = n;
+            key
+        })
+        .find(|key| !cordelia_crypto::identity::is_usable_public_key(key))
+        .unwrap();
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let held_for = |n: &Node, key: &[u8; 32]| {
+        let db = n.state.db.lock().unwrap();
+        items::query_sync(&db, &naming::inbox_channel_id(key), None, 100)
+            .unwrap()
+            .len()
+    };
+
+    for bad in [not_a_point, identity, [0u8; 32]] {
+        assert!(membership::add_device(&a.state, &bad, Some("x")).is_err());
+        assert!(membership::accept(&a.state, &bad, Some("x")).is_err());
+        assert_eq!(a.members(&personal), before, "{bad:02x?}");
+        assert_eq!(held_for(&a, &bad), 0, "nothing was sealed to it");
+        assert!(
+            !trust::is_trusted_as(&a.state.db.lock().unwrap(), &bad, trust::TrustKind::Device)
+                .unwrap()
+        );
+
+        // One of your devices, taken over, lists it in a state. Sealed
+        // without the sender's check, as a hostile sender would.
+        let listed = state_at(
+            &b,
+            &personal,
+            epoch_of(&a, &personal) + 1,
+            &[a.pk(), b.pk(), bad],
+            true,
+        );
+        let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&a.pk()).unwrap();
+        let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &listed.to_cbor().unwrap())
+            .unwrap()
+            .to_bytes();
+        insert_signed(&b.state.identity, &a, sealed);
+        let summary = membership::process_inbox(&a.state).unwrap();
+        assert_eq!(summary.invalid, 1, "{summary:?}");
+        assert_eq!(a.members(&personal), before, "{bad:02x?}");
+    }
+
+    // A real device is still added, and sent the channel.
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    assert_eq!(held_for(&a, &c.pk()), 1);
 }
 
 /// T20. One of your devices, taken over, sends a state whose key version
