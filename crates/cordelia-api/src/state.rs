@@ -83,11 +83,11 @@ pub struct AppState {
 /// what is kept for a key is what the check gave. Each node has its own.
 ///
 /// It saves the checks only while the keys the node looks at fit in it.
-/// Once they do not, a look at a state checks its keys again, a
+/// Once they do not, a look at a state checks its keys again, at most a
 /// multiplication for each: what is kept is dropped before the keys kept
 /// from the last look are come to. (A key that several states list can
 /// still be answered from what is kept.) Never more checks than with
-/// nothing kept, and each distinct key at least once a look.
+/// nothing kept.
 pub struct UsableKeys {
     known: Mutex<std::collections::HashMap<[u8; 32], bool>>,
     most: usize,

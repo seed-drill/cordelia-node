@@ -690,7 +690,7 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
 /// that none of it is sent now.
 ///
 /// No channel's key is changed, here or by `remove_device`, on account of
-/// such a key, and nothing shows it afterwards (its rows stay, marked
+/// such a key, and no command shows it afterwards (its rows stay, marked
 /// removed, as a removed device's do). In this version of the protocol a
 /// change of key is a change of membership that one device publishes, and
 /// one made from a list that is behind can undo a removal made on another
@@ -717,7 +717,7 @@ pub fn drop_unusable_keys(state: &AppState) -> Result<Vec<[u8; 32]>, CordeliaErr
 
     for key in &keys {
         // Said before anything is taken off, so that a start that is cut
-        // short has said it, and with the channels named: nothing shows
+        // short has said it, and with the channels named: no command shows
         // which they were afterwards. The key is written as the command
         // line writes one.
         let listed: Vec<String> = channels::list_for_entity(&db, key)?
@@ -880,8 +880,9 @@ fn staying_note(why: &str) -> String {
 /// A key that is not a usable public key is no device, and is refused. If
 /// this device listed it, it took it off when it started, and nothing is
 /// changed on its account (see [`drop_unusable_keys`]). In particular
-/// nothing "written" under it is published again: under a point of small
-/// order anyone could have signed it.
+/// what was "written" under it is not published again as this device's,
+/// as a removed device's entries are: under a point of small order
+/// anyone could have signed it.
 pub fn remove_device(
     state: &AppState,
     device: &[u8; 32],
@@ -1284,8 +1285,8 @@ fn process_one(
 /// devices. What a stranger sent waits unchecked. A state that is then
 /// held for naming a stranger is looked at again on every pass, and the
 /// answer for each of its keys is remembered ([`UsableKeys`]): the same
-/// answer, at the cost of a lookup, while the keys of what waits fit in
-/// what is remembered.
+/// answer, at the cost of a lookup, while the keys the node looks at fit
+/// in what is remembered.
 ///
 /// [`UsableKeys`]: crate::state::UsableKeys
 fn leave_out_unusable_keys(state: &AppState, cs: &mut ChannelState) {

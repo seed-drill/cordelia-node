@@ -1531,8 +1531,8 @@ fn t20_a_key_that_was_stored_before_is_taken_off_and_no_key_is_changed() {
 /// T20. Under a key of small order anyone can sign. While such a key was
 /// listed, what a stranger wrote under it counted as a device's. Once the
 /// key is off the list, what was written under it counts for nothing. And
-/// it is never published again as this device's, as what a removed device
-/// wrote is: removing such a key is refused.
+/// removing such a key is refused, so its entries are not published again
+/// as this device's, as a removed device's are.
 #[test]
 fn t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting() {
     use cordelia_api::entries::{self, Write};
