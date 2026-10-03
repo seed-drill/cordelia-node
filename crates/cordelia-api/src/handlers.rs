@@ -864,7 +864,7 @@ pub async fn group_remove(
     // Distribute new PSK to remaining members via ECIES envelopes
     let member_keys = channels::list_active_member_keys(&db, &body.channel_id)?;
     for member_pk in &member_keys {
-        // A member whose key nothing can be sealed to is sent nothing.
+        // A member whose key is not a usable public key is sent nothing.
         let Some(member_x25519) = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk)
         else {
             tracing::warn!("a member's key is not a usable public key; not sending it the new key");
@@ -995,7 +995,7 @@ pub async fn rotate_psk_handler(
     let member_keys = channels::list_active_member_keys(&db, &channel_id.0)?;
     let mut members_notified = 0;
     for member_pk in &member_keys {
-        // A member whose key nothing can be sealed to is sent nothing.
+        // A member whose key is not a usable public key is sent nothing.
         let Some(member_x25519) = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk)
         else {
             tracing::warn!("a member's key is not a usable public key; not sending it the new key");

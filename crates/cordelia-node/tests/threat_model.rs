@@ -883,9 +883,11 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
 }
 
 /// T20. A key that is no device's key, stored as one of this person's
-/// devices by a version that did not refuse them, goes when the node
-/// starts: it is no longer listed, the channel that listed it has a new
-/// key, and the node's log says what happened.
+/// devices by a version that did not refuse them, is taken off the list
+/// when the node starts, and the node changes no channel's key by itself.
+/// `cordelia devices` says what was found and what to do, and removing the
+/// key, which is the person's act, changes the key of the channel that
+/// listed it.
 #[test]
 fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     use cordelia_storage::{channels, db, trust};
@@ -896,7 +898,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     // A second device, so that there is a personal channel. It never runs.
     let b = node("b", "personal", None);
     let b_key = b.cli(&["id"]).trim().to_string();
-    a.cli(&["add-device", &b_key, "--name", "b"]);
+    a.cli(&["add-device", &b_key, "--name", "laptop"]);
     let personal = groups(&a).into_iter().next().expect("a personal channel");
     a.stop();
 
@@ -908,14 +910,19 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     let version_before = {
         let conn = db::open(&database).unwrap();
         channels::add_member(&conn, &personal, &nobody, "owner").unwrap();
-        trust::trust(
-            &conn,
-            &nobody,
-            trust::TrustKind::Device,
-            Some("stored before"),
-        )
-        .unwrap();
+        let kind = trust::TrustKind::Device;
+        trust::trust(&conn, &nobody, kind, Some("stored before")).unwrap();
         channels::get_by_id(&conn, &personal).unwrap().key_version
+    };
+    // What the node holds for the key and the channel, read while it is
+    // stopped: whether the key is a member, and the channel's key version.
+    let held = || -> (bool, i64) {
+        let conn = db::open(&database).unwrap();
+        assert!(!trust::is_trusted(&conn, &nobody).unwrap());
+        (
+            channels::is_member(&conn, &personal, &nobody).unwrap(),
+            channels::get_by_id(&conn, &personal).unwrap().key_version,
+        )
     };
 
     a.start();
@@ -929,20 +936,33 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
         .collect();
     assert!(keys.contains(&b_key.as_str()), "{devices}");
     assert!(!keys.contains(&listed_as.as_str()), "{devices}");
-    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert_eq!(devices["not_devices"][0]["key"], listed_as.as_str());
+    assert_eq!(devices["not_devices"][0]["channels"], 1, "{devices}");
+    // The person is told, where they look at their devices.
+    let said = a.cli(&["devices"]);
+    let command = format!("cordelia remove-device {listed_as}");
     assert!(
-        log.contains("each channel that listed one has a new key"),
-        "{log}"
+        said.contains("A key that is no device's key was listed among your devices")
+            && said.contains(&command),
+        "{said}"
     );
+    // Taken off, and no key changed.
     a.stop();
+    assert_eq!(held(), (false, version_before));
 
-    let conn = db::open(&database).unwrap();
-    assert!(!channels::is_member(&conn, &personal, &nobody).unwrap());
-    assert!(!trust::is_trusted(&conn, &nobody).unwrap());
-    assert_eq!(
-        channels::get_by_id(&conn, &personal).unwrap().key_version,
-        version_before + 1
+    // The person removes it: the channel has a new key, and there is
+    // nothing more to say.
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    let said = a.cli(&["remove-device", &listed_as]);
+    assert!(
+        said.contains("from 1 channel and rotated its key"),
+        "{said}"
     );
+    let said = a.cli(&["devices"]);
+    assert!(!said.contains("no device's key"), "{said}");
+    a.stop();
+    assert_eq!(held(), (false, version_before + 1));
 }
 
 /// T16. A device is removed. What it last wrote is still in the channel

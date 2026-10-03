@@ -634,7 +634,7 @@ async fn test_group_lifecycle() {
 }
 
 /// T20. The older endpoints seal a channel's key to a member too. A key
-/// that nothing can be sealed to is refused before anything is made for
+/// that is not a usable public key is refused before anything is made for
 /// it, and a member of that kind that is already stored is sent nothing.
 #[actix_web::test]
 async fn test_the_older_endpoints_seal_to_no_key_that_is_not_usable() {

@@ -98,7 +98,22 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(HttpResponse::Ok().json(ListDevicesResponse { devices }))
+    let not_devices = membership::keys_that_were_no_devices(&state)?
+        .into_iter()
+        .map(|n| {
+            Ok(NotADeviceEntry {
+                key: encode_key(&n.key)?,
+                found: chrono::DateTime::from_timestamp(n.found, 0)
+                    .unwrap_or_default()
+                    .to_rfc3339(),
+                channels: n.channels,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(HttpResponse::Ok().json(ListDevicesResponse {
+        devices,
+        not_devices,
+    }))
 }
 
 // ── POST /api/v1/invites/list ──────────────────────────────────────

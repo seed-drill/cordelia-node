@@ -223,7 +223,7 @@ fn add_device_then_accept_joins_the_personal_channel() {
     let a = node();
     let b = node();
 
-    let outcome = membership::add_device(&a.state, &b.pk(), Some("imac")).unwrap();
+    let outcome = membership::add_device(&a.state, &b.pk(), Some("desktop")).unwrap();
     let personal = outcome.personal_channel_id.clone();
     assert_eq!(outcome.channels, vec![personal.clone()]);
     assert_eq!(a.personal().as_deref(), Some(personal.as_str()));
@@ -236,7 +236,7 @@ fn add_device_then_accept_joins_the_personal_channel() {
     assert!(b.personal().is_none());
 
     // `accept` trusts A and applies the waiting invite.
-    let accepted = membership::accept(&b.state, &a.pk(), Some("macbook")).unwrap();
+    let accepted = membership::accept(&b.state, &a.pk(), Some("laptop")).unwrap();
     assert_eq!(accepted.applied, vec![personal.clone()]);
     assert!(membership::list_pending(&b.state).unwrap().is_empty());
 
@@ -1333,7 +1333,7 @@ fn unusable_keys() -> Vec<[u8; 32]> {
 /// trusted and sent nothing. Listed in a state from one of your devices,
 /// it is left out, and the rest of the state is taken.
 #[test]
-fn t20_a_key_that_nothing_can_be_sealed_to_is_never_a_device() {
+fn t20_a_key_that_is_not_usable_is_never_a_device() {
     let (a, b, personal) = paired();
     let before = a.members(&personal);
     let trusted = |n: &Node, key: &[u8; 32]| {
@@ -1421,13 +1421,15 @@ fn t20_a_key_that_was_stored_before_blocks_nothing() {
 }
 
 /// T20. A key of that kind that was stored before does not stay. When the
-/// node starts it goes as a removed device goes: every row for it, the
-/// trust in it, and what this device had stored to send it; and each
-/// channel of this device's that listed one gets one new key, which the
-/// devices that remain take. What was sealed to it before could be read by
-/// others, so the old key is not one to go on writing under.
+/// node starts, every row for it goes, with the trust in it and what this
+/// device had stored to send it. No channel's key is changed by that: the
+/// key is noted for each of this device's channels that listed it, and the
+/// person changes those channels' keys by removing it, on one device. What
+/// was sealed to it before could be read by others, so the keys do need
+/// changing; a device that changed them by itself as it started, before it
+/// had read what the others sent, could undo a removal made elsewhere.
 #[test]
-fn t20_a_key_that_was_stored_before_goes_as_a_removed_device_goes() {
+fn t20_a_key_that_was_stored_before_is_taken_off_and_the_person_changes_the_keys() {
     let (a, b, personal) = paired();
     let project = membership::create_project_group(&a.state, "project:x").unwrap();
     // A channel this device is not in and holds nothing of.
@@ -1468,10 +1470,26 @@ fn t20_a_key_that_was_stored_before_goes_as_a_removed_device_goes() {
         channels::is_member(&n.state.db.lock().unwrap(), channel, key).unwrap()
     };
     assert!(listed(&a, &left, &in_left));
-    let (key_before, version_before) = (a.key(&personal), a.key_version(&personal));
-    let project_version = a.key_version(&project);
     let unrelated = membership::create_project_group(&a.state, "project:y").unwrap();
-    let unrelated_key = a.key(&unrelated);
+    let keys_of = |n: &Node| -> Vec<([u8; 32], i64)> {
+        [&personal, &project, &unrelated]
+            .iter()
+            .map(|channel| (n.key(channel), n.key_version(channel)))
+            .collect()
+    };
+    let before = keys_of(&a);
+    let sent_before = held_for(&a, &b.pk());
+    // The keys noted, each with how many channels: sorted by key.
+    let noted = |n: &Node| -> Vec<([u8; 32], usize)> {
+        let mut found: Vec<([u8; 32], usize)> = membership::keys_that_were_no_devices(&n.state)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.key, n.channels))
+            .collect();
+        found.sort();
+        found
+    };
+    assert!(noted(&a).is_empty());
 
     let mut went = membership::drop_unusable_keys(&a.state).unwrap();
     went.sort();
@@ -1488,81 +1506,128 @@ fn t20_a_key_that_was_stored_before_goes_as_a_removed_device_goes() {
         assert_eq!(held_for(&a, key), 0);
     }
     assert!(trust::is_trusted(&a.state.db.lock().unwrap(), &b.pk()).unwrap());
-    // One new key for each channel that listed one, however many it
-    // listed; none for a channel that listed none.
-    assert_eq!(a.key_version(&personal), version_before + 1);
-    assert_ne!(a.key(&personal), key_before);
-    assert_eq!(a.key_version(&project), project_version + 1);
-    assert_eq!(a.key(&unrelated), unrelated_key);
-    // The device that remains takes it.
+    // No key is changed, and nothing is sent to the other device.
+    assert_eq!(keys_of(&a), before);
+    assert_eq!(held_for(&a, &b.pk()), sent_before);
+    // Noted: each key for the channels of this device's that listed it.
+    // One that was only trusted, or only in a channel this device does not
+    // own, was listed for none.
+    let mut expected = vec![(in_personal, 1), (in_both, 2)];
+    expected.sort();
+    assert_eq!(noted(&a), expected);
+
+    // Done again, it finds nothing, and what is noted stays.
+    assert!(membership::drop_unusable_keys(&a.state).unwrap().is_empty());
+    assert_eq!(noted(&a), expected);
+    assert_eq!(keys_of(&a), before);
+
+    // The person removes one of the keys, on this device. Each channel
+    // that listed it gets a new key, once; a channel that listed none
+    // keeps its key; and the device that remains takes the new one.
+    let outcome = membership::remove_device(&a.state, &in_both).unwrap();
+    let mut rotated = outcome.channels_rotated;
+    rotated.sort();
+    let mut both = vec![personal.clone(), project.clone()];
+    both.sort();
+    assert_eq!(rotated, both);
+    let after = keys_of(&a);
+    for (channel, (was, now)) in before.iter().zip(&after).enumerate() {
+        if channel == 2 {
+            assert_eq!(was, now, "the channel that listed none");
+        } else {
+            assert_ne!(was.0, now.0);
+            assert_eq!(now.1, was.1 + 1);
+        }
+    }
     deliver(&a, &b);
     assert_eq!(b.key(&personal), a.key(&personal));
     assert_eq!(a.members(&personal), b.members(&personal));
     assert_eq!(a.members(&personal).len(), 2);
-
-    // Done again, it finds nothing and changes no key.
-    assert!(membership::drop_unusable_keys(&a.state).unwrap().is_empty());
-    assert_eq!(a.key_version(&personal), version_before + 1);
+    // The other key was listed for the personal channel alone, and that
+    // has a new key now: there is nothing left to do for it.
+    assert!(noted(&a).is_empty());
+    let outcome = membership::remove_device(&a.state, &in_personal).unwrap();
+    assert!(outcome.channels_rotated.is_empty());
+    assert_eq!(keys_of(&a), after);
 }
 
 /// T20. Under a key of small order anyone can sign. While such a key was
-/// listed, what a stranger wrote under it counted as a device's. When the
-/// key goes, what was written under it goes with it: it is not published
-/// again as this device's, as what a removed device wrote is.
+/// listed, what a stranger wrote under it counted as a device's. Once the
+/// key is off the list, what was written under it counts for nothing, and
+/// it is not published again as this device's when the key is removed, as
+/// what a removed device wrote is.
 #[test]
-fn t20_what_was_written_under_a_key_anyone_can_sign_with_is_not_kept() {
+fn t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting() {
     use cordelia_api::entries::{self, Write};
     use cordelia_crypto::slots::{item_aad, slot_id};
 
-    let (a, _b, personal) = paired();
     let nobody = nobodys_key();
-    let text_of = |n: &Node| -> (Vec<u8>, serde_json::Value) {
+    // A device with its own text at revision 1, and the next revision
+    // written under the key by anyone who has the channel's key (which was
+    // sealed to this one): it counts, while the key is an owner.
+    let forged_over = || -> (Node, String) {
+        let (a, _b, personal) = paired();
+        {
+            let db = a.state.db.lock().unwrap();
+            let mine = Write {
+                key: "notes.md",
+                content: &serde_json::json!("mine"),
+                metadata: None,
+                item_type: "memory",
+                deleted: false,
+            };
+            entries::publish(&a.state, &db, &personal, &mine).unwrap();
+            channels::add_member(&db, &personal, &nobody, "owner").unwrap();
+        }
+        let slot_key = psk::read_slot_key(&a.state.home_dir, &personal).unwrap();
+        let slot = slot_id(&slot_key, "notes.md");
+        let envelope =
+            serde_json::json!({ "key": "notes.md", "content": "forged", "metadata": null });
+        let blob = cordelia_crypto::item_encrypt(
+            &a.key(&personal),
+            &serde_json::to_vec(&envelope).unwrap(),
+            &item_aad(&personal, Some(&slot), Some(2)),
+        )
+        .unwrap();
+        let forged = insert_from_nobody(
+            &a,
+            &personal,
+            "memory",
+            blob,
+            a.key_version(&personal),
+            Some((slot, 2)),
+        );
+        assert!(cordelia_api::verify::verify_item_signature(&forged));
+        (a, personal)
+    };
+    let text_of = |n: &Node, personal: &str| -> (Vec<u8>, serde_json::Value) {
         let db = n.state.db.lock().unwrap();
-        let all = entries::current(&n.state, &db, &personal).unwrap();
+        let all = entries::current(&n.state, &db, personal).unwrap();
         let entry = all.into_iter().find(|e| e.key == "notes.md").unwrap();
         (entry.current.author.to_vec(), entry.current.content)
     };
 
-    // This device's own text, at revision 1.
-    {
-        let db = a.state.db.lock().unwrap();
-        let mine = Write {
-            key: "notes.md",
-            content: &serde_json::json!("mine"),
-            metadata: None,
-            item_type: "memory",
-            deleted: false,
-        };
-        entries::publish(&a.state, &db, &personal, &mine).unwrap();
-    }
-    assert_eq!(text_of(&a), (a.pk().to_vec(), serde_json::json!("mine")));
-
-    // As an older version could leave it: the key is an owner. Anyone who
-    // has the channel's key (and it was sealed to this one) can then write
-    // the next revision, and it counts.
-    channels::add_member(&a.state.db.lock().unwrap(), &personal, &nobody, "owner").unwrap();
-    let slot_key = psk::read_slot_key(&a.state.home_dir, &personal).unwrap();
-    let slot = slot_id(&slot_key, "notes.md");
-    let envelope = serde_json::json!({ "key": "notes.md", "content": "forged", "metadata": null });
-    let blob = cordelia_crypto::item_encrypt(
-        &a.key(&personal),
-        &serde_json::to_vec(&envelope).unwrap(),
-        &item_aad(&personal, Some(&slot), Some(2)),
-    )
-    .unwrap();
-    let forged = insert_from_nobody(
-        &a,
-        &personal,
-        "memory",
-        blob,
-        a.key_version(&personal),
-        Some((slot, 2)),
+    // The key is taken off when the node starts, and then removed.
+    let (a, personal) = forged_over();
+    assert_eq!(
+        text_of(&a, &personal),
+        (nobody.to_vec(), serde_json::json!("forged"))
     );
-    assert!(cordelia_api::verify::verify_item_signature(&forged));
-    assert_eq!(text_of(&a), (nobody.to_vec(), serde_json::json!("forged")));
-
     assert_eq!(membership::drop_unusable_keys(&a.state).unwrap(), [nobody]);
-    assert_eq!(text_of(&a), (a.pk().to_vec(), serde_json::json!("mine")));
+    let mine = (a.pk().to_vec(), serde_json::json!("mine"));
+    assert_eq!(text_of(&a, &personal), mine);
+    let outcome = membership::remove_device(&a.state, &nobody).unwrap();
+    assert_eq!(outcome.channels_rotated, std::slice::from_ref(&personal));
+    assert_eq!(text_of(&a, &personal), mine);
+
+    // The same where it is removed while it is still on the list.
+    let (a, personal) = forged_over();
+    let outcome = membership::remove_device(&a.state, &nobody).unwrap();
+    assert_eq!(outcome.channels_rotated, std::slice::from_ref(&personal));
+    assert_eq!(
+        text_of(&a, &personal),
+        (a.pk().to_vec(), serde_json::json!("mine"))
+    );
 }
 
 /// T20. Nothing is taken from a sender whose key is not usable, whatever
@@ -1650,6 +1715,22 @@ fn t20_a_key_that_is_not_usable_is_left_out_of_every_state_that_is_applied() {
         "{summary:?}"
     );
     assert_eq!(keys_of(&a, &project), both);
+    // The keys that were left out are noted for that channel.
+    let noted = || -> Vec<([u8; 32], usize)> {
+        let mut noted: Vec<([u8; 32], usize)> = membership::keys_that_were_no_devices(&a.state)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.key, n.channels))
+            .collect();
+        noted.sort();
+        noted
+    };
+    let for_each = |channels: usize| -> Vec<([u8; 32], usize)> {
+        let mut expected: Vec<([u8; 32], usize)> = bad.iter().map(|key| (*key, channels)).collect();
+        expected.sort();
+        expected
+    };
+    assert_eq!(noted(), for_each(1));
 
     // The same channel, now that this device is in it.
     let epoch = epoch_of(&a, &project) + 1;
@@ -1679,32 +1760,37 @@ fn t20_a_key_that_is_not_usable_is_left_out_of_every_state_that_is_applied() {
         assert!(!trust::is_trusted(&a.state.db.lock().unwrap(), key).unwrap());
         assert_eq!(held_for(&a, key), 0, "nothing was sealed to it");
     }
+    // The device that sent those states listed the keys, and may have
+    // sealed to them: each is noted for both channels, once, for the
+    // person to see and act on.
+    assert_eq!(noted(), for_each(2));
 }
 
-/// T20. Checking a key costs a multiplication on the curve, and a state
-/// lists up to 1,024. A stranger who knows a device's key can leave states
-/// waiting in its inbox, which is looked at every few seconds. A state
-/// that only waits is not checked key by key: the keys are checked when a
-/// state is about to be applied, which a stranger's never is.
-#[test]
-fn t20_what_a_stranger_sends_is_not_checked_key_by_key() {
-    let a = node();
-    let stranger = NodeIdentity::generate().unwrap();
-    let mut members = vec![stranger.public_key(), a.pk()];
+/// A state for `channel_id` at `epoch` and `key_version`, from `sender`,
+/// that lists `sender`, `to` and keys of nobody's up to the most a state
+/// holds.
+fn state_listing_the_most(
+    channel_id: &str,
+    sender: &[u8; 32],
+    to: &[u8; 32],
+    (epoch, key_version, key): (u64, u32, [u8; 32]),
+    personal: bool,
+) -> ChannelState {
+    let mut members = vec![*sender, *to];
     for n in 0..1022u32 {
         let mut key = [0x42; 32];
         key[..4].copy_from_slice(&n.to_le_bytes());
         members.push(key);
     }
-    let cs = ChannelState {
-        channel_id: naming::group_channel_id(),
+    ChannelState {
+        channel_id: channel_id.to_string(),
         name: None,
         mode: "realtime".into(),
-        creator: stranger.public_key(),
-        sender: stranger.public_key(),
-        epoch: 1,
-        key_version: 1,
-        keys: vec![(1, [0x01; 32])],
+        creator: *sender,
+        sender: *sender,
+        epoch,
+        key_version,
+        keys: vec![(key_version, key)],
         slot_key: [0x02; 32],
         members: members
             .iter()
@@ -1713,20 +1799,122 @@ fn t20_what_a_stranger_sends_is_not_checked_key_by_key() {
                 role: MemberRole::Owner,
             })
             .collect(),
-        personal: true,
-    };
+        personal,
+    }
+}
+
+/// T20. Checking a key costs a multiplication on the curve, and a state
+/// lists up to 1,024. A stranger who knows a device's key can leave states
+/// waiting in its inbox, which is looked at every few seconds. A state
+/// that only waits is not checked key by key: on each pass one key is
+/// checked for it, its sender's. The keys are checked when the state is
+/// about to be applied, which a stranger's never is.
+#[test]
+fn t20_what_a_stranger_sends_is_not_checked_key_by_key() {
+    use cordelia_crypto::identity::{is_usable_public_key, key_checks};
+
+    let a = node();
+    let stranger = NodeIdentity::generate().unwrap();
+    let offered = naming::group_channel_id();
+    let cs = state_listing_the_most(
+        &offered,
+        &stranger.public_key(),
+        &a.pk(),
+        (1, 1, [0x01; 32]),
+        true,
+    );
     deliver_crafted(&stranger, &a, &cs);
 
-    let before = cordelia_crypto::identity::key_checks();
+    let before = key_checks();
     for _ in 0..3 {
         let summary = membership::process_inbox(&a.state).unwrap();
         assert_eq!((summary.pending, summary.invalid), (1, 0), "{summary:?}");
     }
-    let checked = cordelia_crypto::identity::key_checks() - before;
-    assert!(
-        checked <= 3,
-        "{checked} keys checked for a state that only waits"
+    assert_eq!(
+        key_checks() - before,
+        3,
+        "one key for each pass: the sender's"
     );
+
+    // The control: the person accepts that sender, and the same state is
+    // applied, as this device's personal channel. Now every key is
+    // checked, and those that are no device's are left out and noted (as
+    // many as are kept).
+    let before = key_checks();
+    let summary = membership::accept(&a.state, &stranger.public_key(), Some("x")).unwrap();
+    assert_eq!(summary.applied, vec![offered.clone()], "{summary:?}");
+    assert!(key_checks() - before >= 1024);
+    assert_eq!(a.personal().as_deref(), Some(offered.as_str()));
+    let members = a.members(&offered);
+    assert!(
+        members.len() < 1024 && members.len() >= 2,
+        "{}",
+        members.len()
+    );
+    assert!(members.iter().all(|(key, _)| is_usable_public_key(key)));
+    let noted = membership::keys_that_were_no_devices(&a.state).unwrap();
+    assert_eq!(noted.len(), 64);
+}
+
+/// T20. A device that has been removed from the personal channel can
+/// still be an owner of a project the remover is not in. Its states for
+/// that project are held, and looked at again on every pass. They are held
+/// for their sender, before their keys are looked at.
+#[test]
+fn t20_a_state_from_a_device_that_is_no_longer_yours_is_held_unchecked() {
+    use cordelia_crypto::identity::key_checks;
+
+    let (a, _b, _personal) = paired();
+    let project = membership::create_project_group(&a.state, "project:x").unwrap();
+    let gone = NodeIdentity::generate().unwrap();
+    channels::add_member(
+        &a.state.db.lock().unwrap(),
+        &project,
+        &gone.public_key(),
+        "owner",
+    )
+    .unwrap();
+    let version = a.key_version(&project) as u32;
+    let cs = state_listing_the_most(
+        &project,
+        &gone.public_key(),
+        &a.pk(),
+        (epoch_of(&a, &project) + 1, version, a.key(&project)),
+        false,
+    );
+    deliver_crafted(&gone, &a, &cs);
+
+    let before = key_checks();
+    for _ in 0..3 {
+        let summary = membership::process_inbox(&a.state).unwrap();
+        assert_eq!((summary.held, summary.invalid), (1, 0), "{summary:?}");
+    }
+    assert_eq!(key_checks() - before, 3);
+
+    // The same for a channel this device does not have yet, from a sender
+    // it trusts by name and that is not in its personal channel: a second
+    // state is held, at the same cost.
+    trust::trust(
+        &a.state.db.lock().unwrap(),
+        &gone.public_key(),
+        trust::TrustKind::Device,
+        None,
+    )
+    .unwrap();
+    let new_to_a = state_listing_the_most(
+        &naming::group_channel_id(),
+        &gone.public_key(),
+        &a.pk(),
+        (1, 1, [0x01; 32]),
+        false,
+    );
+    deliver_crafted(&gone, &a, &new_to_a);
+    let before = key_checks();
+    for _ in 0..3 {
+        let summary = membership::process_inbox(&a.state).unwrap();
+        assert_eq!((summary.held, summary.invalid), (2, 0), "{summary:?}");
+    }
+    assert_eq!(key_checks() - before, 6);
 }
 
 /// T20. One of your devices, taken over, sends a state whose key version

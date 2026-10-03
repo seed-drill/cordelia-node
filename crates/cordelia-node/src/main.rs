@@ -1748,7 +1748,44 @@ fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
         };
         println!("{key}  {name}{marker}");
     }
+    for line in not_devices_note(&resp["not_devices"]) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// What `cordelia devices` says of keys that were listed among the devices
+/// and are no device's keys: what was done, what it means, and the command
+/// that changes the keys of the channels they were listed for.
+fn not_devices_note(not_devices: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for n in not_devices.as_array().into_iter().flatten() {
+        let key = n["key"].as_str().unwrap_or_default();
+        let found = n["found"].as_str().unwrap_or_default();
+        let found = found.split('T').next().unwrap_or(found);
+        let channels = n["channels"].as_u64().unwrap_or(0);
+        lines.push(String::new());
+        lines.push(format!(
+            "A key that is no device's key was listed among your devices (found {found}):"
+        ));
+        lines.push(format!("  {key}"));
+        lines.push(
+            "It is off the list, and nothing is sealed to it or taken from it now. What your \
+             devices wrote before may have been read by others."
+                .to_string(),
+        );
+        lines.push("Check the devices above, and remove any you do not recognise.".to_string());
+        lines.push(format!(
+            "Then change the key of the {} it was listed for, from one device:",
+            if channels == 1 {
+                "channel".to_string()
+            } else {
+                format!("{channels} channels")
+            }
+        ));
+        lines.push(format!("  cordelia remove-device {key}"));
+    }
+    lines
 }
 
 /// How long a change may go unconfirmed before `cordelia devices` says so.
@@ -2747,6 +2784,38 @@ mod tests {
         ] {
             assert_eq!(shell_word(name), want);
         }
+    }
+
+    /// `cordelia devices` says of a key that was listed and is no
+    /// device's: what was found and when, what it means, and the command
+    /// that changes the keys of the channels it was listed for. It says
+    /// nothing when there is none.
+    #[test]
+    fn test_devices_names_a_key_that_was_no_devices() {
+        assert!(not_devices_note(&serde_json::Value::Null).is_empty());
+        assert!(not_devices_note(&serde_json::json!([])).is_empty());
+        let one = serde_json::json!([
+            { "key": "cordelia_pk1abc", "found": "2026-10-03T14:00:00+00:00", "channels": 1 }
+        ]);
+        let said = not_devices_note(&one).join("\n");
+        for part in [
+            "was listed among your devices (found 2026-10-03):",
+            "  cordelia_pk1abc",
+            "may have been read by others",
+            "remove any you do not recognise",
+            "change the key of the channel it was listed for, from one device:",
+            "  cordelia remove-device cordelia_pk1abc",
+        ] {
+            assert!(said.contains(part), "missing {part:?} in:\n{said}");
+        }
+        let three = serde_json::json!([
+            { "key": "cordelia_pk1abc", "found": "2026-10-03T14:00:00+00:00", "channels": 3 }
+        ]);
+        let said = not_devices_note(&three).join("\n");
+        assert!(
+            said.contains("of the 3 channels it was listed for"),
+            "{said}"
+        );
     }
 
     #[test]

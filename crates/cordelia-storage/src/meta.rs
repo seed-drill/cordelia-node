@@ -13,6 +13,11 @@ pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
 /// is taken. Nothing a device is sent can set it.
 pub const ACCEPTED_PERSONAL_FROM: &str = "membership.accepted_personal_from";
 
+/// JSON array of the keys that were listed for this device's channels and
+/// are no device's keys (see `cordelia_api::membership`): what the person
+/// is told about, until each channel's key has been changed.
+pub const KEYS_THAT_WERE_NO_DEVICES: &str = "membership.keys_that_were_no_devices";
+
 /// Claude Code directory to sync; sync is off when absent.
 pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 

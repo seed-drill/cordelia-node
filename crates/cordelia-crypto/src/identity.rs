@@ -180,7 +180,9 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 /// Used when we have only the peer's Ed25519 public key (no seed access).
 ///
 /// `None` when there is no key to derive: the bytes are not a point on the
-/// curve, or the point is not in the subgroup every real key is in.
+/// curve, or the point is not of the order every real key has. Every real
+/// key is of one prime order. The identity, the other points of small
+/// order, and a real key with one of those added, are not.
 ///
 /// - **Not a point.** There is nothing to convert, and no signature under
 ///   such bytes is accepted either.
@@ -218,8 +220,8 @@ pub fn key_checks() -> u64 {
     KEY_CHECKS.with(std::cell::Cell::get)
 }
 
-/// Whether `ed_pk` can be a device's public key: something can be sealed
-/// to it (see [`x25519_pub_from_ed25519_pub`]).
+/// Whether `ed_pk` can be a device's public key: a point on the curve of
+/// the order every real key has (see [`x25519_pub_from_ed25519_pub`]).
 pub fn is_usable_public_key(ed_pk: &[u8; 32]) -> bool {
     x25519_pub_from_ed25519_pub(ed_pk).is_some()
 }
