@@ -9,7 +9,9 @@
 //! - Both changed differently: the channel's version (which other devices
 //!   already have) goes in the file, and this device's version is kept
 //!   beside it as a conflict file, which syncs like any other file. An edit
-//!   beats a delete, whichever side made it. `MEMORY.md` is merged instead.
+//!   beats a delete, whichever side made it. `MEMORY.md` is merged instead;
+//!   where the merge is the channel's version as it stands, the file takes
+//!   that and nothing is published.
 //! - The channel's version does not follow from what this folder agreed:
 //!   treated as both having changed, so this device's version is kept as
 //!   above. That is so when
@@ -110,6 +112,19 @@ pub fn plan(
         _ => true,
     };
     let is_index = key == memory_md::INDEX_FILE;
+    // The index: the channel's version `c` at `rev`, with this device's
+    // lines. Where the channel's version already has them all, the merge
+    // is that version, and the file takes it as any file would: there is
+    // nothing to publish. (Published all the same, a merge that could not
+    // then be written to the file would be published again every cycle.)
+    let merged = |c: &Content, l: &Content, rev: u64| {
+        let text = memory_md::merge(&c.text, &l.text, deleted_files);
+        if text == c.text {
+            Action::Pull { text, rev }
+        } else {
+            Action::Merge(text)
+        }
+    };
 
     match (local_changed, remote_changed) {
         // Nothing to move. If the channel's revision moved all the same,
@@ -156,13 +171,7 @@ pub fn plan(
                 }],
                 // Content that does not follow from this device's version:
                 // keep ours before taking the channel's.
-                (Some(c), Some(l)) if is_index => {
-                    vec![Action::Merge(memory_md::merge(
-                        &c.text,
-                        &l.text,
-                        deleted_files,
-                    ))]
-                }
+                (Some(c), Some(l)) if is_index => vec![merged(c, l, r.rev)],
                 (Some(c), Some(l)) => vec![
                     Action::SaveConflict(l.text.clone()),
                     Action::Pull {
@@ -190,13 +199,7 @@ pub fn plan(
                 }],
                 // Edited here, deleted there: the edit wins (revives the key).
                 (Some(l), None) => vec![Action::Publish(l.text.clone())],
-                (Some(l), Some(c)) if is_index => {
-                    vec![Action::Merge(memory_md::merge(
-                        &c.text,
-                        &l.text,
-                        deleted_files,
-                    ))]
-                }
+                (Some(l), Some(c)) if is_index => vec![merged(c, l, r.rev)],
                 (Some(l), Some(c)) => vec![
                     Action::SaveConflict(l.text.clone()),
                     Action::Pull {
@@ -440,6 +443,56 @@ mod tests {
             vec![Action::Merge(
                 "- [C](c.md) theirs\n- [B](b.md) mine\n".into()
             )]
+        );
+    }
+
+    /// The merged index is the channel's version as it stands where that
+    /// version has every line this device has. The file then takes it, and
+    /// nothing is published: where both changed, and at a lost race.
+    #[test]
+    fn an_index_the_channel_already_has_whole_is_pulled() {
+        let theirs = "- [A](a.md) x\n- [B](b.md) mine\n- [C](c.md) theirs\n";
+        let taken = vec![Action::Pull {
+            text: theirs.into(),
+            rev: 2,
+        }];
+        let a = agreed(1, "- [A](a.md) x\n");
+        let mine = c("- [A](a.md) x\n- [B](b.md) mine\n");
+        let index = memory_md::INDEX_FILE;
+        assert_eq!(
+            plan(
+                index,
+                Some(&mine),
+                Some(&live(2, theirs)),
+                Some(&a),
+                &none()
+            ),
+            taken
+        );
+        let raced = agreed(2, "- [B](b.md) mine\n");
+        assert_eq!(
+            plan(
+                index,
+                Some(&c("- [B](b.md) mine\n")),
+                Some(&live(2, theirs)),
+                Some(&raced),
+                &none()
+            ),
+            taken
+        );
+        // A line of the channel's that points at a deleted file is dropped
+        // by the merge. The merge is then not the channel's version, and
+        // is published.
+        let deleted: HashSet<String> = ["c.md".to_string()].into();
+        assert_eq!(
+            plan(
+                index,
+                Some(&mine),
+                Some(&live(2, theirs)),
+                Some(&a),
+                &deleted
+            ),
+            vec![Action::Merge("- [A](a.md) x\n- [B](b.md) mine\n".into())]
         );
     }
 

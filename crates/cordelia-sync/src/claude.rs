@@ -95,6 +95,8 @@ pub struct FolderReport {
     /// and deletes the file.
     pub conflict_files: Vec<String>,
     /// Files present but not synced: an unsafe name, not text, or a link.
+    /// And names that something other than a file has here (a folder),
+    /// where the channel has a file of that name.
     pub skipped: Vec<String>,
     /// Files present but not synced because they do not fit in an entry
     /// (64 KB as it travels). They are left as they are on this device, and
@@ -107,15 +109,22 @@ pub struct FolderReport {
     pub last_published_at: Option<String>,
     /// Why this folder did not sync this cycle.
     pub error: Option<String>,
-    /// Files that could not be synced this cycle, each with why. The other
-    /// files of the folder were synced, and these are tried again in the
-    /// next cycle.
+    /// Files that could not be synced this cycle, each with why: the first
+    /// [`FAILED_FILES_KEPT`] of them. The other files of the folder were
+    /// synced, and these are tried again in the next cycle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<FailedFile>,
+    /// How many more files failed than `failed` lists.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed_more: usize,
     /// The settings changed while this folder was being synced, and the
     /// cycle stopped there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A file that could not be synced in a cycle.
@@ -127,20 +136,39 @@ pub struct FailedFile {
 }
 
 /// The most files that failed in one folder that a cycle's errors name one
-/// by one. The rest are counted. (The folder's own report has them all.)
+/// by one. The rest are counted.
 const FAILED_FILES_NAMED: usize = 5;
+
+/// The most files that failed that a folder's report lists. The rest are
+/// counted: the report is stored after every cycle, and a folder that
+/// cannot be written fails for every file there is to write.
+const FAILED_FILES_KEPT: usize = 100;
+
+impl FolderReport {
+    /// Note that the file `name` could not be synced, and why.
+    fn fail(&mut self, name: &str, error: String) {
+        if self.failed.len() < FAILED_FILES_KEPT {
+            self.failed.push(FailedFile {
+                name: name.to_string(),
+                error,
+            });
+        } else {
+            self.failed_more += 1;
+        }
+    }
+}
 
 /// The errors a cycle reports for the files of one folder that failed: one
 /// for each, with its path, up to [`FAILED_FILES_NAMED`], and one more that
-/// counts the rest.
-fn failed_as_errors(memory: &Path, failed: &[FailedFile]) -> Vec<String> {
+/// counts the rest, those in `failed` and `more` besides.
+fn failed_as_errors(memory: &Path, failed: &[FailedFile], more: usize) -> Vec<String> {
     let mut errors: Vec<String> = failed
         .iter()
         .take(FAILED_FILES_NAMED)
         .map(|f| format!("{}: {}", memory.join(&f.name).display(), f.error))
         .collect();
-    if failed.len() > FAILED_FILES_NAMED {
-        let more = failed.len() - FAILED_FILES_NAMED;
+    let more = failed.len().saturating_sub(FAILED_FILES_NAMED) + more;
+    if more > 0 {
         errors.push(format!(
             "{}: {more} more {} could not be synced",
             memory.display(),
@@ -623,7 +651,9 @@ impl ClaudeAdapter {
                 }
             });
             // A file that failed is an error of the cycle, by name.
-            report.errors.extend(failed_as_errors(&memory, &r.failed));
+            report
+                .errors
+                .extend(failed_as_errors(&memory, &r.failed, r.failed_more));
             // A repository created above a mapped folder moves its memory.
             if target.mapped
                 && r.error.is_none()
@@ -920,7 +950,10 @@ struct Local {
 /// non-UTF-8 and oversized files are left out and listed; hidden files are
 /// ignored; what is neither a file nor a link is left out and remembered.
 /// A folder that does not exist has no files; one that cannot be read is
-/// an error, never an empty folder.
+/// an error, never an empty folder. Nor is a name whose kind cannot be
+/// told (the folder can be listed and not looked into) a file that has
+/// gone: that is an error too, or every file in it would be taken for
+/// deleted.
 fn read_local(dir: &Path) -> std::io::Result<Local> {
     let mut local = Local::default();
     let entries = match std::fs::read_dir(dir) {
@@ -940,13 +973,16 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
         if name.starts_with('.') {
             continue; // our temporary files, editor swap files, etc.
         }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            // Gone since the folder was listed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         if !meta.file_type().is_file() {
             if meta.file_type().is_symlink() {
                 skipped.push(name);
-            } else if names::is_safe_file_name(&name) {
+            } else {
                 not_files.push(name);
             }
             continue;
@@ -971,14 +1007,24 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
 
 /// Write `text` to `dir/name` atomically: temporary file, then rename. The
 /// rename replaces a symlink at `name` rather than writing through it.
-fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+///
+/// The folder is made only where `create` says it may be: where it has
+/// agreed nothing yet, so that a first file can arrive. A folder that has
+/// agreed files was there when the cycle began. If it is not there now it
+/// has gone since, and making it again would leave a folder with one file
+/// in it, which the next cycle would read as every other file deleted.
+fn write_atomic(dir: &Path, name: &str, text: &str, create: bool) -> std::io::Result<()> {
+    if create {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = dir.join(temporary_name(name));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, dir.join(name)).inspect_err(|_| {
-        // Not left behind where the file could not take its place.
-        let _ = std::fs::remove_file(&tmp);
-    })
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, dir.join(name)))
+        .inspect_err(|_| {
+            // Not left behind where it could not be written whole, or the
+            // file could not take its place.
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 /// The name of the temporary file that `name` is written through: hidden,
@@ -990,13 +1036,27 @@ fn temporary_name(name: &str) -> String {
     format!(".cordelia-tmp-{}", hex::encode(&hash[..8]))
 }
 
-/// A free conflict-file name for `key`, or `None` if a conflict file with
-/// exactly this content already exists.
+/// A free conflict-file name for `key`, or `None` if this text is already
+/// kept: a conflict file holds exactly it, and is one this folder made and
+/// has not yet agreed with the channel (`agreed` says which names the
+/// folder had agreed when the cycle began).
+///
+/// A conflict file that the folder has agreed is not taken for the copy,
+/// whatever it holds. It has been to the other devices, and a delete or an
+/// edit of it may be on its way back from one that did not know it would
+/// be relied on again: the text would then be in no file. So the text is
+/// kept again, under the next name.
 ///
 /// A name is free only if nothing is there. A file that cannot be read as
 /// text, a folder or a link under the name is not ours to replace: the
 /// next name is tried.
-fn conflict_target(dir: &Path, key: &str, tag: &str, text: &str) -> Option<String> {
+fn conflict_target(
+    dir: &Path,
+    key: &str,
+    tag: &str,
+    text: &str,
+    agreed: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let base = names::conflict_name(key, tag);
     for n in 1.. {
         let candidate = if n == 1 {
@@ -1007,12 +1067,14 @@ fn conflict_target(dir: &Path, key: &str, tag: &str, text: &str) -> Option<Strin
         let path = dir.join(&candidate);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() => match std::fs::read(&path) {
-                Ok(existing) if existing == text.as_bytes() => return None,
+                Ok(existing) if existing == text.as_bytes() && !agreed(&candidate) => {
+                    return None;
+                }
                 _ => continue,
             },
             Ok(_) => continue,
             // Nothing there. (Where the folder cannot be looked into at
-            // all, the write that follows fails and says so.)
+            // all, or has gone, the write that follows fails and says so.)
             Err(_) => return Some(candidate),
         }
     }
@@ -1110,10 +1172,11 @@ fn sync_folder_between(
     };
 
     // What is not a file is listed only where the channel has a memory
-    // file of that name: a folder beside the memory files is nobody's
-    // business.
+    // file of that name, which cannot be written here: a folder beside
+    // the memory files is nobody's business, and neither is one under a
+    // name that is deleted in the channel.
     for name in not_files {
-        if remote.contains_key(&name) {
+        if remote.get(&name).is_some_and(|r| r.content.is_some()) {
             report.skipped.push(name);
         }
     }
@@ -1161,6 +1224,7 @@ fn sync_folder_between(
             folder: &folder,
             generation,
             planned: taken.get(key).map(String::as_str),
+            agreed: &agreed,
         };
         for action in actions {
             match apply(&ctx, key, seen, action, &mut report) {
@@ -1171,14 +1235,16 @@ fn sync_folder_between(
                 // Nothing more is done for this file (a version that was
                 // to be kept first and could not be is not written over),
                 // and the next cycle plans it again.
-                Err(e) => {
-                    tracing::debug!(file = %dir.join(key).display(), error = %e, "could not sync a file; going on with the rest of the folder");
-                    report.failed.push(FailedFile {
-                        name: key.clone(),
-                        error: e.to_string(),
-                    });
+                Err(Failure::File(error)) => {
+                    tracing::debug!(file = %dir.join(key).display(), %error, "could not sync a file; going on with the rest of the folder");
+                    report.fail(key, error);
                     break;
                 }
+                // Not this file's failure: the next file would meet it too,
+                // and a file written with no record of it made would be
+                // taken for a change the next time. The folder's cycle
+                // ends here.
+                Err(Failure::Folder(e)) => return Err(e),
             }
         }
         if state.sync_control.generation() != generation {
@@ -1190,14 +1256,17 @@ fn sync_folder_between(
     Ok(report)
 }
 
-/// The conflict files in `dir` now, sorted, as full paths.
+/// The conflict files in `dir` now, sorted, as full paths. Hidden files
+/// are none of them, as they are no memory files: a temporary file left
+/// by a write that was cut short has a hidden name.
 fn conflict_files(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let is_conflict = |name: &str| !name.starts_with('.') && names::is_conflict_name(name);
     let mut files: Vec<String> = entries
         .filter_map(Result::ok)
-        .filter(|e| names::is_conflict_name(&e.file_name().to_string_lossy()))
+        .filter(|e| is_conflict(&e.file_name().to_string_lossy()))
         .map(|e| e.path().display().to_string())
         .collect();
     files.sort();
@@ -1218,6 +1287,28 @@ struct Ctx<'a> {
     /// it (its item ID), or `None` if it took there to be none. An edit, a
     /// delete or a merge is published only over this: see `publish_over`.
     planned: Option<&'a str>,
+    /// What the folder had agreed, for each file, when the cycle began.
+    /// Where that is nothing at all, a write may make the folder
+    /// ([`write_atomic`]); and a conflict file that is among them is not
+    /// taken for a copy made now ([`conflict_target`]).
+    agreed: &'a HashMap<String, Agreed>,
+}
+
+/// Why an action could not be done.
+#[derive(Debug)]
+enum Failure {
+    /// This file could not be written, removed or published, for a reason
+    /// of its own. The cycle goes on with the other files of the folder.
+    File(String),
+    /// A failure that is not this file's: the database, the channel's
+    /// keys, this device's place in the channel. The folder's cycle ends.
+    Folder(CordeliaError),
+}
+
+impl From<CordeliaError> for Failure {
+    fn from(e: CordeliaError) -> Self {
+        Failure::Folder(e)
+    }
 }
 
 /// The item that the adapter takes as the channel's version of a memory
@@ -1313,7 +1404,9 @@ fn publish_over(
     Ok(Some(entries::publish(state, db, channel, &write)?.rev))
 }
 
-/// Apply one action. Returns `false`, having made no change, in four cases:
+/// Apply one action. An error says whether it is this file's or the
+/// folder's ([`Failure`]). Returns `false`, having made no change, in four
+/// cases:
 ///
 /// - The action would replace or remove the file, but the file changed
 ///   since it was scanned: an agent wrote to it mid-cycle. The next cycle
@@ -1341,7 +1434,7 @@ fn apply(
     seen: Option<[u8; 32]>,
     action: Action,
     report: &mut FolderReport,
-) -> Result<bool, CordeliaError> {
+) -> Result<bool, Failure> {
     let Ctx {
         state,
         dir,
@@ -1351,7 +1444,9 @@ fn apply(
         folder,
         generation,
         planned: _,
+        agreed,
     } = *ctx;
+    let create = agreed.is_empty();
     let writes_file = matches!(
         action,
         Action::Pull { .. } | Action::RemoveFile { .. } | Action::SaveConflict(_)
@@ -1368,11 +1463,17 @@ fn apply(
         return Ok(false);
     }
     // The reason alone: the file is named by whoever reports it.
-    let io = |e: std::io::Error| CordeliaError::Internal(e.to_string());
+    let io = |e: std::io::Error| Failure::File(e.to_string());
     let full_key = format!("{prefix}{key}");
-    let publish = |text: Option<&str>| -> Result<Option<u64>, CordeliaError> {
+    // A publish that is refused for what the entry is (its name's
+    // revisions are used up, say) is this file's failure. Any other is
+    // the folder's.
+    let publish = |text: Option<&str>| -> Result<Option<u64>, Failure> {
         let db = lock(state)?;
-        publish_over(ctx, &db, &full_key, text)
+        publish_over(ctx, &db, &full_key, text).map_err(|e| match e {
+            CordeliaError::Validation(why) => Failure::File(why),
+            e => Failure::Folder(e),
+        })
     };
     let record = |hash: Option<[u8; 32]>, rev: u64| -> Result<(), CordeliaError> {
         record_agreed(state, generation, folder, channel, key, (hash, rev))
@@ -1394,7 +1495,7 @@ fn apply(
                 report.published += 1;
             }
             Ok(None) => return Ok(false),
-            Err(CordeliaError::TooLarge { .. }) => {
+            Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
                 too_large(report);
                 return Ok(false);
             }
@@ -1408,7 +1509,7 @@ fn apply(
             report.published += 1;
         }
         Action::Pull { text, rev } => {
-            write_atomic(dir, key, &text).map_err(io)?;
+            write_atomic(dir, key, &text, create).map_err(io)?;
             record(Some(Content::new(text).hash), rev)?;
             report.pulled += 1;
         }
@@ -1422,8 +1523,16 @@ fn apply(
             report.pulled += 1;
         }
         Action::SaveConflict(text) => {
-            if let Some(name) = conflict_target(dir, key, tag, &text) {
-                write_atomic(dir, &name, &text).map_err(io)?;
+            let had_agreed = |name: &str| agreed.contains_key(name);
+            if let Some(name) = conflict_target(dir, key, tag, &text, &had_agreed) {
+                // Said in full: the file named in the report is there and
+                // can be read, and it is the copy beside it that failed.
+                write_atomic(dir, &name, &text, create).map_err(|e| {
+                    Failure::File(format!(
+                        "the version here could not be kept beside it as {name} ({e}), \
+                         so the file is left as it is"
+                    ))
+                })?;
                 tracing::info!(file = %dir.join(&name).display(), "kept this device's version of a conflicting edit");
             }
             report.conflicts += 1;
@@ -1433,12 +1542,12 @@ fn apply(
             // not fit, the file stays as it was.
             match publish(Some(&text)) {
                 Ok(Some(rev)) => {
-                    write_atomic(dir, key, &text).map_err(io)?;
+                    write_atomic(dir, key, &text, create).map_err(io)?;
                     record(Some(Content::new(text).hash), rev)?;
                     report.published += 1;
                 }
                 Ok(None) => return Ok(false),
-                Err(CordeliaError::TooLarge { .. }) => {
+                Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
                     too_large(report);
                     return Ok(false);
                 }
@@ -1498,6 +1607,7 @@ mod tests {
             folder: "f",
             generation: 0,
             planned: None,
+            agreed: &HashMap::new(),
         };
         let mut report = FolderReport::default();
         for action in [
@@ -1591,6 +1701,7 @@ mod tests {
             folder: &folder,
             generation: started,
             planned: None,
+            agreed: &HashMap::new(),
         };
         let seen = Some(Content::new("here\n").hash);
         let mut report = FolderReport::default();
@@ -1708,6 +1819,63 @@ mod tests {
             .item_id
     }
 
+    /// Put in `st`'s store an entry for `key` by `st` at the revision
+    /// `rev`, with `text`: what a device that has written the file that
+    /// many times holds. (A publish takes the next revision, whatever it
+    /// is.)
+    fn write_at(st: &AppState, channel: &str, key: &str, text: &str, rev: u64) {
+        use cordelia_crypto::signing::ItemMetadata;
+        use cordelia_crypto::slots::{item_aad, slot_id};
+        use cordelia_storage::{items, psk};
+        let author = st.identity.public_key();
+        let slot = slot_id(&psk::read_slot_key(&st.home_dir, channel).unwrap(), key);
+        let plaintext = serde_json::json!({ "key": key, "content": text, "metadata": null });
+        let blob = cordelia_crypto::item_encrypt(
+            &psk::read_psk(&st.home_dir, channel).unwrap(),
+            &serde_json::to_vec(&plaintext).unwrap(),
+            &item_aad(channel, Some(&slot), Some(rev)),
+        )
+        .unwrap();
+        let content_hash = cordelia_crypto::sha256(&blob);
+        let db = st.db.lock().unwrap();
+        let key_version = channels::get_by_id(&db, channel).unwrap().key_version;
+        let item_id = items::generate_item_id();
+        let published_at = chrono::Utc::now().to_rfc3339();
+        let signed = ItemMetadata {
+            author_id: &author,
+            channel_id: channel,
+            content_hash: &content_hash,
+            is_tombstone: false,
+            item_id: &item_id,
+            key_version,
+            published_at: &published_at,
+            slot: Some(&slot),
+            rev: Some(rev),
+        }
+        .encode()
+        .unwrap();
+        let stored = items::insert_item(
+            &db,
+            &items::NewItem {
+                item_id: &item_id,
+                channel_id: channel,
+                author_id: &author,
+                item_type: ITEM_TYPE,
+                published_at: &published_at,
+                parent_id: None,
+                key_version,
+                content_hash: &content_hash,
+                signature: &st.identity.sign(&signed),
+                encrypted_blob: &blob,
+                is_tombstone: false,
+                slot: Some(&slot),
+                rev: Some(rev),
+            },
+        )
+        .unwrap();
+        assert!(stored);
+    }
+
     /// What `st` takes as the channel's version of `key`: the entry's ID,
     /// its revision and its text.
     fn version(st: &AppState, channel: &str, key: &str) -> Option<(String, u64, String)> {
@@ -1746,6 +1914,7 @@ mod tests {
                     folder: &folder,
                     generation: st.sync_control.generation(),
                     planned,
+                    agreed: &HashMap::new(),
                 };
                 let seen = current_hash(&mem, key);
                 apply(&ctx, key, seen, action, &mut FolderReport::default()).unwrap()
@@ -1771,6 +1940,7 @@ mod tests {
                     folder: &folder,
                     generation: st.sync_control.generation(),
                     planned,
+                    agreed: &HashMap::new(),
                 };
                 let mut report = FolderReport::default();
                 let done = apply(&ctx, key, None, action.clone(), &mut report).unwrap();
@@ -1957,6 +2127,11 @@ mod tests {
         /// One cycle of the folder on `st`, with `between` done once it
         /// has read the folder and the channel.
         fn cycle_with(&self, between: &dyn Fn()) -> FolderReport {
+            self.try_cycle_with(between).unwrap()
+        }
+
+        /// The same, for a cycle that may fail for the whole folder.
+        fn try_cycle_with(&self, between: &dyn Fn()) -> Result<FolderReport, CordeliaError> {
             let generation = self.st.sync_control.generation();
             sync_folder_between(
                 &self.st,
@@ -1967,7 +2142,6 @@ mod tests {
                 generation,
                 between,
             )
-            .unwrap()
         }
 
         fn cycle(&self) -> FolderReport {
@@ -2279,63 +2453,154 @@ mod tests {
 
     /// Where a file's first action fails, its others are not done. Here
     /// this device's text was to be kept beside the file before the
-    /// channel's version was written over it. It could not be kept (the
-    /// conflict file's name would be longer than a file name can be), so
-    /// the file is left as it is, and nothing is left behind.
+    /// channel's version was written over it. It could not be kept
+    /// (something is in the way of the temporary file the copy is written
+    /// through), so the file is left as it is, and the report says that it
+    /// is the copy that failed.
     #[test]
     fn a_file_whose_text_cannot_be_kept_is_not_written_over() {
-        let long = format!("{}.md", "n".repeat(247));
-        assert_eq!(long.len(), 250);
-        assert!(names::conflict_name(&long, "abcd").len() > 255);
         let p = Pair::new();
-        p.file(&long, "agreed\n");
+        p.file("notes.md", "agreed\n");
         p.file("z.md", "z\n");
         assert_eq!(p.cycle().published, 2);
-        p.other_writes(&long, Some("theirs\n"));
+        p.other_writes("notes.md", Some("theirs\n"));
         p.other_writes("z.md", Some("theirs too\n"));
-        p.file(&long, "mine\n");
+        p.file("notes.md", "mine\n");
+        let copy = names::conflict_name("notes.md", "abcd");
+        let in_the_way = p.mem.join(temporary_name(&copy));
+        std::fs::create_dir(&in_the_way).unwrap();
+
         let report = p.cycle();
-        let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(failed, [long.as_str()], "{report:?}");
-        assert_eq!(p.read(&long).as_deref(), Some("mine\n"));
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].name, "notes.md");
+        let why = &report.failed[0].error;
+        let start = format!("the version here could not be kept beside it as {copy} (");
+        assert!(why.starts_with(&start), "{why}");
+        assert!(why.ends_with("), so the file is left as it is"), "{why}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("mine\n"));
+        assert!(!p.mem.join(&copy).exists());
         // The file after it is synced all the same.
         assert_eq!(p.read("z.md").as_deref(), Some("theirs too\n"));
-        assert_eq!(report.pulled, 1, "{report:?}");
-        let mut names: Vec<String> = std::fs::read_dir(&p.mem)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert_eq!(names, [long.as_str(), "z.md"]);
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+
+        // With nothing in the way, the next cycle keeps the text and
+        // takes the channel's.
+        std::fs::remove_dir(&in_the_way).unwrap();
+        let report = p.cycle();
+        assert_eq!(
+            (report.pulled, report.conflicts, report.failed.len()),
+            (1, 1, 0),
+            "{report:?}"
+        );
+        assert_eq!(p.read(&copy).as_deref(), Some("mine\n"));
+        assert_eq!(p.read("notes.md").as_deref(), Some("theirs\n"));
     }
 
     /// A conflict file takes a name only if nothing is there. What is
     /// there and is not a text file that can be read (a file that is not
-    /// text, a folder) is not replaced: the next name is taken.
+    /// text, a folder, a link) is not replaced: the next name is taken.
     #[test]
     fn a_conflict_file_replaces_nothing_that_is_there() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        let none_agreed = |_: &str| false;
+        let target = |text: &str| conflict_target(dir, "notes.md", "abcd", text, &none_agreed);
+        let at = |n: usize| match n {
+            1 => "notes.conflict-abcd.md".to_string(),
+            n => format!("notes.conflict-abcd-{n}.md"),
+        };
         // Nothing there: the first name.
-        let first = conflict_target(dir, "notes.md", "abcd", "mine\n");
-        assert_eq!(first.as_deref(), Some("notes.conflict-abcd.md"));
+        assert_eq!(target("mine\n"), Some(at(1)));
         // A file that is not text has that name: it is left, and the next
         // name is taken.
-        let not_text = [0xff, 0xfe, 0x00, 0x80];
-        std::fs::write(dir.join("notes.conflict-abcd.md"), not_text).unwrap();
-        let second = conflict_target(dir, "notes.md", "abcd", "mine\n");
-        assert_eq!(second.as_deref(), Some("notes.conflict-abcd-2.md"));
+        std::fs::write(dir.join(at(1)), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        assert_eq!(target("mine\n"), Some(at(2)));
         // A folder has the next: the one after.
-        std::fs::create_dir(dir.join("notes.conflict-abcd-2.md")).unwrap();
-        let third = conflict_target(dir, "notes.md", "abcd", "mine\n");
-        assert_eq!(third.as_deref(), Some("notes.conflict-abcd-3.md"));
-        // The same text is already kept: nothing to write.
-        std::fs::write(dir.join("notes.conflict-abcd-3.md"), "mine\n").unwrap();
-        assert_eq!(conflict_target(dir, "notes.md", "abcd", "mine\n"), None);
-        assert_eq!(
-            std::fs::read(dir.join("notes.conflict-abcd.md")).unwrap(),
-            not_text
-        );
+        std::fs::create_dir(dir.join(at(2))).unwrap();
+        assert_eq!(target("mine\n"), Some(at(3)));
+        // A link has that one, to a file with this very text. A link is
+        // no copy: it is never synced, and what it points at may be
+        // anywhere.
+        std::fs::write(dir.join("elsewhere"), "mine\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join(at(3))).unwrap();
+        assert_eq!(target("mine\n"), Some(at(4)));
+        // A link to nothing has the next.
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join(at(4))).unwrap();
+        assert_eq!(target("mine\n"), Some(at(5)));
+        // A file with the same text: it is the copy, and there is nothing
+        // to write. Another text takes the name after it.
+        std::fs::write(dir.join(at(5)), "mine\n").unwrap();
+        assert_eq!(target("mine\n"), None);
+        assert_eq!(target("other\n"), Some(at(6)));
+
+        // But not if that file is one the folder has agreed with the
+        // channel: then the text is kept again, under the next name.
+        let fifth = at(5);
+        let agreed = |name: &str| name == fifth;
+        let again = conflict_target(dir, "notes.md", "abcd", "mine\n", &agreed);
+        assert_eq!(again, Some(at(6)));
+    }
+
+    /// A text is kept in a conflict file that this folder has made and not
+    /// yet agreed with the channel, or in a new one. A conflict file that
+    /// has been agreed has been to the other devices, and a delete of it
+    /// can be on its way back from one that did not know it would be
+    /// relied on again. Taken for the copy, the text would be in no file.
+    ///
+    /// The file here has no extension, so it is handled before its
+    /// conflict file in a cycle: the order in which the conflict file
+    /// would be relied on first and removed afterwards.
+    #[test]
+    fn a_conflict_file_that_was_agreed_is_not_taken_for_the_copy() {
+        let p = Pair::new();
+        let (first, second) = ("notes.conflict-abcd", "notes.conflict-abcd-2");
+        p.file("notes", "base\n");
+        assert_eq!(p.cycle().published, 1);
+        // Both devices edit. This device's text is kept beside the file,
+        // and the copy is published: every device has it.
+        p.file("notes", "mine\n");
+        p.other_writes("notes", Some("theirs\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read(first).as_deref(), Some("mine\n"));
+        assert_eq!(p.cycle().published, 1);
+
+        // On the other device the file is edited again and the copy is
+        // deleted, as a conflict that is done with. Here, meanwhile, the
+        // person has put the copy's text back in the file.
+        p.other_writes("notes", Some("theirs again\n"));
+        p.other_writes(first, None);
+        p.file("notes", "mine\n");
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (2, 1), "{report:?}");
+        assert_eq!(p.read("notes").as_deref(), Some("theirs again\n"));
+        // The copy that had been agreed goes, as the other device asked.
+        // The text is in a copy of its own, made now.
+        assert_eq!(p.read(first), None);
+        assert_eq!(p.read(second).as_deref(), Some("mine\n"));
+    }
+
+    /// A conflict file that this folder made and has not yet agreed is the
+    /// copy: the same text is not kept twice. Here the cycle that made it
+    /// could not go on to take the channel's version, because the file was
+    /// being written to; the next cycle keeps the same text again.
+    #[test]
+    fn a_conflict_file_not_yet_agreed_is_the_copy() {
+        let p = Pair::new();
+        p.file("notes", "base\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file("notes", "mine\n");
+        p.other_writes("notes", Some("theirs\n"));
+        let report = p.cycle_with(&|| p.file("notes", "being written\n"));
+        assert_eq!((report.pulled, report.conflicts), (0, 1), "{report:?}");
+        assert_eq!(p.read("notes.conflict-abcd").as_deref(), Some("mine\n"));
+
+        p.file("notes", "mine\n");
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read("notes").as_deref(), Some("theirs\n"));
+        assert_eq!(p.read("notes.conflict-abcd").as_deref(), Some("mine\n"));
+        assert!(!p.mem.join("notes.conflict-abcd-2").exists());
     }
 
     /// Something that is not a file (a folder), under a name a memory file
@@ -2349,11 +2614,14 @@ mod tests {
         p.file("mine.md", "mine\n");
         assert_eq!(p.cycle().published, 1);
         p.other_writes("theirs.md", Some("theirs\n"));
+        p.other_writes("gone.md", Some("for a while\n"));
+        p.other_writes("gone.md", None);
         // The file that was agreed is replaced by a folder; another folder
         // has the name of the entry that has just arrived; a third has a
-        // name nothing else has.
+        // name that is deleted in the channel, where no file could be
+        // written anyway; a fourth has a name nothing else has.
         std::fs::remove_file(p.mem.join("mine.md")).unwrap();
-        for name in ["mine.md", "theirs.md", "attic"] {
+        for name in ["mine.md", "theirs.md", "gone.md", "attic"] {
             std::fs::create_dir(p.mem.join(name)).unwrap();
         }
         let report = p.cycle();
@@ -2369,29 +2637,62 @@ mod tests {
         assert_eq!(p.held("mine.md").as_deref(), Some("mine\n"));
     }
 
+    /// Whether a file name can be as long here as a file name usually can
+    /// (255 bytes). A test that needs such names says so and passes where
+    /// it cannot.
+    fn long_names_fit(dir: &Path) -> bool {
+        let probe = dir.join("p".repeat(255));
+        let fits = std::fs::write(&probe, "").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if !fits {
+            eprintln!("not run: this file system does not take a file name of 255 bytes");
+        }
+        fits
+    }
+
     /// A file name may be as long as a file name can be. It is written
-    /// through a temporary file whose name does not grow with it.
+    /// through a temporary file whose name does not grow with it, and a
+    /// version of it is kept under a conflict name that is cut to fit.
     #[test]
-    fn a_file_with_the_longest_name_is_written() {
+    fn a_file_with_the_longest_name_is_written_and_its_conflict_kept() {
         let long = format!("{}.md", "n".repeat(252));
         assert_eq!(long.len(), 255);
         assert!(names::is_safe_file_name(&long));
-        let p = Pair::new();
-        p.other_writes(&long, Some("text\n"));
-        let report = p.cycle();
-        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
-        assert_eq!(p.read(&long).as_deref(), Some("text\n"));
         let temporary = temporary_name(&long);
         assert!(
             temporary.starts_with('.') && temporary.len() < 40,
             "{temporary}"
         );
         assert_ne!(temporary, temporary_name("other.md"));
+
+        let p = Pair::new();
+        if !long_names_fit(&p.mem) {
+            return;
+        }
+        p.other_writes(&long, Some("text\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read(&long).as_deref(), Some("text\n"));
         assert!(!p.mem.join(&temporary).exists());
+
+        // Both edit it: this device's text is kept, and the file takes
+        // the channel's.
+        p.file(&long, "mine\n");
+        p.other_writes(&long, Some("theirs\n"));
+        let report = p.cycle();
+        assert_eq!(
+            (report.pulled, report.conflicts, report.failed.len()),
+            (1, 1, 0),
+            "{report:?}"
+        );
+        assert_eq!(p.read(&long).as_deref(), Some("theirs\n"));
+        let copy = names::conflict_name(&long, "abcd");
+        assert_eq!(p.read(&copy).as_deref(), Some("mine\n"));
     }
 
     /// A cycle's errors name the files of a folder that failed, each with
-    /// its path and why, up to five, and count the rest.
+    /// its path and why, up to five, and count the rest. The folder's
+    /// report lists the first hundred, and counts those after.
     #[test]
     fn test_files_that_failed_are_named_in_the_cycles_errors() {
         let memory = Path::new("/home/sam/.claude/projects/-home-sam/memory");
@@ -2403,24 +2704,240 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(failed_as_errors(memory, &[]).is_empty());
+        assert!(failed_as_errors(memory, &[], 0).is_empty());
         assert_eq!(
-            failed_as_errors(memory, &failed(1)),
+            failed_as_errors(memory, &failed(1), 0),
             ["/home/sam/.claude/projects/-home-sam/memory/f0.md: why 0"]
         );
-        assert_eq!(failed_as_errors(memory, &failed(5)).len(), 5);
-        let six = failed_as_errors(memory, &failed(6));
+        assert_eq!(failed_as_errors(memory, &failed(5), 0).len(), 5);
+        let six = failed_as_errors(memory, &failed(6), 0);
         assert_eq!(six.len(), 6);
         assert_eq!(
             six[5],
             "/home/sam/.claude/projects/-home-sam/memory: 1 more file could not be synced"
         );
-        let eight = failed_as_errors(memory, &failed(8));
+        let eight = failed_as_errors(memory, &failed(8), 0);
         assert!(
             eight[5].ends_with("3 more files could not be synced"),
             "{eight:?}"
         );
         assert!(eight[4].ends_with("f4.md: why 4"), "{eight:?}");
+        // Those the report only counted are counted here too.
+        let counted = failed_as_errors(memory, &failed(8), 4);
+        assert!(
+            counted[5].ends_with("7 more files could not be synced"),
+            "{counted:?}"
+        );
+        let few = failed_as_errors(memory, &failed(2), 1);
+        assert_eq!(few.len(), 3, "{few:?}");
+        assert!(few[2].ends_with("1 more file could not be synced"));
+
+        let mut report = FolderReport::default();
+        for i in 0..FAILED_FILES_KEPT + 3 {
+            report.fail(&format!("f{i}.md"), "why".into());
+        }
+        assert_eq!(
+            (report.failed.len(), report.failed_more),
+            (FAILED_FILES_KEPT, 3)
+        );
+        assert_eq!(report.failed[FAILED_FILES_KEPT - 1].name, "f99.md");
+    }
+
+    /// A failure that is not one file's ends the folder's cycle, as any
+    /// failure did before files were passed over. The file after it would
+    /// meet it too: written with no record made of it, it would be taken
+    /// for a change of this device's the next time. Here the folder's
+    /// records cannot be written.
+    #[test]
+    fn a_failure_that_is_not_a_files_ends_the_folders_cycle() {
+        let p = Pair::new();
+        p.other_writes("a.md", Some("a\n"));
+        p.other_writes("b.md", Some("b\n"));
+        let broken = p.try_cycle_with(&|| {
+            let db = p.st.db.lock().unwrap();
+            db.execute_batch("ALTER TABLE sync_files RENAME TO sync_files_away")
+                .unwrap();
+        });
+        assert!(
+            matches!(broken, Err(CordeliaError::Storage(_))),
+            "{broken:?}"
+        );
+        // The first file was written before its record failed. The second
+        // was not come to.
+        assert_eq!(p.read("a.md").as_deref(), Some("a\n"));
+        assert_eq!(p.read("b.md"), None);
+
+        // With the records back, the next cycle finishes: the first file
+        // is as the channel has it, and only needs recording.
+        let db = p.st.db.lock().unwrap();
+        db.execute_batch("ALTER TABLE sync_files_away RENAME TO sync_files")
+            .unwrap();
+        drop(db);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+        assert_eq!(p.read("b.md").as_deref(), Some("b\n"));
+    }
+
+    /// A publish that is refused for what the entry is fails for that file
+    /// alone. Here a name's revisions are used up: a device holds an entry
+    /// for it at the highest revision there is, so nothing can be written
+    /// after it. The file is reported, and the file after it is published.
+    #[test]
+    fn a_name_whose_revisions_are_used_up_fails_alone() {
+        let p = Pair::new();
+        p.file("a.md", "one\n");
+        p.file("b.md", "one\n");
+        assert_eq!(p.cycle().published, 2);
+        let limit = cordelia_core::protocol::MAX_REV;
+        write_at(&p.other, &p.channel, "a.md", "at the limit\n", limit);
+        deliver(&p.other, &p.st, &p.channel);
+        assert_eq!(p.cycle().pulled, 1);
+
+        p.file("a.md", "two\n");
+        p.file("b.md", "two\n");
+        let report = p.cycle();
+        assert_eq!(report.published, 1, "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].name, "a.md");
+        assert!(
+            report.failed[0].error.contains("revision limit"),
+            "{report:?}"
+        );
+        assert_eq!(p.held("b.md").as_deref(), Some("two\n"));
+        assert_eq!(p.held("a.md").as_deref(), Some("at the limit\n"));
+    }
+
+    /// A folder that can be listed and not looked into (its names can be
+    /// read, and nothing about them) is an error, like a folder that
+    /// cannot be read at all. Its files are not taken for deleted, which
+    /// would delete them on every other device.
+    #[test]
+    fn a_folder_that_cannot_be_looked_into_deletes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Pair::new();
+        p.file("a.md", "a\n");
+        p.file("b.md", "b\n");
+        assert_eq!(p.cycle().published, 2);
+
+        let mode = |mode: u32| {
+            std::fs::set_permissions(&p.mem, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o444);
+        if std::fs::symlink_metadata(p.mem.join("a.md")).is_ok() {
+            // Nothing is closed to this user (root): there is no such
+            // folder to test with.
+            mode(0o755);
+            eprintln!("not run: this user can look into any folder");
+            return;
+        }
+        let closed = p.try_cycle_with(&|| {});
+        mode(0o755);
+        assert!(closed.is_err(), "{closed:?}");
+        assert_eq!(p.held("a.md").as_deref(), Some("a\n"));
+        assert_eq!(p.held("b.md").as_deref(), Some("b\n"));
+        // Open again, there is nothing to do.
+        let report = p.cycle();
+        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+    }
+
+    /// A folder that has agreed files and goes while a cycle runs is not
+    /// made again by a file that the cycle writes. Made again, it would
+    /// hold that one file, and the next cycle would take every other file
+    /// for deleted and delete them on every other device.
+    #[test]
+    fn a_folder_that_goes_during_a_cycle_is_not_made_again() {
+        let p = Pair::new();
+        p.file("a.md", "a\n");
+        p.file("b.md", "b\n");
+        assert_eq!(p.cycle().published, 2);
+        p.other_writes("new.md", Some("new\n"));
+        let away = p.mem.with_file_name("memory-away");
+        let report = p.cycle_with(&|| std::fs::rename(&p.mem, &away).unwrap());
+        assert_eq!((report.pulled, report.published), (0, 0), "{report:?}");
+        let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failed, ["new.md"], "{report:?}");
+        assert!(!p.mem.exists(), "the folder is not made again");
+
+        // The next cycle finds it gone, and says so. Nothing is deleted.
+        let gone = p.try_cycle_with(&|| {}).unwrap_err().to_string();
+        assert!(gone.contains("is gone"), "{gone}");
+        assert_eq!(p.held("a.md").as_deref(), Some("a\n"));
+        assert_eq!(p.held("b.md").as_deref(), Some("b\n"));
+
+        // Back where it was, it syncs.
+        std::fs::rename(&away, &p.mem).unwrap();
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.published), (1, 0), "{report:?}");
+        assert_eq!(p.read("new.md").as_deref(), Some("new\n"));
+    }
+
+    /// A folder that has agreed nothing is made by the first file that
+    /// arrives for it: a device that maps a name has no memory folder for
+    /// it until then.
+    #[test]
+    fn a_folder_that_has_agreed_nothing_is_made_by_its_first_file() {
+        let p = Pair::new();
+        std::fs::remove_dir(&p.mem).unwrap();
+        p.other_writes("first.md", Some("first\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read("first.md").as_deref(), Some("first\n"));
+    }
+
+    /// Where the channel's index already has every line this device has,
+    /// the merge is the channel's version, and the file takes it: nothing
+    /// is published. (Published all the same, an index that could not be
+    /// written to the file would be published again in every cycle.)
+    #[test]
+    fn an_index_the_channel_already_has_whole_is_taken_and_not_published() {
+        let p = Pair::new();
+        let index = crate::memory_md::INDEX_FILE;
+        p.file(index, "- [A](a.md) a\n");
+        assert_eq!(p.cycle().published, 1);
+        // Both change it; the other device's has this device's new line
+        // and one more.
+        p.file(index, "- [A](a.md) a\n- [B](b.md) b\n");
+        let theirs = "- [A](a.md) a\n- [B](b.md) b\n- [C](c.md) c\n";
+        p.other_writes(index, Some(theirs));
+        let (_, rev, _) = version(&p.st, &p.channel, index).unwrap();
+        let report = p.cycle();
+        assert_eq!((report.published, report.pulled), (0, 1), "{report:?}");
+        assert_eq!(p.read(index).as_deref(), Some(theirs));
+        let (_, now, text) = version(&p.st, &p.channel, index).unwrap();
+        assert_eq!((now, text.as_str()), (rev, theirs));
+        // And it is agreed: the next cycle has nothing to do.
+        let report = p.cycle();
+        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+
+        // A line of this device's that the channel's lacks is merged in
+        // and published, as before.
+        p.file(index, &format!("{theirs}- [D](d.md) d\n"));
+        p.other_writes(index, Some(&format!("{theirs}- [E](e.md) e\n")));
+        let report = p.cycle();
+        assert_eq!((report.published, report.pulled), (1, 0), "{report:?}");
+        let merged = format!("{theirs}- [E](e.md) e\n- [D](d.md) d\n");
+        assert_eq!(p.read(index), Some(merged));
+    }
+
+    /// A hidden file is no conflict file, as it is no memory file: a
+    /// temporary file left by a write that was cut short has a hidden
+    /// name, and for a conflict file it ends as a conflict file's does.
+    #[test]
+    fn test_a_hidden_file_is_no_conflict_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for name in [
+            "notes.conflict-0a1b2c3d.md",
+            ".notes.conflict-0a1b2c3d.md",
+            "notes.md",
+        ] {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+        }
+        let listed = conflict_files(dir);
+        assert_eq!(
+            listed,
+            [dir.join("notes.conflict-0a1b2c3d.md").display().to_string()]
+        );
     }
 
     /// The bookkeeping at the end of a cycle is done under the settings

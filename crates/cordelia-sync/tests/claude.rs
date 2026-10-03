@@ -1171,34 +1171,33 @@ fn a_folder_that_fails_is_reported_and_the_others_still_sync() {
     assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "not a folder");
 }
 
-/// A file that fails is an error of the cycle, named with its path and
-/// why, and the rest of its folder syncs in the same cycle. The folder
-/// itself is not reported as failed.
+/// A file that fails in a cycle is an error of the cycle, by its path and
+/// with why, and the rest of its folder still syncs. The folder's report
+/// lists the file, and the folder itself is not reported as failed.
 ///
-/// Here the file's name is so long that the conflict file, which would
-/// keep this device's text beside it, cannot be made. So the file is left
-/// as this device has it.
+/// Here something is in the way of the temporary file that the incoming
+/// version of one file is written through, so that file cannot be written.
 #[test]
 fn a_file_that_fails_is_an_error_of_the_cycle_and_the_folder_still_syncs() {
     let (mut a, mut b) = paired();
     let a_mem = a.home_memory();
     let b_mem = b.home_memory();
-    let long = format!("{}.md", "n".repeat(247));
-    std::fs::write(a_mem.join(&long), "base\n").unwrap();
+    std::fs::write(a_mem.join("a.md"), "base\n").unwrap();
     std::fs::write(a_mem.join("z.md"), "base\n").unwrap();
     settle(&mut a, &mut b);
-    assert_eq!(read(&b_mem, &long).as_deref(), Some("base\n"));
+    assert_eq!(read(&b_mem, "a.md").as_deref(), Some("base\n"));
 
-    // Both edit the file before hearing from each other, and A edits the
-    // file after it as well.
-    std::fs::write(a_mem.join(&long), "from a\n").unwrap();
+    // A edits both files.
+    std::fs::write(a_mem.join("a.md"), "from a\n").unwrap();
     std::fs::write(a_mem.join("z.md"), "from a\n").unwrap();
-    std::fs::write(b_mem.join(&long), "from b\n").unwrap();
+    let hash = cordelia_crypto::sha256(b"a.md");
+    let in_the_way = b_mem.join(format!(".cordelia-tmp-{}", hex::encode(&hash[..8])));
+    std::fs::create_dir(&in_the_way).unwrap();
     a.cycle();
     relay(&a, &b);
     let report = b.adapter.run_cycle(&b.state);
 
-    let path = b_mem.join(&long).display().to_string();
+    let path = b_mem.join("a.md").display().to_string();
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(
         report.errors[0].starts_with(&format!("{path}: "))
@@ -1213,9 +1212,9 @@ fn a_file_that_fails_is_an_error_of_the_cycle_and_the_folder_still_syncs() {
         .unwrap_or_else(|| panic!("{:?}", report.folders));
     assert_eq!(folder.error, None);
     assert_eq!(folder.failed.len(), 1);
-    assert_eq!(folder.failed[0].name, long);
-    // Left as this device has it, and the file after it was synced.
-    assert_eq!(read(&b_mem, &long).as_deref(), Some("from b\n"));
+    assert_eq!(folder.failed[0].name, "a.md");
+    // Left as it was, and the file after it was synced.
+    assert_eq!(read(&b_mem, "a.md").as_deref(), Some("base\n"));
     assert_eq!(read(&b_mem, "z.md").as_deref(), Some("from a\n"));
     assert_eq!(folder.pulled, 1);
 }
