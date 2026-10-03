@@ -1348,6 +1348,18 @@ fn claude_memory_syncs_between_two_machines() {
         serde_json::json!([path(&a_notes)]),
         "an unmapped folder stays out until it is mapped again"
     );
+    // `--exclude` replaces the names in the list and keeps a folder that
+    // was unmapped, and `include` of the name leaves the folder too.
+    a.cli(&["sync", "claude", "--exclude", "Client-Co/App.GIT"]);
+    assert_eq!(
+        state(&a)["sync"]["exclude"],
+        serde_json::json!(["client-co/app", path(&a_notes)])
+    );
+    a.cli(&["sync", "include", "client-co/app"]);
+    assert_eq!(
+        state(&a)["sync"]["exclude"],
+        serde_json::json!([path(&a_notes)])
+    );
     a.cli(&["sync", "unmap", &path(&sub)]);
     assert_eq!(mapped_names(&state(&a)), ["~"]);
     a.cli(&["sync", "map", &path(&a_repo)]);
@@ -1532,7 +1544,27 @@ fn home_memory_syncs_under_any_name() {
         "{said}"
     );
     assert_eq!(mapped_names(&state(&a)), ["elsewhere", "lab", "team"]);
-    a.cli(&["sync", "unmap", &path(&a_lab)]);
+    // With a `/` at its end, as a shell completes it, the word is the
+    // folder and not the name: the folder is unmapped, and what syncs as
+    // `lab` is left alone.
+    let out = a.command_in(&a.home(), &["sync", "unmap", "lab/"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("No longer synced from this device: ~/lab (elsewhere)."),
+        "{said}"
+    );
+    assert_eq!(mapped_names(&state(&a)), ["lab", "team"]);
+    // And where the folder is not a mapped one, the word names nothing:
+    // it says so, with the command for the name.
+    let out = a.command_in(&a.home(), &["sync", "unmap", "lab/"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("is taken for a folder") && said.contains("cordelia sync unmap lab"),
+        "{said}"
+    );
+    assert_eq!(mapped_names(&state(&a)), ["lab", "team"]);
 
     // B syncs its own home as `~`. A is not offered it: its home has a
     // name already, and mapping it as `~` would take it out of `team`.

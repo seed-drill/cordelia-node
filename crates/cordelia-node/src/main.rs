@@ -147,7 +147,8 @@ enum SyncCommand {
         mapped_only: bool,
         /// With --all: never sync this project from this device (its git
         /// remote, e.g. github.com/client-co/app, or a prefix ending in *).
-        /// Repeatable; replaces the current list.
+        /// Repeatable; replaces the names in the current list. A folder
+        /// that was unmapped stays out.
         #[arg(long)]
         exclude: Vec<String>,
         /// Do not sync home-folder memory on this device (unmaps it too)
@@ -1658,6 +1659,44 @@ fn mapping_in_the_way<'a>(
         .or_else(|| mapping_named(mappings, typed))
 }
 
+/// The mapping of a folder, given the folder's spellings in the order
+/// they are meant: the first spelling that is a mapping's folder decides.
+/// So a folder that is mapped is found before the repository it is in,
+/// whichever of the two was mapped first.
+fn mapping_at<'a>(
+    mappings: &'a [(String, String)],
+    spellings: &[String],
+) -> Option<&'a (String, String)> {
+    spellings
+        .iter()
+        .find_map(|spelt| mappings.iter().find(|(folder, _)| folder == spelt))
+}
+
+/// The exclude list that `cordelia sync claude --exclude` sends: what was
+/// typed, each taken as `cordelia sync exclude` takes it, in place of the
+/// names in the stored list; and the folders in the stored list, which
+/// `unmap` put there. An unmapped folder stays out until it is mapped
+/// again or included. With `--reset` nothing of the stored list is kept.
+fn exclude_list_to_send(
+    typed: &[String],
+    stored: &[String],
+    reset: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut list: Vec<String> = Vec::new();
+    for given in typed {
+        let entry = exclusion(given)?;
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+    }
+    for folder in stored.iter().filter(|e| !reset && e.starts_with('/')) {
+        if !list.contains(folder) {
+            list.push(folder.clone());
+        }
+    }
+    Ok(list)
+}
+
 /// The mappings as the node's own check takes them.
 fn as_mappings(mappings: &[(String, String)]) -> Vec<cordelia_api::types::SyncMapping> {
     mappings
@@ -2111,14 +2150,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             if all || mapped_only {
                 body["all"] = all.into();
             }
-            if !exclude.is_empty() {
-                body["exclude"] = serde_json::json!(exclude);
-            }
             if no_home {
                 body["home"] = false.into();
             }
             // Nothing changes silently: say what this run changed.
             let before = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
+            if !exclude.is_empty() {
+                let stored = excluded_projects(&before);
+                body["exclude"] =
+                    serde_json::json!(exclude_list_to_send(&exclude, &stored, reset)?);
+            }
             let after = set(body)?;
             since = after["generation"].as_u64();
             for line in setting_changes(&before, &after) {
@@ -2326,13 +2367,30 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     other => other,
                 };
                 let path = config::expand_tilde(trimmed);
+                // The folder as typed, then its real path, then the
+                // repository it is in.
                 let mut spellings = vec![path.display().to_string()];
                 if let Ok(real) = std::fs::canonicalize(&path) {
-                    spellings.push(discover::memory_root(&real).display().to_string());
                     spellings.push(real.display().to_string());
+                    spellings.push(discover::memory_root(&real).display().to_string());
                 }
-                mappings.iter().find(|(f, _)| spellings.contains(f))
+                mapping_at(&mappings, &spellings)
             };
+            // A word that ends in `/` is a folder. If it is not a mapped
+            // one, and is a mapping's name without the `/`, say so.
+            if by_folder.is_none()
+                && let Some((named, name)) =
+                    mapping_named(&mappings, folder.trim().trim_end_matches('/'))
+                && by_name.is_none()
+            {
+                anyhow::bail!(
+                    "{folder} is taken for a folder, and it is not mapped on this device. To \
+                     unmap {}, which syncs as {}: cordelia sync unmap {}",
+                    short_path(named),
+                    sync_label(name),
+                    shell_word(name)
+                );
+            }
             let (mapped, name) = mapping_meant(&folder, by_name, by_folder)?;
             let after = api_post(
                 config_path,
@@ -2456,17 +2514,20 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
 /// or a project's name, which is the name it is found under. A remote that
 /// is pasted (`https://...`, `git@host:...`) is taken for the name it
 /// gives. Anything else is a name or a prefix, cleaned as the node cleans
-/// one. It is an error if nothing is left.
+/// one, with no space round it: what is typed and is no folder on disk is
+/// not a folder whose name ends in a space. It is an error if nothing is
+/// left.
 fn exclusion(given: &str) -> anyhow::Result<String> {
     let looks_like_a_path = given.starts_with(['/', '~', '.']);
+    let typed = given.trim();
     let as_stored = match std::fs::canonicalize(config::expand_tilde(given)) {
         Ok(real) if looks_like_a_path => Some(
             cordelia_sync::discover::memory_root(&real)
                 .display()
                 .to_string(),
         ),
-        _ => cordelia_sync::discover::normalize_remote(given)
-            .or_else(|| cordelia_api::sync::clean_exclusion(given)),
+        _ => cordelia_sync::discover::normalize_remote(typed)
+            .or_else(|| cordelia_api::sync::clean_exclusion(typed)),
     };
     as_stored.ok_or_else(|| {
         anyhow::anyhow!("{given:?} is not a project's name, a prefix ending in *, or a folder")
@@ -3533,12 +3594,89 @@ mod tests {
             ("X.GIT", "x"),
             // A folder that is not there, spelled as the node spells one.
             ("/cordelia-test-not-there//x/", "/cordelia-test-not-there/x"),
+            // What is typed and is no folder on disk has no space round
+            // it: it is not taken for a folder whose name ends in one.
+            ("/cordelia-test-not-there/x ", "/cordelia-test-not-there/x"),
+            (" client-co/app ", "client-co/app"),
         ] {
             assert_eq!(exclusion(given).unwrap(), stored, "{given:?}");
         }
         for nothing in [".GIT", "  ", ""] {
             assert!(exclusion(nothing).is_err(), "{nothing:?}");
         }
+        // A folder that is on disk, and whose name does end in a space, is
+        // taken as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().canonicalize().unwrap().join("odd ");
+        std::fs::create_dir(&odd).unwrap();
+        let given = odd.display().to_string();
+        assert_eq!(exclusion(&given).unwrap(), given);
+    }
+
+    /// `cordelia sync claude --exclude` replaces the names in the exclude
+    /// list and keeps the folders in it. A folder is there because it was
+    /// unmapped, and it stays out of what `--all` finds until it is mapped
+    /// again or included, whatever names are then excluded.
+    #[test]
+    fn test_what_the_exclude_option_sends() {
+        let list =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        let stored = list(&[
+            "old-name",
+            "/home/sam/notes",
+            "client-co/*",
+            "/home/sam/odd ",
+        ]);
+        let typed = list(&["Team.GIT", "https://github.com/Client-Co/App.git", "team"]);
+        // Each typed as `exclude` takes it, once; then the folders, as
+        // they are stored. The names that were stored go.
+        assert_eq!(
+            exclude_list_to_send(&typed, &stored, false).unwrap(),
+            list(&[
+                "team",
+                "github.com/client-co/app",
+                "/home/sam/notes",
+                "/home/sam/odd ",
+            ])
+        );
+        // A folder that is typed and is already there is there once.
+        let typed_folder = list(&["/home/sam/notes"]);
+        assert_eq!(
+            exclude_list_to_send(&typed_folder, &stored, false).unwrap(),
+            list(&["/home/sam/notes", "/home/sam/odd "])
+        );
+        // With a reset nothing of the stored list is kept.
+        assert_eq!(
+            exclude_list_to_send(&typed, &stored, true).unwrap(),
+            list(&["team", "github.com/client-co/app"])
+        );
+        // What leaves nothing is refused, and does not empty the list.
+        assert!(exclude_list_to_send(&list(&[".git"]), &stored, false).is_err());
+    }
+
+    /// `cordelia sync unmap <folder>` means the mapping of that folder
+    /// before the mapping of the repository it is in, whichever of the two
+    /// was mapped first.
+    #[test]
+    fn test_unmap_takes_the_folder_named_before_the_repository_it_is_in() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let list =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        // Home was mapped first, then a folder in it; later the home
+        // directory became a git repository, so it is the repository the
+        // folder is in.
+        let mappings = [pair("/home/sam", "~"), pair("/home/sam/notes", "lab")];
+        let folder = |spellings: &[&str]| {
+            mapping_at(&mappings, &list(spellings)).map(|(folder, _)| folder.as_str())
+        };
+        // As typed, its real path, the repository.
+        let notes = ["notes", "/home/sam/notes", "/home/sam"];
+        assert_eq!(folder(&notes), Some("/home/sam/notes"));
+        // A folder that is not mapped means the repository it is in.
+        let other = ["other", "/home/sam/other", "/home/sam"];
+        assert_eq!(folder(&other), Some("/home/sam"));
+        assert_eq!(folder(&["/elsewhere"]), None);
+        assert_eq!(folder(&[]), None);
     }
 
     /// A refusal that points at `home on` says so only where the node

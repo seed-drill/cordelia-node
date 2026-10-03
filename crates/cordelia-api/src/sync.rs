@@ -1340,6 +1340,14 @@ mod tests {
             Some("/home/sam/old")
         );
         assert_eq!(clean_exclusion("/home/sam/../old"), None);
+        // A stored folder is read by the same rule: its separators are
+        // tidied, and one with `..` in it is no folder and is dropped.
+        let stored = r#"["/home/sam//old/","/home/sam/./notes","/home/sam/../x"]"#;
+        meta::set(&s.db, meta::SYNC_CLAUDE_EXCLUDE, stored).unwrap();
+        assert_eq!(
+            exclusions(&s.db).unwrap(),
+            ["/home/sam/old", "/home/sam/notes"]
+        );
     }
 
     /// Every handler counts its change, with the lock held, so that a
