@@ -173,6 +173,17 @@ pub fn write_ring(home_dir: &Path, ring: &KeyRing) -> Result<(), CordeliaError> 
     Ok(())
 }
 
+/// Drop from a ring what is not part of the channel's history as this
+/// device records it: entries at or above the version the ring says this
+/// device holds. Every earlier version it used is below that. An entry at
+/// or above it was put there by something other than a change this device
+/// made or applied, and, left in the ring, would stand as that version's
+/// key once the channel had passed the version.
+fn drop_what_is_not_history(ring: &mut KeyRing) {
+    let held = ring.current_version;
+    ring.keys.retain(|e| e.version < held);
+}
+
 /// Rotate the PSK for a channel: archive old PSK to ring, write new PSK.
 ///
 /// Returns the new key_version.
@@ -185,6 +196,7 @@ pub fn rotate_psk(
     // Read current PSK (the one being replaced)
     let old_psk = read_psk(home_dir, channel_id)?;
     let mut ring = read_ring(home_dir, channel_id)?;
+    drop_what_is_not_history(&mut ring);
 
     // Archive the old PSK
     ring.keys.push(KeyRingEntry {
@@ -259,9 +271,15 @@ pub fn read_slot_key(home_dir: &Path, channel_id: &str) -> Result<[u8; 32], Cord
 
 /// Install a channel's full key ring, as received in a channel state.
 ///
-/// The key for `current_version` becomes the channel PSK; every other
-/// version goes into the ring, merged with versions already held (a state
-/// never makes this node forget a key).
+/// The key for `current_version` becomes the channel PSK. Every earlier
+/// version given goes into the ring, unless the ring already holds that
+/// version, in which case the key it holds stays.
+///
+/// A key for a version the channel has not reached is never kept. One
+/// given above `current_version` is dropped. One already in the ring at
+/// or above the version this device held is dropped before the merge
+/// (see [`drop_what_is_not_history`]), so that the real key for that
+/// version is taken from the state when the channel has passed it.
 pub fn install_key_ring(
     home_dir: &Path,
     channel_id: &str,
@@ -279,6 +297,7 @@ pub fn install_key_ring(
         })?;
 
     let mut ring = read_ring(home_dir, channel_id)?;
+    drop_what_is_not_history(&mut ring);
     let now = chrono::Utc::now().to_rfc3339();
     for (version, key) in keys {
         let version = *version as i64;
@@ -291,7 +310,7 @@ pub fn install_key_ring(
             rotated_at: now.clone(),
         });
     }
-    ring.keys.retain(|e| e.version != current_version as i64);
+    ring.keys.retain(|e| e.version < current_version as i64);
     ring.keys.sort_by_key(|e| e.version);
     ring.current_version = current_version as i64;
 
@@ -299,8 +318,10 @@ pub fn install_key_ring(
     write_psk(home_dir, channel_id, &current)
 }
 
-/// The full key ring held for a channel: every archived version plus the
-/// current PSK, ordered by version. Used to build channel states.
+/// The full key ring held for a channel: every earlier version plus the
+/// current PSK, ordered by version. Used to build channel states, and to
+/// make the next version. Nothing in the ring above the current version is
+/// part of it.
 pub fn export_key_ring(
     home_dir: &Path,
     channel_id: &str,
@@ -308,7 +329,7 @@ pub fn export_key_ring(
 ) -> Result<Vec<(u32, [u8; 32])>, CordeliaError> {
     let mut keys = Vec::new();
     for entry in read_ring(home_dir, channel_id)?.keys {
-        if entry.version == current_version {
+        if entry.version >= current_version {
             continue;
         }
         let bytes = hex::decode(&entry.psk_hex)
@@ -394,6 +415,136 @@ mod tests {
 
         // The current version must be in the ring being installed.
         assert!(install_key_ring(dir.path(), "grp_r", &[(5, [0x55; 32])], 6).is_err());
+    }
+
+    /// T16. A key for a version the channel has not reached is never kept
+    /// and never handed on. Otherwise it would wait for the removal that
+    /// makes that version, and take the place of the key made then.
+    #[test]
+    fn a_key_above_the_current_version_is_never_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = |dir: &Path| -> Vec<i64> {
+            let ring = read_ring(dir, "grp_r").unwrap();
+            ring.keys.iter().map(|e| e.version).collect()
+        };
+
+        // Given in a state: not kept.
+        let given = [(1u32, [0x11u8; 32]), (2, [0x22; 32]), (3, [0x4a; 32])];
+        install_key_ring(dir.path(), "grp_r", &given, 2).unwrap();
+        assert_eq!(versions(dir.path()), vec![1]);
+        assert_eq!(read_psk(dir.path(), "grp_r").unwrap(), [0x22; 32]);
+
+        // Already in the file: not handed on, and gone at the next install.
+        let mut ring = read_ring(dir.path(), "grp_r").unwrap();
+        ring.keys.push(KeyRingEntry {
+            version: 3,
+            psk_hex: hex::encode([0x4a; 32]),
+            rotated_at: "2026-10-03T00:00:00Z".into(),
+        });
+        write_ring(dir.path(), &ring).unwrap();
+        assert_eq!(
+            export_key_ring(dir.path(), "grp_r", 2).unwrap(),
+            vec![(1, [0x11; 32]), (2, [0x22; 32])]
+        );
+        install_key_ring(dir.path(), "grp_r", &[(2, [0x22; 32])], 2).unwrap();
+        assert_eq!(versions(dir.path()), vec![1]);
+
+        // An entry at the current version itself is no part of the ring
+        // either: the key in place is the current one.
+        let mut ring = read_ring(dir.path(), "grp_r").unwrap();
+        ring.keys.push(KeyRingEntry {
+            version: 2,
+            psk_hex: hex::encode([0x4a; 32]),
+            rotated_at: "2026-10-03T00:00:00Z".into(),
+        });
+        write_ring(dir.path(), &ring).unwrap();
+        assert_eq!(
+            export_key_ring(dir.path(), "grp_r", 2).unwrap(),
+            vec![(1, [0x11; 32]), (2, [0x22; 32])]
+        );
+        install_key_ring(dir.path(), "grp_r", &[(2, [0x22; 32])], 2).unwrap();
+        assert_eq!(versions(dir.path()), vec![1]);
+    }
+
+    /// T16. A key that was waiting in the ring for a later version does
+    /// not become that version's key when the channel passes it: a device
+    /// that was away for two changes takes the real key for the version it
+    /// missed, and can read what was written under it.
+    #[test]
+    fn a_key_that_was_waiting_is_not_kept_when_its_version_is_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        install_key_ring(dir.path(), "grp_r", &[(1, [0x11; 32]), (2, [0x22; 32])], 2).unwrap();
+        let mut ring = read_ring(dir.path(), "grp_r").unwrap();
+        ring.keys.push(KeyRingEntry {
+            version: 3,
+            psk_hex: hex::encode([0x4a; 32]),
+            rotated_at: "2026-10-03T00:00:00Z".into(),
+        });
+        write_ring(dir.path(), &ring).unwrap();
+
+        let later = [
+            (1u32, [0x11u8; 32]),
+            (2, [0x22; 32]),
+            (3, [0x33; 32]),
+            (4, [0x44; 32]),
+        ];
+        install_key_ring(dir.path(), "grp_r", &later, 4).unwrap();
+        assert_eq!(
+            read_psk_for_version(dir.path(), "grp_r", 3, 4).unwrap(),
+            [0x33; 32]
+        );
+        assert_eq!(export_key_ring(dir.path(), "grp_r", 4).unwrap(), later);
+
+        // The same for an entry at the very version this device holds: the
+        // key in use is the one in the key file, and when the channel
+        // moves on, that version's key is the one the state gives.
+        let mut ring = read_ring(dir.path(), "grp_r").unwrap();
+        ring.keys.push(KeyRingEntry {
+            version: 4,
+            psk_hex: hex::encode([0x4a; 32]),
+            rotated_at: "2026-10-03T00:00:00Z".into(),
+        });
+        write_ring(dir.path(), &ring).unwrap();
+        let next = [
+            (1u32, [0x11u8; 32]),
+            (2, [0x22; 32]),
+            (3, [0x33; 32]),
+            (4, [0x44; 32]),
+            (5, [0x55; 32]),
+        ];
+        install_key_ring(dir.path(), "grp_r", &next, 5).unwrap();
+        assert_eq!(
+            read_psk_for_version(dir.path(), "grp_r", 4, 5).unwrap(),
+            [0x44; 32]
+        );
+        assert_eq!(export_key_ring(dir.path(), "grp_r", 5).unwrap(), next);
+    }
+
+    /// T16. The older way of making a new key (`rotate_psk`) drops a
+    /// waiting key as well. Kept, it would sit beside the real key for its
+    /// version after two rotations, and be the one that is read.
+    #[test]
+    fn a_key_that_was_waiting_does_not_survive_the_older_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_psk(dir.path(), "ch1", &[0x11; 32]).unwrap();
+        let mut ring = read_ring(dir.path(), "ch1").unwrap();
+        ring.keys.push(KeyRingEntry {
+            version: 2,
+            psk_hex: hex::encode([0x4a; 32]),
+            rotated_at: "2026-10-03T00:00:00Z".into(),
+        });
+        write_ring(dir.path(), &ring).unwrap();
+
+        rotate_psk(dir.path(), "ch1", &[0x22; 32], "2026-10-03T00:00:00Z").unwrap();
+        rotate_psk(dir.path(), "ch1", &[0x33; 32], "2026-10-03T00:00:01Z").unwrap();
+        assert_eq!(
+            read_psk_for_version(dir.path(), "ch1", 2, 3).unwrap(),
+            [0x22; 32]
+        );
+        assert_eq!(
+            export_key_ring(dir.path(), "ch1", 3).unwrap(),
+            vec![(1, [0x11; 32]), (2, [0x22; 32]), (3, [0x33; 32])]
+        );
     }
 
     #[test]

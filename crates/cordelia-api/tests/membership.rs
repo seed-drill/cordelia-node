@@ -1174,6 +1174,77 @@ fn t20_a_full_key_ring_does_not_stop_a_removal() {
     assert_eq!(c.key(&personal), a.key(&personal));
 }
 
+/// T16. One of your devices, taken over and not yet removed, sends a state
+/// that changes nothing but carries a key for the version the channel will
+/// have next. If that key were kept, the removal that follows would put it
+/// in place as the channel's new key, and the removed device would go on
+/// reading. A state may carry no key above its own version.
+#[test]
+fn t16_a_state_cannot_carry_the_key_a_removal_will_make() {
+    let (a, b, c, personal) = three_devices();
+    let all = [a.pk(), b.pk(), c.pk()];
+    let chosen = [0x4a; 32];
+
+    let mut ahead = state_at(&c, &personal, epoch_of(&a, &personal) + 1, &all, true);
+    ahead.keys.push((ahead.key_version + 1, chosen));
+    // Sealed without the sender's check, as a hostile sender would.
+    let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&a.pk());
+    let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &ahead.to_cbor().unwrap())
+        .unwrap()
+        .to_bytes();
+    insert_signed(&c.state.identity, &a, sealed);
+    let summary = membership::process_inbox(&a.state).unwrap();
+    assert_eq!(summary.invalid, 1, "{summary:?}");
+
+    membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_ne!(a.key(&personal), chosen);
+    deliver(&a, &b);
+    assert_eq!(b.key(&personal), a.key(&personal));
+}
+
+/// T16. The same key, already in this device's key ring file (a version of
+/// the node that kept it, or anything else that wrote it there), and
+/// another waiting for the version after. The removal makes its own key
+/// all the same, hands that one to the devices that remain, and neither
+/// waiting key is left in the file.
+#[test]
+fn t16_a_key_waiting_for_the_next_version_is_not_used_by_a_removal() {
+    let (a, b, c, personal) = three_devices();
+    let chosen = [0x4a; 32];
+    let version = a.key_version(&personal);
+
+    let later = [0x4b; 32];
+    let mut ring = psk::read_ring(&a.state.home_dir, &personal).unwrap();
+    for (ahead, key) in [(1, chosen), (2, later)] {
+        ring.keys.push(psk::KeyRingEntry {
+            version: version + ahead,
+            psk_hex: hex::encode(key),
+            rotated_at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+    psk::write_ring(&a.state.home_dir, &ring).unwrap();
+
+    membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_eq!(a.key_version(&personal), version + 1);
+    assert_ne!(a.key(&personal), chosen);
+    let recorded = {
+        let db = a.state.db.lock().unwrap();
+        channels::get_by_id(&db, &personal).unwrap().psk_hash
+    };
+    assert_eq!(
+        recorded.as_deref(),
+        Some(&cordelia_crypto::sha256(&a.key(&personal))[..])
+    );
+    deliver(&a, &b);
+    assert_eq!(b.key(&personal), a.key(&personal));
+    for node in [&a, &b] {
+        let ring = psk::read_ring(&node.state.home_dir, &personal).unwrap();
+        for waiting in [chosen, later] {
+            assert!(ring.keys.iter().all(|e| e.psk_hex != hex::encode(waiting)));
+        }
+    }
+}
+
 /// T20. One of your devices, taken over, sends a state whose key version
 /// is the largest there is, so that no key could follow it and no device
 /// could be removed. A state may move the key version only as far as its
