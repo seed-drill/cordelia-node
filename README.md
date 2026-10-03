@@ -113,8 +113,8 @@ memory sync. For status bars:
   that syncs and its name, what was found and is not syncing, what your
   other devices sync, items waiting to reach a relay and any that a relay
   refused, last change, the conflict files waiting to be merged, the files
-  that are too large to sync, and any that could not be synced in the last
-  cycle, each with why.
+  that are too large to sync, and the files that could not be synced in the
+  last cycle, each with why (the first hundred, and how many more).
 
 To show it in Claude Code, add this to `~/.claude/settings.json` (use the full
 path, e.g. `~/.cordelia/bin/cordelia`, if `cordelia` is not on the `PATH`

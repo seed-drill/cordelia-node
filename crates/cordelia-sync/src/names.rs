@@ -20,10 +20,10 @@ pub fn is_safe_file_name(name: &str) -> bool {
 /// Name of the file holding this device's version of `name` after a
 /// conflict: `notes.md` -> `notes.conflict-<tag>.md`.
 ///
-/// It is always a name that can be a file's. Where the name is so long
-/// that the conflict name would be longer than a file name can be, the
-/// name is cut short and marked with the start of its hash, so that two
-/// long names that begin alike do not get one conflict name:
+/// It is never longer than 255 bytes, which is as long as a file name can
+/// usually be. Where the name is so long that the conflict name would be
+/// longer, the name is cut short and marked with the start of its hash,
+/// so that two long names that begin alike do not get one conflict name:
 /// `<start of the name>-<8 hex digits>.conflict-<tag>.md`. Without this a
 /// file with such a name could never have a version kept beside it, and
 /// would be left out of sync from its first conflict on.

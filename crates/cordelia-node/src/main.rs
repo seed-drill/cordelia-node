@@ -2909,8 +2909,9 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
 
 /// What a folder's row in `cordelia sync status` says of it, from its
 /// report: why it does not sync, or that it does, and how many of its
-/// files could not be synced in the last cycle. (Those are named, each
-/// with why, among the errors at the end.)
+/// files could not be synced in the last cycle. (The first five are
+/// named, each with why, among the errors at the end, and the rest are
+/// counted there.)
 fn folder_state(folder: &serde_json::Value) -> String {
     if let Some(error) = folder["error"].as_str() {
         return format!("error: {error}");
