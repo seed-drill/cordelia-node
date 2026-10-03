@@ -1482,6 +1482,16 @@ fn home_memory_syncs_under_any_name() {
         assert!(said.contains(why), "{asked:?}: {said}");
         assert!(!said.contains("unmap"), "{asked:?}: {said}");
     }
+    // The flag given for another folder: what is said about home memory
+    // is said in full.
+    let said = a.refused(&["sync", "map", &notes, "other", "--home"]);
+    assert!(
+        said.contains(
+            "--home is for the home directory itself. To sync home memory: \
+             cordelia sync home on"
+        ),
+        "{said}"
+    );
     let s = state(&a);
     assert_eq!(mapped_names(&s), ["lab", "team"], "{s}");
     assert_eq!(s["sync"]["home"], true, "{s}");
@@ -1569,6 +1579,21 @@ fn home_memory_syncs_under_any_name() {
     assert!(!status.contains("cordelia sync map ~ --home"), "{status}");
     assert!(!status.contains("(your other devices sync it)"), "{status}");
 
+    // The name home memory last had can be another folder's by now. A
+    // refusal of `map` then does not offer `home on`, which the node
+    // would refuse: it says why, and how to map home under a name.
+    a.cli(&["sync", "map", &path(&a_lab), "team"]);
+    let said = a.refused(&["sync", "map", &path(&a.home())]);
+    assert!(
+        said.contains("Home memory cannot be put back as team")
+            && said.contains("cordelia sync map ~ <name> --home"),
+        "{said}"
+    );
+    assert!(!said.contains("home on"), "{said}");
+    a.cli(&["sync", "unmap", &path(&a_lab)]);
+    let said = a.refused(&["sync", "map", &path(&a.home())]);
+    assert!(said.contains("cordelia sync home on"), "{said}");
+
     // On again: under the name it had, so into the channel it was in.
     let out = a.cli(&["sync", "home", "on"]);
     assert!(
@@ -1596,7 +1621,13 @@ fn home_memory_syncs_under_any_name() {
 
     // Found, and not mapped: where everything found syncs, home syncs as
     // `~`. Turned off and on again it is `~`, not a name it once had.
-    a.cli(&["sync", "unmap", "crew"]);
+    // (Home is unmapped here by its folder, as the two steps that `map`
+    // gives for a home mapped under another name spell it.)
+    let out = a.cli(&["sync", "unmap", "~"]);
+    assert!(
+        out.contains("No longer synced from this device: ~ (crew)."),
+        "{out}"
+    );
     a.cli(&["sync", "claude", "--all"]);
     a.cli(&["sync", "include", &path(&a.home())]);
     wait_for("a's home is found, and syncs as ~", &all, 120, || {

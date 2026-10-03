@@ -1623,15 +1623,39 @@ fn home_offer(typed: &str, home_dir: &std::path::Path) -> Result<String, String>
     }
 }
 
-/// The mapping a word names, if it names one: by the name as typed, in
-/// its one spelling, or as it is stored. (An earlier version could store a
-/// name that ends in `.git`, which the one spelling takes off.)
+/// The mapping a word names, if it names one: by the name as it is
+/// stored, or else in its one spelling. (An earlier version could store a
+/// name that ends in `.git`, which the one spelling takes off. Where one
+/// mapping is stored as `x.git` and another as `x`, `x.git` names the
+/// first.)
+///
+/// A word that ends in `/` is a folder, as a shell completes one, and
+/// names no mapping.
 fn mapping_named<'a>(mappings: &'a [(String, String)], word: &str) -> Option<&'a (String, String)> {
+    let word = word.trim();
+    if word.ends_with('/') {
+        return None;
+    }
+    let as_stored = word.to_lowercase();
     let as_name = normalise_project(word);
-    let as_stored = word.trim().to_lowercase();
+    [as_stored, as_name]
+        .iter()
+        .find_map(|spelt| mappings.iter().find(|(_, name)| name == spelt))
+}
+
+/// The mapping that stands in the way of an exclusion: one whose name or
+/// folder is what would be stored (`project`), or that the word as typed
+/// names. A mapped folder syncs whatever is excluded, so excluding it
+/// would say something that is not so.
+fn mapping_in_the_way<'a>(
+    mappings: &'a [(String, String)],
+    project: &str,
+    typed: &str,
+) -> Option<&'a (String, String)> {
     mappings
         .iter()
-        .find(|(_, name)| name == word || *name == as_name || *name == as_stored)
+        .find(|(folder, name)| name == project || folder == project)
+        .or_else(|| mapping_named(mappings, typed))
 }
 
 /// The mappings as the node's own check takes them.
@@ -2391,11 +2415,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             let project = exclusion(&typed)?;
             let settings = sync_settings(config_path)?;
             let mappings = declared_mappings(&settings);
-            if let Some((folder, name)) = mappings
-                .iter()
-                .find(|(folder, name)| *name == project || *folder == project)
-                .or_else(|| mapping_named(&mappings, &typed))
-            {
+            if let Some((folder, name)) = mapping_in_the_way(&mappings, &project, &typed) {
                 anyhow::bail!(
                     "{} is mapped on this device. To stop syncing it: cordelia sync unmap {}",
                     short_path(folder),
@@ -3432,14 +3452,18 @@ mod tests {
         assert_eq!((made.get(), slot), (2, Some("/b")));
     }
 
-    /// A word names a mapping as it was typed, in its one spelling, or as
-    /// the name is stored. An earlier version could store a name that ends
-    /// in `.git`: the one spelling takes that off, so such a name is found
-    /// as it is stored, in whatever case it is typed.
+    /// A word names a mapping as the name is stored, or else in its one
+    /// spelling. An earlier version could store a name that ends in
+    /// `.git`: the one spelling takes that off, so such a name is found as
+    /// it is stored, in whatever case it is typed, and before a mapping
+    /// that has the name without the ending.
     #[test]
-    fn test_a_mapping_is_named_as_typed_tidied_or_as_stored() {
+    fn test_a_mapping_is_named_as_stored_or_tidied() {
         let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        // The mapping with the shorter name comes first, so that taking
+        // the first that matches in any spelling would take the wrong one.
         let mappings = [
+            pair("/home/sam/c", "old"),
             pair("/home/sam/a", "team"),
             pair("/home/sam/b", "old.git"),
             pair("/home/sam", "~"),
@@ -3450,13 +3474,42 @@ mod tests {
             ("team.git", "/home/sam/a"),
             ("old.git", "/home/sam/b"),
             ("OLD.GIT", "/home/sam/b"),
+            (" Old.Git ", "/home/sam/b"),
+            ("old", "/home/sam/c"),
+            ("old.git.git", "/home/sam/c"),
             ("~", "/home/sam"),
         ] {
             let found = mapping_named(&mappings, word).map(|(folder, _)| folder.as_str());
             assert_eq!(found, Some(folder), "{word:?}");
         }
-        for word in ["old", "other", "/home/sam/a", ""] {
+        // A word that ends in `/` is a folder, and names nothing.
+        for word in ["other", "/home/sam/a", "", "team/", "old.git/", " team/ "] {
             assert_eq!(mapping_named(&mappings, word), None, "{word:?}");
+        }
+    }
+
+    /// An exclusion is refused for a mapping whose name or folder is what
+    /// would be stored, and for one the word as typed names: a name that
+    /// an earlier version stored with `.git` is not what the exclusion is
+    /// stored as, and is still in the way.
+    #[test]
+    fn test_a_mapping_stands_in_the_way_of_an_exclusion() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let mappings = [pair("/home/sam/a", "team"), pair("/home/sam/b", "old.git")];
+        for (typed, folder) in [
+            ("team", Some("/home/sam/a")),
+            ("Team.git", Some("/home/sam/a")),
+            ("/home/sam/a", Some("/home/sam/a")),
+            // Stored as `old`, which is no mapping's name: found by the
+            // word as typed.
+            ("old.git", Some("/home/sam/b")),
+            ("OLD.GIT", Some("/home/sam/b")),
+            ("old", None),
+            ("github.com/o/r", None),
+        ] {
+            let project = cordelia_api::sync::clean_exclusion(typed).unwrap();
+            let found = mapping_in_the_way(&mappings, &project, typed).map(|(f, _)| f.as_str());
+            assert_eq!(found, folder, "{typed:?}");
         }
     }
 
