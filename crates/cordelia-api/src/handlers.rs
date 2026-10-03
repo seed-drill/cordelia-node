@@ -543,6 +543,9 @@ pub async fn dm(
     // Decode peer's Ed25519 public key from Bech32
     let peer_pk_bytes = cordelia_crypto::bech32::decode_public_key(&body.peer)
         .map_err(|e| ApiError::BadRequest(format!("invalid peer: {e}")))?;
+    // Before anything is made for it: there must be a key to seal to.
+    let peer_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk_bytes)
+        .ok_or_else(|| ApiError::BadRequest("invalid peer: not a usable public key".into()))?;
 
     let db = state
         .db
@@ -577,8 +580,6 @@ pub async fn dm(
             psk::write_psk(&state.home_dir, &ch.channel_id, &new_psk)?;
 
             // Create ECIES envelope wrapping PSK for peer's X25519 key
-            let peer_x25519 =
-                cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk_bytes);
             let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &new_psk)
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -727,6 +728,9 @@ pub async fn group_invite(
 
     let peer_pk = cordelia_crypto::bech32::decode_public_key(&body.member)
         .map_err(|e| ApiError::BadRequest(format!("invalid member: {e}")))?;
+    // Before it is made a member: there must be a key to seal to.
+    let peer_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk)
+        .ok_or_else(|| ApiError::BadRequest("invalid member: not a usable public key".into()))?;
 
     let db = state
         .db
@@ -763,7 +767,6 @@ pub async fn group_invite(
 
     // Wrap current PSK in ECIES envelope for the invitee
     let channel_psk = psk::read_psk(&state.home_dir, &body.channel_id)?;
-    let peer_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&peer_pk);
     let envelope = cordelia_crypto::ecies::ecies_encrypt(&peer_x25519, &channel_psk)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -861,7 +864,12 @@ pub async fn group_remove(
     // Distribute new PSK to remaining members via ECIES envelopes
     let member_keys = channels::list_active_member_keys(&db, &body.channel_id)?;
     for member_pk in &member_keys {
-        let member_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk);
+        // A member whose key is not a usable public key is sent nothing.
+        let Some(member_x25519) = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk)
+        else {
+            tracing::warn!("a member's key is not a usable public key; not sending it the new key");
+            continue;
+        };
         let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -985,8 +993,15 @@ pub async fn rotate_psk_handler(
 
     // Distribute to all active members
     let member_keys = channels::list_active_member_keys(&db, &channel_id.0)?;
+    let mut members_notified = 0;
     for member_pk in &member_keys {
-        let member_x25519 = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk);
+        // A member whose key is not a usable public key is sent nothing.
+        let Some(member_x25519) = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk)
+        else {
+            tracing::warn!("a member's key is not a usable public key; not sending it the new key");
+            continue;
+        };
+        members_notified += 1;
         let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -1035,7 +1050,7 @@ pub async fn rotate_psk_handler(
         ok: true,
         channel: body.channel.clone(),
         new_key_version,
-        members_notified: member_keys.len() as i64,
+        members_notified,
     }))
 }
 

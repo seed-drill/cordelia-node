@@ -51,8 +51,8 @@ pub struct InboxSummary {
     pub pending: usize,
     pub superseded: usize,
     pub invalid: usize,
-    /// States from this person's devices that name a key this device does
-    /// not know as one of them, kept until it does.
+    /// States that name a key this device does not know as one of this
+    /// person's devices (their sender's, or another), kept until it does.
     pub held: usize,
     /// What the person should know: why something they asked for did not
     /// happen.
@@ -219,6 +219,17 @@ fn build_state(
             tracing::warn!(
                 channel = %channel_id,
                 "leaving a key that is not one of this person's devices out of the channel's state"
+            );
+            continue;
+        }
+        // Nor is a key that is no device's. One stored before such keys
+        // were refused would otherwise make every state this node builds
+        // one it cannot send.
+        if !cordelia_crypto::identity::is_usable_public_key(&key) {
+            tracing::warn!(
+                channel = %channel_id,
+                key = %hex::encode(key),
+                "leaving a key that is not a usable public key out of the channel's state"
             );
             continue;
         }
@@ -669,6 +680,83 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
     Ok(added)
 }
 
+/// Take each stored key that is not a usable public key off: from the
+/// keys this device trusts, and from the members of every channel it has a
+/// row for. Returns the keys that went. It is done when the node starts.
+///
+/// Such a key can only have been stored before they were refused. From
+/// here on nothing is sealed to it and nothing written under it counts in
+/// a channel. What this device had stored to send to it is deleted, so
+/// that none of it is sent now.
+///
+/// No channel's key is changed, here or anywhere, on account of such a
+/// key, and nothing is kept about it. In this version of the protocol a
+/// change of key is a change of membership that one device publishes, and
+/// one made from a list that is behind can undo a removal made on another
+/// device. So a channel that listed such a key keeps the key it had
+/// (decision 2026-09-30 §9), and the log says so here, for each key, with
+/// the channels that listed it.
+///
+/// A start that is cut short leaves what is not yet done to the next: a
+/// key is found by its rows and by the trust in it, and those go last.
+pub fn drop_unusable_keys(state: &AppState) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let pk = state.identity.public_key();
+    let db = lock(state)?;
+    let mut keys = channels::all_active_member_keys(&db)?;
+    let trusted = trust::list(&db)?;
+    keys.extend(
+        trusted
+            .iter()
+            .filter(|t| t.revoked_at.is_none())
+            .map(|t| t.key),
+    );
+    keys.sort();
+    keys.dedup();
+    keys.retain(|key| !cordelia_crypto::identity::is_usable_public_key(key));
+
+    for key in &keys {
+        // Said before anything is taken off, so that a start that is cut
+        // short has said it, and with the channels named: nothing else
+        // records which they were.
+        let listed: Vec<String> = channels::list_for_entity(&db, key)?
+            .into_iter()
+            .map(|ch| ch.channel_id)
+            .collect();
+        tracing::warn!(
+            key = %hex::encode(key),
+            channels = ?listed,
+            "a key that is no device's was stored among this person's devices. It is taken \
+             off, and nothing is sealed to it or taken from it now. The channels that listed \
+             it keep the keys they had: others may have read what those channels hold and \
+             written to them, and may read them until their keys change (see the known \
+             limits in the decision record)"
+        );
+        for ch in channels::list_owned_groups(&db, &pk)? {
+            if channels::is_member(&db, &ch.channel_id, key)? {
+                offers::forget(&db, &ch.channel_id, key)?;
+            }
+        }
+        channels::drop_stored(&db, &naming::inbox_channel_id(key))?;
+        channels::remove_member_everywhere(&db, key)?;
+        trust::revoke(&db, key)?;
+    }
+    Ok(keys)
+}
+
+/// Refuse bytes that cannot be a device's key: not a point on the curve,
+/// or a point that is not of the order every real key has (see
+/// [`cordelia_crypto::identity::x25519_pub_from_ed25519_pub`] for each
+/// kind). Such a key is never made a device, never trusted, and never
+/// sealed to.
+fn not_a_device_key(key: &[u8; 32]) -> Result<(), CordeliaError> {
+    if cordelia_crypto::identity::is_usable_public_key(key) {
+        return Ok(());
+    }
+    Err(CordeliaError::Validation(
+        "that is not a device's key: check it against `cordelia id` on the other device".into(),
+    ))
+}
+
 /// Add another of this person's devices: trust it, and make it an owner of
 /// the personal channel (created if needed), whose new epoch goes to every
 /// member. It joins project channels on its own, as it finds those projects
@@ -685,6 +773,7 @@ pub fn add_device(
             "that is this device's own key".into(),
         ));
     }
+    not_a_device_key(device)?;
 
     let db = lock(state)?;
     ensure_own_inbox_locked(state, &db)?;
@@ -720,6 +809,7 @@ pub fn accept(
             "that is this device's own key".into(),
         ));
     }
+    not_a_device_key(key)?;
     let stays = {
         let db = lock(state)?;
         ensure_own_inbox_locked(state, &db)?;
@@ -779,6 +869,12 @@ fn staying_note(why: &str) -> String {
 /// Remove one of this person's devices: revoke trust, remove it from every
 /// group channel this node owns, and rotate each of those channels' keys so
 /// it cannot read anything written afterwards.
+///
+/// A key that is not a usable public key is no device, and is refused. If
+/// this device listed it, it took it off when it started, and nothing is
+/// changed on its account (see [`drop_unusable_keys`]). In particular
+/// nothing "written" under it is published again: under a point of small
+/// order anyone could have signed it.
 pub fn remove_device(
     state: &AppState,
     device: &[u8; 32],
@@ -787,6 +883,15 @@ pub fn remove_device(
     if *device == pk {
         return Err(CordeliaError::Validation(
             "cannot remove this device from itself".into(),
+        ));
+    }
+    if !cordelia_crypto::identity::is_usable_public_key(device) {
+        return Err(CordeliaError::Validation(
+            "that is not a usable public key, so it is no device's key, and nothing is \
+             removed. If this device listed it, this device took it off when it started. A \
+             device of yours on an older version may still list it. The channels that \
+             listed it keep their keys (see the known limits in the decision record)"
+                .into(),
         ));
     }
 
@@ -934,9 +1039,10 @@ pub fn list_pending(state: &AppState) -> Result<Vec<invites::PendingInvite>, Cor
 }
 
 /// The invitations that wait for `accept`, oldest first: those from a key
-/// this device has not accepted. Anything else that waits is from one of
-/// this person's own devices and waits for another reason (see
-/// `process_one`).
+/// this device has not accepted. A state that is held and whose sender
+/// this device does not trust is among them (it is stored as they are).
+/// Anything else that waits is from a device this one trusts, and waits
+/// for another reason (see `process_one`).
 fn waiting_for_accept(
     db: &Connection,
     pk: &[u8; 32],
@@ -1045,10 +1151,16 @@ fn process_one(
     if author == pk {
         return invalid("sent by this node");
     }
+    // No device has a key that is not a usable public key, and under one
+    // of small order anyone can sign. Nothing is taken from such a sender,
+    // whatever this device has stored about it.
+    if !cordelia_crypto::identity::is_usable_public_key(&author) {
+        return invalid("sender's key is not a usable public key");
+    }
     if !verify_item_signature(item) {
         return invalid("bad signature");
     }
-    let Ok(cs) = ChannelState::open(&state.identity, &item.encrypted_blob) else {
+    let Ok(mut cs) = ChannelState::open(&state.identity, &item.encrypted_blob) else {
         return invalid("cannot open or validate channel state");
     };
     if cs.sender != author {
@@ -1089,6 +1201,13 @@ fn process_one(
                 return invalid("state moves the key version further than its changes can");
             }
             let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id.as_str());
+            // A state from a sender that is not this person's device names
+            // a stranger whatever else it lists, since a state lists its
+            // sender. It is held before its keys are looked at.
+            if !is_personal && !is_own_device(db, &pk, &author)? {
+                return Ok((InviteStatus::Held, channel_id));
+            }
+            leave_out_unusable_keys(state, &mut cs);
             if !is_personal && names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
@@ -1121,11 +1240,17 @@ fn process_one(
                     }
                     return Ok((InviteStatus::Pending, channel_id));
                 }
+                leave_out_unusable_keys(state, &mut cs);
                 apply(state, db, &cs, true, true)?;
                 meta::set(db, meta::ACCEPTED_PERSONAL_FROM, "")?;
                 answer(state, db, &channel_id, &author);
                 return Ok((InviteStatus::Accepted, channel_id));
             }
+            // As above: held before its keys are looked at.
+            if !is_own_device(db, &pk, &author)? {
+                return Ok((InviteStatus::Held, channel_id));
+            }
+            leave_out_unusable_keys(state, &mut cs);
             if names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
@@ -1134,6 +1259,37 @@ fn process_one(
             Ok((InviteStatus::Accepted, channel_id))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Leave out of a state the keys that are not usable public keys. Such a
+/// key is no member, whatever a state says, and however many it lists. The
+/// rest of the state is taken: refusing the whole, or holding it, would
+/// lose a removal that a device not yet upgraded made while its list still
+/// held such a key.
+///
+/// Checking a key costs a multiplication on the curve, and a state lists up
+/// to 1,024. So this is done only for a state that has passed every test
+/// that would make it wait without a look: it is from an owner of the
+/// channel or a device this one trusts, it is newer, and for a channel
+/// that is not the personal one its sender is one of this person's
+/// devices. What a stranger sent waits unchecked. A state that is then
+/// held for naming a stranger is looked at again on every pass, and the
+/// answer for each of its keys is remembered ([`UsableKeys`]): the same
+/// answer, at the cost of a lookup.
+///
+/// [`UsableKeys`]: crate::state::UsableKeys
+fn leave_out_unusable_keys(state: &AppState, cs: &mut ChannelState) {
+    let before = cs.members.len();
+    cs.members
+        .retain(|member| state.usable_keys.is_usable(&member.key));
+    let left_out = before - cs.members.len();
+    if left_out > 0 {
+        tracing::warn!(
+            channel = %cs.channel_id,
+            left_out,
+            "a channel state lists keys that are not usable public keys; they are left out"
+        );
     }
 }
 

@@ -1137,6 +1137,7 @@ mod tests {
             outbox_refused: Default::default(),
             relist: Default::default(),
             sync_control: Default::default(),
+            usable_keys: Default::default(),
         }
     }
 

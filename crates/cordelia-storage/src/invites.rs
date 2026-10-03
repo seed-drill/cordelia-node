@@ -34,12 +34,13 @@ pub enum InviteStatus {
     Invalid,
     /// Valid, but not newer than the state this node already applied.
     Superseded,
-    /// Valid and from one of this person's devices, but it names a key this
-    /// device does not know as one of them. Reconsidered each time the
-    /// inbox is processed: the key may be a device this one has not heard
-    /// of yet. If it never becomes one, the state is never applied. Stored
-    /// as pending (the table has no value of its own for it); what tells
-    /// the two apart is who sent it.
+    /// Valid, and from an owner of the channel or a device this one
+    /// trusts, but it names a key this device does not know as one of this
+    /// person's devices: its sender's, or another. Reconsidered each time
+    /// the inbox is processed: the key may be a device this one has not
+    /// heard of yet. If it never becomes one, the state is never applied.
+    /// Stored as pending (the table has no value of its own for it); what
+    /// tells the two apart is who sent it.
     Held,
 }
 

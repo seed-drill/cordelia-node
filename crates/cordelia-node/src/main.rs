@@ -812,6 +812,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
+        usable_keys: Default::default(),
     });
 
     // Personal nodes receive invites and channel states in an inbox channel
@@ -819,6 +820,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     if config.network.role == "personal" {
         let inbox = cordelia_api::membership::ensure_own_inbox(&state)?;
         tracing::info!(%inbox, "inbox ready");
+        // Keys that are no device's are no longer taken. One that was
+        // stored before is taken off now, and the log says so. No
+        // channel's key is changed by that.
+        cordelia_api::membership::drop_unusable_keys(&state)?;
     }
 
     // Start the tokio/actix runtime with graceful shutdown
