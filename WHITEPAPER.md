@@ -284,10 +284,17 @@ any key. No relay holds a channel key in any form.
 **Who can read a channel:** the devices its owner added, and nobody else. Memory
 is never shared between people: an agent reads its memory as its own notes, so
 another person's text there would act with the agent's authority (decision
-record §4.7). A removed device keeps what it already had but cannot read
-anything written after the key rotation that removal triggers, and its later
-writes are ignored because it is no longer a member. What it wrote before is
-kept: the device that removes it publishes those entries again.
+record §4.7). A removed device keeps what it already had. The device that
+removes it changes the key of each channel in which it finds the removed
+device, and sends each new key only to the devices that remain in that
+channel. Each of them starts to use the new key when it applies the channel's
+new state. It stops taking what the removed device writes there once it has
+applied that state and the personal channel's. A device that has not applied
+the channel's new state still writes under the key from before, and still
+takes what the removed device writes there (decision record §9). What the
+removed device last wrote in a channel is kept, as far as the device that
+changes that channel's key holds it: that device publishes those entries
+again.
 
 The threats Cordelia defends against, the ones it does not, and the tests
 that prove each claim are in
@@ -305,7 +312,7 @@ readable only by the user).
 | Someone answers for a relay's name, or claims another node's key | A node's identity is the key its certificate carries. Devices know their relays by key and refuse any other. |
 | Stranger writes to a channel | Items from non-members are ignored, and devices do not store them; no storage rule lets one author's items hide, displace or sweep away another's. |
 | Stranger invites a device | Invitations apply only from trusted keys; others wait for `accept`. A channel of your own is only ever handed to your own devices. |
-| Lost or stolen device | `remove-device` from any other device removes it everywhere and rotates keys. The change is offered until every remaining device confirms it. A device only ever held keys for the projects it had. |
+| Lost or stolen device | `remove-device` from any other device removes it from the channels the two share and rotates those channels' keys. Each other device applies the change to a channel only when its node has received that channel's new state, and until then acts in that channel as it did before the removal (decision record §9). The change is offered until every remaining device confirms it. A device only ever held keys for the projects it had. |
 | Replayed old channel state | Epoch ordering: stale states are ignored. Epochs, key versions and revisions are bounded, so none can be run out. |
 | Malicious file names | Only plain names are written, only inside the memory folder. |
 | Burst writes, floods | One size for every entry (64 KB), checked at every hop. Limits for a connection and for its address; a peer that keeps going over is cut off. A storage cap at relays that keeps what was there first. Pending invites capped. |

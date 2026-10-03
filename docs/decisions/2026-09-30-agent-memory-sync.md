@@ -94,7 +94,7 @@ Without a trust check, anyone who knows your public key could add you to a chann
 
 **Revocation.** `cordelia remove-device <key>`, run from any remaining device, revokes trust in the key, removes the device from every channel this device owns, rotates each of those channels' keys, and sends the new state to the remaining members through their inboxes. **As built:** since devices join only the projects they have (4.5), the remover may not be in every project channel. Each device that sees a device dropped from the personal channel therefore removes it from the project channels the remover is not in. Of a channel's remaining owners, the one with the lowest key acts, so two devices never rotate the same channel at once. It is run from one device at a time; two devices changing membership at once can lose one of the changes (section 9).
 
-**A change is offered until each member holds it.** Sending a state once is not enough: a relay can lose it, and a member may be away for weeks. A removal that a device never receives leaves it trusting the removed device.
+**A change is offered until each member confirms it.** Sending a state once is not enough: a relay can lose it, and a member may be away for weeks. A removal that a device never receives leaves it trusting the removed device.
 
 - The device that sends a state remembers it, for each member it was sent to, until that member is seen to hold it.
 - A member that applies a state answers its sender with its own state for the channel, which carries the epoch it now holds. Any state from a member at that epoch or a later one counts as the answer. (An answer is not itself waited for, or two devices would answer each other for ever.)
@@ -102,7 +102,7 @@ Without a trust check, anyone who knows your public key could add you to a chann
 - `cordelia devices` shows a device that has not confirmed a change for ten minutes or more.
 - A device on a version before 0.2.0-alpha.4 applies states and never answers, so it shows as not confirmed until it is upgraded.
 
-**What a removed device wrote.** Once a device is removed, its entries count for nothing: not when a name is read, not towards a name's next revision, not in the sweep of old deletes. So that the channel keeps what it held:
+**What a removed device wrote.** On the device that removes it from a channel, and on each other device once that device has applied that channel's new state and the personal channel's, the removed device's entries in that channel count for nothing: not when a name is read, not towards a name's next revision, not in the sweep of old deletes. So that the channel keeps what it held:
 
 - Just before it removes a device, the removing device publishes again, under its own name, every entry whose current value the removed device wrote: its content, or its delete. It uses the revision the removed device gave the entry, so the new entry takes the old one's place exactly. A device that already holds the entry sees no change; a device that is behind, or is added later, gets it.
 - Only the removing device does this, with what it holds at that moment. A device that learns of the removal later may hold something newer from the removed device. It cannot tell whether that was written before the removal or after it, so it does not publish it. Its sync adapter keeps that version beside the file as a conflict file (4.5), and the file takes the channel's value.
@@ -295,6 +295,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 
 - Two devices changing the membership of the same channel at the same moment can lose one of the changes.
 - A project channel that the removing device is not in is rotated by its remaining owner with the lowest key (4.1). If that device is offline, the rotation waits until it next runs, and until then the removed device can still read what others write to that project.
+- A removal changes a channel's key first on the device that changes it, and on each other device only when that device applies the channel's new state (4.1), not when the removal is made. A device that has not applied it still writes to the channel under the key from before, which the removed device holds, so the removed device can still read what that device writes there. And that device still takes what the removed device writes there: it stores it, and counts it when a name is read. A device that has not applied the personal channel's new state still trusts the removed device (4.1). On the device that changed the key, `cordelia devices` marks a device that has not confirmed the change for ten minutes or more (4.1). The mark shows only that a change has not been confirmed: its absence does not show that every device has applied the removal.
 - Relays keep what they store until they are full: the retention limit (30 days was proposed) is not implemented. It must ship before any public announcement, because every node dials our relays by default. The storage cap is enforced (4.6).
 - The older key-distribution endpoints (`dm`, `group/invite`, `group/remove`, `rotate-psk`) still write key envelopes into the channel itself, which never reach other nodes. v1 doesn't use them; they will move onto sealed channel states or be removed.
 - Home memory synced before 0.2.0-alpha.3 stays in the personal channel as items no version reads any more. A device added later receives them with the rest of that channel, whether or not it maps home memory. Removing them safely needs every device of the person upgraded first (an older version takes a delete there as a delete of its own files), so it is not done yet.
@@ -312,7 +313,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 - Editing and deleting a memory propagates too, and a concurrent edit leaves a conflict file rather than losing either version.
 - The same project's memory lands in the right folder on macOS and Linux, despite the different paths.
 - The relay's database is checked and holds only ciphertext and HMAC slots, with no file names.
-- A removed device cannot read anything written after its removal.
+- A removed device cannot read anything written after its removal. (Not so in every case; see section 9.)
 - Installing on macOS and on Linux reaches a working sync in under five minutes.
 - Sync keeps working when either relay is stopped.
 

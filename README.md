@@ -87,10 +87,13 @@ it, and your other machines keep the last version that did sync;
 `cordelia sync status` names it.
 
 Other commands: `cordelia devices`, `cordelia invites`,
-`cordelia remove-device <key>` (removes a device everywhere and rotates keys),
-`cordelia sync off`. Removing a device keeps what it last wrote. The change
-is offered to your other devices until each has it, and `cordelia devices`
-shows any that has not confirmed.
+`cordelia remove-device <key>` (removes a device from the channels this device
+shares with it, and rotates those channels' keys), `cordelia sync off`.
+Removing a device keeps what it last wrote, as far as this device holds it.
+Each of your other devices applies the removal only when its node has received
+it. It is offered to them until each confirms it, and `cordelia devices`, on
+the device that sent it, marks any that has not after ten minutes. The absence
+of a mark does not show that every device has applied it.
 
 ### Status
 
