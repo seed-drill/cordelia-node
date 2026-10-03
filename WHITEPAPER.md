@@ -51,11 +51,11 @@ off.
 ## 2. What Cordelia does
 
 ```
-MacBook                               iMac
+Laptop                                Desktop
 $ cordelia init                       $ cordelia init
                                       $ cordelia id
                                         cordelia_pk1...    (copy this)
-$ cordelia add-device cordelia_pk1... --name imac
+$ cordelia add-device cordelia_pk1... --name desktop
     On the other device, run:
     cordelia accept cordelia_pk1...  (copy this back)
                                       $ cordelia accept cordelia_pk1...
@@ -104,8 +104,8 @@ A node applies an invitation only from a key it **trusts**:
   screens to the other, in each direction, so each device has been told by its
   owner which key is which.
 - **Through the personal channel**: every member of a person's personal channel
-  is one of their devices, so a third device added from the MacBook is trusted
-  by the iMac without another `accept`.
+  is one of their devices, so a third device added from any one of them is
+  trusted by the others without another `accept`.
 
 Anything else waits in `cordelia invites` until accepted (capped at 100,
 oldest dropped first; nothing a person's own devices sent is dropped to make
