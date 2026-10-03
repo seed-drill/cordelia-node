@@ -1597,8 +1597,8 @@ fn t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting() {
     assert_eq!(text_of(&a, &personal), mine);
 
     // Removing it while it is still on the list is refused as well, so
-    // nothing written under it is published again as this device's. The
-    // forged text counts only until the node next starts.
+    // the removal publishes nothing written under it again as this
+    // device's. The forged text counts only until the node next starts.
     let (a, personal) = forged_over();
     let version = a.key_version(&personal);
     assert!(membership::remove_device(&a.state, &nobody).is_err());

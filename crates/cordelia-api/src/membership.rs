@@ -880,9 +880,10 @@ fn staying_note(why: &str) -> String {
 /// A key that is not a usable public key is no device, and is refused. If
 /// this device listed it, it took it off when it started, and nothing is
 /// changed on its account (see [`drop_unusable_keys`]). In particular
-/// what was "written" under it is not published again as this device's,
-/// as a removed device's entries are: under a point of small order
-/// anyone could have signed it.
+/// the removal does not publish again what was "written" under it, as
+/// it does a removed device's entries: under a point of small order
+/// anyone could have signed it. (What a device had already taken of it
+/// is the sync adapter's: decision 2026-09-30 §4.1.)
 pub fn remove_device(
     state: &AppState,
     device: &[u8; 32],
