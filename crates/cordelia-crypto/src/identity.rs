@@ -180,13 +180,21 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 /// Used when we have only the peer's Ed25519 public key (no seed access).
 ///
 /// `None` when there is no key to derive: the bytes are not a point on the
-/// curve, or the point is one of small order. A secret agreed with either
-/// is the same for everyone (all zero), so whatever was sealed to it could
-/// be opened by anyone.
+/// curve, or the point is not in the subgroup every real key is in.
+///
+/// - A secret agreed with bytes that are not a point, or with a point of
+///   small order, is the same for everyone (all zero). Whatever was sealed
+///   to it could be opened by anyone, and anyone can sign under it.
+/// - A point of mixed order (a real key plus a point of small order) seals
+///   to the real key's holder alone, so it leaks nothing. It is refused
+///   all the same: no device makes such a key, and one key then has one
+///   encoding. It is what libsodium does, and what the test vectors in
+///   `docs/reference/encryption-test-vectors.md` require.
 pub fn x25519_pub_from_ed25519_pub(ed_pk: &[u8; 32]) -> Option<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
+    use curve25519_dalek::traits::IsIdentity;
     let point = CompressedEdwardsY(*ed_pk).decompress()?;
-    (!point.is_small_order()).then(|| point.to_montgomery().to_bytes())
+    (point.is_torsion_free() && !point.is_identity()).then(|| point.to_montgomery().to_bytes())
 }
 
 /// Whether `ed_pk` can be a device's public key: something can be sealed
@@ -420,9 +428,10 @@ mod tests {
         );
     }
 
-    /// T20. Bytes that are not a point on the curve, and the eight points
-    /// of small order, are no device's key: there is no key to seal to. A
-    /// secret agreed with any of them is all zero, whoever agrees it.
+    /// T20. Bytes that are not a point on the curve, the eight points of
+    /// small order, and a real key with one of those added to it, are no
+    /// device's key: there is no key to seal to. A secret agreed with any
+    /// of the first two kinds is all zero, whoever agrees it.
     #[test]
     fn a_key_that_is_not_a_point_or_is_of_small_order_is_no_key() {
         use curve25519_dalek::constants::EIGHT_TORSION;
@@ -432,6 +441,23 @@ mod tests {
             let key = point.compress().to_bytes();
             assert_eq!(x25519_pub_from_ed25519_pub(&key), None, "{key:02x?}");
             assert!(!is_usable_public_key(&key));
+        }
+        // A real key is one; with a point of small order added, it is not.
+        let real = NodeIdentity::generate().unwrap().public_key();
+        assert!(is_usable_public_key(&real));
+        let point = CompressedEdwardsY(real).decompress().unwrap();
+        for torsion in &EIGHT_TORSION[1..] {
+            let mixed = (point + torsion).compress().to_bytes();
+            assert!(!is_usable_public_key(&mixed), "{mixed:02x?}");
+        }
+        // The keys the test vectors say are refused
+        // (docs/reference/encryption-test-vectors.md): a point of order 4,
+        // the identity, bytes that are no point, and a point of mixed
+        // order.
+        for first in [0u8, 1, 2, 5] {
+            let mut key = [0u8; 32];
+            key[0] = first;
+            assert_eq!(x25519_pub_from_ed25519_pub(&key), None, "{first:02x} 00..");
         }
         // About half of all byte strings are not a point: find some.
         let not_points: Vec<[u8; 32]> = (0u8..=255)
@@ -447,8 +473,6 @@ mod tests {
             assert_eq!(x25519_pub_from_ed25519_pub(&key), None);
             assert!(!is_usable_public_key(&key));
         }
-        // What the earlier code sealed to for all of those.
-        assert!(!is_usable_public_key(&[0u8; 32]));
     }
 
     // T3-4 (MEDIUM): Identity file wrong size

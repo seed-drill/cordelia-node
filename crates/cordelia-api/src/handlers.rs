@@ -993,6 +993,7 @@ pub async fn rotate_psk_handler(
 
     // Distribute to all active members
     let member_keys = channels::list_active_member_keys(&db, &channel_id.0)?;
+    let mut members_notified = 0;
     for member_pk in &member_keys {
         // A member whose key nothing can be sealed to is sent nothing.
         let Some(member_x25519) = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(member_pk)
@@ -1000,6 +1001,7 @@ pub async fn rotate_psk_handler(
             tracing::warn!("a member's key is not a usable public key; not sending it the new key");
             continue;
         };
+        members_notified += 1;
         let envelope = cordelia_crypto::ecies::ecies_encrypt(&member_x25519, &new_psk)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -1048,7 +1050,7 @@ pub async fn rotate_psk_handler(
         ok: true,
         channel: body.channel.clone(),
         new_key_version,
-        members_notified: member_keys.len() as i64,
+        members_notified,
     }))
 }
 

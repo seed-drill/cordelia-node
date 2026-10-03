@@ -36,7 +36,7 @@ use ciborium::Value;
 
 use crate::CryptoError;
 use crate::ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt};
-use crate::identity::{NodeIdentity, is_usable_public_key, x25519_pub_from_ed25519_pub};
+use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
 
 /// Payload format version.
 pub const CHANNEL_STATE_VERSION: u64 = 1;
@@ -162,12 +162,6 @@ impl ChannelState {
         }
         if self.role_of(&self.sender) != Some(MemberRole::Owner) {
             return invalid("sender must be an owner in the member list");
-        }
-        // A member is a key the channel's keys are sealed to. Bytes that
-        // are not a usable key can be sealed to only under a secret anyone
-        // can work out.
-        if self.members.iter().any(|m| !is_usable_public_key(&m.key)) {
-            return invalid("member list holds a key that is not a usable public key");
         }
         if self.members.len() > MAX_MEMBERS || self.keys.len() > MAX_KEYS {
             return invalid("channel state exceeds size limits");
@@ -390,6 +384,7 @@ fn as_key(v: &Value, name: &str) -> Result<[u8; 32], CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::is_usable_public_key;
 
     fn sample(sender: &NodeIdentity, recipient: &NodeIdentity) -> ChannelState {
         ChannelState {
@@ -534,12 +529,13 @@ mod tests {
         }
     }
 
-    /// T20. A member is a key the channel's keys are sealed to. A state
-    /// that lists bytes which are not a usable key is not valid, and no
-    /// state is sealed to such a key: the secret it would be sealed under
-    /// is one anyone can work out.
+    /// T20. No state is sealed to bytes that are not a usable key: the
+    /// secret it would be sealed under is one anyone can work out. A state
+    /// that only lists such a key is still read, so that the device that
+    /// reads it can leave the key out and take the rest (a device not yet
+    /// upgraded may send one).
     #[test]
-    fn a_member_whose_key_is_not_usable_is_not_a_valid_state() {
+    fn a_state_is_sealed_to_no_key_that_is_not_usable() {
         let sender = NodeIdentity::generate().unwrap();
         let recipient = NodeIdentity::generate().unwrap();
         let not_a_point = (0u8..=255)
@@ -555,7 +551,7 @@ mod tests {
         identity[0] = 1;
 
         let state = sample(&sender, &recipient);
-        assert!(state.validate().is_ok());
+        assert!(state.seal(&recipient.public_key()).is_ok());
         for bad in [not_a_point, identity, [0u8; 32]] {
             assert!(state.seal(&bad).is_err(), "{bad:02x?}");
 
@@ -564,14 +560,9 @@ mod tests {
                 key: bad,
                 role: MemberRole::Owner,
             });
-            assert!(listed.validate().is_err(), "{bad:02x?}");
-            assert!(listed.seal(&recipient.public_key()).is_err());
-            // Sealed without the check, as a hostile sender would.
-            let to = x25519_pub_from_ed25519_pub(&recipient.public_key()).unwrap();
-            let sealed = ecies_encrypt(&to, &listed.to_cbor().unwrap())
-                .unwrap()
-                .to_bytes();
-            assert!(ChannelState::open(&recipient, &sealed).is_err());
+            let sealed = listed.seal(&recipient.public_key()).unwrap();
+            let opened = ChannelState::open(&recipient, &sealed).unwrap();
+            assert_eq!(opened.members.len(), 3);
         }
     }
 

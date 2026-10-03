@@ -249,7 +249,9 @@ Inputs:
 
 A recipient known by an Ed25519 key has recipient_xpk derived from it
 (§2.2). There is none for bytes that are not a point on the curve, or for
-a point of small order, and nothing is sealed to either.
+a point outside the prime-order subgroup (a point of small order, or a
+real key with one added), and nothing is sealed to any of them. §8.1 has
+one of each.
 
 Steps:
   1. Generate ephemeral X25519 keypair:
@@ -592,7 +594,7 @@ Summary:
 3. libsodium `ed25519_convert.c` seed
 4. ed2curve-js cross-verified seed
 
-Plus 3 invalid public key rejection cases.
+Plus 4 invalid public key rejection cases.
 
 ### 8.2 ECDH Shared Secret
 

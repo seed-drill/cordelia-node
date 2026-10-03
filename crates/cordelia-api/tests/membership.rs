@@ -1245,65 +1245,132 @@ fn t16_a_key_waiting_for_the_next_version_is_not_used_by_a_removal() {
     }
 }
 
+/// Keys that nothing can be sealed to, each all zero after its first
+/// byte: a point of order 4, the identity, bytes that are not a point on
+/// the curve, and a point of mixed order. The first, third and fourth are
+/// the three in `docs/reference/encryption-test-vectors.md`.
+fn unusable_keys() -> Vec<[u8; 32]> {
+    [0u8, 1, 2, 5]
+        .into_iter()
+        .map(|first| {
+            let mut key = [0u8; 32];
+            key[0] = first;
+            key
+        })
+        .collect()
+}
+
 /// T20. Bytes that are not a usable key (not a point on the curve, or a
-/// point of small order) are never a device. Sealing to such a key seals
-/// under a secret anyone can work out, so whatever it was sent could be
-/// read by anyone who fetched its inbox. It is not added, not accepted, not
-/// trusted and sent nothing, and a state that lists it is not a state.
+/// point outside the subgroup every real key is in) are never a device.
+/// Sealing to such a key seals under a secret anyone can work out, so
+/// whatever it was sent could be read by anyone who fetched its inbox. It
+/// is not added, not accepted, not trusted and sent nothing. Listed in a
+/// state from one of your devices, it is left out, and the rest of the
+/// state is taken.
 #[test]
 fn t20_a_key_that_nothing_can_be_sealed_to_is_never_a_device() {
     let (a, b, personal) = paired();
     let before = a.members(&personal);
-    let not_a_point = (0u8..=255)
-        .map(|n| {
-            let mut key = [0x42; 32];
-            key[0] = n;
-            key
-        })
-        .find(|key| !cordelia_crypto::identity::is_usable_public_key(key))
-        .unwrap();
-    let mut identity = [0u8; 32];
-    identity[0] = 1;
     let held_for = |n: &Node, key: &[u8; 32]| {
         let db = n.state.db.lock().unwrap();
         items::query_sync(&db, &naming::inbox_channel_id(key), None, 100)
             .unwrap()
             .len()
     };
+    let trusted = |n: &Node, key: &[u8; 32]| {
+        trust::is_trusted_as(&n.state.db.lock().unwrap(), key, trust::TrustKind::Device).unwrap()
+    };
 
-    for bad in [not_a_point, identity, [0u8; 32]] {
+    for bad in unusable_keys() {
+        assert!(!cordelia_crypto::identity::is_usable_public_key(&bad));
         assert!(membership::add_device(&a.state, &bad, Some("x")).is_err());
         assert!(membership::accept(&a.state, &bad, Some("x")).is_err());
         assert_eq!(a.members(&personal), before, "{bad:02x?}");
         assert_eq!(held_for(&a, &bad), 0, "nothing was sealed to it");
-        assert!(
-            !trust::is_trusted_as(&a.state.db.lock().unwrap(), &bad, trust::TrustKind::Device)
-                .unwrap()
-        );
+        assert!(!trusted(&a, &bad));
 
-        // One of your devices, taken over, lists it in a state. Sealed
-        // without the sender's check, as a hostile sender would.
-        let listed = state_at(
-            &b,
-            &personal,
-            epoch_of(&a, &personal) + 1,
-            &[a.pk(), b.pk(), bad],
-            true,
-        );
-        let to = cordelia_crypto::identity::x25519_pub_from_ed25519_pub(&a.pk()).unwrap();
-        let sealed = cordelia_crypto::ecies::ecies_encrypt(&to, &listed.to_cbor().unwrap())
-            .unwrap()
-            .to_bytes();
-        insert_signed(&b.state.identity, &a, sealed);
+        // One of your devices lists it in a state: taken over, or not yet
+        // upgraded. The state is applied without it.
+        let epoch = epoch_of(&a, &personal) + 1;
+        let listed = state_at(&b, &personal, epoch, &[a.pk(), b.pk(), bad], true);
+        deliver_crafted(&b.state.identity, &a, &listed);
         let summary = membership::process_inbox(&a.state).unwrap();
-        assert_eq!(summary.invalid, 1, "{summary:?}");
+        assert_eq!(
+            (summary.applied.len(), summary.invalid),
+            (1, 0),
+            "{summary:?}"
+        );
+        assert_eq!(epoch_of(&a, &personal), epoch);
         assert_eq!(a.members(&personal), before, "{bad:02x?}");
+        assert!(!trusted(&a, &bad));
+        assert_eq!(held_for(&a, &bad), 0, "nothing was sealed to it");
     }
 
     // A real device is still added, and sent the channel.
     let c = node();
     membership::add_device(&a.state, &c.pk(), None).unwrap();
     assert_eq!(held_for(&a, &c.pk()), 1);
+}
+
+/// T20. A key of that kind that was stored before such keys were refused
+/// blocks nothing, and does not stay. A state this device builds leaves it
+/// out, so a removal made with it still listed is made whole and reaches
+/// the other devices; and when the node starts, the stored row goes.
+#[test]
+fn t20_a_key_that_was_stored_before_blocks_nothing_and_does_not_stay() {
+    let (a, b, personal) = paired();
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), Some("c")).unwrap();
+    relay(&a, &c);
+    membership::accept(&c.state, &a.pk(), Some("a")).unwrap();
+    deliver(&a, &b);
+    let three = a.members(&personal);
+    assert_eq!(three.len(), 3);
+    assert_eq!(b.members(&personal), three);
+
+    // As an older version left it: a member of the personal channel, and
+    // trusted as a device.
+    let bad = unusable_keys();
+    {
+        let db = a.state.db.lock().unwrap();
+        for key in &bad {
+            channels::add_member(&db, &personal, key, "owner").unwrap();
+            trust::trust(&db, key, trust::TrustKind::Device, Some("stored before")).unwrap();
+        }
+    }
+    assert_eq!(a.members(&personal).len(), 3 + bad.len());
+
+    // A removal is made whole: the other device hears of it, and holds
+    // the key that follows it.
+    let before = a.key(&personal);
+    membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_ne!(a.key(&personal), before);
+    deliver(&a, &b);
+    assert_eq!(b.key(&personal), a.key(&personal));
+    let two: Vec<[u8; 32]> = b.members(&personal).into_iter().map(|(k, _)| k).collect();
+    let mut expected = vec![a.pk(), b.pk()];
+    expected.sort();
+    assert_eq!(two, expected);
+    // So is an addition.
+    let d = node();
+    membership::add_device(&a.state, &d.pk(), Some("d")).unwrap();
+    deliver(&a, &b);
+    assert_eq!(b.members(&personal).len(), 3);
+
+    // At start the stored rows go: each from the list and from the keys
+    // this device trusts. Nothing else does.
+    assert_eq!(
+        membership::drop_unusable_keys(&a.state).unwrap(),
+        2 * bad.len()
+    );
+    assert_eq!(a.members(&personal), b.members(&personal));
+    let db = a.state.db.lock().unwrap();
+    for key in &bad {
+        assert!(!trust::is_trusted(&db, key).unwrap());
+    }
+    assert!(trust::is_trusted(&db, &b.pk()).unwrap());
+    drop(db);
+    assert_eq!(membership::drop_unusable_keys(&a.state).unwrap(), 0);
 }
 
 /// T20. One of your devices, taken over, sends a state whose key version

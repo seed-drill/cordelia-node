@@ -819,6 +819,9 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     if config.network.role == "personal" {
         let inbox = cordelia_api::membership::ensure_own_inbox(&state)?;
         tracing::info!(%inbox, "inbox ready");
+        // Keys that nothing can be sealed to are no longer taken. One that
+        // was stored before goes now.
+        cordelia_api::membership::drop_unusable_keys(&state)?;
     }
 
     // Start the tokio/actix runtime with graceful shutdown

@@ -222,6 +222,17 @@ fn build_state(
             );
             continue;
         }
+        // Nor is a key that nothing can be sealed to. One stored before
+        // such keys were refused would otherwise make every state this
+        // node builds one it cannot send.
+        if !cordelia_crypto::identity::is_usable_public_key(&key) {
+            tracing::warn!(
+                channel = %channel_id,
+                key = %hex::encode(key),
+                "leaving a key that is not a usable public key out of the channel's state"
+            );
+            continue;
+        }
         members.push(StateMember {
             key,
             role: MemberRole::parse(&role).map_err(crypto_err)?,
@@ -669,10 +680,46 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
     Ok(added)
 }
 
+/// Remove, from every channel's members and from the keys this device
+/// trusts, each key that is not a usable public key. Returns how many
+/// rows went.
+///
+/// Such a key can only have been stored before they were refused. Left in
+/// place it would still pass for a member: anyone can sign under a key of
+/// small order, so what a stranger wrote under it would count. It is done
+/// when the node starts.
+pub fn drop_unusable_keys(state: &AppState) -> Result<usize, CordeliaError> {
+    let usable = cordelia_crypto::identity::is_usable_public_key;
+    let db = lock(state)?;
+    let mut dropped = 0;
+    // Every channel this device is in, and every channel it holds entries of.
+    let mut channel_ids = channels::list_stored_channel_ids(&db)?;
+    let own = channels::list_for_entity(&db, &state.identity.public_key())?;
+    channel_ids.extend(own.into_iter().map(|c| c.channel_id));
+    channel_ids.sort();
+    channel_ids.dedup();
+    for channel_id in channel_ids {
+        for key in channels::list_active_member_keys(&db, &channel_id)? {
+            if !usable(&key) {
+                channels::remove_member(&db, &channel_id, &key)?;
+                tracing::warn!(channel = %channel_id, key = %hex::encode(key), "removed a member whose key is not a usable public key");
+                dropped += 1;
+            }
+        }
+    }
+    for trusted in trust::list(&db)? {
+        if !usable(&trusted.key) && trust::revoke(&db, &trusted.key)? {
+            tracing::warn!(key = %hex::encode(trusted.key), "stopped trusting a key that is not a usable public key");
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
 /// Refuse bytes that cannot be a device's key: not a point on the curve,
-/// or a point of small order. Nothing can be sealed to such a key except
-/// under a secret that anyone can work out, so it is never made a device,
-/// never trusted, and never sealed to.
+/// or a point outside the subgroup every real key is in. Nothing can be
+/// sealed to such a key except under a secret that anyone can work out, so
+/// it is never made a device, never trusted, and never sealed to.
 fn not_a_device_key(key: &[u8; 32]) -> Result<(), CordeliaError> {
     if cordelia_crypto::identity::is_usable_public_key(key) {
         return Ok(());
@@ -1063,11 +1110,25 @@ fn process_one(
     if !verify_item_signature(item) {
         return invalid("bad signature");
     }
-    let Ok(cs) = ChannelState::open(&state.identity, &item.encrypted_blob) else {
+    let Ok(mut cs) = ChannelState::open(&state.identity, &item.encrypted_blob) else {
         return invalid("cannot open or validate channel state");
     };
     if cs.sender != author {
         return invalid("sealed sender does not match item author");
+    }
+    // A key that nothing can be sealed to is no member, whatever a state
+    // says. It is left out, and the rest of the state is taken: refusing
+    // the whole would lose a removal that a device not yet upgraded made
+    // while its list still held such a key.
+    let listed = cs.members.len();
+    cs.members
+        .retain(|m| cordelia_crypto::identity::is_usable_public_key(&m.key));
+    if cs.members.len() != listed {
+        tracing::warn!(
+            channel = %cs.channel_id,
+            left_out = listed - cs.members.len(),
+            "a channel state lists keys that are not usable public keys; they are left out"
+        );
     }
     let channel_id = cs.channel_id.clone();
 

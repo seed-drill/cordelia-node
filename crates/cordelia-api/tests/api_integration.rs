@@ -633,6 +633,111 @@ async fn test_group_lifecycle() {
     assert_eq!(body["new_key_version"], 2);
 }
 
+/// T20. The older endpoints seal a channel's key to a member too. A key
+/// that nothing can be sealed to is refused before anything is made for
+/// it, and a member of that kind that is already stored is sent nothing.
+#[actix_web::test]
+async fn test_the_older_endpoints_seal_to_no_key_that_is_not_usable() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let post = |uri: &'static str, body: serde_json::Value| {
+        test::TestRequest::post()
+            .uri(uri)
+            .insert_header(auth_header())
+            .set_json(body)
+            .to_request()
+    };
+    // A point of mixed order, and bytes that are not a point.
+    let unusable: Vec<[u8; 32]> = [5u8, 2]
+        .into_iter()
+        .map(|first| {
+            let mut key = [0u8; 32];
+            key[0] = first;
+            key
+        })
+        .collect();
+    let named = |key: &[u8; 32]| cordelia_crypto::bech32::encode_public_key(key).unwrap();
+
+    // A direct channel with such a key is not made.
+    for key in &unusable {
+        let resp = test::call_service(
+            &app,
+            post("/api/v1/channels/dm", json!({ "peer": named(key) })),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "{key:02x?}");
+    }
+    let resp = test::call_service(&app, post("/api/v1/channels/list-dms", json!({}))).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["dms"].as_array().unwrap().len(), 0, "{body}");
+
+    // A group: such a key is not invited, even where an older version had
+    // stored it as one of this person's devices.
+    let resp = test::call_service(
+        &app,
+        post("/api/v1/channels/group", json!({ "mode": "realtime" })),
+    )
+    .await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let group = body["channel_id"].as_str().unwrap().to_string();
+    let real = NodeIdentity::generate().unwrap().public_key();
+    let add = post("/api/v1/devices/add", json!({ "device": named(&real) }));
+    assert_eq!(test::call_service(&app, add).await.status(), 200);
+    {
+        let db = state.db.lock().unwrap();
+        let personal =
+            cordelia_storage::meta::get(&db, cordelia_storage::meta::PERSONAL_CHANNEL_ID)
+                .unwrap()
+                .unwrap();
+        for key in &unusable {
+            cordelia_storage::trust::trust(
+                &db,
+                key,
+                cordelia_storage::trust::TrustKind::Device,
+                None,
+            )
+            .unwrap();
+            cordelia_storage::channels::add_member(&db, &personal, key, "owner").unwrap();
+        }
+    }
+    for key in &unusable {
+        let invite = json!({ "channel_id": group, "member": named(key) });
+        let resp = test::call_service(&app, post("/api/v1/channels/group/invite", invite)).await;
+        assert_eq!(resp.status(), 400, "{key:02x?}");
+    }
+    let invite = json!({ "channel_id": group, "member": named(&real) });
+    let resp = test::call_service(&app, post("/api/v1/channels/group/invite", invite)).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["member_count"], 2, "{body}");
+
+    // Stored as members of the group, they are sent nothing when its key
+    // changes, and are not counted among those who were.
+    {
+        let db = state.db.lock().unwrap();
+        for key in &unusable {
+            cordelia_storage::channels::add_member(&db, &group, key, "member").unwrap();
+        }
+    }
+    let resp = test::call_service(
+        &app,
+        post("/api/v1/channels/rotate-psk", json!({ "channel": group })),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["members_notified"], 2, "{body}");
+    let remove = json!({ "channel_id": group, "member": named(&real) });
+    let resp = test::call_service(&app, post("/api/v1/channels/group/remove", remove)).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["psk_rotated"].as_bool().unwrap(), "{body}");
+}
+
 #[actix_web::test]
 async fn test_rotate_psk() {
     let state = test_state();

@@ -191,9 +191,12 @@ pub fn ecies_decrypt(
 
     let shared = secret.diffie_hellman(&eph_pk);
     // An envelope whose ephemeral key is of small order was sealed under a
-    // secret anyone can work out: it proves nothing about who sealed it.
+    // secret that is the same for every recipient: it would open for any
+    // of them, so it is not an envelope for this one.
     if !shared.was_contributory() {
-        return Err(CryptoError::DecryptionFailed);
+        return Err(CryptoError::InvalidMessage(
+            "the envelope was sealed under a secret that anyone can work out".into(),
+        ));
     }
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
@@ -239,32 +242,46 @@ mod tests {
             );
         }
 
-        // An envelope made by someone who holds no key at all: its
-        // ephemeral key is of small order, so the secret is all zero for
-        // whoever opens it. Without the check, every recipient opens it.
-        let iv = [7u8; IV_LEN];
-        let wrapping_key = hkdf_sha256(&[0u8; 32], &[], HKDF_INFO).unwrap();
-        let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &wrapping_key).unwrap());
-        let mut in_out = b"forged".to_vec();
-        key.seal_in_place_append_tag(
-            Nonce::try_assume_unique_for_key(&iv).unwrap(),
-            Aad::empty(),
-            &mut in_out,
-        )
-        .unwrap();
-        let tag_start = in_out.len() - TAG_LEN;
-        let forged = EciesEnvelope {
-            ephemeral_pk: [0u8; 32],
-            iv,
-            ciphertext: in_out[..tag_start].to_vec(),
-            auth_tag: in_out[tag_start..].try_into().unwrap(),
+        // An envelope made by hand under a given secret, as someone would
+        // who holds no key at all.
+        let sealed_under = |secret: &[u8; 32], ephemeral_pk: [u8; 32]| {
+            let iv = [7u8; IV_LEN];
+            let wrapping_key = hkdf_sha256(secret, &[], HKDF_INFO).unwrap();
+            let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &wrapping_key).unwrap());
+            let mut in_out = b"made by hand".to_vec();
+            key.seal_in_place_append_tag(
+                Nonce::try_assume_unique_for_key(&iv).unwrap(),
+                Aad::empty(),
+                &mut in_out,
+            )
+            .unwrap();
+            let tag_start = in_out.len() - TAG_LEN;
+            EciesEnvelope {
+                ephemeral_pk,
+                iv,
+                ciphertext: in_out[..tag_start].to_vec(),
+                auth_tag: in_out[tag_start..].try_into().unwrap(),
+            }
         };
+        // With an ephemeral key of small order the secret is all zero for
+        // whoever opens it. Without the check, every recipient would.
+        let forged = sealed_under(&[0u8; 32], [0u8; 32]);
         for seed in [[1u8; 32], [2u8; 32]] {
-            let (recipient_sk, _) = x25519_from_ed25519_seed(&seed);
+            let (recipient_sk, recipient_pk) = x25519_from_ed25519_seed(&seed);
             assert!(matches!(
                 ecies_decrypt(&recipient_sk, &forged),
-                Err(CryptoError::DecryptionFailed)
+                Err(CryptoError::InvalidMessage(_))
             ));
+            // The control: made the same way under a secret that is this
+            // recipient's alone, the envelope opens. So the one above is
+            // refused for its secret, and not for how it was made.
+            let ephemeral = StaticSecret::from([9u8; 32]);
+            let secret = ephemeral.diffie_hellman(&PublicKey::from(recipient_pk));
+            let real = sealed_under(secret.as_bytes(), PublicKey::from(&ephemeral).to_bytes());
+            assert_eq!(
+                ecies_decrypt(&recipient_sk, &real).unwrap(),
+                b"made by hand"
+            );
         }
     }
 
