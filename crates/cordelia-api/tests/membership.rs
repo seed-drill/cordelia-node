@@ -166,7 +166,7 @@ fn add_device_then_accept_joins_the_personal_channel() {
     let a = node();
     let b = node();
 
-    let outcome = membership::add_device(&a.state, &b.pk(), Some("imac")).unwrap();
+    let outcome = membership::add_device(&a.state, &b.pk(), Some("desktop")).unwrap();
     let personal = outcome.personal_channel_id.clone();
     assert_eq!(outcome.channels, vec![personal.clone()]);
     assert_eq!(a.personal().as_deref(), Some(personal.as_str()));
@@ -179,7 +179,7 @@ fn add_device_then_accept_joins_the_personal_channel() {
     assert!(b.personal().is_none());
 
     // `accept` trusts A and applies the waiting invite.
-    let accepted = membership::accept(&b.state, &a.pk(), Some("macbook")).unwrap();
+    let accepted = membership::accept(&b.state, &a.pk(), Some("laptop")).unwrap();
     assert_eq!(accepted.applied, vec![personal.clone()]);
     assert!(membership::list_pending(&b.state).unwrap().is_empty());
 

@@ -50,11 +50,11 @@ mod tests {
 
     #[test]
     fn test_union_keeps_both_devices_pointers() {
-        let current = "- [A](a.md) — from mac\n- [B](b.md) — shared\n";
-        let ours = "- [B](b.md) — shared\n- [C](c.md) — from imac\n";
+        let current = "- [A](a.md) — from laptop\n- [B](b.md) — shared\n";
+        let ours = "- [B](b.md) — shared\n- [C](c.md) — from desktop\n";
         assert_eq!(
             merge(current, ours, &none()),
-            "- [A](a.md) — from mac\n- [B](b.md) — shared\n- [C](c.md) — from imac\n"
+            "- [A](a.md) — from laptop\n- [B](b.md) — shared\n- [C](c.md) — from desktop\n"
         );
     }
 

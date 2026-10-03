@@ -200,6 +200,10 @@ pub fn project_for(cwd: &Path, home: &Path) -> Option<Project> {
 /// repository agrees whatever the transport: lowercased, no scheme, user,
 /// credentials, port, trailing `.git` or `/`. Local paths are not portable
 /// across machines and give `None`.
+///
+/// What it gives is a name in its one spelling
+/// (`cordelia_core::sync_name::tidy`), so a project's name typed as an
+/// exclusion is the name the project is found under.
 pub fn normalize_remote(url: &str) -> Option<String> {
     let url = url.trim();
     let (host, path) = if let Some(rest) = url.split_once("://").map(|(_, r)| r) {
@@ -219,15 +223,16 @@ pub fn normalize_remote(url: &str) -> Option<String> {
         return None;
     };
 
-    let path = path.trim_matches('/');
-    let path = path
-        .strip_suffix(".git")
-        .unwrap_or(path)
-        .trim_end_matches('/');
-    if host.is_empty() || path.is_empty() || url.starts_with("file://") {
+    if url.starts_with("file://") {
         return None;
     }
-    Some(format!("{host}/{path}").to_lowercase())
+    let name = cordelia_core::sync_name::tidy(&format!("{host}/{}", path.trim_matches('/')));
+    // A name is a host and a path. Tidied, it does not end in `/`, so
+    // where there is a `/` there is a path after it.
+    match name.split_once('/') {
+        Some((host, _)) if !host.is_empty() => Some(name),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -261,14 +266,53 @@ mod tests {
                 "https://user:secret-token@gitlab.com/group/sub/repo.git",
                 "gitlab.com/group/sub/repo",
             ),
+            // The ending however it is spelled, and however often.
+            (
+                "https://github.com/Seed-Drill/Cordelia-Node.GIT",
+                "github.com/seed-drill/cordelia-node",
+            ),
+            (
+                "git@github.com:seed-drill/cordelia-node.Git",
+                "github.com/seed-drill/cordelia-node",
+            ),
+            (
+                "https://git.example.com/team/repo.git.git",
+                "git.example.com/team/repo",
+            ),
+            (
+                "https://git.example.com/team/repo.git/.git/",
+                "git.example.com/team/repo",
+            ),
+            // Not an ending.
+            (
+                "https://git.example.com/team/repo.github",
+                "git.example.com/team/repo.github",
+            ),
         ];
         for (url, want) in cases {
-            assert_eq!(normalize_remote(url).as_deref(), Some(want), "{url}");
+            let found = normalize_remote(url);
+            assert_eq!(found.as_deref(), Some(want), "{url}");
+            // What is found is a name in its one spelling: an exclusion
+            // typed for it, which is tidied, is that name.
+            assert_eq!(cordelia_core::sync_name::tidy(want), want, "{url}");
+        }
+        // Nothing is left of the path.
+        for no_path in [
+            "https://git.example.com/.git",
+            "https://git.example.com/.GIT/",
+            "git@git.example.com:.git",
+            "https://host.git/",
+        ] {
+            assert_eq!(normalize_remote(no_path), None, "{no_path}");
         }
         for local in [
             "/srv/git/repo.git",
             "../repo",
             "file:///srv/git/repo.git",
+            // A `file` URL that names a host is still a path on a machine.
+            "file://host/srv/git/repo.git",
+            // No host.
+            "https:///team/repo.git",
             "C:\\repos\\x",
             "",
         ] {
