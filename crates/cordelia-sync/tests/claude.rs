@@ -1271,8 +1271,9 @@ fn a_cycle_does_nothing_once_sync_is_off() {
 /// A cycle runs only for the Claude Code directory that is set, and the
 /// directory is the string that is stored: what a folder agrees is
 /// recorded under it, and the handlers forget by it. An adapter started
-/// for another directory, or for another spelling of the same one, does
-/// nothing. The node's loop starts a new one.
+/// for another directory, or for another spelling of the same one, is not
+/// for it, and a cycle of it does nothing. (The node's loop asks the same
+/// question of the adapter it holds, and starts a new one.)
 #[test]
 fn a_cycle_runs_only_for_the_directory_that_is_set() {
     let (mut a, mut b) = paired_explicit();
@@ -1290,8 +1291,11 @@ fn a_cycle_runs_only_for_the_directory_that_is_set() {
     let set = a.home.join(".claude");
     let respelled = PathBuf::from(format!("{}//.claude", a.home.display()));
     assert_eq!(respelled, set, "the same path");
+    let stored = set.display().to_string();
+    assert!(a.adapter.is_for(&stored));
     for other in [a.home.join(".claude-other"), respelled] {
         let mut stale = ClaudeAdapter::new(other.clone(), a.home.clone(), &a.pk());
+        assert!(!stale.is_for(&stored), "{}", other.display());
         let report = stale.run_cycle(&a.state);
         assert!(report.stopped, "{}: {report:?}", other.display());
         assert!(report.folders.is_empty(), "{}", other.display());
@@ -1335,15 +1339,10 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
     assert_eq!(files(&a_mem), ["MEMORY.md", "one.md", "two.md"]);
 
-    // The same when sync is turned off altogether and on again.
+    // The same when sync is turned off altogether and on again, with no
+    // cycle in between: the handler that turned it off forgot.
     claude(&a, serde_json::json!({ "enabled": false }));
     std::fs::remove_file(a_mem.join("one.md")).unwrap();
-    settle(&mut a, &mut b);
-    assert_eq!(
-        read(&a_mem, "one.md"),
-        None,
-        "nothing syncs while it is off"
-    );
     claude(&a, serde_json::json!({}));
     settle(&mut a, &mut b);
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
@@ -1367,7 +1366,9 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     // A goes back to mapped folders only (it has none), loses its copy,
     // then syncs everything it finds again. The same when home memory is
     // turned off and on, and when it is kept out and let in again. Each
-    // is set as the command sets it, through the node's handler.
+    // is set as the command sets it, through the node's handler, and no
+    // cycle runs while the scope is narrow: it is the handler that has
+    // forgotten what the folder agreed, by the time it answers.
     let home = a.home.display().to_string();
     for (narrower, wider) in [
         (
@@ -1384,15 +1385,25 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
         ),
     ] {
         claude(&a, narrower.clone());
-        settle(&mut a, &mut b);
         std::fs::remove_file(a_home.join("profile.md")).unwrap();
-        settle(&mut a, &mut b);
-        assert_eq!(files(&a_home), [""; 0], "{narrower}: it does not sync");
         claude(&a, wider);
         settle(&mut a, &mut b);
         assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
         assert_eq!(files(&a_home), ["profile.md"], "{narrower}");
     }
+
+    // A folder can also stop being found with no command having stopped
+    // it (its transcripts have gone, say). Then no handler forgot for it.
+    // The first cycle that no longer finds it does.
+    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "off");
+    settle(&mut a, &mut b);
+    std::fs::remove_file(a_home.join("profile.md")).unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(files(&a_home), [""; 0], "it does not sync");
+    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_home), ["profile.md"]);
+    assert_eq!(files(&a_home), ["profile.md"]);
 }
 
 /// A mapped folder whose memory directory is gone (its disk is not

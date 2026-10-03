@@ -1026,6 +1026,9 @@ mod tests {
         let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
         set_claude(&s.control, &s.db, &body, None).unwrap();
         assert_eq!(s.names(), ["team"]);
+        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
+        assert_eq!(all.as_deref(), Some("on"));
+        assert!(s.control.generation() > count);
     }
 
     /// The name home memory is put back under is the name it last synced

@@ -1129,7 +1129,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
     use cordelia_storage::meta;
     use cordelia_sync::claude::ClaudeAdapter;
 
-    let adapter: std::sync::Arc<Mutex<Option<(std::path::PathBuf, ClaudeAdapter)>>> =
+    let adapter: std::sync::Arc<Mutex<Option<ClaudeAdapter>>> =
         std::sync::Arc::new(Mutex::new(None));
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
         cordelia_sync::claude::CYCLE_SECS,
@@ -1152,7 +1152,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                 Err(_) => return,
             };
             let Ok(mut slot) = adapter.lock() else { return };
-            let Some(dir) = dir.map(std::path::PathBuf::from) else {
+            let Some(dir) = dir else {
                 // Sync was just turned off: this person's other devices
                 // stop listing what this one synced. If the settings
                 // change under it, the adapter is kept, and the next turn
@@ -1169,19 +1169,17 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                 }
                 return;
             };
-            // Compared as it is stored, not as a path: see `run_cycle_under`.
-            if slot
-                .as_ref()
-                .is_none_or(|(d, _)| d.as_os_str() != dir.as_os_str())
-            {
+            // One adapter, for the directory that is set, as it is stored:
+            // a cycle of any other does nothing (`ClaudeAdapter::is_for`).
+            if slot.as_ref().is_none_or(|running| !running.is_for(&dir)) {
                 let home = std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_default();
                 let pk = state.identity.public_key();
-                *slot = Some((dir.clone(), ClaudeAdapter::new(dir, home, &pk)));
+                *slot = Some(ClaudeAdapter::new(dir.into(), home, &pk));
                 tracing::info!("sync adapter started");
             }
-            let Some((_, running)) = slot.as_mut() else {
+            let Some(running) = slot.as_mut() else {
                 return;
             };
             // The report carries the settings count it was made under: a
@@ -1987,8 +1985,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 // never because a folder inside it was named.
                 let names_home = given == home_dir;
                 // What each refusal offers is `home on`, which puts home
-                // memory back under the name it last had here. A name the
-                // person gave is kept in the command it offers.
+                // memory back under the name it last had here. Where the
+                // person named the home directory itself and gave a name
+                // that home memory can take, that name is kept in the
+                // command offered.
                 if home && !names_home {
                     anyhow::bail!(
                         "--home is for the home directory itself. To sync home memory: \
@@ -2004,10 +2004,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     );
                 }
                 if is_home && !home {
+                    let named = name
+                        .as_deref()
+                        .map(normalise_project)
+                        .filter(|n| n != HOME_NAME && cordelia_api::sync::valid_sync_name(n));
                     anyhow::bail!(
                         "that is your home directory. To sync home memory: {}",
-                        match &name {
-                            Some(name) => format!("cordelia sync map ~ {name} --home"),
+                        match named {
+                            Some(name) => {
+                                format!("cordelia sync map ~ {} --home", shell_word(&name))
+                            }
                             None => "cordelia sync home on".to_string(),
                         }
                     );

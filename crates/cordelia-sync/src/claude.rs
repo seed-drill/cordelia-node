@@ -311,6 +311,16 @@ impl ClaudeAdapter {
         }
     }
 
+    /// Whether this adapter is for the Claude Code directory `dir`, which
+    /// is the text that is stored as the setting, not the path it spells.
+    /// What a folder agrees is recorded under that text, and the handlers
+    /// forget by it. So an adapter made for another spelling of the same
+    /// path is not for it: the node's loop makes a new one, and a cycle
+    /// of the old one does nothing.
+    pub fn is_for(&self, dir: &str) -> bool {
+        self.claude_dir.as_os_str() == std::ffi::OsStr::new(dir)
+    }
+
     /// The project a directory belongs to, if it has a name to sync under.
     /// A remote that does not make a usable name is left for the person to
     /// name.
@@ -453,11 +463,8 @@ impl ClaudeAdapter {
         // Whether sync is on, and for which directory, is a setting like
         // the others. It was looked at before these were read, and may
         // have been turned off or changed since: then there is nothing to
-        // do. The directory is the string that is stored, not the path it
-        // spells: what a folder agrees is recorded under it, and the
-        // handlers forget by it.
-        let set = settings.dir.as_deref().map(std::ffi::OsStr::new);
-        if set != Some(self.claude_dir.as_os_str()) {
+        // do.
+        if !settings.dir.as_deref().is_some_and(|dir| self.is_for(dir)) {
             report.stopped = true;
             return report;
         }
@@ -686,16 +693,14 @@ fn store_activity(
 }
 
 /// Sync was turned off: tell this person's other devices that this one
-/// no longer syncs anything, and forget what its folders had agreed, so
-/// that turning sync on again merges rather than replays what changed in
-/// between.
+/// no longer syncs anything. (What its folders had agreed was forgotten by
+/// the handler that turned sync off.)
 ///
 /// `generation` is the settings count read with the setting that says sync
-/// is off. Returns `false`, having done nothing or only a part, if the
-/// settings have changed since: sync may be on again, and whoever asked
-/// looks again.
+/// is off. Returns `false` if the settings have changed since: sync may be
+/// on again, the list may not have been published, and whoever asked
+/// looks again. Looking again when it had been published does no harm.
 pub fn withdraw(state: &AppState, generation: u64) -> Result<bool, CordeliaError> {
-    forget_other_folders(state, &[], generation)?;
     let personal = membership::personal_channel_id(state)?;
     let none = BTreeSet::new();
     exchange_names(state, &personal, &none, &none, generation)?;
@@ -1494,18 +1499,10 @@ mod tests {
                 .unwrap()
                 .len()
         };
-        sync_state::save(
-            &st.db.lock().unwrap(),
-            "/a/memory",
-            "grp_x",
-            "notes.md",
-            (None, 1),
-        )
-        .unwrap();
         st.sync_control.changed(&st.db.lock().unwrap());
         assert!(!withdraw(&st, now).unwrap());
-        assert_eq!((names(&st), agreed(&st)), (1, 1));
+        assert_eq!(names(&st), 1);
         assert!(withdraw(&st, st.sync_control.generation()).unwrap());
-        assert_eq!((names(&st), agreed(&st)), (0, 0));
+        assert_eq!(names(&st), 0);
     }
 }
