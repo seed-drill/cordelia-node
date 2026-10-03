@@ -529,11 +529,14 @@ mod tests {
         }
     }
 
-    /// T20. No state is sealed to bytes that are not a usable key: the
-    /// secret it would be sealed under is one anyone can work out. A state
-    /// that only lists such a key is still read, so that the device that
-    /// reads it can leave the key out and take the rest (a device not yet
-    /// upgraded may send one).
+    /// T20. No state is sealed to bytes that are not a usable key. For
+    /// bytes that are no point, or a point of small order, the secret it
+    /// would be sealed under is one anyone can work out, and the envelope
+    /// refuses that secret as well. A point of mixed order has a secret of
+    /// its own, so only the check of the key stops a state being sealed to
+    /// it. A state that only lists such a key is still read, so that the
+    /// device that reads it can leave the key out and take the rest (a
+    /// device not yet upgraded may send one).
     #[test]
     fn a_state_is_sealed_to_no_key_that_is_not_usable() {
         let sender = NodeIdentity::generate().unwrap();
@@ -549,10 +552,24 @@ mod tests {
         // Two points of small order: the identity, and the all-zero bytes.
         let mut identity = [0u8; 32];
         identity[0] = 1;
+        // A point of mixed order: a real key with a point of small order
+        // added to it. The envelope alone would seal to it.
+        let mixed = {
+            use curve25519_dalek::constants::EIGHT_TORSION;
+            use curve25519_dalek::edwards::CompressedEdwardsY;
+            let real = CompressedEdwardsY(recipient.public_key()).decompress();
+            (real.unwrap() + EIGHT_TORSION[1]).compress().to_bytes()
+        };
+        let to_montgomery = {
+            use curve25519_dalek::edwards::CompressedEdwardsY;
+            let point = CompressedEdwardsY(mixed).decompress().unwrap();
+            point.to_montgomery().to_bytes()
+        };
+        assert!(crate::ecies::ecies_encrypt(&to_montgomery, b"x").is_ok());
 
         let state = sample(&sender, &recipient);
         assert!(state.seal(&recipient.public_key()).is_ok());
-        for bad in [not_a_point, identity, [0u8; 32]] {
+        for bad in [not_a_point, identity, [0u8; 32], mixed] {
             assert!(state.seal(&bad).is_err(), "{bad:02x?}");
 
             let mut listed = sample(&sender, &recipient);

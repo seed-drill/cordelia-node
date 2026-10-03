@@ -182,19 +182,40 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 /// `None` when there is no key to derive: the bytes are not a point on the
 /// curve, or the point is not in the subgroup every real key is in.
 ///
-/// - A secret agreed with bytes that are not a point, or with a point of
-///   small order, is the same for everyone (all zero). Whatever was sealed
-///   to it could be opened by anyone, and anyone can sign under it.
-/// - A point of mixed order (a real key plus a point of small order) seals
-///   to the real key's holder alone, so it leaks nothing. It is refused
-///   all the same: no device makes such a key, and one key then has one
-///   encoding. It is what libsodium does, and what the test vectors in
-///   `docs/reference/encryption-test-vectors.md` require.
+/// - **Not a point.** There is nothing to convert, and no signature under
+///   such bytes is accepted either.
+/// - **A point of small order** (there are eight). The secret agreed with
+///   one is the same for everyone (all zero), so whatever was sealed to it
+///   could be opened by anyone; and anyone can make a signature that is
+///   accepted under one.
+/// - **A point of mixed order** (a real key plus a point of small order).
+///   It seals to the real key's holder alone, so nothing sealed to it
+///   leaks. It is refused all the same: no device makes such a key,
+///   libraries do not agree on which signatures under one are good, and
+///   libsodium refuses it too. The test vectors in
+///   `docs/reference/encryption-test-vectors.md` have one of each kind.
+///
+/// The check costs a multiplication on the curve. What a stranger sends
+/// must not be put through it key by key (see [`key_checks`]).
 pub fn x25519_pub_from_ed25519_pub(ed_pk: &[u8; 32]) -> Option<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::traits::IsIdentity;
+    KEY_CHECKS.with(|n| n.set(n.get() + 1));
     let point = CompressedEdwardsY(*ed_pk).decompress()?;
     (point.is_torsion_free() && !point.is_identity()).then(|| point.to_montgomery().to_bytes())
+}
+
+thread_local! {
+    static KEY_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many keys the calling thread has put through
+/// [`x25519_pub_from_ed25519_pub`]. It is here for tests of what a
+/// stranger can make a device spend: a count is exact where a clock is
+/// not.
+#[doc(hidden)]
+pub fn key_checks() -> u64 {
+    KEY_CHECKS.with(std::cell::Cell::get)
 }
 
 /// Whether `ed_pk` can be a device's public key: something can be sealed

@@ -562,8 +562,10 @@ pub fn newest_stored(conn: &Connection) -> Result<Option<String>, CordeliaError>
     }
 }
 
-/// Drop a channel that a relay stores: its items, and its row. Returns how
-/// many items went. For relays, which hold no keys or members for it.
+/// Drop a channel that this node only stores: its items, and its row if
+/// it has no members. Returns how many items went. For a relay, which holds
+/// no keys or members for a channel; and for the inbox of another key,
+/// which a device writes into without being a member of it.
 pub fn drop_stored(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
     let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
     conn.execute(
@@ -867,6 +869,40 @@ pub fn list_active_member_keys(
         }
     }
     Ok(keys)
+}
+
+/// Every key that is an active member of any channel this node has a row
+/// for, each once.
+pub fn all_active_member_keys(conn: &Connection) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT entity_key FROM channel_members WHERE posture = 'active'")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(storage)?;
+    let mut keys = Vec::new();
+    for row in rows {
+        if let Ok(key) = <[u8; 32]>::try_from(row.map_err(storage)?.as_slice()) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Soft-remove a key from every channel it is an active member of. Returns
+/// how many channels that was.
+pub fn remove_member_everywhere(
+    conn: &Connection,
+    entity_key: &[u8; 32],
+) -> Result<usize, CordeliaError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE channel_members SET posture = 'removed', removed_at = ?1
+         WHERE entity_key = ?2 AND posture = 'active'",
+        params![now, entity_key.as_slice()],
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
 /// Increment key_version and update psk_hash after a PSK rotation.

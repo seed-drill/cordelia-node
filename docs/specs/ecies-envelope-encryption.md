@@ -5,7 +5,7 @@
 **Date**: 2026-03-10
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Supersedes**: cordelia-core/docs/design/encryption-specification.md (pre-pivot, reference only)
-**References**: cordelia-core/docs/design/encryption-test-vectors.md (test vectors remain valid)
+**References**: `docs/reference/encryption-test-vectors.md` (test vectors remain valid)
 **Depends on**: specs/channel-naming.md (§4.2 system channels), specs/network-protocol.md (§4.4 Channel-Announce, §4.7 PSK-Exchange)
 
 > **v1 status (2026-09-30).** The primitives stand: key types (§2), Bech32
@@ -250,8 +250,8 @@ Inputs:
 A recipient known by an Ed25519 key has recipient_xpk derived from it
 (§2.2). There is none for bytes that are not a point on the curve, or for
 a point outside the prime-order subgroup (a point of small order, or a
-real key with one added), and nothing is sealed to any of them. §8.1 has
-one of each.
+real key with one added), and nothing is sealed to any of them.
+`docs/reference/encryption-test-vectors.md` §1 has one of each.
 
 Steps:
   1. Generate ephemeral X25519 keypair:
@@ -586,7 +586,7 @@ Bootnodes never receive items (discovery-only role). Malicious peers can observe
 
 ### 8.1 Ed25519 → X25519 Derivation
 
-Four test vectors are defined in `cordelia-core/docs/design/encryption-test-vectors.md` §1. They remain valid and authoritative for Phase 1.
+Four test vectors are defined in `docs/reference/encryption-test-vectors.md` §1. They remain valid and authoritative for Phase 1.
 
 Summary:
 1. RFC 8032 Section 7.1 seed
@@ -760,7 +760,7 @@ Both Rust (`ciborium`) and TypeScript (`cbor-x`) MUST produce byte-identical out
 
 ### 8.7 Item Encryption (AES-256-GCM)
 
-Item encryption test vectors are defined in `cordelia-core/docs/design/encryption-test-vectors.md` §4 (full ECIES round-trip). The round-trip covers: Ed25519 → X25519 → ECDH → HKDF → AES-256-GCM encrypt → decrypt → verify.
+Item encryption test vectors are defined in `docs/reference/encryption-test-vectors.md` §4 (full ECIES round-trip). The round-trip covers: Ed25519 → X25519 → ECDH → HKDF → AES-256-GCM encrypt → decrypt → verify.
 
 For channel PSK encryption (the common case in Phase 1), the flow is simpler:
 ```
@@ -1137,7 +1137,7 @@ No outstanding TODOs. Spec ready for Martin's review and implementation.
 - **RFC 9052**: COSE (CBOR Object Signing and Encryption), COSE_Sign1 for Phase 3
 - **NIST SP 800-38D**: AES-GCM specification
 - **cordelia-core/docs/design/encryption-specification.md**: Pre-pivot encryption architecture (reference)
-- **cordelia-core/docs/design/encryption-test-vectors.md**: Cryptographic test vectors (authoritative, remains valid)
+- **docs/reference/encryption-test-vectors.md**: Cryptographic test vectors (authoritative, remains valid)
 - **decisions/2026-03-10-phase1-design-decisions.md**: Node encryption boundary, greenfield build
 - **decisions/2026-03-10-identity-privacy-model.md**: Identity stack, Bech32 key usage in examples
 - **decisions/2026-03-09-architecture-simplification.md**: Architecture pivot, channel encryption model

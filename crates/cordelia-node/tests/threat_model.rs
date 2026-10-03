@@ -882,6 +882,69 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
     assert_eq!(held_by(&mut b), 0, "b stored what a stranger wrote");
 }
 
+/// T20. A key that is no device's key, stored as one of this person's
+/// devices by a version that did not refuse them, goes when the node
+/// starts: it is no longer listed, the channel that listed it has a new
+/// key, and the node's log says what happened.
+#[test]
+fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
+    use cordelia_storage::{channels, db, trust};
+
+    let mut a = node("a", "personal", None);
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    // A second device, so that there is a personal channel. It never runs.
+    let b = node("b", "personal", None);
+    let b_key = b.cli(&["id"]).trim().to_string();
+    a.cli(&["add-device", &b_key, "--name", "b"]);
+    let personal = groups(&a).into_iter().next().expect("a personal channel");
+    a.stop();
+
+    // The identity of the curve: a point of small order.
+    let mut nobody = [0u8; 32];
+    nobody[0] = 1;
+    let listed_as = cordelia_crypto::bech32::encode_public_key(&nobody).unwrap();
+    let database = a.data_dir().join("cordelia.db");
+    let version_before = {
+        let conn = db::open(&database).unwrap();
+        channels::add_member(&conn, &personal, &nobody, "owner").unwrap();
+        trust::trust(
+            &conn,
+            &nobody,
+            trust::TrustKind::Device,
+            Some("stored before"),
+        )
+        .unwrap();
+        channels::get_by_id(&conn, &personal).unwrap().key_version
+    };
+
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    let devices = a.post("/api/v1/devices/list", serde_json::json!({}));
+    let keys: Vec<&str> = devices["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["key"].as_str())
+        .collect();
+    assert!(keys.contains(&b_key.as_str()), "{devices}");
+    assert!(!keys.contains(&listed_as.as_str()), "{devices}");
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(
+        log.contains("each channel that listed one has a new key"),
+        "{log}"
+    );
+    a.stop();
+
+    let conn = db::open(&database).unwrap();
+    assert!(!channels::is_member(&conn, &personal, &nobody).unwrap());
+    assert!(!trust::is_trusted(&conn, &nobody).unwrap());
+    assert_eq!(
+        channels::get_by_id(&conn, &personal).unwrap().key_version,
+        version_before + 1
+    );
+}
+
 /// T16. A device is removed. What it last wrote is still in the channel
 /// for the device that removed it and for one added afterwards: a file it
 /// edited keeps its edit, a file it created is there, and a file it deleted
