@@ -1107,8 +1107,21 @@ fn claude_memory_syncs_between_two_machines() {
         out.contains("~/notes is already mapped to lab-notes. Nothing changed."),
         "{out}"
     );
+    // A shell hands an unquoted `~` over as the home directory's path:
+    // as a name, that is `~`, the name home has here.
+    let out = a.cli(&["sync", "map", &path(&a.home()), &path(&a.home()), "--home"]);
+    assert!(
+        out.contains("~ is already mapped to home memory. Nothing changed."),
+        "{out}"
+    );
     let said = a.refused(&["sync", "map", &path(&a_notes), "other"]);
-    assert!(said.contains("already mapped"), "{said}");
+    assert!(
+        said.contains(
+            "~/notes is already mapped to lab-notes. To sync it under another name, unmap \
+             it first: cordelia sync unmap ~/notes"
+        ),
+        "{said}"
+    );
     assert_eq!(mapped_names(&state(&a)), [PROJECT, "lab-notes", "~"]);
 
     // B is offered all three and has none of them: what it found itself is
@@ -1249,6 +1262,27 @@ fn claude_memory_syncs_between_two_machines() {
     let said = a.refused(&["sync", "exclude", "lab-notes"]);
     assert!(said.contains("cordelia sync unmap lab-notes"), "{said}");
     a.cli(&["sync", "include", "github.com/client-co/app"]);
+    // A name has one spelling, so what excludes a project includes it
+    // again, typed the same way: with its ending in capitals too, and
+    // whichever command stored it.
+    let exclude_by: [&[&str]; 2] = [
+        &["sync", "exclude", "Client-Co/App.GIT"],
+        &["sync", "claude", "--exclude", "Client-Co/App.GIT"],
+    ];
+    for exclude in exclude_by {
+        a.cli(exclude);
+        assert_eq!(
+            state(&a)["sync"]["exclude"],
+            serde_json::json!(["client-co/app"]),
+            "{exclude:?}"
+        );
+        a.cli(&["sync", "include", "Client-Co/App.GIT"]);
+        assert_eq!(
+            state(&a)["sync"]["exclude"],
+            serde_json::json!([]),
+            "{exclude:?}"
+        );
+    }
     a.cli(&["sync", "home", "on"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], true, "{s}");
@@ -1381,7 +1415,10 @@ fn home_memory_syncs_under_any_name() {
         let args = [&["sync", "map", home_path.as_str()], other].concat();
         let said = a.refused(&args);
         assert!(
-            said.contains("is already mapped to team") && said.contains("cordelia sync unmap"),
+            said.contains(
+                "~ is already mapped to team. To sync it under another name, unmap it \
+                 first: cordelia sync unmap ~"
+            ),
             "{other:?}: {said}"
         );
         assert!(!said.contains("other --home"), "{other:?}: {said}");
@@ -1389,6 +1426,29 @@ fn home_memory_syncs_under_any_name() {
     b.cli(&["sync", "map", &path(&b_dir), "team"]);
     a.cli(&["sync", "map", &path(&a_other), "lab"]);
     b.cli(&["sync", "map", &path(&b_other), "lab"]);
+    // Unmapping is advised only when it would help. A request that would
+    // be refused once the folder was unmapped is refused for its own
+    // reason, and no unmap is offered: for home, and for a folder.
+    let notes = path(&a_other);
+    let refusals: [(&[&str], &str); 8] = [
+        (&[&home_path, "my team", "--home"], "is not a usable name"),
+        (&[&home_path, "my team"], "is not a name it can sync under"),
+        (&[&home_path, "lab", "--home"], "is already mapped from"),
+        (&[&home_path, "lab"], "it cannot sync under that name"),
+        (&[&notes, "Lab Notes"], "is not a usable name"),
+        (&[&notes, "~"], "is the name of home memory"),
+        (
+            &[&notes, "other", "--home"],
+            "--home is for the home directory itself",
+        ),
+        (&[&notes, "team"], "is already mapped from"),
+    ];
+    for (asked, why) in refusals {
+        let args = [&["sync", "map"], asked].concat();
+        let said = a.refused(&args);
+        assert!(said.contains(why), "{asked:?}: {said}");
+        assert!(!said.contains("unmap"), "{asked:?}: {said}");
+    }
     let s = state(&a);
     assert_eq!(mapped_names(&s), ["lab", "team"], "{s}");
     assert_eq!(s["sync"]["home"], true, "{s}");

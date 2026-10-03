@@ -220,7 +220,10 @@ impl Settings {
                 .iter()
                 .filter(|entry| !entry.starts_with('/'))
                 .any(|pattern| {
-                    let pattern = pattern.to_lowercase();
+                    // In the spelling a project is found under. The node
+                    // stores it so; an earlier version could store one
+                    // that ended in `.git`.
+                    let pattern = cordelia_core::sync_name::tidy(pattern);
                     match pattern.strip_suffix('*') {
                         Some(prefix) => remote.starts_with(prefix),
                         None => *remote == pattern,

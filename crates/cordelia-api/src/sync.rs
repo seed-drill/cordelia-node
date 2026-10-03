@@ -26,10 +26,14 @@ fn store_mappings(db: &rusqlite::Connection, list: &[SyncMapping]) -> Result<(),
     Ok(meta::set(db, meta::SYNC_CLAUDE_MAPPINGS, &json)?)
 }
 
+/// The exclude list, each entry as [`clean_exclusion`] spells it. It is
+/// stored so; an earlier version could store a name that ended in `.git`,
+/// which is read here as the name a project is found under.
 fn exclusions(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
-    Ok(meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
+    let stored: Vec<String> = meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
         .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    Ok(stored.iter().filter_map(|e| clean_exclusion(e)).collect())
 }
 
 fn store_exclusions(db: &rusqlite::Connection, list: &[String]) -> Result<(), ApiError> {
@@ -121,14 +125,15 @@ fn clean_path(path: &str) -> Option<String> {
 }
 
 /// An exclusion as it is stored: a folder (an absolute path) that is never
-/// found by `all`, or a project name or prefix, lower case and without
-/// `.git`.
+/// found by `all`, or a project name or prefix in its one spelling
+/// (`cordelia_core::sync_name::tidy`), which is the spelling a project is
+/// found under.
 fn clean_exclusion(entry: &str) -> Option<String> {
     let entry = entry.trim();
     if entry.starts_with('/') {
         return clean_path(entry);
     }
-    let name = entry.trim_end_matches(".git").to_lowercase();
+    let name = cordelia_core::sync_name::tidy(entry);
     (!name.is_empty()).then_some(name)
 }
 
@@ -348,7 +353,13 @@ pub async fn claude(
 /// Claude Code keeps in one, the name of home memory for a folder that is
 /// not the home directory). The home directory takes any name. `Ok(None)`
 /// if exactly this mapping is already declared, whatever else is asked.
-fn check_mapping(
+///
+/// A folder that is mapped under another name is refused for that last, with
+/// the advice to unmap it: unmapping is not free (the folder stops syncing,
+/// forgets what it agreed and is excluded), so a request that would be
+/// refused anyway is refused for its own reason. `cordelia sync map` asks
+/// this of the mappings without the folder's own, to tell the two apart.
+pub fn check_mapping(
     request: &SyncMapRequest,
     home_dir: &std::path::Path,
     existing: &[SyncMapping],
@@ -398,12 +409,6 @@ fn check_mapping(
         ));
     }
 
-    if let Some(mapped) = mapped {
-        return Err(format!(
-            "{folder} is already mapped to {:?}: unmap it first",
-            mapped.name
-        ));
-    }
     if let Some(mapped) = existing.iter().find(|m| m.name == name) {
         return Err(format!(
             "{name:?} is already mapped from {}: one folder per name on a device",
@@ -414,11 +419,17 @@ fn check_mapping(
     // character turned into a dash, so two paths can share one.
     if let Some(mapped) = existing
         .iter()
-        .find(|m| folder_name(&m.folder) == claude_folder)
+        .find(|m| m.folder != folder && folder_name(&m.folder) == claude_folder)
     {
         return Err(format!(
             "Claude Code keeps {folder} and {} in one folder, and that one is mapped to {:?}",
             mapped.folder, mapped.name
+        ));
+    }
+    if let Some(mapped) = mapped {
+        return Err(format!(
+            "{folder} is already mapped to {:?}: unmap it first",
+            mapped.name
         ));
     }
     Ok(Some(SyncMapping {
@@ -753,6 +764,66 @@ mod tests {
             let got = check_mapping(&req, home, &existing).unwrap_err();
             assert!(got.contains(why), "{} as {:?}: {got}", req.folder, req.name);
         }
+    }
+
+    /// A folder mapped under another name is told to unmap it first only
+    /// when nothing else refuses the request. Unmapping is not free, and a
+    /// request that is refused for another reason would be refused again
+    /// once the folder was unmapped.
+    #[test]
+    fn test_an_unmap_is_the_last_thing_asked_for() {
+        let home = std::path::Path::new("/home/sam");
+        let stored = |folder: &str, name: &str| SyncMapping {
+            folder: folder.into(),
+            name: name.into(),
+        };
+        let existing = [
+            stored("/home/sam", "team"),
+            stored("/home/sam/notes", "lab-notes"),
+            stored("/home/sam/Work", "work"),
+        ];
+        for (req, why) in [
+            // Each of these folders is mapped under another name.
+            (
+                request("/home/sam/notes", "Lab Notes", false),
+                "not a usable name",
+            ),
+            (
+                request("/home/sam/notes", "~", false),
+                "the name of home memory",
+            ),
+            (request("/home/sam/notes", "other", true), "--home"),
+            (request("/home/sam", "other", false), "--home"),
+            (request("/home/sam", "my team", true), "not a usable name"),
+            (
+                request("/home/sam/notes", "work", false),
+                "already mapped from /home/sam/Work",
+            ),
+            (
+                request("/home/sam", "work", true),
+                "already mapped from /home/sam/Work",
+            ),
+            // Nothing else refuses these.
+            (request("/home/sam/notes", "other", false), "unmap it first"),
+            (request("/home/sam", "other", true), "unmap it first"),
+            (request("/home/sam", "~", true), "unmap it first"),
+        ] {
+            let got = check_mapping(&req, home, &existing).unwrap_err();
+            assert!(got.contains(why), "{} as {:?}: {got}", req.folder, req.name);
+        }
+        // What `cordelia sync map` asks: without the folder's own mapping,
+        // a request that was told to unmap is taken, and one that was
+        // refused for another reason is refused for it still.
+        let others = [
+            stored("/home/sam", "team"),
+            stored("/home/sam/Work", "work"),
+        ];
+        assert_eq!(
+            check_mapping(&request("/home/sam/notes", "other", false), home, &others),
+            Ok(Some(stored("/home/sam/notes", "other")))
+        );
+        let got = check_mapping(&request("/home/sam/notes", "work", false), home, &others);
+        assert!(got.unwrap_err().contains("already mapped from"));
     }
 
     /// The home directory has one name on a device, like any folder.
@@ -1108,28 +1179,53 @@ mod tests {
             let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
             set_claude(&s.control, &s.db, &body, Some(home))
         };
+        let change = |s: &Settings, which: &str| match which {
+            "sync off" => claude(s, serde_json::json!({ "enabled": false })),
+            "a narrower scope" => claude(s, serde_json::json!({ "enabled": true, "all": false })),
+            "a mapping" => {
+                let body = request("/home/sam/Work", "work", false);
+                add_mapping(&s.control, &s.db, &body, home)
+            }
+            _ => {
+                let body = SyncUnmapRequest {
+                    folder: "lab".into(),
+                };
+                remove_mapping(&s.control, &s.db, &body)
+            }
+        };
+        // The first thing each writes is a setting, and no setting can be
+        // written: the change is counted, once, and nothing came of it.
+        for which in ["sync off", "a narrower scope", "a mapping", "an unmapping"] {
+            let s = Settings::on();
+            s.claude(serde_json::json!({ "all": true }));
+            s.map("/home/sam/notes", "lab");
+            let before = s.control.generation();
+            let held = (mappings(&s.db).unwrap(), exclusions(&s.db).unwrap());
+            for write in ["INSERT", "UPDATE", "DELETE"] {
+                s.db.execute_batch(&format!(
+                    "CREATE TRIGGER no_{write} BEFORE {write} ON node_meta
+                     BEGIN SELECT RAISE(ABORT, 'no setting can be written'); END;"
+                ))
+                .unwrap();
+            }
+            assert!(change(&s, which).is_err(), "{which}");
+            assert_eq!(s.control.generation(), before + 1, "{which}");
+            assert_eq!(
+                (mappings(&s.db).unwrap(), exclusions(&s.db).unwrap()),
+                held,
+                "{which}"
+            );
+        }
+        // Three of them also forget, later on, and the table of what
+        // folders agreed is gone: counted all the same.
         for which in ["sync off", "a narrower scope", "an unmapping"] {
             let s = Settings::on();
             s.claude(serde_json::json!({ "all": true }));
             s.map("/home/sam/notes", "lab");
             let before = s.control.generation();
-            // The table of what folders agreed is gone, so forgetting
-            // fails, which each of these does last.
             s.db.execute("DROP TABLE sync_files", []).unwrap();
-            let outcome = match which {
-                "sync off" => claude(&s, serde_json::json!({ "enabled": false })),
-                "a narrower scope" => {
-                    claude(&s, serde_json::json!({ "enabled": true, "all": false }))
-                }
-                _ => {
-                    let body = SyncUnmapRequest {
-                        folder: "lab".into(),
-                    };
-                    remove_mapping(&s.control, &s.db, &body)
-                }
-            };
-            assert!(outcome.is_err(), "{which}");
-            assert!(s.control.generation() > before, "{which}");
+            assert!(change(&s, which).is_err(), "{which}");
+            assert_eq!(s.control.generation(), before + 1, "{which}");
         }
         // A request that is refused before anything is written counts
         // nothing.
@@ -1146,7 +1242,46 @@ mod tests {
             folder: "nothing".into(),
         };
         assert!(remove_mapping(&s.control, &s.db, &body).is_err());
+        let body = request("/srv/outside", "outside", false);
+        assert!(add_mapping(&s.control, &s.db, &body, home).is_err());
         assert_eq!(s.control.generation(), before);
+    }
+
+    /// An exclusion is stored in the one spelling a project is found
+    /// under, however it was typed and however often it is sent: the
+    /// command tidies it, the node tidies it, and the node tidies the whole
+    /// list again each time the list changes.
+    #[test]
+    fn test_an_exclusion_has_one_spelling() {
+        let s = Settings::on();
+        let typed = ["X.GIT", " Repo.git ", "client-co/*", "/home/sam//old/"];
+        let stored = ["x", "repo", "client-co/*", "/home/sam/old"];
+        s.claude(serde_json::json!({ "exclude": typed }));
+        assert_eq!(exclusions(&s.db).unwrap(), stored);
+        // Sent again as it is stored, as `exclude` and `include` send it.
+        s.claude(serde_json::json!({ "exclude": stored }));
+        assert_eq!(exclusions(&s.db).unwrap(), stored);
+        // What the command looks for in the list is what the list holds:
+        // the name as typed, tidied once by the command.
+        for typed in ["X.GIT", "x.git", "X", "x.git.GIT", "x .git"] {
+            let looked_for = cordelia_core::sync_name::tidy(typed);
+            assert_eq!(looked_for, "x", "{typed}");
+            assert_eq!(clean_exclusion(typed).as_deref(), Some("x"), "{typed}");
+            assert_eq!(clean_exclusion(&looked_for).as_deref(), Some("x"));
+        }
+        // Nothing left is no exclusion.
+        for nothing in [".git", "  ", ".GIT.git"] {
+            assert_eq!(clean_exclusion(nothing), None, "{nothing:?}");
+        }
+        // A name an earlier version stored with `.git` at its end is read
+        // as the name a project is found under, so the command finds it.
+        meta::set(
+            &s.db,
+            meta::SYNC_CLAUDE_EXCLUDE,
+            r#"["x.git","/home/sam/old"]"#,
+        )
+        .unwrap();
+        assert_eq!(exclusions(&s.db).unwrap(), ["x", "/home/sam/old"]);
     }
 
     /// Every handler counts its change, with the lock held, so that a

@@ -129,9 +129,14 @@ impl Device {
 
     /// A clone of the shared repository at `rel` under this home.
     fn clone_at(&self, rel: &str) -> PathBuf {
+        self.clone_of(rel, REMOTE)
+    }
+
+    /// A repository at `rel` under this home whose origin is `remote`.
+    fn clone_of(&self, rel: &str, remote: &str) -> PathBuf {
         let repo = self.home.join(rel);
         std::fs::create_dir_all(&repo).unwrap();
-        for args in [vec!["init", "-q"], vec!["remote", "add", "origin", REMOTE]] {
+        for args in [vec!["init", "-q"], vec!["remote", "add", "origin", remote]] {
             assert!(
                 Command::new("git")
                     .arg("-C")
@@ -625,6 +630,47 @@ fn excluded_projects_never_sync() {
         vec!["github.com/seed-drill/cordelia-node".to_string()]
     );
     assert_eq!(read(&b_mem, "secret.md"), None);
+}
+
+/// A project is kept off a device by its name, however its remote and the
+/// exclusion spell the ending: both are read in one spelling. An earlier
+/// version found a project whose remote ended `.GIT` under a name that
+/// ended `.git`, and stored an exclusion sent to it with that ending.
+#[test]
+fn a_project_is_excluded_however_its_ending_is_spelled() {
+    let name = "github.com/client-co/plans";
+    for (remote, stored) in [
+        // The remote's ending in capitals, the exclusion as it is typed
+        // today.
+        (
+            "git@github.com:Client-Co/Plans.GIT",
+            r#"["github.com/client-co/plans"]"#,
+        ),
+        // An exclusion as an earlier version stored it.
+        (
+            "git@github.com:client-co/plans.git",
+            r#"["github.com/client-co/plans.git"]"#,
+        ),
+        (
+            "git@github.com:client-co/plans.GIT",
+            r#"["github.com/client-co/plans.git"]"#,
+        ),
+        // A prefix, and an ending given twice.
+        (
+            "https://github.com/client-co/plans.git.GIT/",
+            r#"["GitHub.com/Client-Co/*"]"#,
+        ),
+    ] {
+        let mut a = Device::new().sync_on();
+        set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+        set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE, stored);
+        let memory = a.claude_folder(&a.clone_of("Work/plans", remote));
+        std::fs::write(memory.join("secret.md"), "stays on this machine\n").unwrap();
+
+        let report = a.cycle();
+        assert_eq!(report.excluded, vec![name.to_string()], "{remote} {stored}");
+        assert!(report.folders.is_empty(), "{remote} {stored}");
+    }
 }
 
 #[test]

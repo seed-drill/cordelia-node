@@ -1569,38 +1569,102 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 // Thin clients of the running node's local API: all logic lives in the
 // node (cordelia_api::membership), which must be started first.
 
-/// A project as the exclude list stores it, and as the node cleans one:
-/// no `.git`, lower case.
+/// A project's name in its one spelling: as the exclude list stores it,
+/// as the node cleans one, and as a project is found from its remote.
 fn normalise_project(project: &str) -> String {
-    project.trim().trim_end_matches(".git").to_lowercase()
+    cordelia_core::sync_name::tidy(project)
 }
 
-/// What `map` offers when the home directory is named without `--home`:
-/// the command that was typed, with the flag.
+/// The name `map` was given, as it is sent to the node. A shell hands an
+/// unquoted `~` over as the home directory's path, in whatever spelling
+/// `$HOME` has (it may reach the directory through a link), so that path
+/// is taken for `~`.
+fn name_given(typed: &str, home_dir: &std::path::Path) -> String {
+    let typed = typed.trim();
+    let path = std::path::Path::new(typed);
+    let is_home = path == home_dir
+        || (path.is_absolute() && std::fs::canonicalize(path).is_ok_and(|real| real == home_dir));
+    if is_home {
+        cordelia_sync::claude::HOME_NAME.to_string()
+    } else {
+        normalise_project(typed)
+    }
+}
+
+/// Whether the name `map` was given is the name the folder is mapped
+/// under: none was given, or it is that name as it would be sent, or it
+/// is that name as it is stored. (A name stored by an earlier version can
+/// end in `.git`, which is taken off a name that is sent.)
+fn is_the_name_it_has(typed: Option<&str>, home_dir: &std::path::Path, mapped: &str) -> bool {
+    typed.is_none_or(|typed| {
+        name_given(typed, home_dir) == mapped || typed.trim().to_lowercase() == mapped
+    })
+}
+
+/// What `map` offers when the home directory is named with a name and
+/// without `--home`: the command that was typed, with the flag.
 ///
-/// - No name: `home on`, which puts home memory back under the name it
-///   last had on this device.
-/// - The name `~`: `map` with the flag and no name, which is `~`. A shell
-///   hands an unquoted `~` over as the home directory's path, so that is
-///   taken for it too.
+/// - The name `~`, however a shell handed it over (see [`name_given`]):
+///   `map` with the flag and no name, which is `~`.
 /// - A name home memory can take: `map` with the flag and the name as it
 ///   was typed, quoted for a shell where it needs to be. Run, it maps
 ///   home under the name the typed command would have.
 /// - Anything else is `Err`, with the name as typed: it is said to be
 ///   unusable, and no name is offered in its place.
-fn home_offer(name: Option<&str>, home_dir: &std::path::Path) -> Result<String, String> {
-    let Some(typed) = name.map(str::trim) else {
-        return Ok("cordelia sync home on".to_string());
-    };
-    // What `map` would send, and the node store: the node trims it.
-    let stored = normalise_project(typed);
-    let stored = stored.trim();
-    if stored == cordelia_sync::claude::HOME_NAME || std::path::Path::new(typed) == home_dir {
+fn home_offer(typed: &str, home_dir: &std::path::Path) -> Result<String, String> {
+    let typed = typed.trim();
+    let sent = name_given(typed, home_dir);
+    if sent == cordelia_sync::claude::HOME_NAME {
         Ok("cordelia sync map ~ --home".to_string())
-    } else if cordelia_api::sync::valid_sync_name(stored) {
+    } else if cordelia_api::sync::valid_sync_name(&sent) {
         Ok(format!("cordelia sync map ~ {} --home", shell_word(typed)))
     } else {
         Err(typed.to_string())
+    }
+}
+
+/// What `map` does about a folder that is not already mapped as asked.
+#[derive(Debug, PartialEq)]
+enum MapStep {
+    /// Ask the node. It takes the request, or refuses it for a reason
+    /// that unmapping the folder would not change.
+    Send,
+    /// The folder is mapped under another name, and nothing else stands
+    /// in the way: unmapping it first is the way.
+    UnmapFirst(String),
+}
+
+/// Whether to advise an unmap. `request` is what would be sent, and
+/// `mappings` what the node holds.
+///
+/// Unmapping is not free: the folder stops syncing, forgets what it agreed
+/// and is excluded. So it is advised only when the request would be taken
+/// once the folder was unmapped, which is asked of the node's own check
+/// (`cordelia_api::sync::check_mapping`) with the folder's mapping left
+/// out. A request that would be refused anyway is sent, and the node says
+/// why.
+fn map_step(
+    request: &cordelia_api::types::SyncMapRequest,
+    home_dir: &std::path::Path,
+    mappings: &[(String, String)],
+) -> MapStep {
+    let Some((_, mapped)) = mappings
+        .iter()
+        .find(|(folder, _)| *folder == request.folder)
+    else {
+        return MapStep::Send;
+    };
+    let others: Vec<cordelia_api::types::SyncMapping> = mappings
+        .iter()
+        .filter(|(folder, _)| *folder != request.folder)
+        .map(|(folder, name)| cordelia_api::types::SyncMapping {
+            folder: folder.clone(),
+            name: name.clone(),
+        })
+        .collect();
+    match cordelia_api::sync::check_mapping(request, home_dir, &others) {
+        Ok(_) => MapStep::UnmapFirst(mapped.clone()),
+        Err(_) => MapStep::Send,
     }
 }
 
@@ -2006,30 +2070,30 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             let mapped_folder = root.display().to_string();
             let home_dir = real_home();
             let is_home = root == home_dir;
+            let mappings = declared_mappings(&sync_settings(config_path)?);
+            let mapped = mappings
+                .iter()
+                .find(|(folder, _)| *folder == mapped_folder)
+                .map(|(_, name)| name.clone());
+            // The name asked for, as it would be sent.
+            let asked = name.as_deref().map(|typed| name_given(typed, &home_dir));
             // Mapped already, and no name given, or the name it has: there
             // is nothing to change, and the name it has is the answer. It
             // is never refused, not for a flag left out either.
-            let mapped = declared_mappings(&sync_settings(config_path)?)
-                .into_iter()
-                .find(|(folder, _)| *folder == mapped_folder)
-                .map(|(_, name)| name);
-            let already = mapped.clone().filter(|mapped| {
-                name.as_deref()
-                    .is_none_or(|given| normalise_project(given).trim() == mapped)
-            });
-            // Mapped under another name: that is said here, before any
-            // other refusal offers a command the node would then refuse.
-            if already.is_none()
-                && let Some(mapped) = &mapped
-            {
-                anyhow::bail!(
+            let already = mapped
+                .clone()
+                .filter(|mapped| is_the_name_it_has(name.as_deref(), &home_dir, mapped));
+            // What is said of a folder mapped under another name, once
+            // nothing else stands in the way of the request.
+            let unmap_first = |mapped: &str| {
+                anyhow::anyhow!(
                     "{0} is already mapped to {1}. To sync it under another name, unmap it \
                      first: cordelia sync unmap {2}",
                     short_path(&mapped_folder),
                     sync_label(mapped),
                     shell_arg(&mapped_folder)
-                );
-            }
+                )
+            };
             if let Some(mapped) = already {
                 println!(
                     "{} is already mapped to {}. Nothing changed.",
@@ -2061,20 +2125,52 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     );
                 }
                 if is_home && !home {
-                    match home_offer(name.as_deref(), &home_dir) {
-                        Ok(command) => anyhow::bail!(
-                            "that is your home directory. To sync home memory: {command}"
-                        ),
-                        Err(name) => anyhow::bail!(
+                    // No name: `home on` puts home memory back under the
+                    // name it last had on this device.
+                    let Some(typed) = name.as_deref() else {
+                        anyhow::bail!(
+                            "that is your home directory. To sync home memory: \
+                             cordelia sync home on"
+                        );
+                    };
+                    let command = home_offer(typed, &home_dir).map_err(|name| {
+                        anyhow::anyhow!(
                             "that is your home directory, and {name:?} is not a name it can \
                              sync under: use lower-case letters, digits and . _ - / ~ + % @, \
                              and do not start it with - or ~. To sync home memory under a \
                              name: cordelia sync map ~ <name> --home"
+                        )
+                    })?;
+                    // The command offered is one the node would take: it
+                    // is asked here, of the same check, with the flag.
+                    let with_flag = cordelia_api::types::SyncMapRequest {
+                        folder: mapped_folder.clone(),
+                        name: asked.clone().unwrap_or_default(),
+                        home: true,
+                    };
+                    if let MapStep::UnmapFirst(mapped) = map_step(&with_flag, &home_dir, &mappings)
+                    {
+                        return Err(unmap_first(&mapped));
+                    }
+                    let held: Vec<cordelia_api::types::SyncMapping> = mappings
+                        .iter()
+                        .map(|(folder, name)| cordelia_api::types::SyncMapping {
+                            folder: folder.clone(),
+                            name: name.clone(),
+                        })
+                        .collect();
+                    match cordelia_api::sync::check_mapping(&with_flag, &home_dir, &held) {
+                        Ok(_) => anyhow::bail!(
+                            "that is your home directory. To sync home memory: {command}"
+                        ),
+                        Err(why) => anyhow::bail!(
+                            "that is your home directory, and it cannot sync under that \
+                             name: {why}"
                         ),
                     }
                 }
-                let name = match name {
-                    Some(name) => normalise_project(&name),
+                let name = match asked {
+                    Some(name) => name,
                     None if is_home => HOME_NAME.to_string(),
                     None => {
                         let needs_name = |why: &str| {
@@ -2099,13 +2195,21 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                         }
                     }
                 };
+                let request = cordelia_api::types::SyncMapRequest {
+                    folder: mapped_folder.clone(),
+                    name: name.clone(),
+                    home: is_home,
+                };
+                if let MapStep::UnmapFirst(mapped) = map_step(&request, &home_dir, &mappings) {
+                    return Err(unmap_first(&mapped));
+                }
                 let settings = api_post(
                     config_path,
                     "/api/v1/sync/map",
                     serde_json::json!({
-                        "folder": mapped_folder,
-                        "name": name,
-                        "home": is_home,
+                        "folder": request.folder,
+                        "name": request.name,
+                        "home": request.home,
                     }),
                 )?;
                 since = settings["generation"].as_u64();
@@ -3055,19 +3159,18 @@ mod tests {
         assert!(!report_stands(&report(3, false), 4));
     }
 
-    /// What `map` offers when the home directory is named without the
-    /// flag is the command that was typed, with the flag: the name as
-    /// typed, so that it maps home under the name that command would have,
-    /// and quoted where a shell would read it otherwise.
+    /// What `map` offers when the home directory is named, with a name and
+    /// without the flag, is the command that was typed, with the flag: the
+    /// name as typed, so that it maps home under the name that command
+    /// would have, and quoted where a shell would read it otherwise.
     #[test]
     fn test_what_map_offers_for_the_home_directory() {
         let home = std::path::Path::new("/home/sam");
-        let offer = |name: Option<&str>| home_offer(name, home);
-        assert_eq!(offer(None).unwrap(), "cordelia sync home on");
+        let offer = |name: &str| home_offer(name, home);
         // `~`, quoted or as a shell hands it over.
         for home_itself in ["~", " ~ ", "/home/sam"] {
             assert_eq!(
-                offer(Some(home_itself)).unwrap(),
+                offer(home_itself).unwrap(),
                 "cordelia sync map ~ --home",
                 "{home_itself:?}"
             );
@@ -3080,21 +3183,177 @@ mod tests {
                 "github.com/Owner/Repo.git",
                 "cordelia sync map ~ github.com/Owner/Repo.git --home",
             ),
+            // An ending in capitals, and one with a space before it: the
+            // typed command would map `repo` and `team`, which are names.
+            ("Repo.GIT", "cordelia sync map ~ Repo.GIT --home"),
+            ("team .git", "cordelia sync map ~ 'team .git' --home"),
             (
                 "git.sr.ht/~sam/proj",
                 "cordelia sync map ~ 'git.sr.ht/~sam/proj' --home",
             ),
             ("100%mine", "cordelia sync map ~ '100%mine' --home"),
         ] {
-            assert_eq!(offer(Some(typed)).unwrap(), offered, "{typed}");
+            assert_eq!(offer(typed).unwrap(), offered, "{typed}");
         }
-        for not_a_name in ["my team", "a/../b", "it's", "-x", "~x", "", "/home/sam/x"] {
-            assert_eq!(
-                offer(Some(not_a_name)).unwrap_err(),
-                not_a_name,
-                "{not_a_name:?}"
+        // Not a name. It is said as it was typed, not as it was tidied.
+        for not_a_name in [
+            "my team",
+            "My Team",
+            "a/../b",
+            "it's",
+            "-x",
+            "~x",
+            "",
+            ".git",
+            "/home/sam/x",
+        ] {
+            assert_eq!(offer(not_a_name).unwrap_err(), not_a_name, "{not_a_name:?}");
+        }
+    }
+
+    /// The name `map` sends: in its one spelling, and `~` for the home
+    /// directory's path, which is what a shell makes of an unquoted `~`.
+    #[test]
+    fn test_the_name_map_sends() {
+        let home = std::path::Path::new("/home/sam");
+        for (typed, sent) in [
+            ("~", "~"),
+            (" ~ ", "~"),
+            ("/home/sam", "~"),
+            ("/home/sam/", "~"),
+            ("Team", "team"),
+            ("Repo.GIT", "repo"),
+            ("team .git", "team"),
+            // Another path is no name, and is sent as it is to be refused.
+            ("/home/sam/x", "/home/sam/x"),
+            ("/home/samantha", "/home/samantha"),
+        ] {
+            assert_eq!(name_given(typed, home), sent, "{typed:?}");
+        }
+    }
+
+    /// `$HOME` may reach the home directory through a link. A shell hands
+    /// that spelling over for an unquoted `~`, and the home directory is
+    /// known by its real path: it is still `~`.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_home_directory_by_another_spelling_is_still_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let within = dir.path().canonicalize().unwrap();
+        let (real, other, link) = (
+            within.join("real"),
+            within.join("other"),
+            within.join("link"),
+        );
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.to_str().unwrap();
+        assert_eq!(name_given(link, &real), "~");
+        assert_eq!(
+            home_offer(link, &real).unwrap(),
+            "cordelia sync map ~ --home"
+        );
+        // A directory that is not the home directory is not.
+        assert_ne!(name_given(other.to_str().unwrap(), &real), "~");
+        // Nor a path that does not exist.
+        assert_ne!(
+            name_given(within.join("gone").to_str().unwrap(), &real),
+            "~"
+        );
+        // Nor a word that happens to lead there from where the command is
+        // run: a shell makes an absolute path of `~`.
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(name_given(".", &here), ".");
+    }
+
+    /// `map` changes nothing when it is given the name the folder has, or
+    /// none: the name as it would be sent, or as it is stored.
+    #[test]
+    fn test_the_name_a_folder_has_is_no_change() {
+        let home = std::path::Path::new("/home/sam");
+        for (typed, mapped) in [
+            (None, "team"),
+            (Some("team"), "team"),
+            (Some(" Team "), "team"),
+            (Some("team.git"), "team"),
+            (Some("~"), "~"),
+            // An unquoted `~`, as a shell hands it over.
+            (Some("/home/sam"), "~"),
+            // A name an earlier version stored with its ending, typed as
+            // it is stored.
+            (Some("x.git"), "x.git"),
+            (Some("X.GIT"), "x.git"),
+        ] {
+            assert!(
+                is_the_name_it_has(typed, home, mapped),
+                "{typed:?} {mapped}"
             );
         }
+        for (typed, mapped) in [
+            ("other", "team"),
+            ("x", "x.git"),
+            ("~", "team"),
+            ("/home/sam", "team"),
+            ("team", "~"),
+        ] {
+            assert!(
+                !is_the_name_it_has(Some(typed), home, mapped),
+                "{typed} {mapped}"
+            );
+        }
+    }
+
+    /// A folder mapped under another name is told to unmap first only when
+    /// that would help: when the request would be taken once it was
+    /// unmapped. Unmapping is not free, so a request that would be refused
+    /// anyway is sent, and the node says why.
+    #[test]
+    fn test_an_unmap_is_advised_only_when_it_would_help() {
+        let home = std::path::Path::new("/home/sam");
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let mappings = [
+            pair("/home/sam", "team"),
+            pair("/home/sam/notes", "lab-notes"),
+            pair("/home/sam/Work", "work"),
+        ];
+        let step = |folder: &str, name: &str, flag: bool| {
+            let request = cordelia_api::types::SyncMapRequest {
+                folder: folder.into(),
+                name: name.into(),
+                home: flag,
+            };
+            map_step(&request, home, &mappings)
+        };
+        // Mapped under another name, and nothing else stands in the way.
+        assert_eq!(
+            step("/home/sam/notes", "other", false),
+            MapStep::UnmapFirst("lab-notes".into())
+        );
+        assert_eq!(
+            step("/home/sam", "other", true),
+            MapStep::UnmapFirst("team".into())
+        );
+        // Mapped under another name, and refused whatever is unmapped.
+        for (folder, name, flag, why) in [
+            ("/home/sam/notes", "lab notes", false, "not a usable name"),
+            ("/home/sam/notes", "~", false, "the name of home memory"),
+            (
+                "/home/sam/notes",
+                "work",
+                false,
+                "another folder has the name",
+            ),
+            ("/home/sam/notes", "other", true, "the flag is for home"),
+            ("/home/sam", "my team", true, "not a usable name"),
+            ("/home/sam", "work", true, "another folder has the name"),
+            ("/home/sam", "other", false, "home, without the flag"),
+        ] {
+            assert_eq!(step(folder, name, flag), MapStep::Send, "{why}");
+        }
+        // Not mapped at all.
+        assert_eq!(step("/home/sam/new", "new", false), MapStep::Send);
+        assert_eq!(step("/home/sam/new", "work", false), MapStep::Send);
     }
 
     /// One adapter is held, for the Claude Code directory that is set: the
