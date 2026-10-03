@@ -238,7 +238,8 @@ An agent's memory is who it is for one person: what it knows about them, how the
     - a state for one of your channels that names any other key is not applied, whichever of your devices sent it. It is kept, and applies if that key turns out to be a device this one had not heard of yet;
     - the older `group/invite` endpoint refuses a key that is not one of your devices.
   - **Which personal channel a device belongs to** is decided by the person's act on that device, `cordelia accept`, and by nothing the device is sent. The accept is honoured for an hour, for the key it named. A device that is in use, because it has other devices in its personal channel or is syncing, cannot be moved: `accept` says so, and the person turns sync off first if they mean it. Trust in a key is for one purpose, so a key trusted for anything else is not one of your devices. (Adding a device with a code that the new device shows, #75, replaces `accept`.)
-- **What comes next is therefore not shared memory.** It is channels shared between people that carry what is shared on purpose: messages between agents first, then skills and secrets. The rule there is the other half of this one: automatic between your own devices, deliberate between people.
+- **What comes next is therefore not shared memory.** It is channels shared between people that carry what is shared on purpose: messages between agents first, then secrets. The rule there is the other half of this one: automatic between your own devices, deliberate between people.
+  - **Changed 2026-10-03.** Skills were to travel in these channels too. Skills that people share travel in a repository instead, where a change is reviewed before anyone runs it.
 
 This decision is expected to stand. If people later want notes in common, the answer is a note that is published on purpose and shown with its author, and that never lands in the memory folder.
 
@@ -277,9 +278,9 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 | Two relays and DNS | **Running** | 4.6; hosted by us for the alpha |
 | Release: macOS and Linux binaries | **Built** | `release.yml`; Homebrew tap and AUR package to follow |
 | Sharing a project's memory with a teammate (`share`) | **Drop** | Memory is not shared between people (4.7) |
-| Channels shared between people: messages, skills, secrets | **Next** | Designed separately; never memory (4.7) |
+| Channels shared between people: messages, then secrets | **Next** | Designed separately; never memory (4.7). Skills that people share travel in a repository |
 | Second agent adapter | **Later** | Proves portability |
-| Open channels, secret keepers, PSK-Exchange (0x07) | Defer | Only needed for public channels |
+| Open channels, secret keepers, PSK-Exchange (0x07) | **Drop** | Decided 2026-10-03: channels that anyone can join or write to will not be built ([`docs/vision.md`](../vision.md) §6) |
 | FTS search, semantic search | Defer | The agent reads the files; v1 needs no search |
 | PAN / swarm (`swarm-init`) | Defer | Sub-agents, not devices |
 | TypeScript SDK (`cordelia-sdk`) | Defer | |
