@@ -29,9 +29,9 @@ fn store_mappings(db: &rusqlite::Connection, list: &[SyncMapping]) -> Result<(),
 /// The exclude list, each entry read as it would be stored now
 /// ([`clean_exclusion`]). A name is read in its one spelling: an earlier
 /// version could store one that ended in `.git`, which is read here as the
-/// name a project is found under. A folder is read as it is, a space at
-/// the end of its name included, since that is the text the adapter
-/// compares a directory with.
+/// name a project is found under. A folder keeps a space at the end of
+/// its name, since that is the text the adapter compares a directory
+/// with; its separators are tidied, and one with `..` in it is dropped.
 fn exclusions(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
     let stored: Vec<String> = meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
         .and_then(|j| serde_json::from_str(&j).ok())
@@ -136,9 +136,9 @@ fn clean_path(path: &str) -> Option<String> {
 /// found under. `None` for what is neither: a name of which nothing is
 /// left, or a path with `..` in it.
 ///
-/// A folder is taken as it is given, a space at its end included: a
-/// folder's name can end in one, and what is stored is the text a
-/// directory is compared with. So a list that is sent back as it was
+/// A folder keeps a space at the end of its name: a folder's name can end
+/// in one, and what is stored is the text a directory is compared with.
+/// Its separators are tidied. So a list that is sent back as it was
 /// stored is stored as it was.
 ///
 /// The command line uses this too, so that what `include` looks for in
@@ -1312,8 +1312,8 @@ mod tests {
         }
         // A name an earlier version stored with `.git` at its end is read
         // as the name a project is found under, so the command finds it.
-        // A folder is read as it is, a space at the end of its name
-        // included: it is the text a directory is compared with.
+        // A folder keeps a space at the end of its name: it is the text
+        // a directory is compared with.
         let stored = r#"["x.git","owner/repo/","/home/sam/old","/home/sam/odd "]"#;
         meta::set(&s.db, meta::SYNC_CLAUDE_EXCLUDE, stored).unwrap();
         assert_eq!(

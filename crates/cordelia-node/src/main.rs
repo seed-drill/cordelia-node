@@ -148,7 +148,7 @@ enum SyncCommand {
         /// With --all: never sync this project from this device (its git
         /// remote, e.g. github.com/client-co/app, or a prefix ending in *).
         /// Repeatable; replaces the names in the current list. A folder
-        /// that was unmapped stays out.
+        /// that was unmapped stays out (unless --reset is given).
         #[arg(long)]
         exclude: Vec<String>,
         /// Do not sync home-folder memory on this device (unmaps it too)
@@ -1674,9 +1674,10 @@ fn mapping_at<'a>(
 
 /// The exclude list that `cordelia sync claude --exclude` sends: what was
 /// typed, each taken as `cordelia sync exclude` takes it, in place of the
-/// names in the stored list; and the folders in the stored list, which
-/// `unmap` put there. An unmapped folder stays out until it is mapped
-/// again or included. With `--reset` nothing of the stored list is kept.
+/// names in the stored list; and the folders in the stored list. A folder
+/// is there because it was unmapped, or was excluded as a folder, and it
+/// stays out until it is mapped again or included. With `--reset` nothing
+/// of the stored list is kept.
 fn exclude_list_to_send(
     typed: &[String],
     stored: &[String],
@@ -3605,10 +3606,19 @@ mod tests {
             assert!(exclusion(nothing).is_err(), "{nothing:?}");
         }
         // A folder that is on disk, and whose name does end in a space, is
-        // taken as it is.
+        // taken as it is. (It is made a repository of its own, so that it
+        // is the folder Claude Code keeps memory for wherever the test's
+        // temporary directory happens to be.)
         let dir = tempfile::tempdir().unwrap();
         let odd = dir.path().canonicalize().unwrap().join("odd ");
         std::fs::create_dir(&odd).unwrap();
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&odd)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(made.success());
         let given = odd.display().to_string();
         assert_eq!(exclusion(&given).unwrap(), given);
     }
@@ -3623,9 +3633,9 @@ mod tests {
             |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
         let stored = list(&[
             "old-name",
-            "/home/sam/notes",
+            "/cordelia-test-not-there/notes",
             "client-co/*",
-            "/home/sam/odd ",
+            "/cordelia-test-not-there/odd ",
         ]);
         let typed = list(&["Team.GIT", "https://github.com/Client-Co/App.git", "team"]);
         // Each typed as `exclude` takes it, once; then the folders, as
@@ -3635,15 +3645,18 @@ mod tests {
             list(&[
                 "team",
                 "github.com/client-co/app",
-                "/home/sam/notes",
-                "/home/sam/odd ",
+                "/cordelia-test-not-there/notes",
+                "/cordelia-test-not-there/odd ",
             ])
         );
         // A folder that is typed and is already there is there once.
-        let typed_folder = list(&["/home/sam/notes"]);
+        let typed_folder = list(&["/cordelia-test-not-there/notes"]);
         assert_eq!(
             exclude_list_to_send(&typed_folder, &stored, false).unwrap(),
-            list(&["/home/sam/notes", "/home/sam/odd "])
+            list(&[
+                "/cordelia-test-not-there/notes",
+                "/cordelia-test-not-there/odd "
+            ])
         );
         // With a reset nothing of the stored list is kept.
         assert_eq!(
@@ -3651,7 +3664,7 @@ mod tests {
             list(&["team", "github.com/client-co/app"])
         );
         // What leaves nothing is refused, and does not empty the list.
-        assert!(exclude_list_to_send(&list(&[".git"]), &stored, false).is_err());
+        assert!(exclude_list_to_send(&list(&["x", " .GIT.git"]), &stored, false).is_err());
     }
 
     /// `cordelia sync unmap <folder>` means the mapping of that folder

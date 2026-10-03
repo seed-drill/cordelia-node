@@ -1709,4 +1709,16 @@ fn home_memory_syncs_under_any_name() {
     assert_eq!(mapped_names(&state(&a)), ["lab"]);
     let out = a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
     assert!(out.contains("Mapped ~ to team."), "{out}");
+
+    // The home directory is now the repository that `~/notes` is in, and
+    // both are mapped. Unmapping the folder, by a path that is not the
+    // one stored, unmaps the folder and not the repository above it.
+    let out = a.command_in(&a.home(), &["sync", "unmap", "notes"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("No longer synced from this device: ~/notes (lab)."),
+        "{said}"
+    );
+    assert_eq!(mapped_names(&state(&a)), ["team"]);
 }
