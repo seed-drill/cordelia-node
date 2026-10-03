@@ -68,7 +68,8 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 
 | Parameter | Value | Spec Section |
 |-----------|-------|-------------|
-| `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §5.3 |
+| `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §6 |
+| `NODE_STOP_TIMEOUT_SECS` | 30s | parameter-rationale.md §6 |
 | `MAX_MESSAGE_BYTES` | 1MB | parameter-rationale.md §5.2 |
 | `MAX_ITEM_BYTES` | 64KB | parameter-rationale.md §4 |
 | `ENTRY_OVERHEAD_BYTES` | 1KB (counted for each entry, in every limit on bytes) | parameter-rationale.md §4 |

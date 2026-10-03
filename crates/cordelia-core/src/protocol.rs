@@ -14,6 +14,7 @@
 //!
 //! ```text
 //! STREAM_TIMEOUT_SECS ──> HANDSHAKE_TIMEOUT_SECS
+//!                     \──> NODE_STOP_TIMEOUT_SECS (3x stream)
 //!
 //! TICK_INTERVAL_SECS ──> RATE_WINDOW_SECS ──> BAN_WINDOW_SECS
 //!                     \──> SYNCS_PER_PEER_PER_MINUTE
@@ -93,10 +94,19 @@ pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
 // TIMING PRIMITIVES -- the small set of values everything else derives from
 // ══════════════════════════════════════════════════════════════════════
 
-/// Timeout for all QUIC stream read/write operations in seconds (parameter-rationale.md §5.3).
+/// Timeout for all QUIC stream read/write operations in seconds (parameter-rationale.md §6).
 /// Primitive: single-digit-second responsiveness; covers cross-continent RTT + processing.
 /// One value, one layer (codec). If a single read or write takes longer, the peer is unresponsive.
 pub const STREAM_TIMEOUT_SECS: u64 = 10;
+
+/// How long a node that is told to stop waits for its parts to finish, in
+/// all, before it exits without them (parameter-rationale.md §6).
+/// Derived: three stream timeouts. The HTTP server gives a request it is
+/// answering one to finish, and the peer-to-peer loop gives its peers one
+/// to hear that it is closing, side by side; the rest is margin. A node
+/// that waited for ever for one of its parts would be killed by systemd
+/// after a minute and a half, and an upgrade would take that long.
+pub const NODE_STOP_TIMEOUT_SECS: u64 = 3 * STREAM_TIMEOUT_SECS;
 
 /// Governor tick interval in seconds (network-behaviour.md §5.1).
 /// Primitive: resolution of the governor state machine. Matches stream timeout --
@@ -807,10 +817,16 @@ mod tests {
         assert_eq!(TLS_CERT_VALIDITY_DAYS, 365);
     }
 
-    // Stream I/O (parameter-rationale.md §5.3)
+    // Stream I/O (parameter-rationale.md §6)
     #[test]
-    fn test_stream_timeout_parameter_rationale_5_3() {
+    fn test_stream_timeout_parameter_rationale_6() {
         assert_eq!(STREAM_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_node_stop_timeout_parameter_rationale_6() {
+        assert_eq!(NODE_STOP_TIMEOUT_SECS, 30);
+        assert_eq!(NODE_STOP_TIMEOUT_SECS, 3 * STREAM_TIMEOUT_SECS);
     }
 
     // Keepalive (network-protocol.md §4.2)

@@ -123,14 +123,56 @@ impl Node {
         self.child = Some(child);
     }
 
-    /// Stop the node as a service manager would (SIGTERM), so it closes
-    /// its connections on the way out.
+    /// Tell the node to stop with SIGTERM, as a service manager does, so
+    /// that it closes its connections on the way out.
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
+        self.stop_with("TERM");
+    }
+
+    /// Tell the node to stop with `signal` (TERM, INT or QUIT). A node that
+    /// is told to stop exits within a bounded time, and with success, which
+    /// it has only if every part of it stopped in time and without
+    /// failing. One that does not exit is killed. Either way the test fails
+    /// with the node's log: a node that never exits would otherwise hang
+    /// the whole run, and one that gave up on a part of itself would pass
+    /// unnoticed.
+    pub fn stop_with(&mut self, signal: &str) {
+        use cordelia_core::protocol::{NODE_STOP_TIMEOUT_SECS, STREAM_TIMEOUT_SECS};
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args([&format!("-{signal}"), &child.id().to_string()])
+            .status();
+        // The node's own bound, the stream timeout it then gives work that
+        // cannot be interrupted, and a margin.
+        let allowed = Duration::from_secs(NODE_STOP_TIMEOUT_SECS + STREAM_TIMEOUT_SECS + 5);
+        let told = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if told.elapsed() < allowed => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => break None,
+            }
+        };
+        let Some(status) = status else {
+            let _ = child.kill();
             let _ = child.wait();
+            panic!(
+                "{} did not exit within {}s of being told to stop\n{}",
+                self.name,
+                allowed.as_secs(),
+                self.log_tail()
+            );
+        };
+        if !status.success() {
+            panic!(
+                "{} did not stop as it should ({status})\n{}",
+                self.name,
+                self.log_tail()
+            );
         }
     }
 

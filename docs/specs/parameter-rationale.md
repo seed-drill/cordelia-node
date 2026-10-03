@@ -588,6 +588,41 @@ fixed the handshake case only). Session 92 added STREAM_TIMEOUT to all stream
 operations after `test_chaos_disconnect_during_sync` exposed a 60s hang on
 peer crash (QUIC idle timeout was the only backstop).
 
+### NODE_STOP_TIMEOUT = 30s (3 x STREAM_TIMEOUT)
+
+**Rationale:** A node that is told to stop exits within a bounded time,
+whatever one of its parts is waiting for. Once it has been told, it waits
+this long at most, for its HTTP server and its peer-to-peer loop together,
+and then exits without what has not finished, with a failure. Blocking
+work on the node's own runtime (a sync cycle) is then given one more
+STREAM_TIMEOUT, and is left as a crash would leave it. So a node exits
+within 40 seconds of being told: as a rule within a second, and within a
+few while a client of its API has a connection open.
+
+The HTTP server is stopped gracefully. A connection still open when it is
+told (a request being answered, or a client idle between requests) is
+given one STREAM_TIMEOUT, and is then closed; an idle one closes sooner of
+itself. So, as a rule, the process does not end in the middle of a
+request, some of which (removing a device, rotating a key) make several
+writes. A request whose handler is held up longer than that, or begins in
+its last moment, can still be cut, as a crash would cut it. Before 2.9.1,
+actix-server could wait for ever in a graceful stop: a worker could leave
+without answering the stop request (#99). The node asks for a later one,
+and its own bound covers the rest.
+
+A node whose HTTP server or peer-to-peer loop ends without its being told
+to stop stops the other, and exits with a failure, so that whatever runs it
+starts it again. It does not run on without a part, looking alive.
+
+**Derivation:** The HTTP server gives a request it is answering one
+STREAM_TIMEOUT, and the peer-to-peer loop gives its peers one to hear that
+it is closing, side by side; the rest is margin. systemd kills a node that
+has not exited after a minute and a half, so a node that waited for ever
+would make every restart and upgrade take that long. launchd (20 seconds)
+and Docker (10 seconds, unless a grace period is set) kill sooner. That is
+what a crash is: what was committed stays, and something made of several
+writes can be left half done.
+
 ---
 
 ## 7. P2P Select Loop Parameters

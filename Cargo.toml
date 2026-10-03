@@ -55,6 +55,9 @@ rustls = { version = "0.23", features = ["ring"] }
 
 # HTTP API
 actix-web = "4"
+# Not used directly: actix-web brings it. Before 2.9.1 a graceful stop
+# could wait for ever (#99), so the node asks for one after that.
+actix-server = "2.9.1"
 actix-rt = "2"
 
 # Storage
