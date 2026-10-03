@@ -452,8 +452,12 @@ impl ClaudeAdapter {
         };
         // Whether sync is on, and for which directory, is a setting like
         // the others. It was looked at before these were read, and may
-        // have been turned off since: then there is nothing to do.
-        if settings.dir.as_deref().map(Path::new) != Some(self.claude_dir.as_path()) {
+        // have been turned off or changed since: then there is nothing to
+        // do. The directory is the string that is stored, not the path it
+        // spells: what a folder agrees is recorded under it, and the
+        // handlers forget by it.
+        let set = settings.dir.as_deref().map(std::ffi::OsStr::new);
+        if set != Some(self.claude_dir.as_os_str()) {
             report.stopped = true;
             return report;
         }
@@ -685,12 +689,17 @@ fn store_activity(
 /// no longer syncs anything, and forget what its folders had agreed, so
 /// that turning sync on again merges rather than replays what changed in
 /// between.
-pub fn withdraw(state: &AppState) -> Result<(), CordeliaError> {
-    let generation = state.sync_control.generation();
+///
+/// `generation` is the settings count read with the setting that says sync
+/// is off. Returns `false`, having done nothing or only a part, if the
+/// settings have changed since: sync may be on again, and whoever asked
+/// looks again.
+pub fn withdraw(state: &AppState, generation: u64) -> Result<bool, CordeliaError> {
     forget_other_folders(state, &[], generation)?;
     let personal = membership::personal_channel_id(state)?;
     let none = BTreeSet::new();
-    exchange_names(state, &personal, &none, &none, generation).map(|_| ())
+    exchange_names(state, &personal, &none, &none, generation)?;
+    Ok(state.sync_control.generation() == generation)
 }
 
 /// Publish the names this device syncs (`mine`), if they changed, and
@@ -1472,5 +1481,31 @@ mod tests {
         exchange_names(&st, &personal, &mine, &mine, now).unwrap();
         forget_other_folders(&st, &[], now).unwrap();
         assert_eq!((listed(&st), agreed(&st)), (1, 0));
+
+        // Withdrawing, once sync is off, is the same: it is done under the
+        // count read with that setting, or not at all, and says which.
+        // Sync may be on again.
+        let names = |st: &AppState| -> usize {
+            let db = st.db.lock().unwrap();
+            let all = entries::current(st, &db, &personal).unwrap();
+            let list = all.iter().find(|e| e.key.starts_with(SYNCING_PREFIX));
+            list.unwrap().current.content["names"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        sync_state::save(
+            &st.db.lock().unwrap(),
+            "/a/memory",
+            "grp_x",
+            "notes.md",
+            (None, 1),
+        )
+        .unwrap();
+        st.sync_control.changed(&st.db.lock().unwrap());
+        assert!(!withdraw(&st, now).unwrap());
+        assert_eq!((names(&st), agreed(&st)), (1, 1));
+        assert!(withdraw(&st, st.sync_control.generation()).unwrap());
+        assert_eq!((names(&st), agreed(&st)), (0, 0));
     }
 }

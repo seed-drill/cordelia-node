@@ -1144,22 +1144,36 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         let state = state.clone();
         let adapter = adapter.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let dir = match state.db.lock() {
-                Ok(db) => meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
+            let (dir, generation) = match state.db.lock() {
+                Ok(db) => (
+                    meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
+                    state.sync_control.generation_under(&db),
+                ),
                 Err(_) => return,
             };
             let Ok(mut slot) = adapter.lock() else { return };
             let Some(dir) = dir.map(std::path::PathBuf::from) else {
                 // Sync was just turned off: this person's other devices
-                // stop listing what this one synced.
-                if slot.take().is_some()
-                    && let Err(e) = cordelia_sync::claude::withdraw(&state)
-                {
-                    tracing::warn!(error = %e, "sync: could not withdraw this device's names");
+                // stop listing what this one synced. If the settings
+                // change under it, the adapter is kept, and the next turn
+                // looks again.
+                if slot.is_some() {
+                    match cordelia_sync::claude::withdraw(&state, generation) {
+                        Ok(false) => return,
+                        Ok(true) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "sync: could not withdraw this device's names");
+                        }
+                    }
+                    *slot = None;
                 }
                 return;
             };
-            if slot.as_ref().is_none_or(|(d, _)| *d != dir) {
+            // Compared as it is stored, not as a path: see `run_cycle_under`.
+            if slot
+                .as_ref()
+                .is_none_or(|(d, _)| d.as_os_str() != dir.as_os_str())
+            {
                 let home = std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_default();
@@ -1679,7 +1693,8 @@ fn api_post(
             .map(|m| m.strip_prefix("bad request: ").unwrap_or(m).to_string())
             .unwrap_or_else(|| format!("HTTP {status}"));
         // An install leaves the old node running until it is restarted.
-        // A refusal may then mean only that the node is older than this.
+        // A refusal may then mean only that the node is another version
+        // than this command.
         let timeout = std::time::Duration::from_secs(3);
         if !VERSION_NOTED.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(node) = local_api(&config, false, "/api/v1/status", timeout)
@@ -1971,23 +1986,30 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 // naming the home directory itself: never by a slip, and
                 // never because a folder inside it was named.
                 let names_home = given == home_dir;
+                // What each refusal offers is `home on`, which puts home
+                // memory back under the name it last had here. A name the
+                // person gave is kept in the command it offers.
                 if home && !names_home {
                     anyhow::bail!(
-                        "--home maps the home directory itself: cordelia sync map ~ --home"
+                        "--home is for the home directory itself. To sync home memory: \
+                         cordelia sync home on"
                     );
                 }
                 if is_home && !names_home {
                     anyhow::bail!(
                         "Claude Code keeps the memory for {} with your home directory's, because \
                          your home directory is a git repository. To sync home memory: \
-                         cordelia sync map ~ --home",
+                         cordelia sync home on",
                         given.display()
                     );
                 }
                 if is_home && !home {
                     anyhow::bail!(
-                        "that is your home directory. To sync home memory: \
-                         cordelia sync map ~ --home"
+                        "that is your home directory. To sync home memory: {}",
+                        match &name {
+                            Some(name) => format!("cordelia sync map ~ {name} --home"),
+                            None => "cordelia sync home on".to_string(),
+                        }
                     );
                 }
                 let name = match name {

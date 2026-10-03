@@ -146,17 +146,30 @@ pub fn memory_folder(claude_dir: &str, folder: &str) -> String {
         .to_string()
 }
 
-/// Forget what a mapped folder agreed with its channel. A folder that
-/// stops syncing starts afresh if it syncs again: what it lost in between
-/// is fetched back, never sent as deletes (decision 2026-09-30 §4.5). It is
-/// done here, by the handler that stops the folder and under the lock it
-/// holds, so that it is true by the time the command answers.
-fn forget_mapping(db: &rusqlite::Connection, mapping: &SyncMapping) -> Result<(), ApiError> {
-    if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
-        let forgotten = sync_state::forget_folder(db, &memory_folder(&dir, &mapping.folder))?;
-        if forgotten > 0 {
-            tracing::info!(folder = %mapping.folder, files = forgotten, "sync: forgot what the folder had agreed");
-        }
+/// Forget what every folder that is not mapped agreed with its channel,
+/// under the Claude Code directory `claude_dir`.
+///
+/// A folder that stops syncing starts afresh if it syncs again: what it
+/// lost in between is fetched back, never sent as deletes (decision
+/// 2026-09-30 §4.5). A handler knows which mapping it removes. It does not
+/// know which folders a narrower scope no longer finds: that is known only
+/// to a cycle. So every folder that is not mapped forgets, the folder of a
+/// mapping just removed among them. A folder that is found and goes on
+/// syncing pays for that with a merge it did not need.
+///
+/// It is done here, by the handler and under the lock it holds, so that it
+/// is true by the time the command answers.
+fn forget_what_is_not_mapped(db: &rusqlite::Connection, claude_dir: &str) -> Result<(), ApiError> {
+    let mapped: Vec<String> = mappings(db)?
+        .iter()
+        .map(|m| memory_folder(claude_dir, &m.folder))
+        .collect();
+    let forgotten = sync_state::forget_folders_except(db, &mapped)?;
+    if forgotten > 0 {
+        tracing::info!(
+            files = forgotten,
+            "sync: folders that are not mapped forgot what they had agreed"
+        );
     }
     Ok(())
 }
@@ -207,8 +220,12 @@ pub fn set_claude(
             tracing::info!(all, "sync: scope changed");
         }
         meta::set(db, meta::SYNC_CLAUDE_ALL, if all { "on" } else { "off" })?;
-        // Whether anything found by `all` may have stopped syncing.
+        // Whether anything found by `all` may have stopped syncing. It is
+        // judged against what was set before this request: a reset with
+        // the same setting given again narrows nothing.
         let mut narrowed = was_all && !all;
+        let excluded_before = exclusions(db)?;
+        let home_was = meta::get(db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
 
         if body.reset {
             meta::remove(db, meta::SYNC_CLAUDE_EXCLUDE)?;
@@ -217,51 +234,46 @@ pub fn set_claude(
         }
         if let Some(exclude) = &body.exclude {
             let cleaned: Vec<String> = exclude.iter().filter_map(|e| clean_exclusion(e)).collect();
-            let before = exclusions(db)?;
-            if cleaned != before {
+            if cleaned != excluded_before {
                 tracing::info!(exclude = ?cleaned, "sync: exclusions changed");
             }
-            narrowed |= cleaned.iter().any(|e| !before.contains(e));
+            narrowed |= cleaned.iter().any(|e| !excluded_before.contains(e));
             store_exclusions(db, &cleaned)?;
         }
         if let Some(on) = body.home {
-            let was = meta::get(db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
-            if on != was {
+            if on != home_was {
                 tracing::info!(home = on, "sync: home memory setting changed");
             }
             if on {
                 meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
             } else {
                 // Off means off: not found by `all`, and not mapped,
-                // whatever name the home directory was mapped under.
+                // whatever name the home directory was mapped under. Its
+                // folder then forgets with the rest that is not mapped,
+                // below: the setting was on if it was mapped, since
+                // mapping it turns the setting on.
                 meta::set(db, meta::SYNC_CLAUDE_HOME, "off")?;
-                narrowed |= was;
+                narrowed |= home_was;
                 let mut list = mappings(db)?;
                 if let Some(home) = home
                     && let Some(mapping) = unmap_home(&mut list, home)
                 {
                     store_mappings(db, &list)?;
-                    forget_mapping(db, &mapping)?;
                     tracing::info!(name = %mapping.name, "sync: home memory unmapped");
                 }
             }
         }
 
         // What is no longer found starts afresh if it is found again.
-        // Which folders those are is known only to a cycle, so every
-        // folder that is not mapped forgets what it had agreed. So does
-        // every folder when the Claude Code directory changes.
+        // When the Claude Code directory changes, every folder does. The
+        // directory is the string that is stored: the adapter is started
+        // again for a new spelling of the same path, and records what its
+        // folders agree under that.
         let dir_changed = stored.as_deref().is_some_and(|was| was != dir);
-        if narrowed || dir_changed {
-            let mapped: Vec<String> = if dir_changed {
-                Vec::new()
-            } else {
-                mappings(db)?
-                    .iter()
-                    .map(|m| memory_folder(&dir, &m.folder))
-                    .collect()
-            };
-            sync_state::forget_folders_except(db, &mapped)?;
+        if dir_changed {
+            sync_state::forget_folders_except(db, &[])?;
+        } else if narrowed {
+            forget_what_is_not_mapped(db, &dir)?;
         }
 
         if stored.as_deref() != Some(dir.as_str()) {
@@ -496,7 +508,8 @@ pub async fn map(
 /// so that mapped again it merges, and nothing it lost in between is sent
 /// as a delete. The folder is also excluded, so that a device set to sync
 /// everything it finds does not pick it up again under another name; it
-/// syncs again when it is mapped again.
+/// syncs again when it is mapped again. That exclusion is a narrowing like
+/// any other (see [`forget_what_is_not_mapped`]).
 pub fn remove_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -517,11 +530,16 @@ pub fn remove_mapping(
         if !excluded.contains(&mapping.folder) {
             excluded.push(mapping.folder.clone());
         }
-        forget_mapping(db, mapping)?;
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping removed");
     }
     store_exclusions(db, &excluded)?;
     store_mappings(db, &kept)?;
+    // The folder forgets, and so does whatever else is not mapped: the
+    // exclusion also keeps out anything found for the same directory (a
+    // Claude Code folder laid out by hand can name it).
+    if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
+        forget_what_is_not_mapped(db, &dir)?;
+    }
     meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
     control.changed(db);
     Ok(())
@@ -868,10 +886,10 @@ mod tests {
     }
 
     /// A folder that a command stops syncing has forgotten what it agreed
-    /// with its channel by the time the command answers, and the others
-    /// have not. So if it syncs again it merges: a file it lost in between
-    /// is fetched back, and never sent as a delete, whether or not a cycle
-    /// ran in between.
+    /// with its channel by the time the command answers, and the folders
+    /// that stay mapped have not. So if it syncs again it merges: a file
+    /// it lost in between is fetched back, and never sent as a delete,
+    /// whether or not a cycle ran in between.
     #[test]
     fn test_a_folder_that_is_stopped_forgets_what_it_agreed() {
         let s = Settings::on();
@@ -891,6 +909,7 @@ mod tests {
         assert_eq!(remembered(&s), ["/home/sam/notes", "/home/sam/Work"]);
 
         // Unmapped, by name or by folder.
+        s.map(HOME, "team");
         agree(&s);
         s.unmap("lab");
         assert_eq!(remembered(&s), [HOME, "/home/sam/Work"]);
@@ -905,16 +924,19 @@ mod tests {
     }
 
     /// Narrowing what is found (`all` turned off, an exclusion added, home
-    /// memory turned off) stops folders the handler cannot name: which
-    /// folders are found is known only to a cycle. So every folder that is
-    /// not mapped forgets, and mapped folders do not. A change of the
-    /// Claude Code directory moves every folder, so all of them forget.
+    /// memory turned off, a folder unmapped and so kept out) stops folders
+    /// the handler cannot name: which folders are found is known only to a
+    /// cycle. So every folder that is not mapped forgets, and mapped
+    /// folders do not. A request that narrows nothing forgets nothing. A
+    /// change of the Claude Code directory moves every folder, so all of
+    /// them forget.
     #[test]
     fn test_a_narrower_scope_forgets_what_was_found() {
         let found = "/home/sam/code/app";
+        let kept_out = "github.com/client-co/*";
         let narrowings = [
             serde_json::json!({ "all": false }),
-            serde_json::json!({ "exclude": ["github.com/client-co/*"] }),
+            serde_json::json!({ "exclude": [kept_out] }),
             serde_json::json!({ "home": false }),
         ];
         for narrowing in narrowings {
@@ -932,13 +954,78 @@ mod tests {
             s.claude(narrowing.clone());
             assert!(!s.remembers(found), "{narrowing}");
             assert!(s.remembers("/home/sam/notes"), "{narrowing}");
+
+            // The same request again narrows nothing more.
+            s.agreed(found);
+            s.claude(narrowing.clone());
+            assert!(s.remembers(found), "{narrowing}, again");
         }
 
+        // Nor does a reset with the same settings given again, or the
+        // same exclusions in another order.
         let s = Settings::on();
+        let narrow =
+            serde_json::json!({ "all": true, "home": false, "exclude": [kept_out, "b/*"] });
+        s.claude(narrow.clone());
+        s.agreed(found);
+        let mut again = narrow.clone();
+        again["reset"] = true.into();
+        again["dir"] = DIR.into();
+        s.claude(again);
+        s.claude(serde_json::json!({ "exclude": ["b/*", kept_out] }));
+        assert!(s.remembers(found));
+
+        // Unmapping a folder keeps out whatever is found for it too.
+        let s = Settings::on();
+        s.claude(serde_json::json!({ "all": true }));
+        s.map("/home/sam/notes", "lab");
+        s.map("/home/sam/Work", "work");
+        for folder in [found, "/home/sam/notes", "/home/sam/Work"] {
+            s.agreed(folder);
+        }
+        s.unmap("lab");
+        assert!(!s.remembers(found) && !s.remembers("/home/sam/notes"));
+        assert!(s.remembers("/home/sam/Work"));
+
+        // Every folder, a mapped one too, and whatever directory it was
+        // recorded under.
+        let s = Settings::on();
+        let other = "/home/sam/.claude-other";
+        let there = memory_folder(other, "/home/sam/notes");
         s.map("/home/sam/notes", "lab");
         s.agreed("/home/sam/notes");
-        s.claude(serde_json::json!({ "dir": "/home/sam/.claude-other" }));
+        sync_state::save(&s.db, &there, "grp_x", "notes.md", (Some([7; 32]), 1)).unwrap();
+        s.claude(serde_json::json!({ "dir": other }));
         assert!(!s.remembers("/home/sam/notes"));
+        assert!(sync_state::load(&s.db, &there, "grp_x").unwrap().is_empty());
+        // The directory is the string: another spelling of the same path
+        // is a change of it.
+        s.agreed("/home/sam/notes");
+        s.claude(serde_json::json!({ "dir": "/home/sam//.claude-other" }));
+        assert!(!s.remembers("/home/sam/notes"));
+    }
+
+    /// Turning home memory off unmaps the home directory, so the node has
+    /// to know where that is. Where it does not, the request is refused
+    /// whole: nothing in it is stored, and nothing is counted as changed.
+    #[test]
+    fn test_home_memory_is_not_turned_off_where_home_is_not_known() {
+        let s = Settings::on();
+        s.map(HOME, "team");
+        let count = s.control.generation();
+        let body = serde_json::json!({ "enabled": true, "all": true, "home": false });
+        let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
+        assert!(set_claude(&s.control, &s.db, &body, None).is_err());
+        assert_eq!(s.names(), ["team"]);
+        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
+        assert_ne!(all.as_deref(), Some("on"));
+        assert_eq!(s.control.generation(), count);
+
+        // Everything else is carried out without it.
+        let body = serde_json::json!({ "enabled": true, "all": true });
+        let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
+        set_claude(&s.control, &s.db, &body, None).unwrap();
+        assert_eq!(s.names(), ["team"]);
     }
 
     /// The name home memory is put back under is the name it last synced
@@ -963,9 +1050,11 @@ mod tests {
         assert_eq!(s.home_name().as_deref(), Some("team"));
 
         // Mapped under another name, then unmapped: an unmapped folder
-        // stays out of what is found, so it is still that name.
+        // stays out of what is found, so it is still that name, whatever
+        // is set afterwards.
         s.map(HOME, "crew");
         s.unmap("crew");
+        s.claude(serde_json::json!({ "all": true }));
         assert_eq!(s.home_name().as_deref(), Some("crew"));
 
         // Found, and syncing as `~`: once it is no longer kept out.

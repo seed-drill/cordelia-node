@@ -1057,11 +1057,11 @@ fn claude_memory_syncs_between_two_machines() {
 
     // What cannot be mapped by accident, or by a slip.
     let said = a.refused(&["sync", "map", &path(&a.home())]);
-    assert!(said.contains("cordelia sync map ~ --home"), "{said}");
+    assert!(said.contains("cordelia sync home on"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a.home()), "team"]);
-    assert!(said.contains("cordelia sync map ~ --home"), "{said}");
+    assert!(said.contains("cordelia sync map ~ team --home"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_repo), "--home"]);
-    assert!(said.contains("--home maps the home directory"), "{said}");
+    assert!(said.contains("--home is for the home directory"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_notes), "~"]);
     assert!(said.contains("the name of home memory"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_notes)]);
@@ -1515,11 +1515,11 @@ fn home_memory_syncs_under_any_name() {
     let said = a.refused(&["sync", "map", &inside, "scratch"]);
     assert!(
         said.contains("your home directory is a git repository")
-            && said.contains("cordelia sync map ~ --home"),
+            && said.contains("cordelia sync home on"),
         "{said}"
     );
     let said = a.refused(&["sync", "map", &inside, "scratch", "--home"]);
-    assert!(said.contains("--home maps the home directory"), "{said}");
+    assert!(said.contains("--home is for the home directory"), "{said}");
     assert_eq!(mapped_names(&state(&a)), ["lab"]);
     let out = a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
     assert!(out.contains("Mapped ~ to team."), "{out}");

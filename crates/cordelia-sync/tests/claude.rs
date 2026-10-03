@@ -268,6 +268,27 @@ fn unmap(d: &Device, folder: &Path) {
     cordelia_api::sync::remove_mapping(&d.state.sync_control, &db, &request).unwrap();
 }
 
+/// Change a device's sync settings as `cordelia sync claude` does: through
+/// the node's own handler, with what it forgets. Turning sync off is
+/// followed by what the node's loop does next: this person's other devices
+/// stop listing what this one synced.
+fn claude(d: &Device, mut body: serde_json::Value) {
+    let off = body["enabled"] == false;
+    if !off {
+        body["enabled"] = true.into();
+    }
+    let request: cordelia_api::types::SyncClaudeRequest = serde_json::from_value(body).unwrap();
+    {
+        let db = d.state.db.lock().unwrap();
+        cordelia_api::sync::set_claude(&d.state.sync_control, &db, &request, Some(&d.home))
+            .unwrap();
+    }
+    if off {
+        let count = d.state.sync_control.generation();
+        assert!(cordelia_sync::claude::withdraw(&d.state, count).unwrap());
+    }
+}
+
 /// Everything flows both ways until quiet, as `settle`, but returning each
 /// device's last report instead of failing on a sync error.
 fn settle_reporting(
@@ -1012,7 +1033,7 @@ fn what_other_devices_sync_is_what_they_sync_now() {
     map(&a, &a_notes, "lab-notes");
     settle(&mut a, &mut b);
     assert_eq!(b.cycle().available, vec!["lab-notes".to_string()]);
-    cordelia_sync::claude::withdraw(&a.state).unwrap();
+    claude(&a, serde_json::json!({ "enabled": false }));
     relay(&a, &b);
     assert!(b.cycle().available.is_empty());
 }
@@ -1247,6 +1268,38 @@ fn a_cycle_does_nothing_once_sync_is_off() {
     assert_eq!(written(&a), before, "nothing was published");
 }
 
+/// A cycle runs only for the Claude Code directory that is set, and the
+/// directory is the string that is stored: what a folder agrees is
+/// recorded under it, and the handlers forget by it. An adapter started
+/// for another directory, or for another spelling of the same one, does
+/// nothing. The node's loop starts a new one.
+#[test]
+fn a_cycle_runs_only_for_the_directory_that_is_set() {
+    let (mut a, mut b) = paired_explicit();
+    let a_one = a.plain_dir("one");
+    let a_mem = a.claude_folder(&a_one);
+    std::fs::write(a_mem.join("x.md"), "first\n").unwrap();
+    map(&a, &a_one, "one");
+    settle(&mut a, &mut b);
+
+    std::fs::write(a_mem.join("x.md"), "edited\n").unwrap();
+    let written = |d: &Device| {
+        cordelia_storage::items::outbox_len(&d.state.db.lock().unwrap(), &d.pk()).unwrap()
+    };
+    let before = written(&a);
+    let set = a.home.join(".claude");
+    let respelled = PathBuf::from(format!("{}//.claude", a.home.display()));
+    assert_eq!(respelled, set, "the same path");
+    for other in [a.home.join(".claude-other"), respelled] {
+        let mut stale = ClaudeAdapter::new(other.clone(), a.home.clone(), &a.pk());
+        let report = stale.run_cycle(&a.state);
+        assert!(report.stopped, "{}: {report:?}", other.display());
+        assert!(report.folders.is_empty(), "{}", other.display());
+    }
+    assert_eq!(written(&a), before, "nothing was published");
+    assert_eq!(a.cycle().folders[0].published, 1);
+}
+
 /// Unmapped (or home turned off, or the scope narrowed), emptied, and
 /// mapped again: the folder starts afresh. What it lost in between is not
 /// sent to the other devices as deletes.
@@ -1283,8 +1336,15 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&a_mem), ["MEMORY.md", "one.md", "two.md"]);
 
     // The same when sync is turned off altogether and on again.
-    cordelia_sync::claude::withdraw(&a.state).unwrap();
+    claude(&a, serde_json::json!({ "enabled": false }));
     std::fs::remove_file(a_mem.join("one.md")).unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(
+        read(&a_mem, "one.md"),
+        None,
+        "nothing syncs while it is off"
+    );
+    claude(&a, serde_json::json!({}));
     settle(&mut a, &mut b);
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
     assert_eq!(read(&a_mem, "one.md").as_deref(), Some("one\n"));
@@ -1305,15 +1365,34 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     assert_eq!(files(&b_home), ["profile.md"]);
 
     // A goes back to mapped folders only (it has none), loses its copy,
-    // then syncs everything it finds again.
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "off");
-    settle(&mut a, &mut b);
-    std::fs::remove_file(a_home.join("profile.md")).unwrap();
-    settle(&mut a, &mut b);
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
-    settle(&mut a, &mut b);
-    assert_eq!(files(&b_home), ["profile.md"]);
-    assert_eq!(files(&a_home), ["profile.md"]);
+    // then syncs everything it finds again. The same when home memory is
+    // turned off and on, and when it is kept out and let in again. Each
+    // is set as the command sets it, through the node's handler.
+    let home = a.home.display().to_string();
+    for (narrower, wider) in [
+        (
+            serde_json::json!({ "all": false }),
+            serde_json::json!({ "all": true }),
+        ),
+        (
+            serde_json::json!({ "home": false }),
+            serde_json::json!({ "home": true }),
+        ),
+        (
+            serde_json::json!({ "exclude": [home] }),
+            serde_json::json!({ "exclude": [] }),
+        ),
+    ] {
+        claude(&a, narrower.clone());
+        settle(&mut a, &mut b);
+        std::fs::remove_file(a_home.join("profile.md")).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(files(&a_home), [""; 0], "{narrower}: it does not sync");
+        claude(&a, wider);
+        settle(&mut a, &mut b);
+        assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
+        assert_eq!(files(&a_home), ["profile.md"], "{narrower}");
+    }
 }
 
 /// A mapped folder whose memory directory is gone (its disk is not

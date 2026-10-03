@@ -237,7 +237,7 @@ Two mechanisms carry items between them:
    - The name is what devices share. A repository's name defaults to its
      normalised git remote (lower-cased host and path, without scheme,
      credentials, port, or `.git`); any other folder is given one; home memory
-     is `~` and has to be asked for by name.
+     syncs as `~` unless it is given another name, and has to be asked for.
    - Each name has its own channel, found in a map held in the personal
      channel. The first device to sync a name creates its channel, owned by it
      alone. Another of the person's devices joins only when it maps the name
