@@ -885,8 +885,8 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
 /// T20. A key that is no device's key, stored as one of this person's
 /// devices by a version that did not refuse them, is taken off the list
 /// when the node starts, and the log says so. No channel's key is changed
-/// on its account, by the node or by a command: removing such a key is
-/// refused, and nothing about it is kept or shown afterwards.
+/// on its account, by the node or by `remove-device`: removing such a key
+/// is refused, and no command shows anything about it afterwards.
 #[test]
 fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     use cordelia_storage::{channels, db, trust};
@@ -945,13 +945,13 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     let said = a.cli(&["devices"]);
     assert!(!said.contains(&listed_as), "{said}");
     // The log says what was done, that the channels keep their keys, and
-    // which channels: nothing else records them.
+    // which channels, by name: no command shows them afterwards.
     let log = std::fs::read_to_string(a.log()).unwrap();
     let said: Vec<&str> = log.lines().filter(|l| l.contains(taken_off)).collect();
     assert_eq!(said.len(), 1, "{log}");
     assert!(
         said[0].contains("The channels that listed it keep the keys they had")
-            && said[0].contains(&personal)
+            && said[0].contains(&format!("personal ({personal})"))
             && said[0].contains(&listed_as),
         "{log}"
     );

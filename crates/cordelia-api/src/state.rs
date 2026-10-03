@@ -82,10 +82,12 @@ pub struct AppState {
 /// Nothing depends on what is kept: a key that is not here is checked, and
 /// what is kept for a key is what the check gave. Each node has its own.
 ///
-/// It saves the checks only while the keys of what waits fit in it. Once
-/// they do not, every look at a state checks its keys again, as it did
-/// before there was anything kept: what is kept is dropped before the
-/// keys kept from the last look are come to.
+/// It saves the checks only while the keys the node looks at fit in it.
+/// Once they do not, a look at a state checks its keys again, a
+/// multiplication for each: what is kept is dropped before the keys kept
+/// from the last look are come to. (A key that several states list can
+/// still be answered from what is kept.) Never more checks than with
+/// nothing kept, and each distinct key at least once a look.
 pub struct UsableKeys {
     known: Mutex<std::collections::HashMap<[u8; 32], bool>>,
     most: usize,
@@ -96,7 +98,7 @@ impl UsableKeys {
     /// members as a state may (1,024).
     pub const MOST: usize = 65_536;
 
-    /// One that keeps at most `most` answers, and never fewer than one.
+    /// One that keeps at most `most` answers (one, if `most` is nought).
     /// When one more is to be kept, all are dropped first.
     pub fn keeping(most: usize) -> Self {
         Self {

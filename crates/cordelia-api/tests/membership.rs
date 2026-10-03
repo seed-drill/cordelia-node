@@ -1989,12 +1989,12 @@ fn t20_a_state_that_is_held_has_its_keys_checked_once() {
 }
 
 /// T20. What is remembered of keys is bounded. Where the keys of a state
-/// that waits do not fit in it, every look checks them all again, as
-/// before anything was remembered, and what becomes of the state is the
-/// same: it is held, and it is applied without the keys that are no
-/// device's once the stranger it names is one of this person's devices.
+/// that waits do not fit in it, every look checks them all again, a check
+/// for each key, and what becomes of the state is the same: it is held,
+/// and it is applied without the keys that are no device's once the
+/// stranger it names is one of this person's devices.
 #[test]
-fn t20_past_what_is_remembered_a_state_costs_what_it_did_and_ends_the_same() {
+fn t20_past_what_is_remembered_a_state_costs_a_check_a_key_and_ends_the_same() {
     use cordelia_api::state::UsableKeys;
     use cordelia_crypto::identity::{is_usable_public_key, key_checks};
 
