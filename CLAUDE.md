@@ -151,7 +151,7 @@ covered by `crates/cordelia-node/tests/devices_e2e.rs`.
 
 ## Related Repos
 
-- **seed-drill** (strategy-and-planning): ROADMAP.md, STRATEGY.md, venture docs
+- **seed-drill** (private): strategy and planning. Nothing from it belongs in this repository unless it is meant to be public
 - **seeddrill-website**: seeddrill.ai (Astro, Cloudflare Pages); `/install.sh` redirects to `scripts/install.sh` here
 - **cordelia-sdk**: TypeScript SDK (`@seeddrill/cordelia`), deferred
 - **ARCHIVED, do not use:** cordelia-core (old libp2p+JSON+axum implementation), cordelia-proxy,
