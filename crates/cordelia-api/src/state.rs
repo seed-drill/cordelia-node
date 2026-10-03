@@ -85,13 +85,15 @@ pub struct SyncControl {
 }
 
 impl SyncControl {
-    /// A setting changed: count it, and wake the adapter so that the change
-    /// takes effect now rather than at its next cycle.
+    /// A setting is changing: count it, and wake the adapter so that the
+    /// change takes effect now rather than at its next cycle.
     ///
     /// It is called with the database lock held, which is what `_db` is
     /// for: a cycle reads the count under that lock before each entry it
     /// publishes, so no entry is published under settings that a handler
-    /// has already replaced and answered for.
+    /// has already replaced and answered for. A handler calls it before
+    /// the first thing it writes, so that a change that fails part-way has
+    /// still stopped the cycle that was running.
     pub fn changed(&self, _db: &rusqlite::Connection) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.wake.notify_one();

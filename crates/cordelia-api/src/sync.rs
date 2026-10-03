@@ -212,6 +212,9 @@ pub fn set_claude(
             return Err(ApiError::BadRequest("HOME is not set".into()));
         }
 
+        // Counted before anything is written (see `SyncControl::changed`).
+        control.changed(db);
+
         // The scope is stored before the directory that turns sync on, so
         // that sync is never on with its scope left to be implied.
         let was_all = meta::get(db, meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on");
@@ -275,7 +278,13 @@ pub fn set_claude(
         // forgot only later, in its loop, and a write may have failed.
         let dir_changed = stored.as_deref().is_some_and(|was| was != dir);
         if dir_changed || stored.is_none() {
-            sync_state::forget_folders_except(db, &[])?;
+            let forgotten = sync_state::forget_folders_except(db, &[])?;
+            if forgotten > 0 {
+                tracing::info!(
+                    files = forgotten,
+                    "sync: every folder forgot what it had agreed"
+                );
+            }
         } else if narrowed {
             forget_what_is_not_mapped(db, &dir)?;
         }
@@ -299,6 +308,7 @@ pub fn set_claude(
             meta::set(db, meta::SYNC_CLAUDE_HOME_NAME, HOME_NAME)?;
         }
     } else {
+        control.changed(db);
         if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
             meta::set(db, meta::SYNC_CLAUDE_LAST_DIR, &dir)?;
         }
@@ -308,7 +318,6 @@ pub fn set_claude(
         tracing::info!("sync: turned off");
     }
     meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
-    control.changed(db);
     Ok(())
 }
 
@@ -461,7 +470,9 @@ pub fn add_mapping(
         ));
     }
     let mut list = mappings(db)?;
-    if let Some(mapping) = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)? {
+    let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
+    control.changed(db);
+    if let Some(mapping) = checked {
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping added");
         let excluded = exclusions(db)?;
         if excluded.contains(&mapping.folder) {
@@ -479,7 +490,6 @@ pub fn add_mapping(
         store_mappings(db, &list)?;
         meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
     }
-    control.changed(db);
     Ok(())
 }
 
@@ -529,6 +539,7 @@ pub fn remove_mapping(
             body.folder
         )));
     }
+    control.changed(db);
     let mut excluded = exclusions(db)?;
     for mapping in &gone {
         if !excluded.contains(&mapping.folder) {
@@ -545,7 +556,6 @@ pub fn remove_mapping(
         forget_what_is_not_mapped(db, &dir)?;
     }
     meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
-    control.changed(db);
     Ok(())
 }
 
@@ -1085,6 +1095,58 @@ mod tests {
         s.map(HOME, "team");
         s.claude(serde_json::json!({ "all": true }));
         assert_eq!(s.home_name().as_deref(), Some("team"));
+    }
+
+    /// A handler counts its change before the first thing it writes. One
+    /// that fails part-way has then still stopped the cycle that was
+    /// running. Otherwise that cycle would go on from what it read before,
+    /// with whatever the handler did get written under it.
+    #[test]
+    fn test_a_change_that_fails_part_way_is_still_counted() {
+        let home = std::path::Path::new(HOME);
+        let claude = |s: &Settings, body: serde_json::Value| {
+            let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
+            set_claude(&s.control, &s.db, &body, Some(home))
+        };
+        for which in ["sync off", "a narrower scope", "an unmapping"] {
+            let s = Settings::on();
+            s.claude(serde_json::json!({ "all": true }));
+            s.map("/home/sam/notes", "lab");
+            let before = s.control.generation();
+            // The table of what folders agreed is gone, so forgetting
+            // fails, which each of these does last.
+            s.db.execute("DROP TABLE sync_files", []).unwrap();
+            let outcome = match which {
+                "sync off" => claude(&s, serde_json::json!({ "enabled": false })),
+                "a narrower scope" => {
+                    claude(&s, serde_json::json!({ "enabled": true, "all": false }))
+                }
+                _ => {
+                    let body = SyncUnmapRequest {
+                        folder: "lab".into(),
+                    };
+                    remove_mapping(&s.control, &s.db, &body)
+                }
+            };
+            assert!(outcome.is_err(), "{which}");
+            assert!(s.control.generation() > before, "{which}");
+        }
+        // A request that is refused before anything is written counts
+        // nothing.
+        let s = Settings::on();
+        let before = s.control.generation();
+        assert!(
+            claude(
+                &s,
+                serde_json::json!({ "enabled": true, "dir": "relative" })
+            )
+            .is_err()
+        );
+        let body = SyncUnmapRequest {
+            folder: "nothing".into(),
+        };
+        assert!(remove_mapping(&s.control, &s.db, &body).is_err());
+        assert_eq!(s.control.generation(), before);
     }
 
     /// Every handler counts its change, with the lock held, so that a

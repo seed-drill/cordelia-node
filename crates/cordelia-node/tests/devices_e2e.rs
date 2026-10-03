@@ -1364,6 +1364,28 @@ fn home_memory_syncs_under_any_name() {
 
     let out = a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
     assert!(out.contains("Mapped ~ to team."), "{out}");
+    // Declared again under the name it has, with or without the flag:
+    // nothing to change, and nothing refused.
+    let home_path = path(&a.home());
+    for again in [&["team", "--home"][..], &["team"], &["Team"], &[]] {
+        let args = [&["sync", "map", home_path.as_str()], again].concat();
+        let out = a.cli(&args);
+        assert!(
+            out.contains("is already mapped to team. Nothing changed."),
+            "{again:?}: {out}"
+        );
+    }
+    // Under another name it is refused for being mapped, with or without
+    // the flag, and nothing is offered that the node would refuse.
+    for other in [&["other", "--home"][..], &["other"]] {
+        let args = [&["sync", "map", home_path.as_str()], other].concat();
+        let said = a.refused(&args);
+        assert!(
+            said.contains("is already mapped to team") && said.contains("cordelia sync unmap"),
+            "{other:?}: {said}"
+        );
+        assert!(!said.contains("other --home"), "{other:?}: {said}");
+    }
     b.cli(&["sync", "map", &path(&b_dir), "team"]);
     a.cli(&["sync", "map", &path(&a_other), "lab"]);
     b.cli(&["sync", "map", &path(&b_other), "lab"]);
@@ -1390,7 +1412,7 @@ fn home_memory_syncs_under_any_name() {
         "{out}"
     );
     let said = a.refused(&["sync", "map", &path(&a.home()), "other", "--home"]);
-    assert!(said.contains("already mapped to \"team\""), "{said}");
+    assert!(said.contains("~ is already mapped to team."), "{said}");
     assert_eq!(mapped_names(&state(&a)), ["lab", "team"]);
 
     // One word that is a name and also a folder is not unmapped: `lab` is

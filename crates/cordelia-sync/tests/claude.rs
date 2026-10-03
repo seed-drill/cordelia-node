@@ -1367,8 +1367,10 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     // then syncs everything it finds again. The same when home memory is
     // turned off and on, and when it is kept out and let in again. Each
     // is set as the command sets it, through the node's handler, and no
-    // cycle runs while the scope is narrow: it is the handler that has
-    // forgotten what the folder agreed, by the time it answers.
+    // cycle runs between the narrowing and the loss: it is the handler
+    // that has forgotten what the folder agreed, by the time it answers.
+    // (A cycle does run while the scope is narrow, further down, to show
+    // that the folder is out.)
     let home = a.home.display().to_string();
     for (narrower, wider) in [
         (
