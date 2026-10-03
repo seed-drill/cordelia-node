@@ -1645,7 +1645,7 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 
 Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
 
-The `max_message_bytes` of 1 MB accommodates 14 max-size items with their headers, or ~100 typical items (~10 KB each). A sender keeps a push to 192 KB (`OUTBOX_BATCH_MAX_BYTES`), and a node that fetches asks for fewer items when a page's would not fit (`SYNC_PAGE_STEPS`). The wire codec rejects messages exceeding this before any parsing occurs.
+The `max_message_bytes` of 1 MB accommodates 14 max-size items with their headers, or ~100 typical items (~10 KB each). A sender keeps a push to what three entries of the largest size cost, 195 KB (`OUTBOX_BATCH_MAX_BYTES`), and a node that fetches asks for fewer items when a page's would not fit (`SYNC_PAGE_STEPS`). The wire codec rejects messages exceeding this before any parsing occurs.
 
 ### 9.4 Backpressure Model
 

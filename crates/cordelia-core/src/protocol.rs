@@ -378,11 +378,31 @@ pub fn entry_fields_fit(
     published_at: &str,
     parent_id: Option<&str>,
 ) -> bool {
-    item_id.len() <= MAX_ITEM_ID_LEN
-        && channel_id.len() <= MAX_CHANNEL_ID_LEN
-        && item_type.len() <= MAX_ITEM_TYPE_LEN
-        && published_at.len() <= MAX_TIMESTAMP_LEN
-        && parent_id.is_none_or(|parent| parent.len() <= MAX_ITEM_ID_LEN)
+    entry_field_over(item_id, channel_id, item_type, published_at, parent_id).is_none()
+}
+
+/// The first of an entry's fields that is over the size it must fit in,
+/// by name and with that size in bytes, if any is.
+pub fn entry_field_over(
+    item_id: &str,
+    channel_id: &str,
+    item_type: &str,
+    published_at: &str,
+    parent_id: Option<&str>,
+) -> Option<(&'static str, usize)> {
+    if item_id.len() > MAX_ITEM_ID_LEN {
+        Some(("ID", MAX_ITEM_ID_LEN))
+    } else if channel_id.len() > MAX_CHANNEL_ID_LEN {
+        Some(("channel", MAX_CHANNEL_ID_LEN))
+    } else if item_type.len() > MAX_ITEM_TYPE_LEN {
+        Some(("type", MAX_ITEM_TYPE_LEN))
+    } else if published_at.len() > MAX_TIMESTAMP_LEN {
+        Some(("time", MAX_TIMESTAMP_LEN))
+    } else if parent_id.is_some_and(|parent| parent.len() > MAX_ITEM_ID_LEN) {
+        Some(("parent", MAX_ITEM_ID_LEN))
+    } else {
+        None
+    }
 }
 
 /// Maximum items per batch fetch (demand-model.md §3.1).
@@ -478,7 +498,7 @@ pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
 /// A device sends what it writes as it writes it, so a relay asks only for
 /// what it lost, dropped or had no room for. The wait is the one a device
 /// keeps before it offers again what a relay refused: whichever of the two
-/// has the entry, the other hears of it within ten minutes.
+/// has the entry, the other hears of it in about ten minutes.
 /// Rationale: parameter-rationale.md §4.
 pub const RELAY_ASK_AGAIN_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
 

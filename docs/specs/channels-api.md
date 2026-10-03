@@ -265,7 +265,7 @@ Node-internal types are written by the node itself (during subscribe, PSK rotati
 9. If realtime channel: trigger eager push to peers
 
 **Errors:**
-- `400` if content is missing or not valid JSON
+- `400` if content is missing or not valid JSON, or if `item_type` (32 bytes at most), or `parent_id` (64) when no `key` is given, is longer than it may be; the message names the field. An entry under a key has no parent.
 - `404` if channel not found
 - `403` if caller is not a member
 - `413` if the item would exceed 64 KB as it travels: its serialized content plus the 28 bytes that encryption adds

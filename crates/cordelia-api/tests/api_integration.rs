@@ -963,6 +963,58 @@ async fn test_publish_oversized_item_rejected() {
     assert_eq!(body["error"]["quota_bytes"], limit);
 }
 
+/// An entry whose type or parent is over the size a field may be is refused
+/// with the field named. It was answered as a payload too large, with a
+/// count that meant nothing for a field.
+#[actix_web::test]
+async fn test_publish_with_a_field_over_its_size_names_the_field() {
+    use cordelia_core::protocol::{MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN};
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/subscribe")
+        .insert_header(auth_header())
+        .set_json(json!({"channel": "field-limit-test"}))
+        .to_request();
+    test::call_service(&app, req).await;
+
+    for (field, len, named) in [
+        ("item_type", MAX_ITEM_TYPE_LEN + 1, "type may be at most 32"),
+        ("parent_id", MAX_ITEM_ID_LEN + 1, "parent may be at most 64"),
+    ] {
+        let mut body = json!({"channel": "field-limit-test", "content": "small"});
+        body[field] = json!("x".repeat(len));
+        let req = test::TestRequest::post()
+            .uri("/api/v1/channels/publish")
+            .insert_header(auth_header())
+            .set_json(body)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "{field}");
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body.to_string().contains(named), "{field}: {body}");
+    }
+
+    // Each at its largest is taken.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/channels/publish")
+        .insert_header(auth_header())
+        .set_json(json!({
+            "channel": "field-limit-test",
+            "content": "small",
+            "item_type": "x".repeat(MAX_ITEM_TYPE_LEN),
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+}
+
 /// T5-12: Publish just under MAX_ITEM_BYTES succeeds.
 #[actix_web::test]
 async fn test_publish_just_under_size_limit_succeeds() {

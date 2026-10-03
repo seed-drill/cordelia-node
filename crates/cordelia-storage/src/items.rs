@@ -107,22 +107,16 @@ pub fn insert_item(conn: &Connection, item: &NewItem) -> Result<bool, CordeliaEr
     // One size for an entry means every field of it: the rest of an entry
     // is bounded too, or its ID, type or time could carry what its content
     // may not.
-    if !cordelia_core::protocol::entry_fields_fit(
+    if let Some((field, most)) = cordelia_core::protocol::entry_field_over(
         item.item_id,
         item.channel_id,
         item.item_type,
         item.published_at,
         item.parent_id,
     ) {
-        let fields = item.item_id.len()
-            + item.channel_id.len()
-            + item.item_type.len()
-            + item.published_at.len()
-            + item.parent_id.map_or(0, str::len);
-        return Err(CordeliaError::TooLarge {
-            bytes: fields,
-            limit: cordelia_core::protocol::ENTRY_OVERHEAD_BYTES,
-        });
+        return Err(CordeliaError::Validation(format!(
+            "an entry's {field} may be at most {most} bytes"
+        )));
     }
     if item
         .rev
@@ -1508,34 +1502,33 @@ mod tests {
         };
         let conn = setup();
         let long = |len: usize| -> &'static str { Box::leak("x".repeat(len).into_boxed_str()) };
-        let too_large = |item: &NewItem| {
-            matches!(
-                insert_item(&conn, item),
-                Err(CordeliaError::TooLarge { .. })
-            )
+        // Refused, with the field named.
+        let too_large = |item: &NewItem, field: &str| match insert_item(&conn, item) {
+            Err(CordeliaError::Validation(why)) => why.contains(field),
+            _ => false,
         };
 
-        assert!(too_large(&test_item(
-            long(MAX_ITEM_ID_LEN + 1),
-            "2026-01-01T00:01:00Z"
-        )));
+        assert!(too_large(
+            &test_item(long(MAX_ITEM_ID_LEN + 1), "2026-01-01T00:01:00Z"),
+            "ID may be at most 64"
+        ));
 
         let mut item = test_item("ci_channel", "2026-01-01T00:01:00Z");
         item.channel_id = long(MAX_CHANNEL_ID_LEN + 1);
-        assert!(too_large(&item));
+        assert!(too_large(&item, "channel may be at most 96"));
 
         let mut item = test_item("ci_type", "2026-01-01T00:01:00Z");
         item.item_type = long(MAX_ITEM_TYPE_LEN + 1);
-        assert!(too_large(&item));
+        assert!(too_large(&item, "type may be at most 32"));
 
-        assert!(too_large(&test_item(
-            "ci_time",
-            long(MAX_TIMESTAMP_LEN + 1)
-        )));
+        assert!(too_large(
+            &test_item("ci_time", long(MAX_TIMESTAMP_LEN + 1)),
+            "time may be at most 40"
+        ));
 
         let mut item = test_item("ci_parent", "2026-01-01T00:01:00Z");
         item.parent_id = Some(long(MAX_ITEM_ID_LEN + 1));
-        assert!(too_large(&item));
+        assert!(too_large(&item, "parent may be at most 64"));
 
         // Each field at its largest is stored.
         let mut item = test_item(long(MAX_ITEM_ID_LEN), long(MAX_TIMESTAMP_LEN));
