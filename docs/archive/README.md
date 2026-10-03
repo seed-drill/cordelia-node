@@ -14,6 +14,7 @@ one of these files by name, it is here.
 | `specs/search-indexing.md` | FTS5 and semantic search | Deferred: v1 needs no search. The `/api/v1/channels/search` endpoint and the FTS index are still in the code. |
 | `specs/sdk-api-reference.md` | The TypeScript SDK (`@seeddrill/cordelia`) | Deferred with `cordelia-sdk` |
 | `reference/game-theory.md` | Game-theoretic foundations of trust and relay economics | Dropped with Bayesian trust and relay economics |
+| `reference/risk-model-2026-04.md` | Risk model v1.0 (April 2026), the formal companion to whitepaper v2.3 §12 | Replaced 2026-10-03 by the one-page [`docs/reference/risk-model.md`](../reference/risk-model.md). It argued in part from trust scores, group culture, attestation and governance voting, which were not built |
 | `decisions/2026-03-09-mvp-implementation-plan.md` | The March build plan (WP1-WP12) | Replaced by the v1 build sequence |
 | `decisions/2026-03-09-spo-economic-model.md` | Cardano stake pool operators as the relay network and settlement layer | Dropped 2026-09-30: no settlement layer is chosen (`docs/vision.md` §4) |
 | `decisions/2026-03-10-identity-privacy-model.md` | Identity layers 1-3, proof of agency, access policies, DMs, namespaces | v1 keeps Layer 0 only: one Ed25519 key per device |

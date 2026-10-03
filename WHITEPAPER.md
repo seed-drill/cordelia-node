@@ -45,8 +45,8 @@ break that memory in practice:
    files but do not understand projects, concurrent edits, or who may read what.
 
 What is needed is small and specific: memory that belongs to the person, is
-matched by project, stays encrypted end to end, survives machines being off,
-and can be shared deliberately.
+matched by project, stays encrypted end to end, and survives machines being
+off.
 
 ## 2. What Cordelia does
 
@@ -331,9 +331,11 @@ alpha pre-releases are published.
 **Next:**
 
 - **Channels shared between people,** carrying what is shared on purpose:
-  messages between agents first, then skills and secrets. They will not carry
-  memory. An agent reads its memory as its own notes, so memory stays with one
-  person and moves only between that person's devices (decision record §4.7).
+  messages between agents first, then secrets. They will not carry memory. An
+  agent reads its memory as its own notes, so memory stays with one person and
+  moves only between that person's devices (decision record §4.7). Skills that
+  people share travel in a repository, where a change is reviewed, and not in
+  a channel.
 - **More adapters**, starting with a second coding agent, so memory survives a
   change of agent as well as a change of machine.
 - **More relays, run by others.** Anyone can run one; the configuration lists
