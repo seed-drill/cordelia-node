@@ -1988,6 +1988,63 @@ fn t20_a_state_that_is_held_has_its_keys_checked_once() {
     assert_eq!(pass(5), 5);
 }
 
+/// T20. What is remembered of keys is bounded. Where the keys of a state
+/// that waits do not fit in it, every look checks them all again, as
+/// before anything was remembered, and what becomes of the state is the
+/// same: it is held, and it is applied without the keys that are no
+/// device's once the stranger it names is one of this person's devices.
+#[test]
+fn t20_past_what_is_remembered_a_state_costs_what_it_did_and_ends_the_same() {
+    use cordelia_api::state::UsableKeys;
+    use cordelia_crypto::identity::{is_usable_public_key, key_checks};
+
+    let (mut a, b, personal) = paired();
+    a.state.usable_keys = UsableKeys::keeping(100);
+    let project = membership::create_project_group(&a.state, "project:x").unwrap();
+    channels::add_member(&a.state.db.lock().unwrap(), &project, &b.pk(), "owner").unwrap();
+    let at = (
+        epoch_of(&a, &project) + 1,
+        a.key_version(&project) as u32,
+        a.key(&project),
+    );
+    let many = state_listing_the_most(&project, &b.pk(), &a.pk(), at, false);
+    let strangers: Vec<[u8; 32]> = many
+        .members
+        .iter()
+        .map(|m| m.key)
+        .filter(|key| is_usable_public_key(key) && *key != a.pk() && *key != b.pk())
+        .collect();
+    assert!(!strangers.is_empty());
+    deliver_crafted(&b.state.identity, &a, &many);
+    for _ in 0..3 {
+        let before = key_checks();
+        let summary = membership::process_inbox(&a.state).unwrap();
+        assert_eq!((summary.applied.len(), summary.held), (0, 1), "{summary:?}");
+        assert_eq!(
+            key_checks() - before,
+            1 + 1024,
+            "the sender's, and every key"
+        );
+        assert!(a.state.usable_keys.kept() <= 100);
+    }
+
+    // The strangers become this person's devices: the state is applied,
+    // with every usable key it lists and none of the others.
+    {
+        let db = a.state.db.lock().unwrap();
+        for key in &strangers {
+            channels::add_member(&db, &personal, key, "owner").unwrap();
+        }
+    }
+    let summary = membership::process_inbox(&a.state).unwrap();
+    assert_eq!((summary.applied.len(), summary.held), (1, 0), "{summary:?}");
+    let mut want: Vec<[u8; 32]> = strangers.iter().copied().chain([a.pk(), b.pk()]).collect();
+    want.sort();
+    let mut members: Vec<[u8; 32]> = a.members(&project).into_iter().map(|(k, _)| k).collect();
+    members.sort();
+    assert_eq!(members, want);
+}
+
 /// T20. A state is taken however many keys it lists that are no device's:
 /// they are left out, and the rest of it is applied. What becomes of a
 /// state is never decided by a count.

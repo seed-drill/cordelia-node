@@ -157,6 +157,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_was_stored_before_blocks_nothing`
 - `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_was_stored_before_is_taken_off_and_no_key_is_changed`
 - `crates/cordelia-api/tests/membership.rs`: `t20_a_state_that_is_held_has_its_keys_checked_once`
+- `crates/cordelia-api/tests/membership.rs`: `t20_past_what_is_remembered_a_state_costs_what_it_did_and_ends_the_same`
 - `crates/cordelia-api/tests/membership.rs`: `t20_a_state_is_taken_however_many_keys_of_nobodys_it_lists`
 - `crates/cordelia-api/tests/membership.rs`: `t20_a_state_held_for_a_device_not_yet_known_is_taken_when_it_is`
 - `crates/cordelia-api/tests/membership.rs`: `t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting`

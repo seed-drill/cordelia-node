@@ -689,8 +689,9 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
 /// a channel. What this device had stored to send to it is deleted, so
 /// that none of it is sent now.
 ///
-/// No channel's key is changed, here or anywhere, on account of such a
-/// key, and nothing is kept about it. In this version of the protocol a
+/// No channel's key is changed, here or by `remove_device`, on account of
+/// such a key, and nothing shows it afterwards (its rows stay, marked
+/// removed, as a removed device's do). In this version of the protocol a
 /// change of key is a change of membership that one device publishes, and
 /// one made from a list that is behind can undo a removal made on another
 /// device. So a channel that listed such a key keeps the key it had
@@ -716,20 +717,26 @@ pub fn drop_unusable_keys(state: &AppState) -> Result<Vec<[u8; 32]>, CordeliaErr
 
     for key in &keys {
         // Said before anything is taken off, so that a start that is cut
-        // short has said it, and with the channels named: nothing else
-        // records which they were.
+        // short has said it, and with the channels named: nothing shows
+        // which they were afterwards. The key is written as the command
+        // line writes one.
         let listed: Vec<String> = channels::list_for_entity(&db, key)?
             .into_iter()
-            .map(|ch| ch.channel_id)
+            .map(|ch| match ch.channel_name {
+                Some(name) => format!("{name} ({})", ch.channel_id),
+                None => ch.channel_id,
+            })
             .collect();
+        let named =
+            cordelia_crypto::bech32::encode_public_key(key).unwrap_or_else(|_| hex::encode(key));
         tracing::warn!(
-            key = %hex::encode(key),
+            key = %named,
             channels = ?listed,
             "a key that is no device's was stored among this person's devices. It is taken \
              off, and nothing is sealed to it or taken from it now. The channels that listed \
              it keep the keys they had: others may have read what those channels hold and \
-             written to them, and may read them until their keys change (see the known \
-             limits in the decision record)"
+             written to them, and may read them until their keys change (known limits: \
+             docs/decisions/2026-09-30-agent-memory-sync.md, section 9)"
         );
         for ch in channels::list_owned_groups(&db, &pk)? {
             if channels::is_member(&db, &ch.channel_id, key)? {
@@ -890,7 +897,8 @@ pub fn remove_device(
             "that is not a usable public key, so it is no device's key, and nothing is \
              removed. If this device listed it, this device took it off when it started. A \
              device of yours on an older version may still list it. The channels that \
-             listed it keep their keys (see the known limits in the decision record)"
+             listed it keep their keys (known limits: \
+             docs/decisions/2026-09-30-agent-memory-sync.md, section 9)"
                 .into(),
         ));
     }
@@ -1276,7 +1284,8 @@ fn process_one(
 /// devices. What a stranger sent waits unchecked. A state that is then
 /// held for naming a stranger is looked at again on every pass, and the
 /// answer for each of its keys is remembered ([`UsableKeys`]): the same
-/// answer, at the cost of a lookup.
+/// answer, at the cost of a lookup, while the keys of what waits fit in
+/// what is remembered.
 ///
 /// [`UsableKeys`]: crate::state::UsableKeys
 fn leave_out_unusable_keys(state: &AppState, cs: &mut ChannelState) {

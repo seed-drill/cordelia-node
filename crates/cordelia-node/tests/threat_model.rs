@@ -952,7 +952,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     assert!(
         said[0].contains("The channels that listed it keep the keys they had")
             && said[0].contains(&personal)
-            && said[0].contains(&hex::encode(nobody)),
+            && said[0].contains(&listed_as),
         "{log}"
     );
     // Taken off, and no key changed.

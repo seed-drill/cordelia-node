@@ -81,6 +81,11 @@ pub struct AppState {
 ///
 /// Nothing depends on what is kept: a key that is not here is checked, and
 /// what is kept for a key is what the check gave. Each node has its own.
+///
+/// It saves the checks only while the keys of what waits fit in it. Once
+/// they do not, every look at a state checks its keys again, as it did
+/// before there was anything kept: what is kept is dropped before the
+/// keys kept from the last look are come to.
 pub struct UsableKeys {
     known: Mutex<std::collections::HashMap<[u8; 32], bool>>,
     most: usize,
@@ -88,11 +93,11 @@ pub struct UsableKeys {
 
 impl UsableKeys {
     /// The most answers kept: those of 64 states that each list as many
-    /// keys as a state may.
-    pub const MOST: usize = 64 * cordelia_core::protocol::MAX_STATE_KEYS;
+    /// members as a state may (1,024).
+    pub const MOST: usize = 65_536;
 
-    /// One that keeps at most `most` answers. When one more is to be
-    /// kept, all are dropped first.
+    /// One that keeps at most `most` answers, and never fewer than one.
+    /// When one more is to be kept, all are dropped first.
     pub fn keeping(most: usize) -> Self {
         Self {
             known: Mutex::default(),
@@ -299,14 +304,27 @@ mod tests {
             // Four are kept; the fifth empties them and is kept alone.
             assert_eq!(known.kept(), i % 4 + 1, "after {}", i + 1);
         }
-        // Twice round: a key dropped the first time round is checked
-        // again, and one kept is not.
+        // Round again. Six keys do not fit in four, so nothing is saved:
+        // the two that were kept are dropped before they are come to,
+        // and every key is checked again. The answers are the same.
         let before = key_checks();
         for (key, want) in &all {
             assert_eq!(known.is_usable(key), *want);
         }
-        assert!(known.kept() <= 4);
-        assert!(key_checks() - before >= 4, "the four that were dropped");
+        assert_eq!(key_checks() - before, 6);
+        assert_eq!(known.kept(), 4);
+        // Four keys do fit: the second time round costs nothing.
+        let known = UsableKeys::keeping(4);
+        for _ in 0..2 {
+            for (key, want) in &all[..4] {
+                assert_eq!(known.is_usable(key), *want);
+            }
+        }
+        let before = key_checks();
+        for (key, want) in &all[..4] {
+            assert_eq!(known.is_usable(key), *want);
+        }
+        assert_eq!(key_checks(), before);
         assert_eq!(UsableKeys::MOST, 65_536);
         assert_eq!(UsableKeys::default().most, UsableKeys::MOST);
     }
