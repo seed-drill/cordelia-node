@@ -19,6 +19,8 @@ cordelia-sync = { workspace = true }
 tokio = { workspace = true }
 quinn = { workspace = true }
 actix-web = { workspace = true }
+# The HTTP server's version, at least the one without #99's hang.
+actix-server = { workspace = true }
 rusqlite = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }

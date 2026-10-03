@@ -963,10 +963,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             },
             move || {
                 let _ = p2p_shutdown_tx.send(true);
-                // Gracefully: a request being handled finishes, so the
-                // process never ends in the middle of one. actix-server
-                // before 2.9.1 could wait for ever here (#99). The server's
-                // own future says when it has stopped.
+                // Gracefully: a request being handled finishes, and what is
+                // still open after one stream timeout is closed. So, as a
+                // rule, the process does not end in the middle of a request.
+                // actix-server before 2.9.1 could wait for ever here (#99).
+                // The server's own future says when it has stopped.
                 tokio::spawn(server_handle.stop(true));
             },
             std::time::Duration::from_secs(cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS),
