@@ -3,18 +3,23 @@
 //! A name is written in three places: typed at the command line, sent to
 //! the node in a list of exclusions, and found from a git remote. All
 //! three tidy it with [`tidy`], so a name written in one is the name read
-//! in another: an exclusion typed for a project is the name that project
-//! is found under.
+//! in another: a project's name typed as an exclusion is the name that
+//! project is found under.
 
 /// `name` with one spelling: lower case, with nothing around it, and with
-/// no `.git` at its end, however that was typed (`Repo.GIT`).
+/// no `.git` and no `/` at its end, however that was typed (`Repo.GIT`,
+/// `owner/repo.git/`).
 ///
 /// Tidying a tidy name changes nothing, so it does not matter how many of
 /// the three places a name has been through.
 pub fn tidy(name: &str) -> String {
     let mut name = name.trim().to_lowercase();
     loop {
-        let shorter = name.trim_end_matches(".git").trim_end().len();
+        let shorter = name
+            .trim_end_matches(".git")
+            .trim_end_matches('/')
+            .trim_end()
+            .len();
         if shorter == name.len() {
             return name;
         }
@@ -39,6 +44,11 @@ mod tests {
             ("repo.git.git", "repo"),
             ("team .git", "team"),
             ("team.git .GIT ", "team"),
+            // A `/` at the end, before an ending or after one.
+            ("owner/repo/", "owner/repo"),
+            ("owner/repo.git/", "owner/repo"),
+            ("owner/repo/.git", "owner/repo"),
+            ("owner/repo/ .GIT//", "owner/repo"),
             // Not an ending.
             ("repo.github", "repo.github"),
             ("git", "git"),
@@ -48,6 +58,8 @@ mod tests {
             // Nothing is left.
             (".git", ""),
             ("  ", ""),
+            ("/", ""),
+            ("/.git/", ""),
         ] {
             assert_eq!(tidy(typed), want, "{typed:?}");
         }
@@ -65,6 +77,9 @@ mod tests {
             " x.GIT .Git  ",
             ".git.git",
             "a/b.git/",
+            "a/b/.git",
+            "a/b.git/.GIT//",
+            "a/ /.git",
             "ΌΣ.GIT",
             "İ.GIT",
             "x\u{a0}.git",

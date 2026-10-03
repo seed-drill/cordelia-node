@@ -26,14 +26,21 @@ fn store_mappings(db: &rusqlite::Connection, list: &[SyncMapping]) -> Result<(),
     Ok(meta::set(db, meta::SYNC_CLAUDE_MAPPINGS, &json)?)
 }
 
-/// The exclude list, each entry as [`clean_exclusion`] spells it. It is
-/// stored so; an earlier version could store a name that ended in `.git`,
-/// which is read here as the name a project is found under.
+/// The exclude list. A name is read in its one spelling: an earlier
+/// version could store one that ended in `.git`, which is read here as the
+/// name a project is found under. A folder is read exactly as it is
+/// stored, since that is the text the adapter compares a directory with.
 fn exclusions(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
     let stored: Vec<String> = meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
-    Ok(stored.iter().filter_map(|e| clean_exclusion(e)).collect())
+    Ok(stored
+        .into_iter()
+        .filter_map(|entry| match entry.starts_with('/') {
+            true => Some(entry),
+            false => clean_exclusion(&entry),
+        })
+        .collect())
 }
 
 fn store_exclusions(db: &rusqlite::Connection, list: &[String]) -> Result<(), ApiError> {
@@ -127,8 +134,11 @@ fn clean_path(path: &str) -> Option<String> {
 /// An exclusion as it is stored: a folder (an absolute path) that is never
 /// found by `all`, or a project name or prefix in its one spelling
 /// (`cordelia_core::sync_name::tidy`), which is the spelling a project is
-/// found under.
-fn clean_exclusion(entry: &str) -> Option<String> {
+/// found under. `None` for what is neither: nothing is left of it.
+///
+/// The command line uses this too, so that what `include` looks for in
+/// the list is spelled as the list spells it.
+pub fn clean_exclusion(entry: &str) -> Option<String> {
     let entry = entry.trim();
     if entry.starts_with('/') {
         return clean_path(entry);
@@ -1182,8 +1192,18 @@ mod tests {
         let change = |s: &Settings, which: &str| match which {
             "sync off" => claude(s, serde_json::json!({ "enabled": false })),
             "a narrower scope" => claude(s, serde_json::json!({ "enabled": true, "all": false })),
+            // Its first write is the list of mappings; of a folder that
+            // was unmapped, the exclusion that goes; of home, its name.
             "a mapping" => {
+                let body = request("/home/sam/new", "new", false);
+                add_mapping(&s.control, &s.db, &body, home)
+            }
+            "a mapping of a folder that was unmapped" => {
                 let body = request("/home/sam/Work", "work", false);
+                add_mapping(&s.control, &s.db, &body, home)
+            }
+            "a mapping of home" => {
+                let body = request(HOME, "team", true);
                 add_mapping(&s.control, &s.db, &body, home)
             }
             _ => {
@@ -1195,10 +1215,19 @@ mod tests {
         };
         // The first thing each writes is a setting, and no setting can be
         // written: the change is counted, once, and nothing came of it.
-        for which in ["sync off", "a narrower scope", "a mapping", "an unmapping"] {
+        for which in [
+            "sync off",
+            "a narrower scope",
+            "a mapping",
+            "a mapping of a folder that was unmapped",
+            "a mapping of home",
+            "an unmapping",
+        ] {
             let s = Settings::on();
             s.claude(serde_json::json!({ "all": true }));
             s.map("/home/sam/notes", "lab");
+            s.map("/home/sam/Work", "work");
+            s.unmap("work");
             let before = s.control.generation();
             let held = (mappings(&s.db).unwrap(), exclusions(&s.db).unwrap());
             for write in ["INSERT", "UPDATE", "DELETE"] {
@@ -1263,7 +1292,7 @@ mod tests {
         assert_eq!(exclusions(&s.db).unwrap(), stored);
         // What the command looks for in the list is what the list holds:
         // the name as typed, tidied once by the command.
-        for typed in ["X.GIT", "x.git", "X", "x.git.GIT", "x .git"] {
+        for typed in ["X.GIT", "x.git", "X", "x.git.GIT", "x .git", "x/", "X.git/"] {
             let looked_for = cordelia_core::sync_name::tidy(typed);
             assert_eq!(looked_for, "x", "{typed}");
             assert_eq!(clean_exclusion(typed).as_deref(), Some("x"), "{typed}");
@@ -1275,13 +1304,20 @@ mod tests {
         }
         // A name an earlier version stored with `.git` at its end is read
         // as the name a project is found under, so the command finds it.
-        meta::set(
-            &s.db,
-            meta::SYNC_CLAUDE_EXCLUDE,
-            r#"["x.git","/home/sam/old"]"#,
-        )
-        .unwrap();
-        assert_eq!(exclusions(&s.db).unwrap(), ["x", "/home/sam/old"]);
+        // A folder is read exactly as it is stored, a space at its end
+        // included: it is the text a directory is compared with.
+        let stored = r#"["x.git","owner/repo/","/home/sam/old","/home/sam/odd "]"#;
+        meta::set(&s.db, meta::SYNC_CLAUDE_EXCLUDE, stored).unwrap();
+        assert_eq!(
+            exclusions(&s.db).unwrap(),
+            ["x", "owner/repo", "/home/sam/old", "/home/sam/odd "]
+        );
+        // And it is there, as it was, after a change that writes the list
+        // again.
+        s.map("/home/sam/notes", "lab");
+        s.unmap("lab");
+        let after = exclusions(&s.db).unwrap();
+        assert!(after.contains(&"/home/sam/odd ".to_string()), "{after:?}");
     }
 
     /// Every handler counts its change, with the lock held, so that a

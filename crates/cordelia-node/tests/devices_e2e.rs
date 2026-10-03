@@ -1283,6 +1283,27 @@ fn claude_memory_syncs_between_two_machines() {
             "{exclude:?}"
         );
     }
+    // A remote that is pasted is the name the project is found under,
+    // and what is left of nothing is refused, not stored.
+    for remote in [
+        "https://github.com/Client-Co/App.git",
+        "git@github.com:client-co/app.GIT",
+    ] {
+        a.cli(&["sync", "exclude", remote]);
+        assert_eq!(
+            state(&a)["sync"]["exclude"],
+            serde_json::json!(["github.com/client-co/app"]),
+            "{remote}"
+        );
+        a.cli(&["sync", "include", remote]);
+        assert_eq!(
+            state(&a)["sync"]["exclude"],
+            serde_json::json!([]),
+            "{remote}"
+        );
+    }
+    let said = a.refused(&["sync", "exclude", ".GIT"]);
+    assert!(said.contains("is not a project's name"), "{said}");
     a.cli(&["sync", "home", "on"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], true, "{s}");
@@ -1409,20 +1430,30 @@ fn home_memory_syncs_under_any_name() {
             "{again:?}: {out}"
         );
     }
-    // Under another name it is refused for being mapped, with or without
-    // the flag, and nothing is offered that the node would refuse.
-    for other in [&["other", "--home"][..], &["other"]] {
-        let args = [&["sync", "map", home_path.as_str()], other].concat();
-        let said = a.refused(&args);
-        assert!(
-            said.contains(
-                "~ is already mapped to team. To sync it under another name, unmap it \
-                 first: cordelia sync unmap ~"
-            ),
-            "{other:?}: {said}"
-        );
-        assert!(!said.contains("other --home"), "{other:?}: {said}");
-    }
+    // Under another name, with the flag, it is told to unmap first, and
+    // nothing is offered that the node would refuse.
+    let said = a.refused(&["sync", "map", home_path.as_str(), "other", "--home"]);
+    assert!(
+        said.contains(
+            "~ is already mapped to team. To sync it under another name, unmap it \
+             first: cordelia sync unmap ~"
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("other --home"), "{said}");
+    // Without the flag the command as typed would be refused again once
+    // home was unmapped. So it is told that this is the home directory,
+    // and both steps, in order.
+    let said = a.refused(&["sync", "map", home_path.as_str(), "other"]);
+    assert!(
+        said.contains("that is your home directory, and it is already mapped to team."),
+        "{said}"
+    );
+    let (unmap, map) = (
+        said.find("cordelia sync unmap ~\n").expect(&said),
+        said.find("cordelia sync map ~ other --home").expect(&said),
+    );
+    assert!(unmap < map, "{said}");
     b.cli(&["sync", "map", &path(&b_dir), "team"]);
     a.cli(&["sync", "map", &path(&a_other), "lab"]);
     b.cli(&["sync", "map", &path(&b_other), "lab"]);
@@ -1430,7 +1461,9 @@ fn home_memory_syncs_under_any_name() {
     // be refused once the folder was unmapped is refused for its own
     // reason, and no unmap is offered: for home, and for a folder.
     let notes = path(&a_other);
-    let refusals: [(&[&str], &str); 8] = [
+    let refusals: [(&[&str], &str); 9] = [
+        // The home directory's path as a name is `~`, for any folder.
+        (&[&notes, &home_path], "is the name of home memory"),
         (&[&home_path, "my team", "--home"], "is not a usable name"),
         (&[&home_path, "my team"], "is not a name it can sync under"),
         (&[&home_path, "lab", "--home"], "is already mapped from"),

@@ -202,8 +202,8 @@ pub fn project_for(cwd: &Path, home: &Path) -> Option<Project> {
 /// across machines and give `None`.
 ///
 /// What it gives is a name in its one spelling
-/// (`cordelia_core::sync_name::tidy`), so an exclusion typed for a project
-/// is the name the project is found under.
+/// (`cordelia_core::sync_name::tidy`), so a project's name typed as an
+/// exclusion is the name the project is found under.
 pub fn normalize_remote(url: &str) -> Option<String> {
     let url = url.trim();
     let (host, path) = if let Some(rest) = url.split_once("://").map(|(_, r)| r) {
@@ -226,18 +226,11 @@ pub fn normalize_remote(url: &str) -> Option<String> {
     if url.starts_with("file://") {
         return None;
     }
-    // Tidied until nothing changes: taking `.git` off can leave a `/` at
-    // the end, and taking that off another `.git`.
-    let mut name = format!("{host}/{}", path.trim_matches('/'));
-    loop {
-        let tidied = cordelia_core::sync_name::tidy(name.trim_end_matches('/'));
-        if tidied == name {
-            break;
-        }
-        name = tidied;
-    }
+    let name = cordelia_core::sync_name::tidy(&format!("{host}/{}", path.trim_matches('/')));
+    // A name is a host and a path. Tidied, it does not end in `/`, so
+    // where there is a `/` there is a path after it.
     match name.split_once('/') {
-        Some((host, path)) if !host.is_empty() && !path.is_empty() => Some(name),
+        Some((host, _)) if !host.is_empty() => Some(name),
         _ => None,
     }
 }
@@ -316,6 +309,10 @@ mod tests {
             "/srv/git/repo.git",
             "../repo",
             "file:///srv/git/repo.git",
+            // A `file` URL that names a host is still a path on a machine.
+            "file://host/srv/git/repo.git",
+            // No host.
+            "https:///team/repo.git",
             "C:\\repos\\x",
             "",
         ] {
