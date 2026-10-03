@@ -938,7 +938,15 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     assert!(!keys.contains(&listed_as.as_str()), "{devices}");
     assert_eq!(devices["not_devices"][0]["key"], listed_as.as_str());
     assert_eq!(devices["not_devices"][0]["channels"], 1, "{devices}");
-    // The person is told, where they look at their devices.
+    // The person is told: in the log at start, where they look at their
+    // devices, and in the status that panels read.
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(
+        log.contains("keys that are no device's were stored among this person's devices"),
+        "{log}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["not_devices"][0]["key"], listed_as.as_str());
     let said = a.cli(&["devices"]);
     let command = format!("cordelia remove-device {listed_as}");
     assert!(
@@ -961,6 +969,8 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     );
     let said = a.cli(&["devices"]);
     assert!(!said.contains("no device's key"), "{said}");
+    let status: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
+    assert!(status["not_devices"].is_null(), "{status}");
     a.stop();
     assert_eq!(held(), (false, version_before + 1));
 }

@@ -249,9 +249,9 @@ Inputs:
 
 A recipient known by an Ed25519 key has recipient_xpk derived from it
 (§2.2). There is none for bytes that are not a point on the curve, or for
-a point that is not of prime order (a point of small order, the identity
-among them, or a real key with one added), and nothing is sealed to any
-of them.
+a point that is not of the order every real key has (one of the eight
+points of small order, the identity among them, or a real key with one of
+the other seven added), and nothing is sealed to any of them.
 `docs/reference/encryption-test-vectors.md` §1 has one of each.
 
 Steps:

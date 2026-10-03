@@ -181,8 +181,8 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 ///
 /// `None` when there is no key to derive: the bytes are not a point on the
 /// curve, or the point is not of the order every real key has. Every real
-/// key is of one prime order. The identity, the other points of small
-/// order, and a real key with one of those added, are not.
+/// key is of one prime order. The identity, the other seven points of
+/// small order, and a real key with one of those seven added, are not.
 ///
 /// - **Not a point.** There is nothing to convert, and no signature under
 ///   such bytes is accepted either.
@@ -190,7 +190,8 @@ pub fn x25519_from_ed25519_seed(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
 ///   one is the same for everyone (all zero), so whatever was sealed to it
 ///   could be opened by anyone; and anyone can make a signature that is
 ///   accepted under one.
-/// - **A point of mixed order** (a real key plus a point of small order).
+/// - **A point of mixed order** (a real key plus a point of small order
+///   other than the identity).
 ///   It seals to the real key's holder alone, so nothing sealed to it
 ///   leaks. It is refused all the same: no device makes such a key,
 ///   libraries do not agree on which signatures under one are good, and
