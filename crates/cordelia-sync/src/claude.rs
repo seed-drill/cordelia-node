@@ -107,10 +107,47 @@ pub struct FolderReport {
     pub last_published_at: Option<String>,
     /// Why this folder did not sync this cycle.
     pub error: Option<String>,
+    /// Files that could not be synced this cycle, each with why. The other
+    /// files of the folder were synced, and these are tried again in the
+    /// next cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FailedFile>,
     /// The settings changed while this folder was being synced, and the
     /// cycle stopped there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+}
+
+/// A file that could not be synced in a cycle.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailedFile {
+    /// The file's name in its folder.
+    pub name: String,
+    pub error: String,
+}
+
+/// The most files that failed in one folder that a cycle's errors name one
+/// by one. The rest are counted. (The folder's own report has them all.)
+const FAILED_FILES_NAMED: usize = 5;
+
+/// The errors a cycle reports for the files of one folder that failed: one
+/// for each, with its path, up to [`FAILED_FILES_NAMED`], and one more that
+/// counts the rest.
+fn failed_as_errors(memory: &Path, failed: &[FailedFile]) -> Vec<String> {
+    let mut errors: Vec<String> = failed
+        .iter()
+        .take(FAILED_FILES_NAMED)
+        .map(|f| format!("{}: {}", memory.join(&f.name).display(), f.error))
+        .collect();
+    if failed.len() > FAILED_FILES_NAMED {
+        let more = failed.len() - FAILED_FILES_NAMED;
+        errors.push(format!(
+            "{}: {more} more {} could not be synced",
+            memory.display(),
+            if more == 1 { "file" } else { "files" }
+        ));
+    }
+    errors
 }
 
 /// When a device last received and last sent a memory under one name.
@@ -585,6 +622,8 @@ impl ClaudeAdapter {
                     ..Default::default()
                 }
             });
+            // A file that failed is an error of the cycle, by name.
+            report.errors.extend(failed_as_errors(&memory, &r.failed));
             // A repository created above a mapped folder moves its memory.
             if target.mapped
                 && r.error.is_none()
@@ -870,12 +909,18 @@ struct Local {
     skipped: Vec<String>,
     /// Too large to fit in an entry.
     too_large: Vec<String>,
+    /// Neither a file nor a link (a folder, say), under a name a memory
+    /// file could have. Something is there, so the name is not synced and
+    /// is not taken for deleted. It is listed only where the channel has a
+    /// file of that name.
+    not_files: Vec<String>,
 }
 
 /// Read the syncable files of a memory folder. Symlinks, unsafe names,
 /// non-UTF-8 and oversized files are left out and listed; hidden files are
-/// ignored. A folder that does not exist has no files; one that cannot be
-/// read is an error, never an empty folder.
+/// ignored; what is neither a file nor a link is left out and remembered.
+/// A folder that does not exist has no files; one that cannot be read is
+/// an error, never an empty folder.
 fn read_local(dir: &Path) -> std::io::Result<Local> {
     let mut local = Local::default();
     let entries = match std::fs::read_dir(dir) {
@@ -887,6 +932,7 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
         files,
         skipped,
         too_large,
+        not_files,
     } = &mut local;
     for entry in entries {
         let entry = entry?;
@@ -900,6 +946,8 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
         if !meta.file_type().is_file() {
             if meta.file_type().is_symlink() {
                 skipped.push(name);
+            } else if names::is_safe_file_name(&name) {
+                not_files.push(name);
             }
             continue;
         }
@@ -925,13 +973,29 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
 /// rename replaces a symlink at `name` rather than writing through it.
 fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".{name}.cordelia-tmp"));
+    let tmp = dir.join(temporary_name(name));
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, dir.join(name))
+    std::fs::rename(&tmp, dir.join(name)).inspect_err(|_| {
+        // Not left behind where the file could not take its place.
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// The name of the temporary file that `name` is written through: hidden,
+/// so that it is never read as a memory file, and short whatever the
+/// length of `name`. A name may be as long as a file name can be, and a
+/// temporary name made by adding to it would then be too long to create.
+fn temporary_name(name: &str) -> String {
+    let hash = cordelia_crypto::sha256(name.as_bytes());
+    format!(".cordelia-tmp-{}", hex::encode(&hash[..8]))
 }
 
 /// A free conflict-file name for `key`, or `None` if a conflict file with
 /// exactly this content already exists.
+///
+/// A name is free only if nothing is there. A file that cannot be read as
+/// text, a folder or a link under the name is not ours to replace: the
+/// next name is tried.
 fn conflict_target(dir: &Path, key: &str, tag: &str, text: &str) -> Option<String> {
     let base = names::conflict_name(key, tag);
     for n in 1.. {
@@ -940,9 +1004,15 @@ fn conflict_target(dir: &Path, key: &str, tag: &str, text: &str) -> Option<Strin
         } else {
             names::conflict_name(key, &format!("{tag}-{n}"))
         };
-        match std::fs::read_to_string(dir.join(&candidate)) {
-            Ok(existing) if existing == text => return None,
+        let path = dir.join(&candidate);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => match std::fs::read(&path) {
+                Ok(existing) if existing == text.as_bytes() => return None,
+                _ => continue,
+            },
             Ok(_) => continue,
+            // Nothing there. (Where the folder cannot be looked into at
+            // all, the write that follows fails and says so.)
             Err(_) => return Some(candidate),
         }
     }
@@ -982,12 +1052,19 @@ fn sync_folder_between(
         files: local,
         skipped,
         too_large,
+        not_files,
     } = read_local(dir).map_err(|e| CordeliaError::Internal(format!("{}: {e}", dir.display())))?;
     // A file that is there but cannot sync takes no part, in either
     // direction. It is not gone, so it must not be planned as deleted,
     // which would delete it on every other device; and nothing from the
-    // channel is written over it.
-    let apart: HashSet<String> = skipped.iter().chain(too_large.iter()).cloned().collect();
+    // channel is written over it. The same for a name that something
+    // other than a file has (a folder): a file cannot be written there.
+    let apart: HashSet<String> = skipped
+        .iter()
+        .chain(too_large.iter())
+        .chain(not_files.iter())
+        .cloned()
+        .collect();
     report.skipped = skipped;
     report.too_large = too_large;
 
@@ -1031,6 +1108,15 @@ fn sync_folder_between(
             .collect();
         (remote, deleted, taken, agreed)
     };
+
+    // What is not a file is listed only where the channel has a memory
+    // file of that name: a folder beside the memory files is nobody's
+    // business.
+    for name in not_files {
+        if remote.contains_key(&name) {
+            report.skipped.push(name);
+        }
+    }
 
     // A memory folder that has gone is not a folder emptied by hand: its
     // disk may not be attached, or it was moved or restored. Taking that
@@ -1077,8 +1163,22 @@ fn sync_folder_between(
             planned: taken.get(key).map(String::as_str),
         };
         for action in actions {
-            if !apply(&ctx, key, seen, action, &mut report)? {
-                break; // left as it is; planned again next cycle
+            match apply(&ctx, key, seen, action, &mut report) {
+                Ok(true) => {}
+                // Left as it is; planned again next cycle.
+                Ok(false) => break,
+                // One file that fails does not stop the files after it.
+                // Nothing more is done for this file (a version that was
+                // to be kept first and could not be is not written over),
+                // and the next cycle plans it again.
+                Err(e) => {
+                    tracing::debug!(file = %dir.join(key).display(), error = %e, "could not sync a file; going on with the rest of the folder");
+                    report.failed.push(FailedFile {
+                        name: key.clone(),
+                        error: e.to_string(),
+                    });
+                    break;
+                }
             }
         }
         if state.sync_control.generation() != generation {
@@ -1267,8 +1367,8 @@ fn apply(
         tracing::debug!(file = %dir.join(key).display(), "changed during the cycle; deferring");
         return Ok(false);
     }
-    let io =
-        |e: std::io::Error| CordeliaError::Internal(format!("{}: {e}", dir.join(key).display()));
+    // The reason alone: the file is named by whoever reports it.
+    let io = |e: std::io::Error| CordeliaError::Internal(e.to_string());
     let full_key = format!("{prefix}{key}");
     let publish = |text: Option<&str>| -> Result<Option<u64>, CordeliaError> {
         let db = lock(state)?;
@@ -2134,6 +2234,193 @@ mod tests {
         assert_eq!(p.read(index), Some(merged));
         // No file comes back and no second conflict file is made.
         assert_eq!(files(&p), there);
+    }
+
+    /// One file that fails does not stop the files after it. It is named
+    /// in the folder's report with why, nothing more is done for it in
+    /// that cycle, and the next cycle plans it again.
+    #[test]
+    fn a_file_that_fails_is_passed_over_and_the_rest_sync() {
+        let p = Pair::new();
+        for (name, text) in [("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")] {
+            p.other_writes(name, Some(text));
+        }
+        // A folder takes the second file's name once the cycle has read
+        // what is there, so the file cannot be written.
+        let in_the_way = p.mem.join("b.md");
+        let report = p.cycle_with(&|| std::fs::create_dir(&in_the_way).unwrap());
+        assert_eq!(p.read("a.md").as_deref(), Some("a\n"));
+        assert_eq!(p.read("c.md").as_deref(), Some("c\n"), "the file after it");
+        assert_eq!(report.pulled, 2, "{report:?}");
+        let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failed, ["b.md"], "{report:?}");
+        assert!(!report.failed[0].error.is_empty(), "{report:?}");
+        assert!(report.error.is_none(), "{report:?}");
+        // No temporary file is left where the file could not go.
+        let left: Vec<String> = std::fs::read_dir(&p.mem)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+
+        // While the folder is there the name takes no part: it is listed
+        // as something that cannot sync, and is no failure.
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (0, 0), "{report:?}");
+        assert_eq!(report.skipped, ["b.md"], "{report:?}");
+
+        // With the folder gone, the next cycle writes the file.
+        std::fs::remove_dir(&in_the_way).unwrap();
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read("b.md").as_deref(), Some("b\n"));
+    }
+
+    /// Where a file's first action fails, its others are not done. Here
+    /// this device's text was to be kept beside the file before the
+    /// channel's version was written over it. It could not be kept (the
+    /// conflict file's name would be longer than a file name can be), so
+    /// the file is left as it is, and nothing is left behind.
+    #[test]
+    fn a_file_whose_text_cannot_be_kept_is_not_written_over() {
+        let long = format!("{}.md", "n".repeat(247));
+        assert_eq!(long.len(), 250);
+        assert!(names::conflict_name(&long, "abcd").len() > 255);
+        let p = Pair::new();
+        p.file(&long, "agreed\n");
+        p.file("z.md", "z\n");
+        assert_eq!(p.cycle().published, 2);
+        p.other_writes(&long, Some("theirs\n"));
+        p.other_writes("z.md", Some("theirs too\n"));
+        p.file(&long, "mine\n");
+        let report = p.cycle();
+        let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failed, [long.as_str()], "{report:?}");
+        assert_eq!(p.read(&long).as_deref(), Some("mine\n"));
+        // The file after it is synced all the same.
+        assert_eq!(p.read("z.md").as_deref(), Some("theirs too\n"));
+        assert_eq!(report.pulled, 1, "{report:?}");
+        let mut names: Vec<String> = std::fs::read_dir(&p.mem)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, [long.as_str(), "z.md"]);
+    }
+
+    /// A conflict file takes a name only if nothing is there. What is
+    /// there and is not a text file that can be read (a file that is not
+    /// text, a folder) is not replaced: the next name is taken.
+    #[test]
+    fn a_conflict_file_replaces_nothing_that_is_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Nothing there: the first name.
+        let first = conflict_target(dir, "notes.md", "abcd", "mine\n");
+        assert_eq!(first.as_deref(), Some("notes.conflict-abcd.md"));
+        // A file that is not text has that name: it is left, and the next
+        // name is taken.
+        let not_text = [0xff, 0xfe, 0x00, 0x80];
+        std::fs::write(dir.join("notes.conflict-abcd.md"), not_text).unwrap();
+        let second = conflict_target(dir, "notes.md", "abcd", "mine\n");
+        assert_eq!(second.as_deref(), Some("notes.conflict-abcd-2.md"));
+        // A folder has the next: the one after.
+        std::fs::create_dir(dir.join("notes.conflict-abcd-2.md")).unwrap();
+        let third = conflict_target(dir, "notes.md", "abcd", "mine\n");
+        assert_eq!(third.as_deref(), Some("notes.conflict-abcd-3.md"));
+        // The same text is already kept: nothing to write.
+        std::fs::write(dir.join("notes.conflict-abcd-3.md"), "mine\n").unwrap();
+        assert_eq!(conflict_target(dir, "notes.md", "abcd", "mine\n"), None);
+        assert_eq!(
+            std::fs::read(dir.join("notes.conflict-abcd.md")).unwrap(),
+            not_text
+        );
+    }
+
+    /// Something that is not a file (a folder), under a name a memory file
+    /// has, takes no part: nothing is written there, and the name is not
+    /// taken for deleted, which would delete the file on every other
+    /// device. It is listed where the channel has a file of that name,
+    /// and nowhere else.
+    #[test]
+    fn a_name_that_a_folder_has_takes_no_part() {
+        let p = Pair::new();
+        p.file("mine.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_writes("theirs.md", Some("theirs\n"));
+        // The file that was agreed is replaced by a folder; another folder
+        // has the name of the entry that has just arrived; a third has a
+        // name nothing else has.
+        std::fs::remove_file(p.mem.join("mine.md")).unwrap();
+        for name in ["mine.md", "theirs.md", "attic"] {
+            std::fs::create_dir(p.mem.join(name)).unwrap();
+        }
+        let report = p.cycle();
+        assert_eq!(
+            (report.published, report.pulled, report.failed.len()),
+            (0, 0, 0),
+            "{report:?}"
+        );
+        let mut skipped = report.skipped.clone();
+        skipped.sort();
+        assert_eq!(skipped, ["mine.md", "theirs.md"], "{report:?}");
+        // Not deleted in the channel.
+        assert_eq!(p.held("mine.md").as_deref(), Some("mine\n"));
+    }
+
+    /// A file name may be as long as a file name can be. It is written
+    /// through a temporary file whose name does not grow with it.
+    #[test]
+    fn a_file_with_the_longest_name_is_written() {
+        let long = format!("{}.md", "n".repeat(252));
+        assert_eq!(long.len(), 255);
+        assert!(names::is_safe_file_name(&long));
+        let p = Pair::new();
+        p.other_writes(&long, Some("text\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read(&long).as_deref(), Some("text\n"));
+        let temporary = temporary_name(&long);
+        assert!(
+            temporary.starts_with('.') && temporary.len() < 40,
+            "{temporary}"
+        );
+        assert_ne!(temporary, temporary_name("other.md"));
+        assert!(!p.mem.join(&temporary).exists());
+    }
+
+    /// A cycle's errors name the files of a folder that failed, each with
+    /// its path and why, up to five, and count the rest.
+    #[test]
+    fn test_files_that_failed_are_named_in_the_cycles_errors() {
+        let memory = Path::new("/home/sam/.claude/projects/-home-sam/memory");
+        let failed = |n: usize| -> Vec<FailedFile> {
+            (0..n)
+                .map(|i| FailedFile {
+                    name: format!("f{i}.md"),
+                    error: format!("why {i}"),
+                })
+                .collect()
+        };
+        assert!(failed_as_errors(memory, &[]).is_empty());
+        assert_eq!(
+            failed_as_errors(memory, &failed(1)),
+            ["/home/sam/.claude/projects/-home-sam/memory/f0.md: why 0"]
+        );
+        assert_eq!(failed_as_errors(memory, &failed(5)).len(), 5);
+        let six = failed_as_errors(memory, &failed(6));
+        assert_eq!(six.len(), 6);
+        assert_eq!(
+            six[5],
+            "/home/sam/.claude/projects/-home-sam/memory: 1 more file could not be synced"
+        );
+        let eight = failed_as_errors(memory, &failed(8));
+        assert!(
+            eight[5].ends_with("3 more files could not be synced"),
+            "{eight:?}"
+        );
+        assert!(eight[4].ends_with("f4.md: why 4"), "{eight:?}");
     }
 
     /// The bookkeeping at the end of a cycle is done under the settings

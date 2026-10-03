@@ -479,6 +479,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                         "error": f["error"],
                         "conflicts": f["conflict_files"],
                         "too_large": f["too_large"],
+                        // Files that could not be synced in the last
+                        // cycle, each with why: always a list.
+                        "failed": f["failed"].as_array().cloned().unwrap_or_default(),
                     })
                 })
                 .collect();
