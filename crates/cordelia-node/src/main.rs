@@ -1170,18 +1170,18 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                 return;
             };
             // One adapter, for the directory that is set, as it is stored:
-            // a cycle of any other does nothing (`ClaudeAdapter::is_for`).
-            if slot.as_ref().is_none_or(|running| !running.is_for(&dir)) {
-                let home = std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default();
-                let pk = state.identity.public_key();
-                *slot = Some(ClaudeAdapter::new(dir.into(), home, &pk));
-                tracing::info!("sync adapter started");
-            }
-            let Some(running) = slot.as_mut() else {
-                return;
-            };
+            // a cycle of any other does nothing.
+            let running = adapter_for(
+                &mut slot,
+                |held: &ClaudeAdapter| held.is_for(&dir),
+                || {
+                    let home = std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default();
+                    tracing::info!("sync adapter started");
+                    ClaudeAdapter::new(dir.as_str().into(), home, &state.identity.public_key())
+                },
+            );
             // The report carries the settings count it was made under: a
             // setting changed during the cycle makes it a report from
             // before the change.
@@ -1557,7 +1557,46 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 
 /// A project as the exclude list stores it: lower case, no `.git`.
 fn normalise_project(project: &str) -> String {
-    project.trim().trim_end_matches(".git").to_lowercase()
+    let lower = project.trim().to_lowercase();
+    lower.trim_end_matches(".git").to_string()
+}
+
+/// What `map` offers when the home directory is named without `--home`:
+/// the command that does what was asked.
+///
+/// - No name: `home on`, which puts home memory back under the name it
+///   last had on this device.
+/// - The name `~`: `map` with the flag and no name, which is `~`.
+/// - A name home memory can take: `map` with the flag and that name.
+/// - Anything else is `Err`, with the name: it is said to be unusable, and
+///   nothing is offered that would map home under another name than the
+///   one that was typed.
+fn home_offer(name: Option<&str>) -> Result<String, String> {
+    let Some(name) = name else {
+        return Ok("cordelia sync home on".to_string());
+    };
+    let name = normalise_project(name);
+    if name == cordelia_sync::claude::HOME_NAME {
+        Ok("cordelia sync map ~ --home".to_string())
+    } else if cordelia_api::sync::valid_sync_name(&name) {
+        Ok(format!("cordelia sync map ~ {} --home", shell_word(&name)))
+    } else {
+        Err(name)
+    }
+}
+
+/// The adapter for the Claude Code directory that is set, `dir`, as it is
+/// stored: the one held, if it is for that directory, or a new one in its
+/// place (`ClaudeAdapter::is_for`).
+fn adapter_for<A>(
+    slot: &mut Option<A>,
+    is_for: impl Fn(&A) -> bool,
+    make: impl FnOnce() -> A,
+) -> &mut A {
+    if !slot.as_ref().is_some_and(is_for) {
+        *slot = None;
+    }
+    slot.get_or_insert_with(make)
 }
 
 /// The sync settings of the running node. Sync must be on.
@@ -1984,11 +2023,9 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 // naming the home directory itself: never by a slip, and
                 // never because a folder inside it was named.
                 let names_home = given == home_dir;
-                // What each refusal offers is `home on`, which puts home
-                // memory back under the name it last had here. Where the
-                // person named the home directory itself and gave a name
-                // that home memory can take, that name is kept in the
-                // command offered.
+                // The first two refusals offer `home on`, which puts home
+                // memory back under the name it last had here: the name
+                // that was given, if any, was for another folder.
                 if home && !names_home {
                     anyhow::bail!(
                         "--home is for the home directory itself. To sync home memory: \
@@ -2004,19 +2041,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     );
                 }
                 if is_home && !home {
-                    let named = name
-                        .as_deref()
-                        .map(normalise_project)
-                        .filter(|n| n != HOME_NAME && cordelia_api::sync::valid_sync_name(n));
-                    anyhow::bail!(
-                        "that is your home directory. To sync home memory: {}",
-                        match named {
-                            Some(name) => {
-                                format!("cordelia sync map ~ {} --home", shell_word(&name))
-                            }
-                            None => "cordelia sync home on".to_string(),
-                        }
-                    );
+                    match home_offer(name.as_deref()) {
+                        Ok(command) => anyhow::bail!(
+                            "that is your home directory. To sync home memory: {command}"
+                        ),
+                        Err(name) => anyhow::bail!(
+                            "that is your home directory, and {name:?} is not a name it can \
+                             sync under. To sync home memory under a name (lower-case letters, \
+                             digits and . _ - /): cordelia sync map ~ <name> --home"
+                        ),
+                    }
                 }
                 let name = match name {
                     Some(name) => normalise_project(&name),
@@ -2995,6 +3029,53 @@ mod tests {
         assert!(report_stands(&report(4, false), 4));
         assert!(!report_stands(&report(4, true), 4));
         assert!(!report_stands(&report(3, false), 4));
+    }
+
+    /// What `map` offers when the home directory is named without the
+    /// flag does what was asked: nothing that would map home under another
+    /// name than the one typed, and nothing a shell would read otherwise.
+    #[test]
+    fn test_what_map_offers_for_the_home_directory() {
+        let offer = |name: Option<&str>| home_offer(name);
+        assert_eq!(offer(None).unwrap(), "cordelia sync home on");
+        assert_eq!(offer(Some("~")).unwrap(), "cordelia sync map ~ --home");
+        for (typed, offered) in [
+            ("team", "cordelia sync map ~ team --home"),
+            ("Team", "cordelia sync map ~ team --home"),
+            (
+                "github.com/Owner/Repo.git",
+                "cordelia sync map ~ github.com/owner/repo --home",
+            ),
+            ("Repo.GIT", "cordelia sync map ~ repo --home"),
+        ] {
+            assert_eq!(offer(Some(typed)).unwrap(), offered, "{typed}");
+        }
+        for not_a_name in ["my team", "a/../b", "it's", "-x", "~x", ""] {
+            assert!(offer(Some(not_a_name)).is_err(), "{not_a_name:?}");
+        }
+        // Run as offered, a name is the name it was given as.
+        assert_eq!(normalise_project(&normalise_project("Repo.GIT")), "repo");
+    }
+
+    /// The loop holds one adapter, for the Claude Code directory that is
+    /// set. It keeps the one it has while that is the directory, and makes
+    /// another when it is not, or when it has none.
+    #[test]
+    fn test_the_loop_holds_the_adapter_for_the_directory_that_is_set() {
+        let made = std::cell::Cell::new(0);
+        let make = |dir: &'static str| {
+            made.set(made.get() + 1);
+            dir
+        };
+        let mut slot: Option<&'static str> = None;
+        // None held: one is made.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/a", || make("/a")), "/a");
+        // Held, and for the directory: kept.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/a", || make("/a")), "/a");
+        assert_eq!(made.get(), 1);
+        // Held, for another: one is made for the new directory.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/b", || make("/b")), "/b");
+        assert_eq!((made.get(), slot), (2, Some("/b")));
     }
 
     /// `cordelia sync unmap <word>`: a name, or a folder. A word that is

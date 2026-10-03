@@ -1386,15 +1386,37 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     ] {
         claude(&a, narrower.clone());
         std::fs::remove_file(a_home.join("profile.md")).unwrap();
-        claude(&a, wider);
+        claude(&a, wider.clone());
         settle(&mut a, &mut b);
         assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
         assert_eq!(files(&a_home), ["profile.md"], "{narrower}");
+
+        // And while it is narrow, home memory does not sync: a file made
+        // here stays here until the scope is widened again.
+        claude(&a, narrower.clone());
+        std::fs::write(a_home.join("while-narrow.md"), "kept here\n").unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(
+            files(&b_home),
+            ["profile.md"],
+            "{narrower}: it does not sync"
+        );
+        claude(&a, wider);
+        settle(&mut a, &mut b);
+        assert_eq!(
+            files(&b_home),
+            ["profile.md", "while-narrow.md"],
+            "{narrower}"
+        );
+        std::fs::remove_file(a_home.join("while-narrow.md")).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
     }
 
     // A folder can also stop being found with no command having stopped
     // it (its transcripts have gone, say). Then no handler forgot for it.
-    // The first cycle that no longer finds it does.
+    // The first cycle that no longer finds it does. The scope is written
+    // behind the handler's back here, to stand for that.
     set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "off");
     settle(&mut a, &mut b);
     std::fs::remove_file(a_home.join("profile.md")).unwrap();

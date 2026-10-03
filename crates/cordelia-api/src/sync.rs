@@ -269,8 +269,12 @@ pub fn set_claude(
         // directory is the string that is stored: the adapter is started
         // again for a new spelling of the same path, and records what its
         // folders agree under that.
+        //
+        // Nothing is agreed while sync is off. Turning it off forgets, and
+        // so does turning it on, for whatever was left: an older version
+        // forgot only later, in its loop, and a write may have failed.
         let dir_changed = stored.as_deref().is_some_and(|was| was != dir);
-        if dir_changed {
+        if dir_changed || stored.is_none() {
             sync_state::forget_folders_except(db, &[])?;
         } else if narrowed {
             forget_what_is_not_mapped(db, &dir)?;
@@ -921,6 +925,16 @@ mod tests {
         agree(&s);
         s.claude(serde_json::json!({ "enabled": false }));
         assert_eq!(remembered(&s), Vec::<&str>::new());
+
+        // And turned on: whatever was left agreed while it was off, as an
+        // older version could leave it.
+        agree(&s);
+        s.claude(serde_json::json!({}));
+        assert_eq!(remembered(&s), Vec::<&str>::new());
+        // Run again while it is on, it forgets nothing.
+        agree(&s);
+        s.claude(serde_json::json!({}));
+        assert_eq!(remembered(&s).len(), 3);
     }
 
     /// Narrowing what is found (`all` turned off, an exclusion added, home

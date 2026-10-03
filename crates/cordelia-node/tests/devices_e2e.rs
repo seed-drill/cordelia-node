@@ -1060,12 +1060,14 @@ fn claude_memory_syncs_between_two_machines() {
     assert!(said.contains("cordelia sync home on"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a.home()), "team"]);
     assert!(said.contains("cordelia sync map ~ team --home"), "{said}");
-    // A name home memory cannot take is not offered back.
-    for name in ["~", "not a name"] {
-        let said = a.refused(&["sync", "map", &path(&a.home()), name]);
-        assert!(said.contains("cordelia sync home on"), "{name}: {said}");
-        assert!(!said.contains("cordelia sync map"), "{name}: {said}");
-    }
+    // The name `~` is offered as the command that maps home as `~`, and a
+    // name that cannot be used is said to be one, with nothing offered
+    // that would map home under another.
+    let said = a.refused(&["sync", "map", &path(&a.home()), "~"]);
+    assert!(said.contains("cordelia sync map ~ --home"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a.home()), "not a name"]);
+    assert!(said.contains("is not a name it can sync under"), "{said}");
+    assert!(!said.contains("home on"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_repo), "--home"]);
     assert!(said.contains("--home is for the home directory"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_notes), "~"]);
