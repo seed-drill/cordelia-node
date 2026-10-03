@@ -905,60 +905,6 @@ pub fn remove_member_everywhere(
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
-/// Whether a channel has a row for a key, as a member now or as one that
-/// was removed.
-pub fn has_member_row(
-    conn: &Connection,
-    channel_id: &str,
-    entity_key: &[u8; 32],
-) -> Result<bool, CordeliaError> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM channel_members WHERE channel_id = ?1 AND entity_key = ?2)",
-        params![channel_id, entity_key.as_slice()],
-        |row| row.get(0),
-    )
-    .map_err(|e| CordeliaError::Storage(e.to_string()))
-}
-
-/// The keys a channel has a row for that are no longer members of it.
-pub fn removed_member_keys(
-    conn: &Connection,
-    channel_id: &str,
-) -> Result<Vec<[u8; 32]>, CordeliaError> {
-    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
-    let mut stmt = conn
-        .prepare(
-            "SELECT entity_key FROM channel_members
-             WHERE channel_id = ?1 AND posture != 'active'",
-        )
-        .map_err(storage)?;
-    let rows = stmt
-        .query_map(params![channel_id], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(storage)?;
-    let mut keys = Vec::new();
-    for row in rows {
-        if let Ok(key) = <[u8; 32]>::try_from(row.map_err(storage)?.as_slice()) {
-            keys.push(key);
-        }
-    }
-    Ok(keys)
-}
-
-/// Delete a channel's row for a key outright, so that nothing records it
-/// was ever listed.
-pub fn forget_member(
-    conn: &Connection,
-    channel_id: &str,
-    entity_key: &[u8; 32],
-) -> Result<(), CordeliaError> {
-    conn.execute(
-        "DELETE FROM channel_members WHERE channel_id = ?1 AND entity_key = ?2",
-        params![channel_id, entity_key.as_slice()],
-    )
-    .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    Ok(())
-}
-
 /// Increment key_version and update psk_hash after a PSK rotation.
 pub fn increment_key_version(
     conn: &Connection,

@@ -407,25 +407,9 @@ pub struct DeviceEntry {
     pub unconfirmed_since: Option<String>,
 }
 
-/// A key that is no device's key and was listed among this person's
-/// devices. It is no longer on the list; the channels that listed it still
-/// have the key they had.
-#[derive(Serialize)]
-pub struct NotADeviceEntry {
-    pub key: String,
-    /// When this device found it (RFC 3339).
-    pub found: String,
-    /// How many of this device's channels listed it and have not had their
-    /// key changed since. `cordelia remove-device <key>` changes them.
-    pub channels: usize,
-}
-
 #[derive(Serialize)]
 pub struct ListDevicesResponse {
     pub devices: Vec<DeviceEntry>,
-    /// Keys that were listed among the devices and are no device's.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub not_devices: Vec<NotADeviceEntry>,
 }
 
 #[derive(Serialize)]

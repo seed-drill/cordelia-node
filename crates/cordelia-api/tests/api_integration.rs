@@ -34,6 +34,7 @@ fn test_state() -> web::Data<AppState> {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
+        usable_keys: Default::default(),
     })
 }
 

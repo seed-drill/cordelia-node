@@ -680,134 +680,6 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
     Ok(added)
 }
 
-/// A key that is no device's and that was listed for one of this
-/// device's channels, as it is remembered until that channel's key has
-/// been changed. `key_version` is the channel's when the key was found: a
-/// note is live while the channel is still at that version.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Noted {
-    /// The key, in hex.
-    key: String,
-    channel: String,
-    key_version: i64,
-    /// When it was found (Unix seconds).
-    found: i64,
-}
-
-/// The most notes kept. One of this person's devices can send states that
-/// list such keys, and each would be noted. When there are this many, a
-/// new one is not made: what was noted first is never pushed out by what
-/// is sent later.
-const MAX_NOTED: usize = 64;
-
-/// The notes that are live: each for a channel this device still owns,
-/// whose key has not changed since the note was made.
-fn noted(db: &Connection, pk: &[u8; 32]) -> Result<Vec<Noted>, CordeliaError> {
-    let Some(stored) = meta::get(db, meta::KEYS_THAT_WERE_NO_DEVICES)? else {
-        return Ok(Vec::new());
-    };
-    let all: Vec<Noted> = serde_json::from_str(&stored).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "the note of keys that were no devices cannot be read; it is taken as empty");
-        Vec::new()
-    });
-    let owned = channels::list_owned_groups(db, pk)?;
-    Ok(all
-        .into_iter()
-        .filter(|n| {
-            owned
-                .iter()
-                .any(|ch| ch.channel_id == n.channel && ch.key_version == n.key_version)
-        })
-        .collect())
-}
-
-/// Note that each of `keys`, which are no devices', was listed for
-/// `channel_id`, if this device owns that channel. Noted again, nothing
-/// changes. One write for all of them.
-fn note_not_devices(
-    db: &Connection,
-    pk: &[u8; 32],
-    keys: &[[u8; 32]],
-    channel_id: &str,
-) -> Result<(), CordeliaError> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let Some(owned) = channels::list_owned_groups(db, pk)?
-        .into_iter()
-        .find(|ch| ch.channel_id == channel_id)
-    else {
-        return Ok(());
-    };
-    let mut all = noted(db, pk)?;
-    let mut not_noted = 0;
-    for key in keys {
-        let key = hex::encode(key);
-        if all.iter().any(|n| n.key == key && n.channel == channel_id) {
-            continue;
-        }
-        if all.len() >= MAX_NOTED {
-            not_noted += 1;
-            continue;
-        }
-        all.push(Noted {
-            key,
-            channel: channel_id.to_string(),
-            key_version: owned.key_version,
-            found: Utc::now().timestamp(),
-        });
-    }
-    if not_noted > 0 {
-        tracing::warn!(
-            channel = %channel_id,
-            not_noted,
-            "more keys that are no devices' were listed than are noted; `cordelia devices` shows those that are"
-        );
-    }
-    let stored = serde_json::to_string(&all).map_err(|e| CordeliaError::Internal(e.to_string()))?;
-    meta::set(db, meta::KEYS_THAT_WERE_NO_DEVICES, &stored)
-}
-
-/// A key that is no device's and that was listed among this person's
-/// devices, for `cordelia devices` to show.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NotADevice {
-    pub key: [u8; 32],
-    /// When it was first found (Unix seconds).
-    pub found: i64,
-    /// How many of this device's channels listed it and still have the key
-    /// they had then.
-    pub channels: usize,
-}
-
-/// The keys that are no device's and were listed for this device's
-/// channels, where the channel's key has not been changed since. It is
-/// what the person is told, and what `remove_device` then acts on.
-pub fn keys_that_were_no_devices(state: &AppState) -> Result<Vec<NotADevice>, CordeliaError> {
-    let db = lock(state)?;
-    let mut found: Vec<NotADevice> = Vec::new();
-    for note in noted(&db, &state.identity.public_key())? {
-        let Some(key) = hex::decode(&note.key)
-            .ok()
-            .and_then(|k| <[u8; 32]>::try_from(k).ok())
-        else {
-            continue;
-        };
-        match found.iter_mut().find(|f| f.key == key) {
-            Some(f) => {
-                f.channels += 1;
-                f.found = f.found.min(note.found);
-            }
-            None => found.push(NotADevice {
-                key,
-                found: note.found,
-                channels: 1,
-            }),
-        }
-    }
-    Ok(found)
-}
-
 /// Take each stored key that is not a usable public key off: from the
 /// keys this device trusts, and from the members of every channel it has a
 /// row for. Returns the keys that went. It is done when the node starts.
@@ -817,12 +689,13 @@ pub fn keys_that_were_no_devices(state: &AppState) -> Result<Vec<NotADevice>, Co
 /// a channel. What this device had stored to send to it is deleted, so
 /// that none of it is sent now.
 ///
-/// No channel's key is changed here. A change of key is a person's act,
-/// made from one device at a time: made by every device as it starts,
-/// from whatever it held before it had read what the others sent, it
-/// could undo a removal made elsewhere. So each of this device's channels
-/// that listed such a key is noted, `cordelia devices` shows the note, and
-/// `remove_device` for that key changes those channels' keys.
+/// No channel's key is changed, here or anywhere, on account of such a
+/// key, and nothing is kept about it. In this version of the protocol a
+/// change of key is a change of membership that one device publishes, and
+/// one made from a list that is behind can undo a removal made on another
+/// device. So a channel that listed such a key keeps the key it had
+/// (decision 2026-09-30 §9), and the log says so here, for each key, with
+/// the channels that listed it.
 ///
 /// A start that is cut short leaves what is not yet done to the next: a
 /// key is found by its rows and by the trust in it, and those go last.
@@ -840,31 +713,33 @@ pub fn drop_unusable_keys(state: &AppState) -> Result<Vec<[u8; 32]>, CordeliaErr
     keys.sort();
     keys.dedup();
     keys.retain(|key| !cordelia_crypto::identity::is_usable_public_key(key));
-    if keys.is_empty() {
-        return Ok(keys);
-    }
 
-    let (mut listed, mut unsent) = (0, 0);
     for key in &keys {
+        // Said before anything is taken off, so that a start that is cut
+        // short has said it, and with the channels named: nothing else
+        // records which they were.
+        let listed: Vec<String> = channels::list_for_entity(&db, key)?
+            .into_iter()
+            .map(|ch| ch.channel_id)
+            .collect();
+        tracing::warn!(
+            key = %hex::encode(key),
+            channels = ?listed,
+            "a key that is no device's was stored among this person's devices. It is taken \
+             off, and nothing is sealed to it or taken from it now. The channels that listed \
+             it keep the keys they had: others may have read what those channels hold and \
+             written to them, and may read them until their keys change (see the known \
+             limits in the decision record)"
+        );
         for ch in channels::list_owned_groups(&db, &pk)? {
             if channels::is_member(&db, &ch.channel_id, key)? {
-                note_not_devices(&db, &pk, std::slice::from_ref(key), &ch.channel_id)?;
                 offers::forget(&db, &ch.channel_id, key)?;
-                listed += 1;
             }
         }
-        unsent += channels::drop_stored(&db, &naming::inbox_channel_id(key))?;
+        channels::drop_stored(&db, &naming::inbox_channel_id(key))?;
         channels::remove_member_everywhere(&db, key)?;
         trust::revoke(&db, key)?;
     }
-    tracing::warn!(
-        keys = keys.len(),
-        listed,
-        unsent,
-        "keys that are no device's were stored among this person's devices. They have been \
-         taken off, and nothing is sealed to them or taken from them now. `cordelia devices` \
-         shows any whose channels need a new key"
-    );
     Ok(keys)
 }
 
@@ -995,10 +870,11 @@ fn staying_note(why: &str) -> String {
 /// group channel this node owns, and rotate each of those channels' keys so
 /// it cannot read anything written afterwards.
 ///
-/// For a key that is no device's and was found among them (see
-/// [`keys_that_were_no_devices`]), it changes the key of each channel of
-/// this device's that listed it. That is the same act, made by the person
-/// on one device.
+/// A key that is not a usable public key is no device, and is refused. If
+/// this device listed it, it took it off when it started, and nothing is
+/// changed on its account (see [`drop_unusable_keys`]). In particular
+/// nothing "written" under it is published again: under a point of small
+/// order anyone could have signed it.
 pub fn remove_device(
     state: &AppState,
     device: &[u8; 32],
@@ -1009,53 +885,29 @@ pub fn remove_device(
             "cannot remove this device from itself".into(),
         ));
     }
-
-    // A key that is no device's is no member by now (`drop_unusable_keys`),
-    // but the channels that listed it still have the key they had. Those
-    // are changed here too. This device first acts on what it has been
-    // sent, so that the change is made from its newest view of each
-    // channel. Nothing written under such a key is published again: under
-    // a point of small order anyone could have signed it.
-    let is_a_key = cordelia_crypto::identity::is_usable_public_key(device);
-    if !is_a_key {
-        process_inbox(state)?;
+    if !cordelia_crypto::identity::is_usable_public_key(device) {
+        return Err(CordeliaError::Validation(
+            "that is not a usable public key, so it is no device's key, and nothing is \
+             removed. If this device listed it, this device took it off when it started. A \
+             device of yours on an older version may still list it. The channels that \
+             listed it keep their keys (see the known limits in the decision record)"
+                .into(),
+        ));
     }
 
     let db = lock(state)?;
     trust::revoke(&db, device)?;
-    let was_noted: Vec<String> = noted(&db, &pk)?
-        .into_iter()
-        .filter(|n| n.key == hex::encode(device))
-        .map(|n| n.channel)
-        .collect();
 
     let mut rotated = Vec::new();
     for ch in channels::list_owned_groups(&db, &pk)? {
-        let is_member = channels::is_member(&db, &ch.channel_id, device)?;
-        // Noted, or a row that the start took off: the note may not have
-        // been made (there is room for only so many). Once the channel's
-        // key has changed, the rows of every such key in it are deleted,
-        // so the change is made once for all of them.
-        let was_listed = !is_a_key
-            && (was_noted.contains(&ch.channel_id)
-                || channels::has_member_row(&db, &ch.channel_id, device)?);
-        if !is_member && !was_listed {
+        if !channels::is_member(&db, &ch.channel_id, device)? {
             continue;
         }
-        if is_member && is_a_key {
-            keep_what_it_wrote(state, &db, &ch.channel_id, device);
-        }
+        keep_what_it_wrote(state, &db, &ch.channel_id, device);
         channels::remove_member(&db, &ch.channel_id, device)?;
         offers::forget(&db, &ch.channel_id, device)?;
         rotate_key(state, &db, &ch.channel_id)?;
         publish_state(state, &db, &ch.channel_id)?;
-        if !is_a_key {
-            for key in channels::removed_member_keys(&db, &ch.channel_id)? {
-                if !cordelia_crypto::identity::is_usable_public_key(&key) {
-                    channels::forget_member(&db, &ch.channel_id, &key)?;
-                }
-            }
-        }
         rotated.push(ch.channel_id);
     }
     tracing::info!(channels = rotated.len(), "device removed, keys rotated");
@@ -1349,17 +1201,17 @@ fn process_one(
                 return invalid("state moves the key version further than its changes can");
             }
             let is_personal = personal_channel(db, &pk)?.as_deref() == Some(channel_id.as_str());
-            // A state that will be held is held before its keys are
-            // looked at, since it is looked at again on every pass.
-            if !is_personal && held_unexamined(db, &pk, &author, &cs)? {
+            // A state from a sender that is not this person's device names
+            // a stranger whatever else it lists, since a state lists its
+            // sender. It is held before its keys are looked at.
+            if !is_personal && !is_own_device(db, &pk, &author)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
-            let left_out = leave_out_unusable_keys(&mut cs);
+            leave_out_unusable_keys(state, &mut cs);
             if !is_personal && names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
             apply(state, db, &cs, false, false)?;
-            note_left_out(db, &pk, &channel_id, &left_out)?;
             // A change, not only a tie between two devices at one epoch:
             // tell its sender that this device holds it.
             if cs.epoch > epoch && cs.role_of(&pk).is_some() {
@@ -1388,23 +1240,21 @@ fn process_one(
                     }
                     return Ok((InviteStatus::Pending, channel_id));
                 }
-                let left_out = leave_out_unusable_keys(&mut cs);
+                leave_out_unusable_keys(state, &mut cs);
                 apply(state, db, &cs, true, true)?;
-                note_left_out(db, &pk, &channel_id, &left_out)?;
                 meta::set(db, meta::ACCEPTED_PERSONAL_FROM, "")?;
                 answer(state, db, &channel_id, &author);
                 return Ok((InviteStatus::Accepted, channel_id));
             }
             // As above: held before its keys are looked at.
-            if held_unexamined(db, &pk, &author, &cs)? {
+            if !is_own_device(db, &pk, &author)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
-            let left_out = leave_out_unusable_keys(&mut cs);
+            leave_out_unusable_keys(state, &mut cs);
             if names_a_stranger(db, &pk, &cs)? {
                 return Ok((InviteStatus::Held, channel_id));
             }
             apply(state, db, &cs, true, false)?;
-            note_left_out(db, &pk, &channel_id, &left_out)?;
             answer(state, db, &channel_id, &author);
             Ok((InviteStatus::Accepted, channel_id))
         }
@@ -1412,86 +1262,35 @@ fn process_one(
     }
 }
 
-/// The most keys that are not this person's devices that a state for one
-/// of their own channels may list and still have its keys looked at. A
-/// device not yet upgraded can list a key that is no device's; no device
-/// lists many.
-const MOST_KEYS_LOOKED_AT: usize = 8;
-
-/// Whether a state for one of this person's own channels (not the personal
-/// channel) is held without its keys being looked at. It is, in two cases
-/// that `names_a_stranger` would hold it for in the end:
-///
-/// - its sender is not one of this person's devices. A state lists its
-///   sender, so it names a stranger whatever else it lists;
-/// - it lists more than a few keys that are not this person's devices.
-///   One of them at most is likely to be a key that is no device's, and
-///   the rest are strangers.
-///
-/// A state that is held is looked at again on every pass, and checking a
-/// key costs a multiplication on the curve. So what is held stays cheap.
-fn held_unexamined(
-    db: &Connection,
-    pk: &[u8; 32],
-    sender: &[u8; 32],
-    cs: &ChannelState,
-) -> Result<bool, CordeliaError> {
-    if !is_own_device(db, pk, sender)? {
-        return Ok(true);
-    }
-    let mut not_devices = 0;
-    for member in &cs.members {
-        if !is_own_device(db, pk, &member.key)? {
-            not_devices += 1;
-            if not_devices > MOST_KEYS_LOOKED_AT {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-/// Leave out of a state the keys that are not usable public keys, and
-/// return them. Such a key is no member, whatever a state says. The rest of
-/// the state is taken: refusing the whole would lose a removal that a
-/// device not yet upgraded made while its list still held such a key.
+/// Leave out of a state the keys that are not usable public keys. Such a
+/// key is no member, whatever a state says, and however many it lists. The
+/// rest of the state is taken: refusing the whole, or holding it, would
+/// lose a removal that a device not yet upgraded made while its list still
+/// held such a key.
 ///
 /// Checking a key costs a multiplication on the curve, and a state lists up
 /// to 1,024. So this is done only for a state that has passed every test
-/// that would make it wait unexamined: it is from an owner of the channel
-/// or a device this one trusts, it is newer, and for a channel that is not
-/// the personal one, see [`held_unexamined`]. What a stranger sent waits
-/// unchecked. A state that is then held for naming a stranger has at most
-/// a few keys checked on each pass.
-fn leave_out_unusable_keys(cs: &mut ChannelState) -> Vec<[u8; 32]> {
-    let usable = cordelia_crypto::identity::is_usable_public_key;
-    let left_out: Vec<[u8; 32]> = cs
-        .members
-        .iter()
-        .map(|m| m.key)
-        .filter(|key| !usable(key))
-        .collect();
-    if !left_out.is_empty() {
-        cs.members.retain(|m| !left_out.contains(&m.key));
+/// that would make it wait without a look: it is from an owner of the
+/// channel or a device this one trusts, it is newer, and for a channel
+/// that is not the personal one its sender is one of this person's
+/// devices. What a stranger sent waits unchecked. A state that is then
+/// held for naming a stranger is looked at again on every pass, and the
+/// answer for each of its keys is remembered ([`UsableKeys`]): the same
+/// answer, at the cost of a lookup.
+///
+/// [`UsableKeys`]: crate::state::UsableKeys
+fn leave_out_unusable_keys(state: &AppState, cs: &mut ChannelState) {
+    let before = cs.members.len();
+    cs.members
+        .retain(|member| state.usable_keys.is_usable(&member.key));
+    let left_out = before - cs.members.len();
+    if left_out > 0 {
         tracing::warn!(
             channel = %cs.channel_id,
-            left_out = left_out.len(),
+            left_out,
             "a channel state lists keys that are not usable public keys; they are left out"
         );
     }
-    left_out
-}
-
-/// Note the keys that were left out of a state that has been applied (see
-/// [`note_not_devices`]). The device that sent it listed them, and may
-/// have sealed the channel's keys to them.
-fn note_left_out(
-    db: &Connection,
-    pk: &[u8; 32],
-    channel_id: &str,
-    left_out: &[[u8; 32]],
-) -> Result<(), CordeliaError> {
-    note_not_devices(db, pk, left_out, channel_id)
 }
 
 /// Whether a state for one of this person's own channels (not the personal

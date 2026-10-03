@@ -884,10 +884,9 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
 
 /// T20. A key that is no device's key, stored as one of this person's
 /// devices by a version that did not refuse them, is taken off the list
-/// when the node starts, and the node changes no channel's key by itself.
-/// `cordelia devices` says what was found and what to do, and removing the
-/// key, which is the person's act, changes the key of the channel that
-/// listed it.
+/// when the node starts, and the log says so. No channel's key is changed
+/// on its account, by the node or by a command: removing such a key is
+/// refused, and nothing about it is kept or shown afterwards.
 #[test]
 fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     use cordelia_storage::{channels, db, trust};
@@ -924,9 +923,13 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
             channels::get_by_id(&conn, &personal).unwrap().key_version,
         )
     };
+    let taken_off = "a key that is no device's was stored among this person's devices";
 
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
+    // The devices are the real ones, and nothing else is said of the key:
+    // not where the person looks at their devices, and not in the status
+    // that panels read.
     let devices = a.post("/api/v1/devices/list", serde_json::json!({}));
     let keys: Vec<&str> = devices["devices"]
         .as_array()
@@ -936,41 +939,46 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
         .collect();
     assert!(keys.contains(&b_key.as_str()), "{devices}");
     assert!(!keys.contains(&listed_as.as_str()), "{devices}");
-    assert_eq!(devices["not_devices"][0]["key"], listed_as.as_str());
-    assert_eq!(devices["not_devices"][0]["channels"], 1, "{devices}");
-    // The person is told: in the log at start, where they look at their
-    // devices, and in the status that panels read.
-    let log = std::fs::read_to_string(a.log()).unwrap();
-    assert!(
-        log.contains("keys that are no device's were stored among this person's devices"),
-        "{log}"
-    );
-    let status: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
-    assert_eq!(status["not_devices"][0]["key"], listed_as.as_str());
+    assert!(devices["not_devices"].is_null(), "{devices}");
+    let status = a.cli(&["status", "--json"]);
+    assert!(!status.contains(&listed_as), "{status}");
     let said = a.cli(&["devices"]);
-    let command = format!("cordelia remove-device {listed_as}");
+    assert!(!said.contains(&listed_as), "{said}");
+    // The log says what was done, that the channels keep their keys, and
+    // which channels: nothing else records them.
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    let said: Vec<&str> = log.lines().filter(|l| l.contains(taken_off)).collect();
+    assert_eq!(said.len(), 1, "{log}");
     assert!(
-        said.contains("A key that is no device's key was listed among your devices")
-            && said.contains(&command),
-        "{said}"
+        said[0].contains("The channels that listed it keep the keys they had")
+            && said[0].contains(&personal)
+            && said[0].contains(&hex::encode(nobody)),
+        "{log}"
     );
     // Taken off, and no key changed.
     a.stop();
     assert_eq!(held(), (false, version_before));
 
-    // The person removes it: the channel has a new key, and there is
-    // nothing more to say.
+    // At the next start (a log of its own) there is nothing to take off.
+    // Removing the key is refused, and changes nothing.
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
-    let said = a.cli(&["remove-device", &listed_as]);
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(!log.contains(taken_off), "{log}");
+    let said = a.refused(&["remove-device", &listed_as]);
+    assert!(
+        said.contains("not a usable public key, so it is no device's key")
+            && said.contains("nothing is removed")
+            && said.contains("The channels that listed it keep their keys"),
+        "{said}"
+    );
+
+    // A real device is removed as it always was.
+    let said = a.cli(&["remove-device", &b_key]);
     assert!(
         said.contains("from 1 channel and rotated its key"),
         "{said}"
     );
-    let said = a.cli(&["devices"]);
-    assert!(!said.contains("no device's key"), "{said}");
-    let status: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
-    assert!(status["not_devices"].is_null(), "{status}");
     a.stop();
     assert_eq!(held(), (false, version_before + 1));
 }

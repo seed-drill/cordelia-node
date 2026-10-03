@@ -511,11 +511,6 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             }
             if let Ok(devices) = local_api(&config, true, "/api/v1/devices/list", timeout) {
                 out["devices"] = devices["devices"].clone();
-                // Keys that were listed among them and are no device's:
-                // there only when there are some.
-                if !devices["not_devices"].is_null() {
-                    out["not_devices"] = devices["not_devices"].clone();
-                }
             }
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -817,6 +812,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
+        usable_keys: Default::default(),
     });
 
     // Personal nodes receive invites and channel states in an inbox channel
@@ -825,8 +821,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let inbox = cordelia_api::membership::ensure_own_inbox(&state)?;
         tracing::info!(%inbox, "inbox ready");
         // Keys that are no device's are no longer taken. One that was
-        // stored before is taken off now. No channel's key is changed by
-        // that: `cordelia devices` says what the person should do.
+        // stored before is taken off now, and the log says so. No
+        // channel's key is changed by that.
         cordelia_api::membership::drop_unusable_keys(&state)?;
     }
 
@@ -1754,64 +1750,7 @@ fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
         };
         println!("{key}  {name}{marker}");
     }
-    for line in not_devices_note(&resp["not_devices"]) {
-        println!("{line}");
-    }
     Ok(())
-}
-
-/// What `cordelia devices` says of keys that were listed among the devices
-/// and are no device's keys: what was done, what it means, and the command
-/// that changes the keys of the channels they were listed for. At most
-/// five are named; the rest are counted.
-fn not_devices_note(not_devices: &serde_json::Value) -> Vec<String> {
-    const NAMED: usize = 5;
-    let found: Vec<&serde_json::Value> = not_devices.as_array().into_iter().flatten().collect();
-    if found.is_empty() {
-        return Vec::new();
-    }
-    let one = found.len() == 1;
-    let mut lines = vec![String::new()];
-    lines.push(if one {
-        "A key that is no device's key was listed among your devices:".to_string()
-    } else {
-        format!(
-            "{} keys that are no devices' keys were listed among your devices:",
-            found.len()
-        )
-    });
-    for n in found.iter().take(NAMED) {
-        let key = n["key"].as_str().unwrap_or_default();
-        let day = n["found"].as_str().unwrap_or_default();
-        let day = day.split('T').next().unwrap_or(day);
-        let channels = n["channels"].as_u64().unwrap_or(0);
-        lines.push(format!(
-            "  {key}  (found {day} UTC, listed for {channels} channel{})",
-            if channels == 1 { "" } else { "s" }
-        ));
-    }
-    if found.len() > NAMED {
-        lines.push(format!("  and {} more", found.len() - NAMED));
-    }
-    lines.push(format!(
-        "{} off the list, and nothing is sealed to {} or taken from {} now. What your devices \
-         wrote before may have been read by others, and your memory may hold text that \
-         others wrote.",
-        if one { "It is" } else { "They are" },
-        if one { "it" } else { "them" },
-        if one { "it" } else { "them" },
-    ));
-    lines.push("Check the devices above, and remove any you do not recognise.".to_string());
-    lines.push(
-        "Then change the keys of the channels listed. Do it on one device only: one that is \
-         connected, and has been running since you last added or removed a device."
-            .to_string(),
-    );
-    for n in found.iter().take(NAMED) {
-        let key = n["key"].as_str().unwrap_or_default();
-        lines.push(format!("  cordelia remove-device {key}"));
-    }
-    lines
 }
 
 /// How long a change may go unconfirmed before `cordelia devices` says so.
@@ -2810,48 +2749,6 @@ mod tests {
         ] {
             assert_eq!(shell_word(name), want);
         }
-    }
-
-    /// `cordelia devices` says of keys that were listed and are no
-    /// devices': what was found and when, what it means, and the command
-    /// that changes the keys of the channels they were listed for. It says
-    /// nothing when there is none, and names at most five.
-    #[test]
-    fn test_devices_names_a_key_that_was_no_devices() {
-        assert!(not_devices_note(&serde_json::Value::Null).is_empty());
-        assert!(not_devices_note(&serde_json::json!([])).is_empty());
-        let key = |n: usize, channels: usize| {
-            serde_json::json!({
-                "key": format!("cordelia_pk1abc{n}"),
-                "found": "2026-10-03T14:00:00+00:00",
-                "channels": channels,
-            })
-        };
-        let said = not_devices_note(&serde_json::json!([key(0, 1)])).join("\n");
-        for part in [
-            "A key that is no device's key was listed among your devices:",
-            "  cordelia_pk1abc0  (found 2026-10-03 UTC, listed for 1 channel)",
-            "It is off the list",
-            "may have been read by others, and your memory may hold text that others wrote",
-            "remove any you do not recognise",
-            "Do it on one device only",
-            "  cordelia remove-device cordelia_pk1abc0",
-        ] {
-            assert!(said.contains(part), "missing {part:?} in:\n{said}");
-        }
-
-        let seven: Vec<serde_json::Value> = (0..7).map(|n| key(n, 3)).collect();
-        let said = not_devices_note(&serde_json::json!(seven)).join("\n");
-        for part in [
-            "7 keys that are no devices' keys were listed among your devices:",
-            "listed for 3 channels)",
-            "  and 2 more",
-            "They are off the list",
-            "  cordelia remove-device cordelia_pk1abc4",
-        ] {
-            assert!(said.contains(part), "missing {part:?} in:\n{said}");
-        }
-        assert!(!said.contains("cordelia_pk1abc5"), "{said}");
     }
 
     #[test]
