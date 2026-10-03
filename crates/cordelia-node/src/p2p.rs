@@ -386,9 +386,12 @@ impl<'a> RelayRoom<'a> {
     /// what the channel will hold once the item is stored. Makes the
     /// channel's row if it is a channel the relay will now hold.
     ///
-    /// Nothing is counted here. An item that is then not stored (a revision
-    /// no newer than the one held) changes nothing, and must not make the
-    /// channel look emptier than it is: see [`RelayRoom::stored`].
+    /// What the channel holds is not counted here. An item that is then not
+    /// stored (a revision no newer than the one held) changes nothing, and
+    /// must not make the channel look emptier than it is: see
+    /// [`RelayRoom::stored`]. A channel the relay does not hold is counted
+    /// against the address here, and its row made, as before: an item that
+    /// is then not stored leaves an empty channel.
     fn admit(
         &mut self,
         db: &rusqlite::Connection,
@@ -525,6 +528,16 @@ struct Place {
     /// It moves down when a fetch fails (the page's entries did not fit in
     /// one message) and goes back once the channel is caught up.
     step: usize,
+    /// Whether the channel was caught up there. A place that is still
+    /// being fetched is kept before one that is caught up.
+    done: bool,
+}
+
+impl Place {
+    /// The start of a channel, with nothing kept for it.
+    fn is_start(&self) -> bool {
+        self.after == 0 && self.step == 0
+    }
 }
 
 /// When something was read from [`Kept`]. What is kept later is kept only
@@ -584,10 +597,12 @@ impl Kept {
     /// that was under way when that happened does not put its place back.
     /// Returns whether it was kept.
     ///
-    /// A peer has at most `most` channels kept. When it has that many, the
-    /// one kept longest ago is forgotten to make room, so the channel being
-    /// fetched always keeps its place. The start is not kept: it is what a
-    /// channel with nothing kept has.
+    /// A peer has at most `most` channels kept. When it has that many, one
+    /// is forgotten to make room: a caught-up channel's before one that is
+    /// still being fetched, and of those the one kept longest ago. So a
+    /// long channel keeps its place from one pass to the next, whatever
+    /// else the peer lists. The start is not kept: it is what a channel
+    /// with nothing kept has.
     fn keep(
         &mut self,
         peer: &NodeId,
@@ -600,7 +615,7 @@ impl Kept {
         if since != mark.peer || self.relisted != mark.relisted {
             return false;
         }
-        if place == Place::default() {
+        if place.is_start() {
             if let Some(kept) = self.by_peer.get_mut(peer) {
                 kept.places.remove(channel);
             }
@@ -614,7 +629,7 @@ impl Kept {
             let oldest = kept
                 .places
                 .iter()
-                .min_by_key(|(_, (_, when))| *when)
+                .min_by_key(|(_, (place, when))| (!place.done, *when))
                 .map(|(channel, _)| channel.clone());
             if let Some(oldest) = oldest {
                 kept.places.remove(&oldest);
@@ -623,6 +638,18 @@ impl Kept {
         kept.kept += 1;
         kept.places.insert(channel.to_string(), (place, kept.kept));
         true
+    }
+
+    /// Where a fetch under way, now at `at`, goes on from. If nothing has
+    /// been forgotten since it last looked (`mark`), from `at`. Otherwise
+    /// from what is kept for its channel now: its own last place, if this
+    /// channel's was not among what was forgotten; the start, if it was (the
+    /// channel is to be listed again from the start, or the peer has
+    /// connected again). Either way it goes on with a fresh mark, so that
+    /// one channel's being forgotten costs the others nothing.
+    fn catch_up(&self, peer: &NodeId, channel: &str, at: Place, mark: Mark) -> (Place, Mark) {
+        let (kept, now) = self.get(peer, channel);
+        if now == mark { (at, now) } else { (kept, now) }
     }
 
     /// Forget everything kept for `peer`: it has connected again, and may
@@ -893,15 +920,22 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
         }
         // This node's place in the peer's list of the channel, and the
         // size of page it asks for there. Both move with each page of this
-        // pass, whatever is kept of them. What is kept is not put back if
-        // the peer's places, or any channel's, are forgotten while the
-        // channel is fetched (the peer connected again, or a channel is to
-        // be listed again from the start).
-        let (place, mark) = lock_kept().get(&target, ch_id);
+        // pass, whatever is kept of them. If this channel's place is
+        // forgotten while it is fetched (the peer connected again, or the
+        // channel is to be listed again from the start), the fetch starts
+        // it again; another channel's being forgotten changes nothing here.
+        let (place, mut mark) = lock_kept().get(&target, ch_id);
         let mut after = place.after;
         let mut step = place.step.min(SYNC_PAGE_STEPS.len() - 1);
         let mut caught_up = false;
         for _page in 0..PAGES {
+            let here = Place {
+                after,
+                step,
+                done: false,
+            };
+            let (place, now) = lock_kept().catch_up(&target, ch_id, here, mark);
+            (after, step, mark) = (place.after, place.step.min(SYNC_PAGE_STEPS.len() - 1), now);
             // How many entries the peer's allowance has room for now: a
             // whole page if it has room for the most a page can cost, and
             // otherwise as many as would fit if each were of the largest
@@ -1005,7 +1039,12 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                             // one message: ask for fewer next time.
                             tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
                             step = (step + 1).min(SYNC_PAGE_STEPS.len() - 1);
-                            lock_kept().keep(&target, ch_id, Place { after, step }, most, mark);
+                            let place = Place {
+                                after,
+                                step,
+                                done: false,
+                            };
+                            lock_kept().keep(&target, ch_id, place, most, mark);
                             fetched = Fetched::More;
                             break 'channels;
                         }
@@ -1116,9 +1155,10 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                 break;
             };
             // The page is passed, whether or not what it listed could be
-            // stored: what this node will not store it does not ask for
-            // again. A page with nothing in it moves no place, so a name
-            // that lists nothing has nothing kept for it.
+            // stored, so that what follows is reached; what this node will
+            // not store it does not ask for again in this part of the list.
+            // A page with nothing in it moves no place, so a name that lists
+            // nothing has nothing kept for it.
             if !resp.items.is_empty() {
                 after = last_seq;
             }
@@ -1128,7 +1168,12 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                 // Caught up here: back to full pages.
                 step = 0;
             }
-            lock_kept().keep(&target, ch_id, Place { after, step }, most, mark);
+            let place = Place {
+                after,
+                step,
+                done: end,
+            };
+            lock_kept().keep(&target, ch_id, place, most, mark);
             if end {
                 caught_up = true;
                 break;
@@ -4937,7 +4982,11 @@ mod tests {
     #[test]
     fn what_is_kept_for_a_peer_is_bounded_and_forgotten_when_it_goes() {
         let peer = |n: u8| NodeId([n; 32]);
-        let at = |after: u64| Place { after, step: 0 };
+        let at = |after: u64| Place {
+            after,
+            step: 0,
+            done: false,
+        };
         // Keep a place as a fetch does: with the mark taken when it began.
         let keep = |kept: &mut Kept, p: u8, c: usize, after: u64| {
             let (_, mark) = kept.get(&peer(p), &channel(c));
@@ -4953,8 +5002,8 @@ mod tests {
         }
         assert!(keep(&mut kept, 1, 0, 8));
         assert_eq!(kept.kept_for(&peer(1)), 4);
-        // One more takes the place of the one kept longest ago, so the
-        // channel being fetched always keeps its place.
+        // One more takes the place of the one kept longest ago (none is
+        // caught up here), and is kept.
         assert!(keep(&mut kept, 1, 4, 7));
         assert_eq!(kept.kept_for(&peer(1)), 4);
         assert_eq!(place(&kept, 1, 1), Place::default(), "kept longest ago");
@@ -4969,8 +5018,13 @@ mod tests {
         assert!(keep(&mut kept, 3, 0, 9));
         // The size of page asked for is kept with the place.
         let (_, mark) = kept.get(&peer(3), &channel(0));
-        assert!(kept.keep(&peer(3), &channel(0), Place { after: 9, step: 2 }, 4, mark));
-        assert_eq!(place(&kept, 3, 0), Place { after: 9, step: 2 });
+        let smaller = Place {
+            after: 9,
+            step: 2,
+            done: false,
+        };
+        assert!(kept.keep(&peer(3), &channel(0), smaller, 4, mark));
+        assert_eq!(place(&kept, 3, 0), smaller);
 
         // A channel that is to be listed again is forgotten for every
         // peer, and a fetch that was under way does not put its place back.
@@ -5012,6 +5066,92 @@ mod tests {
         assert_eq!(place(&kept, 2, 4), at(10));
         assert!(!kept.keep(&peer(1), &channel(1), at(9), 4, under_way));
         assert_eq!(kept.total(), 1);
+    }
+
+    /// T3. When a peer has as many places kept as it may, a caught-up
+    /// channel's place makes room before one that is still being fetched,
+    /// whatever was kept longest ago. So a long channel keeps its place
+    /// from one pass to the next, though the peer lists more channels than
+    /// a relay keeps places for.
+    #[test]
+    fn a_channel_still_being_fetched_keeps_its_place_before_caught_up_ones() {
+        let peer = NodeId([1; 32]);
+        let mut kept = Kept::default();
+        let keep = |kept: &mut Kept, c: usize, after: u64, done: bool| {
+            let (_, mark) = kept.get(&peer, &channel(c));
+            let place = Place {
+                after,
+                step: 0,
+                done,
+            };
+            kept.keep(&peer, &channel(c), place, 3, mark)
+        };
+        let after = |kept: &Kept, c: usize| kept.get(&peer, &channel(c)).0.after;
+
+        // A long channel still being fetched, kept first; then two that
+        // are caught up.
+        assert!(keep(&mut kept, 0, 1000, false));
+        assert!(keep(&mut kept, 1, 5, true));
+        assert!(keep(&mut kept, 2, 5, true));
+        // One more: the caught-up one kept longest ago makes room.
+        assert!(keep(&mut kept, 3, 5, true));
+        assert_eq!(after(&kept, 0), 1000, "the long channel kept its place");
+        assert_eq!(after(&kept, 1), 0);
+        // When every place is still being fetched, the one kept longest ago
+        // makes room.
+        assert!(keep(&mut kept, 2, 7, false));
+        assert!(keep(&mut kept, 3, 7, false));
+        assert!(keep(&mut kept, 4, 7, false));
+        assert_eq!(after(&kept, 0), 0);
+        assert_eq!(kept.kept_for(&peer), 3);
+    }
+
+    /// T3. A fetch under way goes on from its own place when another
+    /// channel's place is forgotten, and starts its channel again when that
+    /// channel's place is forgotten or the peer connects again. Before, any
+    /// channel's being listed again stopped every fetch under way from
+    /// keeping its place for the rest of its channel.
+    #[test]
+    fn a_fetch_starts_its_channel_again_only_when_that_channel_is_forgotten() {
+        let peer = NodeId([1; 32]);
+        let at = |after: u64| Place {
+            after,
+            step: 0,
+            done: false,
+        };
+        let mut kept = Kept::default();
+
+        // A fetch keeps its place in channel 0, page by page.
+        let (_, mark) = kept.get(&peer, &channel(0));
+        assert!(kept.keep(&peer, &channel(0), at(100), 1024, mark));
+        // Nothing forgotten: it goes on.
+        assert_eq!(
+            kept.catch_up(&peer, &channel(0), at(100), mark),
+            (at(100), mark)
+        );
+        // Another channel is to be listed again: it goes on from its own
+        // place, with a mark it can keep its next place with.
+        kept.forget_channels(&[channel(1)]);
+        let (place, fresh) = kept.catch_up(&peer, &channel(0), at(100), mark);
+        assert_eq!(place.after, 100);
+        assert!(kept.keep(&peer, &channel(0), at(200), 1024, fresh));
+        // Its own channel is to be listed again: it starts from the start.
+        kept.forget_channels(&[channel(0)]);
+        let (place, fresh) = kept.catch_up(&peer, &channel(0), at(200), fresh);
+        assert_eq!(place, Place::default());
+        // So does it when the peer connects again.
+        assert!(kept.keep(&peer, &channel(0), at(50), 1024, fresh));
+        kept.forget_peer(&peer);
+        let (place, _) = kept.catch_up(&peer, &channel(0), at(50), fresh);
+        assert_eq!(place, Place::default());
+        // A place it could not keep, because something was forgotten while
+        // its page was on its way: it goes back to the place that was kept.
+        let (_, mark) = kept.get(&peer, &channel(0));
+        assert!(kept.keep(&peer, &channel(0), at(10), 1024, mark));
+        kept.forget_channels(&[channel(1)]);
+        assert!(!kept.keep(&peer, &channel(0), at(20), 1024, mark));
+        let (place, _) = kept.catch_up(&peer, &channel(0), at(20), mark);
+        assert_eq!(place.after, 10);
     }
 
     /// T3. Against its address, what a relay fetches from one connection

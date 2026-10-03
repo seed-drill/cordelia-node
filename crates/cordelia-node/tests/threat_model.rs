@@ -1259,6 +1259,8 @@ struct Held {
 struct Pass {
     /// The channel of each request for a list of entries.
     listed: Vec<String>,
+    /// The size of page asked for, with each request for a list.
+    limits: Vec<u32>,
     /// How many requests for entries.
     fetches: usize,
     /// The entries asked for, by ID, in the order asked.
@@ -1698,6 +1700,7 @@ impl Client {
                         }
                         WireMessage::SyncRequest(req) if held.makes_up_names > 0 => {
                             pass.listed.push(req.channel_id.clone());
+                            pass.limits.push(req.limit);
                             WireMessage::SyncResponse(SyncResponse {
                                 items: Vec::new(),
                                 has_more: true,
@@ -1718,6 +1721,7 @@ impl Client {
                         // place among the entries held, from 1.
                         WireMessage::SyncRequest(req) => {
                             pass.listed.push(req.channel_id.clone());
+                            pass.limits.push(req.limit);
                             let after = req.after_seq.unwrap_or(0);
                             let of: Vec<(u64, &cordelia_network::messages::Item)> = items
                                 .iter()
@@ -2238,6 +2242,69 @@ async fn t03_a_relay_keeps_only_so_many_places_for_a_peer() {
         "{kept:?}"
     );
     assert_eq!(relay_holds(&relay), (0, 0));
+
+    // Once the peer has gone, what was kept for it is forgotten. (Another
+    // peer stays, so that the relay goes on saying what it keeps.)
+    let stays = client_of(&relay).await.expect("another peer connects");
+    stays.serve(Held::default());
+    peer.close().await;
+    wait_for(
+        "the relay forgets the places it kept",
+        &[&relay],
+        90,
+        || (places_kept(&relay).last() == Some(&0)).then_some(()),
+    );
+}
+
+/// A relay that asked a device for fewer entries at a time, because a page
+/// of them did not fit in one message, asks for whole pages again once it
+/// has caught up with that channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_asks_for_whole_pages_again_once_caught_up() {
+    use cordelia_core::protocol::SYNC_PAGE_STEPS;
+    let large = "grp_550e8400-e29b-41d4-a716-000000000001";
+
+    let mut relay = node("relay", "relay", None);
+    relay.relay_ask_again_secs(2);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let device = client_of(&relay).await.expect("the device connects");
+    // Thirty entries that are more than a megabyte together: the first
+    // request for them cannot be answered, and the relay asks for fewer.
+    let held = Held::of((0..30).map(|_| device.entry_in(large, 40_000)).collect());
+    device.serve(held.clone());
+    wait_for("the relay holds the channel", &[&relay], 120, || {
+        (relay_holds(&relay).0 == 30).then_some(())
+    });
+    let asked_fewer = held
+        .passes()
+        .iter()
+        .flat_map(|pass| pass.limits.clone())
+        .any(|limit| limit < SYNC_PAGE_STEPS[0]);
+    assert!(asked_fewer, "the relay never asked for fewer");
+
+    // The device comes to hold a few more, small ones, once what the relay
+    // fetched has left the minute it counts against the device: until then
+    // the relay asks for fewer for that reason. It asks for them a whole
+    // page at a time.
+    tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+    let before = held.passes().len();
+    held.items
+        .lock()
+        .unwrap()
+        .extend((0..5).map(|_| device.entry_in(large, 100)));
+    wait_for("the relay holds the new entries", &[&relay], 60, || {
+        (relay_holds(&relay).0 == 35).then_some(())
+    });
+    let later: Vec<u32> = held.passes()[before..]
+        .iter()
+        .flat_map(|pass| pass.limits.clone())
+        .collect();
+    assert!(!later.is_empty());
+    assert!(
+        later.iter().all(|limit| *limit == SYNC_PAGE_STEPS[0]),
+        "asked for {later:?} after it had caught up"
+    );
 }
 
 /// T3. A relay does not fetch what it has no room for. A device holds
