@@ -21,7 +21,9 @@ never shared with another person. It is encrypted on the device
 that wrote it and travels through relays that store only ciphertext and hold no
 keys. Each device has its own key and is added or removed individually. A
 project's memory follows the project, matched by its git remote, not by where it
-sits on disk. Concurrent edits never silently lose work.
+sits on disk. When two devices edit the same memory, both versions are kept
+(the known exceptions are in section 9 of the decision record,
+`docs/decisions/2026-09-30-agent-memory-sync.md`).
 
 Version 1 does this for Claude Code's memory. This paper describes what v1 is,
 how it works, and what it promises; it makes no claim beyond what is built.
@@ -75,7 +77,8 @@ After that:
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
-  (`MEMORY.md`) is merged line by line instead.
+  (`MEMORY.md`) is merged line by line instead. (Section 9 of the decision
+  record lists the cases where one of the two is not kept.)
 - `cordelia sync status` lists what was found on the machine and is not
   syncing, with the command that maps it, and what the person's other
   devices sync. `cordelia sync claude --all` syncs everything found instead.
@@ -262,7 +265,10 @@ Two mechanisms carry items between them:
    changed is taken. If both changed, the channel's version goes in the file and
    this device's version is kept as a conflict file. An edit beats a delete,
    whichever side made it. `MEMORY.md` is merged: the union of both versions'
-   lines, minus pointers to deleted files.
+   lines, minus pointers to deleted files. (Whether the channel's version
+   follows this device's is judged by its revision number alone; section 9 of
+   the decision record says where that takes one side without keeping the
+   other.)
 3. **Apply safely.** Files are written atomically (a temporary file, then a
    rename, which never writes through a symlink). Only plain file names are
    accepted from other devices: no separators, no `..`, no hidden files. Before

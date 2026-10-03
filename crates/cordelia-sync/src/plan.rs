@@ -21,7 +21,9 @@
 //!   published again when the device that wrote it is removed): note the
 //!   revision, and touch nothing.
 //!
-//! Nothing is ever dropped silently: every losing edit ends up in a file.
+//! Every losing edit is meant to end up in a file. One case where it does
+//! not is in decision 2026-09-30 §9: a higher revision is taken to
+//! follow, whoever wrote it and whatever they had seen.
 
 use std::collections::HashSet;
 

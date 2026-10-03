@@ -672,21 +672,43 @@ pub fn slotted_items(
     conn: &Connection,
     channel_id: &str,
 ) -> Result<Vec<StoredItem>, CordeliaError> {
+    items_in_slots(conn, channel_id, None)
+}
+
+/// The items stored in one slot of a channel, in the order they were
+/// stored: at most one for each author.
+pub fn slot_items(
+    conn: &Connection,
+    channel_id: &str,
+    slot: &[u8; 32],
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    items_in_slots(conn, channel_id, Some(slot))
+}
+
+fn items_in_slots(
+    conn: &Connection,
+    channel_id: &str,
+    slot: Option<&[u8; 32]>,
+) -> Result<Vec<StoredItem>, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    let which = match slot {
+        Some(_) => "slot = ?2",
+        None => "slot IS NOT NULL AND ?2 IS NULL",
+    };
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {ITEM_COLUMNS} FROM items
-             WHERE channel_id = ?1 AND slot IS NOT NULL
+             WHERE channel_id = ?1 AND {which}
              ORDER BY seq ASC"
         ))
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        .map_err(storage)?;
     let rows = stmt
-        .query_map(params![channel_id], stored_item_from_row)
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    let mut items = Vec::new();
-    for row in rows {
-        items.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
-    }
-    Ok(items)
+        .query_map(
+            params![channel_id, slot.map(|s| s.as_slice())],
+            stored_item_from_row,
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
 /// Fetch specific items of a channel by ID, for item-sync fetch requests.
@@ -1187,6 +1209,38 @@ mod tests {
         let kept = &query_sync(&conn, "ch1", None, 10).unwrap()[0];
         assert_eq!(kept.slot.as_deref(), Some(&slot[..]));
         assert_eq!(kept.rev, Some(2));
+    }
+
+    /// One slot's items are that slot's alone, in the order they were
+    /// stored, a delete among them. An item with no slot is in none.
+    #[test]
+    fn test_one_slots_items_are_read_alone() {
+        let conn = setup();
+        let (me, other, third) = ([0xA1; 32], [0xB2; 32], [0xC3; 32]);
+        let (slot, beside) = ([0x51; 32], [0x52; 32]);
+        // Three, stored in an order that sorting by author's key, by
+        // revision, by ID or by hash does not give, up or down: by each
+        // of the four the first stored is in the middle.
+        let mut gone = slotted("ci_m_theirs", &other, &slot, 2, &[0x03; 32]);
+        gone.is_tombstone = true;
+        insert_item(&conn, &gone).unwrap();
+        insert_item(&conn, &slotted("ci_a_mine", &me, &slot, 1, &[0x01; 32])).unwrap();
+        insert_item(&conn, &slotted("ci_z_third", &third, &slot, 3, &[0x05; 32])).unwrap();
+        insert_item(&conn, &slotted("ci_beside", &me, &beside, 7, &[0x02; 32])).unwrap();
+        let mut plain = slotted("ci_plain", &me, &slot, 1, &[0x04; 32]);
+        (plain.slot, plain.rev) = (None, None);
+        insert_item(&conn, &plain).unwrap();
+
+        let in_slot = |slot: &[u8; 32]| -> Vec<String> {
+            let items = slot_items(&conn, "ch1", slot).unwrap();
+            items.into_iter().map(|i| i.item_id).collect()
+        };
+        assert_eq!(in_slot(&slot), ["ci_m_theirs", "ci_a_mine", "ci_z_third"]);
+        assert_eq!(in_slot(&beside), ["ci_beside"]);
+        assert!(in_slot(&[0x53; 32]).is_empty());
+        assert_eq!(slotted_items(&conn, "ch1").unwrap().len(), 4);
+        assert_eq!(ids(&conn).len(), 5);
+        assert!(slot_items(&conn, "another", &slot).unwrap().is_empty());
     }
 
     #[test]
