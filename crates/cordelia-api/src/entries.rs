@@ -9,8 +9,9 @@
 //! slot; the highest revision wins, ties going to the higher content hash.
 //! Other items at the winning revision are concurrent edits, returned as
 //! conflicts. An item at a lower revision is not returned, though it too
-//! may have been written without sight of the winner (decision
-//! 2026-09-30 §9).
+//! may have been written without sight of the winner. A reader that
+//! minds says so itself: the sync adapter has each of its entries say
+//! what it was written after (`Write::after`, decision 2026-09-30 §4.5).
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -36,6 +37,12 @@ pub struct Write<'a> {
     pub item_type: &'a str,
     /// Publish a tombstone revision: the key was deleted (§4.4).
     pub deleted: bool,
+    /// What the writer says this revision was written after, carried
+    /// beside the content and sealed with it, for a delete as for a
+    /// text. `None` puts no such member in the entry. Only the sync
+    /// adapter sets it, and only its readers take anything from it
+    /// (decision 2026-09-30 §4.5).
+    pub after: Option<&'a Value>,
 }
 
 /// A revision just published.
@@ -56,6 +63,9 @@ pub struct Version {
     pub deleted: bool,
     pub content: Value,
     pub metadata: Option<Value>,
+    /// The `after` member the writer put beside the content, as it was
+    /// written. `None` where there is none, or it is `null`.
+    pub after: Option<Value>,
     pub item_type: String,
     content_hash: Vec<u8>,
 }
@@ -116,6 +126,7 @@ fn publish_at(
         metadata,
         item_type,
         deleted,
+        after,
     } = *write;
     validate_key(key)?;
     let pk = state.identity.public_key();
@@ -137,12 +148,16 @@ fn publish_at(
     }
     let channel = channels::get_by_id(db, channel_id)?;
 
-    let plaintext = serde_json::to_vec(&serde_json::json!({
+    let mut envelope = serde_json::json!({
         "key": key,
         "content": if deleted { Value::Null } else { content.clone() },
         "metadata": if deleted { None } else { metadata.cloned() },
-    }))
-    .map_err(|e| CordeliaError::Internal(e.to_string()))?;
+    });
+    if let Some(after) = after {
+        envelope["after"] = after.clone();
+    }
+    let plaintext =
+        serde_json::to_vec(&envelope).map_err(|e| CordeliaError::Internal(e.to_string()))?;
     // Checked here as well as by every node that carries it: the entry as
     // it travels is its content plus what sealing adds.
     let sealed_len = plaintext.len() + cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES;
@@ -291,6 +306,7 @@ impl<'a> Reading<'a> {
             deleted: item.is_tombstone,
             content: envelope.get("content").cloned().unwrap_or(Value::Null),
             metadata: envelope.get("metadata").cloned().filter(|m| !m.is_null()),
+            after: envelope.get("after").cloned().filter(|a| !a.is_null()),
             item_type: item.item_type.clone(),
             content_hash: item.content_hash.clone(),
         };
@@ -415,6 +431,10 @@ pub fn take_over(
             metadata: entry.current.metadata.as_ref(),
             item_type: &entry.current.item_type,
             deleted: entry.current.deleted,
+            // Not carried over from the entry this takes the place of:
+            // this device did not write the text over anything. A reader
+            // takes an entry without it by its revision alone, as before.
+            after: None,
         };
         match publish_at(state, db, channel_id, &write, Some(at)) {
             Ok(_) => taken += 1,

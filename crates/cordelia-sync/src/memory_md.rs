@@ -4,8 +4,9 @@
 //! so where the plan merges two devices' edits it takes the union of lines
 //! rather than one side winning: the current version's lines in order, then
 //! any lines only this device had, minus lines pointing at deleted files
-//! (decision 2026-09-30-agent-memory-sync §4.5; §9 says where the plan
-//! does not merge).
+//! (decision 2026-09-30-agent-memory-sync §4.5, which also says where the
+//! plan does not merge: at a higher revision the index is taken as any
+//! file is).
 
 use std::collections::HashSet;
 

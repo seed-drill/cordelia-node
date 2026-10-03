@@ -615,6 +615,7 @@ pub fn request_join(state: &AppState, channel_id: &str) -> Result<bool, Cordelia
             metadata: None,
             item_type: "membership",
             deleted: false,
+            after: None,
         },
     )?;
     tracing::info!(channel = %channel_id, "asked this person's other devices to join");
@@ -674,6 +675,7 @@ pub fn process_join_requests(state: &AppState) -> Result<usize, CordeliaError> {
                 metadata: None,
                 item_type: "membership",
                 deleted: true,
+                after: None,
             },
         )?;
     }

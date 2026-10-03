@@ -516,6 +516,170 @@ fn memory_index_merges_instead_of_conflicting() {
     );
 }
 
+// ── An edit that another device has overtaken is kept ──────────────────
+
+/// The conflict files in `dir` that are copies of `name`, each with its
+/// text, sorted.
+fn copies_of(dir: &Path, name: &str) -> Vec<(String, String)> {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let start = format!("{stem}.conflict-");
+    let mut copies: Vec<(String, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&start))
+        .map(|n| {
+            let text = read(dir, &n).unwrap();
+            (n, text)
+        })
+        .collect();
+    copies.sort();
+    copies
+}
+
+/// Two devices that agree on `base` as the text of one file, and are then
+/// apart. Each writes the texts given to the file in turn (`None` deletes
+/// it), with a cycle after each, and hears nothing from the other. Then
+/// they meet. Returns the two devices and their memory folders.
+fn apart(
+    name: &str,
+    base: &str,
+    b_does: &[Option<&str>],
+    a_does: &[Option<&str>],
+) -> (Device, Device, PathBuf, PathBuf) {
+    let (mut a, mut b) = paired();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    std::fs::write(a_mem.join(name), base).unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&b_mem, name).as_deref(), Some(base));
+    for (device, mem, does) in [(&mut b, &b_mem, b_does), (&mut a, &a_mem, a_does)] {
+        for text in does {
+            match text {
+                Some(text) => std::fs::write(mem.join(name), text).unwrap(),
+                None => std::fs::remove_file(mem.join(name)).unwrap(),
+            }
+            device.cycle();
+        }
+    }
+    settle(&mut a, &mut b);
+    (a, b, a_mem, b_mem)
+}
+
+/// One edit on one device against two on the other (#79). The second of
+/// the two is at a higher revision than the one, which shows only that its
+/// writer had made more edits. It is taken, as it always was. The one is
+/// now kept beside it, on both devices: it used to be in no file on
+/// either.
+#[test]
+fn an_edit_overtaken_by_two_is_kept_beside_the_file() {
+    let (_a, _b, a_mem, b_mem) = apart(
+        "notes.md",
+        "base\n",
+        &[Some("from b\n")],
+        &[Some("from a, one\n"), Some("from a, two\n")],
+    );
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(read(mem, "notes.md").as_deref(), Some("from a, two\n"));
+        let copies = copies_of(mem, "notes.md");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].1, "from b\n");
+    }
+    assert_eq!(copies_of(&a_mem, "notes.md"), copies_of(&b_mem, "notes.md"));
+}
+
+/// Two edits against three. The first of the two was replaced by the
+/// device that made it, knowingly. The second is the one that was
+/// overtaken, and it is kept.
+#[test]
+fn the_last_of_two_edits_overtaken_by_three_is_kept() {
+    let (_a, _b, a_mem, b_mem) = apart(
+        "notes.md",
+        "base\n",
+        &[Some("from b, one\n"), Some("from b, two\n")],
+        &[
+            Some("from a, one\n"),
+            Some("from a, two\n"),
+            Some("from a, three\n"),
+        ],
+    );
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(read(mem, "notes.md").as_deref(), Some("from a, three\n"));
+        let copies = copies_of(mem, "notes.md");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].1, "from b, two\n");
+    }
+}
+
+/// One edit against an edit and then a delete. The delete is at a higher
+/// revision, so the file goes on both devices, as it always did. The edit
+/// that the delete was made without sight of is kept as a conflict file.
+#[test]
+fn an_edit_overtaken_by_an_edit_and_a_delete_is_kept() {
+    let (_a, _b, a_mem, b_mem) = apart(
+        "notes.md",
+        "base\n",
+        &[Some("from b\n")],
+        &[Some("from a\n"), None],
+    );
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(read(mem, "notes.md"), None);
+        let copies = copies_of(mem, "notes.md");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].1, "from b\n");
+    }
+}
+
+/// The index, with one line added on one device against two on the
+/// other. At a higher revision it is not merged: the index is taken as
+/// any file is, and the index that was overtaken is kept whole beside
+/// it, with the line that used to be lost.
+#[test]
+fn an_index_overtaken_by_two_edits_is_kept_whole_beside_it() {
+    let base = "- [Base](base.md) — shared\n";
+    let from_b = format!("{base}- [B](b.md) — from b\n");
+    let one = format!("{base}- [A1](a1.md) — from a\n");
+    let two = format!("{one}- [A2](a2.md) — from a\n");
+    let (_a, _b, a_mem, b_mem) = apart(
+        "MEMORY.md",
+        base,
+        &[Some(&from_b)],
+        &[Some(&one), Some(&two)],
+    );
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(read(mem, "MEMORY.md").as_deref(), Some(two.as_str()));
+        let copies = copies_of(mem, "MEMORY.md");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].1, from_b);
+    }
+}
+
+/// Only the entries of memory files say what they were written after.
+/// What the adapter writes in the personal channel (the map from a name to
+/// its channel, each device's list of what it syncs) says nothing, and is
+/// read by its revision as it always was.
+#[test]
+fn only_memory_entries_say_what_they_were_written_after() {
+    let (mut a, mut b) = paired();
+    let a_mem = a.home_memory();
+    b.home_memory();
+    std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
+    settle(&mut a, &mut b);
+    let home = channel_of(&mut a, "~");
+    let personal = membership::personal_channel_id(&a.state).unwrap();
+    let says = |channel: &str| -> Vec<(String, bool)> {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::entries::current(&a.state, &db, channel)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.key, e.current.after.is_some()))
+            .collect()
+    };
+    let in_personal = says(&personal);
+    // The name's channel, and each of the two devices' lists.
+    assert!(in_personal.len() >= 3, "{in_personal:?}");
+    assert!(in_personal.iter().all(|(_, says)| !says), "{in_personal:?}");
+    assert_eq!(says(&home), [("notes.md".to_string(), true)]);
+}
+
 #[test]
 fn keys_that_are_not_safe_file_names_are_never_written() {
     let (mut a, mut b) = paired();
@@ -538,6 +702,7 @@ fn keys_that_are_not_safe_file_names_are_never_written() {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             },
         )
         .unwrap();
@@ -735,6 +900,7 @@ fn a_device_cannot_ask_to_join_on_anothers_behalf() {
                 metadata: None,
                 item_type: "membership",
                 deleted: false,
+                after: None,
             },
         )
         .unwrap();
@@ -1056,6 +1222,7 @@ fn what_other_devices_sync_is_what_they_sync_now() {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             },
         )
         .unwrap();
@@ -1721,6 +1888,7 @@ fn a_name_is_offered_only_once_a_device_syncs_it() {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             },
         )
         .unwrap();

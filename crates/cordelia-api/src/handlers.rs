@@ -174,6 +174,7 @@ pub async fn publish(
                 metadata: body.metadata.as_ref(),
                 item_type: &body.item_type,
                 deleted: false,
+                after: None,
             },
         )?;
         return Ok(HttpResponse::Ok().json(PublishResponse {
@@ -1430,6 +1431,7 @@ pub async fn delete_key(
             metadata: None,
             item_type: "memory",
             deleted: true,
+            after: None,
         },
     )?;
     Ok(HttpResponse::Ok().json(DeleteKeyResponse {

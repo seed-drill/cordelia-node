@@ -977,7 +977,14 @@ mod tests {
         /// As the adapter records it: `folder` agreed something with a channel.
         fn agreed(&self, folder: &str) {
             let memory = memory_folder(DIR, folder);
-            sync_state::save(&self.db, &memory, "grp_x", "notes.md", (Some([7; 32]), 1)).unwrap();
+            sync_state::save(
+                &self.db,
+                &memory,
+                "grp_x",
+                "notes.md",
+                (Some([7; 32]), 1, None),
+            )
+            .unwrap();
         }
 
         fn remembers(&self, folder: &str) -> bool {
@@ -1107,7 +1114,7 @@ mod tests {
         let there = memory_folder(other, "/home/sam/notes");
         s.map("/home/sam/notes", "lab");
         s.agreed("/home/sam/notes");
-        sync_state::save(&s.db, &there, "grp_x", "notes.md", (Some([7; 32]), 1)).unwrap();
+        sync_state::save(&s.db, &there, "grp_x", "notes.md", (Some([7; 32]), 1, None)).unwrap();
         s.claude(serde_json::json!({ "dir": other }));
         assert!(!s.remembers("/home/sam/notes"));
         assert!(sync_state::load(&s.db, &there, "grp_x").unwrap().is_empty());
