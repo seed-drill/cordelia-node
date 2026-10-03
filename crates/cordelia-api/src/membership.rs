@@ -798,17 +798,56 @@ pub fn remove_device(
         if !channels::is_member(&db, &ch.channel_id, device)? {
             continue;
         }
-        keep_what_it_wrote(state, &db, &ch.channel_id, device);
-        channels::remove_member(&db, &ch.channel_id, device)?;
-        offers::forget(&db, &ch.channel_id, device)?;
-        rotate_key(state, &db, &ch.channel_id)?;
-        publish_state(state, &db, &ch.channel_id)?;
+        remove_from_channel(state, &db, &ch.channel_id, device)?;
         rotated.push(ch.channel_id);
     }
     tracing::info!(channels = rotated.len(), "device removed, keys rotated");
     Ok(RemoveDeviceOutcome {
         channels_rotated: rotated,
     })
+}
+
+/// Take `gone` out of one channel this device owns: publish again what it
+/// last wrote, give the channel a new key, and send the new state to the
+/// members that remain.
+///
+/// The key is changed first. The member is then removed in the same
+/// database change that sends the others the new state, so `gone` stays a
+/// member until every step has been taken. A removal that fails, or that
+/// the node is stopped in the middle of, is therefore finished when it is
+/// run again: the channel is never passed by as one that `gone` has
+/// already left.
+///
+/// (This removed the member first. A node that stopped before the next
+/// step left a channel `gone` was no longer listed in and whose key had
+/// not changed, and a second removal skipped it: `gone` went on reading.)
+fn remove_from_channel(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    gone: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    keep_what_it_wrote(state, db, channel_id, gone);
+    rotate_key(state, db, channel_id)?;
+
+    // A savepoint, so that it holds whether or not the caller has a
+    // transaction open.
+    db.execute_batch("SAVEPOINT remove_member")
+        .map_err(storage)?;
+    let removed = (|| -> Result<(), CordeliaError> {
+        channels::remove_member(db, channel_id, gone)?;
+        offers::forget(db, channel_id, gone)?;
+        publish_state(state, db, channel_id)?;
+        Ok(())
+    })();
+    match removed {
+        Ok(()) => db.execute_batch("RELEASE remove_member").map_err(storage),
+        Err(e) => {
+            let _ = db.execute_batch("ROLLBACK TO remove_member; RELEASE remove_member");
+            Err(e)
+        }
+    }
 }
 
 /// Publish again, as this device, what `leaving` last wrote in a channel,
@@ -871,11 +910,7 @@ fn remove_where_remover_absent(
         if acting != Some(pk) {
             continue; // another remaining owner acts
         }
-        keep_what_it_wrote(state, db, &id, gone);
-        channels::remove_member(db, &id, gone)?;
-        offers::forget(db, &id, gone)?;
-        rotate_key(state, db, &id)?;
-        publish_state(state, db, &id)?;
+        remove_from_channel(state, db, &id, gone)?;
         tracing::info!(channel = %id, "removed a device the remover could not reach, keys rotated");
         rotated.push(id);
     }

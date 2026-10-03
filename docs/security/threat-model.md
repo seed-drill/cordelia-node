@@ -109,6 +109,8 @@ belongs to something that is not built or designed in public yet.
 
 ### T16
 - `crates/cordelia-api/tests/membership.rs`: `remove_device_rotates_the_key_and_informs_only_remaining_members`
+- `crates/cordelia-api/tests/membership.rs`: `t16_a_removal_that_failed_is_finished_when_it_is_run_again`
+- `crates/cordelia-api/tests/membership.rs`: `t16_a_removal_cut_short_is_finished_when_it_is_run_again`
 - `crates/cordelia-api/tests/entries.rs`: `a_removed_device_can_no_longer_write`
 - `crates/cordelia-node/tests/threat_model.rs`: `t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not`
 - `crates/cordelia-api/tests/entries.rs`: `t16_what_a_removed_device_last_wrote_is_kept`

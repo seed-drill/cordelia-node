@@ -1088,6 +1088,122 @@ fn a_change_waits_until_each_member_confirms_it() {
     assert_eq!(unconfirmed(&a), vec![c.pk()]);
 }
 
+/// Three devices in one personal channel, and what the third holds.
+fn with_a_third() -> (Node, Node, Node, String) {
+    let (a, b, personal) = paired();
+    let c = node();
+    membership::add_device(&a.state, &c.pk(), None).unwrap();
+    relay(&a, &b);
+    relay(&a, &c);
+    membership::process_inbox(&b.state).unwrap();
+    membership::accept(&c.state, &a.pk(), None).unwrap();
+    (a, b, c, personal)
+}
+
+/// After a removal is finished: the channel has a new key that the device
+/// that remains holds, and the removed device is out and was sent nothing.
+fn assert_removed(a: &Node, b: &Node, c: &Node, personal: &str, old_version: i64) {
+    let old_key = c.key(personal);
+    assert!(a.key_version(personal) > old_version);
+    assert_ne!(a.key(personal), old_key);
+    assert!(!a.members(personal).iter().any(|(k, _)| *k == c.pk()));
+
+    relay(a, b);
+    membership::process_inbox(&b.state).unwrap();
+    assert_eq!(b.key(personal), a.key(personal));
+    assert!(!b.members(personal).iter().any(|(k, _)| *k == c.pk()));
+
+    assert_eq!(relay(a, c), 0);
+    membership::process_inbox(&c.state).unwrap();
+    assert_eq!(c.key(personal), old_key);
+}
+
+/// T16. A removal that fails before the key is changed is finished when it
+/// is run again. Here the channel's key cannot be written, so the removal
+/// stops. The device being removed is still a member, and the second
+/// attempt does all of it.
+///
+/// As first built the member was removed before the key was changed. A
+/// removal that stopped between the two left a channel the device was no
+/// longer listed in and whose key had not changed, and a second attempt
+/// passed the channel by: the removed device went on reading.
+#[test]
+#[cfg(unix)]
+fn t16_a_removal_that_failed_is_finished_when_it_is_run_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let (a, b, c, personal) = with_a_third();
+    let version = a.key_version(&personal);
+
+    // Nothing under the key directory can be written.
+    let keys = a.state.home_dir.join("channel-keys");
+    let files: Vec<_> = std::fs::read_dir(&keys)
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .collect();
+    let shut = |mode_dir: u32, mode_file: u32| {
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode_file)).unwrap();
+        }
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(mode_dir)).unwrap();
+    };
+    shut(0o500, 0o400);
+    if std::fs::write(keys.join("probe"), b"x").is_ok() {
+        // Run as a user that file modes do not hold (root): nothing to test.
+        let _ = std::fs::remove_file(keys.join("probe"));
+        shut(0o700, 0o600);
+        return;
+    }
+    let failed = membership::remove_device(&a.state, &c.pk());
+    shut(0o700, 0o600);
+    assert!(failed.is_err(), "the removal went through: {failed:?}");
+    assert!(
+        a.members(&personal).iter().any(|(k, _)| *k == c.pk()),
+        "a removal that failed left the device out, with the key unchanged"
+    );
+    assert_eq!(a.key_version(&personal), version);
+
+    let outcome = membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_eq!(outcome.channels_rotated, vec![personal.clone()]);
+    assert_removed(&a, &b, &c, &personal, version);
+}
+
+/// T16. A removal that is cut short after the key is changed, before the
+/// devices that remain are told, is finished when it is run again. Here
+/// the new state cannot be stored for the other device, so the removal
+/// stops. The device being removed is still a member, as if nothing had
+/// been done, and the second attempt does all of it.
+#[test]
+fn t16_a_removal_cut_short_is_finished_when_it_is_run_again() {
+    let (a, b, c, personal) = with_a_third();
+    let version = a.key_version(&personal);
+
+    {
+        let db = a.state.db.lock().unwrap();
+        db.execute_batch(&format!(
+            "CREATE TRIGGER not_now BEFORE INSERT ON items WHEN NEW.channel_id = '{}'
+             BEGIN SELECT RAISE(ABORT, 'not now'); END;",
+            naming::inbox_channel_id(&b.pk())
+        ))
+        .unwrap();
+    }
+    let failed = membership::remove_device(&a.state, &c.pk());
+    a.state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER not_now")
+        .unwrap();
+    assert!(failed.is_err(), "the removal went through: {failed:?}");
+    assert!(
+        a.members(&personal).iter().any(|(k, _)| *k == c.pk()),
+        "a removal that was cut short left the device out, and the others untold"
+    );
+
+    let outcome = membership::remove_device(&a.state, &c.pk()).unwrap();
+    assert_eq!(outcome.channels_rotated, vec![personal.clone()]);
+    assert_removed(&a, &b, &c, &personal, version);
+}
+
 /// T16. A device is removed, and the relay loses the change before another
 /// device fetches it. The device that removed it offers the change again,
 /// at a slowing pace, until the other device answers that it holds it.
