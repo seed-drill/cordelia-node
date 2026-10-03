@@ -87,7 +87,12 @@ pub struct SyncControl {
 impl SyncControl {
     /// A setting changed: count it, and wake the adapter so that the change
     /// takes effect now rather than at its next cycle.
-    pub fn changed(&self) {
+    ///
+    /// It is called with the database lock held, which is what `_db` is
+    /// for: a cycle reads the count under that lock before each entry it
+    /// publishes, so no entry is published under settings that a handler
+    /// has already replaced and answered for.
+    pub fn changed(&self, _db: &rusqlite::Connection) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.wake.notify_one();
     }
@@ -97,6 +102,14 @@ impl SyncControl {
     /// can tell a report from before a change from one after it.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// [`Self::generation`], read with the database lock held, which is
+    /// what `_db` is for. Read this way, the count cannot move between the
+    /// read and whatever is done next under the same hold of the lock: a
+    /// handler counts only while it holds it (see [`Self::changed`]).
+    pub fn generation_under(&self, _db: &rusqlite::Connection) -> u64 {
+        self.generation()
     }
 
     /// Resolves when a setting has changed.

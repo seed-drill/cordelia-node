@@ -1058,8 +1058,12 @@ fn claude_memory_syncs_between_two_machines() {
     // What cannot be mapped by accident, or by a slip.
     let said = a.refused(&["sync", "map", &path(&a.home())]);
     assert!(said.contains("cordelia sync map ~ --home"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a.home()), "team"]);
+    assert!(said.contains("cordelia sync map ~ --home"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_repo), "--home"]);
     assert!(said.contains("--home maps the home directory"), "{said}");
+    let said = a.refused(&["sync", "map", &path(&a_notes), "~"]);
+    assert!(said.contains("the name of home memory"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_notes)]);
     assert!(said.contains("needs a name"), "{said}");
     let said = a.refused(&["sync", "map", &path(&a_notes), "Lab Notes"]);
@@ -1081,7 +1085,20 @@ fn claude_memory_syncs_between_two_machines() {
     );
     a.cli(&["sync", "map", &path(&a_notes), "lab-notes"]);
     let out = a.cli(&["sync", "map", &path(&a.home()), "--home"]);
-    assert!(out.contains("home memory"), "{out}");
+    assert!(out.contains("Mapped ~ to home memory."), "{out}");
+    // Mapping what is mapped, with no name, changes nothing and says the
+    // name it has: for home without the flag, and for a folder whose name
+    // is not the one it would get by default.
+    let out = a.cli(&["sync", "map", &path(&a.home())]);
+    assert!(
+        out.contains("~ is already mapped to home memory. Nothing changed."),
+        "{out}"
+    );
+    let out = a.cli(&["sync", "map", &path(&a_notes)]);
+    assert!(
+        out.contains("~/notes is already mapped to lab-notes. Nothing changed."),
+        "{out}"
+    );
     let said = a.refused(&["sync", "map", &path(&a_notes), "other"]);
     assert!(said.contains("already mapped"), "{said}");
     assert_eq!(mapped_names(&state(&a)), [PROJECT, "lab-notes", "~"]);
@@ -1286,4 +1303,224 @@ fn claude_memory_syncs_between_two_machines() {
     wait_for("a is synced again", &all, 60, || {
         (state(&a)["state"] == "synced").then_some(())
     });
+}
+
+/// The home directory maps under any name. So one machine's home memory and
+/// another machine's folder can be one agent's memory: the agent starts in
+/// `~` on one and in a project folder on the other. "Stop syncing home
+/// memory" stops it whatever it is called, and turning it on again puts it
+/// back under the name it had.
+#[test]
+fn home_memory_syncs_under_any_name() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    let all = [&relay, &a, &b];
+    for n in [&a, &b] {
+        wait_for("node healthy", &all, 30, || healthy(n));
+        wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
+    }
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let state = |n: &Node| -> serde_json::Value {
+        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+    };
+
+    // A's agent starts in its home directory, B's in a folder. Beside
+    // them, a second folder on each, which syncs throughout: without it,
+    // "nothing arrived" would also be true of a sync that had stopped.
+    // (Made before sync is on: a cycle that saw a folder before its
+    // transcript was written would not look at it again for minutes.)
+    let a_mem = claude_folder(&a.home(), &a.home());
+    let b_dir = b.home().join("seeddrill");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let b_mem = claude_folder(&b.home(), &b_dir);
+    let a_other = a.home().join("notes");
+    let b_other = b.home().join("notes");
+    std::fs::create_dir_all(&a_other).unwrap();
+    std::fs::create_dir_all(&b_other).unwrap();
+    let a_other_mem = claude_folder(&a.home(), &a_other);
+    let b_other_mem = claude_folder(&b.home(), &b_other);
+
+    pair(&a, &b, "b", &all);
+    for n in [&a, &b] {
+        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+    }
+    // The node says what version it is, beside the command's own.
+    let s = state(&a);
+    assert_eq!(s["node_version"], s["version"], "{s}");
+
+    let out = a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
+    assert!(out.contains("Mapped ~ to team."), "{out}");
+    b.cli(&["sync", "map", &path(&b_dir), "team"]);
+    a.cli(&["sync", "map", &path(&a_other), "lab"]);
+    b.cli(&["sync", "map", &path(&b_other), "lab"]);
+    let s = state(&a);
+    assert_eq!(mapped_names(&s), ["lab", "team"], "{s}");
+    assert_eq!(s["sync"]["home"], true, "{s}");
+    assert_eq!(s["sync"]["home_name"], "team", "{s}");
+
+    // Memory written on each arrives on the other.
+    std::fs::write(a_mem.join("from_a.md"), "Written in A's home.\n").unwrap();
+    wait_for("b's folder gets a's home memory", &all, 120, || {
+        (read(&b_mem.join("from_a.md"))?.as_str() == "Written in A's home.\n").then_some(())
+    });
+    std::fs::write(b_mem.join("from_b.md"), "Written in B's folder.\n").unwrap();
+    wait_for("a's home gets b's folder's memory", &all, 120, || {
+        (read(&a_mem.join("from_b.md"))?.as_str() == "Written in B's folder.\n").then_some(())
+    });
+
+    // Home has one name on a device. Mapping it again with no name changes
+    // nothing; another name is refused.
+    let out = a.cli(&["sync", "map", &path(&a.home())]);
+    assert!(
+        out.contains("~ is already mapped to team. Nothing changed."),
+        "{out}"
+    );
+    let said = a.refused(&["sync", "map", &path(&a.home()), "other", "--home"]);
+    assert!(said.contains("already mapped to \"team\""), "{said}");
+    assert_eq!(mapped_names(&state(&a)), ["lab", "team"]);
+
+    // One word that is a name and also a folder is not unmapped: `lab` is
+    // what `~/notes` syncs under, and in the home directory it is also a
+    // folder, mapped as something else.
+    let a_lab = a.home().join("lab");
+    std::fs::create_dir_all(&a_lab).unwrap();
+    a.cli(&["sync", "map", &path(&a_lab), "elsewhere"]);
+    let out = a.command_in(&a.home(), &["sync", "unmap", "lab"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("cordelia sync unmap ~/lab") && said.contains("cordelia sync unmap ~/notes"),
+        "{said}"
+    );
+    assert_eq!(mapped_names(&state(&a)), ["elsewhere", "lab", "team"]);
+    a.cli(&["sync", "unmap", &path(&a_lab)]);
+
+    // B syncs its own home as `~`. A is not offered it: its home has a
+    // name already, and mapping it as `~` would take it out of `team`.
+    b.cli(&["sync", "map", &path(&b.home()), "--home"]);
+    let offered = wait_for("a sees that b syncs home memory", &all, 120, || {
+        let out = a.cli(&["sync", "status"]);
+        out.contains("home memory on this device syncs as team")
+            .then_some(out)
+    });
+    assert!(!offered.contains("cordelia sync map ~ --home"), "{offered}");
+
+    // Turning home memory off stops it, under whatever name it synced, and
+    // leaves the other folder syncing.
+    let out = a.cli(&["sync", "home", "off"]);
+    assert!(out.contains("is not synced on this device"), "{out}");
+    let s = state(&a);
+    assert_eq!(mapped_names(&s), ["lab"], "{s}");
+    assert_eq!(s["sync"]["home"], false, "{s}");
+    assert_eq!(s["sync"]["home_name"], "team", "{s}");
+    std::fs::write(
+        a_mem.join("later.md"),
+        "Written after home was turned off.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        a_other_mem.join("control.md"),
+        "Written at the same time.\n",
+    )
+    .unwrap();
+    wait_for("the other folder still syncs", &all, 120, || {
+        read(&b_other_mem.join("control.md")).map(|_| ())
+    });
+    std::thread::sleep(Duration::from_secs(2 * cordelia_sync::claude::CYCLE_SECS));
+    assert_eq!(read(&b_mem.join("later.md")), None);
+    // What was found is offered under the name it had, not as `~`, and
+    // B's `~` is still not offered.
+    let status = a.cli(&["sync", "status"]);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.contains("last synced as team") && l.contains("cordelia sync home on")),
+        "{status}"
+    );
+    assert!(!status.contains("cordelia sync map ~ --home"), "{status}");
+    assert!(!status.contains("(your other devices sync it)"), "{status}");
+
+    // On again: under the name it had, so into the channel it was in.
+    let out = a.cli(&["sync", "home", "on"]);
+    assert!(
+        out.contains("Home-folder memory syncs on this device, as team."),
+        "{out}"
+    );
+    let s = state(&a);
+    assert_eq!(mapped_names(&s), ["lab", "team"], "{s}");
+    assert_eq!(s["sync"]["home"], true, "{s}");
+    wait_for("b gets what a wrote while home was off", &all, 120, || {
+        read(&b_mem.join("later.md")).map(|_| ())
+    });
+
+    // `unmap` remembers the name as `home off` does: mapped under another
+    // name and unmapped, home comes back under that one. Turning on what
+    // is on changes nothing.
+    a.cli(&["sync", "unmap", "team"]);
+    a.cli(&["sync", "map", &path(&a.home()), "crew", "--home"]);
+    a.cli(&["sync", "unmap", "crew"]);
+    assert_eq!(state(&a)["sync"]["home_name"], "crew");
+    a.cli(&["sync", "home", "on"]);
+    let out = a.cli(&["sync", "home", "on"]);
+    assert!(out.contains("as crew."), "{out}");
+    assert_eq!(mapped_names(&state(&a)), ["crew", "lab"]);
+
+    // Found, and not mapped: where everything found syncs, home syncs as
+    // `~`. Turned off and on again it is `~`, not a name it once had.
+    a.cli(&["sync", "unmap", "crew"]);
+    a.cli(&["sync", "claude", "--all"]);
+    a.cli(&["sync", "include", &path(&a.home())]);
+    wait_for("a's home is found, and syncs as ~", &all, 120, || {
+        state(&a)["sync"]["projects"]
+            .as_array()?
+            .iter()
+            .any(|p| p["project"] == "~" && p["mapped"] == false && p["channel"].is_string())
+            .then_some(())
+    });
+    a.cli(&["sync", "home", "off"]);
+    assert_eq!(state(&a)["sync"]["home_name"], "~");
+    let out = a.cli(&["sync", "home", "on"]);
+    assert!(
+        out.contains("Home-folder memory syncs on this device."),
+        "{out}"
+    );
+    assert_eq!(mapped_names(&state(&a)), ["lab", "~"]);
+    a.cli(&["sync", "claude", "--mapped-only"]);
+    a.cli(&["sync", "unmap", "~"]);
+    a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
+
+    // A home directory that is itself a git repository: Claude Code keeps
+    // the memory of every folder in it with home's. Naming one of those
+    // folders must not sync home memory; naming home does.
+    a.cli(&["sync", "unmap", "team"]);
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(a.home())
+            .args(["init", "-q"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let inside = a.home().join("scratch");
+    std::fs::create_dir_all(&inside).unwrap();
+    let inside = path(&inside);
+    let said = a.refused(&["sync", "map", &inside, "scratch"]);
+    assert!(
+        said.contains("your home directory is a git repository")
+            && said.contains("cordelia sync map ~ --home"),
+        "{said}"
+    );
+    let said = a.refused(&["sync", "map", &inside, "scratch", "--home"]);
+    assert!(said.contains("--home maps the home directory"), "{said}");
+    assert_eq!(mapped_names(&state(&a)), ["lab"]);
+    let out = a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
+    assert!(out.contains("Mapped ~ to team."), "{out}");
 }
