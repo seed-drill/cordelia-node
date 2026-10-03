@@ -49,8 +49,8 @@ the test of that claim.
 
 Relays are simple on purpose: they store and forward ciphertext, verify
 signatures, and hold no keys. Anyone can run one, and a node's configuration
-lists the relays it uses. We run the first two; the aim is for others to run
-most of them, so no single operator, including us, is necessary.
+lists the relays it uses. The aim is for others to run most of them, so that no
+single operator, including us, is necessary.
 
 A relay promises best effort and nothing more. It is a cache: each device holds
 its channels whole, and a relay fetches again from a device whatever it no
