@@ -25,7 +25,7 @@
 //!   "sender":   h'<32>',                   -- must equal the item author
 //!   "epoch":    <uint>,
 //!   "kv":       <uint>,                    -- current key version
-//!   "keys":     [[<uint>, h'<32>'], ...],  -- full key ring, including kv
+//!   "keys":     [[<uint>, h'<32>'], ...],  -- key ring: kv, and versions below it
 //!   "slot_key": h'<32>',                   -- never rotated (§4.3)
 //!   "members":  [[h'<32>', "owner" / "member"], ...],
 //!   "personal": <bool>                     -- sender's personal channel
@@ -146,6 +146,13 @@ impl ChannelState {
         versions.dedup();
         if versions.len() != self.keys.len() {
             return invalid("key ring has duplicate versions");
+        }
+        // A key for a version the channel has not reached would wait in the
+        // receiver's ring for the removal that makes that version, and be
+        // put in place then: the key after a removal would be one the
+        // sender chose.
+        if versions.last().is_some_and(|v| *v > self.key_version) {
+            return invalid("key ring holds a version above the current one");
         }
         let mut members: Vec<[u8; 32]> = self.members.iter().map(|m| m.key).collect();
         members.sort_unstable();
@@ -517,6 +524,28 @@ mod tests {
                 .to_bytes();
             assert!(ChannelState::open(&recipient, &sealed).is_err(), "{epoch}");
         }
+    }
+
+    /// T16. A state that carries a key for a version above its own is not
+    /// valid: it can be neither sealed nor, sealed some other way, opened.
+    /// Kept by the receiver, that key would become the channel's key at the
+    /// removal that makes the version.
+    #[test]
+    fn a_key_above_the_current_version_is_not_a_valid_state() {
+        let sender = NodeIdentity::generate().unwrap();
+        let recipient = NodeIdentity::generate().unwrap();
+
+        let mut state = sample(&sender, &recipient);
+        assert!(state.validate().is_ok());
+        state.keys.push((state.key_version + 1, [0x4a; 32]));
+        assert!(state.validate().is_err());
+        assert!(state.seal(&recipient.public_key()).is_err());
+
+        let to = x25519_pub_from_ed25519_pub(&recipient.public_key());
+        let sealed = ecies_encrypt(&to, &state.to_cbor().unwrap())
+            .unwrap()
+            .to_bytes();
+        assert!(ChannelState::open(&recipient, &sealed).is_err());
     }
 
     #[test]
