@@ -16,8 +16,10 @@
 //! removed before it. A reader counts at most 64 devices in all: those of
 //! the statement, and then those added since, in the order it saw their
 //! records. A key that has been counted goes on counting until a statement
-//! is applied that does not list it. [`see_addition`] takes a record, and
-//! [`who_counts`] says who counts.
+//! is applied that does not list it. Inside that bound, who counts does not
+//! turn on the order in which the records were seen: a record that was kept
+//! as not counted is judged again whenever another is kept. [`see_addition`]
+//! takes a record, and [`who_counts`] says who counts.
 //!
 //! ## A change entry that a device is shown (§4.2 to §4.6)
 //!
@@ -219,6 +221,24 @@ impl Counting {
         self.listed.len() + self.added.len()
     }
 
+    /// What a record that adds `key`, signed by `adder`, is to this
+    /// reader: whether the key counts by it, and where it does not, why.
+    /// It is one rule, asked when a record is seen and asked again of a
+    /// record that was kept as not counted.
+    fn judge(&self, key: &[u8; 32], adder: &[u8; 32]) -> AdditionSeen {
+        if self.removed.contains(key) {
+            AdditionSeen::NotCounted(NotCounted::Removed)
+        } else if self.counts(key) {
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        } else if !self.may_add(adder) {
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        } else if self.devices() >= MAX_COUNTED_DEVICES {
+            AdditionSeen::NotCounted(NotCounted::NoRoom)
+        } else {
+            AdditionSeen::Counted
+        }
+    }
+
     /// Whether the key that a link names counts: a key that counts has
     /// those first 16 bytes ([`Link::signer_of`]). It is what a chain is
     /// read with ([`cordelia_crypto::entry::known_to_follow`]).
@@ -254,7 +274,9 @@ pub fn who_counts(conn: &Connection) -> Result<Counting, PersonError> {
 pub enum AdditionSeen {
     /// It is kept, and the key it adds counts from now on.
     Counted,
-    /// It is kept as not counted, and says why.
+    /// It is kept as not counted, and says why. It is judged again each
+    /// time another record is kept, and comes to count where it then
+    /// would.
     NotCounted(NotCounted),
     /// The device keeps this record already. Nothing changes.
     SeenBefore,
@@ -271,7 +293,9 @@ pub enum NotCounted {
     /// statement signed it, the key may add.
     CountsAlready,
     /// The device that signed it was itself added by a device added since
-    /// the statement: a chain is two long at most.
+    /// the statement: a chain is two long at most. Where a record by a
+    /// device of the statement is seen later for that signer, this one
+    /// comes to count.
     MayNotAdd,
     /// The device counts 64 devices already. A statement makes room.
     NoRoom,
@@ -287,11 +311,22 @@ pub enum NotCounted {
 /// is not read (§4.4). A device that follows no phrase, or has stopped,
 /// takes none.
 ///
-/// A record is judged once, when it is seen, and is kept as it was
-/// judged: one that did not count is not made to count by what is seen
-/// later, and a key that counts is not displaced by a later record.
-/// Whether a key that counts may add is read from every record kept for
-/// it ([`Counting::may_add`]), in whatever order they were seen.
+/// Inside the bound of 64, who counts does not turn on the order in which
+/// the records were seen. A record that is kept as not counted because its
+/// signer may not add yet is judged again each time another record is
+/// kept, and comes to count once a record by a device of the statement is
+/// kept for its signer: "8 adds 9" counts whether it was seen before "0
+/// adds 8" or after it. So does whatever that lets count in its turn,
+/// while a chain of two allows.
+///
+/// What stands: a key that counts is not displaced by a later record, and
+/// goes on counting; and a record that found no room is not counted until
+/// a statement makes room. Whether a key that counts may add is read from
+/// every record kept for it ([`Counting::may_add`]).
+///
+/// What is returned is what the record was when it was seen. A caller that
+/// asks how many keys came to count with it reads [`who_counts`] before
+/// and after.
 pub fn see_addition(
     conn: &Connection,
     record: &SignedAddition,
@@ -319,17 +354,7 @@ pub fn see_addition(
             return Err(PersonError::RecordByAKeyThatDoesNotCount);
         }
 
-        let seen = if statement.removes(&added.device.key) {
-            AdditionSeen::NotCounted(NotCounted::Removed)
-        } else if counting.counts(&added.device.key) {
-            AdditionSeen::NotCounted(NotCounted::CountsAlready)
-        } else if !counting.may_add(&added.adder) {
-            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
-        } else if counting.devices() >= MAX_COUNTED_DEVICES {
-            AdditionSeen::NotCounted(NotCounted::NoRoom)
-        } else {
-            AdditionSeen::Counted
-        };
+        let seen = counting.judge(&added.device.key, &added.adder);
         held_rows::keep_addition(
             conn,
             &bytes,
@@ -338,8 +363,31 @@ pub fn see_addition(
             seen == AdditionSeen::Counted,
             now,
         )?;
+        judge_again(conn, statement)?;
         Ok(seen)
     })
+}
+
+/// Judge again the records that are kept as not counted, under
+/// `statement`, until none of them would count (decision 2026-10-04 §6).
+///
+/// One comes to count where, as things now stand, it would count if it
+/// were seen: its key is not removed and does not count yet, its signer
+/// may add, and there is room. Each that comes to count may let another:
+/// the records are asked again from the first, in the order they were
+/// seen. A record keeps its place in that order.
+fn judge_again(conn: &Connection, statement: &Statement) -> Result<(), PersonError> {
+    loop {
+        let kept = held_rows::additions(conn)?;
+        let counting = Counting::of(statement, &kept);
+        let comes_to_count = kept.iter().find(|record| {
+            !record.counted && counting.judge(&record.key, &record.adder) == AdditionSeen::Counted
+        });
+        let Some(record) = comes_to_count else {
+            return Ok(());
+        };
+        held_rows::count_addition(conn, record.seen)?;
+    }
 }
 
 // ── The names a device holds ─────────────────────────────────────────
@@ -1941,6 +1989,267 @@ mod tests {
         see_addition(&conn, &added(&three, 0, 2), NOW).unwrap();
         let counting = who_counts(&conn).unwrap();
         assert!(!counting.counts(&key(2)) && !counting.may_add(&key(2)));
+    }
+
+    /// The keys that count and the keys that may add, among devices 0 to
+    /// 12, in order of their numbers.
+    fn counting_of(conn: &Connection) -> (Vec<u16>, Vec<u16>) {
+        let counting = who_counts(conn).unwrap();
+        let of = |says: &dyn Fn(&[u8; 32]) -> bool| -> Vec<u16> {
+            (0..=12).filter(|n| says(&key(*n))).collect()
+        };
+        (
+            of(&|key| counting.counts(key)),
+            of(&|key| counting.may_add(key)),
+        )
+    }
+
+    /// The records in each order they can be seen in.
+    fn in_every_order(records: &[SignedAddition]) -> Vec<Vec<SignedAddition>> {
+        if records.len() <= 1 {
+            return vec![records.to_vec()];
+        }
+        let mut orders = Vec::new();
+        for first in 0..records.len() {
+            let mut rest = records.to_vec();
+            let one = rest.remove(first);
+            for mut order in in_every_order(&rest) {
+                order.insert(0, one.clone());
+                orders.push(order);
+            }
+        }
+        orders
+    }
+
+    /// The device sees `records` in that order. One whose signer does not
+    /// count is not kept, and is seen again once every other has been:
+    /// until a pass in which none of those is kept.
+    fn see_until_none_is_kept(conn: &Connection, records: &[SignedAddition]) {
+        let mut waiting = records.to_vec();
+        loop {
+            let before = waiting.len();
+            waiting.retain(|record| match see_addition(conn, record, NOW) {
+                Ok(_) => false,
+                Err(PersonError::RecordByAKeyThatDoesNotCount) => true,
+                Err(e) => panic!("{e}"),
+            });
+            if waiting.len() == before {
+                return;
+            }
+        }
+    }
+
+    /// "8 adds 9" is seen while device 8 may not add yet: device 7, which
+    /// was itself added, had added it. The record is kept as not counted.
+    /// Once "0 adds 8" is seen, device 8 may add, and the record counts:
+    /// as it does where "0 adds 8" was seen first.
+    #[test]
+    fn test_a_record_kept_as_not_counted_counts_once_its_signer_may_add() {
+        let [_, two, ..] = statements(&phrase());
+
+        // "8 adds 9" first.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+        assert_eq!(
+            see_addition(&conn, &added(&two, 8, 9), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        );
+        // And a second record that device 8 signed.
+        assert_eq!(
+            see_addition(&conn, &added(&two, 8, 11), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        );
+        assert_eq!(counting_of(&conn), (vec![0, 1, 2, 7, 8], vec![0, 1, 2, 7]));
+        let before = held_rows::additions(&conn).unwrap();
+
+        // "0 adds 8" adds a key that counts already. It is what lets
+        // device 8 add, and both records that device 8 signed count.
+        assert_eq!(
+            see_addition(&conn, &added(&two, 0, 8), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        let late = counting_of(&conn);
+        assert_eq!(late, (vec![0, 1, 2, 7, 8, 9, 11], vec![0, 1, 2, 7, 8]));
+        // Each record is where it was in the order it was seen, and the
+        // two are kept as counted now.
+        let after = held_rows::additions(&conn).unwrap();
+        let said: Vec<([u8; 32], bool)> = after.iter().map(|one| (one.key, one.counted)).collect();
+        assert_eq!(
+            said,
+            [
+                (key(7), true),
+                (key(8), true),
+                (key(9), true),
+                (key(11), true),
+                (key(8), false)
+            ]
+        );
+        assert_eq!(after[..4].len(), before.len());
+        for (was, is) in before.iter().zip(&after) {
+            assert_eq!((was.seen, &was.record), (is.seen, &is.record));
+        }
+        // A link that device 9 signed is read as one of a key that counts.
+        assert!(
+            who_counts(&conn)
+                .unwrap()
+                .signer_counts(&Link::signer_of(&key(9)))
+        );
+
+        // "0 adds 8" first: the same keys count, and the same may add.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &added(&two, 0, 8), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+        for new in [9, 11] {
+            assert_eq!(
+                see_addition(&conn, &added(&two, 8, new), NOW).unwrap(),
+                AdditionSeen::Counted
+            );
+        }
+        assert_eq!(counting_of(&conn), late);
+
+        // The control: without "0 adds 8", device 9 does not count, however
+        // many other records are seen.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+        see_addition(&conn, &added(&two, 8, 9), NOW).unwrap();
+        see_addition(&conn, &added(&two, 1, 10), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 12), NOW).unwrap();
+        assert_eq!(
+            counting_of(&conn),
+            (vec![0, 1, 2, 7, 8, 10, 12], vec![0, 1, 2, 7, 10])
+        );
+    }
+
+    /// Who counts, and who may add, is the same in whatever order a device
+    /// sees the records, inside the bound of 64. A record whose signer
+    /// does not count yet is not kept, and is seen again.
+    #[test]
+    fn test_who_counts_does_not_turn_on_the_order_records_were_seen() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        // What the device counts once it has seen the records in that
+        // order, from having seen none.
+        let seen_in = |order: &[SignedAddition]| {
+            held_rows::clear_additions(&conn).unwrap();
+            see_until_none_is_kept(&conn, order);
+            (
+                counting_of(&conn),
+                held_rows::additions(&conn).unwrap().len(),
+            )
+        };
+
+        // Device 8 is added by a device that was added, and by a device of
+        // the statement: it may add, and device 9 counts. In each of the
+        // 24 orders.
+        let four = [
+            added(&two, 0, 7),
+            added(&two, 7, 8),
+            added(&two, 8, 9),
+            added(&two, 0, 8),
+        ];
+        let orders = in_every_order(&four);
+        assert_eq!(orders.len(), 24);
+        for order in &orders {
+            assert_eq!(
+                seen_in(order),
+                ((vec![0, 1, 2, 7, 8, 9], vec![0, 1, 2, 7, 8]), 4)
+            );
+        }
+
+        // Device 9 is the third of a chain, whichever record is seen
+        // first: it counts, and may not add, so device 10 does not count.
+        let mut five = four.to_vec();
+        five.push(added(&two, 9, 10));
+        for first in 0..five.len() {
+            let mut order = five.clone();
+            order.rotate_left(first);
+            assert_eq!(
+                seen_in(&order),
+                ((vec![0, 1, 2, 7, 8, 9], vec![0, 1, 2, 7, 8]), 5),
+                "{first}"
+            );
+            order.reverse();
+            assert_eq!(
+                seen_in(&order),
+                ((vec![0, 1, 2, 7, 8, 9], vec![0, 1, 2, 7, 8]), 5),
+                "{first}"
+            );
+        }
+
+        // With a record by a device of the statement for device 9, it may
+        // add, and device 10 counts.
+        let mut six = five.clone();
+        six.push(added(&two, 1, 9));
+        for first in 0..six.len() {
+            let mut order = six.clone();
+            order.rotate_left(first);
+            assert_eq!(
+                seen_in(&order),
+                ((vec![0, 1, 2, 7, 8, 9, 10], vec![0, 1, 2, 7, 8, 9]), 6),
+                "{first}"
+            );
+        }
+    }
+
+    /// The bound of 64 stands where a record is judged again: one that
+    /// would count, and finds the device counting 64 already, stays not
+    /// counted. And no key that counted is displaced by it.
+    #[test]
+    fn test_a_record_judged_again_finds_no_room_beyond_the_bound() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+        assert_eq!(
+            see_addition(&conn, &added(&two, 8, 9), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        );
+        // Three of the statement and two added: 58 more make 63, and the
+        // record that is judged again takes the last place.
+        for n in 100..158 {
+            assert_eq!(
+                see_addition(&conn, &added(&two, 1, n), NOW).unwrap(),
+                AdditionSeen::Counted,
+                "{n}"
+            );
+        }
+        assert_eq!(who_counts(&conn).unwrap().devices(), 63);
+
+        // Device 2 fills the bound first, on another device of the person.
+        let full = device_at(0, 2);
+        for record in held_rows::additions(&conn).unwrap() {
+            let record = SignedAddition::from_bytes(&record.record).unwrap();
+            see_addition(&full, &record, NOW).unwrap();
+        }
+        see_addition(&full, &added(&two, 2, 200), NOW).unwrap();
+        assert_eq!(who_counts(&full).unwrap().devices(), 64);
+        let before = who_counts(&full).unwrap().keys();
+        assert_eq!(
+            see_addition(&full, &added(&two, 0, 8), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        // Device 8 may add now, and its record finds no room.
+        let counting = who_counts(&full).unwrap();
+        assert!(counting.may_add(&key(8)) && !counting.counts(&key(9)));
+        assert_eq!(counting.keys(), before);
+        assert_eq!(counting.devices(), 64);
+
+        // Where there is room for one, it is counted, and the bound is
+        // reached by it.
+        assert_eq!(
+            see_addition(&conn, &added(&two, 0, 8), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        let counting = who_counts(&conn).unwrap();
+        assert!(counting.counts(&key(9)));
+        assert_eq!(counting.devices(), 64);
+        assert_eq!(
+            see_addition(&conn, &added(&two, 2, 200), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::NoRoom)
+        );
     }
 
     #[test]
