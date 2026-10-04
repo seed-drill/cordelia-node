@@ -66,14 +66,14 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and without three things of whoever runs the tests: any
+    /// and home, and without four things of whoever runs the tests: any
     /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
-    /// the node's configuration), and any proxy (the tests of what a
-    /// command does with one set their own). The rest of the environment
-    /// is left. Of it the binary reads `NO_COLOR` and the user's name, and
-    /// hands all of it to `git` where it asks which repository a folder is
-    /// in. A test that rests on git's answer rests on the caller having
-    /// set none of git's own variables (`GIT_DIR` and the like).
+    /// the node's configuration), any proxy (the tests of what a command
+    /// does with one set their own), and git's own variables (the binary
+    /// hands its environment to `git` where it asks which repository a
+    /// folder is in, and `GIT_DIR` would answer for the caller's). The
+    /// rest of the environment is left. Of it the binary reads `NO_COLOR`
+    /// and the user's name.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -85,6 +85,7 @@ impl Node {
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
                 name.starts_with("CORDELIA_")
+                    || name.starts_with("GIT_")
                     || name == "RUST_LOG"
                     || name.to_lowercase().ends_with("_proxy")
             });

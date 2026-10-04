@@ -421,7 +421,7 @@ file_max_bytes = 10485760              # 10 MB per log file (if output is file p
 file_max_count = 5                     # Keep 5 rotated log files
 
 [api]
-bind_address = "127.0.0.1"            # MUST be loopback (non-loopback = refuse to start)
+bind_address = "127.0.0.1"            # MUST be 127.0.0.1 or ::1 (any other = refuse to start)
 token_path = "~/.cordelia/node-token"  # Bearer token file
 ```
 
@@ -439,7 +439,7 @@ Environment variables override config.toml values. Prefix: `CORDELIA_`, but for 
 | `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` |
 
-No variable sets the relays or the role (configuration.md SS4.1).
+No variable sets the relays or the role; `CORDELIA_CONFIG` sets which file is read (configuration.md SS4.1).
 
 ### 5.3 Precedence Order
 

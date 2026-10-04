@@ -1831,7 +1831,7 @@ public_key = "cordelia_pk1..."             # Ed25519 public key (Bech32, read-on
 ```toml
 [network]
 listen_addr = "0.0.0.0:9474"              # P2P listen address
-api_addr = "127.0.0.1:9473"               # REST API listen address (loopback only, see below)
+api_addr = "127.0.0.1:9473"               # REST API listen address (127.0.0.1 or ::1 only, see below)
 role = "personal"                           # "personal" | "bootnode" | "relay" | "keeper"
 push_policy = "subscribers_only"           # "subscribers_only" | "pull_only" (personal nodes only, §8.1.1)
 bootstrap_timeout_secs = 10              # Per-bootnode connection timeout during bootstrap
