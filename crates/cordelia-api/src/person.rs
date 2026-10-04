@@ -164,22 +164,27 @@ pub struct Counting {
     /// The keys that statement lists as removed: every key removed so far.
     removed: Vec<[u8; 32]>,
     /// The keys added since by a record that counts, in the order the
-    /// device saw their records, each with the key that added it.
-    added: Vec<([u8; 32], [u8; 32])>,
+    /// device saw their records.
+    added: Vec<[u8; 32]>,
+    /// The keys that a device of the statement has added, by any record
+    /// the device keeps, counted or not.
+    added_by_a_listed: Vec<[u8; 32]>,
 }
 
 impl Counting {
     /// Who counts under `statement`, with the records the device keeps
     /// under it.
     fn of(statement: &Statement, kept: &[KeptAddition]) -> Self {
+        let keys = |records: &mut dyn Iterator<Item = &KeptAddition>| {
+            records.map(|record| record.key).collect::<Vec<_>>()
+        };
         Self {
             listed: statement.devices.iter().map(|device| device.key).collect(),
             removed: statement.removed.clone(),
-            added: kept
-                .iter()
-                .filter(|record| record.counted)
-                .map(|record| (record.key, record.adder))
-                .collect(),
+            added: keys(&mut kept.iter().filter(|record| record.counted)),
+            added_by_a_listed: keys(
+                &mut kept.iter().filter(|record| statement.lists(&record.adder)),
+            ),
         }
     }
 
@@ -190,22 +195,22 @@ impl Counting {
         if self.removed.contains(key) {
             return false;
         }
-        self.listed.contains(key) || self.added.iter().any(|(added, _)| added == key)
+        self.listed.contains(key) || self.added.contains(key)
     }
 
     /// Whether `key` may add a device: it is a device of the statement, or
-    /// a device that such a device added. One that was added by a device
-    /// added since may not, until a statement lists it: a chain is two
-    /// long at most.
+    /// a key that counts and that such a device added. One that only
+    /// devices added since have added may not, until a statement lists it:
+    /// a chain is two long at most.
+    ///
+    /// Any record that the device keeps for the key says so, whether it
+    /// was the one that made the key count or came after it: the answer
+    /// does not turn on the order in which the device saw the records.
     pub fn may_add(&self, key: &[u8; 32]) -> bool {
-        if self.removed.contains(key) {
+        if !self.counts(key) {
             return false;
         }
-        self.listed.contains(key)
-            || self
-                .added
-                .iter()
-                .any(|(added, adder)| added == key && self.listed.contains(adder))
+        self.listed.contains(key) || self.added_by_a_listed.contains(key)
     }
 
     /// How many devices count: those of the statement, and those added
@@ -228,7 +233,7 @@ impl Counting {
     pub fn keys(&self) -> Vec<[u8; 32]> {
         self.listed
             .iter()
-            .chain(self.added.iter().map(|(added, _)| added))
+            .chain(self.added.iter())
             .filter(|key| self.counts(key))
             .copied()
             .collect()
@@ -261,7 +266,9 @@ pub enum NotCounted {
     /// The statement lists the key as removed: a removed key never counts.
     Removed,
     /// The key counts already: the statement lists it, or an earlier
-    /// record added it. No later record displaces that one.
+    /// record added it. No later record displaces that one. The record is
+    /// kept, and says who else added the key: where a device of the
+    /// statement signed it, the key may add.
     CountsAlready,
     /// The device that signed it was itself added by a device added since
     /// the statement: a chain is two long at most.
@@ -283,6 +290,8 @@ pub enum NotCounted {
 /// A record is judged once, when it is seen, and is kept as it was
 /// judged: one that did not count is not made to count by what is seen
 /// later, and a key that counts is not displaced by a later record.
+/// Whether a key that counts may add is read from every record kept for
+/// it ([`Counting::may_add`]), in whatever order they were seen.
 pub fn see_addition(
     conn: &Connection,
     record: &SignedAddition,
@@ -1673,6 +1682,8 @@ mod tests {
         let counting = who_counts(&conn).unwrap();
         assert_eq!(counting.devices(), 64);
         assert!(!counting.counts(&key(163)) && !counting.counts(&key(164)));
+        // Nor may it add, though a device of the statement signed for it.
+        assert!(!counting.may_add(&key(163)));
         let kept = held_rows::additions(&conn).unwrap();
         assert_eq!(kept.len(), 65);
         assert_eq!(kept.iter().filter(|one| one.counted).count(), 63);
@@ -1759,8 +1770,8 @@ mod tests {
         assert_eq!(held_rows::additions(&conn).unwrap(), kept);
     }
 
-    /// A key that has been counted goes on counting as it was counted: no
-    /// later record displaces the one that added it.
+    /// A key that has been counted goes on counting: no later record
+    /// displaces the one that added it, or counts it again.
     #[test]
     fn test_no_later_record_displaces_a_key_that_counts() {
         let conn = device_at(0, 2);
@@ -1770,28 +1781,85 @@ mod tests {
         let before = who_counts(&conn).unwrap();
         assert!(before.counts(&key(8)) && !before.may_add(&key(8)));
 
-        // A device of the statement adds key 8 too. It was counted as one
-        // that a device added since had added, and stays so.
+        // A device that was added adds key 8 too, and a record for a key
+        // that the statement lists adds nothing.
+        see_addition(&conn, &added(&two, 1, 9), NOW).unwrap();
+        let before = who_counts(&conn).unwrap();
         assert_eq!(
-            see_addition(&conn, &added(&two, 0, 8), NOW).unwrap(),
+            see_addition(&conn, &added(&two, 9, 8), NOW).unwrap(),
             AdditionSeen::NotCounted(NotCounted::CountsAlready)
         );
-        // A record for a key that the statement lists adds nothing.
         assert_eq!(
             see_addition(&conn, &added(&two, 0, 1), NOW).unwrap(),
             AdditionSeen::NotCounted(NotCounted::CountsAlready)
         );
-        assert_eq!(who_counts(&conn).unwrap(), before);
-        assert_eq!(before.devices(), 5);
+        let after = who_counts(&conn).unwrap();
+        assert_eq!(after.keys(), before.keys());
+        assert_eq!(after.devices(), 6);
+        assert!(!after.may_add(&key(8)));
+        assert!(after.may_add(&key(1)));
 
         // A record that was seen is one record, however often it is seen.
         let rows = held_rows::additions(&conn).unwrap();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert_eq!(
             see_addition(&conn, &added(&two, 0, 7), NOW + 9).unwrap(),
             AdditionSeen::SeenBefore
         );
         assert_eq!(held_rows::additions(&conn).unwrap(), rows);
+    }
+
+    /// Who may add does not turn on the order in which a device saw the
+    /// records. Key 8 is added by device 7, which was added since, and by
+    /// device 0, which the statement lists: it may add, whichever of the
+    /// two records the device saw first.
+    #[test]
+    fn test_who_may_add_does_not_depend_on_the_order_records_were_seen() {
+        let [_, two, ..] = statements(&phrase());
+        let by_an_added = added(&two, 7, 8);
+        let by_a_listed = added(&two, 0, 8);
+
+        let mut answers = Vec::new();
+        for order in [[&by_an_added, &by_a_listed], [&by_a_listed, &by_an_added]] {
+            let conn = device_at(0, 2);
+            see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+            assert_eq!(
+                see_addition(&conn, order[0], NOW).unwrap(),
+                AdditionSeen::Counted
+            );
+            assert_eq!(
+                see_addition(&conn, order[1], NOW).unwrap(),
+                AdditionSeen::NotCounted(NotCounted::CountsAlready)
+            );
+            let counting = who_counts(&conn).unwrap();
+            assert!(counting.counts(&key(8)));
+            assert!(counting.may_add(&key(8)));
+            assert_eq!(counting.devices(), 5);
+            assert_eq!(counting.keys(), [key(0), key(1), key(2), key(7), key(8)]);
+            // What key 8 adds counts.
+            assert_eq!(
+                see_addition(&conn, &added(&two, 8, 9), NOW).unwrap(),
+                AdditionSeen::Counted
+            );
+            answers.push(who_counts(&conn).unwrap());
+        }
+        assert_eq!(answers[0], answers[1]);
+
+        // With the record of the added device alone, key 8 may not add:
+        // before the other is seen, and where it never is.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &by_an_added, NOW).unwrap();
+        assert!(!who_counts(&conn).unwrap().may_add(&key(8)));
+
+        // A record that a device of the statement signed lets no key add
+        // that does not count: a removed key here, and one that found no
+        // room where the sixty-fifth is tested.
+        let [_, _, three, _] = statements(&phrase());
+        let conn = device_at(0, 3);
+        see_addition(&conn, &added(&three, 0, 2), NOW).unwrap();
+        let counting = who_counts(&conn).unwrap();
+        assert!(!counting.counts(&key(2)) && !counting.may_add(&key(2)));
     }
 
     #[test]
