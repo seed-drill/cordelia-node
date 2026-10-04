@@ -87,7 +87,7 @@ enum Commands {
     AddDevice {
         /// The other device's key, from `cordelia id` on that device
         key: String,
-        /// A name for the device, e.g. "imac"
+        /// A name for the device, e.g. "desktop"
         #[arg(long)]
         name: Option<String>,
     },
@@ -95,7 +95,7 @@ enum Commands {
     Accept {
         /// The key printed by `add-device` on the other device
         key: String,
-        /// A name for the device, e.g. "macbook"
+        /// A name for the device, e.g. "laptop"
         #[arg(long)]
         name: Option<String>,
     },
