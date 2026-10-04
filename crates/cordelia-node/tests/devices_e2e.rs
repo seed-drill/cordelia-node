@@ -1246,6 +1246,9 @@ fn claude_memory_syncs_between_two_machines() {
     assert!(project["last_published_at"].is_string(), "{snapshot}");
     assert!(project["last_pulled_at"].is_string(), "{snapshot}");
     assert!(project["error"].is_null(), "{snapshot}");
+    // Always there, for a panel to read: no file failed, and none more.
+    assert_eq!(project["failed"], serde_json::json!([]), "{snapshot}");
+    assert_eq!(project["failed_more"], 0, "{snapshot}");
 
     // One setting changes at a time; the others stay as they were. Turning
     // home memory off unmaps it; a mapped folder is unmapped, not excluded.

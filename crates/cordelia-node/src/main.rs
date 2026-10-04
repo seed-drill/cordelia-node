@@ -479,6 +479,11 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                         "error": f["error"],
                         "conflicts": f["conflict_files"],
                         "too_large": f["too_large"],
+                        // Files that could not be synced in the last
+                        // cycle, each with why: always a list. Past the
+                        // first hundred they are only counted.
+                        "failed": f["failed"].as_array().cloned().unwrap_or_default(),
+                        "failed_more": f["failed_more"].as_u64().unwrap_or(0),
                     })
                 })
                 .collect();
@@ -2758,17 +2763,10 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
             Some(cwd) => short_path(cwd),
             None => short_path(&text(&f["folder"])),
         };
-        let state = if let Some(error) = f["error"].as_str() {
-            format!("error: {error}")
-        } else if f["waiting"].as_bool() == Some(true) {
-            "waiting for one of your other devices to let this one in".to_string()
-        } else {
-            "syncing".to_string()
-        };
         rows.push(vec![
             place,
             sync_label(&text(&f["project"])),
-            state,
+            folder_state(f),
             folder_activity(f),
         ]);
     }
@@ -2909,6 +2907,26 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// What a folder's row in `cordelia sync status` says of it, from its
+/// report: why it does not sync, or that it does, and how many of its
+/// files could not be synced in the last cycle. (The first five are
+/// named, each with why, among the errors at the end, and the rest are
+/// counted there.)
+fn folder_state(folder: &serde_json::Value) -> String {
+    if let Some(error) = folder["error"].as_str() {
+        return format!("error: {error}");
+    }
+    if folder["waiting"].as_bool() == Some(true) {
+        return "waiting for one of your other devices to let this one in".to_string();
+    }
+    let listed = folder["failed"].as_array().map_or(0, Vec::len) as u64;
+    match listed + folder["failed_more"].as_u64().unwrap_or(0) {
+        0 => "syncing".to_string(),
+        1 => "syncing, but 1 file could not be synced".to_string(),
+        n => format!("syncing, but {n} files could not be synced"),
+    }
+}
+
 // ── Signal handling ───────────────────────────────────────────────
 
 /// Wait for SIGINT (Ctrl+C), SIGTERM (systemd, launchd, Docker) or SIGQUIT.
@@ -2954,6 +2972,35 @@ fn init_tracing(level: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// A folder's row says why it does not sync, or that it does and how
+    /// many of its files failed in the last cycle: those listed, and those
+    /// only counted.
+    #[test]
+    fn test_a_folders_row_says_how_many_files_failed() {
+        use serde_json::json;
+        let state = |folder: serde_json::Value| super::folder_state(&folder);
+        assert_eq!(state(json!({})), "syncing");
+        assert_eq!(state(json!({ "failed": [], "failed_more": 0 })), "syncing");
+        let one = json!({ "name": "a.md", "error": "why" });
+        assert_eq!(
+            state(json!({ "failed": [one] })),
+            "syncing, but 1 file could not be synced"
+        );
+        assert_eq!(
+            state(json!({ "failed": [one, one], "failed_more": 3 })),
+            "syncing, but 5 files could not be synced"
+        );
+        // Why the folder does not sync at all comes first.
+        assert_eq!(
+            state(json!({ "error": "it is gone", "failed": [one] })),
+            "error: it is gone"
+        );
+        assert_eq!(
+            state(json!({ "waiting": true })),
+            "waiting for one of your other devices to let this one in"
+        );
+    }
+
     /// A part of a node, for these tests: it runs until it is told to stop,
     /// and then takes `to_stop` to finish, or never does.
     async fn part(

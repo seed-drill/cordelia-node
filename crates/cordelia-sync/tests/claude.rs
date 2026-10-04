@@ -1171,6 +1171,54 @@ fn a_folder_that_fails_is_reported_and_the_others_still_sync() {
     assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "not a folder");
 }
 
+/// A file that fails in a cycle is an error of the cycle, by its path and
+/// with why, and the rest of its folder still syncs. The folder's report
+/// lists the file, and the folder itself is not reported as failed.
+///
+/// Here something is in the way of the temporary file that the incoming
+/// version of one file is written through, so that file cannot be written.
+#[test]
+fn a_file_that_fails_is_an_error_of_the_cycle_and_the_folder_still_syncs() {
+    let (mut a, mut b) = paired();
+    let a_mem = a.home_memory();
+    let b_mem = b.home_memory();
+    std::fs::write(a_mem.join("a.md"), "base\n").unwrap();
+    std::fs::write(a_mem.join("z.md"), "base\n").unwrap();
+    settle(&mut a, &mut b);
+    assert_eq!(read(&b_mem, "a.md").as_deref(), Some("base\n"));
+
+    // A edits both files.
+    std::fs::write(a_mem.join("a.md"), "from a\n").unwrap();
+    std::fs::write(a_mem.join("z.md"), "from a\n").unwrap();
+    let hash = cordelia_crypto::sha256(b"a.md");
+    let in_the_way = b_mem.join(format!(".cordelia-tmp-{}", hex::encode(&hash[..8])));
+    std::fs::create_dir(&in_the_way).unwrap();
+    a.cycle();
+    relay(&a, &b);
+    let report = b.adapter.run_cycle(&b.state);
+
+    let path = b_mem.join("a.md").display().to_string();
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].starts_with(&format!("{path}: "))
+            && report.errors[0].len() > path.len() + 2,
+        "{:?}",
+        report.errors
+    );
+    let folder = report
+        .folders
+        .iter()
+        .find(|f| !f.failed.is_empty())
+        .unwrap_or_else(|| panic!("{:?}", report.folders));
+    assert_eq!(folder.error, None);
+    assert_eq!(folder.failed.len(), 1);
+    assert_eq!(folder.failed[0].name, "a.md");
+    // Left as it was, and the file after it was synced.
+    assert_eq!(read(&b_mem, "a.md").as_deref(), Some("base\n"));
+    assert_eq!(read(&b_mem, "z.md").as_deref(), Some("from a\n"));
+    assert_eq!(folder.pulled, 1);
+}
+
 // ── A folder that stops syncing, or goes missing, deletes nothing ──────
 
 /// A command that stops a folder syncing has stopped it when it answers. A
@@ -1500,7 +1548,7 @@ fn a_memory_folder_that_goes_missing_deletes_nothing() {
     std::fs::rename(&claude, &aside).unwrap();
     let (report, _) = settle_reporting(&mut a, &mut b);
     let error = report.folders[0].error.as_deref().expect("reported");
-    assert!(error.contains("Nothing was deleted"), "{error}");
+    assert!(error.contains("were not deleted"), "{error}");
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert_eq!(files(&b_mem), ["one.md", "two.md"], "B keeps everything");
     assert!(!claude.exists(), "and nothing is written in its place");
