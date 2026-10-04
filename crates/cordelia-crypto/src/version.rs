@@ -78,6 +78,15 @@ pub struct VersionEntry {
 /// has applied, and `counts` says whether a key counts (decision
 /// 2026-10-04 §4.4).
 ///
+/// **A slot is read under the statement of its own generation:** `secret`
+/// is the channel's secret in the generation that `statement` numbers.
+/// What a device holds of a generation is at the revisions that the move
+/// into it gave ([`cordelia_core::revision::lifted`]), so each is in the
+/// statement's band or in the bottom half of a lower one. Read under
+/// another statement than its generation's, an entry may be no version
+/// though it was one, and the next revision is then not the one that an
+/// edit has.
+///
 /// Entries of another channel than the secret's, or of more than one
 /// slot, are refused: there is no slot to read.
 pub fn current(
@@ -698,17 +707,34 @@ mod tests {
         }
 
         // At the top of the statement's band there is none until the next
-        // statement, under which the version is no version until it is
-        // moved, and the next revision is above where it is moved to.
+        // statement. The version is then carried into that statement's
+        // generation, where the move puts it in the bottom half of the
+        // next band, and the next revision is one above where it was
+        // moved to.
         let top = at(2, SIZE - 1);
         let entries = [of_text(1, top, "out of reach")];
         let slot = current(&entries, &SECRET, 2, everyone).unwrap();
         assert_eq!(slot.current.as_ref().unwrap().rev, top);
         assert_eq!((slot.highest, slot.next), (Some(top), None));
+        assert_eq!(lifted(top), at(3, HALF - 1));
+        let moved = [of_text(1, lifted(top), "out of reach")];
+        let slot = current(&moved, &SECRET, 3, everyone).unwrap();
+        assert_eq!(slot.current.as_ref().unwrap().rev, at(3, HALF - 1));
+        assert_eq!(
+            (slot.highest, slot.next),
+            (Some(at(3, HALF - 1)), Some(at(3, HALF)))
+        );
+
+        // A slot is read under the statement of its own generation. The
+        // entry as it was before the move, read under the next statement,
+        // is no version there. It counts for the next revision, which is
+        // one above it: the first of band 3. That is below where the move
+        // puts the version, so it is not the revision that an edit of the
+        // moved version has.
         let slot = current(&entries, &SECRET, 3, everyone).unwrap();
         assert_eq!(slot.current, None);
         assert_eq!((slot.highest, slot.next), (Some(top), Some(at(3, 0))));
-        assert_eq!(lifted(top), at(3, HALF - 1));
+        assert!(at(3, 0) < lifted(top));
     }
 
     /// Under a number that no statement has, no revision is an entry's:
