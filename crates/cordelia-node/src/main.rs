@@ -1825,6 +1825,19 @@ fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     local_api(&config, false, path, std::time::Duration::from_secs(3))
 }
 
+/// How a command reaches its own node: straight to the address, within
+/// `limit`. The HTTP client's default takes a proxy from the environment
+/// (`ALL_PROXY`, `HTTP_PROXY` and the rest). A proxy is for the network:
+/// a request to this machine, with the node's token in it, is not sent
+/// to one.
+fn to_this_machine(
+    limit: Option<std::time::Duration>,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(limit)
+}
+
 /// Call the running node's local API (GET, or POST with an empty body)
 /// with the node token, failing after `timeout`.
 fn local_api(
@@ -1838,10 +1851,7 @@ fn local_api(
         "http://{}:{}{path}",
         config.api.bind_address, config.node.http_port
     );
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .into();
+    let agent: ureq::Agent = to_this_machine(Some(timeout)).build().into();
     let auth = format!("Bearer {}", token.trim());
     let resp = if post {
         agent
@@ -1884,9 +1894,8 @@ fn api_post(
         config.api.bind_address, config.node.http_port
     );
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = to_this_machine(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
         .into();
     let mut resp = agent

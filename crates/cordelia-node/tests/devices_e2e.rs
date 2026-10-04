@@ -1133,6 +1133,57 @@ fn a_node_whose_dialling_cannot_be_checked_is_not_started() {
     n.start();
 }
 
+/// A command asks its own node directly, whatever proxy the environment
+/// names: a proxy is for the network, and a request to this machine
+/// carries the node's token. Here every proxy variable names something
+/// on this machine that counts who calls it and answers with a refusal:
+/// each command works, and nothing calls.
+#[test]
+fn a_command_asks_its_own_node_and_no_proxy() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut n = node("alone", "personal", None);
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+        }
+    });
+    // (The harness passes a command no proxy of the caller's: here it is
+    // given these, and nothing that excepts this machine from them.)
+    let run = |args: &[&str]| {
+        let mut command = n.binary_given(["NO_PROXY", "no_proxy"].iter().map(Into::into));
+        command.args(args);
+        for name in ["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"] {
+            command.env(name, &proxy).env(name.to_lowercase(), &proxy);
+        }
+        command.output().unwrap()
+    };
+    // One that reads, one that posts, and the one that does both.
+    for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "cordelia {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "cordelia {args:?}");
+    }
+    // The answers came from the node: its own key is in what it lists.
+    let listed = String::from_utf8_lossy(&run(&["devices"]).stdout).into_owned();
+    assert!(listed.contains("this device"), "{listed}");
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
