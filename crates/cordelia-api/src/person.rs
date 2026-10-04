@@ -1298,7 +1298,7 @@ mod tests {
     }
 
     /// An entry that holds the text `said` under `name` and lacks what it
-    /// should say: its chain names one link twice, and cannot be read.
+    /// should say: what follows its value is not a chain and the fill.
     fn put_what_lacks_its_chain(
         conn: &Connection,
         channel: &[u8; 32],
@@ -1312,8 +1312,8 @@ mod tests {
         says.push(1);
         says.extend_from_slice(&(said.len() as u16).to_be_bytes());
         says.extend_from_slice(said.as_bytes());
-        says.extend_from_slice(&[0, 2]);
-        says.extend_from_slice(&[7u8; 128]);
+        // A count of no links, and then a byte that is no fill.
+        says.extend_from_slice(&[0, 0, 7]);
         let size = (says.len() + ITEM_SEAL_OVERHEAD_BYTES)
             .next_power_of_two()
             .max(MIN_ENTRY_CONTENT_BYTES);

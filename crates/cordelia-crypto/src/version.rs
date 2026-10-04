@@ -751,12 +751,11 @@ mod tests {
         assert_eq!(version.entries[0].author, key(2));
         assert_eq!(version.entries[0].chain, Some(chain.clone()));
 
-        // One whose chain cannot be read: it names a link twice.
-        let twice = Inside {
-            chain: Some(vec![chain[0], chain[1], chain[0]]),
-            ..text(NAME, "a text")
-        };
-        let lacking = saying(3, 5, NAME, &twice.to_bytes(), false);
+        // One whose chain cannot be read: a byte that is no fill comes
+        // after its last link.
+        let mut and_more = inside.to_bytes();
+        and_more.push(1);
+        let lacking = saying(3, 5, NAME, &and_more, false);
         let slot = read(std::slice::from_ref(&lacking));
         let version = slot.current.unwrap();
         assert_eq!((version.rev, &version.value), (5, &text_value("a text")));

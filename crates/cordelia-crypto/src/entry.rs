@@ -51,11 +51,16 @@
 //! (`cordelia_core::protocol` checks it when it is compiled). So what an
 //! entry says always fits, whatever its value.
 //!
-//! The chain is read strictly. A count over 100, a link that is there
-//! twice, or anything left over after the last link but the zeros that
-//! fill the content to its size, and the entry lacks what it should say:
-//! it is a version all the same, and shows nothing. [`known_to_follow`] is
-//! the one question that a chain answers.
+//! The chain is read strictly. A count over 100, or anything left over
+//! after the last link but the zeros that fill the content to its size,
+//! and the entry lacks what it should say: it is a version all the same,
+//! and shows nothing. [`known_to_follow`] is the one question that a chain
+//! answers.
+//!
+//! A link may stand in a chain twice. A file that held a text, then
+//! another, then the first again descends from one version twice, and so
+//! does one that was deleted twice by one device. The newest link with a
+//! hash is the one that decides.
 //!
 //! ## Three things that are done with one
 //!
@@ -101,9 +106,6 @@ pub enum EntryError {
 
     #[error("an entry's chain has at most 100 links, and this has {0}")]
     TooManyLinks(usize),
-
-    #[error("a link is in an entry's chain once")]
-    LinkTwice,
 
     #[error("an entry's content is a power of two from 256 to 65536 bytes, and this is {0}")]
     ContentSize(usize),
@@ -285,9 +287,9 @@ pub struct Inside {
     pub name: String,
     pub value: Value,
     /// What the entry says it was written after: for each version it
-    /// descends from, the newest first, a link. At most 100, none of them
-    /// twice. Two links may have one hash, where two entries were one
-    /// version, and a new name's chain is empty.
+    /// descends from, the newest first, a link. At most 100. A link may
+    /// stand twice, where a file came to hold again what it held before,
+    /// and a new name's chain is empty.
     ///
     /// `None` where the entry lacks what it should say: what its content
     /// holds after its value is not a chain and the fill. It shows
@@ -305,9 +307,6 @@ impl Inside {
         let chain = self.chain.as_ref().ok_or(EntryError::NoChain)?;
         if chain.len() > MAX_ENTRY_LINKS {
             return Err(EntryError::TooManyLinks(chain.len()));
-        }
-        if !each_once(chain) {
-            return Err(EntryError::LinkTwice);
         }
         Ok(())
     }
@@ -377,8 +376,6 @@ impl Inside {
 ///
 /// - the count is not there, or is over 100;
 /// - a link is not whole;
-/// - a link is there twice (two links with one hash and two keys are two
-///   links);
 /// - something is left over after the last link: anything but zeros, or
 ///   more zeros than fill the smallest size that holds what is said.
 fn chain_in(reader: &mut Reader, filled: usize) -> Option<Vec<Link>> {
@@ -392,9 +389,6 @@ fn chain_in(reader: &mut Reader, filled: usize) -> Option<Vec<Link>> {
             hash: reader.array()?,
             signer: reader.array()?,
         });
-    }
-    if !each_once(&chain) {
-        return None;
     }
     if !reader.rest().iter().all(|byte| *byte == 0) {
         return None;
@@ -451,8 +445,7 @@ impl Entry {
     ///
     /// Refused, and never cut to fit: a revision that is not from 1 to
     /// 2^53 - 1; a name of no bytes; a name and a value over their bound
-    /// together; no chain; a chain of more than 100 links; and a link that
-    /// is in the chain twice.
+    /// together; no chain; and a chain of more than 100 links.
     pub fn seal(
         secret: &[u8; 32],
         author: &NodeIdentity,
@@ -705,14 +698,6 @@ fn within_the_bound(name: &str, value: &Value) -> Result<(), EntryError> {
         return Err(EntryError::OverTheBound(together));
     }
     Ok(())
-}
-
-/// Whether no link is in a chain twice, hash and key.
-fn each_once(chain: &[Link]) -> bool {
-    chain
-        .iter()
-        .enumerate()
-        .all(|(place, link)| !chain[..place].contains(link))
 }
 
 fn crypto(e: crate::CryptoError) -> EntryError {
@@ -1438,22 +1423,6 @@ mod tests {
             );
         }
 
-        // A link that is there twice, wherever the two are. Two links with
-        // one hash and two keys are two links, and so are two with one key
-        // and two hashes: two entries that were one version, and a device
-        // that wrote twice.
-        let (one, other_key, other_text) = (link("a", 1), link("a", 2), link("b", 1));
-        assert_eq!(seal(Some(vec![one, other_key, other_text])), Ok(()));
-        assert_eq!(seal(Some(vec![one, one])), Err(EntryError::LinkTwice));
-        assert_eq!(
-            seal(Some(vec![one, other_key, other_text, one])),
-            Err(EntryError::LinkTwice)
-        );
-        assert_eq!(
-            seal(Some(vec![other_text, one, other_key, other_key])),
-            Err(EntryError::LinkTwice)
-        );
-
         // No chain at all: an entry that is made says its chain, which is
         // empty for a new name.
         assert_eq!(seal(Some(Vec::new())), Ok(()));
@@ -1762,16 +1731,10 @@ mod tests {
             let chain = counted(links, &chain_of(usize::from(links)));
             assert_eq!(open(&with(&chain, 4096)), lacking, "{links}");
         }
-        // A link that is there twice, next to itself and further on.
-        assert_eq!(open(&with(&counted(2, &[a, a]), 256)), lacking);
-        assert_eq!(open(&with(&counted(3, &[a, b, a]), 256)), lacking);
         assert_eq!(
             open(&with(&counted(4, &chain_of(4)), 256)),
             saying(chain_of(4))
         );
-        let mut twice = chain_of(100);
-        twice[99] = twice[0];
-        assert_eq!(open(&with(&counted(100, &twice), 4096)), lacking);
 
         // Bytes left over after the last link: anything but zeros,
         // wherever it is.
@@ -1956,24 +1919,173 @@ mod tests {
         assert!(!known_to_follow(None, &named("agreed"), everyone));
         assert!(!known_to_follow(None, &[0; 16], everyone));
 
-        // As it is opened: an entry whose chain names a link twice.
-        let twice = Inside {
-            chain: Some(vec![link("agreed", 1), link("agreed", 1)]),
+        // As it is opened: an entry whose chain names the agreed text, and
+        // has a byte after its last link that is no fill.
+        let says = Inside {
+            chain: Some(vec![link("agreed", 1)]),
             ..text("a.md", "t")
         };
-        let opened = saying(1, 5, "a.md", &twice.to_bytes(), false)
+        let mut and_more = says.to_bytes();
+        and_more.push(1);
+        let opened = saying(1, 5, "a.md", &and_more, false)
             .open(&SECRET)
             .unwrap();
         assert_eq!(opened.chain, None);
         let agreed = named("agreed");
         assert!(!known_to_follow(opened.chain.as_deref(), &agreed, everyone));
-        // The control: named once, it follows.
-        let once = Inside {
-            chain: Some(vec![link("agreed", 1)]),
-            ..text("a.md", "t")
-        };
-        let opened = entry(1, 5, &once).open(&SECRET).unwrap();
+        // The control: without that byte, it follows.
+        let opened = entry(1, 5, &says).open(&SECRET).unwrap();
         assert!(known_to_follow(opened.chain.as_deref(), &agreed, everyone));
+    }
+
+    /// A link may stand in a chain twice. A file that one device wrote as
+    /// A, then B, then A again, then C: the entry of C descends from A
+    /// twice. It is made, it opens to the chain it was made with, and the
+    /// newest link with a hash decides for a folder that holds that text.
+    #[test]
+    fn a_link_may_stand_in_a_chain_twice() {
+        let nobody = |_: &[u8; 16]| false;
+        let everyone = |_: &[u8; 16]| true;
+        let chain_of_c = vec![link("A", 1), link("B", 1), link("A", 1)];
+        assert_eq!(chain_of_c[0], chain_of_c[2]);
+        let inside = Inside {
+            chain: Some(chain_of_c.clone()),
+            ..text("a.md", "C")
+        };
+        let opened = entry(1, 4, &inside).open(&SECRET).unwrap();
+        assert_eq!(opened, inside);
+        let chain = opened.chain.as_deref();
+
+        // A folder at A: C was written over that very text, and no version
+        // stands between, whoever counts. The older link with A, which has
+        // two versions above it, is not the one that is asked.
+        assert!(known_to_follow(chain, &named("A"), nobody));
+        // A folder at B: one version stands between, and its signer is
+        // asked about.
+        assert!(known_to_follow(chain, &named("B"), everyone));
+        assert!(!known_to_follow(chain, &named("B"), nobody));
+        // A folder at C holds the version itself: its text is in no chain
+        // of its own.
+        assert!(!known_to_follow(chain, &named("C"), everyone));
+
+        // The entry written over C descends from each of the three.
+        let over_c = Inside {
+            chain: Some([vec![link("C", 1)], chain_of_c].concat()),
+            ..text("a.md", "D")
+        };
+        let opened = entry(1, 5, &over_c).open(&SECRET).unwrap();
+        assert_eq!(opened, over_c);
+        let chain = opened.chain.as_deref();
+        let only_1 = |by: &[u8; 16]| *by == signer(1);
+        for said in ["A", "B", "C"] {
+            assert!(known_to_follow(chain, &named(said), only_1), "{said}");
+        }
+        assert!(known_to_follow(chain, &named("C"), nobody));
+        assert!(!known_to_follow(chain, &named("A"), nobody));
+        assert!(!known_to_follow(chain, &named("B"), nobody));
+
+        // The same link next to itself, and a chain of nothing else.
+        for chain in [vec![link("A", 1); 2], vec![link("A", 1); 100]] {
+            let inside = Inside {
+                chain: Some(chain),
+                ..text("a.md", "C")
+            };
+            let opened = entry(1, 4, &inside).open(&SECRET).unwrap();
+            assert_eq!(opened, inside);
+            assert!(known_to_follow(
+                opened.chain.as_deref(),
+                &named("A"),
+                nobody
+            ));
+        }
+    }
+
+    /// A file that one device deleted, wrote, deleted again and wrote
+    /// again: the last entry descends from a delete twice, and a chain
+    /// names both by the same zeros and the same key.
+    #[test]
+    fn two_deletes_by_one_device_stand_in_one_chain() {
+        let nobody = |_: &[u8; 16]| false;
+        let everyone = |_: &[u8; 16]| true;
+        let a_delete = Link::of(&Value::Delete, key(1));
+        let deleted = Value::Delete.chain_hash();
+        let inside = Inside {
+            chain: Some(vec![a_delete, link("a text", 1), a_delete]),
+            ..text("a.md", "another text")
+        };
+        let opened = entry(1, 4, &inside).open(&SECRET).unwrap();
+        assert_eq!(opened, inside);
+        let chain = opened.chain.as_deref();
+
+        // A folder that agreed the delete: the text was written over a
+        // delete, and nothing stands between.
+        assert!(known_to_follow(chain, &deleted, nobody));
+        // A folder at the text between the two deletes.
+        assert!(known_to_follow(chain, &named("a text"), everyone));
+        assert!(!known_to_follow(chain, &named("a text"), nobody));
+        assert!(!known_to_follow(chain, &named("another text"), everyone));
+
+        // A delete written over the same history is made and read alike.
+        let a_third = Inside {
+            chain: Some(vec![link("another text", 1), a_delete, a_delete]),
+            ..holding("a.md", Value::Delete)
+        };
+        let opened = entry(1, 5, &a_third).open(&SECRET).unwrap();
+        assert_eq!(opened, a_third);
+        assert!(known_to_follow(opened.chain.as_deref(), &deleted, everyone));
+        assert!(!known_to_follow(opened.chain.as_deref(), &deleted, nobody));
+    }
+
+    /// The hundredth link is read as the first is, and there is no one
+    /// more: a chain of 101 links is not made, and one that is read lacks
+    /// what it should say.
+    #[test]
+    fn the_hundredth_link_is_followed_and_there_is_no_one_more() {
+        let everyone = |_: &[u8; 16]| true;
+        let texts: Vec<String> = (1..=101).map(|n| format!("text {n}")).collect();
+        let links: Vec<Link> = texts.iter().map(|said| link(said, 1)).collect();
+
+        let inside = Inside {
+            chain: Some(links[..100].to_vec()),
+            ..text("a.md", "the newest")
+        };
+        let opened = entry(1, 200, &inside).open(&SECRET).unwrap();
+        assert_eq!(opened.chain.as_ref().unwrap().len(), 100);
+        let chain = opened.chain.as_deref();
+        assert!(known_to_follow(chain, &named("text 1"), everyone));
+        assert!(known_to_follow(chain, &named("text 100"), everyone));
+        // Every one of the 99 above it is asked about.
+        let only_1 = |by: &[u8; 16]| *by == signer(1);
+        assert!(known_to_follow(chain, &named("text 100"), only_1));
+        let mut one_other = links[..100].to_vec();
+        one_other[98].signer = signer(9);
+        assert!(!known_to_follow(
+            Some(&one_other),
+            &named("text 100"),
+            only_1
+        ));
+        // What is older than the hundredth is not said.
+        assert!(!known_to_follow(chain, &named("text 101"), everyone));
+
+        // One more: not made, and where another made it, not read.
+        let one_more = Inside {
+            chain: Some(links.clone()),
+            ..text("a.md", "the newest")
+        };
+        assert_eq!(
+            Entry::seal(&SECRET, &device(1), 200, &one_more),
+            Err(EntryError::TooManyLinks(101))
+        );
+        let opened = saying(1, 200, "a.md", &one_more.to_bytes(), false)
+            .open(&SECRET)
+            .unwrap();
+        assert_eq!(opened.value, Value::Text("the newest".to_string()));
+        assert_eq!(opened.chain, None);
+        assert!(!known_to_follow(
+            opened.chain.as_deref(),
+            &named("text 1"),
+            everyone
+        ));
     }
 
     /// A link is a version by the start of the hash of what it held, which
