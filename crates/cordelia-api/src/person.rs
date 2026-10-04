@@ -635,7 +635,8 @@ struct Change<'a> {
 /// Every rule of §4.2 is asked here. The statement is judged beside the
 /// one applied, and only one that applies is applied: the phrase the
 /// device follows signed it, its number is above, the device is among its
-/// devices, no removal is undone, and it was made after the one applied.
+/// devices, no removal is undone, it was made after the one applied, and
+/// it commits to another secret than the one applied.
 /// The secret opens to its commitment. And the entry is that statement's:
 /// it is the phrase's change entry, and the statement key opens it to
 /// this very statement.
@@ -733,7 +734,8 @@ fn its_own_entry(change: &Change) -> Result<(), PersonError> {
 ///
 /// Rules 3 and 4 of §4.2 are asked again here, whoever calls: the device
 /// is among the statement's devices, and the secret opens to the
-/// commitment.
+/// commitment. And the secret is another than the one the device leaves:
+/// were the two one, what is carried would be dropped with what is left.
 fn apply_judged(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -768,6 +770,12 @@ fn apply_judged(
             number: leaving.number,
             secret: applied_secret(conn, leaving)?,
         };
+        // The generation it comes to is another than the one it leaves:
+        // the carry reads the one and writes the other, and then drops
+        // the one.
+        if from.secret == to.secret {
+            return Err(StatementError::SameSecret.into());
+        }
         let counting = Counting::of(leaving, &held_rows::additions(conn)?);
         applied.left = Some(from.number);
 
@@ -4056,6 +4064,68 @@ mod tests {
             Err(PersonError::Stopped(State::Removed))
         ));
         assert_eq!(statement.statement.number, 3);
+    }
+
+    /// A statement that commits to the secret that is already applied is
+    /// refused: the channels of the generation it names are the ones the
+    /// device is in, and what was carried there would be dropped with what
+    /// is left. Nothing changes, and the device does not stop.
+    #[test]
+    fn test_a_statement_that_commits_to_the_applied_secret_is_refused() {
+        let phrase = phrase();
+        let [_, _, three, four] = statements(&phrase);
+        let conn = device_at(1, 3);
+        hold_name(&conn, "team", NOW).unwrap();
+        put(&conn, &own(3, "team"), 1, 5, "a.md", text("a"), &[]);
+        put(&conn, &own(3, "team"), 0, 6, "b.md", text("b"), &[]);
+        let before = everything(&conn);
+
+        // Statement 4, as a maker with a fault would have made it: it
+        // commits to secret 3, which statement 3 does.
+        let mut same = four.clone();
+        same.commitment = three.commitment;
+        same.validate().unwrap();
+        let signed = sign(&same, &phrase);
+        let entry = change(&phrase, &same, secret(3));
+        let refused = ChangeEntryError::Statement(StatementError::SameSecret);
+        assert_eq!(
+            shown(&conn, &device(1), &entry, NOW).unwrap(),
+            Shown::Refused(Refused::NotAChangeEntry(refused))
+        );
+        assert!(matches!(
+            apply(&conn, &device(1), &signed, &secret(3), &entry, NOW),
+            Err(PersonError::Statement(StatementError::SameSecret))
+        ));
+        assert_eq!(state(&conn), State::Applied);
+        assert_eq!(everything(&conn), before);
+
+        // Where it is applied, whoever asks: the carry is not begun.
+        let held = held(&conn).unwrap().unwrap();
+        let given = Change {
+            following: &held.following,
+            statement: &signed,
+            secret: &secret(3),
+            entry: &entry,
+        };
+        let applied = in_one(&conn, || {
+            apply_judged(&conn, &device(1), Some(&held), &given, NOW)
+        });
+        assert!(matches!(
+            applied,
+            Err(PersonError::Statement(StatementError::SameSecret))
+        ));
+        assert_eq!(everything(&conn), before);
+        // What the device holds is still there, under the statement it
+        // has applied.
+        let version = read(&conn, &own(3, "team"), 3, "b.md", &[0, 1]);
+        assert_eq!(version.current.unwrap().value, text("b"));
+
+        // The control: statement 4 with its own secret is applied.
+        let entry = change(&phrase, &four, secret(4));
+        assert!(matches!(
+            shown(&conn, &device(1), &entry, NOW).unwrap(),
+            Shown::Applied(Applied { carried: 2, .. })
+        ));
     }
 
     /// What a device holds of its person is checked again as it is read:

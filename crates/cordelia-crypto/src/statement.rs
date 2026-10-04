@@ -121,6 +121,11 @@ pub enum StatementError {
         "the statement was made after the applied one, and lacks a key that the applied one removed"
     )]
     UndoesARemoval,
+
+    #[error(
+        "the statement commits to the secret of the statement it was made after: its channels would be that one's"
+    )]
+    SameSecret,
 }
 
 /// A device as a statement lists it.
@@ -261,7 +266,10 @@ impl Statement {
     /// will hold `secret`, the maker among them.
     ///
     /// Refused where it would be over a bound: a phrase makes 256
-    /// statements and removes 256 keys, and no more.
+    /// statements and removes 256 keys, and no more. And refused where
+    /// `secret` is the one this statement commits to: every statement has
+    /// a secret of its own, or its channels would be this one's, and a
+    /// device that it removes would go on reading them.
     pub fn next(
         &self,
         maker: [u8; 32],
@@ -269,6 +277,9 @@ impl Statement {
         devices: Vec<Device>,
         removed: &[[u8; 32]],
     ) -> Result<Self, StatementError> {
+        if self.commits_to(secret) {
+            return Err(StatementError::SameSecret);
+        }
         let mut chain = self.chain.clone();
         chain.push(self.link()?);
         let statement = Self {
@@ -294,7 +305,9 @@ impl Statement {
     ///
     /// Two statements of which one is the other, or is on the other's
     /// chain, were not made apart, and are not settled: the later one is
-    /// simply the later one.
+    /// simply the later one. And a settlement has a secret of its own: one
+    /// that either of the two commits to is refused, as [`Statement::next`]
+    /// refuses the secret of the statement before.
     pub fn settle(
         one: &Self,
         other: &Self,
@@ -309,6 +322,9 @@ impl Statement {
         let (a, b) = (one.link()?, other.link()?);
         if a == b || one.has_on_chain(&b) || other.has_on_chain(&a) {
             return Err(StatementError::NotApart);
+        }
+        if one.commits_to(secret) || other.commits_to(secret) {
+            return Err(StatementError::SameSecret);
         }
         let mut chain: Vec<Link> = one.chain.iter().chain(&other.chain).copied().collect();
         chain.extend([a, b]);
@@ -626,7 +642,7 @@ impl SignedStatement {
 ///   [`Judgement::Removed`] or [`Judgement::NotListed`], and only by a
 ///   statement that passes every rule above.
 ///
-/// Two things that those rules do not say outright:
+/// What those rules do not say outright:
 ///
 /// - **The applied statement, shown again, is [`Judgement::Behind`].** It
 ///   has the applied one's number and hash. It is not above the applied
@@ -643,6 +659,11 @@ impl SignedStatement {
 ///   not well formed. And it is no fork: the two were not made apart, so
 ///   nothing could settle them, and a device that stopped for it would
 ///   stay stopped.
+/// - **A statement that has the applied one on its chain and commits to
+///   the applied one's secret is an error as well**
+///   ([`StatementError::SameSecret`]). The generation it names is the
+///   one the device is in: there is nothing to come to, and a device that
+///   it removes would lose nothing.
 pub fn judge(
     shown: &SignedStatement,
     applied: &Statement,
@@ -668,6 +689,9 @@ pub fn judge(
     }
     if !shown.keeps_the_removals_of(applied) {
         return Err(StatementError::UndoesARemoval);
+    }
+    if shown.commitment == applied.commitment {
+        return Err(StatementError::SameSecret);
     }
     Ok(if shown.lists(device) {
         Judgement::Applies
@@ -1917,7 +1941,7 @@ mod tests {
         }
         assert_eq!(latest.validate(), Ok(()));
         assert_eq!(
-            latest.next(key(0), &secret(0), devices(&[0]), &[]),
+            latest.next(key(0), &secret(1), devices(&[0]), &[]),
             Err(StatementError::Number(257))
         );
     }
@@ -2440,6 +2464,76 @@ mod tests {
         let Apart { two, .. } = apart(&phrase);
         assert!(two.removed.is_empty());
         assert_eq!(judged(&phrase, &undone, &two, 1), Ok(Judgement::Applies));
+    }
+
+    /// Every statement has a secret of its own. One that commits to the
+    /// secret of the statement it was made after is not made, and where a
+    /// maker with a fault made one, it is refused for every device: the
+    /// generation it names is the one the device is in.
+    #[test]
+    fn a_statement_that_commits_to_the_secret_before_it_is_refused() {
+        let phrase = phrase();
+        let Apart { two, a3, b3, .. } = apart(&phrase);
+
+        // Where one is made: the next, and a settlement with the secret
+        // of either of its two.
+        assert_eq!(
+            a3.next(key(0), &secret(0xa3), devices(&[0, 1]), &[]),
+            Err(StatementError::SameSecret)
+        );
+        for of_either in [secret(0xa3), secret(0xb3)] {
+            assert_eq!(
+                Statement::settle(&a3, &b3, key(1), &of_either, devices(&[1]), &[]),
+                Err(StatementError::SameSecret)
+            );
+        }
+        // The control: with a secret of its own.
+        let next = a3
+            .next(key(0), &secret(4), devices(&[0, 1]), &[key(9)])
+            .unwrap();
+        assert_eq!(judged(&phrase, &next, &a3, 1), Ok(Judgement::Applies));
+        assert!(Statement::settle(&a3, &b3, key(1), &secret(4), devices(&[1]), &[]).is_ok());
+
+        // Where one is read: the same statement, committing to the secret
+        // of the one applied. It is refused for a device it lists, one it
+        // removes, and a stranger.
+        let mut same = next.clone();
+        same.commitment = a3.commitment;
+        assert_eq!(same.validate(), Ok(()));
+        assert!(same.has_on_chain(&a3.link().unwrap()));
+        for device in [0, 1, 2, 9, 7] {
+            assert_eq!(
+                judged(&phrase, &same, &a3, device),
+                Err(StatementError::SameSecret),
+                "{device}"
+            );
+        }
+        // And one made two statements after the applied one, that comes
+        // back to its secret.
+        let mut back = next
+            .next(key(0), &secret(5), devices(&[0, 1]), &[])
+            .unwrap();
+        back.commitment = a3.commitment;
+        assert_eq!(
+            judged(&phrase, &back, &a3, 1),
+            Err(StatementError::SameSecret)
+        );
+        // To a device that has applied the one between, it has another
+        // secret than the one applied.
+        assert_eq!(judged(&phrase, &back, &next, 1), Ok(Judgement::Applies));
+
+        // One made apart with the same secret is a fork, as any made
+        // apart, and one that is behind is behind.
+        let mut apart_and_same = b3.clone();
+        apart_and_same.commitment = a3.commitment;
+        assert_eq!(
+            judged(&phrase, &apart_and_same, &a3, 1),
+            Ok(Judgement::Fork)
+        );
+        let mut behind = two.clone();
+        behind.commitment = a3.commitment;
+        assert_eq!(judged(&phrase, &behind, &a3, 1), Ok(Judgement::Fork));
+        assert_eq!(judged(&phrase, &two, &a3, 1), Ok(Judgement::Behind));
     }
 
     /// A removal undone by a later statement made apart: the other side
