@@ -245,6 +245,57 @@ async fn test_full_pubsub_flow() {
     assert!(!listen_body["has_more"].as_bool().unwrap());
 }
 
+/// A keyed entry written through the API, and a key deleted through it,
+/// say nothing of what they were written after: only the sync adapter
+/// says that. A device that reads such an entry decides by its revision.
+#[actix_web::test]
+async fn test_a_keyed_write_through_the_api_says_nothing() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let post = |uri: &str, body: serde_json::Value| {
+        test::TestRequest::post()
+            .uri(uri)
+            .insert_header(auth_header())
+            .set_json(body)
+            .to_request()
+    };
+    // A keyed entry needs a group channel.
+    let group = post("/api/v1/channels/group", json!({"mode": "realtime"}));
+    let made = test::call_service(&app, group).await;
+    assert_eq!(made.status(), 200);
+    let made: serde_json::Value = test::read_body_json(made).await;
+    let channel = made["channel_id"].as_str().unwrap().to_string();
+    // Whether the entry is a delete, and what it says.
+    let said = || {
+        let db = state.db.lock().unwrap();
+        let entry = cordelia_api::entries::current_of(&state, &db, &channel, "notes.md");
+        let version = entry.unwrap().unwrap().current;
+        (version.deleted, version.after)
+    };
+
+    let write = post(
+        "/api/v1/channels/publish",
+        json!({"channel": channel, "key": "notes.md", "content": "a text\n"}),
+    );
+    let answer = test::call_service(&app, write).await;
+    let status = answer.status();
+    let body = test::read_body(answer).await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(said(), (false, None));
+
+    let delete = post(
+        "/api/v1/channels/delete-key",
+        json!({"channel": channel, "key": "notes.md"}),
+    );
+    assert_eq!(test::call_service(&app, delete).await.status(), 200);
+    assert_eq!(said(), (true, None));
+}
+
 #[actix_web::test]
 async fn test_listen_with_cursor() {
     let state = test_state();

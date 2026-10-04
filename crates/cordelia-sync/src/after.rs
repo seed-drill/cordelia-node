@@ -10,8 +10,9 @@
 //! It is read for one decision only, in [`crate::plan`]: whether a version
 //! at a higher revision is known to have been written after the entry this
 //! folder agreed. It can only make that decision keep more. An entry that
-//! says nothing, or says something that cannot be read, is taken by its
-//! revision as it was before.
+//! says nothing is taken by its revision as it was before. One that says
+//! something that cannot be read is not the same: it shows nothing, so it
+//! is not known to follow, and what the file held is kept.
 //!
 //! It is a member of the entry's sealed content, beside the text: a relay
 //! sees only that the entry is larger.

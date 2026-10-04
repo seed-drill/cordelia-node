@@ -16,10 +16,23 @@
 //!   is in no file at the end, unless someone edited or deleted a file
 //!   while it held that text.
 //!
+//!   "Let go" goes by the text, on any device and for good: once a step
+//!   has edited or deleted a file that held a text, that text is not
+//!   looked for again, on any device. So this check does not see a text
+//!   that is lost after it was put back by hand: the adapter's own tests
+//!   have that case (`a_text_overtaken_twice_is_kept_twice`). An index
+//!   line is let go of only when a step deletes or edits a copy of the
+//!   index that holds it while the device's index does not.
+//!
 //! A tie between two devices' entries goes by the hash of the sealed
 //! entry, which is random. Here the sequence says who wins each tie, and
 //! the entry just published is sealed again until its hash says the same.
-//! So one sequence has one outcome, in every run.
+//! So one sequence has one outcome, in every run. Two seeds that differ
+//! only in their last bit decide every tie the other way from each other.
+//!
+//! What the sequences do not vary: of three entries tied at one revision
+//! the newest is first or last, never between the other two; and what one
+//! device passes to another arrives in the order it was published.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -146,6 +159,9 @@ enum Step {
     /// The device's records lose their writers, as records made before
     /// the writer was kept.
     NoWriters(usize),
+    /// From now on the device behaves as devices did before. Only for a
+    /// test of the check itself: a fault, put where the test wants it.
+    AsBefore(usize),
     /// The device moves the channel to a new key, as a device that
     /// removes another does, and writes under it from now on.
     NewKey(usize),
@@ -215,6 +231,9 @@ struct World {
     /// Each text that a file held when a step edited or deleted that
     /// file: someone saw it and let it go.
     let_go: BTreeSet<(String, String)>,
+    /// Each index line that a copy of the index held when a step edited
+    /// or deleted that copy, and that the device's index did not have.
+    let_go_lines: BTreeSet<String>,
     _tmp: tempfile::TempDir,
 }
 
@@ -293,6 +312,7 @@ impl World {
             wrote: BTreeSet::new(),
             lines: BTreeSet::new(),
             let_go: BTreeSet::new(),
+            let_go_lines: BTreeSet::new(),
             _tmp: tmp,
         }
     }
@@ -320,10 +340,19 @@ impl World {
     }
 
     /// A step writes `text` to `name` on a device, or deletes the file.
-    /// Whatever the file held there is let go of, knowingly.
+    /// Whatever the file held there is let go of, knowingly. Of a copy of
+    /// the index, the lines that the device's index does not have are let
+    /// go of: the others are still in front of whoever does this.
     fn put(&mut self, d: usize, name: &str, text: Option<&str>) {
         if let Some(held) = self.read(d, name) {
-            self.let_go.insert((root_of(name), held));
+            let root = root_of(name);
+            if root == INDEX_FILE {
+                let index = self.read(d, INDEX_FILE).unwrap_or_default();
+                let there: BTreeSet<&str> = index.lines().collect();
+                let gone = held.lines().filter(|line| !there.contains(line));
+                self.let_go_lines.extend(gone.map(String::from));
+            }
+            self.let_go.insert((root, held));
         }
         let path = self.devices[d].mem.join(name);
         match text {
@@ -363,6 +392,7 @@ impl World {
                 db.execute("UPDATE sync_files SET author = NULL", [])
                     .unwrap();
             }
+            Step::AsBefore(d) => self.devices[*d].kind = Kind::Before,
             Step::NewKey(d) => {
                 self.keys += 1;
                 self.key_by = *d;
@@ -388,12 +418,21 @@ impl World {
                     let held = self.read(*d, &root).unwrap_or_default();
                     // With a line of its own: a text that no other step
                     // writes, like every other.
-                    let both = format!("{held}{kept}- merged on {d} at step {}\n", self.step);
-                    if root != INDEX_FILE {
+                    let line = format!("- merged on {d} at step {}", self.step);
+                    let both = format!("{held}{kept}{line}\n");
+                    let mem = &self.devices[*d].mem;
+                    if root == INDEX_FILE {
+                        // Every line of the index and of the copy is in
+                        // the index afterwards, with one more: nothing is
+                        // let go of, and the new line is one to look for.
+                        self.lines.insert(line);
+                        std::fs::write(mem.join(&root), both).unwrap();
+                        std::fs::remove_file(mem.join(&copy)).unwrap();
+                    } else {
                         self.wrote.insert((root.clone(), both.clone()));
+                        self.put(*d, &root, Some(&both));
+                        self.put(*d, &copy, None);
                     }
-                    self.put(*d, &root, Some(&both));
-                    self.put(*d, &copy, None);
                 }
             }
         }
@@ -445,7 +484,9 @@ impl World {
                 continue;
             }
             let at: Option<[u8; 32]> = it.slot.as_deref().map(|s| s.try_into().unwrap());
-            let _ = items::insert_item(
+            // `false` for an entry that is not taken; an error is a fault
+            // of this harness.
+            items::insert_item(
                 &db,
                 &items::NewItem {
                     item_id: &it.item_id,
@@ -462,7 +503,8 @@ impl World {
                     slot: at.as_ref(),
                     rev: it.rev,
                 },
-            );
+            )
+            .unwrap();
         }
     }
 
@@ -501,10 +543,12 @@ impl World {
 
     /// Whether, of two entries for `name` at one revision, the one
     /// published in this step wins: decided by the sequence, so that it
-    /// is the same in every run.
+    /// is the same in every run. A seed and the next one (2 and 3, say)
+    /// decide every tie the other way from each other.
     fn new_entry_wins(&self, name: &str) -> bool {
-        let said = format!("{}/{}/{name}", self.seed, self.step);
-        cordelia_crypto::sha256(said.as_bytes())[0] & 1 == 1
+        let said = format!("{}/{}/{name}", self.seed >> 1, self.step);
+        let wins = cordelia_crypto::sha256(said.as_bytes())[0] & 1 == 1;
+        wins ^ (self.seed & 1 == 1)
     }
 
     /// For each entry the device has published and that has not been
@@ -547,6 +591,9 @@ impl World {
                 .unwrap();
             let aad = item_aad(&self.channel, it.slot.as_deref(), it.rev);
             let plaintext = cordelia_crypto::item_decrypt(&key, &it.encrypted_blob, &aad).unwrap();
+            // No bound: each try lands on the right side with the chance
+            // that the rivals' hashes leave, so it ends, and now and then
+            // takes many thousands of tries.
             let (blob, hash) = loop {
                 let blob = cordelia_crypto::item_encrypt(&key, &plaintext, &aad).unwrap();
                 let hash = cordelia_crypto::sha256(&blob);
@@ -695,13 +742,6 @@ impl World {
                 note(root, text);
             }
         }
-        // An index text that was let go of took its lines with it.
-        let let_go_lines: BTreeSet<&str> = self
-            .let_go
-            .iter()
-            .filter(|(root, _)| root == INDEX_FILE)
-            .flat_map(|(_, text)| text.lines())
-            .collect();
         let mut lost: Vec<String> = self
             .wrote
             .iter()
@@ -711,9 +751,7 @@ impl World {
         lost.extend(
             self.lines
                 .iter()
-                .filter(|line| {
-                    !index_lines.contains(*line) && !let_go_lines.contains(line.as_str())
-                })
+                .filter(|line| !index_lines.contains(*line) && !self.let_go_lines.contains(*line))
                 .map(|line| format!("{INDEX_FILE}: the line {line:?}")),
         );
         lost
@@ -737,8 +775,9 @@ fn run(kinds: &[Kind], seed: u64, steps: &[Step]) -> Vec<Vec<Has>> {
 /// with devices of `kinds`, it leaves every device after every step with
 /// the same files that are not conflict files, the same versions in the
 /// channel and the same records. Every conflict file of the first run is
-/// in the second.
-fn same_as_before(kinds: &[Kind], seed: u64, steps: &[Step]) {
+/// in the second. Returns whether the second run ends with conflict files
+/// that the first does not have: whether the rule made a difference.
+fn same_as_before(kinds: &[Kind], seed: u64, steps: &[Step]) -> bool {
     let before = run(&vec![Kind::Before; kinds.len()], seed, steps);
     let built = run(kinds, seed, steps);
     for (i, (was, is)) in before.iter().zip(&built).enumerate() {
@@ -753,6 +792,8 @@ fn same_as_before(kinds: &[Kind], seed: u64, steps: &[Step]) {
             assert!(was.copies.is_subset(&is.copies), "conflict files: {at}");
         }
     }
+    let copies = |last: &[Has]| -> usize { last.iter().map(|has| has.copies.len()).sum() };
+    copies(built.last().unwrap()) > copies(before.last().unwrap())
 }
 
 /// Every device hears from every other and runs a cycle, twice over: what
@@ -853,6 +894,17 @@ fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
     tie.extend([Pass(2, 1), Cycle(1), Pass(1, 0), Pass(2, 0), Cycle(0)]);
     tie.extend(sync(3));
 
+    // A tie between devices 0 and 1 that device 2 holds whole. Device 2
+    // takes the one that counts and writes over it, and each of the two
+    // then hears of that before anything else: the one whose entry lost
+    // the tie was not written over.
+    let mut whole = agreed(3, "a.md");
+    whole.extend([Edit(0, "a.md"), Edit(1, "a.md"), Cycle(0), Cycle(1)]);
+    whole.extend([Pass(0, 2), Pass(1, 2), Cycle(2), Edit(2, "a.md"), Cycle(2)]);
+    whole.extend([PassOne(2, 0, "a.md"), Cycle(0)]);
+    whole.extend([PassOne(2, 1, "a.md"), Cycle(1)]);
+    whole.extend(sync(3));
+
     // A file deleted, and written again while another device still holds
     // the text from before.
     let mut again = agreed(3, "a.md");
@@ -885,6 +937,7 @@ fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
         ("a file with no extension", 4, overtaken("b", Edit(0, "b"))),
         ("the index overtaken", 3, index),
         ("a tie beside a higher revision", 3, tie),
+        ("a tie written over by a device that holds both", 3, whole),
         ("written again after a delete", 3, again),
         ("waiting for a key, an edit", 2, waits(Edit(1, "a.md"))),
         ("waiting for a key, a delete", 2, waits(Delete(1, "a.md"))),
@@ -901,8 +954,9 @@ fn every_file_is_as_it_was_before_in_the_written_sequences() {
             let kinds: Vec<Kind> = (0..n)
                 .map(|d| if mix & (1 << d) != 0 { Built } else { Before })
                 .collect();
-            // Two outcomes of each tie.
-            for seed in [1, 2] {
+            // Each tie both ways: the two seeds decide every tie the
+            // other way from each other.
+            for seed in [2, 3] {
                 eprintln!("{name}: {kinds:?}, seed {seed}");
                 same_as_before(&kinds, seed, &steps);
             }
@@ -920,14 +974,18 @@ fn sequences() -> u64 {
 }
 
 /// The property, over generated sequences of two, three and four devices.
+/// The rule makes a difference in a good part of them: a generator that
+/// stopped reaching it would leave the property true of nothing.
 #[test]
 fn every_file_is_as_it_was_before_in_generated_sequences() {
+    let (mut run, mut fired) = (0, 0);
     for n in 2..=4 {
         for seed in 1..=sequences() {
             let mut dice = Dice(seed * 7919 + n as u64);
             let mut steps = dice.steps(n, 60, false);
             steps.extend(sync(n));
-            same_as_before(&vec![Built; n], seed, &steps);
+            run += 1;
+            fired += usize::from(same_as_before(&vec![Built; n], seed, &steps));
             // And a mix, chosen by the seed.
             let kinds: Vec<Kind> = (0..n)
                 .map(|_| if dice.roll(2) == 0 { Built } else { Before })
@@ -935,6 +993,7 @@ fn every_file_is_as_it_was_before_in_generated_sequences() {
             same_as_before(&kinds, seed, &steps);
         }
     }
+    assert!(3 * fired >= run, "the rule fired in {fired} of {run}");
 }
 
 /// The written sequences do make the rule fire: each run with every
@@ -944,11 +1003,13 @@ fn every_file_is_as_it_was_before_in_generated_sequences() {
 #[test]
 fn the_written_sequences_make_the_rule_fire() {
     for (name, n, steps) in written() {
-        let copies = |kind: Kind| -> usize {
-            let last = run(&vec![kind; n], 1, &steps).pop().unwrap();
-            last.iter().map(|has| has.copies.len()).sum()
-        };
-        assert!(copies(Built) > copies(Before), "{name}");
+        for seed in [2, 3] {
+            let copies = |kind: Kind| -> usize {
+                let last = run(&vec![kind; n], seed, &steps).pop().unwrap();
+                last.iter().map(|has| has.copies.len()).sum()
+            };
+            assert!(copies(Built) > copies(Before), "{name}, seed {seed}");
+        }
     }
 }
 
@@ -967,7 +1028,7 @@ fn no_text_is_lost_that_nobody_let_go_of() {
         assert!(lost.is_empty(), "seed {seed}: {lost:?} after {steps:?}");
     };
     for (_, n, steps) in written() {
-        for seed in [1, 2] {
+        for seed in [2, 3] {
             at_rest(n, seed, &steps);
         }
     }
@@ -1013,6 +1074,39 @@ fn each_device_that_held_an_overtaken_entry_keeps_it() {
     }
 }
 
+/// A record made before the writer was kept says nothing of who wrote
+/// the entry, and a version at a higher revision is then taken as it was
+/// before, with nothing kept. Here device 2's records are such when the
+/// version arrives that overtakes the entry it holds: it keeps nothing,
+/// and device 1, which wrote that entry, is the only one that does.
+#[test]
+fn a_device_whose_records_are_from_before_keeps_nothing() {
+    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
+    steps.extend(sync(3));
+    steps.extend([Edit(1, "a.md"), Cycle(1), Pass(1, 2), Cycle(2)]);
+    steps.extend([Edit(0, "a.md"), Cycle(0), Edit(0, "a.md"), Cycle(0)]);
+    steps.extend([NoWriters(2), Pass(0, 2), Cycle(2)]);
+    let mut world = World::new(&[Built; 3], 2);
+    for step in &steps {
+        world.run(step);
+    }
+    assert!(world.read(2, "a.md").unwrap().contains("written on 0"));
+    assert_eq!(world.first_copy(2), None);
+    world.rest();
+    let only = format!(
+        "a.conflict-{}.md",
+        hex::encode(&world.devices[1].st.identity.public_key()[..4])
+    );
+    for d in 0..3 {
+        let copies: Vec<String> = world
+            .names(d)
+            .into_iter()
+            .filter(|name| names::is_conflict_name(name))
+            .collect();
+        assert_eq!(copies, std::slice::from_ref(&only), "device {d}");
+    }
+}
+
 /// The check that nothing is lost can see what the rule is for: on
 /// devices as they were before, one edit against two loses the one, and
 /// the check says so.
@@ -1048,4 +1142,30 @@ fn the_check_sees_an_edit_that_is_overtaken_and_lost() {
         "{lost:?}"
     );
     assert_eq!(lost_on(Built), Vec::<String>::new());
+}
+
+/// The check goes on seeing after a copy of the index has been resolved.
+/// Device 1's index is overtaken and kept, and the copy is merged back
+/// into the index by hand, which lets go of no line. Then the index is
+/// overtaken again, and this time device 1 behaves as devices did before:
+/// the lines it had are in no index and in no copy, and the check says so.
+#[test]
+fn the_check_sees_a_line_lost_after_a_copy_was_merged() {
+    let mut steps = vec![Line(0), Cycle(0)];
+    steps.extend(sync(2));
+    steps.extend([Line(1), Cycle(1)]);
+    steps.extend([Line(0), Cycle(0), Line(0), Cycle(0)]);
+    steps.extend([Pass(0, 1), Cycle(1), MergeCopy(1), Cycle(1)]);
+    steps.extend([Line(0), Cycle(0), Line(0), Cycle(0)]);
+    steps.extend([AsBefore(1), Pass(0, 1), Cycle(1)]);
+    let mut world = World::new(&[Built, Built], 2);
+    for step in &steps {
+        world.run(step);
+    }
+    world.rest();
+    let lost = world.lost();
+    assert_eq!(lost.len(), 2, "{lost:?}");
+    for line in ["- written on 1 at step", "- merged on 1 at step"] {
+        assert!(lost.iter().any(|l| l.contains(line)), "{line}: {lost:?}");
+    }
 }

@@ -538,8 +538,9 @@ fn copies_of(dir: &Path, name: &str) -> Vec<(String, String)> {
 
 /// Two devices that agree on `base` as the text of one file, and are then
 /// apart. Each writes the texts given to the file in turn (`None` deletes
-/// it), with a cycle after each, and hears nothing from the other. Then
-/// they meet. Returns the two devices and their memory folders.
+/// it), with a cycle after each that publishes it, and hears nothing from
+/// the other. Then they meet. Returns the two devices and their memory
+/// folders.
 fn apart(
     name: &str,
     base: &str,
@@ -557,7 +558,11 @@ fn apart(
                 Some(text) => std::fs::write(mem.join(name), text).unwrap(),
                 None => std::fs::remove_file(mem.join(name)).unwrap(),
             }
-            device.cycle();
+            // Each is published by itself, so each is a revision: the
+            // device that does more ends at the higher one.
+            let report = device.cycle();
+            let published: usize = report.folders.iter().map(|f| f.published).sum();
+            assert_eq!(published, 1, "{report:?}");
         }
     }
     settle(&mut a, &mut b);

@@ -273,9 +273,10 @@ Two mechanisms carry items between them:
    this device's version is kept as a conflict file. An edit beats a delete,
    whichever side made it. `MEMORY.md` is merged: the union of both versions'
    lines, minus pointers to deleted files. A version at a higher revision is
-   taken; where its item does not show that it was written after this
-   device's, this device's is kept as a conflict file first. (Section 4.5 of
-   the decision record has the rule, and section 9 what it does not cover.)
+   taken. Where its item says what it was written after, and that does not
+   show it was written after this device's, this device's is kept as a
+   conflict file first. (Section 4.5 of the decision record has the rule, and
+   section 9 what it does not cover.)
 3. **Apply safely.** Files are written atomically (a temporary file, then a
    rename, which never writes through a symlink). Only plain file names are
    accepted from other devices: no separators, no `..`, no hidden files. Before

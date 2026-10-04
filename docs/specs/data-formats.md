@@ -7,7 +7,7 @@
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, specs/search-indexing.md, specs/identity.md
 
-> **v1 status (2026-09-30).** The schema is at version 8. Migrations since
+> **v1 status (2026-09-30).** The schema is at version 9. Migrations since
 > this spec, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md):
 >
 > - **v4:** `channels` admits type `inbox` and gains `epoch` and

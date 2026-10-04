@@ -3221,6 +3221,84 @@ mod tests {
             said(&p.st, &p.channel, "z.md"),
             Some(after(&[(&them, 2)], Some("two\n"), Some(2)))
         );
+
+        // The same where the entry held beside the channel's version is
+        // at its own revision. The other device and the third write the
+        // file again, neither with the other's, and this device takes the
+        // one that counts. The one that lost the tie is not named: this
+        // device's entry was not written over it.
+        p.other_writes("z.md", Some("theirs\n"));
+        write_at(&third, &p.channel, "z.md", "the third's\n", 4);
+        deliver(&third, &p.st, &p.channel);
+        let (_, rev, counts) = version(&p.st, &p.channel, "z.md").unwrap();
+        assert_eq!(rev, 4);
+        let winner = match counts.as_str() {
+            "theirs\n" => them,
+            _ => third.identity.public_key(),
+        };
+        assert_eq!(p.cycle().pulled, 1);
+        p.file("z.md", "mine again\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(
+            said(&p.st, &p.channel, "z.md"),
+            Some(after(&[(&winner, 4)], Some(&counts), Some(4)))
+        );
+    }
+
+    /// An entry cannot have been written after an entry at its own
+    /// revision or a higher one, whatever it says, and the adapter reads
+    /// what an entry says against that entry's revision. Here another
+    /// device's entry names this device at the entry's own revision. If
+    /// that were believed it would be known to follow this device's. It
+    /// is not believed, and the name is not carried into what this device
+    /// then writes over that entry.
+    #[test]
+    fn what_an_entry_says_is_read_against_its_own_revision() {
+        let p = Pair::new();
+        let me = p.st.identity.public_key();
+        let them = p.other.identity.public_key();
+        // Named at the revision this device wrote: known to follow, and
+        // nothing is kept.
+        p.file("y.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_says("y.md", "theirs\n", Some(&after(&[(&me, 1)], None, None)));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+
+        // Named at the entry's own revision, 2: this device's text is
+        // kept.
+        p.file("z.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_says("z.md", "theirs\n", Some(&after(&[(&me, 2)], None, None)));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.cycle().published, 1);
+
+        p.file("z.md", "mine again\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(
+            said(&p.st, &p.channel, "z.md"),
+            Some(after(&[(&them, 2)], Some("theirs\n"), None))
+        );
+    }
+
+    /// A delete is no text to have been written over, whatever it
+    /// carries.
+    #[test]
+    fn a_delete_is_no_text_to_be_written_over() {
+        let p = Pair::new();
+        p.other_writes("z.md", Some("theirs\n"));
+        let db = p.st.db.lock().unwrap();
+        let mut version = entries::current_of(&p.st, &db, &p.channel, "z.md")
+            .unwrap()
+            .unwrap()
+            .current;
+        assert_eq!(
+            written_after(Some(&version)).over,
+            Some(Content::new("theirs\n").hash)
+        );
+        version.deleted = true;
+        assert_eq!(written_after(Some(&version)).over, None);
     }
 
     /// An entry that would not fit with all that it says, says less: the

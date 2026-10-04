@@ -82,7 +82,7 @@ See the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4 for 
 - **Slot**: HMAC-SHA256(slot_key, "cordelia:slot:v1:" || key). Lets relays group revisions of a key without learning the key.
 - **Slot key**: A random 32-byte key per channel, sent in the channel state and never rotated.
 - **Rev**: A keyed item's revision number: the highest seen for its slot, plus one.
-- **Conflict**: Two revisions of a key with the same rev from different authors. The higher content hash wins; the device whose version lost keeps it as `<file>.conflict-<tag>.md`, where the tag is the first 8 hex digits of its key.
+- **Conflict**: Two revisions of a key with the same rev from different authors. The higher content hash wins; the device whose version lost keeps it as `<file>.conflict-<tag>.md`, where the tag is the first 8 hex digits of its key. A version at a higher rev that is not known to have been written after this device's is taken, and this device's is kept in such a file too (decision record 4.5).
 - **Outbox**: Items this node wrote that no relay has acknowledged yet.
 - **Adapter**: The part of the node that maps one agent's memory files onto channels. v1 has one, for Claude Code (`cordelia sync claude`).
 - **Mapping**: A declaration, on one device, that Claude's memory for a folder syncs under a name (`cordelia sync map`). The name is what a person's devices share: a git project's normalised remote, a name given to a folder, or `~` for home memory.

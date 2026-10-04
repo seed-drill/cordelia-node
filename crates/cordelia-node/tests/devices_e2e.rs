@@ -1808,19 +1808,25 @@ fn an_edit_overtaken_while_apart_is_kept_on_both_machines() {
 
     // The machines are apart: the relay, which is how they meet, is down.
     relay.stop();
-    // When home memory was last published from a machine. Each edit is
-    // waited for, so that two edits are two revisions.
-    let published = |n: &Node| -> Option<String> {
-        let state: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
+    // When home memory was last published from a machine: `Some(None)` if
+    // it never was, and `None` if this reading says nothing (a status
+    // that could not ask the node has no folders in it). Each edit is
+    // waited for, so that two edits are two revisions; and a reading that
+    // says nothing is not taken for a change, or the wait would end before
+    // the edit was published and two edits could be one revision.
+    let published = |n: &Node| -> Option<Option<String>> {
+        let state: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).ok()?;
         let projects = state["sync"]["projects"].as_array()?.clone();
         let home = projects.into_iter().find(|p| p["project"] == "~")?;
-        home["last_published_at"].as_str().map(String::from)
+        Some(home["last_published_at"].as_str().map(String::from))
     };
     let edit = |n: &Node, mem: &std::path::Path, text: &str| {
-        let before = published(n);
+        let before = wait_for("when it last published", &[&a, &b], 60, || published(n));
         std::fs::write(mem.join("notes.md"), text).unwrap();
         wait_for("the edit is published", &[&a, &b], 60, || {
-            (published(n) != before).then_some(())
+            published(n)
+                .filter(|now| now.is_some() && *now != before)
+                .map(|_| ())
         });
     };
     edit(&b, &b_mem, "from b\n");

@@ -288,12 +288,23 @@ ALTER TABLE sync_files ADD COLUMN author BLOB;
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
 /// again from the beginning.
+///
+/// The version is read again inside the transaction, and the step is not
+/// run if the database is already at `version`. The node and a command
+/// each open the database for themselves, and two that open it at one
+/// moment both read the version from before: the second would otherwise
+/// run the step a second time, and fail.
 fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), StorageError> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    match conn
-        .execute_batch(sql)
-        .and_then(|_| conn.pragma_update(None, "user_version", version))
-    {
+    let step = || -> rusqlite::Result<()> {
+        let now: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if now >= version {
+            return Ok(());
+        }
+        conn.execute_batch(sql)?;
+        conn.pragma_update(None, "user_version", version)
+    };
+    match step() {
         Ok(()) => Ok(conn.execute_batch("COMMIT;")?),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK;");
@@ -775,5 +786,10 @@ mod tests {
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), 9);
         assert!(has_writer(&conn));
+
+        // Nor does the step itself, asked for again by a process that
+        // read the version before another had run it.
+        migrate_in_one(&conn, MIGRATION_V9, 9).unwrap();
+        assert_eq!(version(&conn), 9);
     }
 }

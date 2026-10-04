@@ -429,10 +429,11 @@ fn join(owner: &Node, new: &Node, others: &[&Node]) {
 /// What an entry says it was written after is a member of its sealed
 /// content, beside the text. It is there only when the writer puts it
 /// there, for a delete as for a text, and it is read back as written. An
-/// entry with it is read by a version that knows nothing of it to the
-/// same key and content, since that version takes the members it knows by
-/// name. And an entry published again when a device is removed says
-/// nothing, whatever the one it takes the place of said.
+/// entry with it has the `key`, `content` and `metadata` members it would
+/// have without it, and those are the members that a version which knows
+/// nothing of it takes, by name. And an entry published again when a
+/// device is removed says nothing, whatever the one it takes the place of
+/// said.
 #[test]
 fn what_an_entry_was_written_after_is_carried_only_when_said() {
     let (a, b, ch) = paired();
