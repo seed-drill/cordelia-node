@@ -445,9 +445,9 @@ pub struct Applied {
 /// Its statement is judged beside the one the device has applied
 /// ([`judge`]). A device that is in a fork goes on judging, so that it
 /// applies the statement that settles the two, and takes no other: a
-/// statement that was not made after both is a fork still. A device that
-/// has stopped for another reason takes nothing: the way on is a
-/// person's.
+/// statement that was not made after both is a fork still, and one that
+/// undoes a removal of either is refused. A device that has stopped for
+/// another reason takes nothing: the way on is a person's.
 ///
 /// An error is this device's, and not the entry's: its database could not
 /// be read or written. Nothing was changed, and the device has been shown
@@ -486,13 +486,11 @@ pub fn shown(
             Err(e) => return Ok(Shown::Refused(Refused::NotAChangeEntry(e))),
         };
 
-        let applied = &held.statement.statement;
-        let own = identity.public_key();
-        let judgement = match judge(&opened.statement, applied, &own, &following.phrase_key) {
+        let judgement = match judged(conn, &held, &opened.statement, &identity.public_key())? {
             Ok(judgement) => judgement,
             Err(e) => return Ok(Shown::Refused(Refused::NotAChangeEntry(e.into()))),
         };
-        match beside_the_one_apart(conn, &held, &opened.statement.statement, judgement)? {
+        match judgement {
             Judgement::Behind => Ok(Shown::Behind),
             Judgement::Fork => {
                 // A device that is in a fork keeps the two entries it has.
@@ -529,37 +527,59 @@ pub fn shown(
     })
 }
 
-/// What a statement is to a device that is in a fork, where `judgement`
-/// is what it is beside the statement the device has applied.
+/// What the statement `shown` is to this device, whose key is `own`: it
+/// is judged beside the statement the device has applied ([`judge`]), and
+/// on a device that is in a fork beside the one kept apart as well.
+///
+/// The error inside is the statement's: it is no statement that this
+/// device takes, and nothing is done with it. The error outside is this
+/// device's.
 ///
 /// A device in a fork has seen two statements made apart, and takes only
 /// a statement that was made after both: the one that settles them, or
-/// one made after that. Any other is a fork still, though it was made
-/// after the one applied: the one kept apart is not on its chain, and
-/// what that one decided would be dropped in silence. To a device that is
-/// in no fork, a statement is what it was judged to be.
-fn beside_the_one_apart(
+/// one made after that.
+///
+/// - One that has not the statement kept apart on its chain is a fork
+///   still, though it was made after the one applied: what the one kept
+///   apart decided would be dropped in silence.
+/// - One that has both on its chain and lacks a removal that either has
+///   is refused, as [`judge`] refuses one that undoes a removal of the
+///   applied statement: a statement lists as removed every key that any
+///   statement on its chain removes.
+///
+/// To a device that is in no fork, a statement is what [`judge`] says.
+fn judged(
     conn: &Connection,
     held: &Held,
-    shown: &Statement,
-    judgement: Judgement,
-) -> Result<Judgement, PersonError> {
+    shown: &SignedStatement,
+    own: &[u8; 32],
+) -> Result<Result<Judgement, StatementError>, PersonError> {
+    let following = &held.following;
+    let applied = &held.statement.statement;
+    let judgement = match judge(shown, applied, own, &following.phrase_key) {
+        Ok(judgement) => judgement,
+        Err(e) => return Ok(Err(e)),
+    };
     if held.state != State::Fork || matches!(judgement, Judgement::Behind | Judgement::Fork) {
-        return Ok(judgement);
+        return Ok(Ok(judgement));
     }
     let not_held = |what: String| PersonError::Held(format!("the entry kept apart: {what}"));
     let apart = kept_entry(conn, Kept::Apart)?.ok_or_else(|| not_held("there is none".into()))?;
     let apart = change_entry::open_statement(
         &apart,
-        &held.following.phrase_key,
-        &held.following.phrase_channel,
-        &held.following.statement_key,
+        &following.phrase_key,
+        &following.phrase_channel,
+        &following.statement_key,
     )
     .map_err(|e| not_held(e.to_string()))?;
-    if !shown.has_on_chain(&apart.statement.link()?) {
-        return Ok(Judgement::Fork);
+    let (shown, apart) = (&shown.statement, &apart.statement);
+    if !shown.has_on_chain(&apart.link()?) {
+        return Ok(Ok(Judgement::Fork));
     }
-    Ok(judgement)
+    if !shown.keeps_the_removals_of(apart) {
+        return Ok(Err(StatementError::UndoesARemoval));
+    }
+    Ok(Ok(judgement))
 }
 
 /// The device stops, and keeps the entry that stopped it as the latest
@@ -642,13 +662,7 @@ pub fn apply(
             entry,
         };
         its_own_entry(&change)?;
-        let judgement = judge(
-            statement,
-            &held.statement.statement,
-            &identity.public_key(),
-            &held.following.phrase_key,
-        )?;
-        let judgement = beside_the_one_apart(conn, &held, &statement.statement, judgement)?;
+        let judgement = judged(conn, &held, statement, &identity.public_key())??;
         if judgement != Judgement::Applies {
             return Err(PersonError::NotApplied(judgement));
         }
@@ -2579,6 +2593,85 @@ mod tests {
         assert_eq!(kept(&conn, Kept::Latest), Some(entry.id()));
         assert_eq!(kept(&conn, Kept::Apart), None);
         assert_eq!(applied_number(&conn), 3);
+    }
+
+    /// A device in a fork refuses a statement that has both on its chain
+    /// and lacks a removal that either of the two has: the one applied,
+    /// or the one kept apart. The device stays in its fork, and nothing
+    /// changes.
+    #[test]
+    fn test_a_device_in_a_fork_refuses_a_statement_that_undoes_a_removal_of_either() {
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        // Statement 3 removes device 2. Made apart from it, on device 2,
+        // one that removes device 1.
+        let apart = two
+            .next(key(2), &secret(13), listed(&[2, 0]), &[key(1)])
+            .unwrap();
+        let conn = db::open_in_memory().unwrap();
+        follow(&conn, 0, &phrase, &three, secret(3));
+        hold_name(&conn, "team", NOW).unwrap();
+        put(&conn, &own(3, "team"), 0, 5, "a.md", text("a"), &[]);
+        let other = change(&phrase, &apart, secret(13));
+        assert_eq!(shown(&conn, &device(0), &other, NOW).unwrap(), Shown::Fork);
+        let in_the_fork = everything(&conn);
+
+        // The settlement removes both, and lists device 0 alone.
+        let settled =
+            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0]), &[]).unwrap();
+        assert_eq!(settled.removed.len(), 2);
+        let lacking = |key: [u8; 32]| {
+            let mut lacking = settled.clone();
+            lacking.removed.retain(|removed| *removed != key);
+            lacking.validate().unwrap();
+            assert!(lacking.has_on_chain(&three.link().unwrap()));
+            assert!(lacking.has_on_chain(&apart.link().unwrap()));
+            lacking
+        };
+        // What the one kept apart removed, what the one applied removed,
+        // and the first with the key among its devices again.
+        let mut back = lacking(key(1));
+        back.devices.push(listed(&[1]).remove(0));
+        back.validate().unwrap();
+        for (what, statement) in [
+            ("of the one kept apart", lacking(key(1))),
+            ("of the one applied", lacking(key(2))),
+            ("of the one kept apart, with the key listed", back),
+        ] {
+            let entry = change(&phrase, &statement, secret(20));
+            let undoes = ChangeEntryError::Statement(StatementError::UndoesARemoval);
+            assert_eq!(
+                shown(&conn, &device(0), &entry, NOW).unwrap(),
+                Shown::Refused(Refused::NotAChangeEntry(undoes)),
+                "{what}"
+            );
+            assert_eq!(state(&conn), State::Fork, "{what}");
+            assert_eq!(everything(&conn), in_the_fork, "{what}");
+            // Nor is it applied where it is given with its secret.
+            assert!(
+                matches!(
+                    apply(
+                        &conn,
+                        &device(0),
+                        &sign(&statement, &phrase),
+                        &secret(20),
+                        &entry,
+                        NOW
+                    ),
+                    Err(PersonError::Statement(StatementError::UndoesARemoval))
+                ),
+                "{what}"
+            );
+            assert_eq!(everything(&conn), in_the_fork, "{what}");
+        }
+
+        // The control: the settlement, which removes both, is applied.
+        let entry = change(&phrase, &settled, secret(20));
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert_eq!(state(&conn), State::Applied);
     }
 
     /// An entry that is not the phrase's, or is not well formed, is

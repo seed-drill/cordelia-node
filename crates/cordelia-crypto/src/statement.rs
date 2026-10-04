@@ -409,6 +409,13 @@ impl Statement {
         self.chain.contains(link)
     }
 
+    /// Whether this statement lists as removed every key that `before`
+    /// does (decision 2026-10-04 §4.2, rule 5): a statement undoes no
+    /// removal of one that it was made after.
+    pub fn keeps_the_removals_of(&self, before: &Statement) -> bool {
+        before.removed.iter().all(|key| self.removes(key))
+    }
+
     /// Whether this statement commits to `secret`: the secret's hash,
     /// under the commitment's label, is the one the statement gives
     /// (decision 2026-10-04 §4.2, rule 4).
@@ -659,7 +666,7 @@ pub fn judge(
     if !shown.has_on_chain(&ours) {
         return Ok(Judgement::Fork);
     }
-    if !applied.removed.iter().all(|key| shown.removes(key)) {
+    if !shown.keeps_the_removals_of(applied) {
         return Err(StatementError::UndoesARemoval);
     }
     Ok(if shown.lists(device) {
