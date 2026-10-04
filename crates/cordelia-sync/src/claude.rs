@@ -1641,13 +1641,16 @@ fn current_hash(dir: &Path, key: &str) -> Option<[u8; 32]> {
 }
 
 /// Whether the file is as the cycle saw it: the same bytes, or still not
-/// there. A name that has come to hold something that cannot be read is
-/// not absent: what it holds could not be kept, so it is not replaced.
+/// there. A name that has come to hold something that cannot be read (a
+/// directory, a link to nowhere) is not absent: what it holds could not
+/// be kept, so it is not replaced. A name that cannot be looked at is
+/// taken as still not there: the write is then tried, and its failure is
+/// the file's, reported as any is, where a name passed over here would be
+/// passed over in silence every cycle.
 fn as_seen(dir: &Path, key: &str, seen: Option<[u8; 32]>) -> bool {
     match seen {
         Some(hash) => current_hash(dir, key) == Some(hash),
-        None => std::fs::symlink_metadata(dir.join(key))
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        None => std::fs::symlink_metadata(dir.join(key)).is_err(),
     }
 }
 
@@ -2144,8 +2147,19 @@ fn apply(
         }
     };
 
+    // Whether a text can be published under this name at all. It is asked
+    // before anything is kept for the publish: a text that fits in no
+    // entry is not published in any cycle while the file stays as it is,
+    // and what it would replace would otherwise be written to history,
+    // and removed again, in each.
+    let fits = |text: &str| entries::fits(&full_key, &Value::String(text.to_string()));
+
     match action {
         Action::Publish(text) => {
+            if !fits(&text) {
+                too_large(report);
+                return Ok(false);
+            }
             // The channel's version is kept in history first. A publish
             // that is not made takes the record with it.
             let (ahead, at) = keep_channel(ctx, key, &full_key, history::Change::EditedHere)?;
@@ -2261,6 +2275,10 @@ fn apply(
             report.conflicts += 1;
         }
         Action::Merge(text) => {
+            if !fits(&text) {
+                too_large(report);
+                return Ok(false);
+            }
             // The file as it is here is kept in history first, in a record
             // that names the revision the merged entry is to have.
             let at = revision_ahead(ctx, &full_key)?;
@@ -6198,6 +6216,55 @@ mod tests {
         }
     }
 
+    /// Nothing is kept for an entry that cannot be published: a text that
+    /// fits in no entry, a merged index that does not, a name whose
+    /// revisions are used up. Each is found out before the text it would
+    /// replace goes into history, and would otherwise be written there,
+    /// and removed again, in every cycle. Here nothing can be kept at all,
+    /// so anything that asked for a record would fail for that: each is
+    /// reported for what it is.
+    #[test]
+    fn nothing_is_kept_for_an_entry_that_cannot_be_published() {
+        let index = crate::memory_md::INDEX_FILE;
+        let large = "\"".repeat(MAX_FILE_BYTES - 64);
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        p.file("a.md", "one\n");
+        p.file(index, "- [Notes](notes.md) one\n");
+        assert_eq!(p.cycle().published, 3);
+        // A name at the last revision there is.
+        let limit = cordelia_core::protocol::MAX_REV;
+        write_at(&p.other, &p.channel, "a.md", "at the limit\n", limit);
+        deliver(&p.other, &p.st, &p.channel);
+        assert_eq!(p.cycle().pulled, 1);
+        // Something other than a directory where history is kept.
+        drop(store);
+        let dir = p.st.home_dir.join("history");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, "in the way").unwrap();
+
+        p.file("notes.md", &large);
+        p.file("a.md", "two\n");
+        p.file(index, &large);
+        p.other_writes(index, Some("- [Other](other.md) there\n"));
+        for _ in 0..2 {
+            let report = p.cycle();
+            let mut too_large = report.too_large.clone();
+            too_large.sort();
+            assert_eq!(too_large, [index, "notes.md"], "{report:?}");
+            assert_eq!(report.failed.len(), 1, "{report:?}");
+            assert_eq!(report.failed[0].name, "a.md");
+            assert!(
+                report.failed[0].error.contains("revision limit"),
+                "{report:?}"
+            );
+            assert_eq!(report.published, 0, "{report:?}");
+        }
+        assert!(dir.is_file());
+        assert_eq!(p.read("notes.md").as_deref(), Some(large.as_str()));
+        assert_eq!(p.held("notes.md").as_deref(), Some("one\n"));
+    }
+
     /// A record stays only if its change was made. A publish that is
     /// refused, an entry that does not fit, and a file that is written to
     /// while its new text is flushed each take their record with them,
@@ -6379,6 +6446,23 @@ mod tests {
         let db = p.st.db.lock().unwrap();
         let entry = publish_over(&ctx, &db, "notes.md", Some("three\n"), None).unwrap();
         assert_eq!(entry.map(|(entry, _)| entry.rev), Some(3));
+    }
+
+    /// A name that cannot be looked at is taken as still not there, so
+    /// that the write is tried and its failure reported: passed over, it
+    /// would be passed over in silence every cycle. (Here a name longer
+    /// than any volume takes.) A name that holds something is another
+    /// matter, and is not written over.
+    #[test]
+    fn a_name_that_cannot_be_looked_at_is_not_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "n".repeat(4096);
+        let looked = std::fs::symlink_metadata(dir.path().join(&long));
+        assert!(looked.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound));
+        assert!(as_seen(dir.path(), &long, None));
+        assert!(as_seen(dir.path(), "absent.md", None));
+        std::fs::create_dir(dir.path().join("taken.md")).unwrap();
+        assert!(!as_seen(dir.path(), "taken.md", None));
     }
 
     /// A name that had no file when the cycle listed the folder, and has

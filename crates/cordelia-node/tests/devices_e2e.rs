@@ -2512,7 +2512,7 @@ fn what_sync_replaced_or_removed_is_put_back_from_either_machine() {
     // the first machine as an ordinary edit.
     let before = id_of(&b, "pulled", "one\n").expect("the record of what was pulled over");
     let said = b.cli(&["restore", &before]);
-    assert!(said.contains("at the next sync, as an edit"), "{said}");
+    assert!(said.contains("It goes to your other devices"), "{said}");
     both("the restored text is on both", "notes.md", Some("one\n"));
     // And undoes it, by the id the restore gave: the record of what the
     // restore replaced.
@@ -2567,12 +2567,45 @@ fn what_sync_replaced_or_removed_is_put_back_from_either_machine() {
     // Records dropped on one machine are gone from it, and stay on the
     // other. Those of another file stay too.
     let of = |n: &Node, file: &str| kept(n).iter().filter(|r| r.0 == file).count();
+    // (A record is made final a moment after its file is written, so a
+    // machine may come to list one more than it did: none fewer.)
     let (notes_on_a, index_on_b) = (of(&a, "notes.md"), of(&b, "MEMORY.md"));
     assert!(of(&b, "notes.md") > 0 && notes_on_a > 0 && index_on_b > 0);
     let said = b.cli(&["history", "drop", "~", "notes.md"]);
     assert!(said.contains("records from this device"), "{said}");
     assert_eq!(of(&b, "notes.md"), 0);
-    assert_eq!(of(&b, "MEMORY.md"), index_on_b);
-    assert_eq!(of(&a, "notes.md"), notes_on_a);
+    assert!(of(&b, "MEMORY.md") >= index_on_b);
+    assert!(of(&a, "notes.md") >= notes_on_a);
     assert_eq!(read(&b_mem.join("notes.md")).as_deref(), Some("two\n"));
+}
+
+/// Local history is set up as the configuration says: how long a record
+/// is kept, how much is kept, and whether anything is. A node told to
+/// keep nothing removes what it had kept.
+#[test]
+fn local_history_is_kept_as_the_configuration_says() {
+    let mut n = node("alone", "personal", None);
+    let path = n.config();
+    let config = std::fs::read_to_string(&path).unwrap();
+    let with = |history: &str| std::fs::write(&path, format!("{config}\n{history}")).unwrap();
+    with("[history]\ndays = 7\nmax_bytes = 123456\n");
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+    let listed = n.post("/api/v1/history/list", serde_json::json!({}));
+    assert_eq!(listed["on"], true, "{listed}");
+    assert_eq!(
+        (&listed["days"], &listed["max_bytes"]),
+        (&serde_json::json!(7), &serde_json::json!(123456))
+    );
+    let kept = n.data_dir().join("history");
+    assert!(kept.is_dir());
+    n.stop();
+
+    with("[history]\ndays = 0\n");
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+    let listed = n.post("/api/v1/history/list", serde_json::json!({}));
+    assert_eq!(listed["on"], false, "{listed}");
+    assert!(!kept.exists());
+    assert!(n.cli(&["history"]).contains("turned off"));
 }

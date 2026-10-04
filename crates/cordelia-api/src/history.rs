@@ -141,7 +141,8 @@ pub struct Restored {
     /// The record that keeps what the restore replaced: restoring that
     /// one undoes it. `None` where the file was absent, when undoing is
     /// deleting it; and where the record could not be made final, when it
-    /// is listed, as interrupted, once the node has started again.
+    /// is listed, as interrupted, after the next sweep of history (within
+    /// the hour, and when the node starts).
     pub undo: Option<String>,
     /// There was no file: the restore brought it back.
     pub was_absent: bool,
@@ -161,19 +162,26 @@ pub struct RestoreResponse {
     pub results: Vec<Restored>,
 }
 
-/// Whether a memory folder syncs now, as far as the node can tell from
+/// Whether a restored text will sync, as far as the node can tell from
 /// the report its last whole cycle left.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Syncs {
-    /// It synced in that cycle.
+    /// Its folder synced in that cycle, with nothing to report.
     Yes,
     /// Sync is off, or that cycle did not have the folder.
     No,
-    /// It is to sync, and waits to join its channel.
+    /// The folder is to sync, and waits to join its channel.
     Waits,
-    /// It cannot be told: no cycle has finished since the node started or
-    /// a setting changed, or the folder failed in the last one.
+    /// The text does not fit in an entry, so it stays on this device
+    /// whatever its folder does.
+    TooLarge,
+    /// It cannot be told: there is no report since a setting last
+    /// changed, the cycle ended before it reached its folders, or the
+    /// report has something to say of this one (it failed, or ended part
+    /// of the way through, or Claude Code keeps its memory elsewhere).
+    /// (A report is not removed when the node starts: for the seconds
+    /// until the first cycle ends, the answer is the last run's.)
     #[default]
     Unknown,
 }
@@ -199,8 +207,11 @@ pub struct DropResponse {
     /// The records removed: those asked for, and every other record on
     /// this device that held the same text as one of them.
     pub dropped: Vec<Line>,
-    /// With `all`: how many records were removed, readable or not.
+    /// How many records were removed (with `all`, readable or not).
     pub removed: usize,
+    /// How many were to go and could not be removed: they are still on
+    /// this device.
+    pub left: usize,
 }
 
 // ── Reading ────────────────────────────────────────────────────────
@@ -369,10 +380,12 @@ fn turn(state: &AppState, wait: Duration) -> Result<std::sync::MutexGuard<'_, ()
 ///
 /// It is read from the report the node's last whole cycle left, which is
 /// removed whenever a setting changes. A folder that the cycle gave a
-/// channel synced, whatever else the report says of it: an `error` there
-/// can be a notice about a folder that did sync, or one file's failure.
-/// One that the report lists with no channel failed before it began, and
-/// may or may not sync in the next cycle.
+/// channel, with nothing to say of it, synced. (A file that failed is
+/// reported by itself, and its folder synced.) One that the report says
+/// anything of may or may not sync in the next cycle: it failed before
+/// it began, or part of the way through, or Claude Code has moved its
+/// memory. A cycle that ended before it reached its folders says nothing
+/// of any of them.
 fn syncs(state: &AppState, folder: &str) -> Syncs {
     let Ok(db) = state.db.lock() else {
         return Syncs::Unknown;
@@ -402,10 +415,15 @@ fn syncs(state: &AppState, folder: &str) -> Syncs {
             .as_str()
             .is_some_and(|dir| Path::new(dir).join("memory") == Path::new(folder))
     });
+    let reached_none = folders.is_empty()
+        && report["errors"]
+            .as_array()
+            .is_some_and(|errors| !errors.is_empty());
     match listed {
+        None if reached_none => Syncs::Unknown,
         None => Syncs::No,
         Some(f) if f["waiting"] == true => Syncs::Waits,
-        Some(f) if f["channel_id"].is_string() => Syncs::Yes,
+        Some(f) if f["channel_id"].is_string() && f["error"].is_null() => Syncs::Yes,
         Some(_) => Syncs::Unknown,
     }
 }
@@ -468,7 +486,13 @@ fn restore_one(
     let target = folder.join(&about.file);
     let display = target.display().to_string();
     let before = text_now(&target).map_err(|why| format!("{display} {why}"))?;
-    let syncs = syncs(state, &about.folder);
+    // A text that fits in no entry stays on this device, whether or not
+    // its folder syncs: a record keeps a text of any size (what a restore
+    // replaced, say), and a restore puts back whatever it kept.
+    let syncs = match crate::entries::fits(&about.file, &serde_json::json!(text)) {
+        true => syncs(state, &about.folder),
+        false => Syncs::TooLarge,
+    };
     let mut restored = Restored {
         id: id.to_string(),
         done: true,
@@ -510,7 +534,7 @@ fn restore_one(
         return Err(format!("{display} changed while it was being restored"));
     }
     // Left pending where it cannot be made final: the text is kept either
-    // way, and is listed, as interrupted, once the node has started again.
+    // way, and is listed, as interrupted, after the next sweep.
     let undo = store.settle(pending).ok();
 
     if about.file == INDEX_FILE {
@@ -589,12 +613,18 @@ pub fn drop_records(
     }
     let _turn = turn(state, wait)?;
     if request.all {
-        let removed = store.clear().map_err(io("could not be cleared"))?;
+        let (removed, left) = store.clear().map_err(io("could not be cleared"))?;
         return Ok(DropResponse {
             dropped: Vec::new(),
             removed,
+            left,
         });
     }
+    // A record left pending holds a text too: its change could not be
+    // finished, or it could not be made final. Whoever holds the turn has
+    // no change in hand, so each is marked first, and is then listed with
+    // the rest.
+    store.recover().map_err(io("cannot be read"))?;
     let of = request.of.as_deref().unwrap_or_default();
     let dir = claude_dir(state)?;
     let listing = store.list().map_err(io("cannot be read"))?;
@@ -620,10 +650,15 @@ pub fn drop_records(
         .filter(|r| asked(&r.about) || same_text(&r.about))
         .collect();
     let ids: Vec<Id> = gone.iter().map(|r| r.id.clone()).collect();
-    let removed = store.remove(&ids).map_err(io("could not be removed"))?;
+    let (removed, left) = store.remove(&ids);
     Ok(DropResponse {
-        dropped: gone.into_iter().map(Line::of).collect(),
+        dropped: gone
+            .into_iter()
+            .filter(|r| !left.contains(&r.id))
+            .map(Line::of)
+            .collect(),
         removed,
+        left: left.len(),
     })
 }
 
@@ -736,10 +771,8 @@ mod tests {
             self.state.history.store().unwrap()
         }
 
-        /// Keep `text` as what `file` held before `change`, as the adapter
-        /// does. Returns the record's id.
-        fn kept(&self, file: &str, change: Change, text: Option<&str>, when: i64) -> String {
-            let about = About {
+        fn about(&self, file: &str, change: Change, text: Option<&str>) -> About {
+            About {
                 at: String::new(),
                 agent: "lab".into(),
                 folder: self.memory.display().to_string(),
@@ -751,10 +784,26 @@ mod tests {
                     rev: 4,
                 }),
                 behind: false,
-            };
+            }
+        }
+
+        /// Keep `text` as what `file` held before `change`, as the adapter
+        /// does. Returns the record's id.
+        fn kept(&self, file: &str, change: Change, text: Option<&str>, when: i64) -> String {
             let store = self.store();
+            let about = self.about(file, change, text);
             let pending = store.keep(about, text, at(when)).unwrap();
             store.settle(pending).unwrap().to_string()
+        }
+
+        /// The same, for a change that was never finished: the record is
+        /// left pending, as when the node stops between the two.
+        fn left_pending(&self, file: &str, text: &str, when: i64) -> String {
+            let about = self.about(file, Change::Pulled, Some(text));
+            let pending = self.store().keep(about, Some(text), at(when)).unwrap();
+            let id = pending.id().to_string();
+            std::mem::forget(pending);
+            id
         }
 
         fn write(&self, file: &str, text: &str) {
@@ -1195,12 +1244,18 @@ mod tests {
         // The last cycle synced it.
         report(generation, synced.clone());
         assert_eq!(syncs(), Syncs::Yes);
-        // And so it did where the report has something to say of it: a
-        // notice, or that it stopped part of the way through.
-        let notice = json!({ "channel_id": "grp_this", "error": "Claude Code now keeps..." });
-        report(generation, listed(notice));
+        // So it did where a file of it failed: that is reported by itself.
+        let a_file = json!({ "channel_id": "grp_this",
+            "failed": [{ "name": "other.md", "error": "is not text" }] });
+        report(generation, listed(a_file));
         assert_eq!(syncs(), Syncs::Yes);
-        // It failed before it began: it may sync in the next cycle or not.
+        // Where the report has something to say of the folder, it may sync
+        // in the next cycle or not: it ended part of the way through, or
+        // Claude Code keeps its memory elsewhere now.
+        let part_way = json!({ "channel_id": "grp_this", "error": "the database is locked" });
+        report(generation, listed(part_way));
+        assert_eq!(syncs(), Syncs::Unknown);
+        // The same where it failed before it began.
         report(
             generation,
             listed(json!({ "error": "the database is locked" })),
@@ -1215,6 +1270,16 @@ mod tests {
             json!({ "folder": "/another", "channel_id": "grp_this" }),
         );
         assert_eq!(syncs(), Syncs::No);
+        // The cycle ended before it reached any folder: it says nothing of
+        // this one. (One that reached none and had no failure had none.)
+        let reached = |errors: Value| {
+            let report = json!({ "generation": generation, "folders": [], "errors": errors });
+            set(meta::SYNC_CLAUDE_REPORT, Some(report.to_string()));
+        };
+        reached(json!(["personal channel: the database is locked"]));
+        assert_eq!(syncs(), Syncs::Unknown);
+        reached(json!([]));
+        assert_eq!(syncs(), Syncs::No);
         // A report from before the settings last changed says nothing of
         // what syncs now.
         report(generation + 1, synced.clone());
@@ -1227,6 +1292,20 @@ mod tests {
         let done = n.restore(&[&before, &behind]);
         assert_eq!((done[0].syncs, done[0].behind), (Syncs::Yes, false));
         assert_eq!((done[1].syncs, done[1].behind), (Syncs::Yes, true));
+
+        // A text that fits in no entry stays on this device, though its
+        // folder syncs: the largest that fits goes, and one byte more
+        // does not. (An entry holds the file's name and the text.)
+        let envelope = json!({ "key": "notes.md", "content": "", "metadata": null });
+        let room = cordelia_core::protocol::MAX_ITEM_BYTES
+            - cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES
+            - serde_json::to_vec(&envelope).unwrap().len();
+        let fits = n.kept("notes.md", Change::Restored, Some(&"x".repeat(room)), 2);
+        let too_large = n.kept("notes.md", Change::Restored, Some(&"x".repeat(room + 1)), 3);
+        assert_eq!(n.restore(&[&fits])[0].syncs, Syncs::Yes);
+        let done = n.restore(&[&too_large]);
+        assert!(done[0].done, "{done:?}");
+        assert_eq!(done[0].syncs, Syncs::TooLarge);
     }
 
     /// Restoring the index replaces it, and says which lines of the index
@@ -1269,6 +1348,10 @@ mod tests {
         let other = n.kept("other.md", Change::Pulled, Some("something else\n"), 3);
         let nearly = n.kept("other.md", Change::Pulled, Some("a token"), 4);
         let arrived = n.kept("notes.md", Change::Arrived, None, 5);
+        // A record of the file whose change was never finished holds a
+        // text too. It is not listed until it is marked.
+        let unfinished = n.left_pending("notes.md", "a text left pending\n", 6);
+        assert!(!n.ids().contains(&unfinished));
         let drop_of = |of: Option<&str>, file: Option<&str>, all: bool| {
             let request = DropRequest {
                 of: of.map(String::from),
@@ -1298,11 +1381,13 @@ mod tests {
         let dropped = drop_of(Some("lab"), Some("notes.md"), false).unwrap();
         let mut ids: Vec<String> = dropped.dropped.iter().map(|l| l.id.clone()).collect();
         ids.sort();
-        let mut expected = vec![token, older, copy, arrived];
+        let mut expected = vec![token, older, copy, arrived, unfinished];
         expected.sort();
         assert_eq!(ids, expected);
-        assert_eq!(dropped.removed, 4);
+        assert_eq!((dropped.removed, dropped.left), (5, 0));
         assert_eq!(n.ids(), [nearly.clone(), other.clone()]);
+        let on_disk = std::fs::read_dir(n.state.home_dir.join("history")).unwrap();
+        assert_eq!(on_disk.count(), 2);
 
         // By the memory folder as well as by name; then everything.
         let folder = n.memory.display().to_string();
@@ -1312,9 +1397,46 @@ mod tests {
                 .removed,
             0
         );
-        n.kept("notes.md", Change::Pulled, Some("again\n"), 6);
-        assert_eq!(drop_of(None, None, true).unwrap().removed, 3);
+        n.kept("notes.md", Change::Pulled, Some("again\n"), 7);
+        // Everything: what cannot be removed is passed over and counted,
+        // and the rest goes. (A directory under a record's name, older
+        // than every record, cannot be removed as a file.)
+        let stuck = n.state.home_dir.join("history").join("00000000000abc");
+        std::fs::create_dir(&stuck).unwrap();
+        let all = drop_of(None, None, true).unwrap();
+        assert_eq!((all.removed, all.left), (3, 1));
         assert!(n.ids().is_empty());
+        assert!(stuck.is_dir());
+    }
+
+    /// A record that cannot be removed is passed over, and the rest that
+    /// were asked for go: the answer says how many are still there, and
+    /// lists as dropped only those that went.
+    #[test]
+    fn test_a_drop_goes_on_past_a_record_it_cannot_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let n = node();
+        let first = n.kept("notes.md", Change::Pulled, Some("one\n"), 0);
+        let second = n.kept("notes.md", Change::Pulled, Some("two\n"), 1);
+        let history = n.state.home_dir.join("history");
+        let request = DropRequest {
+            of: Some("lab".into()),
+            ..Default::default()
+        };
+        std::fs::set_permissions(&history, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // As root nothing is closed, and there is nothing to show.
+        if std::fs::write(history.join("probe"), "").is_ok() {
+            return;
+        }
+        let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
+        // Neither could go, and each was tried.
+        assert_eq!((dropped.removed, dropped.left), (0, 2));
+        assert!(dropped.dropped.is_empty());
+        std::fs::set_permissions(&history, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(n.ids(), [second, first]);
+        let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
+        assert_eq!((dropped.removed, dropped.left), (2, 0));
+        assert_eq!(dropped.dropped.len(), 2);
     }
 
     /// What a listing shows: how much is kept and from when, the agents
@@ -1391,6 +1513,18 @@ mod tests {
             list(&n.state, &not_a_time),
             Err(ApiError::BadRequest(_))
         ));
+
+        // A drop takes the directory as a listing does: the records of the
+        // agent that works there go, and no others.
+        let other_md = |of: &str, folder: &str| DropRequest {
+            file: Some("other.md".into()),
+            ..drop_as(of, folder)
+        };
+        let dropped = drop_records(&n.state, &other_md("notes", "/home/sam/other"), NO_WAIT);
+        assert_eq!(dropped.unwrap().removed, 0);
+        let dropped = drop_records(&n.state, &other_md("notes", "/home/sam/notes"), NO_WAIT);
+        assert_eq!(dropped.unwrap().removed, 1);
+        assert_eq!(of("lab", None), [third.clone(), first.clone()]);
 
         // With history off there is nothing, and it says so.
         n.state.history.open(None);

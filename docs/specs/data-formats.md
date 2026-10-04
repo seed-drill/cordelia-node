@@ -432,8 +432,8 @@ file for each record, mode `0600`.
 **A record's name is its id:** 14 lower-case hex digits. The first eight are
 the second it was written, by this device's clock; the next three are the
 millisecond within it; the last three are random. So names sort by age, two
-records made in one second are in the order they were made, and a record
-that cannot be read still has an age. A record whose change has not been
+records made in different milliseconds are in the order they were made, and a
+record that cannot be read still has an age. A record whose change has not been
 made yet has `.pending` after its id. One that was pending and belonged to
 no change in hand (found when the node started, or at a sweep) has
 `.interrupted`: its change may or may not have been made. Nothing else in

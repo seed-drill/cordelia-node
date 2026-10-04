@@ -389,10 +389,14 @@ impl Store {
             };
             file.write_all(&line)?;
             file.write_all(text.unwrap_or_default().as_bytes())?;
-            // On the disk before the change it is for is made: the change
-            // flushes the new text, and if the power went between the two
-            // the old one would otherwise be the copy that is lost.
-            crate::atomic::flush(&file)?;
+            // A text is on the disk before the change it is for is made:
+            // the change flushes the new text, and if the power went
+            // between the two the old one would otherwise be the copy
+            // that is lost. A record that keeps no text (of a file that
+            // arrived) has nothing to lose that way, and is not flushed.
+            if text.is_some() {
+                crate::atomic::flush(&file)?;
+            }
             let bytes = line.len() + text.map_or(0, str::len);
             self.grown.fetch_add(bytes as u64, Ordering::Relaxed);
             return Ok(pending);
@@ -530,16 +534,21 @@ impl Store {
         Ok(Some((record, text)))
     }
 
-    /// Remove records from this device. Returns how many there were.
-    pub fn remove(&self, ids: &[Id]) -> std::io::Result<usize> {
+    /// Remove records from this device, each by itself: one that cannot
+    /// be removed is passed over, and the rest go. Returns how many went,
+    /// and the ids of those that are still there.
+    pub fn remove(&self, ids: &[Id]) -> (usize, Vec<Id>) {
         let mut removed = 0;
+        let mut left = Vec::new();
         for id in ids {
             if let Some((path, _)) = self.path_of(id) {
-                std::fs::remove_file(path)?;
-                removed += 1;
+                match std::fs::remove_file(path) {
+                    Ok(()) => removed += 1,
+                    Err(_) => left.push(id.clone()),
+                }
             }
         }
-        Ok(removed)
+        (removed, left)
     }
 
     /// Remove what is older than the age kept, then, while the store is
@@ -554,7 +563,8 @@ impl Store {
         self.grown.store(0, Ordering::Relaxed);
         self.recover()?;
         let mut swept = Swept::default();
-        // Oldest first: its size, and whether it was to go and could not.
+        // Oldest first: its size, and whether it is passed over from here
+        // on (it was to go and could not, or it has gone).
         let mut held: Vec<(PathBuf, u64, bool)> = Vec::new();
         for name in self.names()? {
             let Some((id, _)) = record_name(&name) else {
@@ -573,19 +583,27 @@ impl Store {
             held.push((path, bytes, aged));
         }
         let mut total: u64 = held.iter().map(|(_, bytes, _)| bytes).sum();
-        for (path, bytes, stuck) in held {
-            if total <= self.max_bytes {
-                break;
-            }
-            if stuck {
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    total -= bytes;
-                    swept.over += 1;
+        // A record that is over the size by itself goes first, and alone:
+        // taken oldest first, every other record would go before it, and
+        // then it. After that the oldest go, until the store is within
+        // its size.
+        for alone in [true, false] {
+            for (path, bytes, passed) in held.iter_mut() {
+                if total <= self.max_bytes {
+                    break;
                 }
-                Err(_) => swept.failed += 1,
+                if *passed || (alone && *bytes <= self.max_bytes) {
+                    continue;
+                }
+                match std::fs::remove_file(&*path) {
+                    Ok(()) => {
+                        total -= *bytes;
+                        swept.over += 1;
+                    }
+                    Err(_) => swept.failed += 1,
+                }
+                // Gone, or not to be tried again.
+                *passed = true;
             }
         }
         Ok(swept)
@@ -602,15 +620,19 @@ impl Store {
 
     /// Remove every record: `history drop --all`. Whoever clears holds
     /// the turn, so a pending record is one left behind, and goes too.
-    pub fn clear(&self) -> std::io::Result<usize> {
-        let mut removed = 0;
+    /// One that cannot be removed is passed over, and the rest go.
+    /// Returns how many went, and how many are still there.
+    pub fn clear(&self) -> std::io::Result<(usize, usize)> {
+        let (mut removed, mut left) = (0, 0);
         for name in self.names()? {
             if record_name(&name).is_some() {
-                std::fs::remove_file(self.dir.join(&name))?;
-                removed += 1;
+                match std::fs::remove_file(self.dir.join(&name)) {
+                    Ok(()) => removed += 1,
+                    Err(_) => left += 1,
+                }
             }
         }
-        Ok(removed)
+        Ok((removed, left))
     }
 }
 
@@ -786,7 +808,7 @@ mod tests {
         assert_eq!(files(tmp.path()), [format!("{id}.pending")]);
         assert!(s.list().unwrap().records.is_empty());
         assert!(s.read(&id).unwrap().is_none());
-        assert_eq!(s.remove(std::slice::from_ref(&id)).unwrap(), 0);
+        assert_eq!(s.remove(std::slice::from_ref(&id)), (0, vec![]));
 
         // The change is not made: the record goes with it.
         drop(pending);
@@ -814,7 +836,7 @@ mod tests {
             .map(|r| (r.id, r.interrupted))
             .collect();
         assert_eq!(listed, [(stopped.clone(), true), (id.clone(), false)]);
-        assert_eq!(s.remove(&[stopped, id]).unwrap(), 2);
+        assert_eq!(s.remove(&[stopped, id]), (2, vec![]));
         assert!(files(tmp.path()).is_empty());
     }
 
@@ -895,6 +917,20 @@ mod tests {
             .collect();
         assert_eq!(left, [more[1].clone(), more[0].clone(), ids[2].clone()]);
         assert!(s.list().unwrap().bytes <= 4000);
+
+        // A record that is over the size by itself goes alone, though it
+        // is the newest: the others are not sent out ahead of it.
+        let large = keep(&s, "d.md", Some(&"y".repeat(5000)), at(5));
+        assert_eq!(s.sweep(at(10)).unwrap(), over(1));
+        assert!(s.read(&large).unwrap().is_none());
+        let after: Vec<Id> = s
+            .list()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(after, left);
     }
 
     /// A record that cannot be read is reported, and the rest stand. It
@@ -964,7 +1000,7 @@ mod tests {
         // Clearing takes one that no sweep has marked yet.
         left(at(31 * DAY));
         keep(&s, "b.md", Some("x"), at(31 * DAY));
-        assert_eq!(s.clear().unwrap(), 2);
+        assert_eq!(s.clear().unwrap(), (2, 0));
         assert!(files(tmp.path()).is_empty());
     }
 
@@ -1021,7 +1057,9 @@ mod tests {
         .unwrap();
         std::mem::forget(marked);
 
-        let free = Id::parse("6b49d200000abc").unwrap();
+        // (Of another second than the three above, whose random digits
+        // could otherwise be these.)
+        let free = Id::parse("6b49d201000abc").unwrap();
         let mut drawn = vec![
             free.clone(),
             interrupted.clone(),
@@ -1233,7 +1271,7 @@ mod tests {
         let s = store(tmp.path());
         keep(&s, "a.md", Some("x"), at(0));
         keep(&s, "b.md", Some("y"), at(1));
-        assert_eq!(s.clear().unwrap(), 2);
+        assert_eq!(s.clear().unwrap(), (2, 0));
         keep(&s, "a.md", Some("x"), at(2));
 
         assert!(Store::new(tmp.path(), 0, 1 << 20).is_none());

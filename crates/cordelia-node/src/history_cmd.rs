@@ -81,7 +81,10 @@ pub fn drop(
         "all": all });
     let answer = api_post_within(config_path, "/api/v1/history/drop", body, None)?;
     print!("{}", dropped(&answer, all));
-    Ok(())
+    match answer["left"].as_u64().unwrap_or(0) {
+        0 => Ok(()),
+        left => anyhow::bail!("{left} records could not be removed"),
+    }
 }
 
 /// What was typed for an agent, as the full path of the directory of that
@@ -241,7 +244,7 @@ fn change(record: &Value) -> (String, String) {
         other => other,
     };
     let interrupted = if record["interrupted"] == true {
-        " (the node stopped part-way: the change may not have been made)"
+        " (not finished: the change may not have been made)"
     } else {
         ""
     };
@@ -429,7 +432,8 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
             }
             None if wrote => out.push_str(
                 "  What it replaced is kept, but its record could not be made final. It is \
-                 listed, marked as interrupted, once the node has started again.\n",
+                 listed, marked as not finished, after the next sweep of history: within the \
+                 hour, or when the node starts.\n",
             ),
             None => {}
         }
@@ -439,10 +443,16 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
                  may hold a newer text than the one restored.\n",
             );
         }
+        // What becomes of the text is said only where one was written.
         match result["syncs"].as_str().unwrap_or_default() {
+            _ if !wrote => {}
             "yes" => {
                 out.push_str("  It goes to your other devices at the next sync, as an edit.\n")
             }
+            "too_large" => out.push_str(
+                "  This text is too large to sync (an entry holds 64 KB as it travels), so the \
+                 file stays on this device, and your other devices keep the version they have.\n",
+            ),
             "no" => out.push_str(&format!(
                 "  This folder does not sync now, so the file stays on this device. When the \
                  folder syncs again, {WHEN_IT_SYNCS}. To send it now, turn sync on or map the \
@@ -485,21 +495,36 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
 /// What `cordelia history drop` prints.
 fn dropped(answer: &Value, all: bool) -> String {
     let removed = answer["removed"].as_u64().unwrap_or(0);
-    if all {
+    // What was to go and is still there is said first, and last.
+    let left = match answer["left"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        left => format!(
+            "{left} records could not be removed, and are still on this device: look at the \
+             history directory in the node's data directory, and drop again.\n"
+        ),
+    };
+    if all && left.is_empty() {
         return format!("Dropped all history on this device: {removed} records.\n{WHAT_STAYS}");
     }
-    if removed == 0 {
+    if all {
+        return format!("Dropped {removed} records from this device.\n{left}{WHAT_STAYS}");
+    }
+    if removed == 0 && left.is_empty() {
         return "No such records. Nothing was dropped.\n".to_string();
     }
+    // Each with the name its folder syncs under: what was typed is taken
+    // as a name and as a directory, and can be two agents'.
     let mut out = format!("Dropped {removed} records from this device:\n");
     for record in answer["dropped"].as_array().into_iter().flatten() {
         out.push_str(&format!(
-            "  {}  {}  kept {}\n",
+            "  {}  {}  {}  kept {}\n",
             printable(record["id"].as_str().unwrap_or_default()),
+            printable(&sync_label(record["agent"].as_str().unwrap_or_default())),
             printable(record["file"].as_str().unwrap_or_default()),
             printable(record["at"].as_str().unwrap_or_default()),
         ));
     }
+    out.push_str(&left);
     out.push_str(WHAT_STAYS);
     out
 }
@@ -751,7 +776,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("removed, as it was deleted in the channel (the node stopped part-way"),
+            out.contains("removed, as it was deleted in the channel (not finished: the change"),
             "{out}"
         );
         assert!(
@@ -808,9 +833,12 @@ mod tests {
             out[lines..].contains("----- end [a1b2c3d4e5f6] -----"),
             "{out}"
         );
-        // A file that already held the text: nothing to undo, by an id or by removing it.
+        // A file that already held the text: nothing to undo, by an id or
+        // by removing it, and nothing is said to go anywhere, since
+        // nothing was written.
         let same = out.find("already holds that text").unwrap();
         assert!(!out[same..].contains("To undo"), "{out}");
+        assert!(!out[same..].contains("your other devices"), "{out}");
 
         // What is said of the folder, for each answer the node gives.
         let said = |syncs: Value| {
@@ -859,7 +887,13 @@ mod tests {
             "was_absent": false, "syncs": "yes", "behind": false, "lines_gone": [] }]});
         let (out, _) = restored(&unsettled, "a1b2c3d4e5f6", false);
         assert!(!out.contains("To undo"), "{out}");
-        assert!(out.contains("marked as interrupted"), "{out}");
+        assert!(out.contains("marked as not finished"), "{out}");
+
+        // A text that fits in no entry: it stays here, and nothing says
+        // that it goes anywhere.
+        let large = said(json!("too_large"));
+        assert!(large.contains("too large to sync"), "{large}");
+        assert!(!large.contains("at the next sync"), "{large}");
     }
 
     #[test]
@@ -870,15 +904,46 @@ mod tests {
             "No such records. Nothing was dropped.\n"
         );
         let some = json!({ "removed": 2, "dropped": [
-            { "id": "68dfb3a4c91e07", "file": "notes.md", "at": "2026-10-03T11:00:00Z" },
-            { "id": "68dfb3a4c91e08", "file": "notes.conflict-0a1b2c3d.md", "at": "2026-10-03T11:00:05Z" },
+            { "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
+              "at": "2026-10-03T11:00:00Z" },
+            { "id": "68dfb3a4c91e08", "agent": "~", "file": "notes.conflict-0a1b2c3d.md",
+              "at": "2026-10-03T11:00:05Z" },
         ]});
         let out = dropped(&some, false);
         assert!(
             out.starts_with("Dropped 2 records from this device:\n"),
             "{out}"
         );
-        assert!(out.contains("notes.conflict-0a1b2c3d.md"), "{out}");
+        // Each with whose it was: a word can name two agents.
+        assert!(
+            out.contains("68dfb3a4c91e07  team  notes.md  kept"),
+            "{out}"
+        );
+        assert!(
+            out.contains("68dfb3a4c91e08  home memory  notes.conflict-0a1b2c3d.md"),
+            "{out}"
+        );
+        assert!(!out.contains("could not be removed"), "{out}");
+        // What could not be removed is said, by name and for everything.
+        let mut part = some.clone();
+        part["left"] = json!(1);
+        let out = dropped(&part, false);
+        assert!(
+            out.contains("1 records could not be removed, and are still on this device"),
+            "{out}"
+        );
+        let none_went = dropped(&json!({ "dropped": [], "removed": 0, "left": 2 }), false);
+        assert!(none_went.starts_with("Dropped 0 records"), "{none_went}");
+        assert!(
+            none_went.contains("2 records could not be removed"),
+            "{none_went}"
+        );
+        let all = dropped(&json!({ "dropped": [], "removed": 7, "left": 1 }), true);
+        assert!(!all.contains("Dropped all history"), "{all}");
+        assert!(
+            all.contains("Dropped 7 records") && all.contains("1 records could not"),
+            "{all}"
+        );
         assert!(
             out.contains("Treat a secret that reached a memory file as leaked"),
             "{out}"

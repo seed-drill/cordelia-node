@@ -2087,9 +2087,38 @@ fn api_post(
     )
 }
 
+/// How long a command that waits without a limit waits before it says so:
+/// as long as the node waits for its turn before it answers that it is
+/// busy. A wait longer than that is for work the node has begun.
+const STILL_WAITING_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_TURN_WAIT_SECS);
+
+/// Run `say` if nothing has come on `done`, and its other end is still
+/// held, when `wait` is up. The other end is dropped when the node has
+/// answered.
+fn say_if_not_done(
+    done: std::sync::mpsc::Receiver<()>,
+    wait: std::time::Duration,
+    say: impl FnOnce(),
+) {
+    if done.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+        say();
+    }
+}
+
+/// What a command says while it waits for the node with no limit. A
+/// person who sees nothing may interrupt it, and that takes nothing back.
+fn still_waiting() {
+    eprintln!(
+        "Still waiting for the node, which finishes what it has begun. Interrupting this \
+         command does not take back what it asked for: `cordelia history` shows what was done."
+    );
+}
+
 /// [`api_post`], waiting for the answer for `limit`, or for as long as it
 /// takes: what the node carries out to the end whether or not anyone
 /// waits (a restore) is waited for, so that the command says what it did.
+/// With no limit it says, once, that it is still waiting.
 fn api_post_within(
     config_path: &str,
     path: &str,
@@ -2110,15 +2139,21 @@ fn api_post_within(
     })?;
 
     let agent: ureq::Agent = client.http_status_as_error(false).build().into();
-    let mut resp = agent
+    // With no limit, the command says once that it is still waiting.
+    let (answered, done) = std::sync::mpsc::channel::<()>();
+    if limit.is_none() {
+        std::thread::spawn(move || say_if_not_done(done, STILL_WAITING_AFTER, still_waiting));
+    }
+    let sent = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
-        .send_json(&body)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-            )
-        })?;
+        .send_json(&body);
+    drop(answered);
+    let mut resp = sent.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+        )
+    })?;
 
     let status = resp.status();
     // A redirect did not come from the node: nothing of it is read.
@@ -4083,6 +4118,33 @@ mod tests {
                 && refused.contains("nowhere else")
                 && refused.contains("CORDELIA_BIND_ADDRESS"),
             "{refused}"
+        );
+    }
+
+    /// A command that waits for the node with no limit says so once, if
+    /// the answer has not come by then, and says nothing if it has.
+    #[test]
+    fn test_a_long_wait_is_said_once_and_a_short_one_is_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let said = AtomicUsize::new(0);
+        let say = || {
+            said.fetch_add(1, Ordering::SeqCst);
+        };
+        let soon = std::time::Duration::from_millis(20);
+        // Still waiting when the time is up.
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        say_if_not_done(done, soon, say);
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        drop(answered);
+        // Answered before it is.
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        drop(answered);
+        say_if_not_done(done, std::time::Duration::from_secs(60), say);
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        // And it waits as long as the node waits for its turn.
+        assert_eq!(
+            STILL_WAITING_AFTER.as_secs(),
+            cordelia_core::protocol::HISTORY_TURN_WAIT_SECS
         );
     }
 

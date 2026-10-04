@@ -191,6 +191,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-sync/tests/claude.rs`: `a_cycle_that_keeps_enough_sweeps_local_history`
 - `crates/cordelia-api/tests/api_integration.rs`: `test_history_needs_the_token_and_is_used_with_it`
 - `crates/cordelia-node/tests/devices_e2e.rs`: `what_sync_replaced_or_removed_is_put_back_from_either_machine`
+- `crates/cordelia-node/tests/devices_e2e.rs`: `local_history_is_kept_as_the_configuration_says`
 
 ## How CI checks this
 

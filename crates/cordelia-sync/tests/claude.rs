@@ -2067,19 +2067,27 @@ fn a_cycle_that_keeps_enough_sweeps_local_history() {
     let text = |n: usize| format!("{n}{}\n", "x".repeat(1000));
     std::fs::write(a_mem.join("notes.md"), text(0)).unwrap();
     settle(&mut a, &mut b);
+    // How large one kept text is here: a record names its memory folder,
+    // whose path is as long as this machine's temporary directory.
+    let measured = history_on(&a, 1 << 20);
+    std::fs::write(b_mem.join("notes.md"), text(1)).unwrap();
+    settle(&mut a, &mut b);
+    let one = measured.list().unwrap().bytes;
+    assert!(one > 1000, "{one}");
     // Room for two kept texts, and not for three.
-    let store = history_on(&a, 3000);
+    let room = one * 5 / 2;
+    let store = history_on(&a, room);
     let mut most = 0;
-    for n in 1..=6 {
+    for n in 2..=7 {
         std::fs::write(b_mem.join("notes.md"), text(n)).unwrap();
         settle(&mut a, &mut b);
         assert_eq!(read(&a_mem, "notes.md"), Some(text(n)));
         let listing = store.list().unwrap();
-        assert!(listing.bytes <= 3000, "after {n}: {} bytes", listing.bytes);
+        assert!(listing.bytes <= room, "after {n}: {} bytes", listing.bytes);
         most = most.max(listing.records.len());
     }
     // It did keep them: two at a time, the newest.
     assert_eq!(most, 2);
     let newest = store.list().unwrap().records[0].id.clone();
-    assert_eq!(store.read(&newest).unwrap().unwrap().1, Some(text(5)));
+    assert_eq!(store.read(&newest).unwrap().unwrap().1, Some(text(6)));
 }
