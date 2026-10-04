@@ -96,6 +96,12 @@ pub enum PersonError {
     #[error("the record was signed by a key that does not count")]
     RecordByAKeyThatDoesNotCount,
 
+    #[error("this device does not hold the name {0}")]
+    NameNotHeld(String),
+
+    #[error("a merge is written over a version, and the slot holds none")]
+    MergeOverNoVersion,
+
     #[error("what this device holds of its person does not hold together: {0}")]
     Held(String),
 
@@ -176,7 +182,7 @@ pub struct Counting {
 impl Counting {
     /// Who counts under `statement`, with the records the device keeps
     /// under it.
-    fn of(statement: &Statement, kept: &[KeptAddition]) -> Self {
+    pub(crate) fn of(statement: &Statement, kept: &[KeptAddition]) -> Self {
         let keys = |records: &mut dyn Iterator<Item = &KeptAddition>| {
             records.map(|record| record.key).collect::<Vec<_>>()
         };
@@ -904,7 +910,10 @@ struct Generation {
 
 /// The secret of the statement the device has applied, as its store has
 /// it: the one that the statement commits to.
-fn applied_secret(conn: &Connection, applied: &Statement) -> Result<[u8; 32], PersonError> {
+pub(crate) fn applied_secret(
+    conn: &Connection,
+    applied: &Statement,
+) -> Result<[u8; 32], PersonError> {
     let held = held_rows::applied_secret(conn)?
         .ok_or_else(|| PersonError::Held("the applied statement's secret is not held".into()))?;
     if held.number != applied.number || !applied.commits_to(&held.secret) {
@@ -1067,7 +1076,7 @@ fn write_applied(
 /// Where the work does not come back at all, because it unwinds, what it
 /// wrote is undone as it is where the work fails: no transaction is left
 /// open on the connection, and no savepoint in the caller's.
-fn in_one<T>(
+pub(crate) fn in_one<T>(
     conn: &Connection,
     work: impl FnOnce() -> Result<T, PersonError>,
 ) -> Result<T, PersonError> {
