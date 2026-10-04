@@ -2621,3 +2621,127 @@ fn local_history_is_kept_as_the_configuration_says() {
     assert!(!kept.exists());
     assert!(n.cli(&["history"]).contains("turned off"));
 }
+
+/// One machine deletes a memory and its line in the index while the other,
+/// apart, edits the memory. An edit beats a delete, so the file comes back
+/// on both. A minute of looks later the machine that deleted it puts its
+/// line back, and both end with the file and its line (decision 2026-09-30
+/// §4.5). With `restart`, the node that deleted is stopped and started
+/// between the delete and the reunion: what it wrote down is in its
+/// database, and the minute starts when it is up.
+///
+/// It waits the real minute: nothing sets a node's clock from outside.
+fn a_memory_deleted_with_its_line_comes_back_listed(restart: bool) {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let a_mem = claude_folder(&a.home(), &a.home());
+    let b_mem = claude_folder(&b.home(), &b.home());
+
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    for n in [&a, &b] {
+        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        n.cli(&["sync", "map", &path(&n.home()), "--home"]);
+    }
+    let line = "- [Notes](notes.md) what was noted\n";
+    let other = "- [Other](other.md) the other one\n";
+    std::fs::write(a_mem.join("notes.md"), "base\n").unwrap();
+    std::fs::write(a_mem.join("other.md"), "x\n").unwrap();
+    std::fs::write(a_mem.join("MEMORY.md"), format!("{line}{other}")).unwrap();
+    wait_for(
+        "b has the memory and the index",
+        &[&relay, &a, &b],
+        120,
+        || {
+            let index = read(&b_mem.join("MEMORY.md"));
+            let listed = index.is_some_and(|index| index.contains(line.trim_end()));
+            (listed && read(&b_mem.join("notes.md")).is_some()).then_some(())
+        },
+    );
+
+    // The machines are apart: the relay, which is how they meet, is down.
+    relay.stop();
+    let published = |n: &Node| -> Option<Option<String>> {
+        let state: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).ok()?;
+        let projects = state["sync"]["projects"].as_array()?.clone();
+        let home = projects.into_iter().find(|p| p["project"] == "~")?;
+        Some(home["last_published_at"].as_str().map(String::from))
+    };
+    let publishes = |n: &Node, change: &dyn Fn()| {
+        let before = wait_for("when it last published", &[&a, &b], 60, || published(n));
+        change();
+        wait_for("the change is published", &[&a, &b], 60, || {
+            published(n)
+                .filter(|now| now.is_some() && *now != before)
+                .map(|_| ())
+        });
+    };
+    // One machine deletes the memory, and then its line: two publishes,
+    // well inside the hour.
+    publishes(&a, &|| {
+        std::fs::remove_file(a_mem.join("notes.md")).unwrap()
+    });
+    publishes(&a, &|| {
+        std::fs::write(a_mem.join("MEMORY.md"), other).unwrap()
+    });
+    // The other, which has heard of neither, edits the memory.
+    publishes(&b, &|| {
+        std::fs::write(b_mem.join("notes.md"), "from b\n").unwrap()
+    });
+
+    if restart {
+        a.stop();
+        a.start();
+        wait_for("a is up again", &[&a], 30, || healthy(&a));
+    }
+
+    // They meet again.
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let listed_once = |mem: &std::path::Path| {
+        let index = read(&mem.join("MEMORY.md")).unwrap_or_default();
+        index.lines().filter(|l| *l == line.trim_end()).count() == 1
+            && index.contains(other.trim_end())
+    };
+    wait_for(
+        "both have the memory, and its line once",
+        &[&relay, &a, &b],
+        300,
+        || {
+            [&a_mem, &b_mem]
+                .iter()
+                .all(|mem| {
+                    read(&mem.join("notes.md")).as_deref() == Some("from b\n") && listed_once(mem)
+                })
+                .then_some(())
+        },
+    );
+    // The line went back at the end of the index, on the machine that
+    // had removed it.
+    assert_eq!(
+        read(&a_mem.join("MEMORY.md")).as_deref(),
+        Some(format!("{other}{line}").as_str())
+    );
+}
+
+#[test]
+fn the_line_of_a_memory_that_comes_back_is_put_back_on_both_machines() {
+    a_memory_deleted_with_its_line_comes_back_listed(false);
+}
+
+#[test]
+fn the_line_of_a_memory_that_comes_back_is_put_back_after_a_restart() {
+    a_memory_deleted_with_its_line_comes_back_listed(true);
+}
