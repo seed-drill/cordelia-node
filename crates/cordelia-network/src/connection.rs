@@ -19,6 +19,31 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info};
 
+/// Why a connection is closed when the peer already has one with this
+/// node: this one is the extra, or it takes the place of an earlier one.
+const CLOSED_AS_DUPLICATE: &[u8] = b"duplicate";
+const CLOSED_AS_REPLACED: &[u8] = b"replaced";
+
+/// Whether the peer closed a connection because it keeps another one with
+/// this node. Two nodes that list each other both dial at start, and one of
+/// the two connections is dropped: nothing is wrong.
+///
+/// A close made during the handshake arrives without its reason, as QUIC
+/// requires: it is known only as a close by the peer's application. A node
+/// closes a connection it is still opening for this reason alone.
+fn closed_for_another(e: &quinn::ConnectionError) -> bool {
+    match e {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            close.reason.as_ref() == CLOSED_AS_DUPLICATE
+                || close.reason.as_ref() == CLOSED_AS_REPLACED
+        }
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            close.error_code == quinn::TransportErrorCode::APPLICATION_ERROR
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConnectionError {
     #[error("transport error: {0}")]
@@ -184,11 +209,11 @@ impl ConnectionManager {
                     }
                 };
             if keep_existing {
-                outcome.conn.close(0u32.into(), b"duplicate");
+                outcome.conn.close(0u32.into(), CLOSED_AS_DUPLICATE);
                 return Err(ConnectionError::AlreadyConnected(outcome.node_id));
             }
             if let Some(old) = self.connections.remove(&outcome.node_id) {
-                old.conn.close(0u32.into(), b"replaced");
+                old.conn.close(0u32.into(), CLOSED_AS_REPLACED);
                 debug!(peer = %outcome.node_id, "replaced the peer's earlier connection");
             }
         }
@@ -221,7 +246,7 @@ impl ConnectionManager {
         let node_id = NodeId(peer_node_id);
 
         if self.connections.contains_key(&node_id) {
-            conn.close(0u32.into(), b"duplicate");
+            conn.close(0u32.into(), CLOSED_AS_DUPLICATE);
             return Err(ConnectionError::AlreadyConnected(node_id));
         }
 
@@ -440,7 +465,11 @@ pub async fn inbound_accept(
             ConnectionError::Quinn("incoming handshake timeout".into())
         })?
         .map_err(|e| {
-            tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed");
+            if closed_for_another(&e) {
+                debug!(remote = %remote, "incoming connection dropped by the peer, which keeps another one with this node");
+            } else {
+                tracing::warn!(remote = %remote, error = %e, "QUIC incoming handshake failed");
+            }
             ConnectionError::Quinn(e.to_string())
         })?;
 
@@ -500,6 +529,41 @@ mod tests {
 
     fn make_endpoint(id: &NodeIdentity) -> Endpoint {
         transport::create_endpoint(id, "127.0.0.1:0".parse().unwrap()).unwrap()
+    }
+
+    /// A connection that the peer drops because it keeps another one with
+    /// this node is not a failure to warn about: two nodes that list each
+    /// other both dial at start. Any other close, and any other failure,
+    /// still is.
+    #[test]
+    fn a_connection_dropped_for_another_is_told_from_a_failure() {
+        let closed = |reason: &'static [u8]| {
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 0u32.into(),
+                reason: reason.into(),
+            })
+        };
+        assert!(closed_for_another(&closed(CLOSED_AS_DUPLICATE)));
+        assert!(closed_for_another(&closed(CLOSED_AS_REPLACED)));
+        assert!(!closed_for_another(&closed(b"shutdown")));
+        assert!(!closed_for_another(&closed(b"")));
+        // During the handshake the reason does not travel: this is what
+        // the node that keeps the other connection is told.
+        let in_handshake = |error_code| {
+            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                error_code,
+                frame_type: None,
+                reason: (&b""[..]).into(),
+            })
+        };
+        assert!(closed_for_another(&in_handshake(
+            quinn::TransportErrorCode::APPLICATION_ERROR
+        )));
+        assert!(!closed_for_another(&in_handshake(
+            quinn::TransportErrorCode::PROTOCOL_VIOLATION
+        )));
+        assert!(!closed_for_another(&quinn::ConnectionError::TimedOut));
+        assert!(!closed_for_another(&quinn::ConnectionError::Reset));
     }
 
     #[tokio::test]

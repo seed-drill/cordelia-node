@@ -14,14 +14,18 @@
 //!   treated as both having changed, so this device's version is kept as
 //!   above. That is so when
 //!   - another device published the same revision concurrently and won; or
-//!   - the channel has gone back to a lower revision, because the entry
-//!     that was agreed no longer counts (the device that wrote it was
-//!     removed, and nothing replaced what it wrote).
+//!   - the channel has gone back to an earlier entry, at a lower revision
+//!     or the same one, because the entry that was agreed no longer
+//!     counts: the device that wrote it was removed, and nothing replaced
+//!     what it wrote; or its writer has written again, in an entry this
+//!     device cannot read yet (decision 2026-09-30 §9).
 //! - Only the channel's revision moved, not its content (an entry is
 //!   published again when the device that wrote it is removed): note the
 //!   revision, and touch nothing.
 //!
-//! Nothing is ever dropped silently: every losing edit ends up in a file.
+//! Every losing edit is meant to end up in a file. One case where it does
+//! not is in decision 2026-09-30 §9: a higher revision is taken to
+//! follow, whoever wrote it and whatever they had seen.
 
 use std::collections::HashSet;
 

@@ -111,10 +111,13 @@ This is `crypto_sign_ed25519_pk_to_curve25519` in libsodium, `edwardsToMontgomer
 These Ed25519 public keys MUST be rejected by `pk_to_curve25519`:
 
 ```
-0000000000000000000000000000000000000000000000000000000000000000  (identity point)
-0200000000000000000000000000000000000000000000000000000000000000  (small order)
-0500000000000000000000000000000000000000000000000000000000000000  (small order)
+0000000000000000000000000000000000000000000000000000000000000000  (a point of order 4)
+0100000000000000000000000000000000000000000000000000000000000000  (the identity)
+0200000000000000000000000000000000000000000000000000000000000000  (not a point on the curve)
+0500000000000000000000000000000000000000000000000000000000000000  (a point of mixed order)
 ```
+
+The first two are points of small order: the secret agreed with either is all zero, whoever agrees it. The third is no point, so there is no key to convert. The fourth is a point outside the prime-order subgroup, which no real key is. `a_key_that_is_not_a_point_or_is_of_small_order_is_no_key` in `crates/cordelia-crypto/src/identity.rs` checks all four.
 
 ---
 

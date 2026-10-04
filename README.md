@@ -67,10 +67,16 @@ A device joins a name's channel only when it maps that name. A device that
 has never mapped a name holds neither its memory nor its key, and home memory
 is the same.
 
+Home memory is named `~` unless you give it a name:
+`cordelia sync map ~ my-agent --home`. Under a name of its own it can share
+memory with a folder on another machine, for an agent that starts in your
+home directory on one and in a project folder on the other.
+
 To sync everything Claude Code has memory for, now and later (home memory and
 every git project found), use `cordelia sync claude --all`. With `--all`,
 `cordelia sync exclude github.com/client-co/*` keeps projects off this
-machine, and `cordelia sync home off` keeps home memory off it.
+machine, and `cordelia sync home off` keeps home memory off it, whatever name
+it has; `cordelia sync home on` puts it back under that name.
 `cordelia sync claude --mapped-only` goes back to mapped folders only.
 
 Running `cordelia sync claude` again changes nothing; it keeps your settings,
