@@ -937,11 +937,10 @@ pub fn remove_device(
 /// Only the device that removes does this, with what it holds at that
 /// moment. A device that learns of the removal later does not: it cannot
 /// tell what the removed device wrote before its removal from what it
-/// wrote afterwards. Anything it holds that the remover did not is as a
-/// rule kept on that device as a conflict file, where its file had taken
-/// it (the index is merged; a file the channel has no text for stays);
-/// where no file had, it can be left in no memory file (cordelia-sync,
-/// `plan`).
+/// wrote afterwards. Where a file of its had taken something that the
+/// remover did not hold, the text as a rule stays on that device: beside
+/// the file, in it, or merged into the index (cordelia-sync, `plan`).
+/// Where no file had, it can be left in no memory file.
 fn keep_what_it_wrote(state: &AppState, db: &Connection, channel_id: &str, leaving: &[u8; 32]) {
     match crate::entries::take_over(state, db, channel_id, leaving) {
         Ok(0) => {}
