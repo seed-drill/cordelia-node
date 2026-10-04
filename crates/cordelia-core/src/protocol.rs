@@ -906,17 +906,11 @@ pub const SEALED_SECRET_BYTES: usize = 32 + 12 + 32 + 16;
 /// the phrase (decision 2026-10-04 §4.6).
 pub const MAX_EARLIER_SECRETS: usize = 8;
 
-/// The most device keys that a change entry lists for the phrase: the
-/// keys by which a recovery read the generations it recovered from
-/// (decision 2026-10-04 §9).
-pub const MAX_RECOVERY_KEYS: usize = 64;
-
 // Checked at compile time: at every bound together, each part of a change
 // entry fits its share of the 32 KB. The part for the devices is the
 // statement with its length, and a count and a sealed secret for each
-// device. The part for the phrase is a secret, a count and the earlier
-// secrets with their numbers, and a count, the number of a recovery's
-// statement and the listed keys.
+// device. The part for the phrase is a secret, and a count and the
+// earlier secrets with their numbers.
 const _: () = assert!(
     ITEM_SEAL_OVERHEAD_BYTES
         + 2
@@ -926,13 +920,7 @@ const _: () = assert!(
         <= CHANGE_ENTRY_DEVICES_PART_BYTES
 );
 const _: () = assert!(
-    ITEM_SEAL_OVERHEAD_BYTES
-        + 32
-        + 2
-        + MAX_EARLIER_SECRETS * (8 + 32)
-        + 2
-        + 8
-        + MAX_RECOVERY_KEYS * 32
+    ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32)
         <= CHANGE_ENTRY_PHRASE_PART_BYTES
 );
 
@@ -1563,7 +1551,6 @@ mod tests {
         );
         assert_eq!(SEALED_SECRET_BYTES, 92);
         assert_eq!(MAX_EARLIER_SECRETS, 8);
-        assert_eq!(MAX_RECOVERY_KEYS, 64);
     }
 
     /// The bounds of an entry, and the room that is kept in every entry
