@@ -18,6 +18,7 @@ pub struct Config {
     pub governor: GovernorConfig,
     pub replication: ReplicationConfig,
     pub limits: LimitsConfig,
+    pub history: HistoryConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
     pub swarm: SwarmConfig,
@@ -128,6 +129,18 @@ pub struct ReplicationConfig {
     /// How long a relay waits before it asks a device again which channels
     /// it holds, and before it takes again a channel it dropped.
     pub relay_ask_again_secs: u64,
+}
+
+/// Local history: the text of a memory file as it was before sync replaced
+/// or removed it (decision 2026-09-30 §4.5b). Read when the node starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// How long a kept text stays. 0 turns history off and removes what
+    /// is kept.
+    pub days: u32,
+    /// The most that is kept. Over it, the oldest records go first.
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +264,15 @@ impl Default for LimitsConfig {
             max_connections_per_ip: protocol::MAX_CONNECTIONS_PER_IP as u32,
             max_item_bytes: protocol::MAX_ITEM_BYTES as u64,
             writes_per_channel_per_minute: protocol::WRITES_PER_CHANNEL_PER_MINUTE,
+        }
+    }
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            days: protocol::HISTORY_DAYS,
+            max_bytes: protocol::HISTORY_MAX_BYTES,
         }
     }
 }
@@ -414,6 +436,28 @@ http_port = 8080
         let config: Config = toml::from_str(partial).unwrap();
         assert_eq!(config.node.http_port, 8080);
         assert_eq!(config.node.p2p_port, protocol::P2P_PORT); // default preserved
+    }
+
+    /// Local history is on unless it is turned off: 30 days and 256 MB,
+    /// each of which can be set by itself. 0 days is read as it is given,
+    /// and turns history off.
+    #[test]
+    fn test_history_is_on_by_default_and_can_be_set() {
+        let of = |toml: &str| -> (u32, u64) {
+            let config: Config = toml::from_str(toml).unwrap();
+            (config.history.days, config.history.max_bytes)
+        };
+        assert_eq!(of(""), (30, 256 * 1024 * 1024));
+        assert_eq!(
+            of(""),
+            (protocol::HISTORY_DAYS, protocol::HISTORY_MAX_BYTES)
+        );
+        assert_eq!(of("[history]\ndays = 7\n"), (7, 256 * 1024 * 1024));
+        assert_eq!(of("[history]\nmax_bytes = 1024\n"), (30, 1024));
+        assert_eq!(of("[history]\ndays = 0\nmax_bytes = 0\n"), (0, 0));
+        // And it is written out with the rest.
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(written.contains("[history]\ndays = 30\n"), "{written}");
     }
 
     #[test]

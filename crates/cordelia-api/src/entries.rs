@@ -112,6 +112,68 @@ pub fn publish(
     publish_at(state, db, channel_id, write, None)
 }
 
+/// The revision that [`publish`] would give `key` now: the next after the
+/// highest this node holds for the slot. Asked under the hold of the lock
+/// that the publish is then made under, it is the revision the entry gets.
+///
+/// A name whose revisions are used up has no next one: that is the
+/// refusal [`publish`] would give, given here, before anything is done
+/// for an entry that cannot be published.
+pub fn next_rev(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    key: &str,
+) -> Result<u64, CordeliaError> {
+    let slot = slot_id(&slot_key(state, channel_id)?, key);
+    within_the_limit(key, items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1)
+}
+
+/// `rev`, if an entry for `key` may have it.
+fn within_the_limit(key: &str, rev: u64) -> Result<u64, CordeliaError> {
+    if rev > cordelia_core::protocol::MAX_REV {
+        return Err(CordeliaError::Validation(format!(
+            "{key} has reached the revision limit and cannot be written again in this channel"
+        )));
+    }
+    Ok(rev)
+}
+
+/// An entry's content before it is sealed: its name, what it holds, and
+/// what it says it was written after, if it says anything.
+fn unsealed(
+    key: &str,
+    content: &Value,
+    metadata: Option<&Value>,
+    deleted: bool,
+    after: Option<&Value>,
+) -> Result<Vec<u8>, CordeliaError> {
+    let mut envelope = serde_json::json!({
+        "key": key,
+        "content": if deleted { Value::Null } else { content.clone() },
+        "metadata": if deleted { None } else { metadata.cloned() },
+    });
+    if let Some(after) = after {
+        envelope["after"] = after.clone();
+    }
+    serde_json::to_vec(&envelope).map_err(|e| CordeliaError::Internal(e.to_string()))
+}
+
+/// The size of an entry as it travels: its content, and what sealing adds.
+fn sealed_len(plaintext: &[u8]) -> usize {
+    plaintext.len() + cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES
+}
+
+/// Whether `content` can be published under `key` at all: whether the
+/// smallest entry that holds it, one with no metadata that says nothing
+/// of what it was written after, is within the size an entry may have.
+/// [`publish`] checks the entry it is given in the same way, so what
+/// does not fit here is refused there whatever else it says.
+pub fn fits(key: &str, content: &Value) -> bool {
+    unsealed(key, content, None, false, None)
+        .is_ok_and(|plain| sealed_len(&plain) <= cordelia_core::protocol::MAX_ITEM_BYTES)
+}
+
 /// [`publish`], at a given revision when `at` is set.
 fn publish_at(
     state: &AppState,
@@ -137,30 +199,19 @@ fn publish_at(
     }
 
     let slot = slot_id(&slot_key(state, channel_id)?, key);
-    let rev = match at {
-        Some(rev) => rev,
-        None => items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1,
-    };
-    if rev > cordelia_core::protocol::MAX_REV {
-        return Err(CordeliaError::Validation(format!(
-            "{key} has reached the revision limit and cannot be written again in this channel"
-        )));
-    }
+    let rev = within_the_limit(
+        key,
+        match at {
+            Some(rev) => rev,
+            None => items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1,
+        },
+    )?;
     let channel = channels::get_by_id(db, channel_id)?;
 
-    let mut envelope = serde_json::json!({
-        "key": key,
-        "content": if deleted { Value::Null } else { content.clone() },
-        "metadata": if deleted { None } else { metadata.cloned() },
-    });
-    if let Some(after) = after {
-        envelope["after"] = after.clone();
-    }
-    let plaintext =
-        serde_json::to_vec(&envelope).map_err(|e| CordeliaError::Internal(e.to_string()))?;
+    let plaintext = unsealed(key, content, metadata, deleted, after)?;
     // Checked here as well as by every node that carries it: the entry as
     // it travels is its content plus what sealing adds.
-    let sealed_len = plaintext.len() + cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES;
+    let sealed_len = sealed_len(&plaintext);
     if sealed_len > cordelia_core::protocol::MAX_ITEM_BYTES {
         return Err(CordeliaError::TooLarge {
             bytes: sealed_len,

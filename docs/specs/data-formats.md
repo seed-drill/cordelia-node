@@ -423,7 +423,47 @@ Items with node-internal `item_type` values (`kv`, `attestation`, `descriptor`, 
 
 ---
 
-## 8. References
+## 8. Local History Files
+
+Local history (decision 2026-09-30 §4.5b) is not in the database. It is a
+directory, `history/`, in the node's data directory, mode `0700`, with one
+file for each record, mode `0600`.
+
+**A record's name is its id:** 14 lower-case hex digits. The first eight are
+the second it was written, by this device's clock; the next three are the
+millisecond within it; the last three are random. So names sort by age, two
+records made in different milliseconds are in the order they were made, and a
+record that cannot be read still has an age. A record whose change has not been
+made yet has `.pending` after its id. One that was pending and belonged to
+no change in hand (found when the node started, at a sweep, or before a drop)
+has `.interrupted`: its change may or may not have been made. Nothing else in
+the directory is a record.
+
+**A record's content** is one line of JSON, a line break, and then the text
+as it was, byte for byte (nothing, where the record keeps no text). The JSON:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `at` | string | When it was written (RFC 3339, UTC, to the second) |
+| `agent` | string | The name the folder syncs under |
+| `folder` | string | The memory folder the file is in |
+| `file` | string | The file's name |
+| `change` | string | `pulled`, `removed`, `merged`, `edited_here`, `deleted_here`, `restored` or `arrived` |
+| `kept` | object or null | `whose`: `{"here": {"agreed": <revision or null>}}` for this device's file (null: it had agreed none, or the record is of what a restore replaced, which does not look), or `{"channel": {"device": <key>, "rev": <revision>}}` for the channel's version; and `sha256`, the hash of the text in hex. Null where no text is kept |
+| `replaced_by` | object or string | `{"entry": {"device": <key>, "rev": <revision>}}`, `{"record": <id>}` for a restore, or `"nothing"` |
+| `behind` | boolean | This device's file was the version it had agreed, and a later one replaced it |
+
+The text is flushed to the disk before the change it was kept for is made.
+It is read back only while its hash is the one the record carries: a record
+that was cut short, or changed on the disk, is refused.
+
+A name or a path is never taken from a record's content to make a path in
+the history directory, and an id from the command line is checked for its
+shape before any path is made from it. A restore does write to the `folder`
+and `file` its record names: it refuses a `file` that is not a plain file
+name, and a `folder` that is not there.
+
+## 9. References
 
 | Document | What It Defines |
 |----------|----------------|

@@ -2,8 +2,10 @@
 //!
 //! Spec: seed-drill/specs/data-formats.md, seed-drill/specs/channels-api.md
 
+pub mod atomic;
 pub mod channels;
 pub mod db;
+pub mod history;
 pub mod invites;
 pub mod items;
 pub mod meta;

@@ -68,6 +68,8 @@ pub struct AppState {
     /// Which keys have been found usable, and which not, while this node
     /// has run.
     pub usable_keys: UsableKeys,
+    /// Local history, and the turn its users take.
+    pub history: History,
 }
 
 /// Whether a key is a usable public key
@@ -295,6 +297,98 @@ impl SyncControl {
     }
 }
 
+/// Local history (decision 2026-09-30 §4.5b): where the text that sync
+/// replaced is kept, and the turn that everything that touches it takes.
+///
+/// A sync cycle, a restore, a drop and the sweep of old records each hold
+/// the turn from start to end, so none of them sees a memory folder or the
+/// store half-changed by another. The database lock is taken only inside
+/// a turn, never the other way round.
+#[derive(Default)]
+pub struct History {
+    store: std::sync::RwLock<Option<cordelia_storage::history::Store>>,
+    turn: Mutex<()>,
+}
+
+impl History {
+    /// Set when the node starts: the store, or `None` with history off.
+    pub fn open(&self, store: Option<cordelia_storage::history::Store>) {
+        if let Ok(mut held) = self.store.write() {
+            *held = store;
+        }
+    }
+
+    /// The store, or `None` with history turned off.
+    pub fn store(&self) -> Option<cordelia_storage::history::Store> {
+        self.store.read().ok().and_then(|held| held.clone())
+    }
+
+    /// Take the turn, waiting for whoever has it. A sync cycle does: it
+    /// has nobody to answer to.
+    pub fn turn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.turn.lock().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// Take the turn if it comes free within `wait`. A command does: it
+    /// answers that the node is busy rather than leave something to be
+    /// carried out after it has given up.
+    pub fn turn_within(&self, wait: std::time::Duration) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let until = Instant::now() + wait;
+        loop {
+            match self.turn.try_lock() {
+                Ok(turn) => return Some(turn),
+                Err(std::sync::TryLockError::Poisoned(held)) => return Some(held.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            }
+        }
+    }
+
+    /// Drop what is too old or over the size, in a turn of its own: the
+    /// node does every hour that the machine is awake, whether or not
+    /// sync is on.
+    pub fn sweep(&self, now: chrono::DateTime<chrono::Utc>) {
+        if let Some(store) = self.store() {
+            let _turn = self.turn();
+            swept(store.sweep(now));
+        }
+    }
+
+    /// The same, for whoever holds the turn already, and only where
+    /// enough has been kept since the last sweep: a sync cycle does as it
+    /// ends, so that what one busy hour keeps cannot take the store far
+    /// over its size.
+    pub fn sweep_if_grown(&self, now: chrono::DateTime<chrono::Utc>) {
+        if let Some(store) = self.store().filter(|store| store.has_grown()) {
+            swept(store.sweep(now));
+        }
+    }
+}
+
+/// Say what a sweep of local history did.
+fn swept(swept: std::io::Result<cordelia_storage::history::Swept>) {
+    match swept {
+        Ok(swept) => {
+            if swept.aged + swept.over > 0 {
+                tracing::info!(
+                    aged = swept.aged,
+                    over = swept.over,
+                    "history: dropped old records"
+                );
+            }
+            if swept.failed > 0 {
+                tracing::warn!(
+                    records = swept.failed,
+                    "history: some old records could not be removed"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "history: could not drop old records"),
+    }
+}
+
 /// One connected peer, as `cordelia peers` shows it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerSnapshot {
@@ -451,6 +545,52 @@ mod tests {
         assert_eq!(key_checks(), before);
         assert_eq!(UsableKeys::MOST, 65_536);
         assert_eq!(UsableKeys::default().most, UsableKeys::MOST);
+    }
+
+    /// The sweep of local history takes its turn with a sync cycle and a
+    /// restore: while one of them holds the turn nothing is swept, and
+    /// when the turn is free what is too old goes. With history off there
+    /// is nothing to sweep.
+    #[test]
+    fn test_the_sweep_of_history_takes_its_turn() {
+        use cordelia_storage::history::{About, Change, Replacement, Store, Whose, kept};
+        let at = |days: i64| chrono::DateTime::from_timestamp(1_800_000_000 + days * 86_400, 0);
+        let (then, now) = (at(0).unwrap(), at(31).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::default();
+        history.sweep(now);
+        history.sweep_if_grown(now);
+
+        let store = Store::new(dir.path(), 30, 1 << 20).unwrap();
+        let about = About {
+            at: String::new(),
+            agent: "lab".into(),
+            folder: "/m".into(),
+            file: "notes.md".into(),
+            change: Change::Pulled,
+            kept: Some(kept(Whose::Here { agreed: None }, "old\n")),
+            replaced_by: Replacement::Nothing,
+            behind: false,
+        };
+        let pending = store.keep(about, Some("old\n"), then).unwrap();
+        store.settle(pending).unwrap();
+        history.open(Some(store.clone()));
+        let kept_now = || store.list().unwrap().records.len();
+
+        // Not enough has been kept for a sweep at a cycle's end.
+        history.sweep_if_grown(now);
+        assert_eq!(kept_now(), 1);
+
+        std::thread::scope(|scope| {
+            let turn = history.turn();
+            let sweep = scope.spawn(|| history.sweep(now));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!sweep.is_finished(), "swept while the turn was held");
+            assert_eq!(kept_now(), 1);
+            drop(turn);
+            sweep.join().unwrap();
+        });
+        assert_eq!(kept_now(), 0);
     }
 
     fn kept(copy: &str, hash: u8) -> Kept {

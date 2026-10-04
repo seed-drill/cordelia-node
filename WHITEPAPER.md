@@ -285,6 +285,15 @@ Two mechanisms carry items between them:
    overwritten. A file that does not fit in one entry (64 KB), or is not
    plain text, takes no part in sync: it is left as it is, reported, and
    deleted nowhere.
+4. **Keep what is replaced.** Sync makes one device's mistake every
+   device's, so before the adapter replaces or removes a file's text it
+   keeps that text in a history on the device: the file as it was, or, for
+   an edit or a delete made there, the channel's version. A text that cannot
+   be kept is not replaced. `cordelia history` lists what is kept and
+   `cordelia restore` puts a version back; where the folder syncs, every
+   device follows. History is kept for 30 days and up to 256 MB, on the
+   device and in the clear, and is not a backup. It does not notice a
+   mistake: a person has to. (Section 4.5b of the decision record.)
 
 ## 4. Security model
 
@@ -317,8 +326,9 @@ claim loses its test.
 
 **On a person's own machines**, memory is as protected as their disk: the agent's
 memory files are plaintext, as they are without Cordelia, and the node's data
-directory holds the device key and the keys to that person's channels (files
-readable only by the user).
+directory holds the device key, the keys to that person's channels, and the
+local history of what sync replaced, in the clear (files readable only by the
+user).
 
 | Threat | Mitigation |
 |---|---|
@@ -394,6 +404,7 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | A relay asks a device what it holds | when it connects, then every 10 min | `RELAY_ASK_AGAIN_SECS` |
 | Deleted-key retention | 90 days | `KEYED_TOMBSTONE_RETENTION_DAYS` |
 | Adapter cycle | 5 s | `cordelia-sync` `CYCLE_SECS` |
+| Local history kept | 30 days, and the newest 256 MB | `HISTORY_DAYS`, `HISTORY_MAX_BYTES` (`[history]`) |
 | Pending invites kept | 100 | `MAX_PENDING_INVITES` |
 
 Network protocol constants live in `crates/cordelia-core/src/protocol.rs`, with

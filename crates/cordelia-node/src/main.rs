@@ -11,6 +11,7 @@ use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
+mod history_cmd;
 mod indicator;
 mod p2p;
 
@@ -113,6 +114,27 @@ enum Commands {
         #[command(subcommand)]
         what: SyncCommand,
     },
+    /// List the versions of memory files that sync replaced or removed on
+    /// this device: with no argument, how much is kept and for which agents
+    #[command(args_conflicts_with_subcommands = true)]
+    History {
+        /// An agent's name, or the folder it works in
+        of: Option<String>,
+        /// Only files that were removed and are still absent
+        #[arg(long)]
+        removed: bool,
+        /// Only versions kept since a time (2026-10-03T09:00:00Z), or in
+        /// the last while (30m, 2h, 3d)
+        #[arg(long)]
+        since: Option<String>,
+        #[command(subcommand)]
+        what: Option<HistoryCommand>,
+    },
+    /// Put kept versions of memory files back, by id (see `cordelia history`)
+    Restore {
+        /// The ids of the versions, each restored by itself in this order
+        ids: Vec<String>,
+    },
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -126,6 +148,26 @@ enum Commands {
         /// Entity ID of the lead node (for swarm channel naming)
         #[arg(long)]
         lead_entity_id: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum HistoryCommand {
+    /// Print one kept version
+    Show {
+        /// The version's id
+        id: String,
+    },
+    /// Remove kept versions from this device, with every other kept
+    /// version here that holds the same text
+    Drop {
+        /// An agent's name, or the folder it works in
+        of: Option<String>,
+        /// One file of it
+        file: Option<String>,
+        /// Everything kept on this device
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -225,6 +267,19 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Devices) => cmd_devices(&cli.config),
         Some(Commands::Invites) => cmd_invites(&cli.config),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
+        Some(Commands::History {
+            of,
+            removed,
+            since,
+            what,
+        }) => match what {
+            None => history_cmd::list(&cli.config, of.as_deref(), removed, since.as_deref()),
+            Some(HistoryCommand::Show { id }) => history_cmd::show(&cli.config, &id),
+            Some(HistoryCommand::Drop { of, file, all }) => {
+                history_cmd::drop(&cli.config, of.as_deref(), file.as_deref(), all)
+            }
+        },
+        Some(Commands::Restore { ids }) => history_cmd::restore(&cli.config, &ids),
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -848,6 +903,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         relist: Default::default(),
         sync_control: Default::default(),
         usable_keys: Default::default(),
+        history: Default::default(),
     });
 
     // Personal nodes receive invites and channel states in an inbox channel
@@ -859,6 +915,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // stored before is taken off now, and the log says so. No
         // channel's key is changed by that.
         cordelia_api::membership::drop_unusable_keys(&state)?;
+        start_history(&state, &config.history);
     }
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -1145,6 +1202,61 @@ fn p2p_bind_addr(listen_addr: &str, p2p_port: u16) -> anyhow::Result<std::net::S
         .ok_or_else(|| anyhow::anyhow!("listen_addr host {host:?} resolved to no address"))
 }
 
+// ── Local history ──────────────────────────────────────────────────
+
+/// Set up local history as the configuration has it (decision 2026-09-30
+/// §4.5b). Turned off, what was kept is removed. Otherwise the records
+/// that were pending when the node last stopped are marked, and what is
+/// too old or over the size is dropped.
+///
+/// A store that cannot be prepared is still set: it keeps nothing, so the
+/// sync adapter makes no change that needs a text kept, and says why.
+fn start_history(state: &cordelia_api::state::AppState, config: &config::HistoryConfig) {
+    use cordelia_storage::history::{Start, Store};
+    let now = chrono::Utc::now();
+    let (store, interrupted, swept) = match Store::start(
+        &state.home_dir,
+        config.days,
+        config.max_bytes,
+        now,
+    ) {
+        Start::Off(removed) => {
+            match removed {
+                Ok(()) => tracing::info!("history: turned off"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "history: turned off, but what was kept could not be removed")
+                }
+            }
+            return;
+        }
+        Start::On {
+            store,
+            interrupted,
+            swept,
+        } => (store, interrupted, swept),
+    };
+    match interrupted {
+        Ok(0) => {}
+        Ok(interrupted) => tracing::warn!(
+            records = interrupted,
+            "history: the node stopped part-way through these changes; their texts are kept"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "history: cannot be written; sync replaces nothing until it can")
+        }
+    }
+    match swept {
+        Ok(swept) if swept.aged + swept.over > 0 => tracing::info!(
+            aged = swept.aged,
+            over = swept.over,
+            "history: dropped old records"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: could not drop old records"),
+    }
+    state.history.open(Some(store));
+}
+
 // ── Sync adapter loop ──────────────────────────────────────────────
 
 /// The one adapter the sync loop holds: the one in `slot` while `is_for`
@@ -1161,9 +1273,33 @@ fn adapter_for<A>(
     slot.get_or_insert_with(make)
 }
 
+/// What is done once in every `every`: when it was last due, or when the
+/// count began.
+struct Every {
+    since: std::time::Instant,
+    every: std::time::Duration,
+}
+
+impl Every {
+    fn from(since: std::time::Instant, every: std::time::Duration) -> Self {
+        Self { since, every }
+    }
+
+    /// Whether it is due at `now`: `every` has passed since it last was.
+    /// Asked again before another has passed, it is not.
+    fn is_due(&mut self, now: std::time::Instant) -> bool {
+        let due = now.duration_since(self.since) >= self.every;
+        if due {
+            self.since = now;
+        }
+        due
+    }
+}
+
 /// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
 /// adapter cycle (if sync is on) off the async runtime, and store its
-/// report for `cordelia sync status`.
+/// report for `cordelia sync status`. Once in every
+/// `HISTORY_SWEEP_INTERVAL_SECS` it sweeps local history first.
 async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
     use cordelia_storage::meta;
     use cordelia_sync::claude::ClaudeAdapter;
@@ -1174,6 +1310,10 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         cordelia_sync::claude::CYCLE_SECS,
     ));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sweep = Every::from(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS),
+    );
 
     loop {
         tokio::select! {
@@ -1182,7 +1322,13 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         }
         let state = state.clone();
         let adapter = adapter.clone();
+        let sweep = sweep.is_due(std::time::Instant::now());
         let _ = tokio::task::spawn_blocking(move || {
+            // In its own turn, whether or not sync is on: history ages
+            // either way.
+            if sweep {
+                state.history.sweep(chrono::Utc::now());
+            }
             let (dir, generation) = match state.db.lock() {
                 Ok(db) => (
                     meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
@@ -1880,8 +2026,9 @@ fn not_the_nodes_own(address: &str) -> String {
     )
 }
 
-/// How a command reaches its own node: the client, and the address of
-/// `path` there. A request carries the node's token, so it goes to the
+/// How a command reaches its own node: the client, which waits for an
+/// answer for `limit` or, with none, for as long as it takes, and the
+/// address of `path` there. A request carries the node's token, so it goes to the
 /// node's own address and nowhere else:
 ///
 /// - **To no other address.** The node's API listens at one of two
@@ -1897,7 +2044,7 @@ fn not_the_nodes_own(address: &str) -> String {
 fn to_this_machine(
     config: &Config,
     path: &str,
-    limit: std::time::Duration,
+    limit: Option<std::time::Duration>,
 ) -> anyhow::Result<(
     ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     String,
@@ -1907,7 +2054,7 @@ fn to_this_machine(
     let client = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
-        .timeout_global(Some(limit));
+        .timeout_global(limit);
     let url = format!("http://{host}:{}{path}", config.node.http_port);
     Ok((client, url))
 }
@@ -1920,7 +2067,7 @@ fn local_api(
     path: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<serde_json::Value> {
-    let (client, url) = to_this_machine(config, path, timeout)?;
+    let (client, url) = to_this_machine(config, path, Some(timeout))?;
     let token = std::fs::read_to_string(config.token_path())?;
     let agent: ureq::Agent = client.build().into();
     let auth = format!("Bearer {}", token.trim());
@@ -1954,11 +2101,87 @@ fn api_post(
     path: &str,
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
+    api_post_within(
+        config_path,
+        path,
+        body,
+        Some(std::time::Duration::from_secs(30)),
+    )
+}
+
+/// How long a command that waits without a limit waits before it says so:
+/// a little longer than the node waits for its turn before it answers
+/// that it is busy, so that the answer comes first, and this is not said
+/// a moment ahead of it. (The command's wait begins before the request is
+/// sent, and the node's when it takes the request up.) A wait longer
+/// than this is for work the node has begun.
+const STILL_WAITING_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_TURN_WAIT_SECS + 2);
+
+/// When a command that waits for the node says that it is still waiting:
+/// only where it waits with no limit of its own, and then once
+/// [`STILL_WAITING_AFTER`] is up.
+fn said_after(limit: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    limit.is_none().then_some(STILL_WAITING_AFTER)
+}
+
+/// Run `say` if nothing has come on `done`, and its other end is still
+/// held, when `wait` is up. The other end is dropped when the node has
+/// answered.
+fn say_if_not_done(
+    done: std::sync::mpsc::Receiver<()>,
+    wait: std::time::Duration,
+    say: impl FnOnce(),
+) {
+    if done.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+        say();
+    }
+}
+
+/// Do `work`, and run `say` once, from another thread, if it is still
+/// going when `wait` is up. With no `wait` nothing is said: `say` is let
+/// go of before the work begins.
+fn saying_if_long<T>(
+    wait: Option<std::time::Duration>,
+    say: impl FnOnce() + Send + 'static,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (answered, done) = std::sync::mpsc::channel::<()>();
+    match wait {
+        Some(wait) => {
+            std::thread::spawn(move || say_if_not_done(done, wait, say));
+        }
+        None => drop(say),
+    }
+    let out = work();
+    drop(answered);
+    out
+}
+
+/// What a command says while it waits for the node with no limit. A
+/// person who sees nothing may interrupt it, and that takes nothing back.
+fn still_waiting() {
+    eprintln!(
+        "Still waiting for the node, which finishes what it has begun. Interrupting this \
+         command does not take back what it asked for: `cordelia history` shows what was done."
+    );
+}
+
+/// [`api_post`], waiting for the answer for `limit`, or for as long as it
+/// takes: what the node carries out to the end whether or not anyone
+/// waits (a restore) is waited for, so that the command says what it did.
+/// With no limit it says, once, that it is still waiting.
+fn api_post_within(
+    config_path: &str,
+    path: &str,
+    body: serde_json::Value,
+    limit: Option<std::time::Duration>,
+) -> anyhow::Result<serde_json::Value> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
 
-    let (client, url) = to_this_machine(&config, path, std::time::Duration::from_secs(30))?;
+    let (client, url) = to_this_machine(&config, path, limit)?;
     let token_path = config.token_path();
     let token = std::fs::read_to_string(&token_path).map_err(|e| {
         anyhow::anyhow!(
@@ -1968,15 +2191,17 @@ fn api_post(
     })?;
 
     let agent: ureq::Agent = client.http_status_as_error(false).build().into();
-    let mut resp = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {}", token.trim()))
-        .send_json(&body)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-            )
-        })?;
+    let sent = saying_if_long(said_after(limit), still_waiting, || {
+        agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", token.trim()))
+            .send_json(&body)
+    });
+    let mut resp = sent.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+        )
+    })?;
 
     let status = resp.status();
     // A redirect did not come from the node: nothing of it is read.
@@ -3905,7 +4130,7 @@ mod tests {
             assert_eq!(api_host(other), None, "{other}");
         }
         let mut config = Config::default();
-        let limit = std::time::Duration::from_secs(1);
+        let limit = Some(std::time::Duration::from_secs(1));
         let port = config.node.http_port;
         let url_for = |config: &Config| {
             let (_, url) = to_this_machine(config, "/api/v1/status", limit)
@@ -3942,6 +4167,127 @@ mod tests {
                 && refused.contains("CORDELIA_BIND_ADDRESS"),
             "{refused}"
         );
+    }
+
+    /// A command that waits for the node with no limit says so once, if
+    /// the answer has not come by then, and says nothing if it has.
+    #[test]
+    fn test_a_long_wait_is_said_once_and_a_short_one_is_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let said = AtomicUsize::new(0);
+        let say = || {
+            said.fetch_add(1, Ordering::SeqCst);
+        };
+        let soon = std::time::Duration::from_millis(20);
+        // Still waiting when the time is up, and not before it is.
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        let began = std::time::Instant::now();
+        say_if_not_done(done, soon, say);
+        assert!(began.elapsed() >= soon, "said before the wait was up");
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        drop(answered);
+        // Answered before it is.
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        drop(answered);
+        say_if_not_done(done, std::time::Duration::from_secs(60), say);
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        // And it waits longer than the node waits for its turn: a node
+        // that is busy says so first.
+        assert!(STILL_WAITING_AFTER.as_secs() > cordelia_core::protocol::HISTORY_TURN_WAIT_SECS);
+    }
+
+    /// Work that takes long is said to, once, while it goes on, and its
+    /// answer is what comes back. Work that is done in time has nothing
+    /// said of it, and nor has any where no wait is given.
+    ///
+    /// Nothing here has to happen inside a stretch of time. What says it
+    /// holds something that is let go of with it, so the test learns when
+    /// nobody can say it any more. The ten seconds and the ten minutes
+    /// below are limits on a failure: a pass waits the twenty
+    /// milliseconds of its first case, and no longer.
+    #[test]
+    fn test_work_that_takes_long_is_said_to() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        let limit = std::time::Duration::from_secs(10);
+        let said = Arc::new(AtomicUsize::new(0));
+        let say = || {
+            let said = said.clone();
+            let (held, gone) = mpsc::channel::<()>();
+            let say = move || {
+                let _held = held;
+                said.fetch_add(1, Ordering::SeqCst);
+            };
+            (say, gone)
+        };
+        // Nobody holds what says it any more, within the limit.
+        let let_go = |gone: &mpsc::Receiver<()>| {
+            gone.recv_timeout(limit) == Err(mpsc::RecvTimeoutError::Disconnected)
+        };
+
+        // Work that goes on until it is said to: it is said to, once.
+        let (saying, gone) = say();
+        let counted = said.clone();
+        let slow = move || {
+            let began = std::time::Instant::now();
+            while counted.load(Ordering::SeqCst) == 0 && began.elapsed() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            7
+        };
+        let soon = std::time::Duration::from_millis(20);
+        let began = std::time::Instant::now();
+        assert_eq!(saying_if_long(Some(soon), saying, slow), 7);
+        // Not before the wait that was given.
+        assert!(began.elapsed() >= soon);
+        assert!(let_go(&gone));
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+
+        // Done in time: the one who would have said it finds the work
+        // over, and says nothing.
+        let (saying, gone) = say();
+        let long = std::time::Duration::from_secs(600);
+        assert_eq!(saying_if_long(Some(long), saying, || 8), 8);
+        assert!(let_go(&gone));
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+
+        // With no wait there is nobody to say it, however long the work
+        // takes: what says it is let go of before the work begins, and
+        // this work goes on until it has been.
+        let (saying, gone) = say();
+        let until_let_go = move || let_go(&gone);
+        assert!(saying_if_long(None, saying, until_let_go));
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+    }
+
+    /// A command says that it is still waiting only where it waits with
+    /// no limit of its own: a restore and a drop, which the node carries
+    /// out to the end. (That those two are the ones that wait so, and
+    /// that this is what they are given, is not under test here.)
+    #[test]
+    fn test_only_a_wait_with_no_limit_is_said() {
+        assert_eq!(said_after(None), Some(STILL_WAITING_AFTER));
+        let limit = Some(std::time::Duration::from_secs(30));
+        assert_eq!(said_after(limit), None);
+    }
+
+    /// What is done once in each hour (the sweep of local history) is due
+    /// once in each: not before one has passed, and not again until
+    /// another has. (That the node's loop sweeps when it is due is not
+    /// under test here.)
+    #[test]
+    fn test_what_is_done_each_hour_is_due_once_in_each() {
+        let start = std::time::Instant::now();
+        let hour =
+            std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS);
+        let second = std::time::Duration::from_secs(1);
+        let mut sweep = Every::from(start, hour);
+        assert!(!sweep.is_due(start));
+        assert!(!sweep.is_due(start + hour - second));
+        assert!(sweep.is_due(start + hour));
+        assert!(!sweep.is_due(start + hour + second));
+        assert!(!sweep.is_due(start + hour * 2 - second));
+        assert!(sweep.is_due(start + hour * 2));
     }
 
     #[test]

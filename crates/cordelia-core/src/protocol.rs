@@ -436,6 +436,28 @@ pub const MAX_CHANNEL_NAME_LEN: usize = 63;
 /// Primitive: default storage budget per node; configurable.
 pub const MAX_STORAGE_BYTES: u64 = 1_073_741_824;
 
+/// How long local history keeps the text sync replaced or removed: 30
+/// days (parameter-rationale.md §10). Configurable; 0 turns history off.
+pub const HISTORY_DAYS: u32 = 30;
+
+/// The most local history holds: 256 MB. Over that the oldest records go
+/// first (parameter-rationale.md §10). Configurable.
+pub const HISTORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How long a history command waits for a sync cycle that is running
+/// before it says the node is busy: 10 s (parameter-rationale.md §10).
+pub const HISTORY_TURN_WAIT_SECS: u64 = 10;
+
+/// How often local history drops what is too old or over its size: every
+/// hour that the machine is awake, and when the node starts
+/// (parameter-rationale.md §10).
+pub const HISTORY_SWEEP_INTERVAL_SECS: u64 = 3600;
+
+/// And sooner, at the end of a sync cycle, once more than one part in
+/// this many of the most it holds has been kept since it was last swept:
+/// an eighth (parameter-rationale.md §10).
+pub const HISTORY_SWEEP_SHARE: u64 = 8;
+
 /// The most one channel may hold at a relay: 16 MB. A channel is cheap to
 /// make, so the relay's total is what bounds storage; this keeps one
 /// channel from being most of it. Rationale: parameter-rationale.md §4.

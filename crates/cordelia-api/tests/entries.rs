@@ -41,6 +41,7 @@ fn node() -> Node {
         relist: Default::default(),
         sync_control: Default::default(),
         usable_keys: Default::default(),
+        history: Default::default(),
     };
     membership::ensure_own_inbox(&state).unwrap();
     Node { state, _dir: dir }
@@ -365,6 +366,12 @@ fn t03_an_entry_over_the_size_limit_is_not_written() {
             .len();
     let fits = MAX_ITEM_BYTES - ITEM_SEAL_OVERHEAD_BYTES - envelope;
 
+    // What can be asked beforehand says the same as the write.
+    assert!(entries::fits("notes.md", &json!("x".repeat(fits))));
+    assert!(!entries::fits("notes.md", &json!("x".repeat(fits + 1))));
+    // (A longer name leaves less room for the text.)
+    assert!(!entries::fits("longer.md", &json!("x".repeat(fits))));
+
     write(&"x".repeat(fits)).unwrap();
     let stored = {
         let db = a.state.db.lock().unwrap();
@@ -601,6 +608,15 @@ fn t16_a_revision_meant_to_use_the_numbers_up_is_not_kept() {
         a.read(&ch),
         vec![("notes.md".into(), "by b".into(), MAX_REV, 0)]
     );
+    // The name has no next revision, and asking for it says so, as a
+    // write would. Another name has one.
+    {
+        let db = a.state.db.lock().unwrap();
+        let next = |key: &str| entries::next_rev(&a.state, &db, &ch, key);
+        let refused = next("notes.md").unwrap_err().to_string();
+        assert!(refused.contains("revision limit"), "{refused}");
+        assert_eq!(next("other.md").unwrap(), 1);
+    }
 
     membership::remove_device(&a.state, &b.pk()).unwrap();
     assert_eq!(a.read(&ch), vec![("notes.md".into(), "by b".into(), 2, 0)]);

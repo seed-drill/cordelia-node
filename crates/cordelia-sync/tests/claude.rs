@@ -55,6 +55,7 @@ impl Device {
             relist: Default::default(),
             sync_control: Default::default(),
             usable_keys: Default::default(),
+            history: Default::default(),
         };
         membership::ensure_own_inbox(&state).unwrap();
         let adapter = ClaudeAdapter::new(
@@ -2013,4 +2014,80 @@ fn a_file_replaced_by_a_link_is_deleted_nowhere() {
     assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("kept\n"));
     let skipped: Vec<&String> = report.folders.iter().flat_map(|f| &f.skipped).collect();
     assert_eq!(skipped, vec!["notes.md"]);
+}
+
+/// Local history on a device, as the node opens it: kept for 30 days, and
+/// up to `max_bytes`.
+fn history_on(d: &Device, max_bytes: u64) -> cordelia_storage::history::Store {
+    let store = cordelia_storage::history::Store::new(&d.state.home_dir, 30, max_bytes).unwrap();
+    d.state.history.open(Some(store.clone()));
+    store
+}
+
+/// A sync cycle takes its turn with a restore, a drop and the sweep of
+/// local history (decision 2026-09-30 §4.5b). While one of them holds the
+/// turn the cycle waits, and none of it is done; when the turn is free it
+/// goes ahead.
+#[test]
+fn a_cycle_waits_for_its_turn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut a, _b) = paired();
+    let a_mem = a.home_memory();
+    std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
+    let Device { state, adapter, .. } = &mut a;
+    let state = &*state;
+    let done = AtomicBool::new(false);
+    let report = std::thread::scope(|scope| {
+        let turn = state.history.turn();
+        let cycle = scope.spawn(|| {
+            let report = adapter.run_cycle(state);
+            done.store(true, Ordering::SeqCst);
+            report
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the cycle ran while the turn was held"
+        );
+        drop(turn);
+        cycle.join().unwrap()
+    });
+    assert!(done.load(Ordering::SeqCst));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.folders.len(), 1, "{report:?}");
+}
+
+/// Local history is held to its size as it grows, not only once an hour:
+/// a cycle that has kept enough sweeps the store as it ends. So what one
+/// device holds passes its size by what one cycle keeps, and by no more.
+#[test]
+fn a_cycle_that_keeps_enough_sweeps_local_history() {
+    let (mut a, mut b) = paired();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let text = |n: usize| format!("{n}{}\n", "x".repeat(1000));
+    std::fs::write(a_mem.join("notes.md"), text(0)).unwrap();
+    settle(&mut a, &mut b);
+    // How large one kept text is here: a record names its memory folder,
+    // whose path is as long as this machine's temporary directory.
+    let measured = history_on(&a, 1 << 20);
+    std::fs::write(b_mem.join("notes.md"), text(1)).unwrap();
+    settle(&mut a, &mut b);
+    let one = measured.list().unwrap().bytes;
+    assert!(one > 1000, "{one}");
+    // Room for two kept texts, and not for three.
+    let room = one * 5 / 2;
+    let store = history_on(&a, room);
+    let mut most = 0;
+    for n in 2..=7 {
+        std::fs::write(b_mem.join("notes.md"), text(n)).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&a_mem, "notes.md"), Some(text(n)));
+        let listing = store.list().unwrap();
+        assert!(listing.bytes <= room, "after {n}: {} bytes", listing.bytes);
+        most = most.max(listing.records.len());
+    }
+    // It did keep them: two at a time, the newest.
+    assert_eq!(most, 2);
+    let newest = store.list().unwrap().records[0].id.clone();
+    assert_eq!(store.read(&newest).unwrap().unwrap().1, Some(text(6)));
 }

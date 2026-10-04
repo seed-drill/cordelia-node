@@ -36,7 +36,8 @@ use cordelia_api::entries::{self, Write};
 use cordelia_api::membership;
 use cordelia_api::state::{AppState, Kept};
 use cordelia_core::CordeliaError;
-use cordelia_storage::{channels, meta, sync_state};
+use cordelia_storage::atomic::write_atomic;
+use cordelia_storage::{channels, history, meta, sync_state};
 
 use crate::after::{After, Over};
 use crate::discover::{self, Project};
@@ -527,6 +528,18 @@ impl ClaudeAdapter {
     /// been changed since, by the time the cycle gets to a folder or to an
     /// entry, it stops there (see [`CycleReport::stopped`]).
     pub fn run_cycle_under(&mut self, state: &AppState, settings: Settings) -> CycleReport {
+        // A cycle takes its turn with a restore, a drop and the sweep of
+        // local history, and holds it to the end. The database lock is
+        // taken only inside it.
+        let _turn = state.history.turn();
+        let report = self.cycle_in_turn(state, settings);
+        // What the cycle kept may have taken local history over its size.
+        state.history.sweep_if_grown(chrono::Utc::now());
+        report
+    }
+
+    /// The cycle itself, for the caller that holds the turn.
+    fn cycle_in_turn(&mut self, state: &AppState, settings: Settings) -> CycleReport {
         let generation = settings.generation;
         let mut report = CycleReport {
             generation,
@@ -630,12 +643,19 @@ impl ClaudeAdapter {
                 Ok(Some(channel)) => {
                     joined.insert(target.name.clone());
                     syncing.push((memory.display().to_string(), channel.clone()));
-                    sync_folder(state, &memory, &channel, "", &self.device_tag, generation).map(
-                        |mut r| {
-                            r.channel_id = Some(channel);
-                            r
-                        },
+                    sync_folder(
+                        state,
+                        &memory,
+                        &channel,
+                        &target.name,
+                        "",
+                        &self.device_tag,
+                        generation,
                     )
+                    .map(|mut r| {
+                        r.channel_id = Some(channel);
+                        r
+                    })
                 }
                 Ok(None) => Ok(FolderReport {
                     waiting: true,
@@ -1029,105 +1049,6 @@ fn read_local(dir: &Path) -> std::io::Result<Local> {
     Ok(local)
 }
 
-/// Write `text` to `dir/name` atomically: temporary file, then rename. The
-/// rename replaces a symlink at `name` rather than writing through it.
-/// Returns `false`, with nothing written under `name`, if `unchanged` says
-/// that what is there is no longer what the cycle saw.
-///
-/// The text is flushed to the disk before the file gets its name. A copy
-/// of this device's version is written just before the file is replaced:
-/// if the power went between the two, the copy must not be the one that
-/// is empty. A flush takes long enough for an agent to write to the file
-/// meanwhile, so `unchanged` is asked after it, as the last thing before
-/// the rename. The name is flushed after the rename, as far as the volume
-/// can: the record of a write is on the disk as soon as it is made, and a
-/// name that was not would leave the old text under a record of the new.
-///
-/// `flushed` is run between the flush and that last look. A cycle does
-/// nothing there. A test does what an agent may do while a text is
-/// flushed.
-///
-/// The folder is never made here. A cycle makes it once, before any file,
-/// where it was not there when it was listed and a file is to arrive
-/// ([`sync_folder_with`]). A folder that is not there for a write has
-/// gone since: made again by the write, it would hold only what is written
-/// from then on, and the next cycle would read that as every other file
-/// deleted.
-fn write_atomic(
-    dir: &Path,
-    name: &str,
-    text: &str,
-    flushed: &dyn Fn(),
-    unchanged: &dyn Fn() -> bool,
-) -> std::io::Result<bool> {
-    let tmp = dir.join(temporary_name(name));
-    // Made anew each time, so that it is never written through a link
-    // that something has left under its name.
-    let _ = std::fs::remove_file(&tmp);
-    let mut made = std::fs::OpenOptions::new();
-    made.write(true).create_new(true);
-    let written = made
-        .open(&tmp)
-        .and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            flush(&file)
-        })
-        .and_then(|()| {
-            flushed();
-            match unchanged() {
-                true => std::fs::rename(&tmp, dir.join(name)).map(|()| true),
-                false => Ok(false),
-            }
-        });
-    match written {
-        Ok(true) => flush_names(dir),
-        // Not left behind where it could not be written whole, or did not
-        // take the file's place.
-        _ => {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    written
-}
-
-/// Flush the names in a folder to the disk. The file is already in place,
-/// so where this cannot be done there is nothing more to do.
-fn flush_names(dir: &Path) {
-    if let Err(error) = std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
-        tracing::debug!(folder = %dir.display(), %error, "could not flush a folder's names");
-    }
-}
-
-/// Flush a file's contents to the disk. A volume that has no flush (some
-/// network volumes and some removable ones) is written as it was before a
-/// flush was asked for.
-fn flush(file: &std::fs::File) -> std::io::Result<()> {
-    match file.sync_all() {
-        Err(e) if has_no_flush(&e) => Ok(()),
-        done => done,
-    }
-}
-
-/// Whether a flush failed because the volume has none, as against a flush
-/// that was tried and failed (a full disk, a fault of the disk).
-fn has_no_flush(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{InvalidInput, Unsupported};
-    // On a Mac a flush is a request of its own, which a volume without it
-    // answers with one of two codes that have no kind of their own there:
-    // ENOTSUP (45) and ENOTTY (25).
-    let on_a_mac = cfg!(target_vendor = "apple") && matches!(e.raw_os_error(), Some(45 | 25));
-    on_a_mac || matches!(e.kind(), InvalidInput | Unsupported)
-}
-
-/// The name of the temporary file that `name` is written through: hidden,
-/// so that it is never read as a memory file, and short whatever the
-/// length of `name`. A name may be as long as a file name can be, and a
-/// temporary name made by adding to it would then be too long to create.
-fn temporary_name(name: &str) -> String {
-    let hash = cordelia_crypto::sha256(name.as_bytes());
-    format!(".cordelia-tmp-{}", hex::encode(&hash[..8]))
-}
-
 /// Where the text of a file in conflict is kept: see [`conflict_file`].
 #[derive(Debug, PartialEq, Eq)]
 enum ConflictFile {
@@ -1213,16 +1134,19 @@ fn conflict_file(
 /// Sync one memory folder with one channel (keys under `prefix`), under
 /// the settings of `generation`. It stops, and says so in its report, as
 /// soon as it finds that the settings have changed: the change may be the
-/// one that stops this folder syncing.
+/// one that stops this folder syncing. `agent` is the name the folder syncs
+/// under, which is what local history files its records by.
 fn sync_folder(
     state: &AppState,
     dir: &Path,
     channel: &str,
+    agent: &str,
     prefix: &str,
     tag: &str,
     generation: u64,
 ) -> Result<FolderReport, CordeliaError> {
-    sync_folder_with(state, dir, channel, prefix, tag, generation, &Hooks::NONE)
+    let hooks = &Hooks::NONE;
+    sync_folder_with(state, dir, channel, agent, prefix, tag, generation, hooks)
 }
 
 /// How one file is planned: [`plan::plan`].
@@ -1267,10 +1191,12 @@ impl Hooks<'_> {
 }
 
 /// [`sync_folder`], with `hooks` for a test.
+#[allow(clippy::too_many_arguments)]
 fn sync_folder_with(
     state: &AppState,
     dir: &Path,
     channel: &str,
+    agent: &str,
     prefix: &str,
     tag: &str,
     generation: u64,
@@ -1414,8 +1340,10 @@ fn sync_folder_with(
             prefix,
             tag,
             folder: &folder,
+            agent,
             generation,
             planned: taken.get(key).map(String::as_str),
+            over: remote.get(key),
             agreed: &agreed,
             flushed: hooks.flushed,
             relied: RefCell::new(None),
@@ -1487,12 +1415,18 @@ struct Ctx<'a> {
     prefix: &'a str,
     tag: &'a str,
     folder: &'a str,
+    /// The name the folder syncs under: a history record is filed by it.
+    agent: &'a str,
     /// The settings count this cycle runs under.
     generation: u64,
     /// The entry the plan for this file took as the channel's version of
     /// it (its item ID), or `None` if it took there to be none. An edit, a
     /// delete or a merge is published only over this: see `publish_over`.
     planned: Option<&'a str>,
+    /// That entry as the plan read it: who wrote it, at which revision,
+    /// and its text. It is what a publish replaces, if the publish is
+    /// made at all, and what a pull brings.
+    over: Option<&'a Remote>,
     /// What the folder had agreed, for each file, when the cycle began.
     agreed: &'a HashMap<String, Agreed>,
     /// See [`Hooks::flushed`]: nothing, except in a test.
@@ -1706,6 +1640,36 @@ fn current_hash(dir: &Path, key: &str) -> Option<[u8; 32]> {
         .map(|bytes| cordelia_crypto::sha256(&bytes))
 }
 
+/// Whether the file is as the cycle saw it: the same bytes, or still not
+/// there. A name that has come to hold something that cannot be read (a
+/// directory, a link to nowhere) is not absent: what it holds could not
+/// be kept, so it is not replaced. Nor is a name that cannot be looked
+/// at: nothing says that it is free ([`cannot_be_looked_at`]).
+fn as_seen(dir: &Path, key: &str, seen: Option<[u8; 32]>) -> bool {
+    match seen {
+        Some(hash) => current_hash(dir, key) == Some(hash),
+        None => {
+            let there = std::fs::symlink_metadata(dir.join(key));
+            matches!(there, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+    }
+}
+
+/// Why a name that had no file when the cycle listed the folder cannot be
+/// looked at now, if it cannot: the name is too long for the volume, say,
+/// or the volume does not answer. Such a name is not taken for free, and
+/// what arrives for it is not written: a file made under it since would be
+/// replaced unseen. It is the file's failure, said in each cycle, where a
+/// name that was only passed over would be passed over in silence.
+fn cannot_be_looked_at(dir: &Path, key: &str) -> Option<String> {
+    match std::fs::symlink_metadata(dir.join(key)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!(
+            "its name cannot be looked at ({e}), so what arrived for it was not written"
+        )),
+        _ => None,
+    }
+}
+
 /// Record what `folder` and `channel` now agree on for `key`, under the
 /// settings of `generation`, and forget what was kept beside the file
 /// ([`is_the_copy`]): a file can come to agree with the channel without
@@ -1743,11 +1707,18 @@ fn record_agreed(
 /// Both are looked at on `db`, and the entry is published on it: the caller
 /// holds the database lock for the whole of this, so neither can change
 /// between the look and the publish.
+///
+/// What the entry replaces went into local history before the lock was
+/// taken ([`keep_channel`], [`keep_here`]), in a record that names the
+/// revision the entry was then to have: `at`. Nothing is published where
+/// the entry would now have another, so a record never names a revision
+/// that its text was not replaced at.
 fn publish_over(
     ctx: &Ctx,
     db: &rusqlite::Connection,
     full_key: &str,
     text: Option<&str>,
+    at: Option<u64>,
 ) -> Result<Option<(entries::Published, Writer)>, CordeliaError> {
     let Ctx {
         state,
@@ -1781,6 +1752,24 @@ fn publish_over(
         );
         return Ok(None);
     }
+    // What the new entry is written after is what the plan read: the
+    // entry just found to be the one it took, or nothing. Not what the
+    // folder remembers, and not whatever other entries this device holds.
+    let over = now
+        .as_ref()
+        .filter(|entry| taken_as_a_version(entry).is_some())
+        .map(|entry| &entry.current);
+    if let Some(at) = at
+        && entries::next_rev(state, db, channel, full_key)? != at
+    {
+        tracing::debug!(
+            folder,
+            channel,
+            key = full_key,
+            "an entry arrived under the file's name since its text was kept; left for the next cycle"
+        );
+        return Ok(None);
+    }
     let content = text.map_or(Value::Null, |t| Value::String(t.to_string()));
     let write = |after: Option<&Value>| -> Result<entries::Published, CordeliaError> {
         let write = Write {
@@ -1797,13 +1786,6 @@ fn publish_over(
     if says_nothing {
         return write(None).map(said_nothing);
     }
-    // What the new entry is written after is what the plan read: the
-    // entry just found to be the one it took, or nothing. Not what the
-    // folder remembers, and not whatever other entries this device holds.
-    let over = now
-        .as_ref()
-        .filter(|entry| taken_as_a_version(entry).is_some())
-        .map(|entry| &entry.current);
     let mut after = written_after(over);
     loop {
         match write(Some(&after.to_value())) {
@@ -1843,6 +1825,189 @@ fn written_after(over: Option<&entries::Version>) -> After {
         text,
         after: said.as_ref(),
     }))
+}
+
+/// A text kept in local history ahead of the change that replaces it
+/// (decision 2026-09-30 §4.5b), as a pending record. `None` with history
+/// off, and where there was no text to keep. Dropped, it takes its record
+/// with it: a record stays only if its change was made ([`settle`]).
+type Ahead = Option<history::Pending>;
+
+/// A failure of the publish itself, or of what is asked of the channel
+/// ahead of it, as this file's or the folder's: one that is refused for
+/// what the entry is (its name's revisions are used up, say) is this
+/// file's. Any other is the folder's.
+fn of_a_publish(e: CordeliaError) -> Failure {
+    match e {
+        CordeliaError::Validation(why) => Failure::File(why),
+        e => Failure::Folder(e),
+    }
+}
+
+/// The revision the entry that this device is about to publish for `key`
+/// will have, with history on; `None` with history off, where nothing
+/// names it. A record of what the entry replaces names it, and the
+/// publish is then made at this revision or not at all
+/// ([`publish_over`]).
+fn revision_ahead(ctx: &Ctx, full_key: &str) -> Result<Option<u64>, Failure> {
+    if ctx.state.history.store().is_none() {
+        return Ok(None);
+    }
+    let db = lock(ctx.state)?;
+    entries::next_rev(ctx.state, &db, ctx.channel, full_key)
+        .map(Some)
+        .map_err(of_a_publish)
+}
+
+/// Why a change is not made where the text it would replace could not be
+/// kept. The file is named by whoever reports it.
+fn not_kept(why: impl std::fmt::Display) -> String {
+    format!(
+        "the text this would replace could not be kept in history ({why}), so nothing was changed"
+    )
+}
+
+/// A device's entry, as a history record names it.
+fn entry_of(device: &[u8; 32], rev: u64) -> history::Entry {
+    let device =
+        cordelia_crypto::bech32::encode_public_key(device).unwrap_or_else(|_| hex::encode(device));
+    history::Entry { device, rev }
+}
+
+/// The change that a text was kept for has been made: its record stands.
+/// One that cannot be made final is left pending, and is marked at the
+/// next sweep, drop or start: the text is kept either way.
+fn settle(ctx: &Ctx, ahead: Ahead) {
+    if let (Some(pending), Some(store)) = (ahead, ctx.state.history.store())
+        && let Err(error) = store.settle(pending)
+    {
+        tracing::warn!(%error, "a history record could not be made final");
+    }
+}
+
+/// What [`keep_here`] found.
+enum KeptHere {
+    /// What was kept, if anything was to be.
+    Ahead(Ahead),
+    /// The file is no longer as the cycle saw it. Nothing was kept, and
+    /// the change is left for the next cycle.
+    Changed,
+}
+
+/// Keep the file as it is here, ahead of a change that replaces or removes
+/// it: no kept copy, no replacement. The file is read again for it, and is
+/// kept only if it is still what the cycle saw (`seen`).
+///
+/// Where no file is here, an arrival is noted, with no text, and for any
+/// other change nothing: there is nothing to keep. A note that cannot be
+/// written holds nothing up, since no text is lost without it.
+fn keep_here(
+    ctx: &Ctx,
+    key: &str,
+    seen: Option<[u8; 32]>,
+    change: history::Change,
+    replaced_by: history::Replacement,
+) -> Result<KeptHere, Failure> {
+    let Some(store) = ctx.state.history.store() else {
+        return Ok(KeptHere::Ahead(None));
+    };
+    let text = match seen {
+        None => None,
+        Some(hash) => {
+            let bytes = match std::fs::read(ctx.dir.join(key)) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(KeptHere::Changed);
+                }
+                Err(e) => return Err(Failure::File(not_kept(e))),
+            };
+            if cordelia_crypto::sha256(&bytes) != hash {
+                return Ok(KeptHere::Changed);
+            }
+            // The cycle read these bytes as text.
+            Some(String::from_utf8(bytes).map_err(|e| Failure::File(not_kept(e)))?)
+        }
+    };
+    let arrives = matches!(change, history::Change::Pulled) && text.is_none();
+    if text.is_none() && !arrives {
+        return Ok(KeptHere::Ahead(None));
+    }
+    let agreed = ctx.agreed.get(key).filter(|a| a.hash.is_some());
+    let whose = history::Whose::Here {
+        agreed: agreed.map(|a| a.rev),
+    };
+    let about = history::About {
+        at: String::new(),
+        agent: ctx.agent.to_string(),
+        folder: ctx.folder.to_string(),
+        file: key.to_string(),
+        change: if arrives {
+            history::Change::Arrived
+        } else {
+            change
+        },
+        kept: text.as_deref().map(|t| history::kept(whose, t)),
+        replaced_by,
+        // The file here was the version this device had agreed, and what
+        // takes its place was written after it.
+        behind: matches!(change, history::Change::Pulled)
+            && seen.is_some()
+            && agreed.is_some_and(|a| a.hash == seen),
+    };
+    match store.keep(about, text.as_deref(), chrono::Utc::now()) {
+        Ok(pending) => Ok(KeptHere::Ahead(Some(pending))),
+        Err(error) if arrives => {
+            tracing::warn!(%error, "an arrival could not be noted in history");
+            Ok(KeptHere::Ahead(None))
+        }
+        Err(e) => Err(Failure::File(not_kept(e))),
+    }
+}
+
+/// Keep the channel's version of a file, as the plan read it, ahead of
+/// this device's edit or delete that replaces it; and say the revision
+/// the edit or delete is then to be published at. Nothing is kept where
+/// the plan read no text there: a first publish, and a publish over a
+/// delete, replace no text.
+///
+/// It is kept before the database lock is taken for the publish. The
+/// publish is made only over the very entry the plan read, so the text
+/// kept here is the text replaced; if it is not made, the record goes.
+fn keep_channel(
+    ctx: &Ctx,
+    key: &str,
+    full_key: &str,
+    change: history::Change,
+) -> Result<(Ahead, Option<u64>), Failure> {
+    let Some(store) = ctx.state.history.store() else {
+        return Ok((None, None));
+    };
+    let Some((over, text)) = ctx
+        .over
+        .and_then(|version| Some((version, version.content.as_ref()?)))
+    else {
+        return Ok((None, None));
+    };
+    let Some(rev) = revision_ahead(ctx, full_key)? else {
+        return Ok((None, None));
+    };
+    let about = history::About {
+        at: String::new(),
+        agent: ctx.agent.to_string(),
+        folder: ctx.folder.to_string(),
+        file: key.to_string(),
+        change,
+        kept: Some(history::kept(
+            history::Whose::Channel(entry_of(&over.author, over.rev)),
+            &text.text,
+        )),
+        replaced_by: history::Replacement::Entry(entry_of(&ctx.state.identity.public_key(), rev)),
+        behind: false,
+    };
+    match store.keep(about, Some(&text.text), chrono::Utc::now()) {
+        Ok(pending) => Ok((Some(pending), Some(rev))),
+        Err(e) => Err(Failure::File(not_kept(e))),
+    }
 }
 
 /// Apply one action. An error says whether it is this file's or the
@@ -1895,8 +2060,10 @@ fn apply(
         prefix,
         tag,
         folder,
+        agent: _,
         generation,
         planned: _,
+        over: _,
         agreed: _,
         flushed: _,
         relied: _,
@@ -1919,7 +2086,7 @@ fn apply(
     // is replaced.
     let unchanged = || {
         let kept = ctx.relied.borrow();
-        current_hash(dir, key) == seen
+        as_seen(dir, key, seen)
             && kept
                 .as_ref()
                 .is_none_or(|(copy, hash)| current_hash(dir, copy) == Some(*hash))
@@ -1964,15 +2131,16 @@ fn apply(
     // The reason alone: the file is named by whoever reports it.
     let io = |e: std::io::Error| Failure::File(e.to_string());
     let full_key = format!("{prefix}{key}");
+    let me = state.identity.public_key();
     // A publish that is refused for what the entry is (its name's
     // revisions are used up, say) is this file's failure. Any other is
-    // the folder's.
-    let publish = |text: Option<&str>| -> Result<Option<(entries::Published, Writer)>, Failure> {
+    // the folder's. `at` is the revision that a history record of what
+    // the entry replaces was kept for, if one was.
+    let publish = |text: Option<&str>,
+                   at: Option<u64>|
+     -> Result<Option<(entries::Published, Writer)>, Failure> {
         let db = lock(state)?;
-        publish_over(ctx, &db, &full_key, text).map_err(|e| match e {
-            CordeliaError::Validation(why) => Failure::File(why),
-            e => Failure::Folder(e),
-        })
+        publish_over(ctx, &db, &full_key, text, at).map_err(of_a_publish)
     };
     // What is agreed is one entry: its text, its revision, and what a
     // record says of who wrote it (`Remote::writer`). A device that says
@@ -1995,42 +2163,97 @@ fn apply(
         }
     };
 
+    // Whether a text can be published under this name at all. It is asked
+    // before anything is kept for the publish: a text that fits in no
+    // entry is not published in any cycle while the file stays as it is,
+    // and what it would replace would otherwise be written to history,
+    // and removed again, in each.
+    let fits = |text: &str| entries::fits(&full_key, &Value::String(text.to_string()));
+
     match action {
-        Action::Publish(text) => match publish(Some(&text)) {
-            Ok(Some((entry, writer))) => {
-                report.published += 1;
-                note_published(ctx, key, &text, &entry.item_id);
-                record(Some(Content::new(text).hash), entry.rev, writer)?;
-            }
-            Ok(None) => return Ok(false),
-            Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
+        Action::Publish(text) => {
+            if !fits(&text) {
                 too_large(report);
                 return Ok(false);
             }
-            Err(e) => return Err(e),
-        },
+            // The channel's version is kept in history first. A publish
+            // that is not made takes the record with it.
+            let (ahead, at) = keep_channel(ctx, key, &full_key, history::Change::EditedHere)?;
+            match publish(Some(&text), at) {
+                Ok(Some((entry, writer))) => {
+                    settle(ctx, ahead);
+                    report.published += 1;
+                    note_published(ctx, key, &text, &entry.item_id);
+                    record(Some(Content::new(text).hash), entry.rev, writer)?;
+                }
+                Ok(None) => return Ok(false),
+                // Asked above, by the publish's own test: not met unless
+                // the two come to differ.
+                Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
+                    too_large(report);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Action::PublishDelete => {
-            let Some((entry, writer)) = publish(None)? else {
+            let (ahead, at) = keep_channel(ctx, key, &full_key, history::Change::DeletedHere)?;
+            let Some((entry, writer)) = publish(None, at)? else {
                 return Ok(false);
             };
+            settle(ctx, ahead);
             report.published += 1;
             record(None, entry.rev, writer)?;
         }
         Action::Pull { text, rev, writer } => {
+            // Asked before anything is kept, or noted, for the write.
+            if seen.is_none()
+                && let Some(why) = cannot_be_looked_at(dir, key)
+            {
+                return Err(Failure::File(why));
+            }
+            // The file as it is here is kept first, or its arrival noted.
+            // The last look at the file comes after: `write_atomic` makes
+            // it. A write that is not made takes the record with it. What
+            // replaces the file is the channel's version, as the plan
+            // read it: the record names the device that signed it.
+            let replaced_by = match ctx.over {
+                Some(version) => history::Replacement::Entry(entry_of(&version.author, rev)),
+                None => history::Replacement::Nothing,
+            };
+            let ahead = match keep_here(ctx, key, seen, history::Change::Pulled, replaced_by)? {
+                KeptHere::Ahead(ahead) => ahead,
+                KeptHere::Changed => {
+                    deferred();
+                    return Ok(false);
+                }
+            };
             if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                 deferred();
                 return Ok(false);
             }
+            settle(ctx, ahead);
             report.pulled += 1;
             forget_kept(ctx, key);
             record(Some(Content::new(text).hash), rev, writer)?;
         }
         Action::RemoveFile { rev, writer } => {
+            // The file is kept first, and looked at once more now that it
+            // is: an agent may have written to it meanwhile.
+            let nothing = history::Replacement::Nothing;
+            let ahead = match keep_here(ctx, key, seen, history::Change::Removed, nothing)? {
+                KeptHere::Ahead(ahead) if unchanged() => ahead,
+                _ => {
+                    deferred();
+                    return Ok(false);
+                }
+            };
             match std::fs::remove_file(dir.join(key)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(io(e)),
             }
+            settle(ctx, ahead);
             report.pulled += 1;
             forget_kept(ctx, key);
             record(None, rev, writer)?;
@@ -2076,17 +2299,39 @@ fn apply(
             report.conflicts += 1;
         }
         Action::Merge(text) => {
+            if !fits(&text) {
+                too_large(report);
+                return Ok(false);
+            }
+            // The file as it is here is kept in history first, in a record
+            // that names the revision the merged entry is to have.
+            let at = revision_ahead(ctx, &full_key)?;
+            let ahead = match at {
+                Some(rev) => {
+                    let replaced_by = history::Replacement::Entry(entry_of(&me, rev));
+                    match keep_here(ctx, key, seen, history::Change::Merged, replaced_by)? {
+                        KeptHere::Ahead(ahead) => ahead,
+                        KeptHere::Changed => {
+                            deferred();
+                            return Ok(false);
+                        }
+                    }
+                }
+                None => None,
+            };
             // Published before the file is written: if the merged text does
             // not fit, the file stays as it was.
-            match publish(Some(&text)) {
+            match publish(Some(&text), at) {
                 Ok(Some((entry, writer))) => {
                     report.published += 1;
                     if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                         // Published, and the file was written to meanwhile:
-                        // the next cycle merges what is there now.
+                        // the next cycle merges what is there now. The
+                        // file was not replaced, so its record goes.
                         deferred();
                         return Ok(false);
                     }
+                    settle(ctx, ahead);
                     forget_kept(ctx, key);
                     record(Some(Content::new(text).hash), entry.rev, writer)?;
                 }
@@ -2109,6 +2354,7 @@ mod sequences;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cordelia_storage::atomic::temporary_name;
 
     /// The device that wrote a version of the channel's, where a test
     /// makes an action by hand and does not look at whose it is.
@@ -2132,6 +2378,7 @@ mod tests {
             relist: Default::default(),
             sync_control: Default::default(),
             usable_keys: Default::default(),
+            history: Default::default(),
         }
     }
 
@@ -2158,10 +2405,12 @@ mod tests {
             folder: "f",
             generation: 0,
             planned: None,
+            over: None,
             agreed: &HashMap::new(),
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            agent: "x",
         };
         let mut report = FolderReport::default();
         for action in [
@@ -2226,8 +2475,9 @@ mod tests {
                 .map(|e| (e.key, !e.current.deleted))
                 .collect()
         };
-        let cycle =
-            |generation: u64| sync_folder(&st, &mem, &channel, "", "abcd", generation).unwrap();
+        let cycle = |generation: u64| {
+            sync_folder(&st, &mem, &channel, "x", "", "abcd", generation).unwrap()
+        };
 
         // Under the settings it started from, a cycle publishes.
         std::fs::write(mem.join("a.md"), "one\n").unwrap();
@@ -2260,10 +2510,12 @@ mod tests {
             folder: &folder,
             generation: started,
             planned: None,
+            over: None,
             agreed: &HashMap::new(),
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            agent: "x",
         };
         let seen = Some(Content::new("here\n").hash);
         let mut report = FolderReport::default();
@@ -2511,10 +2763,12 @@ mod tests {
                     folder: &folder,
                     generation: st.sync_control.generation(),
                     planned,
+                    over: None,
                     agreed: &HashMap::new(),
                     flushed: &|_| {},
                     relied: RefCell::new(None),
                     says_nothing: false,
+                    agent: "x",
                 };
                 let seen = current_hash(&mem, key);
                 apply(&ctx, key, seen, action, &mut FolderReport::default()).unwrap()
@@ -2540,10 +2794,12 @@ mod tests {
                     folder: &folder,
                     generation: st.sync_control.generation(),
                     planned,
+                    over: None,
                     agreed: &HashMap::new(),
                     flushed: &|_| {},
                     relied: RefCell::new(None),
                     says_nothing: false,
+                    agent: "x",
                 };
                 let mut report = FolderReport::default();
                 let done = apply(&ctx, key, None, action.clone(), &mut report).unwrap();
@@ -2672,7 +2928,7 @@ mod tests {
             std::fs::write(mem.join(name), "mine\n").unwrap();
         }
         let generation = st.sync_control.generation();
-        let report = sync_folder(&st, &mem, &channel, "", "abcd", generation).unwrap();
+        let report = sync_folder(&st, &mem, &channel, "x", "", "abcd", generation).unwrap();
         assert_eq!(report.published, 2);
         for name in ["api.md", "sealed.md"] {
             let (_, rev, text) = version(&st, &channel, name).unwrap();
@@ -2684,7 +2940,7 @@ mod tests {
         // text to take, so the file is left as it is and nothing is
         // published.
         write(&st, &channel, "api.md", serde_json::json!({ "a": 2 }));
-        let report = sync_folder(&st, &mem, &channel, "", "abcd", generation).unwrap();
+        let report = sync_folder(&st, &mem, &channel, "x", "", "abcd", generation).unwrap();
         assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
         let kept = std::fs::read_to_string(mem.join("api.md")).unwrap();
         assert_eq!(kept, "mine\n");
@@ -2748,6 +3004,7 @@ mod tests {
                 &self.st,
                 &self.mem,
                 &self.channel,
+                "x",
                 "",
                 "abcd",
                 generation,
@@ -3611,36 +3868,57 @@ mod tests {
         for (name, text) in [("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")] {
             p.other_writes(name, Some(text));
         }
-        // A folder takes the second file's name once the cycle has read
-        // what is there, so the file cannot be written.
-        let in_the_way = p.mem.join("b.md");
-        let report = p.cycle_with(&|| std::fs::create_dir(&in_the_way).unwrap());
-        assert_eq!(p.read("a.md").as_deref(), Some("a\n"));
-        assert_eq!(p.read("c.md").as_deref(), Some("c\n"), "the file after it");
-        assert_eq!(report.pulled, 2, "{report:?}");
-        let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(failed, ["b.md"], "{report:?}");
-        assert!(!report.failed[0].error.is_empty(), "{report:?}");
-        assert!(report.error.is_none(), "{report:?}");
-        // No temporary file is left where the file could not go.
-        let left: Vec<String> = std::fs::read_dir(&p.mem)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name.starts_with('.'))
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
+        // Something is in the way of the temporary file that the second
+        // file is written through, so the file cannot be written.
+        let in_the_way = p.mem.join(temporary_name("b.md"));
+        std::fs::create_dir(&in_the_way).unwrap();
+        let hidden = || -> Vec<String> {
+            std::fs::read_dir(&p.mem)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.starts_with('.'))
+                .collect()
+        };
+        // It fails in each cycle, and each says so.
+        for pulled in [2, 0] {
+            let report = p.cycle();
+            assert_eq!(p.read("a.md").as_deref(), Some("a\n"));
+            assert_eq!(p.read("c.md").as_deref(), Some("c\n"), "the file after it");
+            assert_eq!(report.pulled, pulled, "{report:?}");
+            let failed: Vec<&str> = report.failed.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(failed, ["b.md"], "{report:?}");
+            assert!(!report.failed[0].error.is_empty(), "{report:?}");
+            assert!(report.error.is_none(), "{report:?}");
+            assert_eq!(p.read("b.md"), None);
+        }
+        // With nothing in the way, the next cycle writes the file.
+        std::fs::remove_dir(&in_the_way).unwrap();
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read("b.md").as_deref(), Some("b\n"));
+        assert!(hidden().is_empty(), "{:?}", hidden());
 
+        // A folder that takes a file's name once the cycle has read what
+        // is there: the name is no longer as the cycle saw it, so nothing
+        // is written there, no temporary file is left, and it is no
+        // failure. The next cycle plans with what is there.
+        p.other_writes("d.md", Some("d\n"));
+        let in_the_way = p.mem.join("d.md");
+        let report = p.cycle_with(&|| std::fs::create_dir(&in_the_way).unwrap());
+        assert_eq!((report.pulled, report.failed.len()), (0, 0), "{report:?}");
+        assert!(in_the_way.is_dir());
+        assert!(hidden().is_empty(), "{:?}", hidden());
         // While the folder is there the name takes no part: it is listed
         // as something that cannot sync, and is no failure.
         let report = p.cycle();
         assert_eq!((report.pulled, report.failed.len()), (0, 0), "{report:?}");
-        assert_eq!(report.skipped, ["b.md"], "{report:?}");
+        assert_eq!(report.skipped, ["d.md"], "{report:?}");
 
         // With the folder gone, the next cycle writes the file.
         std::fs::remove_dir(&in_the_way).unwrap();
         let report = p.cycle();
         assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
-        assert_eq!(p.read("b.md").as_deref(), Some("b\n"));
+        assert_eq!(p.read("d.md").as_deref(), Some("d\n"));
     }
 
     /// Where a file's first action fails, its others are not done. Here
@@ -4814,10 +5092,12 @@ mod tests {
             folder: &folder,
             generation: p.st.sync_control.generation(),
             planned,
+            over: None,
             agreed: &none,
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            agent: "x",
         };
         let is = |planned, name: &str, text: &str| {
             is_the_copy(&with(planned), "notes.md", name, text).unwrap()
@@ -4986,10 +5266,12 @@ mod tests {
                 folder: &folder,
                 generation: p.st.sync_control.generation(),
                 planned: Some(version.as_str()),
+                over: None,
                 agreed: &none,
                 flushed: &|_| {},
                 relied: RefCell::new(None),
                 says_nothing: false,
+                agent: "x",
             };
             let copy = names::conflict_name(file, "abcd");
             assert_eq!(claim(&ctx, file, &copy, "mine\n").unwrap(), Claim::Taken);
@@ -5332,33 +5614,6 @@ mod tests {
         names
     }
 
-    /// A flush that fails because the volume has none is no failure, and
-    /// one that was tried and failed is.
-    #[test]
-    fn test_a_volume_with_no_flush_is_told_from_a_flush_that_failed() {
-        let failed = std::io::Error::from_raw_os_error;
-        // EINVAL, and whatever the system calls unsupported: no flush
-        // here.
-        assert!(has_no_flush(&failed(22)));
-        assert!(has_no_flush(&std::io::Error::from(
-            std::io::ErrorKind::Unsupported
-        )));
-        if cfg!(target_os = "linux") {
-            // ENOSYS and EOPNOTSUPP.
-            assert!(has_no_flush(&failed(38)));
-            assert!(has_no_flush(&failed(95)));
-        }
-        // EIO, ENOSPC and EACCES: a flush that failed.
-        assert!(!has_no_flush(&failed(5)));
-        assert!(!has_no_flush(&failed(28)));
-        assert!(!has_no_flush(&failed(13)));
-        // ENOTSUP and ENOTTY as a Mac numbers them.
-        if cfg!(target_vendor = "apple") {
-            assert!(has_no_flush(&failed(45)));
-            assert!(has_no_flush(&failed(25)));
-        }
-    }
-
     /// A folder that goes once it has been listed is gone, and the cycle
     /// says so before it does anything. (While it is being listed, each
     /// name in it is passed over as it goes; here every file had been
@@ -5649,5 +5904,724 @@ mod tests {
         assert_eq!(names(&st), 1);
         assert!(withdraw(&st, st.sync_control.generation()).unwrap());
         assert_eq!(names(&st), 0);
+    }
+
+    /// What `st` has kept in history, in no order: for each record its
+    /// file, its change, the text it keeps, and all it says.
+    type Kept4 = (String, history::Change, Option<String>, history::About);
+
+    impl Pair {
+        /// Turn local history on for `st`.
+        fn with_history(self) -> (Self, history::Store) {
+            let store = history::Store::new(&self.st.home_dir, 30, 1 << 24).unwrap();
+            self.st.history.open(Some(store.clone()));
+            (self, store)
+        }
+
+        /// A key as a history record shows it.
+        fn shown(key: &[u8; 32]) -> String {
+            cordelia_crypto::bech32::encode_public_key(key).unwrap()
+        }
+    }
+
+    /// The records in `store`, sorted by file and then by the text kept.
+    /// Nothing may be left pending.
+    fn kept_in(store: &history::Store) -> Vec<Kept4> {
+        let listing = store.list().unwrap();
+        assert!(listing.unreadable.is_empty());
+        let mut records: Vec<Kept4> = listing
+            .records
+            .iter()
+            .map(|record| {
+                let (read, text) = store.read(&record.id).unwrap().unwrap();
+                assert!(!read.interrupted);
+                let about = record.about.clone();
+                (about.file.clone(), about.change, text, about)
+            })
+            .collect();
+        let held: u64 = listing.records.iter().map(|record| record.bytes).sum();
+        assert_eq!(held, listing.bytes, "a record was left pending");
+        records.sort_by(|a, b| (&a.0, &a.2).cmp(&(&b.0, &b.2)));
+        records
+    }
+
+    /// The file, the change and the text of each record.
+    fn briefly(records: &[Kept4]) -> Vec<(&str, history::Change, Option<&str>)> {
+        records
+            .iter()
+            .map(|(file, change, text, _)| (file.as_str(), *change, text.as_deref()))
+            .collect()
+    }
+
+    /// Each change that replaces or removes a file's text here keeps the
+    /// file as it was, and says what replaced it. A file that arrives is
+    /// noted with no text. A first publish replaces nothing and keeps
+    /// nothing (decision 2026-09-30 §4.5b).
+    #[test]
+    fn what_another_devices_change_replaces_here_is_kept_in_history() {
+        use history::{Change, Replacement, Whose};
+        let (p, store) = Pair::new().with_history();
+        let them = Pair::shown(&p.other.identity.public_key());
+        let folder = p.mem.display().to_string();
+
+        // A first publish: nothing is replaced.
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(kept_in(&store), []);
+
+        // Another device's version replaces the file here.
+        p.other_writes("notes.md", Some("two\n"));
+        assert_eq!(p.cycle().pulled, 1);
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [("notes.md", Change::Pulled, Some("one\n"))]
+        );
+        let about = &records[0].3;
+        assert_eq!((about.agent.as_str(), &about.folder), ("x", &folder));
+        let kept = about.kept.as_ref().unwrap();
+        assert_eq!(kept.whose, Whose::Here { agreed: Some(1) });
+        assert_eq!(kept.sha256, hex::encode(Content::new("one\n").hash));
+        let theirs = history::Entry {
+            device: them.clone(),
+            rev: 2,
+        };
+        assert_eq!(about.replaced_by, Replacement::Entry(theirs));
+        // The file here was the version agreed, and what replaced it was
+        // written after it.
+        assert!(about.behind);
+
+        // A file arrives that was not here: noted, with no text.
+        p.other_writes("new.md", Some("theirs\n"));
+        assert_eq!(p.cycle().pulled, 1);
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [
+                ("new.md", Change::Arrived, None),
+                ("notes.md", Change::Pulled, Some("one\n"))
+            ]
+        );
+        let about = &records[0].3;
+        assert_eq!(about.kept, None);
+        let arrived = history::Entry {
+            device: them.clone(),
+            rev: 1,
+        };
+        assert_eq!(about.replaced_by, Replacement::Entry(arrived));
+        assert!(!about.behind);
+
+        // Another device's delete removes the file here.
+        p.other_writes("notes.md", None);
+        assert_eq!(p.cycle().pulled, 1);
+        assert_eq!(p.read("notes.md"), None);
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [
+                ("new.md", Change::Arrived, None),
+                ("notes.md", Change::Pulled, Some("one\n")),
+                ("notes.md", Change::Removed, Some("two\n"))
+            ]
+        );
+        let about = &records[2].3;
+        assert_eq!(about.replaced_by, Replacement::Nothing);
+        assert_eq!(
+            about.kept.as_ref().unwrap().whose,
+            Whose::Here { agreed: Some(2) }
+        );
+        assert!(!about.behind);
+    }
+
+    /// An edit of this device's that another device overtook is kept
+    /// beside the file, and the text that the channel's version then
+    /// replaces is kept in history too. It was not behind: it is this
+    /// device's own.
+    #[test]
+    fn an_edit_that_was_overtaken_is_kept_in_history_as_well() {
+        use history::Change;
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file("notes.md", "mine\n");
+        p.other_writes("notes.md", Some("theirs\n"));
+        let report = p.cycle();
+        assert_eq!((report.conflicts, report.pulled), (1, 1), "{report:?}");
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [("notes.md", Change::Pulled, Some("mine\n"))]
+        );
+        assert!(!records[0].3.behind);
+        // The copy is a new file: its publish replaces nothing.
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(kept_in(&store).len(), 1);
+    }
+
+    /// An edit or a delete made here replaces the channel's version: that
+    /// version is kept, whoever wrote it. A publish over a delete replaces
+    /// no text and keeps nothing.
+    #[test]
+    fn what_this_devices_change_replaces_in_the_channel_is_kept_in_history() {
+        use history::{Change, Replacement, Whose};
+        let (p, store) = Pair::new().with_history();
+        let me = Pair::shown(&p.st.identity.public_key());
+        let them = Pair::shown(&p.other.identity.public_key());
+        let entry = |device: &str, rev: u64| history::Entry {
+            device: device.to_string(),
+            rev,
+        };
+
+        // An edit over this device's own version.
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file("notes.md", "two\n");
+        assert_eq!(p.cycle().published, 1);
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [("notes.md", Change::EditedHere, Some("one\n"))]
+        );
+        let about = &records[0].3;
+        assert_eq!(about.agent, "x");
+        assert_eq!(
+            about.kept.as_ref().unwrap().whose,
+            Whose::Channel(entry(&me, 1))
+        );
+        assert_eq!(about.replaced_by, Replacement::Entry(entry(&me, 2)));
+        assert!(!about.behind);
+
+        // An edit over another device's version.
+        p.other_writes("notes.md", Some("theirs\n"));
+        assert_eq!(p.cycle().pulled, 1);
+        p.file("notes.md", "four\n");
+        assert_eq!(p.cycle().published, 1);
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [
+                ("notes.md", Change::EditedHere, Some("one\n")),
+                ("notes.md", Change::EditedHere, Some("theirs\n")),
+                ("notes.md", Change::Pulled, Some("two\n"))
+            ]
+        );
+        let about = &records[1].3;
+        assert_eq!(
+            about.kept.as_ref().unwrap().whose,
+            Whose::Channel(entry(&them, 3))
+        );
+        assert_eq!(about.replaced_by, Replacement::Entry(entry(&me, 4)));
+
+        // A delete made here.
+        std::fs::remove_file(p.mem.join("notes.md")).unwrap();
+        assert_eq!(p.cycle().published, 1);
+        let records = kept_in(&store);
+        assert_eq!(records.len(), 4);
+        let (file, change, text, about) = &records[0];
+        assert_eq!(
+            (file.as_str(), *change, text.as_deref()),
+            ("notes.md", Change::DeletedHere, Some("four\n"))
+        );
+        assert_eq!(
+            about.kept.as_ref().unwrap().whose,
+            Whose::Channel(entry(&me, 4))
+        );
+        assert_eq!(about.replaced_by, Replacement::Entry(entry(&me, 5)));
+
+        // A publish over a delete: no text is replaced.
+        p.file("notes.md", "back\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(kept_in(&store).len(), 4);
+    }
+
+    /// A merged index replaces the file here: the file as it was is kept,
+    /// and the record names the merged entry.
+    #[test]
+    fn an_index_as_it_was_before_a_merge_is_kept_in_history() {
+        use history::{Change, Replacement, Whose};
+        let (p, store) = Pair::new().with_history();
+        let me = Pair::shown(&p.st.identity.public_key());
+        let index = crate::memory_md::INDEX_FILE;
+        p.file(index, "- a\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file(index, "- a\n- mine\n");
+        p.other_writes(index, Some("- a\n- theirs\n"));
+        let report = p.cycle();
+        assert_eq!((report.published, report.conflicts), (1, 0), "{report:?}");
+        let records = kept_in(&store);
+        assert_eq!(
+            briefly(&records),
+            [(index, Change::Merged, Some("- a\n- mine\n"))]
+        );
+        let about = &records[0].3;
+        assert_eq!(
+            about.kept.as_ref().unwrap().whose,
+            Whose::Here { agreed: Some(1) }
+        );
+        let merged = history::Entry { device: me, rev: 3 };
+        assert_eq!(about.replaced_by, Replacement::Entry(merged));
+        assert!(!about.behind);
+    }
+
+    /// No kept copy, no replacement. Where the text cannot be kept, that
+    /// one change is not made: the file and the channel stay as they were,
+    /// the file is reported as failed, and the cycle goes on with the files
+    /// that need nothing kept. A file that arrives needs nothing kept.
+    #[test]
+    fn a_text_that_cannot_be_kept_is_not_replaced() {
+        let index = crate::memory_md::INDEX_FILE;
+        // Each case: what is agreed first, the change on each side, and
+        // what the file and the channel hold once the keep has failed.
+        type Case = (
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<Option<&'static str>>,
+        );
+        let cases: [Case; 5] = [
+            // A version from another device.
+            ("notes.md", "one\n", Some("one\n"), Some(Some("theirs\n"))),
+            // A delete from another device.
+            ("notes.md", "one\n", Some("one\n"), Some(None)),
+            // An edit made here.
+            ("notes.md", "one\n", Some("mine\n"), None),
+            // A delete made here.
+            ("notes.md", "one\n", None, None),
+            // A merged index.
+            (
+                index,
+                "- a\n",
+                Some("- a\n- mine\n"),
+                Some(Some("- a\n- theirs\n")),
+            ),
+        ];
+        for (file, agreed, here, there) in cases {
+            let (p, store) = Pair::new().with_history();
+            p.file(file, agreed);
+            assert_eq!(p.cycle().published, 1);
+            // Something other than a directory where history is kept.
+            let dir = p.st.home_dir.join("history");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&p.st.home_dir).unwrap();
+            std::fs::write(&dir, "in the way").unwrap();
+
+            match here {
+                Some(text) => p.file(file, text),
+                None => std::fs::remove_file(p.mem.join(file)).unwrap(),
+            }
+            if let Some(theirs) = there {
+                p.other_writes(file, theirs);
+            }
+            let held = p.held(file);
+            // Two files that need nothing kept: one to publish, one that
+            // arrives.
+            p.file("zz-new.md", "new here\n");
+            p.other_writes("zz-arrives.md", Some("new there\n"));
+
+            let report = p.cycle();
+            let case = format!("{file} {here:?} {there:?}: {report:?}");
+            assert_eq!(report.failed.len(), 1, "{case}");
+            assert_eq!(report.failed[0].name, file, "{case}");
+            assert!(report.failed[0].error.contains("kept in history"), "{case}");
+            assert_eq!(p.read(file).as_deref(), here, "{case}");
+            assert_eq!(p.held(file), held, "{case}");
+            assert_eq!((report.published, report.pulled), (1, 1), "{case}");
+            assert_eq!(p.read("zz-arrives.md").as_deref(), Some("new there\n"));
+            assert_eq!(p.held("zz-new.md").as_deref(), Some("new here\n"));
+            assert!(dir.is_file(), "{case}");
+            drop(store);
+
+            // It is tried again, and fails again, every cycle: nothing is
+            // changed until the text can be kept.
+            let report = p.cycle();
+            assert_eq!(report.failed.len(), 1, "{case}");
+            assert_eq!(p.read(file).as_deref(), here, "{case}");
+            assert_eq!(p.held(file), held, "{case}");
+        }
+    }
+
+    /// Nothing is kept for an entry that cannot be published: a text that
+    /// fits in no entry, a merged index that does not, a name whose
+    /// revisions are used up. Each is found out before the text it would
+    /// replace goes into history, and would otherwise be written there,
+    /// and removed again, in every cycle. Here nothing can be kept at all,
+    /// so anything that asked for a record would fail for that: each is
+    /// reported for what it is.
+    #[test]
+    fn nothing_is_kept_for_an_entry_that_cannot_be_published() {
+        let index = crate::memory_md::INDEX_FILE;
+        let large = "\"".repeat(MAX_FILE_BYTES - 64);
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        p.file("a.md", "one\n");
+        p.file(index, "- [Notes](notes.md) one\n");
+        assert_eq!(p.cycle().published, 3);
+        // A name at the last revision there is.
+        let limit = cordelia_core::protocol::MAX_REV;
+        write_at(&p.other, &p.channel, "a.md", "at the limit\n", limit);
+        deliver(&p.other, &p.st, &p.channel);
+        assert_eq!(p.cycle().pulled, 1);
+        // Something other than a directory where history is kept.
+        drop(store);
+        let dir = p.st.home_dir.join("history");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, "in the way").unwrap();
+
+        p.file("notes.md", &large);
+        p.file("a.md", "two\n");
+        p.file(index, &large);
+        p.other_writes(index, Some("- [Other](other.md) there\n"));
+        for _ in 0..2 {
+            let report = p.cycle();
+            let mut too_large = report.too_large.clone();
+            too_large.sort();
+            assert_eq!(too_large, [index, "notes.md"], "{report:?}");
+            assert_eq!(report.failed.len(), 1, "{report:?}");
+            assert_eq!(report.failed[0].name, "a.md");
+            assert!(
+                report.failed[0].error.contains("revision limit"),
+                "{report:?}"
+            );
+            assert_eq!(report.published, 0, "{report:?}");
+        }
+        assert!(dir.is_file());
+        assert_eq!(p.read("notes.md").as_deref(), Some(large.as_str()));
+        assert_eq!(p.held("notes.md").as_deref(), Some("one\n"));
+    }
+
+    /// A record stays only if its change was made. A publish that is
+    /// refused, and a file that is written to while its new text is
+    /// flushed, each take their record with them, cycle after cycle. For
+    /// an entry that does not fit, none is made.
+    #[test]
+    fn a_change_that_is_not_made_leaves_no_record() {
+        use history::Change;
+        let index = crate::memory_md::INDEX_FILE;
+
+        // A publish that is refused: the channel's version moved after
+        // the plan was made.
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file("notes.md", "mine\n");
+        let report = p.cycle_with(&|| p.other_writes("notes.md", Some("theirs\n")));
+        assert_eq!(report.published, 0);
+        assert_eq!(kept_in(&store), []);
+
+        // An entry that does not fit: every byte of the text is escaped.
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file("notes.md", &"\"".repeat(MAX_FILE_BYTES - 64));
+        for _ in 0..2 {
+            let report = p.cycle();
+            assert_eq!(report.published, 0, "{report:?}");
+            assert_eq!(report.too_large, ["notes.md"]);
+            assert_eq!(kept_in(&store), []);
+        }
+        assert_eq!(p.held("notes.md").as_deref(), Some("one\n"));
+
+        // A file that is written to while the channel's version is being
+        // flushed is not replaced.
+        let agent_writes = |p: &Pair, file: &'static str, text: &'static str| {
+            let path = p.mem.join(file);
+            move |name: &str| {
+                if name == file {
+                    std::fs::write(&path, text).unwrap();
+                }
+            }
+        };
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_writes("notes.md", Some("theirs\n"));
+        let report = p.cycle_when_flushed(&agent_writes(&p, "notes.md", "written meanwhile\n"));
+        assert_eq!(report.pulled, 0, "{report:?}");
+        assert_eq!(kept_in(&store), []);
+        // The next cycle keeps that write beside the file, and what it
+        // then replaces goes into history.
+        let report = p.cycle();
+        assert_eq!((report.conflicts, report.pulled), (1, 1), "{report:?}");
+        assert_eq!(
+            briefly(&kept_in(&store)),
+            [("notes.md", Change::Pulled, Some("written meanwhile\n"))]
+        );
+
+        // The same for a merged index: it is published, the file is not
+        // replaced, and nothing is recorded as replaced.
+        let (p, store) = Pair::new().with_history();
+        p.file(index, "- a\n");
+        assert_eq!(p.cycle().published, 1);
+        p.file(index, "- a\n- mine\n");
+        p.other_writes(index, Some("- a\n- theirs\n"));
+        let report = p.cycle_when_flushed(&agent_writes(&p, index, "- a\n- mine\n- more\n"));
+        assert_eq!((report.published, report.pulled), (1, 0), "{report:?}");
+        assert_eq!(p.read(index).as_deref(), Some("- a\n- mine\n- more\n"));
+        assert_eq!(kept_in(&store), []);
+
+        // A write that fails: something is in the way of the temporary
+        // file. And a removal that fails: the folder cannot be changed.
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        p.file("gone.md", "one\n");
+        assert_eq!(p.cycle().published, 2);
+        p.other_writes("notes.md", Some("theirs\n"));
+        let in_the_way = p.mem.join(temporary_name("notes.md"));
+        std::fs::create_dir(&in_the_way).unwrap();
+        for _ in 0..2 {
+            let report = p.cycle();
+            assert_eq!((report.pulled, report.failed.len()), (0, 1), "{report:?}");
+            assert_eq!(p.read("notes.md").as_deref(), Some("one\n"));
+            assert_eq!(kept_in(&store), []);
+        }
+        std::fs::remove_dir(&in_the_way).unwrap();
+        assert_eq!(p.cycle().pulled, 1);
+        assert_eq!(
+            briefly(&kept_in(&store)),
+            [("notes.md", Change::Pulled, Some("one\n"))]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            p.other_writes("gone.md", None);
+            let mode = |mode: u32| {
+                std::fs::set_permissions(&p.mem, std::fs::Permissions::from_mode(mode)).unwrap()
+            };
+            mode(0o500);
+            // As root the folder is not closed, and there is nothing to
+            // show.
+            let closed = std::fs::write(p.mem.join("probe.md"), "").is_err();
+            if closed {
+                for _ in 0..2 {
+                    let report = p.cycle();
+                    assert_eq!((report.pulled, report.failed.len()), (0, 1), "{report:?}");
+                    assert_eq!(p.read("gone.md").as_deref(), Some("one\n"));
+                    assert_eq!(kept_in(&store).len(), 1);
+                }
+            }
+            mode(0o700);
+            let _ = std::fs::remove_file(p.mem.join("probe.md"));
+            assert_eq!(p.cycle().pulled, 1);
+            assert_eq!(p.read("gone.md"), None);
+            assert_eq!(
+                briefly(&kept_in(&store)),
+                [
+                    ("gone.md", Change::Removed, Some("one\n")),
+                    ("notes.md", Change::Pulled, Some("one\n")),
+                ]
+            );
+        }
+    }
+
+    /// The text that a publish replaces is kept before the database lock
+    /// is taken, in a record that names the revision the new entry is to
+    /// have. The publish is then made at that revision or not at all: an
+    /// entry that arrived under the file's name meanwhile, and is no
+    /// version of the file, would give the new entry another.
+    #[test]
+    fn an_entry_is_published_at_the_revision_its_record_names_or_not_at_all() {
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        let folder = p.mem.display().to_string();
+        let (planned, rev, _) = version(&p.st, &p.channel, "notes.md").unwrap();
+        assert_eq!(rev, 1);
+        let agreed = HashMap::new();
+        let ctx = Ctx {
+            state: &p.st,
+            dir: &p.mem,
+            channel: &p.channel,
+            prefix: "",
+            tag: "abcd",
+            folder: &folder,
+            agent: "x",
+            generation: p.st.sync_control.generation(),
+            planned: Some(&planned),
+            over: None,
+            agreed: &agreed,
+            flushed: &|_| {},
+            relied: RefCell::new(None),
+            says_nothing: false,
+        };
+        let publish = |at: Option<u64>| {
+            let db = p.st.db.lock().unwrap();
+            publish_over(&ctx, &db, "notes.md", Some("two\n"), at).unwrap()
+        };
+        // The next revision is 2. Kept for any other, nothing is published.
+        assert_eq!(revision_ahead(&ctx, "notes.md").unwrap(), Some(2));
+        for at in [1, 3] {
+            assert!(publish(Some(at)).is_none(), "{at}");
+            assert_eq!(p.held("notes.md").as_deref(), Some("one\n"));
+        }
+        let (entry, _) = publish(Some(2)).expect("published at the revision named");
+        assert_eq!(entry.rev, 2);
+        assert_eq!(p.held("notes.md").as_deref(), Some("two\n"));
+        assert_eq!(kept_in(&store), []);
+
+        // With history off no record names a revision, none is asked for,
+        // and the publish is made at whatever revision is next.
+        p.st.history.open(None);
+        assert_eq!(revision_ahead(&ctx, "notes.md").unwrap(), None);
+        let (planned, ..) = version(&p.st, &p.channel, "notes.md").unwrap();
+        let ctx = Ctx {
+            planned: Some(&planned),
+            ..ctx
+        };
+        let db = p.st.db.lock().unwrap();
+        let entry = publish_over(&ctx, &db, "notes.md", Some("three\n"), None).unwrap();
+        assert_eq!(entry.map(|(entry, _)| entry.rev), Some(3));
+    }
+
+    /// A name that cannot be looked at is not taken for free, and is not
+    /// passed over either: it has a reason, which the cycle reports as the
+    /// file's failure. (Here a name longer than any volume takes.) A name
+    /// with nothing under it, and one that holds something, have none:
+    /// the first is written, and the second is left for the next cycle.
+    #[test]
+    fn a_name_that_cannot_be_looked_at_is_not_taken_for_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "n".repeat(4096);
+        let looked = std::fs::symlink_metadata(dir.path().join(&long));
+        assert!(looked.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound));
+        assert!(!as_seen(dir.path(), &long, None));
+        let why = cannot_be_looked_at(dir.path(), &long).unwrap();
+        assert!(why.contains("cannot be looked at"), "{why}");
+
+        assert!(as_seen(dir.path(), "absent.md", None));
+        assert_eq!(cannot_be_looked_at(dir.path(), "absent.md"), None);
+        std::fs::create_dir(dir.path().join("taken.md")).unwrap();
+        assert!(!as_seen(dir.path(), "taken.md", None));
+        assert_eq!(cannot_be_looked_at(dir.path(), "taken.md"), None);
+    }
+
+    /// What arrives for a name that cannot be looked at is not written, and
+    /// nothing is noted for it: a file made under the name since the folder
+    /// was listed would be replaced unseen. The cycle says so, as the
+    /// file's failure, each time, and the version is taken once the name
+    /// can be looked at.
+    #[test]
+    fn nothing_is_written_under_a_name_that_cannot_be_looked_at() {
+        use std::os::unix::fs::PermissionsExt;
+        let (p, store) = Pair::new().with_history();
+        p.other_writes("notes.md", Some("theirs\n"));
+        let mode = |mode: u32| {
+            std::fs::set_permissions(&p.mem, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o444);
+        let open_to_all = std::fs::symlink_metadata(p.mem.join("notes.md"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        mode(0o755);
+        if open_to_all {
+            eprintln!("not run: this user can look into any folder");
+            return;
+        }
+        for _ in 0..2 {
+            let report = p.cycle_with(&|| mode(0o444));
+            mode(0o755);
+            assert_eq!((report.pulled, report.failed.len()), (0, 1), "{report:?}");
+            assert_eq!(report.failed[0].name, "notes.md");
+            let why = &report.failed[0].error;
+            assert!(why.contains("cannot be looked at"), "{why}");
+            assert_eq!(p.read("notes.md"), None);
+            assert_eq!(kept_in(&store), []);
+            // Nothing was noted and then taken back either: the first
+            // record that is made makes the directory, and it is not there.
+            assert!(!p.st.home_dir.join("history").exists());
+            assert_eq!(std::fs::read_dir(&p.mem).unwrap().count(), 0);
+        }
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("theirs\n"));
+    }
+
+    /// A name that had no file when the cycle listed the folder, and has
+    /// come to hold something that cannot be read, is not written over:
+    /// what it holds could not be kept. Before, whatever could not be read
+    /// passed for absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_has_come_to_hold_what_cannot_be_read_is_not_written_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let (p, store) = Pair::new().with_history();
+        p.other_writes("closed.md", Some("theirs\n"));
+        p.other_writes("link.md", Some("theirs\n"));
+        let elsewhere = p.mem.with_file_name("elsewhere.md");
+        let report = p.cycle_with(&|| {
+            // A file that nobody may read, and a link to nothing.
+            p.file("closed.md", "an agent's, written meanwhile\n");
+            let closed = std::fs::Permissions::from_mode(0o000);
+            std::fs::set_permissions(p.mem.join("closed.md"), closed).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, p.mem.join("link.md")).unwrap();
+        });
+        assert_eq!(report.pulled, 0, "{report:?}");
+        assert_eq!(kept_in(&store), []);
+        let open = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(p.mem.join("closed.md"), open).unwrap();
+        assert_eq!(
+            p.read("closed.md").as_deref(),
+            Some("an agent's, written meanwhile\n")
+        );
+        let link = std::fs::symlink_metadata(p.mem.join("link.md")).unwrap();
+        assert!(link.file_type().is_symlink());
+        assert!(!elsewhere.exists());
+    }
+
+    /// A file that changed between the cycle's read of it and the keep is
+    /// neither kept nor replaced: what would be kept is no longer what the
+    /// cycle planned with. That holds though the file is as the cycle saw
+    /// it again by the last look before it is replaced.
+    #[test]
+    fn a_file_that_changed_since_it_was_read_is_not_kept_as_it_was() {
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        p.file("gone.md", "one\n");
+        assert_eq!(p.cycle().published, 2);
+        p.other_writes("notes.md", Some("theirs\n"));
+        p.other_writes("gone.md", None);
+        // An agent writes to both once the cycle has read the folder.
+        let report = p.cycle_with(&|| {
+            p.file("notes.md", "written meanwhile\n");
+            p.file("gone.md", "written meanwhile\n");
+        });
+        assert_eq!(report.pulled, 0, "{report:?}");
+        assert_eq!(kept_in(&store), []);
+        assert_eq!(p.read("notes.md").as_deref(), Some("written meanwhile\n"));
+        assert_eq!(p.read("gone.md").as_deref(), Some("written meanwhile\n"));
+
+        // The same, where the agent puts back what the file held while the
+        // channel's version is being flushed. The last look finds the file
+        // as the cycle saw it, and the text kept would be another.
+        let (p, store) = Pair::new().with_history();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_writes("notes.md", Some("theirs\n"));
+        let hooks = Hooks {
+            between: &|| p.file("notes.md", "written meanwhile\n"),
+            flushed: &|name| {
+                if name == "notes.md" {
+                    p.file("notes.md", "one\n");
+                }
+            },
+            ..Hooks::NONE
+        };
+        let report = p.cycle_hooked(&hooks).unwrap();
+        assert_eq!(report.pulled, 0, "{report:?}");
+        assert_eq!(kept_in(&store), []);
+        assert_eq!(p.read("notes.md").as_deref(), Some("written meanwhile\n"));
+    }
+
+    /// With history off nothing is kept, and nothing waits for it.
+    #[test]
+    fn with_history_off_nothing_is_kept() {
+        let p = Pair::new();
+        p.file("notes.md", "one\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_writes("notes.md", Some("two\n"));
+        assert_eq!(p.cycle().pulled, 1);
+        p.file("notes.md", "three\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_writes("notes.md", None);
+        assert_eq!(p.cycle().pulled, 1);
+        assert!(!p.st.home_dir.join("history").exists());
     }
 }

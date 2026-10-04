@@ -22,7 +22,7 @@ cordelia-node/
   crates/
     cordelia-core/       # Shared types, config, errors
     cordelia-crypto/     # Ed25519/X25519, ECIES, AES-256-GCM, Bech32
-    cordelia-storage/    # SQLite, channels, items, keys, trust, invites, sync state
+    cordelia-storage/    # SQLite, channels, items, keys, trust, invites, sync state, local history
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols
     cordelia-api/        # REST API (actix-web), auth, handlers
     cordelia-sync/       # Sync adapters: Claude Code memory <-> channels
@@ -53,6 +53,7 @@ Start here when working on a module:
 | Channels/API | `docs/specs/channels-api.md` |
 | Encryption | `docs/specs/ecies-envelope-encryption.md` |
 | Data/storage | `docs/specs/data-formats.md` |
+| Local history (what sync replaced, and restore) | `docs/decisions/2026-09-30-agent-memory-sync.md` §4.5b |
 | Parameters | `docs/specs/parameter-rationale.md` (every value explained) |
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
@@ -98,6 +99,9 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `STATE_OFFER_RETRY_BASE_SECS`, `STATE_OFFER_RETRY_MAX_SECS` | 60s, 6h | parameter-rationale.md §4 |
 | `MAX_STATE_KEYS` | 1024 | parameter-rationale.md §4 |
 | `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 | decision 2026-09-30 §4.4 |
+| `HISTORY_DAYS`, `HISTORY_MAX_BYTES` | 30, 256MB | parameter-rationale.md §10 |
+| `HISTORY_TURN_WAIT_SECS`, `HISTORY_SWEEP_INTERVAL_SECS` | 10s, 3600s | parameter-rationale.md §10 |
+| `HISTORY_SWEEP_SHARE` | 8 (swept at a cycle's end once an eighth of the size is kept) | parameter-rationale.md §10 |
 | `MAX_REV`, `MAX_EPOCH` | 2^53 - 1 | parameter-rationale.md §4 |
 | `MAX_EPOCH_STEP` | 2^20 | parameter-rationale.md §4 |
 | `FALLBACK_PEERS` | relay1/relay2.cordelia.seeddrill.ai:9474 | decision 2026-09-30 §4.6 |
