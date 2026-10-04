@@ -1006,6 +1006,10 @@ fn write_applied(
 /// before it reads, so that what it reads is what it writes over. Inside a
 /// transaction of the caller's it is a savepoint, and is whole with that
 /// one.
+///
+/// Where the work does not come back at all, because it unwinds, what it
+/// wrote is undone as it is where the work fails: no transaction is left
+/// open on the connection, and no savepoint in the caller's.
 fn in_one<T>(
     conn: &Connection,
     work: impl FnOnce() -> Result<T, PersonError>,
@@ -1021,16 +1025,45 @@ fn in_one<T>(
         )
     };
     conn.execute_batch(begin).map_err(storage)?;
-    let done = work();
-    if done.is_err() {
-        conn.execute_batch(undo).map_err(storage)?;
-        return done;
+    let mut begun = Begun {
+        conn,
+        undo,
+        ended: false,
+    };
+    match work() {
+        Ok(done) => {
+            // Where the commit fails, what was begun is undone as it is
+            // dropped.
+            conn.execute_batch(commit).map_err(storage)?;
+            begun.ended = true;
+            Ok(done)
+        }
+        Err(e) => {
+            begun.ended = true;
+            conn.execute_batch(undo).map_err(storage)?;
+            Err(e)
+        }
     }
-    if let Err(e) = conn.execute_batch(commit) {
-        let _ = conn.execute_batch(undo);
-        return Err(storage(e));
+}
+
+/// What [`in_one`] began on a connection. Dropped before it was ended, it
+/// is undone: so it is where the work unwinds.
+struct Begun<'a> {
+    conn: &'a Connection,
+    /// What undoes it.
+    undo: &'static str,
+    /// Whether it was committed, or undone already.
+    ended: bool,
+}
+
+impl Drop for Begun<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            // Nothing can be done where this fails: the connection is the
+            // caller's, and says so at its next use.
+            let _ = self.conn.execute_batch(self.undo);
+        }
     }
-    done
 }
 
 #[cfg(test)]
@@ -3135,6 +3168,85 @@ mod tests {
         assert_eq!(
             held_rows::channel_of_name(&conn, "written before").unwrap(),
             Some(id_of(&own(3, "written before")))
+        );
+    }
+
+    /// Work that unwinds leaves no transaction open on the connection, and
+    /// nothing of what it wrote: it is undone as work that fails is. In a
+    /// transaction of the caller's, what the caller wrote before stays,
+    /// and the transaction is still the caller's.
+    #[test]
+    fn test_work_that_unwinds_is_undone_and_leaves_no_transaction_open() {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+        let conn = holding();
+        let before = everything(&conn);
+        // The work writes, and then unwinds. (It unwinds with no message:
+        // nothing is printed.)
+        let unwinds = || {
+            catch_unwind(AssertUnwindSafe(|| {
+                in_one(&conn, || -> Result<(), PersonError> {
+                    held_rows::set_state(&conn, State::Removed)?;
+                    assert_eq!(state(&conn), State::Removed);
+                    resume_unwind(Box::new("the work unwinds"))
+                })
+            }))
+        };
+
+        assert!(unwinds().is_err());
+        assert!(conn.is_autocommit());
+        assert_eq!(everything(&conn), before);
+        assert_eq!(state(&conn), State::Applied);
+        // The connection is used again as if nothing had been tried: the
+        // next work begins a transaction of its own.
+        hold_name(&conn, "after", NOW).unwrap();
+        assert!(conn.is_autocommit());
+
+        // Inside a transaction of the caller's.
+        conn.execute_batch("BEGIN").unwrap();
+        hold_name(&conn, "written before", NOW).unwrap();
+        let with_the_callers = everything(&conn);
+        assert!(unwinds().is_err());
+        assert!(!conn.is_autocommit(), "the transaction is the caller's");
+        assert_eq!(everything(&conn), with_the_callers);
+        // No savepoint is left in it.
+        assert!(conn.execute_batch("RELEASE person").is_err());
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(everything(&conn), with_the_callers);
+        assert_eq!(state(&conn), State::Applied);
+    }
+
+    /// Work inside work, in a transaction of the caller's: each is ended
+    /// once. Work that is done leaves what the work around it wrote before
+    /// it, and so does work that fails.
+    #[test]
+    fn test_work_inside_work_is_ended_once() {
+        let conn = holding();
+        conn.execute_batch("BEGIN").unwrap();
+        let around = in_one(&conn, || {
+            held_rows::set_state(&conn, State::Fork)?;
+            // Work that is done.
+            in_one(&conn, || {
+                held_rows::hold_name(&conn, "inside", &[0x71; 32], NOW)?;
+                Ok(())
+            })?;
+            assert_eq!(state(&conn), State::Fork);
+            // Work that fails.
+            let failed = in_one(&conn, || -> Result<(), PersonError> {
+                held_rows::set_state(&conn, State::Removed)?;
+                Err(PersonError::FollowsAPhrase)
+            });
+            assert!(matches!(failed, Err(PersonError::FollowsAPhrase)));
+            assert_eq!(state(&conn), State::Fork);
+            Ok(())
+        });
+        around.unwrap();
+        assert!(!conn.is_autocommit(), "the transaction is the caller's");
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(state(&conn), State::Fork);
+        assert_eq!(
+            held_rows::channel_of_name(&conn, "inside").unwrap(),
+            Some([0x71; 32])
         );
     }
 
