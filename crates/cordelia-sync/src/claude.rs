@@ -1545,20 +1545,24 @@ fn lists(dir: &Path, name: &str) -> std::io::Result<bool> {
 /// - when the file is replaced or removed, and when an agreement for the
 ///   file is recorded;
 /// - when a cycle plans the file with no text to keep, whatever it plans
-///   in its place;
-/// - when any setting changes, when the folder stops syncing, and when
-///   the node stops.
+///   in its place, or passes the file over as one that takes no part;
+/// - when the copy could not be written, and when another name is taken
+///   for the file's text (there is one record for a file);
+/// - when a command changes a setting or is run and changes none, when
+///   the folder stops syncing, and when the node stops.
 ///
 /// So a copy is relied on from one cycle to the next only while the file
 /// has still to take the version the copy was made against, under the
 /// settings and in the run it was made in. In every other case a conflict
 /// file that holds the text is not relied on, and the text is kept again
 /// under the next free name. That is one copy more than was needed where
-/// the conflict file was this conflict's own (after a restart, say). It is
-/// what keeps the text where the conflict file is from an earlier
-/// conflict: that file has been with the other devices, and a delete or
-/// an edit of it may be on its way back from one that did not know the
-/// text would be relied on again. The text would then be in no file.
+/// the conflict file was this conflict's own: after each restart and each
+/// settings command, for a file that still cannot take the channel's
+/// version. It is what keeps the text where the conflict file is from an
+/// earlier conflict: that file has been with the other devices, and a
+/// delete or an edit of it may be on its way back from one that did not
+/// know the text would be relied on again. The text would then be in no
+/// file.
 fn is_the_copy(ctx: &Ctx, key: &str, name: &str, text: &str) -> Result<bool, CordeliaError> {
     let control = &ctx.state.sync_control;
     let Some(kept) = control.kept_beside(ctx.folder, ctx.channel, key) else {
@@ -1636,10 +1640,11 @@ fn note_published(ctx: &Ctx, key: &str, text: &str, entry: &str) {
     control.kept_published(ctx.folder, ctx.channel, key, &hash, entry);
 }
 
-/// Forget what this folder has kept beside `key`: the file has been
-/// replaced or removed, so it no longer holds the text that was kept, and
-/// a copy of that text is the copy of a conflict that is over. Forgotten
-/// whatever the settings are now, and before anything is recorded.
+/// Forget what this folder has kept beside `key`. Where the file has been
+/// replaced or removed, it no longer holds the text that was kept, and a
+/// copy of that text is the copy of a conflict that is over: forgotten
+/// whatever the settings are now, and before anything is recorded. Where
+/// the copy could not be written, nothing was kept.
 fn forget_kept(ctx: &Ctx, key: &str) {
     let control = &ctx.state.sync_control;
     control.unkeep(ctx.folder, ctx.channel, key);
@@ -1750,14 +1755,18 @@ fn publish_over(
 }
 
 /// Apply one action. An error says whether it is this file's or the
-/// folder's ([`Failure`]). Returns `false` in six cases, and in the first
-/// five it has made no change:
+/// folder's ([`Failure`]). Returns `false` in seven cases, and in all but
+/// the last it has made no change:
 ///
 /// - The action would replace or remove the file, but the file changed
 ///   since it was scanned: an agent wrote to it mid-cycle. The next cycle
 ///   plans with that write, so it is published or kept as a conflict,
 ///   never overwritten. A file that is to be written is looked at for
 ///   this as the last thing before it is replaced ([`write_atomic`]).
+/// - The action would replace or remove the file, and the conflict file
+///   that the plan's first step kept its text in no longer holds that
+///   text: someone removed or changed the copy meanwhile. The text would
+///   be in no file. The next cycle keeps it again.
 /// - The settings have changed since the cycle read them. A command that
 ///   stops this folder syncing may have answered, and nothing more of the
 ///   folder is to be published or written after that. An entry is
@@ -1810,9 +1819,10 @@ fn apply(
     // Whether the file is still as the cycle saw it, and the copy that
     // its text is kept in, if the plan kept one, still holds that text: a
     // copy that someone removes while the file's new text is flushed
-    // would leave the text in no file. A file that is written (`Pull`,
-    // and the file of a `Merge`) is asked this once more, by
-    // `write_atomic`, as the last thing before it is replaced.
+    // would leave the text in no file. A file that is removed, or merged,
+    // is asked this before anything is done. A file that is written (by
+    // `Pull`, or as the file of a `Merge`) is asked it by `write_atomic`,
+    // as the last thing before it is replaced.
     let unchanged = || {
         let kept = ctx.relied.borrow();
         current_hash(dir, key) == seen
@@ -1822,7 +1832,7 @@ fn apply(
     };
     let flushed = || (ctx.flushed)(key);
     let deferred = || {
-        tracing::debug!(file = %dir.join(key).display(), "changed during the cycle; deferring");
+        tracing::debug!(file = %dir.join(key).display(), "the file, or the copy of its text, changed during the cycle; deferring");
     };
     let replaces_file = matches!(action, Action::RemoveFile { .. } | Action::Merge(_));
     if replaces_file && !unchanged() {
@@ -4224,6 +4234,13 @@ mod tests {
             (None, 1),
         )
         .unwrap();
+        assert!(!is(version, copy, "mine\n"));
+
+        // A name taken where the plan read no version of the file is the
+        // copy for a plan that read none, and for no other.
+        let read_none = claim(&with(None), "notes.md", copy, "mine\n");
+        assert_eq!(read_none.unwrap(), Claim::Taken);
+        assert!(is(None, copy, "mine\n"));
         assert!(!is(version, copy, "mine\n"));
 
         // A change of settings ends it, and the name is not taken by a

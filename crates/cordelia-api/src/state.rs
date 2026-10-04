@@ -150,7 +150,9 @@ pub struct RefusedSnapshot {
 /// kept against (decision 2026-09-30 §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
-    /// The channel's version that the file is to take: its item ID.
+    /// The channel's version that the file is to take (its item ID), as
+    /// the plan read it. `None` where the plan read no version: a record
+    /// made against none matches only a plan that read none.
     pub version: Option<String>,
     /// The name of the conflict file the text is kept in.
     pub copy: String,
