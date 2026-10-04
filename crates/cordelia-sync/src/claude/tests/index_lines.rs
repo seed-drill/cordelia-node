@@ -1273,6 +1273,54 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 }
 
+/// The question is asked of the index's slot, and not of the file's. An
+/// entry of the file's slot that this device cannot read, above a text by
+/// another device, holds nothing back: the file looks at rest, and the
+/// line goes back. Here that entry is a delete. When the key comes the
+/// file goes, and the line stays, pointing at no file: the cost that the
+/// decision record states.
+#[test]
+fn an_entry_of_the_files_slot_that_cannot_be_read_holds_nothing_back() {
+    let p = back_unlisted();
+    // A third device, which the other device knows too, edits the memory,
+    // and this one takes that.
+    let third = third(&p);
+    {
+        let db = p.other.db.lock().unwrap();
+        let key = third.identity.public_key();
+        channels::add_member(&db, &p.channel, &key, "owner").unwrap();
+    }
+    let (_, rev, _) = version(&p.st, &p.channel, "notes.md").unwrap();
+    entry_at(&third, &p.channel, "notes.md", "three\n", rev + 1, false);
+    deliver(&third, &p.st, &p.channel);
+    deliver(&third, &p.other, &p.channel);
+    assert_eq!(cycle_at(&p, 25).pulled, 1);
+    assert_eq!(p.read("notes.md").as_deref(), Some("three\n"));
+
+    // The other device moves to a new key, and deletes the memory under
+    // it, above the third device's text. This device passes that over:
+    // it reads the third device's text.
+    let key_comes = other_moves_to_a_new_key(&p);
+    p.other_writes("notes.md", None);
+    let (_, deleted_at, _) = version(&p.other, &p.channel, "notes.md").unwrap();
+    assert_eq!(deleted_at, rev + 2);
+    assert_eq!(
+        p.held("notes.md").as_deref(),
+        Some("three\n"),
+        "passed over"
+    );
+    assert_eq!(a_minute_from(&p, 30).published, 1);
+    assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+
+    // The key comes: the delete is read, the file goes, and the line
+    // that was put back stays.
+    key_comes(&p.st);
+    let report = cycle_at(&p, 95);
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(p.read("notes.md"), None);
+    assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+}
+
 /// An entry of the index's slot that a key this device holds opens, and
 /// that is not an entry's content, is not one that cannot be read: it
 /// counts for nothing, and the line goes back.
