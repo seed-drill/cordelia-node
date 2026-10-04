@@ -10,7 +10,7 @@
 //!   So a run with every device as it is built, and a run of the same
 //!   sequence with every device as it was before, end every step with
 //!   the same files, the same versions in the channel and the same
-//!   records. Only the conflict files may differ, and only by there being
+//!   records, on every device that is still the person's. Only the conflict files may differ, and only by there being
 //!   more of them.
 //! - **The keep.** With every device as built, no text that an edit wrote
 //!   is in no file at the end, unless someone edited or deleted a file
@@ -718,7 +718,6 @@ impl World {
         (files, held, records)
     }
 
-    /// The devices that are still the person's.
     /// What the device's record of a file says of who wrote the entry it
     /// agreed, if it has a record of the file.
     fn writer_of(&self, d: usize, name: &str) -> Option<Writer> {
@@ -729,6 +728,7 @@ impl World {
         records.get(name).map(|(_, _, writer)| *writer)
     }
 
+    /// The devices that are still the person's.
     fn remaining(&self) -> Vec<usize> {
         (0..self.devices.len())
             .filter(|d| !self.removed.contains(d))
@@ -800,31 +800,34 @@ impl World {
 }
 
 /// Run `steps` on devices of `kinds`, and say what each device has after
-/// each step: each device that remains, since one that was removed is in
-/// the channel no longer.
-fn run(kinds: &[Kind], seed: u64, steps: &[Step]) -> Vec<Vec<Has>> {
+/// each step, with the device's number: each device that remains, since
+/// one that was removed is in the channel no longer.
+fn run(kinds: &[Kind], seed: u64, steps: &[Step]) -> Vec<Vec<(usize, Has)>> {
     let mut world = World::new(kinds, seed);
     steps
         .iter()
         .map(|step| {
             world.run(step);
             let devices = world.remaining();
-            devices.into_iter().map(|d| world.has(d)).collect()
+            devices.into_iter().map(|d| (d, world.has(d))).collect()
         })
         .collect()
 }
 
 /// The property, for one sequence: run with every device as before, and
-/// with devices of `kinds`, it leaves every device after every step with
-/// the same files that are not conflict files, the same versions in the
-/// channel and the same records. Every conflict file of the first run is
-/// in the second. Returns whether the second run ends with conflict files
-/// that the first does not have: whether the rule made a difference.
+/// with devices of `kinds`, it leaves every device that remains, after
+/// every step, with the same files that are not conflict files, the same
+/// versions in the channel and the same records. Every conflict file of
+/// the first run is in the second. Returns whether the second run ends
+/// with conflict files that the first does not have: whether the rule
+/// made a difference.
 fn same_as_before(kinds: &[Kind], seed: u64, steps: &[Step]) -> bool {
     let before = run(&vec![Kind::Before; kinds.len()], seed, steps);
     let built = run(kinds, seed, steps);
     for (i, (was, is)) in before.iter().zip(&built).enumerate() {
-        for (d, (was, is)) in was.iter().zip(is).enumerate() {
+        assert_eq!(was.len(), is.len(), "the devices that remain, step {i}");
+        for ((d, was), (same, is)) in was.iter().zip(is) {
+            assert_eq!(d, same, "the devices that remain, step {i}");
             let at = format!(
                 "seed {seed}, kinds {kinds:?}, device {d}, after step {i} ({:?}) of {steps:?}",
                 steps[i]
@@ -835,7 +838,8 @@ fn same_as_before(kinds: &[Kind], seed: u64, steps: &[Step]) -> bool {
             assert!(was.copies.is_subset(&is.copies), "conflict files: {at}");
         }
     }
-    let copies = |last: &[Has]| -> usize { last.iter().map(|has| has.copies.len()).sum() };
+    let copies =
+        |last: &[(usize, Has)]| -> usize { last.iter().map(|(_, has)| has.copies.len()).sum() };
     copies(built.last().unwrap()) > copies(before.last().unwrap())
 }
 
@@ -1049,7 +1053,7 @@ fn the_written_sequences_make_the_rule_fire() {
         for seed in [2, 3] {
             let copies = |kind: Kind| -> usize {
                 let last = run(&vec![kind; n], seed, &steps).pop().unwrap();
-                last.iter().map(|has| has.copies.len()).sum()
+                last.iter().map(|(_, has)| has.copies.len()).sum()
             };
             assert!(copies(Built) > copies(Before), "{name}, seed {seed}");
         }
@@ -1224,22 +1228,83 @@ fn an_edit_that_tied_with_an_entry_published_again_is_kept() {
     }
 }
 
-/// The property holds through a removal: with the rule and without it,
-/// every device that remains has the same files, the same versions in the
-/// channel and the same records after every step of the two sequences
-/// above, and the rule only adds conflict files. In each of the two it
-/// does add one, for some seed.
+/// The devices that remain of `n`, once device 0 is removed, hear from
+/// each other and run a cycle, twice over: what [`sync`] is for all.
+fn sync_the_rest(n: usize) -> Vec<Step> {
+    let mut steps = Vec::new();
+    for _ in 0..2 {
+        for from in 1..n {
+            for to in 1..n {
+                if from != to {
+                    steps.push(Pass(from, to));
+                }
+            }
+        }
+        steps.extend((1..n).map(Cycle));
+    }
+    steps
+}
+
+/// The rule changes no file through a removal either. In the two
+/// sequences above, each gone on with until the devices that remain have
+/// met, with the rule and without it and in every mix of the two, every
+/// device that remains has the same files, the same versions in the
+/// channel and the same records after every step, and the rule only adds
+/// conflict files. With every device as built it does add one, in each of
+/// the two, for some seed. (The harness's removal reaches every device at
+/// once, and changes no key: what a node does besides is not in it.)
 #[test]
-fn a_removal_changes_no_file_that_the_rule_does_not_keep() {
+fn the_rule_changes_no_file_through_a_removal() {
     let (until, then) = a_removal_and_then_a_tie();
-    let first: Vec<Step> = until.into_iter().chain(then).collect();
-    let made_a_difference = |kinds: &[Kind], steps: &[Step]| {
-        (0..8)
-            .filter(|seed| same_as_before(kinds, *seed, steps))
-            .count()
+    let mut first: Vec<Step> = until.into_iter().chain(then).collect();
+    first.extend(sync_the_rest(4));
+    let mut second = a_tie_and_then_a_removal();
+    second.extend(sync_the_rest(3));
+    for (n, steps) in [(4, &first), (3, &second)] {
+        let mut made_a_difference = 0;
+        for mix in 1..(1u32 << n) {
+            let kinds: Vec<Kind> = (0..n)
+                .map(|d| if mix & (1 << d) != 0 { Built } else { Before })
+                .collect();
+            for seed in 0..4 {
+                let more = same_as_before(&kinds, seed, steps);
+                if kinds.iter().all(|kind| *kind == Built) {
+                    made_a_difference += usize::from(more);
+                }
+            }
+        }
+        assert!(made_a_difference > 0, "{n} devices");
+    }
+}
+
+/// What an entry published again can cost, on the side of keeping. Device
+/// 0 writes a text and is removed by device 1, which then edits the file
+/// twice. Device 2 runs no cycle until both edits are there: its record
+/// still names device 0, the second edit is not known to follow it, and
+/// device 0's text is kept beside the file though both edits were made
+/// from it. With one edit the text published over is the one device 2
+/// holds, and nothing is kept.
+#[test]
+fn a_removal_can_cost_a_copy_that_was_not_needed() {
+    let theirs = |text: &String| text.starts_with("a.md, written on 0 at step");
+    let copies_of_the_removed = |edits: usize| -> usize {
+        let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
+        steps.extend(sync(3));
+        steps.push(Remove(1, 0));
+        for _ in 0..edits {
+            steps.extend([Edit(1, "a.md"), Cycle(1)]);
+        }
+        steps.extend([Pass(1, 2), Cycle(2)]);
+        let mut world = World::new(&[Built; 3], 0);
+        for step in &steps {
+            world.run(step);
+        }
+        let has = world.has(2);
+        assert!(has.files["a.md"].starts_with("a.md, written on 1 at step"));
+        has.copies.iter().filter(|(_, text)| theirs(text)).count()
     };
-    assert!(made_a_difference(&[Built; 4], &first) > 0);
-    assert!(made_a_difference(&[Built; 3], &a_tie_and_then_a_removal()) > 0);
+    assert_eq!(copies_of_the_removed(1), 0);
+    assert_eq!(copies_of_the_removed(2), 1);
 }
 
 /// A record made before the writer was kept says nothing of who wrote

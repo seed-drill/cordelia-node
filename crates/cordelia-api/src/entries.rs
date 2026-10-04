@@ -391,9 +391,13 @@ pub fn current_of(
 /// for a new device, and a file it deleted would come back.
 ///
 /// Each entry is published at the revision `leaving` gave it, so it takes
-/// that entry's place exactly: a device that already holds the entry has
-/// the same text at the same revision, and changes no file for it; one
-/// that is behind sees a newer revision. Two cases differ:
+/// that entry's place: a device that already holds the entry has the same
+/// text at the same revision, and changes no file for it; one that is
+/// behind sees a newer revision. (Where another remaining device has an
+/// entry at that revision too, the tie between the two is decided again,
+/// and can go the other way than it went for `leaving`'s entry: a device
+/// that held `leaving`'s text then takes the other, and keeps that text
+/// beside it.) Two cases differ:
 ///
 /// - This device already has a revision that high for the key (it lost a
 ///   tie to `leaving`): the next one up is used.
