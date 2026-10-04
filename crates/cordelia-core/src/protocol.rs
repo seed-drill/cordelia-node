@@ -1056,6 +1056,13 @@ pub const LABEL_CHANGE_DEVICES: &[u8] = b"cordelia v2 change devices";
 /// [`LABEL_CHANGE_DEVICES`] does the other part.
 pub const LABEL_CHANGE_PHRASE: &[u8] = b"cordelia v2 change phrase";
 
+/// The label that binds a secret sealed to one device in a change entry
+/// to its purpose (decision 2026-10-04 §4.6): the key it is sealed under
+/// is derived with this label, the statement's number and the phrase's
+/// key. What is sealed to a device for any other use, or for another
+/// statement, does not open as that statement's secret.
+pub const LABEL_CHANGE_SECRET: &[u8] = b"cordelia v2 change secret";
+
 /// The label an entry's author signs it under: the author's key signs this
 /// label and what is signed of the entry (decision 2026-10-04 §2.3).
 pub const LABEL_ENTRY_AUTHOR: &[u8] = b"cordelia v2 author";
@@ -1149,7 +1156,7 @@ pub const PERSONAL_APPLIED_PREFIX: &str = "applied/";
 pub const PERSONAL_ADDED_PREFIX: &str = "added/";
 
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 19] = [
+pub const LABELS: [&[u8]; 20] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1165,6 +1172,7 @@ pub const LABELS: [&[u8]; 19] = [
     LABEL_STATEMENT,
     LABEL_CHANGE_DEVICES,
     LABEL_CHANGE_PHRASE,
+    LABEL_CHANGE_SECRET,
     LABEL_ENTRY_AUTHOR,
     LABEL_ENTRY_CHANNEL,
     LABEL_ENTRY_CONTENT,
@@ -1642,6 +1650,11 @@ mod tests {
         );
         assert_eq!(SEALED_SECRET_BYTES, 92);
         assert_eq!(MAX_EARLIER_SECRETS, 8);
+        // The three labels of a change entry: of each part, and of the
+        // secret sealed to each device.
+        assert_eq!(LABEL_CHANGE_DEVICES, b"cordelia v2 change devices");
+        assert_eq!(LABEL_CHANGE_PHRASE, b"cordelia v2 change phrase");
+        assert_eq!(LABEL_CHANGE_SECRET, b"cordelia v2 change secret");
     }
 
     /// The bounds of an entry, and the room that is kept in every entry

@@ -992,13 +992,13 @@ mod tests {
 
     use cordelia_core::protocol::{
         CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
-        ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES, LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL,
-        LABEL_ENTRY_CONTENT, LABEL_STATEMENT, MIN_ENTRY_CONTENT_BYTES, REV_BAND_HALF,
-        REV_COUNT_BITS,
+        ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES, LABEL_CHANGE_SECRET, LABEL_ENTRY_AUTHOR,
+        LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT, LABEL_STATEMENT, MIN_ENTRY_CONTENT_BYTES,
+        REV_BAND_HALF, REV_COUNT_BITS,
     };
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::aes_gcm::item_encrypt;
-    use cordelia_crypto::ecies::ecies_encrypt;
+    use cordelia_crypto::ecies::{ecies_encrypt, ecies_encrypt_for};
     use cordelia_crypto::entry::known_to_follow;
     use cordelia_crypto::identity::x25519_pub_from_ed25519_pub;
     use cordelia_storage::db;
@@ -1445,8 +1445,25 @@ mod tests {
         after
     }
 
-    /// `secret` sealed to device `n`, as the node seals to a key.
+    /// `secret` sealed to device `n` as the secret of statement 3 of the
+    /// phrase: as a change entry seals it.
     fn sealed_to(n: u16, secret: &[u8; 32]) -> Vec<u8> {
+        sealed_for(3, n, secret)
+    }
+
+    /// `secret` sealed to device `n` as the secret of statement `number`
+    /// of the phrase.
+    fn sealed_for(number: u64, n: u16, secret: &[u8; 32]) -> Vec<u8> {
+        let mut info = LABEL_CHANGE_SECRET.to_vec();
+        info.extend_from_slice(&number.to_be_bytes());
+        info.extend_from_slice(&phrase().public_key().unwrap());
+        let to = x25519_pub_from_ed25519_pub(&key(n)).unwrap();
+        ecies_encrypt_for(&to, secret, &info).unwrap().to_bytes()
+    }
+
+    /// `secret` sealed to device `n` as the node seals to a key for any
+    /// other use.
+    fn sealed_for_another_use(n: u16, secret: &[u8; 32]) -> Vec<u8> {
         let to = x25519_pub_from_ed25519_pub(&key(n)).unwrap();
         ecies_encrypt(&to, secret).unwrap().to_bytes()
     }
@@ -2095,7 +2112,7 @@ mod tests {
         let phrase = phrase();
         let [_, two, three, _] = statements(&phrase);
         // Statement 3 lists devices 0 and 1, in that order.
-        let ways: [(&str, Vec<u8>); 4] = [
+        let ways: [(&str, Vec<u8>); 6] = [
             (
                 "sealed to another key",
                 sealed(&[sealed_to(0, &secret(3)), sealed_to(9, &secret(3))]),
@@ -2111,6 +2128,17 @@ mod tests {
             (
                 "the secrets in another order than the devices",
                 sealed(&[sealed_to(1, &secret(3)), sealed_to(0, &secret(3))]),
+            ),
+            (
+                "sealed to this device's key for another use",
+                sealed(&[
+                    sealed_to(0, &secret(3)),
+                    sealed_for_another_use(1, &secret(3)),
+                ]),
+            ),
+            (
+                "sealed to this device for another statement",
+                sealed(&[sealed_to(0, &secret(3)), sealed_for(4, 1, &secret(3))]),
             ),
         ];
         for (what, after) in ways {

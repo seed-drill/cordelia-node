@@ -10,9 +10,11 @@
 //! - **For the devices**, under the statement key, which every device that
 //!   follows the phrase holds: the statement, and, for each device it
 //!   lists and in that order, the new secret sealed to that device's key
-//!   as the node seals to a key ([`crate::ecies`]). So every device that
-//!   follows the phrase can read the statement, and only a device it lists
-//!   can open the secret.
+//!   ([`crate::ecies`]). So every device that follows the phrase can read
+//!   the statement, and only a device it lists can open the secret. Each
+//!   is sealed for this purpose and for this statement, under a label of
+//!   its own with the statement's number and the phrase's key: what was
+//!   sealed to a device for anything else is no secret here.
 //! - **For the phrase**, under a key that only the phrase gives: the new
 //!   secret, and the secrets of the generations before it, as many as
 //!   eight, the newest first, each with its statement's number. Nothing
@@ -67,11 +69,11 @@ use std::fmt;
 use cordelia_core::protocol::{
     CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
     CHANGE_ENTRY_PHRASE_PART_BYTES, ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES,
-    LABEL_CHANGE_PHRASE, MAX_EARLIER_SECRETS, SEALED_SECRET_BYTES,
+    LABEL_CHANGE_PHRASE, LABEL_CHANGE_SECRET, MAX_EARLIER_SECRETS, SEALED_SECRET_BYTES,
 };
 
 use crate::aes_gcm::{item_decrypt, item_encrypt};
-use crate::ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt};
+use crate::ecies::{EciesEnvelope, ecies_decrypt_for, ecies_encrypt_for};
 use crate::entry::CheckedEntry;
 use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
 use crate::slots::slot_id;
@@ -302,7 +304,12 @@ pub fn build(
     for (place, device) in statement.statement.devices.iter().enumerate() {
         let to =
             x25519_pub_from_ed25519_pub(&device.key).ok_or(ChangeEntryError::DeviceKey(place))?;
-        let sealed = ecies_encrypt(&to, &for_phrase.secret).map_err(crypto)?;
+        let sealed = ecies_encrypt_for(
+            &to,
+            &for_phrase.secret,
+            &bound_to(LABEL_CHANGE_SECRET, number, phrase_key),
+        )
+        .map_err(crypto)?;
         said.extend_from_slice(&sealed.to_bytes());
     }
 
@@ -439,7 +446,7 @@ pub fn open_for_device(
     let listed = &statement.statement.devices;
     let secret = match listed.iter().position(|one| one.key == own) {
         None => DeviceSecret::NotListed,
-        Some(place) => match open_sealed(&sealed[place], device) {
+        Some(place) => match open_sealed(&sealed[place], device, entry.rev, phrase_key) {
             Some(secret) if statement.statement.commits_to(&secret) => DeviceSecret::Opened(secret),
             _ => DeviceSecret::DidNotOpen,
         },
@@ -524,11 +531,22 @@ fn sealed_secrets(said: &[u8], devices: usize) -> Option<Vec<[u8; SEALED_SECRET_
     only_zeros(reader.rest()).then_some(sealed)
 }
 
-/// Open a secret that was sealed to `device`'s key, as the node opens what
-/// is sealed to it.
-fn open_sealed(sealed: &[u8; SEALED_SECRET_BYTES], device: &NodeIdentity) -> Option<[u8; 32]> {
+/// Open a secret that was sealed to `device`'s key as the secret of
+/// statement `number` of the phrase whose key is `phrase_key`. What was
+/// sealed to that key for anything else does not open.
+fn open_sealed(
+    sealed: &[u8; SEALED_SECRET_BYTES],
+    device: &NodeIdentity,
+    number: u64,
+    phrase_key: &[u8; 32],
+) -> Option<[u8; 32]> {
     let envelope = EciesEnvelope::from_bytes(sealed, 32).ok()?;
-    let secret = ecies_decrypt(&device.x25519_private_key(), &envelope).ok()?;
+    let secret = ecies_decrypt_for(
+        &device.x25519_private_key(),
+        &envelope,
+        &bound_to(LABEL_CHANGE_SECRET, number, phrase_key),
+    )
+    .ok()?;
     secret.try_into().ok()
 }
 
@@ -566,8 +584,9 @@ fn open_part(part: &[u8], key: &[u8; 32], bound_to: &[u8]) -> Result<Vec<u8>, Ch
     item_decrypt(key, part, bound_to).map_err(|_| ChangeEntryError::DidNotOpen)
 }
 
-/// What a part's encryption is bound to: the part's label, the statement's
-/// number, and the phrase's public key.
+/// What a part's encryption is bound to, and what a secret sealed to a
+/// device is sealed under: a label, the statement's number, and the
+/// phrase's public key.
 fn bound_to(label: &[u8], number: u64, phrase_key: &[u8; 32]) -> Vec<u8> {
     let mut bound = Vec::with_capacity(label.len() + 8 + 32);
     bound.extend_from_slice(label);
@@ -804,10 +823,28 @@ mod tests {
         said
     }
 
-    /// `secret` sealed to device `n`, as the node seals to a key.
+    /// `secret` sealed to device `n` as the secret of statement `number`
+    /// of the phrase of these tests: as `build` seals it.
+    fn sealed_for(number: u64, n: u16, secret: &[u8; 32]) -> Vec<u8> {
+        let phrase_key = phrase().public_key().unwrap();
+        sealed_under(
+            &bound_to(LABEL_CHANGE_SECRET, number, &phrase_key),
+            n,
+            secret,
+        )
+    }
+
+    /// `secret` sealed to device `n` for the purpose that `info` says.
+    fn sealed_under(info: &[u8], n: u16, secret: &[u8; 32]) -> Vec<u8> {
+        let to = x25519_pub_from_ed25519_pub(&key(n)).unwrap();
+        ecies_encrypt_for(&to, secret, info).unwrap().to_bytes()
+    }
+
+    /// `secret` sealed to device `n` as the node seals to a key for any
+    /// other use: under the general key-wrap info.
     fn sealed_to(n: u16, secret: &[u8; 32]) -> Vec<u8> {
         let to = x25519_pub_from_ed25519_pub(&key(n)).unwrap();
-        ecies_encrypt(&to, secret).unwrap().to_bytes()
+        crate::ecies::ecies_encrypt(&to, secret).unwrap().to_bytes()
     }
 
     /// A count, and the sealed secrets after it.
@@ -1048,12 +1085,90 @@ mod tests {
         assert_eq!(sealed.len(), statement.statement.devices.len());
         assert_eq!(sealed.len(), 2);
         for one in &sealed {
-            assert_eq!(open_sealed(one, &identity(2)), None);
-            assert_eq!(open_sealed(one, &identity(7)), None);
+            assert_eq!(open_sealed(one, &identity(2), 3, &keys.phrase_key), None);
+            assert_eq!(open_sealed(one, &identity(7), 3, &keys.phrase_key), None);
         }
         // The control: each opens for the device in its place.
-        assert_eq!(open_sealed(&sealed[0], &identity(0)), Some(secret(3)));
-        assert_eq!(open_sealed(&sealed[1], &identity(1)), Some(secret(3)));
+        let open =
+            |place: usize, n: u16| open_sealed(&sealed[place], &identity(n), 3, &keys.phrase_key);
+        assert_eq!(open(0, 0), Some(secret(3)));
+        assert_eq!(open(1, 1), Some(secret(3)));
+        assert_eq!(open(0, 1), None);
+    }
+
+    /// The secret sealed to a device in a change entry is sealed for that
+    /// purpose and for that statement: under a label of its own, with the
+    /// statement's number and the phrase's key. What was sealed to the
+    /// device's key for another purpose, or for another statement, does
+    /// not open, though it is the right secret under the right key.
+    #[test]
+    fn a_secret_sealed_for_another_purpose_or_statement_does_not_open() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let [_, two, ..] = statements(&phrase);
+        let signed_two = signed(&two, &phrase);
+        let right = |n: u16| sealed_for(2, n, &secret(2));
+        // What device 1 reads where this is sealed in its place.
+        let read_at_1 = |sealed_1: Vec<u8>| {
+            let after = counted(3, &[right(0), sealed_1, right(2)]);
+            let content = content_saying(&statement_and(&signed_two, &after), 2, &keys);
+            opened_by(&content, 2, &keys, 1).secret
+        };
+        let opened = DeviceSecret::Opened(secret(2));
+        let not = DeviceSecret::DidNotOpen;
+
+        // The control: sealed for statement 2 of this phrase.
+        assert_eq!(read_at_1(right(1)), opened);
+        let info = [
+            &b"cordelia v2 change secret"[..],
+            &[0, 0, 0, 0, 0, 0, 0, 2],
+            &keys.phrase_key,
+        ]
+        .concat();
+        assert_eq!(read_at_1(sealed_under(&info, 1, &secret(2))), opened);
+
+        // As the node seals to a key for any other use.
+        assert_eq!(read_at_1(sealed_to(1, &secret(2))), not);
+        // For another statement of this phrase.
+        for number in [1, 3, 258] {
+            assert_eq!(
+                read_at_1(sealed_for(number, 1, &secret(2))),
+                not,
+                "{number}"
+            );
+        }
+        // For statement 2 of another phrase.
+        let theirs = bound_to(LABEL_CHANGE_SECRET, 2, &other.public_key().unwrap());
+        assert_eq!(read_at_1(sealed_under(&theirs, 1, &secret(2))), not);
+        // Under another label of the change entry, and under the label
+        // alone.
+        let as_a_part = bound_to(LABEL_CHANGE_DEVICES, 2, &keys.phrase_key);
+        assert_eq!(read_at_1(sealed_under(&as_a_part, 1, &secret(2))), not);
+        assert_eq!(
+            read_at_1(sealed_under(LABEL_CHANGE_SECRET, 1, &secret(2))),
+            not
+        );
+
+        // And the other way round: what an entry seals to a device opens
+        // for no other use of that device's key.
+        let content = entry(&phrase, &two, &for_phrase_of(2));
+        let (_, sealed) = open_devices_part(
+            &carrying(&content, 2),
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.statement_key,
+        )
+        .unwrap();
+        let envelope = EciesEnvelope::from_bytes(&sealed[1], 32).unwrap();
+        let device = identity(1).x25519_private_key();
+        assert!(crate::ecies::ecies_decrypt(&device, &envelope).is_err());
+        assert_eq!(
+            ecies_decrypt_for(&device, &envelope, &info).unwrap(),
+            secret(2)
+        );
+        let for_3 = bound_to(LABEL_CHANGE_SECRET, 3, &keys.phrase_key);
+        assert!(ecies_decrypt_for(&device, &envelope, &for_3).is_err());
     }
 
     /// A statement that lists this device, with a secret that does not
@@ -1066,7 +1181,7 @@ mod tests {
         let keys = keys(&phrase);
         let [_, two, ..] = statements(&phrase);
         let signed_two = signed(&two, &phrase);
-        let right = |n: u16| sealed_to(n, &secret(2));
+        let right = |n: u16| sealed_for(2, n, &secret(2));
         let secrets_of = |after: &[u8]| -> Vec<DeviceSecret> {
             let content = content_saying(&statement_and(&signed_two, after), 2, &keys);
             [0, 1, 2, 7]
@@ -1105,7 +1220,10 @@ mod tests {
         // In device 1's place, another secret than the statement commits
         // to: it opens, and it is not the secret.
         assert_eq!(
-            secrets_of(&counted(3, &[right(0), sealed_to(1, &secret(7)), right(2)])),
+            secrets_of(&counted(
+                3,
+                &[right(0), sealed_for(2, 1, &secret(7)), right(2)]
+            )),
             [
                 opened.clone(),
                 not.clone(),
@@ -1153,7 +1271,7 @@ mod tests {
         let keys = keys(&phrase);
         let [_, two, ..] = statements(&phrase);
         let signed_two = signed(&two, &phrase);
-        let right = |n: u16| sealed_to(n, &secret(2));
+        let right = |n: u16| sealed_for(2, n, &secret(2));
         let refused = |after: &[u8], what: &str| {
             let content = content_saying(&statement_and(&signed_two, after), 2, &keys);
             assert_eq!(
@@ -1316,7 +1434,10 @@ mod tests {
         let removed = identity(2);
         // Statement 3, which lists devices 0 and 1, with a secret of the
         // removed device's own sealed to each.
-        let broken = counted(2, &[sealed_to(0, &secret(9)), sealed_to(1, &secret(9))]);
+        let broken = counted(
+            2,
+            &[sealed_for(3, 0, &secret(9)), sealed_for(3, 1, &secret(9))],
+        );
         let content = content_saying(&statement_and(&signed(&three, &phrase), &broken), 3, &keys);
 
         // In a channel of its own, and in the phrase's channel were it to
@@ -1509,7 +1630,10 @@ mod tests {
         let keys = keys(&phrase);
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         let [_, _, three, ..] = statements(&phrase);
-        let after = counted(2, &[sealed_to(0, &secret(3)), sealed_to(1, &secret(3))]);
+        let after = counted(
+            2,
+            &[sealed_for(3, 0, &secret(3)), sealed_for(3, 1, &secret(3))],
+        );
 
         // Statement 3, in an entry that is sealed as statement 2's.
         let content = content_saying(&statement_and(&signed(&three, &phrase), &after), 2, &keys);
