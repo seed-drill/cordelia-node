@@ -96,7 +96,7 @@ Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device from each channel in which
 this device finds it, and rotates those channels' keys), `cordelia sync off`.
 Removing a device publishes again what that device last wrote, as far as
-this device holds it and can read it.
+this device holds it, can read it and can publish it again.
 Each of your other devices applies the removal only when its node has received
 it. It is offered to them until each confirms it, and `cordelia devices`, on
 the device that sent it, marks any that has not after ten minutes. The absence
