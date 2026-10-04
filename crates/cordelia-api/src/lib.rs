@@ -2,6 +2,7 @@
 //!
 //! Spec: seed-drill/specs/channels-api.md
 
+pub mod adding;
 pub mod auth;
 pub mod devices;
 pub mod entries;

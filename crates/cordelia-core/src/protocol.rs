@@ -1104,6 +1104,12 @@ pub const CHANGE_ENTRY_NAME: &str = "change";
 /// a pair channel is read.
 pub const HAND_OVER_NAME: &str = "hand-over";
 
+/// How long a key that a person typed on a device opens the pair channel
+/// with that key: one hour (decision 2026-10-04 §2.2, §6). A device reads
+/// a pair channel only with a key that was typed on it within that time,
+/// so nothing that a removed device goes on writing there is read.
+pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
+
 /// The most records of additions a hand-over carries (decision 2026-10-04
 /// §6): the record of the addition, and the record of the adder's own
 /// addition. A chain of additions is two long at most.
@@ -1731,6 +1737,8 @@ mod tests {
         // statement's number and hash, and a signature.
         assert_eq!(MAX_ADDITION_BYTES, 226);
         assert_eq!(HAND_OVER_NAME, "hand-over");
+        // A typed key opens its pair channel for an hour.
+        assert_eq!(PAIR_KEY_TYPED_SECS, 3_600);
         assert_eq!(MAX_HAND_OVER_RECORDS, 2);
         assert_eq!(HAND_OVER_CHANGE_ENTRY_BYTES, 192 + 32_768);
         assert_eq!(MAX_HAND_OVER_BYTES, 54_267);

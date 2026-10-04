@@ -59,6 +59,7 @@ use cordelia_crypto::chain;
 use cordelia_crypto::change_entry::{self, ChangeEntryError, DeviceSecret, ForPhrase};
 use cordelia_crypto::derive::{self, DeriveError};
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError, Inside, Link, Value};
+use cordelia_crypto::hand_over::HandOverError;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::Phrase;
 use cordelia_crypto::slots::slot_id;
@@ -96,11 +97,25 @@ pub enum PersonError {
     #[error("the record was signed by a key that does not count")]
     RecordByAKeyThatDoesNotCount,
 
+    #[error("the record of this device's addition does not count under the statement: {0:?}")]
+    RecordNotCounted(NotCounted),
+
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
 
     #[error("a merge is written over a version, and the slot holds none")]
     MergeOverNoVersion,
+
+    #[error("the statement lists that key as removed: it is not added again without a new key")]
+    KeyRemoved,
+
+    #[error(
+        "this device may not add: it was added, since the last change, by a device added since"
+    )]
+    MayNotAdd,
+
+    #[error("this device counts 64 devices already: a statement makes room")]
+    NoRoom,
 
     #[error("what this device holds of its person does not hold together: {0}")]
     Held(String),
@@ -116,6 +131,9 @@ pub enum PersonError {
 
     #[error(transparent)]
     Addition(#[from] AdditionError),
+
+    #[error(transparent)]
+    HandOver(#[from] HandOverError),
 
     #[error(transparent)]
     Derive(#[from] DeriveError),
@@ -671,14 +689,17 @@ fn stop(conn: &Connection, state: State, entry: &CheckedEntry) -> Result<(), Per
 
 /// The latest change entry the device has seen. A device that follows a
 /// phrase keeps one.
-fn latest_entry(conn: &Connection) -> Result<CheckedEntry, PersonError> {
+pub(crate) fn latest_entry(conn: &Connection) -> Result<CheckedEntry, PersonError> {
     kept_entry(conn, Kept::Latest)?.ok_or_else(|| {
         PersonError::Held("a device that follows a phrase keeps a change entry".into())
     })
 }
 
 /// A change entry the device keeps, checked again as it is read.
-fn kept_entry(conn: &Connection, kept: Kept) -> Result<Option<CheckedEntry>, PersonError> {
+pub(crate) fn kept_entry(
+    conn: &Connection,
+    kept: Kept,
+) -> Result<Option<CheckedEntry>, PersonError> {
     held_rows::change_entry(conn, kept)?
         .map(|entry| {
             entry
@@ -697,13 +718,13 @@ fn opens(statement: &SignedStatement, secret: &[u8; 32]) -> bool {
 }
 
 /// A statement with what it takes to apply it.
-struct Change<'a> {
+pub(crate) struct Change<'a> {
     /// What the device follows, or comes to follow with this statement.
-    following: &'a Following,
-    statement: &'a SignedStatement,
-    secret: &'a [u8; 32],
+    pub(crate) following: &'a Following,
+    pub(crate) statement: &'a SignedStatement,
+    pub(crate) secret: &'a [u8; 32],
     /// The statement's change entry, which the device keeps.
-    entry: &'a CheckedEntry,
+    pub(crate) entry: &'a CheckedEntry,
 }
 
 /// Apply `statement`, given with its `secret` and its change entry, on a
@@ -792,7 +813,7 @@ pub fn first_statement(
 /// Whether the change's entry is its statement's own, under what the
 /// device follows: it is opened as the phrase's change entry, and the
 /// statement key opens it to this very statement.
-fn its_own_entry(change: &Change) -> Result<(), PersonError> {
+pub(crate) fn its_own_entry(change: &Change) -> Result<(), PersonError> {
     let following = change.following;
     let carried = change_entry::open_statement(
         change.entry,
@@ -810,11 +831,12 @@ fn its_own_entry(change: &Change) -> Result<(), PersonError> {
 /// transaction. `before` is what the device held, or `None` where it
 /// followed no phrase.
 ///
-/// Rules 3 and 4 of §4.2 are asked again here, whoever calls: the device
-/// is among the statement's devices, and the secret opens to the
+/// Rule 3 of §4.2 is asked again here, whoever calls: the device is among
+/// the statement's devices. Rule 4 is asked where the device comes to the
+/// statement's generation ([`come_to`]): the secret opens to the
 /// commitment. And the secret is another than the one the device leaves:
 /// were the two one, what is carried would be dropped with what is left.
-fn apply_judged(
+pub(crate) fn apply_judged(
     conn: &Connection,
     identity: &NodeIdentity,
     before: Option<&Held>,
@@ -825,6 +847,60 @@ fn apply_judged(
     if !statement.lists(&identity.public_key()) {
         return Err(PersonError::NotApplied(Judgement::NotListed));
     }
+    come_to(conn, identity, before, change, now)
+}
+
+/// Apply a statement on a device that is being added under it, inside the
+/// caller's transaction (decision 2026-10-04 §4.2, rule 3; §6): the
+/// statement does not list the device, and a record of its addition comes
+/// with it. `addition` is that record, and `adders_own` the record of the
+/// adder's own addition, where the adder was itself added since the
+/// statement.
+///
+/// The record adds this device, under this statement, or the statement is
+/// not applied. Once the statement is applied the records are taken as
+/// any that the device sees ([`see_addition`]), the adder's own first, and
+/// each of them counts: where one does not, the device is not in the
+/// statement, and the error undoes everything.
+pub(crate) fn apply_added(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    before: Option<&Held>,
+    change: &Change,
+    addition: &SignedAddition,
+    adders_own: Option<&SignedAddition>,
+    now: i64,
+) -> Result<Applied, PersonError> {
+    let statement = &change.statement.statement;
+    let adds_this_device = addition.addition.device.key == identity.public_key();
+    if !adds_this_device || addition.addition.under != statement.link()? {
+        return Err(PersonError::NotApplied(Judgement::NotListed));
+    }
+    let applied = come_to(conn, identity, before, change, now)?;
+    for record in adders_own.into_iter().chain([addition]) {
+        match see_addition(conn, record, now)? {
+            AdditionSeen::Counted => {}
+            AdditionSeen::NotCounted(why) => return Err(PersonError::RecordNotCounted(why)),
+            AdditionSeen::SeenBefore => {
+                return Err(PersonError::Held(
+                    "a record of an addition is kept under a statement just applied".into(),
+                ));
+            }
+        }
+    }
+    Ok(applied)
+}
+
+/// The device comes to the generation of the change's statement: what
+/// [`apply_judged`] and [`apply_added`] do once rule 3 is answered.
+fn come_to(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    before: Option<&Held>,
+    change: &Change,
+    now: i64,
+) -> Result<Applied, PersonError> {
+    let statement = &change.statement.statement;
     if !opens(change.statement, change.secret) {
         return Err(PersonError::SecretNotCommitted);
     }
