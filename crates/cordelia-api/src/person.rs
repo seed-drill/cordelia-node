@@ -427,6 +427,17 @@ pub fn applied_name(device: &[u8; 32]) -> Result<String, PersonError> {
     ))
 }
 
+/// The name, in the personal channel, of a record that adds the device
+/// whose key is `device` (decision 2026-10-04 §6): `added/` and that
+/// device's key, as a device's key is written. Each device that adds the
+/// key has an entry of its own there.
+pub fn added_name(device: &[u8; 32]) -> Result<String, PersonError> {
+    Ok(format!(
+        "{PERSONAL_ADDED_PREFIX}{}",
+        encode_public_key(device)?
+    ))
+}
+
 // ── A change entry that a device is shown ────────────────────────────
 
 /// What a change entry that a device was shown was to it, and what was

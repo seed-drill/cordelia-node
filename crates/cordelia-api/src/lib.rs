@@ -13,6 +13,7 @@ pub mod person;
 pub mod publish;
 pub mod state;
 pub mod sync;
+pub mod take;
 pub mod types;
 pub mod verify;
 
