@@ -810,6 +810,38 @@ pub const REASON_NOT_AUTHORIZED: &str = "not_authorized";
 /// PSK denial: PSK temporarily unavailable.
 pub const REASON_NOT_AVAILABLE: &str = "not_available";
 
+// ── A channel from its secret (decision 2026-10-04) ──────────────────
+
+/// How many bits of a revision are its count (decision 2026-10-04 §2.3).
+/// A revision is one number, compared as one, and editing adds one to it.
+/// Its low 44 bits are its count, and the bits above them its band.
+pub const REV_COUNT_BITS: u32 = 44;
+
+/// How many bits of a revision are its band: the nine above the count
+/// (decision 2026-10-04 §2.3).
+pub const REV_BAND_BITS: u32 = 9;
+
+// Checked at compile time: a band and a count are the whole of a revision.
+const _: () = assert!(MAX_REV == (1 << (REV_BAND_BITS + REV_COUNT_BITS)) - 1);
+
+/// How many revisions one band holds.
+/// Derived: every count that fits in REV_COUNT_BITS.
+pub const REV_BAND_SIZE: u64 = 1 << REV_COUNT_BITS;
+
+/// The count at which the top half of a band begins (decision 2026-10-04
+/// §2.3). Editing never gets there, since it is 2^43 edits from the bottom:
+/// a revision is in the top half because a device jumped.
+/// Derived: half of REV_BAND_SIZE.
+pub const REV_BAND_HALF: u64 = REV_BAND_SIZE / 2;
+
+/// The highest number a statement may have, and so the highest band a
+/// revision may be in (decision 2026-10-04 §3, §4.1). The first statement
+/// is number 1, and a phrase makes at most this many.
+pub const MAX_STATEMENT_NUMBER: u64 = 256;
+
+// Checked at compile time: every statement's number is a band.
+const _: () = assert!(MAX_STATEMENT_NUMBER < 1 << REV_BAND_BITS);
+
 // ── Assertion tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1247,5 +1279,16 @@ mod tests {
     #[test]
     fn test_derived_channel_responder_offset() {
         assert_eq!(CHANNEL_RESPONDER_OFFSET_SECS, PEER_SHARE_INTERVAL_SECS / 2);
+    }
+
+    // ── A channel from its secret (decision 2026-10-04) ──────────────
+
+    #[test]
+    fn test_revision_bands_decision_2026_10_04_2_3() {
+        assert_eq!(REV_BAND_BITS, 9);
+        assert_eq!(REV_COUNT_BITS, 44);
+        assert_eq!(REV_BAND_SIZE, 1 << 44);
+        assert_eq!(REV_BAND_HALF, 1 << 43);
+        assert_eq!(MAX_REV, (1 << 53) - 1);
     }
 }
