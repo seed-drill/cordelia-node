@@ -50,7 +50,7 @@ cp deploy/relay/relay.env.example deploy/relay/.env
 Then edit `deploy/relay/.env`:
 
 - `RELAY=relay1` or `RELAY=relay2`.
-- **A release (preferred):** `CORDELIA_VERSION` (e.g. `v0.2.0-alpha.5`) and
+- **A release (preferred):** `CORDELIA_VERSION` (e.g. `v0.2.0-alpha.6`) and
   `CORDELIA_SHA256`, the sha256 of `cordelia-linux-amd64` from that release's
   page (its `.sha256` file). The image build downloads the binary and refuses
   it if the hash differs.
