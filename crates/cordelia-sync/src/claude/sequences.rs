@@ -1255,8 +1255,9 @@ fn sync_the_rest(n: usize) -> Vec<Step> {
 /// once, and changes no key: what a node does besides is not in it. And
 /// the two runs can differ only in the mixes where the device that removes
 /// and the device that holds the overtaken text are both as built: in the
-/// others nothing that is published after the removal says anything, and
-/// the two runs are one run.)
+/// others either nothing that is published after the removal says
+/// anything, or the device that holds the overtaken text reads none of
+/// it, and the two runs come to the same.)
 #[test]
 fn the_rule_changes_no_file_through_a_removal() {
     let (until, then) = a_removal_and_then_a_tie();
