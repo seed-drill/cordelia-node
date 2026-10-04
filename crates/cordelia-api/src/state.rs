@@ -145,9 +145,10 @@ pub struct RefusedSnapshot {
     pub refusals: u32,
 }
 
-/// A text that the sync adapter has kept beside a file, in a conflict
-/// file, for as long as the file has still to take the version it was
-/// kept against (decision 2026-09-30 §4.5).
+/// What the sync adapter wrote down when it kept a text beside a file, in
+/// a conflict file. It is relied on only while the file has still to take
+/// the version the text was kept against, and it may go sooner (decision
+/// 2026-09-30 §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
     /// The channel's version that the file is to take (its item ID), as
@@ -173,9 +174,10 @@ pub struct SyncControl {
     wake: tokio::sync::Notify,
     generation: AtomicU64,
     /// What the adapter has kept beside files. It is held here and not in
-    /// the database, so that it lasts for one run of the node and under
-    /// one set of settings, and no longer: a record that outlived either
-    /// could be of a conflict that is over (see [`Self::changed`]).
+    /// the database, so that it lasts no longer than one run of the node,
+    /// and no longer than until the node next takes a settings command: a
+    /// record that outlived either could be of a conflict that is over
+    /// (see [`Self::changed`]).
     kept: Mutex<KeptByFile>,
 }
 
@@ -189,6 +191,12 @@ impl SyncControl {
     /// has already replaced and answered for. A handler calls it before
     /// the first thing it writes, so that a change that fails part-way has
     /// still stopped the cycle that was running.
+    ///
+    /// A handler calls it for every command it takes: once the command has
+    /// passed the handler's checks, and whether or not the command then
+    /// changes anything. So the count is of commands taken, and where
+    /// these comments say that the settings have changed, they mean that
+    /// the count has moved.
     ///
     /// What the adapter had kept beside files is forgotten with it: the
     /// change may be one that makes a folder forget what it had agreed,
