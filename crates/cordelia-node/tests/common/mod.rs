@@ -66,9 +66,14 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and nothing of whoever runs the tests: no `CORDELIA_`
-    /// variable of theirs, which the node would read a setting from in
-    /// place of its configuration, and no proxy of theirs.
+    /// and home, and without three things of whoever runs the tests: any
+    /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
+    /// the node's configuration), and any proxy (the tests of what a
+    /// command does with one set their own). The rest of the environment
+    /// is left. Of it the binary reads `NO_COLOR` and the user's name, and
+    /// hands all of it to `git` where it asks which repository a folder is
+    /// in. A test that rests on git's answer rests on the caller having
+    /// set none of git's own variables (`GIT_DIR` and the like).
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -79,7 +84,9 @@ impl Node {
         let mut command = Command::new(BIN);
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
-                name.starts_with("CORDELIA_") || name.to_lowercase().ends_with("_proxy")
+                name.starts_with("CORDELIA_")
+                    || name == "RUST_LOG"
+                    || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
                 command.env_remove(&name);
@@ -96,6 +103,19 @@ impl Node {
     /// A CLI command against this node, run as on its machine.
     pub fn command(&self, args: &[&str]) -> std::process::Output {
         self.binary().args(args).output().unwrap()
+    }
+
+    /// A CLI command against this node, with `vars` set for it, not yet
+    /// run: the caller's own are taken out first, as for any command.
+    pub fn command_for(&self, vars: &[(&str, &str)], args: &[&str]) -> Command {
+        let mut command = self.binary();
+        command.envs(vars.iter().copied()).args(args);
+        command
+    }
+
+    /// [`Self::command_for`], run.
+    pub fn command_given(&self, vars: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+        self.command_for(vars, args).output().unwrap()
     }
 
     /// As [`Self::command`], run in the directory `dir`: for what a
@@ -163,17 +183,33 @@ impl Node {
     /// not started if a relay it would dial is not on this machine, or if
     /// its role is one whose dialling cannot be known beforehand: whatever
     /// wrote the configuration, and whatever a test did to it since. (The
-    /// node is given no `CORDELIA_` variable but its data directory, so
-    /// its settings are the file's.)
+    /// node is given no `RUST_LOG`, and no `CORDELIA_` variable but its
+    /// data directory and what [`Self::start_given`] lets through, so
+    /// where it dials is the file's to say.)
     pub fn start(&mut self) {
+        self.start_given(&[]);
+    }
+
+    /// [`Self::start`], with `vars` set for the node, after the same look
+    /// at where it will dial. That look is at the file, and a variable
+    /// could stand in place of what the file says. So only a variable
+    /// that is known not to change where a node dials is let through: the
+    /// address of its API.
+    pub fn start_given(&mut self, vars: &[(&str, &str)]) {
+        for (variable, _) in vars {
+            assert!(
+                *variable == "CORDELIA_BIND_ADDRESS",
+                "{}: a test node may not be started with {variable}",
+                self.name
+            );
+        }
         for host in self.will_dial() {
             assert_on_this_machine(self.name, &host);
         }
         let log = std::fs::File::create(self.log()).unwrap();
         std::fs::create_dir_all(self.home()).unwrap();
         let child = self
-            .binary()
-            .arg("start")
+            .command_for(vars, &["start"])
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()

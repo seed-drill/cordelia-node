@@ -37,32 +37,16 @@ pub fn default_relay_key(host: &str) -> Option<[u8; 32]> {
     cordelia_crypto::bech32::decode_public_key(protocol::FALLBACK_PEER_KEYS[at]).ok()
 }
 
-/// The relays a node dials: those in its configuration (`host:port` and an
-/// optional `cordelia_pk1...` key each) or, with `use_defaults` and none
-/// configured, the default relays.
-///
-/// - A default relay named without a key gets the key compiled into the
-///   binary, so configurations written before keys existed are covered.
-/// - Only personal nodes use the defaults: a relay given none stands
-///   alone, and never dials relays it was not told about.
-/// - A key that does not parse is an error. Dialling without the check the
-///   operator asked for would be worse than not starting.
-pub fn configured_relays(
-    configured: &[(String, Option<String>)],
-    use_defaults: bool,
-) -> Result<Vec<Relay>, String> {
-    relays_from(configured, use_defaults)
-}
-
 /// The relays a node of `role` dials, given the relays its configuration
-/// names. This is the one place that says so: the node asks it when it
-/// starts, and so does whatever needs to know beforehand where a node
-/// will dial.
+/// names (`host:port` and an optional `cordelia_pk1...` key each). This
+/// is the one place that says so: the node asks it when it starts, and so
+/// does whatever needs to know beforehand where a node will dial.
 ///
 /// - A bootnode dials no relay, whatever it names. (It dials the addresses
 ///   its peers share.)
 /// - A personal node dials the relays it names, or the default ones where
-///   it names none.
+///   it names none. Only a personal node uses the defaults: a relay given
+///   none stands alone, and never dials relays it was not told about.
 /// - Any other node dials the relays it names, and none where it names
 ///   none.
 pub fn relays_dialled(
@@ -75,6 +59,13 @@ pub fn relays_dialled(
     relays_from(configured, role == "personal")
 }
 
+/// The relays in a configuration or, with `use_defaults` and none
+/// configured, the default relays.
+///
+/// - A default relay named without a key gets the key compiled into the
+///   binary, so configurations written before keys existed are covered.
+/// - A key that does not parse is an error. Dialling without the check the
+///   operator asked for would be worse than not starting.
 fn relays_from(
     configured: &[(String, Option<String>)],
     use_defaults: bool,
@@ -200,14 +191,14 @@ mod tests {
 
     #[test]
     fn a_personal_node_that_names_no_relays_gets_the_defaults_with_their_keys() {
-        let relays = configured_relays(&[], true).unwrap();
+        let relays = relays_from(&[], true).unwrap();
         assert_eq!(relays.len(), protocol::FALLBACK_PEERS.len());
         for (relay, host) in relays.iter().zip(protocol::FALLBACK_PEERS) {
             assert_eq!(relay.host, *host);
             assert!(relay.key.is_some());
         }
         // A relay given none stands alone.
-        assert!(configured_relays(&[], false).unwrap().is_empty());
+        assert!(relays_from(&[], false).unwrap().is_empty());
     }
 
     /// Which relays a node dials goes by its role: a personal node that
@@ -245,7 +236,7 @@ mod tests {
         let (pk, text) = key(7);
         let own = "relay.example.org:9474".to_string();
         let default = protocol::FALLBACK_PEERS[0].to_string();
-        let relays = configured_relays(
+        let relays = relays_from(
             &[
                 (own.clone(), Some(text.clone())),
                 (default.clone(), None),
@@ -272,7 +263,7 @@ mod tests {
 
     #[test]
     fn a_key_that_does_not_parse_is_an_error() {
-        let err = configured_relays(
+        let err = relays_from(
             &[("relay.example.org:9474".into(), Some("not-a-key".into()))],
             true,
         )

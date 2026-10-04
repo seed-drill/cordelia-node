@@ -245,7 +245,7 @@ Bearer token authentication for SDK-to-node localhost connections (channels-api.
 - Scope: All API endpoints except `/api/v1/health` (unauthenticated liveness probe)
 - Missing or invalid token returns `401 unauthorized`
 
-**Binding:** The REST API MUST bind to a loopback interface only (127.0.0.1 or ::1). If a non-loopback address is configured, the node MUST refuse to start (operations.md SS5.4). The bearer token is a local secret; it is not transmitted over the P2P network.
+**Binding:** The REST API MUST bind to `127.0.0.1` or `::1` only (configuration.md SS2.9). With any other address configured, the node refuses to start (operations.md SS5.4). The bearer token is a local secret; it is not transmitted over the P2P network.
 
 ---
 

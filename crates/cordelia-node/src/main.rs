@@ -598,7 +598,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 }
             }
         }
-        None => println!("  Running:   no (start it with `cordelia start`)"),
+        // A node whose address is refused is not asked, and is not known
+        // to be stopped.
+        None => match &status.not_asked {
+            None => println!("  Running:   no (start it with `cordelia start`)"),
+            Some(why) => println!("  Running:   not asked: {why}"),
+        },
     }
 
     Ok(())
@@ -613,6 +618,9 @@ struct GatheredStatus {
     live: Option<serde_json::Value>,
     /// `POST /api/v1/sync/status` from the running node.
     sync: Option<serde_json::Value>,
+    /// Why the node was not asked, where its API address is not one a
+    /// command asks ([`api_host`]).
+    not_asked: Option<String>,
 }
 
 /// Collect the facts for [`indicator::derive`] without failing: a missing
@@ -625,6 +633,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         device: None,
         live: None,
         sync: None,
+        not_asked: None,
     };
     let Ok(mut config) = Config::load(&config::expand_tilde(config_path)) else {
         return out;
@@ -637,6 +646,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     out.facts.initialised = true;
     out.device = encode_public_key(&identity.public_key()).ok();
 
+    let address = &config.api.bind_address;
+    if api_host(address).is_none() {
+        out.facts.not_asked = true;
+        out.not_asked = Some(not_the_nodes_own(address));
+        return out;
+    }
     let timeout = std::time::Duration::from_secs(1);
     let Ok(live) = local_api(&config, false, "/api/v1/status", timeout) else {
         return out;
@@ -758,17 +773,14 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Validate bind address is loopback
+    // The API listens only on this machine.
     let bind_addr = &config.api.bind_address;
-    if bind_addr != "127.0.0.1" && bind_addr != "::1" && bind_addr != "localhost" {
-        anyhow::bail!(
-            "API bind_address must be loopback (127.0.0.1), got '{bind_addr}'. \
-             Non-loopback binding is not supported in Phase 1."
-        );
-    }
+    let Some(host) = api_host(bind_addr) else {
+        anyhow::bail!("{}", not_the_nodes_own(bind_addr));
+    };
 
     let http_port = config.node.http_port;
-    let listen_addr = format!("{bind_addr}:{http_port}");
+    let listen_addr = format!("{host}:{http_port}");
     let p2p_port = config.node.p2p_port;
 
     // Set up logging
@@ -1825,6 +1837,67 @@ fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     local_api(&config, false, path, std::time::Duration::from_secs(3))
 }
 
+/// The host of the node's API as it is written before a port, where
+/// `address` is one of the two that the API may have: `127.0.0.1`, or
+/// `::1`, which is written in brackets there. `None` for anything else.
+/// The node starts with no other, and a command asks no other.
+///
+/// Only those two, written so. A name is not taken, `localhost` included:
+/// what a name stands for is the resolver's answer, and whatever then
+/// binds or connects asks for it again. Where that answer was another
+/// machine, the node's token would go there.
+fn api_host(address: &str) -> Option<&'static str> {
+    match address {
+        "127.0.0.1" => Some("127.0.0.1"),
+        "::1" => Some("[::1]"),
+        _ => None,
+    }
+}
+
+/// What is said of an API address that [`api_host`] does not take: by the
+/// node, which does not start, and by a command, which does not ask. It
+/// names the address, the two it may be, and where it is set.
+fn not_the_nodes_own(address: &str) -> String {
+    format!(
+        "the node's API address is set to '{address}', which is neither `127.0.0.1` nor \
+         `::1`, written so. The node's API listens at one of those two and at no other, \
+         and a command sends the node's token nowhere else. See `bind_address` under \
+         `[api]` in the configuration, and CORDELIA_BIND_ADDRESS."
+    )
+}
+
+/// How a command reaches its own node: the client, and the address of
+/// `path` there. A request carries the node's token, so it goes to the
+/// node's own address and nowhere else:
+///
+/// - **To no other address.** The node's API listens at one of two
+///   addresses of this machine ([`api_host`]). An API address that a
+///   setting, or `CORDELIA_BIND_ADDRESS`, has made another is refused
+///   here, before anything is sent.
+/// - **Through no proxy.** The HTTP client's default takes one from the
+///   environment (`ALL_PROXY`, `HTTP_PROXY` and the rest). A proxy is for
+///   the network, and a request to this machine is not sent to one.
+/// - **Following no redirect.** The node's API sends none, so an answer
+///   that is one did not come from the node. It is not followed, and
+///   [`local_api`] and [`api_post`] do not read it as the node's.
+fn to_this_machine(
+    config: &Config,
+    path: &str,
+    limit: std::time::Duration,
+) -> anyhow::Result<(
+    ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    String,
+)> {
+    let address = &config.api.bind_address;
+    let host = api_host(address).ok_or_else(|| anyhow::anyhow!(not_the_nodes_own(address)))?;
+    let client = ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .timeout_global(Some(limit));
+    let url = format!("http://{host}:{}{path}", config.node.http_port);
+    Ok((client, url))
+}
+
 /// Call the running node's local API (GET, or POST with an empty body)
 /// with the node token, failing after `timeout`.
 fn local_api(
@@ -1833,15 +1906,9 @@ fn local_api(
     path: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<serde_json::Value> {
+    let (client, url) = to_this_machine(config, path, timeout)?;
     let token = std::fs::read_to_string(config.token_path())?;
-    let url = format!(
-        "http://{}:{}{path}",
-        config.api.bind_address, config.node.http_port
-    );
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .into();
+    let agent: ureq::Agent = client.build().into();
     let auth = format!("Bearer {}", token.trim());
     let resp = if post {
         agent
@@ -1851,15 +1918,20 @@ fn local_api(
     } else {
         agent.get(&url).header("Authorization", &auth).call()
     };
-    let json = resp
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-            )
-        })?
-        .body_mut()
-        .read_json()?;
-    Ok(json)
+    let mut resp = resp.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+        )
+    })?;
+    // A failure is an error already. What is left that is no success is
+    // an answer the node's API never gives (a redirect, say).
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "what answered at {url} is not the node (HTTP {})",
+            resp.status()
+        );
+    }
+    Ok(resp.body_mut().read_json()?)
 }
 
 /// POST `body` to the local node's API and return the JSON response.
@@ -1872,6 +1944,7 @@ fn api_post(
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
 
+    let (client, url) = to_this_machine(&config, path, std::time::Duration::from_secs(30))?;
     let token_path = config.token_path();
     let token = std::fs::read_to_string(&token_path).map_err(|e| {
         anyhow::anyhow!(
@@ -1879,16 +1952,8 @@ fn api_post(
             token_path.display()
         )
     })?;
-    let url = format!(
-        "http://{}:{}{path}",
-        config.api.bind_address, config.node.http_port
-    );
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .into();
+    let agent: ureq::Agent = client.http_status_as_error(false).build().into();
     let mut resp = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
@@ -3790,6 +3855,67 @@ mod tests {
         );
         let said = mapping_meant("x", None, None).unwrap_err().to_string();
         assert!(said.contains("not mapped on this device"), "{said}");
+    }
+
+    /// A command asks the node only at one of the two addresses that the
+    /// node itself starts with, written as it is there. Any other is
+    /// refused before a client is made, so the node's token is sent
+    /// nowhere else.
+    #[test]
+    fn test_a_command_asks_only_at_one_of_the_nodes_two_addresses() {
+        assert_eq!(api_host("127.0.0.1"), Some("127.0.0.1"));
+        // An IPv6 address is written in brackets before a port.
+        assert_eq!(api_host("::1"), Some("[::1]"));
+        // Anything else, this machine's or not: a name (what it stands
+        // for is asked again by whatever connects), another address of
+        // this machine, another way of writing one of the two.
+        for other in [
+            "localhost",
+            "LOCALHOST",
+            "192.0.2.1",
+            "0.0.0.0",
+            "127.0.0.2",
+            "[::1]",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:127.0.0.1",
+            " 127.0.0.1",
+            "127.0.0.1 ",
+            "example.org",
+            "127.0.0.1.example.org",
+            "",
+        ] {
+            assert_eq!(api_host(other), None, "{other}");
+        }
+        let mut config = Config::default();
+        let limit = std::time::Duration::from_secs(1);
+        let port = config.node.http_port;
+        let url_for = |config: &Config| {
+            let (_, url) = to_this_machine(config, "/api/v1/status", limit)
+                .ok()
+                .unwrap();
+            url
+        };
+        assert_eq!(
+            url_for(&config),
+            format!("http://127.0.0.1:{port}/api/v1/status")
+        );
+        config.api.bind_address = "::1".into();
+        assert_eq!(
+            url_for(&config),
+            format!("http://[::1]:{port}/api/v1/status")
+        );
+        config.api.bind_address = "192.0.2.1".into();
+        let refused = to_this_machine(&config, "/api/v1/status", limit)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(refused, not_the_nodes_own("192.0.2.1"));
+        assert!(
+            refused.contains("'192.0.2.1'")
+                && refused.contains("nowhere else")
+                && refused.contains("CORDELIA_BIND_ADDRESS"),
+            "{refused}"
+        );
     }
 
     #[test]

@@ -14,6 +14,13 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
+/// What a node writes to its log on the way to running: its banner, its
+/// endpoint, and the relays it worked out. The test of a node that stops
+/// before all that looks for none of them, and a test of a node that
+/// starts looks for each: a line that is reworded is then missed there,
+/// where it shows, and not only here, where it would pass.
+const A_STARTED_NODE_LOGS: [&str; 3] = ["Cordelia v", "P2P endpoint", "relays configured"];
+
 #[test]
 fn add_device_accept_and_sync_through_a_relay() {
     let mut relay = node("relay", "relay", None);
@@ -853,13 +860,12 @@ fn a_personal_node_listens_on_nothing() {
     });
     let status = a.cli(&["status"]);
     assert!(status.contains("outbound only"), "{status}");
-    assert!(
-        std::fs::read_to_string(a.log())
-            .unwrap()
-            .contains("dials out only"),
-        "{}",
-        a.log_tail()
-    );
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(log.contains("dials out only"), "{}", a.log_tail());
+    // And what a node with no identity is checked not to have reached.
+    for line in A_STARTED_NODE_LOGS {
+        assert!(log.contains(line), "{line}: {}", a.log_tail());
+    }
 
     a.stop();
     let config = std::fs::read_to_string(a.config()).unwrap();
@@ -970,10 +976,15 @@ fn the_harness_refuses_what_the_node_would_take_for_a_name() {
     assert_on_this_machine("odd", "[127.0.0.1]:9");
 }
 
-/// A node, and each command, is run with nothing of the caller's that the
-/// node reads a setting from: no `CORDELIA_` variable (one could move a
-/// node's relays past the look at its configuration), and no proxy. It
-/// is given its own data directory and home, and the rest is left.
+/// A node, and each command that the harness runs, is run without three
+/// things of the caller's: any `CORDELIA_` variable (the specs name one,
+/// `CORDELIA_BOOTNODES`, that would move a node's relays past the look at
+/// its configuration once it is built), `RUST_LOG`, and any proxy. It is
+/// given its own data directory and home, and the rest is left.
+///
+/// This is a test of the function that removes them, given the names: no
+/// node is spawned here with such a variable set, and that the harness
+/// gives the function the real environment's names is not under test.
 #[test]
 fn a_node_is_given_none_of_the_callers_settings() {
     let n = node("alone", "personal", None);
@@ -992,22 +1003,27 @@ fn a_node_is_given_none_of_the_callers_settings() {
         Some(found.1.map(PathBuf::from))
     };
     // Removed.
-    for name in ["CORDELIA_BOOTNODES", "HTTP_PROXY", "all_proxy", "no_proxy"] {
+    for name in [
+        "CORDELIA_BOOTNODES",
+        "HTTP_PROXY",
+        "all_proxy",
+        "no_proxy",
+        "RUST_LOG",
+    ] {
         assert_eq!(set(name), Some(None), "{name}");
     }
     // Its own.
     assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
     assert_eq!(set("HOME"), Some(Some(n.home())));
-    // Left as they are.
-    for name in ["PATH", "RUST_LOG"] {
-        assert_eq!(set(name), None, "{name}");
-    }
+    // Left as it is.
+    assert_eq!(set("PATH"), None);
 }
 
 /// A node with no identity does not start: it stops before it opens a
-/// socket or looks a name up. The tests below rest on that. Each starts a
-/// node that the harness should have refused, with its identity taken
-/// away, so that even with the refusal gone nothing reaches a relay.
+/// socket or looks a name up. Four of the tests below rest on that. Each
+/// of them starts a node that the harness should have refused, with its
+/// identity taken away, so that even with the refusal gone nothing
+/// reaches a relay.
 #[test]
 fn a_node_with_no_identity_stops_before_it_dials() {
     let mut n = node("bare", "personal", None);
@@ -1019,7 +1035,7 @@ fn a_node_with_no_identity_stops_before_it_dials() {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if told.elapsed() > Duration::from_secs(10) {
+        if told.elapsed() > Duration::from_secs(30) {
             let _ = child.kill();
             panic!(
                 "a node with no identity is still running:\n{}",
@@ -1031,12 +1047,13 @@ fn a_node_with_no_identity_stops_before_it_dials() {
     assert!(!status.success());
     let log = std::fs::read_to_string(n.log()).unwrap();
     assert!(log.contains("Node not initialised"), "{log}");
-    // Nothing of the network was begun: not its transport, and not the
-    // relays it would then have worked out.
-    assert!(
-        !log.contains("P2P transport") && !log.contains("relays configured"),
-        "{log}"
-    );
+    // It got no further: not to the banner it prints once it has its
+    // identity, not to its endpoint, and not to the relays it would then
+    // have worked out. (The harness's configuration logs at debug, and
+    // the node is given no `RUST_LOG` to say otherwise.)
+    for later in A_STARTED_NODE_LOGS {
+        assert!(!log.contains(later), "{later}: {log}");
+    }
 }
 
 /// The harness refuses to give a node a relay that is not on this machine,
@@ -1113,6 +1130,16 @@ fn a_relay_that_would_dial_another_machine_is_not_started() {
 /// be known before they are started. A node of another role dials the
 /// addresses its peers hand it, which nothing read beforehand can show,
 /// so the harness makes none.
+/// The harness starts a node with no variable but one it knows not to
+/// change where the node dials: its look at that is at the file, and a
+/// variable could stand in place of what the file says.
+#[test]
+#[should_panic(expected = "may not be started with")]
+fn the_harness_starts_a_node_with_no_variable_it_does_not_know() {
+    let mut n = node("alone", "personal", None);
+    n.start_given(&[("CORDELIA_BOOTNODES", "relay.example:9474")]);
+}
+
 #[test]
 #[should_panic(expected = "does not run one")]
 fn the_harness_makes_no_node_whose_dialling_it_cannot_check() {
@@ -1133,18 +1160,279 @@ fn a_node_whose_dialling_cannot_be_checked_is_not_started() {
     n.start();
 }
 
+/// A command asks its own node directly, whatever proxy the environment
+/// names: a proxy is for the network, and a request to this machine
+/// carries the node's token. Here every proxy variable names something
+/// on this machine that counts who calls it and answers with a refusal.
+/// A client that takes the proxy is counted and refused; each command
+/// works, and none of them calls it.
+#[test]
+fn a_command_asks_its_own_node_and_no_proxy() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut n = node("alone", "personal", None);
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+        }
+    });
+    // What stands in for a proxy does count a caller, and does refuse
+    // one: a client told to use it, asking the node what a command asks,
+    // is counted, and gets nothing.
+    let through: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(Some(ureq::Proxy::new(&proxy).unwrap()))
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let asked = through
+        .get(&format!("http://127.0.0.1:{}/api/v1/status", n.http))
+        .header("Authorization", &format!("Bearer {}", n.token()))
+        .call();
+    assert!(asked.is_err(), "the stand-in passed a request on");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The harness passes a command no proxy of the caller's, and nothing
+    // of theirs that excepts this machine from one. Here it is given
+    // every name the client reads a proxy from, and an empty list of
+    // exceptions.
+    let named = [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ];
+    let mut given = named.map(|name| (name, proxy.as_str())).to_vec();
+    given.extend([("NO_PROXY", ""), ("no_proxy", "")]);
+    let run = |args: &[&str]| {
+        let mut command = n.command_for(&given, args);
+        // The command has them: the test is not passing for want of them.
+        for (name, value) in &given {
+            let set = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value);
+            assert_eq!(set, Some(std::ffi::OsStr::new(value)), "{name}");
+        }
+        command.output().unwrap()
+    };
+    // One that reads, one that posts, and the one that does both.
+    for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "cordelia {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cordelia {args:?}");
+    }
+    // The answers came from the node: its own key is in what it lists,
+    // and `status`, which succeeds whether or not it reached a node, says
+    // that it did.
+    let listed = String::from_utf8_lossy(&run(&["devices"]).stdout).into_owned();
+    assert!(listed.contains("this device"), "{listed}");
+    let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
+    assert!(status.contains("Running:   yes"), "{status}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A command asks the node at one of the two addresses that the node's
+/// API may have, and at no other: its request carries the node's token.
+/// With the API's address set to another (an address, or a name), a
+/// command that reads and one that posts each say why they do not ask,
+/// every form of `status` says that the node was not asked (not that it
+/// is stopped), and the node itself does not start, and says the same.
+///
+/// (Neither value leaves this machine, so nothing does with a refusal
+/// taken out either: `127.0.0.2` is another address of the machine on
+/// Linux, and elsewhere traffic to it stays on the machine; `localhost`
+/// is the machine's name for itself.)
+#[test]
+fn a_command_asks_no_address_but_the_nodes_own() {
+    let mut n = node("idle", "personal", None);
+    for other in ["127.0.0.2", "localhost"] {
+        let given = [("CORDELIA_BIND_ADDRESS", other)];
+        let named = format!("'{other}'");
+        for args in [&["peers", "--json"][..], &["devices"]] {
+            let out = n.command_given(&given, args);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "cordelia {args:?}");
+            assert!(
+                said.contains(&named) && said.contains("nowhere else"),
+                "cordelia {args:?}: {said}"
+            );
+        }
+        let out = n.command_given(&given, &["status"]);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("Running:   not asked") && said.contains(&named),
+            "{said}"
+        );
+        assert!(!said.contains("cordelia start"), "{said}");
+        // The forms that a bar and a panel read say it too.
+        let out = n.command_given(&given, &["status", "--line"]);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("not asked") && !said.contains("stopped"),
+            "{said}"
+        );
+        let out = n.command_given(&given, &["status", "--json"]);
+        let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(said["state"], "attention", "{said}");
+        let summary = said["summary"].as_str().unwrap();
+        assert!(summary.contains("not asked"), "{said}");
+
+        // The node holds itself to the same: it does not start there, and
+        // says which address, and where it is set.
+        n.start_given(&given);
+        let mut child = n.child.take().unwrap();
+        let told = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if told.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("a node started at {other}:\n{}", n.log_tail());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!status.success());
+        let log = std::fs::read_to_string(n.log()).unwrap();
+        assert!(
+            log.contains(&named) && log.contains("CORDELIA_BIND_ADDRESS"),
+            "{log}"
+        );
+    }
+}
+
+/// A node whose API address is `::1` listens there and nowhere else, and
+/// a command reaches it there: the address is written in brackets before
+/// a port, by the node and by a command alike. (On a machine with no
+/// `::1` to listen on the test says so and shows nothing.)
+#[test]
+fn a_node_at_the_ipv6_address_is_reached_there() {
+    if let Err(e) = std::net::TcpListener::bind("[::1]:0") {
+        eprintln!("not run: this machine has no [::1] to listen on ({e})");
+        return;
+    }
+    let mut n = node("six", "personal", None);
+    let given = [("CORDELIA_BIND_ADDRESS", "::1")];
+    n.start_given(&given);
+    let running = || {
+        let out = n.command_given(&given, &["status"]);
+        let said = String::from_utf8_lossy(&out.stdout);
+        said.contains("Running:   yes").then_some(())
+    };
+    wait_for("the node to answer at ::1", &[&n], 30, running);
+    let out = n.command_given(&given, &["devices"]);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && listed.contains("this device"),
+        "{listed}"
+    );
+
+    // There, as the node says when it starts, and not at the other.
+    let log = std::fs::read_to_string(n.log()).unwrap();
+    assert!(log.contains(&format!("http://[::1]:{}/", n.http)), "{log}");
+    assert!(healthy(&n).is_none(), "the node answers at 127.0.0.1 too");
+    n.stop();
+}
+
+/// Read a request's head from `stream` and answer it with `head` (a
+/// status line and any header lines) and `body`, as JSON.
+fn answer(stream: &mut std::net::TcpStream, head: &str, body: &str) {
+    use std::io::{Read, Write};
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    while !seen.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+        seen.push(byte[0]);
+    }
+    let _ = stream.write_all(
+        format!(
+            "{head}content-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
+}
+
+/// A command follows no redirect, and reads none as the node's answer:
+/// the node's API sends none, and a request carries the node's token.
+/// Here what listens at the node's port answers every request with a
+/// redirect to another listener, which counts who calls it, and with what
+/// a node's status would be. A client that follows redirects is counted
+/// there. A command is not, and does not take the answer for the node's.
+#[test]
+fn a_command_follows_no_redirect() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = node("idle", "personal", None);
+    let status = r#"{"version":"0.0.0","uptime_secs":1}"#;
+
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let there = target.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    std::thread::spawn(move || {
+        for mut stream in target.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            answer(&mut stream, "HTTP/1.1 200 OK\r\n", status);
+        }
+    });
+    let stand_in = std::net::TcpListener::bind(("127.0.0.1", n.http)).unwrap();
+    let redirect = format!("HTTP/1.1 302 Found\r\nlocation: http://{there}/api/v1/status\r\n");
+    std::thread::spawn(move || {
+        for mut stream in stand_in.incoming().flatten() {
+            answer(&mut stream, &redirect, status);
+        }
+    });
+    // What stands in for the node does send a client on, and what it
+    // sends it to does count it: a client that follows redirects, asking
+    // what a command asks, gets its answer there.
+    let follows: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let asked = follows
+        .get(&format!("http://127.0.0.1:{}/api/v1/status", n.http))
+        .call();
+    assert!(asked.is_ok_and(|answer| answer.status() == 200));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // `status` succeeds whether or not it reached a node, and does not
+    // say that it reached one.
+    let out = n.command(&["status"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("Running:   no"), "{said}");
+    // One that reads, and one that posts: each fails.
+    for args in [&["peers", "--json"][..], &["devices"]] {
+        let out = n.command(args);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "cordelia {args:?}: {said}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
-    let out = Command::new(BIN)
-        .arg("--config")
-        .arg(n.config())
-        .args(["devices"])
-        .env("CORDELIA_DATA_DIR", n.data_dir())
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = n.refused(&["devices"]);
     assert!(stderr.contains("cordelia start"), "{stderr}");
 
     // `status` still works, and says the node is not running.
@@ -1156,7 +1444,9 @@ fn cli_reports_when_the_node_is_not_running() {
     assert_eq!(json["state"], "stopped", "{json}");
 
     // On a machine without Cordelia (an empty home directory), the status
-    // line prints nothing.
+    // line prints nothing. (Built by hand: the harness would give it this
+    // node's configuration and home. It finds no identity, so it asks
+    // nothing of any node, whatever else the caller's environment says.)
     let empty_home = tempfile::tempdir().unwrap();
     let none = Command::new(BIN)
         .args(["status", "--line"])

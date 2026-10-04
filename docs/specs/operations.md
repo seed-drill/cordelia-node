@@ -427,7 +427,7 @@ token_path = "~/.cordelia/node-token"  # Bearer token file
 
 ### 5.2 Environment Variables
 
-Environment variables override config.toml values. Prefix: `CORDELIA_`.
+Environment variables override config.toml values. Prefix: `CORDELIA_`, but for `RUST_LOG`, which is the node's log filter in place of `logging.level` where it is set to one that can be read.
 
 | Variable | Overrides | Example |
 |----------|-----------|---------|
@@ -436,9 +436,10 @@ Environment variables override config.toml values. Prefix: `CORDELIA_`.
 | `CORDELIA_DATA_DIR` | `node.data_dir` | `/data/cordelia` |
 | `CORDELIA_LOG_LEVEL` | `logging.level` | `debug` |
 | `CORDELIA_LOG_FORMAT` | `logging.format` | `json` |
-| `CORDELIA_BOOTNODES` | `network.bootnodes` | `host1:9474,host2:9474` |
+| `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` |
-| `CORDELIA_MAX_STORAGE` | `node.max_storage_bytes` | `1073741824` |
+
+No variable sets the relays or the role (configuration.md SS4.1).
 
 ### 5.3 Precedence Order
 
@@ -450,7 +451,7 @@ CLI flags  >  Environment variables  >  config.toml  >  Compiled defaults
 
 ### 5.4 Security Constraints
 
-- `api.bind_address` MUST resolve to a loopback interface (127.0.0.1, ::1). If a non-loopback address is configured, the node MUST log a CRITICAL error and refuse to start. This is a hard security boundary (network-protocol.md §12.2).
+- `api.bind_address` MUST be `127.0.0.1` or `::1` (configuration.md SS2.9). With any other value the node refuses to start, and says why. This is a hard security boundary (network-protocol.md §12.2).
 - Key files (`~/.cordelia/identity.key`, `~/.cordelia/node-token`, `~/.cordelia/channel-keys/*.key`) MUST have mode 0600. The node MUST warn on startup if permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0).
 
 ---
@@ -767,7 +768,7 @@ cordelia start
 |---------|-------------|------------|
 | `Error: address already in use` | Another process on port 9473/9474 | `lsof -i :9473` to find process. Stop it or change port in config.toml |
 | `Error: permission denied on key file` | Key file permissions too restrictive | `chmod 0600 ~/.cordelia/identity.key` |
-| `Error: non-loopback bind address` | `api.bind_address` set to non-127.0.0.1 | Fix config.toml. This is a security constraint, not a bug |
+| `Error: the node's API address is set to '...'` | `api.bind_address`, or `CORDELIA_BIND_ADDRESS`, is neither `127.0.0.1` nor `::1` | Set it to one of the two. This is a security constraint, not a bug |
 | `Error: database locked` | Stale lock from crashed process | Remove `~/.cordelia/cordelia.db-wal` and `cordelia.db-shm`, restart |
 | `Error: config parse error` | Invalid TOML | Check `config.toml` syntax. Run `cordelia init` to regenerate |
 
