@@ -889,6 +889,50 @@ fn a_personal_node_listens_on_nothing() {
     assert!(a.log_tail().contains("P2P transport"), "{}", a.log_tail());
 }
 
+/// No test node dials the default relays, which are real and public: a
+/// node that reached them from a test would be counted there as
+/// somebody's device, and would leave its channels behind. A personal node
+/// that is configured with no relay does dial them, so the harness never
+/// leaves one with none: a test that gives a node no relay gets a node
+/// whose one relay is an address on this machine where nothing listens.
+#[test]
+fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
+    let mut n = node("alone", "personal", None);
+    // Looked at before the node is started: one that did have the default
+    // relays is not to be run to show it.
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    let dialled = format!("[[network.bootnodes]]\naddr = \"{NOWHERE}\"");
+    assert_eq!(
+        config.matches("[[network.bootnodes]]").count(),
+        1,
+        "{config}"
+    );
+    assert!(config.contains(&dialled), "{config}");
+    for public in cordelia_core::protocol::FALLBACK_PEERS {
+        let host = public.rsplit_once(':').unwrap().0;
+        assert!(!config.contains(host), "{config}");
+    }
+
+    // And the node says the same of itself: its one relay is that address.
+    n.start();
+    wait_for("node healthy", &[&n], 30, || healthy(&n));
+    // (It lists its relays once its network loop has begun.)
+    let hosts = wait_for("the node lists its relays", &[&n], 30, || {
+        let hosts: Vec<String> = relays_of(&n)
+            .iter()
+            .filter_map(|relay| relay["host"].as_str().map(String::from))
+            .collect();
+        (!hosts.is_empty()).then_some(hosts)
+    });
+    assert_eq!(hosts, [NOWHERE]);
+    n.stop();
+
+    // A relay that is given none dials nothing, and is left with none.
+    let relay = node("relay", "relay", None);
+    let config = std::fs::read_to_string(relay.config()).unwrap();
+    assert!(!config.contains("[[network.bootnodes]]"), "{config}");
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);

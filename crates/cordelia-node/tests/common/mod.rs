@@ -49,6 +49,7 @@ impl Node {
     /// Add a relay to this node's configuration: where to dial and, if
     /// given, the key that must answer there. For before the node starts.
     pub fn add_relay(&self, addr: &str, key: Option<&str>) {
+        assert_on_this_machine(self.name, addr);
         let key = key.map(|k| format!("key = \"{k}\"\n")).unwrap_or_default();
         let mut config = std::fs::read_to_string(self.config()).unwrap();
         config.push_str(&format!(
@@ -285,12 +286,47 @@ pub fn free_port() -> u16 {
     }
 }
 
+/// A node whose one relay is the one on this machine at `relay_p2p`, or
+/// that has no relay at all ([`NOWHERE`]).
 pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
     node_with_bootnode(
         name,
         role,
         relay_p2p.map(|port| format!("127.0.0.1:{port}")),
     )
+}
+
+/// The one address a personal node is given where a test gives it no
+/// relay: this machine, at a port where nothing listens.
+///
+/// A personal node that is configured with no relay dials the default
+/// ones, and those are real and public. A test node that reached them
+/// would be counted there as somebody's device, and would leave its
+/// channels behind. So no test node is ever left with none.
+pub const NOWHERE: &str = "127.0.0.1:9";
+
+/// A test node dials nothing that is not on this machine, whatever a test
+/// gives it.
+fn assert_on_this_machine(name: &str, addr: &str) {
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    let here = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    assert!(
+        here,
+        "the test node {name} would dial {addr}, which is not on this machine"
+    );
+}
+
+/// The relays a node is configured with: those it is given, or
+/// [`NOWHERE`] for a personal node that is given none. (A relay that is
+/// given none dials nothing, and is left with none.)
+fn relays_for(role: &str, relays: &[(String, Option<String>)]) -> Vec<(String, Option<String>)> {
+    if relays.is_empty() && role != "relay" {
+        return vec![(NOWHERE.to_string(), None)];
+    }
+    relays.to_vec()
 }
 
 /// A node whose one bootnode is `bootnode` (`host:port`; a name, like the
@@ -318,6 +354,10 @@ pub fn node_with_relays(
     let mut p2p = free_port();
     while p2p == http {
         p2p = free_port();
+    }
+    let relays = relays_for(role, relays);
+    for (addr, _) in &relays {
+        assert_on_this_machine(name, addr);
     }
     let bootnodes: String = relays
         .iter()
