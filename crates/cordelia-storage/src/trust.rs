@@ -159,9 +159,9 @@ mod tests {
         let key = [0x07u8; 32];
 
         assert!(!is_trusted(&conn, &key).unwrap());
-        trust(&conn, &key, TrustKind::Device, Some("imac")).unwrap();
+        trust(&conn, &key, TrustKind::Device, Some("desktop")).unwrap();
         assert!(is_trusted(&conn, &key).unwrap());
-        assert_eq!(label(&conn, &key).unwrap().as_deref(), Some("imac"));
+        assert_eq!(label(&conn, &key).unwrap().as_deref(), Some("desktop"));
 
         assert!(revoke(&conn, &key).unwrap());
         assert!(!is_trusted(&conn, &key).unwrap());
@@ -170,7 +170,7 @@ mod tests {
         // Re-trusting clears the revocation and keeps the old label.
         trust(&conn, &key, TrustKind::Device, None).unwrap();
         assert!(is_trusted(&conn, &key).unwrap());
-        assert_eq!(label(&conn, &key).unwrap().as_deref(), Some("imac"));
+        assert_eq!(label(&conn, &key).unwrap().as_deref(), Some("desktop"));
 
         let all = list(&conn).unwrap();
         assert_eq!(all.len(), 1);

@@ -29,6 +29,13 @@ pub const SYNC_CLAUDE_EXCLUDE: &str = "sync.claude.exclude";
 /// `"off"` when this device does not sync home-folder memory.
 pub const SYNC_CLAUDE_HOME: &str = "sync.claude.home";
 
+/// The name home memory syncs under on this device, or last did: the name
+/// the home directory is or was mapped under, or `~` where it was found
+/// and not mapped. It is written when home starts to sync under a name,
+/// and kept when home memory is turned off or unmapped, so that turning it
+/// on again maps it under the same name, into the same channel.
+pub const SYNC_CLAUDE_HOME_NAME: &str = "sync.claude.home_name";
+
 /// `"on"` when everything found syncs (home and git projects, now and
 /// later); `"off"` when only declared mappings sync.
 pub const SYNC_CLAUDE_ALL: &str = "sync.claude.all";

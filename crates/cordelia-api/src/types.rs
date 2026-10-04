@@ -512,9 +512,11 @@ pub struct SyncMapping {
 pub struct SyncMapRequest {
     /// The working directory, absolute.
     pub folder: String,
-    /// The name to sync under; `~` for home memory.
+    /// The name to sync under. For the home directory it is `~` unless
+    /// another is given.
     pub name: String,
-    /// Required to map the home directory itself.
+    /// Required to map the home directory itself, and refused for any
+    /// other folder: a slip must not sync a whole home under some name.
     #[serde(default)]
     pub home: bool,
 }
@@ -536,6 +538,11 @@ pub struct SyncStatusResponse {
     /// (absolute paths) that were unmapped.
     pub exclude: Vec<String>,
     pub home: bool,
+    /// The name home memory syncs under on this device, or last did: the
+    /// name the home directory is or was mapped under, or `~` where it was
+    /// found and not mapped. Turning home memory on again uses it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_name: Option<String>,
     /// How many times the settings have changed since the node started.
     /// The report carries the generation it was made under.
     pub generation: u64,

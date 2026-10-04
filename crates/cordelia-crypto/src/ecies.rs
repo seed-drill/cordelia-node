@@ -148,6 +148,13 @@ fn ecies_seal(
     let recipient = PublicKey::from(*recipient_pk);
 
     let shared = eph_secret.diffie_hellman(&recipient);
+    // A key of small order (all zero among them) gives the same secret to
+    // everyone. Sealing under it would seal to nobody in particular.
+    if !shared.was_contributory() {
+        return Err(CryptoError::EncryptionFailed(
+            "the recipient's key gives no secret of its own".into(),
+        ));
+    }
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
 
@@ -183,6 +190,14 @@ pub fn ecies_decrypt(
     let eph_pk = PublicKey::from(envelope.ephemeral_pk);
 
     let shared = secret.diffie_hellman(&eph_pk);
+    // An envelope whose ephemeral key is of small order was sealed under a
+    // secret that is the same for every recipient: it would open for any
+    // of them, so it is not an envelope for this one.
+    if !shared.was_contributory() {
+        return Err(CryptoError::InvalidMessage(
+            "the envelope was sealed under a secret that anyone can work out".into(),
+        ));
+    }
 
     let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
 
@@ -207,6 +222,68 @@ pub fn ecies_decrypt(
 mod tests {
     use super::*;
     use crate::identity::x25519_from_ed25519_seed;
+
+    /// T20. A secret agreed with a key of small order is the same for
+    /// everyone: all zero. Nothing is sealed under it, and an envelope that
+    /// was sealed under it is not opened.
+    #[test]
+    fn a_secret_anyone_can_work_out_seals_and_opens_nothing() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let mut small: Vec<[u8; 32]> = EIGHT_TORSION
+            .iter()
+            .map(|point| point.to_montgomery().to_bytes())
+            .collect();
+        small.push([0u8; 32]);
+        for key in &small {
+            assert!(
+                ecies_encrypt(key, b"a channel's key").is_err(),
+                "{key:02x?}"
+            );
+        }
+
+        // An envelope made by hand under a given secret, as someone would
+        // who holds no key at all.
+        let sealed_under = |secret: &[u8; 32], ephemeral_pk: [u8; 32]| {
+            let iv = [7u8; IV_LEN];
+            let wrapping_key = hkdf_sha256(secret, &[], HKDF_INFO).unwrap();
+            let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &wrapping_key).unwrap());
+            let mut in_out = b"made by hand".to_vec();
+            key.seal_in_place_append_tag(
+                Nonce::try_assume_unique_for_key(&iv).unwrap(),
+                Aad::empty(),
+                &mut in_out,
+            )
+            .unwrap();
+            let tag_start = in_out.len() - TAG_LEN;
+            EciesEnvelope {
+                ephemeral_pk,
+                iv,
+                ciphertext: in_out[..tag_start].to_vec(),
+                auth_tag: in_out[tag_start..].try_into().unwrap(),
+            }
+        };
+        // With an ephemeral key of small order the secret is all zero for
+        // whoever opens it. Without the check, every recipient would.
+        let forged = sealed_under(&[0u8; 32], [0u8; 32]);
+        for seed in [[1u8; 32], [2u8; 32]] {
+            let (recipient_sk, recipient_pk) = x25519_from_ed25519_seed(&seed);
+            assert!(matches!(
+                ecies_decrypt(&recipient_sk, &forged),
+                Err(CryptoError::InvalidMessage(_))
+            ));
+            // The control: made the same way under a secret that is this
+            // recipient's alone, the envelope opens. So the one above is
+            // refused for its secret, and not for how it was made.
+            let ephemeral = StaticSecret::from([9u8; 32]);
+            let secret = ephemeral.diffie_hellman(&PublicKey::from(recipient_pk));
+            let real = sealed_under(secret.as_bytes(), PublicKey::from(&ephemeral).to_bytes());
+            assert_eq!(
+                ecies_decrypt(&recipient_sk, &real).unwrap(),
+                b"made by hand"
+            );
+        }
+    }
 
     #[test]
     fn test_hkdf_sha256_tv() {

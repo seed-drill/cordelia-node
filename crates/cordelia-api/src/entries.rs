@@ -8,7 +8,9 @@
 //! under the key version they claim, and name a key that maps back to the
 //! slot; the highest revision wins, ties going to the higher content hash.
 //! Other items at the winning revision are concurrent edits, returned as
-//! conflicts so no one's change is silently lost.
+//! conflicts. An item at a lower revision is not returned, though it too
+//! may have been written without sight of the winner (decision
+//! 2026-09-30 §9).
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -242,44 +244,44 @@ pub fn decrypt(state: &AppState, channel_key_version: i64, item: &StoredItem) ->
     serde_json::from_slice(&plaintext).ok()
 }
 
-/// Each key's current value in `channel_id` (§4.3 resolution), sorted by key.
-pub fn current(
-    state: &AppState,
-    db: &Connection,
-    channel_id: &str,
-) -> Result<Vec<Entry>, CordeliaError> {
-    let pk = state.identity.public_key();
-    if !channels::is_member(db, channel_id, &pk)? {
-        return Err(CordeliaError::NotAuthorised {
-            context: "not a member of this channel".into(),
-        });
-    }
-    let channel = channels::get_by_id(db, channel_id)?;
-    let slot_key = slot_key(state, channel_id)?;
-    let members = channels::list_active_member_keys(db, channel_id)?;
+/// What a reader needs to tell which stored items of a channel count.
+struct Reading<'a> {
+    state: &'a AppState,
+    key_version: i64,
+    slot_key: [u8; 32],
+    members: Vec<[u8; 32]>,
+}
 
-    // slot -> (key, versions)
-    let mut slots: std::collections::BTreeMap<Vec<u8>, (String, Vec<Version>)> =
-        std::collections::BTreeMap::new();
-    for item in items::slotted_items(db, channel_id)? {
-        let (Some(slot), Some(rev)) = (&item.slot, item.rev) else {
-            continue;
-        };
-        let Ok(author) = <[u8; 32]>::try_from(item.author_id.as_slice()) else {
-            continue;
-        };
-        if !members.contains(&author) || !verify_item_signature(&item) {
-            continue;
+impl<'a> Reading<'a> {
+    fn of(state: &'a AppState, db: &Connection, channel_id: &str) -> Result<Self, CordeliaError> {
+        let pk = state.identity.public_key();
+        if !channels::is_member(db, channel_id, &pk)? {
+            return Err(CordeliaError::NotAuthorised {
+                context: "not a member of this channel".into(),
+            });
         }
-        let Some(envelope) = decrypt(state, channel.key_version, &item) else {
-            continue;
-        };
-        let Some(key) = envelope.get("key").and_then(Value::as_str) else {
-            continue;
-        };
+        Ok(Self {
+            state,
+            key_version: channels::get_by_id(db, channel_id)?.key_version,
+            slot_key: slot_key(state, channel_id)?,
+            members: channels::list_active_member_keys(db, channel_id)?,
+        })
+    }
+
+    /// `item` as a version of the key it names, if it counts: it is signed
+    /// by an active member, decrypts under the key version it claims, and
+    /// names a key that maps back to the slot it is stored under.
+    fn version(&self, item: &StoredItem) -> Option<(Vec<u8>, String, Version)> {
+        let (slot, rev) = (item.slot.as_ref()?, item.rev?);
+        let author = <[u8; 32]>::try_from(item.author_id.as_slice()).ok()?;
+        if !self.members.contains(&author) || !verify_item_signature(item) {
+            return None;
+        }
+        let envelope = decrypt(self.state, self.key_version, item)?;
+        let key = envelope.get("key").and_then(Value::as_str)?;
         // The key inside must map back to the slot it was stored under.
-        if slot_id(&slot_key, key).as_slice() != slot.as_slice() {
-            continue;
+        if slot_id(&self.slot_key, key).as_slice() != slot.as_slice() {
+            return None;
         }
         let version = Version {
             item_id: item.item_id.clone(),
@@ -292,32 +294,74 @@ pub fn current(
             item_type: item.item_type.clone(),
             content_hash: item.content_hash.clone(),
         };
+        Some((slot.clone(), key.to_string(), version))
+    }
+}
+
+/// The current value among the versions of one key, with any concurrent
+/// ones: highest revision first, ties to the higher content hash.
+/// `versions` is not empty.
+fn resolve(key: String, mut versions: Vec<Version>) -> Entry {
+    versions.sort_by(|a, b| (b.rev, &b.content_hash).cmp(&(a.rev, &a.content_hash)));
+    let current = versions.remove(0);
+    let conflicts = versions
+        .into_iter()
+        .filter(|v| v.rev == current.rev)
+        .collect();
+    Entry {
+        key,
+        current,
+        conflicts,
+    }
+}
+
+/// Each key's current value in `channel_id` (§4.3 resolution), sorted by key.
+pub fn current(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+) -> Result<Vec<Entry>, CordeliaError> {
+    let reading = Reading::of(state, db, channel_id)?;
+
+    // slot -> (key, versions)
+    let mut slots: std::collections::BTreeMap<Vec<u8>, (String, Vec<Version>)> =
+        std::collections::BTreeMap::new();
+    for item in items::slotted_items(db, channel_id)? {
+        let Some((slot, key, version)) = reading.version(&item) else {
+            continue;
+        };
         slots
-            .entry(slot.clone())
-            .or_insert_with(|| (key.to_string(), Vec::new()))
+            .entry(slot)
+            .or_insert_with(|| (key, Vec::new()))
             .1
             .push(version);
     }
 
     let mut entries: Vec<Entry> = slots
         .into_values()
-        .map(|(key, mut versions)| {
-            // Highest revision first; ties to the higher content hash.
-            versions.sort_by(|a, b| (b.rev, &b.content_hash).cmp(&(a.rev, &a.content_hash)));
-            let current = versions.remove(0);
-            let conflicts = versions
-                .into_iter()
-                .filter(|v| v.rev == current.rev)
-                .collect();
-            Entry {
-                key,
-                current,
-                conflicts,
-            }
-        })
+        .map(|(key, versions)| resolve(key, versions))
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(entries)
+}
+
+/// The current value of one key in `channel_id`, resolved as [`current`]
+/// resolves every key, reading that key's slot and no other. `None` when
+/// nothing that counts is stored for it.
+pub fn current_of(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    key: &str,
+) -> Result<Option<Entry>, CordeliaError> {
+    let reading = Reading::of(state, db, channel_id)?;
+    let slot = slot_id(&reading.slot_key, key);
+    let versions: Vec<Version> = items::slot_items(db, channel_id, &slot)?
+        .iter()
+        .filter_map(|item| reading.version(item))
+        .map(|(_, _, version)| version)
+        .collect();
+    Ok((!versions.is_empty()).then(|| resolve(key.to_string(), versions)))
 }
 
 /// Publish again, under this device's name, every key in `channel_id` whose

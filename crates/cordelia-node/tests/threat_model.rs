@@ -882,6 +882,107 @@ async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices(
     assert_eq!(held_by(&mut b), 0, "b stored what a stranger wrote");
 }
 
+/// T20. A key that is no device's key, stored as one of this person's
+/// devices by a version that did not refuse them, is taken off the list
+/// when the node starts, and the log says so. No channel's key is changed
+/// on its account, by the node or by `remove-device`: removing such a key
+/// is refused, and no command shows anything about it afterwards.
+#[test]
+fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
+    use cordelia_storage::{channels, db, trust};
+
+    let mut a = node("a", "personal", None);
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    // A second device, so that there is a personal channel. It never runs.
+    let b = node("b", "personal", None);
+    let b_key = b.cli(&["id"]).trim().to_string();
+    a.cli(&["add-device", &b_key, "--name", "laptop"]);
+    let personal = groups(&a).into_iter().next().expect("a personal channel");
+    a.stop();
+
+    // The identity of the curve: a point of small order.
+    let mut nobody = [0u8; 32];
+    nobody[0] = 1;
+    let listed_as = cordelia_crypto::bech32::encode_public_key(&nobody).unwrap();
+    let database = a.data_dir().join("cordelia.db");
+    let version_before = {
+        let conn = db::open(&database).unwrap();
+        channels::add_member(&conn, &personal, &nobody, "owner").unwrap();
+        let kind = trust::TrustKind::Device;
+        trust::trust(&conn, &nobody, kind, Some("stored before")).unwrap();
+        channels::get_by_id(&conn, &personal).unwrap().key_version
+    };
+    // What the node holds for the key and the channel, read while it is
+    // stopped: whether the key is a member, and the channel's key version.
+    let held = || -> (bool, i64) {
+        let conn = db::open(&database).unwrap();
+        assert!(!trust::is_trusted(&conn, &nobody).unwrap());
+        (
+            channels::is_member(&conn, &personal, &nobody).unwrap(),
+            channels::get_by_id(&conn, &personal).unwrap().key_version,
+        )
+    };
+    let taken_off = "a key that is no device's was stored among this person's devices";
+
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    // The devices are the real ones, and nothing else is said of the key:
+    // not where the person looks at their devices, and not in the status
+    // that panels read.
+    let devices = a.post("/api/v1/devices/list", serde_json::json!({}));
+    let keys: Vec<&str> = devices["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["key"].as_str())
+        .collect();
+    assert!(keys.contains(&b_key.as_str()), "{devices}");
+    assert!(!keys.contains(&listed_as.as_str()), "{devices}");
+    assert!(devices["not_devices"].is_null(), "{devices}");
+    let status = a.cli(&["status", "--json"]);
+    assert!(!status.contains(&listed_as), "{status}");
+    let said = a.cli(&["devices"]);
+    assert!(!said.contains(&listed_as), "{said}");
+    // The log says what was done, that the channels keep their keys, and
+    // which channels, by name: no command shows them afterwards.
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    let said: Vec<&str> = log.lines().filter(|l| l.contains(taken_off)).collect();
+    assert_eq!(said.len(), 1, "{log}");
+    assert!(
+        said[0].contains("The channels that listed it keep the keys they had")
+            && said[0].contains(&format!("personal ({personal})"))
+            && said[0].contains(&listed_as),
+        "{log}"
+    );
+    // Taken off, and no key changed.
+    a.stop();
+    assert_eq!(held(), (false, version_before));
+
+    // At the next start (a log of its own) there is nothing to take off.
+    // Removing the key is refused, and changes nothing.
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(!log.contains(taken_off), "{log}");
+    let said = a.refused(&["remove-device", &listed_as]);
+    assert!(
+        said.contains("not a usable public key, so it is no device's key")
+            && said.contains("nothing is removed")
+            && said.contains("The channels that listed it keep their keys"),
+        "{said}"
+    );
+
+    // A real device is removed as it always was.
+    let said = a.cli(&["remove-device", &b_key]);
+    assert!(
+        said.contains("from 1 channel and rotated its key"),
+        "{said}"
+    );
+    a.stop();
+    assert_eq!(held(), (false, version_before + 1));
+}
+
 /// T16. A device is removed. What it last wrote is still in the channel
 /// for the device that removed it and for one added afterwards: a file it
 /// edited keeps its edit, a file it created is there, and a file it deleted
