@@ -1,10 +1,11 @@
 //! Merging `MEMORY.md`, the index Claude Code keeps of its memory files.
 //!
 //! The index is a list of one-line pointers (`- [Title](file.md) — hook`),
-//! so two devices' concurrent edits merge by taking the union of lines
+//! so where the plan merges two devices' edits it takes the union of lines
 //! rather than one side winning: the current version's lines in order, then
 //! any lines only this device had, minus lines pointing at deleted files
-//! (decision 2026-09-30-agent-memory-sync §4.5).
+//! (decision 2026-09-30-agent-memory-sync §4.5; §9 says where the plan
+//! does not merge).
 
 use std::collections::HashSet;
 

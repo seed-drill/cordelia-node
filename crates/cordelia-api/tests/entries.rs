@@ -641,3 +641,105 @@ fn deleting_a_key_replicates_and_a_later_write_revives_it() {
         vec![("notes.md".into(), "recreated".into(), 3, 0)]
     );
 }
+
+/// One name's value is read as the channel's values are: by the same
+/// rules, from that name's slot and no other. The sync adapter plans from
+/// the one and checks against the other before it publishes, so the two
+/// must agree on every name.
+#[test]
+fn one_names_value_is_read_as_the_channels_are() {
+    let (a, b, ch) = paired();
+    let slot_key = psk::read_slot_key(&a.state.home_dir, &ch).unwrap();
+    let channel_key = psk::read_psk(&a.state.home_dir, &ch).unwrap();
+    let stranger = NodeIdentity::generate().unwrap();
+
+    // A value on its own; one written by both devices at the same
+    // revision; one that is deleted.
+    a.write(&ch, "plain.md", "one");
+    a.write(&ch, "tied.md", "from a");
+    b.write(&ch, "tied.md", "from b");
+    a.write(&ch, "deleted.md", "x");
+    delete(&a, &ch, "deleted.md");
+    relay(&b, &a, &ch);
+    // Beside a value, and at higher revisions: an entry from someone who
+    // is no member, and a member's entry that names another file.
+    let plain = slot_id(&slot_key, "plain.md");
+    let inside = |key: &str| json!({ "key": key, "content": { "text": "not this" } });
+    inject(
+        &a,
+        &stranger,
+        &ch,
+        plain,
+        99,
+        channel_key,
+        inside("plain.md"),
+    );
+    inject(
+        &a,
+        &b.state.identity,
+        &ch,
+        plain,
+        50,
+        channel_key,
+        inside("other.md"),
+    );
+    // A name that holds only what does not count.
+    let strangers = slot_id(&slot_key, "strangers.md");
+    inject(
+        &a,
+        &stranger,
+        &ch,
+        strangers,
+        7,
+        channel_key,
+        inside("strangers.md"),
+    );
+
+    let db = a.state.db.lock().unwrap();
+    // What is told of an entry: its name, the entry that counts, and the
+    // entries beside it at the same revision.
+    let told = |e: &entries::Entry| {
+        let beside: Vec<String> = e.conflicts.iter().map(|v| v.item_id.clone()).collect();
+        (
+            e.key.clone(),
+            e.current.item_id.clone(),
+            e.current.rev,
+            e.current.deleted,
+            beside,
+        )
+    };
+    let all = entries::current(&a.state, &db, &ch).unwrap();
+    let names: Vec<&str> = all.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(names, ["deleted.md", "plain.md", "tied.md"]);
+    for entry in &all {
+        let one = entries::current_of(&a.state, &db, &ch, &entry.key).unwrap();
+        assert_eq!(one.as_ref().map(told), Some(told(entry)), "{}", entry.key);
+    }
+    assert_eq!(all[1].current.rev, 1, "plain.md");
+    assert_eq!(all[2].conflicts.len(), 1, "tied.md");
+    for none in ["strangers.md", "other.md", "never-written.md"] {
+        let one = entries::current_of(&a.state, &db, &ch, none).unwrap();
+        assert!(one.is_none(), "{none}");
+    }
+
+    // Only a member reads either. An outsider that has the channel's row
+    // and its keys, and is on no list of members, is told so by both.
+    drop(db);
+    let outsider = node();
+    psk::write_slot_key(&outsider.state.home_dir, &ch, &slot_key).unwrap();
+    psk::write_psk(&outsider.state.home_dir, &ch, &channel_key).unwrap();
+    let theirs = outsider.state.db.lock().unwrap();
+    cordelia_storage::channels::ensure_group(&theirs, &ch, None, "realtime", &a.pk()).unwrap();
+    let not_a_member = |result: Result<(), cordelia_core::CordeliaError>| {
+        matches!(
+            result,
+            Err(cordelia_core::CordeliaError::NotAuthorised { .. })
+        )
+    };
+    assert!(not_a_member(
+        entries::current_of(&outsider.state, &theirs, &ch, "plain.md").map(|_| ())
+    ));
+    assert!(not_a_member(
+        entries::current(&outsider.state, &theirs, &ch).map(|_| ())
+    ));
+}
