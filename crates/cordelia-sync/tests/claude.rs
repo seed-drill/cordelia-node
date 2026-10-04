@@ -1548,7 +1548,7 @@ fn a_memory_folder_that_goes_missing_deletes_nothing() {
     std::fs::rename(&claude, &aside).unwrap();
     let (report, _) = settle_reporting(&mut a, &mut b);
     let error = report.folders[0].error.as_deref().expect("reported");
-    assert!(error.contains("Nothing was deleted"), "{error}");
+    assert!(error.contains("were not deleted"), "{error}");
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert_eq!(files(&b_mem), ["one.md", "two.md"], "B keeps everything");
     assert!(!claude.exists(), "and nothing is written in its place");
