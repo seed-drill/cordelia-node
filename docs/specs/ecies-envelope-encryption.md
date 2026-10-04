@@ -5,7 +5,7 @@
 **Date**: 2026-03-10
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Supersedes**: cordelia-core/docs/design/encryption-specification.md (pre-pivot, reference only)
-**References**: cordelia-core/docs/design/encryption-test-vectors.md (test vectors remain valid)
+**References**: `docs/reference/encryption-test-vectors.md` (test vectors remain valid)
 **Depends on**: specs/channel-naming.md (§4.2 system channels), specs/network-protocol.md (§4.4 Channel-Announce, §4.7 PSK-Exchange)
 
 > **v1 status (2026-09-30).** The primitives stand: key types (§2), Bech32
@@ -247,6 +247,13 @@ Inputs:
   recipient_xpk : X25519 public key (32 bytes)
   plaintext_psk : Channel PSK to wrap (32 bytes)
 
+A recipient known by an Ed25519 key has recipient_xpk derived from it
+(§2.2). There is none for bytes that are not a point on the curve, or for
+a point that is not of the order every real key has (one of the eight
+points of small order, the identity among them, or a real key with one of
+the other seven added), and nothing is sealed to any of them.
+`docs/reference/encryption-test-vectors.md` §1 has one of each.
+
 Steps:
   1. Generate ephemeral X25519 keypair:
        eph_sk = CSPRNG(32 bytes)
@@ -254,6 +261,8 @@ Steps:
 
   2. ECDH key agreement:
        shared_secret = X25519(eph_sk, recipient_xpk)    -- 32 bytes
+       If shared_secret is all zero: fail. The recipient's key is of
+       small order, and the secret would be the same for everyone.
 
   3. Key derivation (HKDF-SHA256):
        salt = 0x00 * 32                                  -- 32 zero bytes
@@ -278,6 +287,8 @@ Inputs:
 
 Steps:
   1. shared_secret = X25519(recipient_sk, eph_pk)
+     If shared_secret is all zero: reject. The envelope was sealed under
+     a secret anyone can work out.
   2. Derive wrapping_key (same HKDF as §4.2 step 3)
   3. plaintext_psk = AES-256-GCM-Decrypt(wrapping_key, iv, ct, tag, aad="")
   4. If tag verification fails: reject (authentication failure)
@@ -576,7 +587,7 @@ Bootnodes never receive items (discovery-only role). Malicious peers can observe
 
 ### 8.1 Ed25519 → X25519 Derivation
 
-Four test vectors are defined in `cordelia-core/docs/design/encryption-test-vectors.md` §1. They remain valid and authoritative for Phase 1.
+Four test vectors are defined in `docs/reference/encryption-test-vectors.md` §1. They remain valid and authoritative for Phase 1.
 
 Summary:
 1. RFC 8032 Section 7.1 seed
@@ -584,7 +595,7 @@ Summary:
 3. libsodium `ed25519_convert.c` seed
 4. ed2curve-js cross-verified seed
 
-Plus 3 invalid public key rejection cases.
+Plus 4 invalid public key rejection cases.
 
 ### 8.2 ECDH Shared Secret
 
@@ -750,7 +761,7 @@ Both Rust (`ciborium`) and TypeScript (`cbor-x`) MUST produce byte-identical out
 
 ### 8.7 Item Encryption (AES-256-GCM)
 
-Item encryption test vectors are defined in `cordelia-core/docs/design/encryption-test-vectors.md` §4 (full ECIES round-trip). The round-trip covers: Ed25519 → X25519 → ECDH → HKDF → AES-256-GCM encrypt → decrypt → verify.
+Item encryption test vectors are defined in `docs/reference/encryption-test-vectors.md` §4 (full ECIES round-trip). The round-trip covers: Ed25519 → X25519 → ECDH → HKDF → AES-256-GCM encrypt → decrypt → verify.
 
 For channel PSK encryption (the common case in Phase 1), the flow is simpler:
 ```
@@ -1127,7 +1138,7 @@ No outstanding TODOs. Spec ready for Martin's review and implementation.
 - **RFC 9052**: COSE (CBOR Object Signing and Encryption), COSE_Sign1 for Phase 3
 - **NIST SP 800-38D**: AES-GCM specification
 - **cordelia-core/docs/design/encryption-specification.md**: Pre-pivot encryption architecture (reference)
-- **cordelia-core/docs/design/encryption-test-vectors.md**: Cryptographic test vectors (authoritative, remains valid)
+- **docs/reference/encryption-test-vectors.md**: Cryptographic test vectors (authoritative, remains valid)
 - **decisions/2026-03-10-phase1-design-decisions.md**: Node encryption boundary, greenfield build
 - **decisions/2026-03-10-identity-privacy-model.md**: Identity stack, Bech32 key usage in examples
 - **decisions/2026-03-09-architecture-simplification.md**: Architecture pivot, channel encryption model
