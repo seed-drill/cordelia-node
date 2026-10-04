@@ -11,6 +11,10 @@
 //! one. Nothing here compares one author's entries with another's, so no
 //! author can hide or displace what another stored.
 //!
+//! The rule is in the statement that writes: a row is replaced only by a
+//! higher revision, whoever else is writing to the database. What became
+//! of an entry is read from what that statement did.
+//!
 //! [`store`] takes only an entry that passed the check
 //! ([`cordelia_crypto::entry::Entry::check`]), so nothing unchecked is
 //! stored. What is read from a slot is checked again as it is read, and
@@ -18,7 +22,7 @@
 //! handed out as it is stored ([`channel_entries_after`]): whoever
 //! receives it checks it.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::ENTRY_OVERHEAD_BYTES;
@@ -77,7 +81,51 @@ pub fn store(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcom
 
 fn stored(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, CordeliaError> {
     let rev = rev_to_sql(entry.rev);
-    let held: Option<i64> = conn
+    // One statement stores the entry or leaves what is held, by the
+    // store's own rule: a row from that author in that slot is replaced
+    // only by a higher revision. Nothing is read first and decided on, so
+    // no other writer can come between the reading and the writing. The
+    // entry's place is the next in this node's order.
+    let changed = conn
+        .execute(
+            "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                  author_sig, channel_sig, seq, stored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                     (SELECT value + 1 FROM counters WHERE name = 'entry_seq'), ?9)
+             ON CONFLICT(channel_id, slot, author) DO UPDATE SET
+                 rev = excluded.rev, is_delete = excluded.is_delete,
+                 content = excluded.content, author_sig = excluded.author_sig,
+                 channel_sig = excluded.channel_sig, seq = excluded.seq,
+                 stored_at = excluded.stored_at
+             WHERE excluded.rev > entries.rev",
+            params![
+                entry.channel.as_slice(),
+                entry.slot.as_slice(),
+                entry.author.as_slice(),
+                rev,
+                entry.delete,
+                entry.content,
+                entry.author_signature.as_slice(),
+                entry.channel_signature.as_slice(),
+                now,
+            ],
+        )
+        .map_err(storage)?;
+    if changed == 1 {
+        // The place is taken: the next entry that is stored has the next.
+        conn.execute(
+            "UPDATE counters SET value = value + 1 WHERE name = 'entry_seq'",
+            [],
+        )
+        .map_err(storage)?;
+        return Ok(Outcome::Stored);
+    }
+
+    // It was not stored: the store holds one from that author in that
+    // slot, at this revision or at a higher one. Which, is read from the
+    // row that the statement left, and that no other writer has changed
+    // since: the statement took the database for writing.
+    let held: i64 = conn
         .query_row(
             "SELECT rev FROM entries WHERE channel_id = ?1 AND slot = ?2 AND author = ?3",
             params![
@@ -87,45 +135,12 @@ fn stored(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, 
             ],
             |row| row.get(0),
         )
-        .optional()
         .map_err(storage)?;
-    match held {
-        Some(held) if held == rev => return Ok(Outcome::AlreadyHeld),
-        Some(held) if held > rev => return Ok(Outcome::OlderThanHeld),
-        _ => {}
-    }
-
-    let seq: i64 = conn
-        .query_row(
-            "UPDATE counters SET value = value + 1 WHERE name = 'entry_seq' RETURNING value",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    conn.execute(
-        "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
-                              author_sig, channel_sig, seq, stored_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(channel_id, slot, author) DO UPDATE SET
-             rev = excluded.rev, is_delete = excluded.is_delete,
-             content = excluded.content, author_sig = excluded.author_sig,
-             channel_sig = excluded.channel_sig, seq = excluded.seq,
-             stored_at = excluded.stored_at",
-        params![
-            entry.channel.as_slice(),
-            entry.slot.as_slice(),
-            entry.author.as_slice(),
-            rev,
-            entry.delete,
-            entry.content,
-            entry.author_signature.as_slice(),
-            entry.channel_signature.as_slice(),
-            seq,
-            now,
-        ],
-    )
-    .map_err(storage)?;
-    Ok(Outcome::Stored)
+    Ok(if held == rev {
+        Outcome::AlreadyHeld
+    } else {
+        Outcome::OlderThanHeld
+    })
 }
 
 /// Every entry that the store holds in one slot of a channel, in the
@@ -428,6 +443,161 @@ mod tests {
         assert_eq!(ids(&conn), [newer.id()]);
     }
 
+    /// Two connections on one database file, as a node and a command have.
+    /// A lower revision never takes the place of a higher, whichever is
+    /// written last and by whichever connection, and each writer is given
+    /// one of the three answers.
+    #[test]
+    fn test_a_lower_revision_never_takes_the_place_of_a_higher_whichever_writes_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let (one, other) = (db::open(&path).unwrap(), db::open(&path).unwrap());
+        let at = |rev: u64, name: &str| text(1, rev, name, &format!("at {rev}"));
+        // The revision that each connection reads in the slot of `name`.
+        let held_rev = |name: &str| -> u64 {
+            let revs: Vec<u64> = [&one, &other]
+                .iter()
+                .map(|conn| {
+                    let read = slot_entries(conn, &channel(), &slot(name)).unwrap();
+                    assert_eq!(read.len(), 1, "{name}");
+                    read[0].rev
+                })
+                .collect();
+            assert_eq!(revs[0], revs[1], "{name}");
+            revs[0]
+        };
+
+        // The higher is written first, and the lower last.
+        assert_eq!(store(&one, &at(7, "a.md"), NOW).unwrap(), Outcome::Stored);
+        assert_eq!(
+            store(&other, &at(5, "a.md"), NOW).unwrap(),
+            Outcome::OlderThanHeld
+        );
+        assert_eq!(held_rev("a.md"), 7);
+        // The lower first, and the higher last.
+        assert_eq!(store(&other, &at(5, "b.md"), NOW).unwrap(), Outcome::Stored);
+        assert_eq!(store(&one, &at(7, "b.md"), NOW).unwrap(), Outcome::Stored);
+        assert_eq!(held_rev("b.md"), 7);
+        // And the lower again, from each: it is the older one to both.
+        for conn in [&one, &other] {
+            assert_eq!(
+                store(conn, &at(5, "b.md"), NOW).unwrap(),
+                Outcome::OlderThanHeld
+            );
+        }
+        assert_eq!(held_rev("b.md"), 7);
+
+        // One revision from each: the one written first stays, and the
+        // other is told that one is held.
+        let (first, second) = (at(9, "c.md"), text(1, 9, "c.md", "also at 9"));
+        assert_ne!(first.id(), second.id());
+        assert_eq!(store(&one, &first, NOW).unwrap(), Outcome::Stored);
+        assert_eq!(store(&other, &second, NOW).unwrap(), Outcome::AlreadyHeld);
+        assert_eq!(store(&other, &first, NOW).unwrap(), Outcome::AlreadyHeld);
+        assert_eq!(
+            slot_entries(&other, &channel(), &slot("c.md")).unwrap(),
+            [first]
+        );
+
+        // The two write in one order: an entry that was not stored took no
+        // place, and no place was given twice.
+        for conn in [&one, &other] {
+            let places: Vec<(i64, u64)> = channel_entries_after(conn, &channel(), 0, 100)
+                .unwrap()
+                .iter()
+                .map(|held| (held.seq, held.entry.rev))
+                .collect();
+            assert_eq!(places, [(1, 7), (3, 7), (4, 9)]);
+        }
+    }
+
+    /// Two writers at once, each with a connection of its own, offer the
+    /// same author's revisions of one slot: one from the lowest up, and
+    /// one from the highest down. Neither is ever refused for the other's
+    /// writing: each offer is given one of the three answers. What the
+    /// store holds never goes down, and ends at the highest.
+    #[test]
+    fn test_two_writers_at_once_are_each_given_one_of_the_three_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        // The database is made before either writes.
+        drop(db::open(&path).unwrap());
+        let offers: Vec<CheckedEntry> = (1..=60)
+            .map(|rev| text(1, rev, "notes.md", &format!("at {rev}")))
+            .collect();
+
+        let writer = |order: Vec<CheckedEntry>| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let conn = db::open(&path).unwrap();
+                let mut answers = Vec::new();
+                let mut seen = 0;
+                for entry in order {
+                    let answer = store(&conn, &entry, NOW).expect("one of the three answers");
+                    let held = slot_entries(&conn, &channel(), &entry.slot).unwrap();
+                    assert_eq!(held.len(), 1);
+                    // What is held is at least what was offered, and at
+                    // least what this writer saw held before.
+                    assert!(
+                        held[0].rev >= entry.rev,
+                        "{} below {}",
+                        held[0].rev,
+                        entry.rev
+                    );
+                    assert!(held[0].rev >= seen, "{} after {seen}", held[0].rev);
+                    seen = held[0].rev;
+                    answers.push((entry.rev, answer));
+                }
+                answers
+            })
+        };
+        let up = writer(offers.clone());
+        let down = writer(offers.iter().rev().cloned().collect());
+        let (up, down) = (up.join().unwrap(), down.join().unwrap());
+        assert_eq!((up.len(), down.len()), (60, 60));
+
+        let conn = db::open(&path).unwrap();
+        let held = slot_entries(&conn, &channel(), &slot("notes.md")).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].rev, 60);
+        // The highest was stored once, by whichever offered it first, and
+        // no revision was stored by both.
+        for rev in 1..=60u64 {
+            let stored = up
+                .iter()
+                .chain(&down)
+                .filter(|(offered, answer)| *offered == rev && *answer == Outcome::Stored)
+                .count();
+            assert!(stored <= 1, "revision {rev} stored {stored} times");
+            if rev == 60 {
+                assert_eq!(stored, 1);
+            }
+        }
+        // The writer that went down stored its first offer or found it
+        // held, and nothing it offered after that was stored.
+        assert!(
+            down[1..]
+                .iter()
+                .all(|(_, answer)| *answer == Outcome::OlderThanHeld)
+        );
+        // Each entry that was stored took the next place: the counter is
+        // at the number of entries stored, and the row has the last.
+        let stored = up
+            .iter()
+            .chain(&down)
+            .filter(|(_, answer)| *answer == Outcome::Stored)
+            .count() as i64;
+        let (counter, place): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT value FROM counters WHERE name = 'entry_seq'),
+                        (SELECT seq FROM entries)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((counter, place), (stored, stored));
+    }
+
     /// One row for each author in each slot of each channel. Nothing
     /// compares one author's entries with another's: none displaces
     /// another's, whatever its revision.
@@ -456,6 +626,13 @@ mod tests {
             store(&conn, &another_channels, NOW).unwrap(),
             Outcome::Stored
         );
+        assert_eq!(held(&conn).len(), 5);
+
+        // What became of an entry that is not stored is said by its own
+        // author's row in its own slot: not by another author's higher
+        // revision there, nor by that author's higher revision elsewhere.
+        assert_eq!(store(&conn, &one, NOW).unwrap(), Outcome::AlreadyHeld);
+        assert_eq!(store(&conn, &elsewhere, NOW).unwrap(), Outcome::AlreadyHeld);
         assert_eq!(held(&conn).len(), 5);
 
         // A newer revision by one author replaces that author's alone.
