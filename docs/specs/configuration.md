@@ -183,7 +183,7 @@ REST API binding and authentication.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `bind_address` | string | `"127.0.0.1"` | Loopback only | REST API bind address. MUST be a loopback address (`127.0.0.1` or `::1`). If a non-loopback address is configured, the node logs a CRITICAL error and refuses to start. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
+| `bind_address` | string | `"127.0.0.1"` | Loopback only | REST API bind address. MUST be `127.0.0.1`, `::1`, or `localhost` where that name resolves to loopback addresses and no other. With any other the node refuses to start, and a command refuses to ask it: a command's request carries the node's token. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
 | `token_path` | string | `"~/.cordelia/node-token"` | Valid file path | Path to the bearer token file for HTTP API authentication. Tilde expanded at startup. | operations.md SS5.1 |
 
 **Note:** network-protocol.md SS12.2 includes `api_addr` (combining address and port) under `[network]`. operations.md SS5.1 splits this into `api.bind_address` and `node.http_port`. This document follows the split form: bind address under `[api]`, port under `[node]`, as this is more granular and allows independent overrides via environment variables.
@@ -321,7 +321,7 @@ file_max_count = 5                         # Rotated log files to retain
 
 ## 4. Environment Variable Overrides
 
-Environment variables override `config.toml` values. All use the `CORDELIA_` prefix but one: `RUST_LOG`, where it is set, is the node's log filter in place of `logging.level`.
+Environment variables override `config.toml` values. All use the `CORDELIA_` prefix but one: `RUST_LOG`, where it is set to one that can be read, is the node's log filter in place of `logging.level`.
 
 ### 4.1 Supported Overrides
 

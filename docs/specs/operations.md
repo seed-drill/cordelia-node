@@ -427,7 +427,7 @@ token_path = "~/.cordelia/node-token"  # Bearer token file
 
 ### 5.2 Environment Variables
 
-Environment variables override config.toml values. Prefix: `CORDELIA_`.
+Environment variables override config.toml values. Prefix: `CORDELIA_`, but for `RUST_LOG`, which is the node's log filter in place of `logging.level` where it is set to one that can be read.
 
 | Variable | Overrides | Example |
 |----------|-----------|---------|

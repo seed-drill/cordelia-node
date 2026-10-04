@@ -598,7 +598,11 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 }
             }
         }
-        None => println!("  Running:   no (start it with `cordelia start`)"),
+        // A node that is not asked is not known to be stopped.
+        None => match api_host(&config.api.bind_address) {
+            Ok(_) => println!("  Running:   no (start it with `cordelia start`)"),
+            Err(why) => println!("  Running:   not asked: {}", not_asked(&config)(why)),
+        },
     }
 
     Ok(())
@@ -758,17 +762,17 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Validate bind address is loopback
+    // The API listens only on this machine.
     let bind_addr = &config.api.bind_address;
-    if !is_this_machine(bind_addr) {
+    let Ok(host) = api_host(bind_addr) else {
         anyhow::bail!(
             "API bind_address must be loopback (127.0.0.1), got '{bind_addr}'. \
              Non-loopback binding is not supported in Phase 1."
         );
-    }
+    };
 
     let http_port = config.node.http_port;
-    let listen_addr = format!("{bind_addr}:{http_port}");
+    let listen_addr = format!("{host}:{http_port}");
     let p2p_port = config.node.p2p_port;
 
     // Set up logging
@@ -1825,22 +1829,47 @@ fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     local_api(&config, false, path, std::time::Duration::from_secs(3))
 }
 
-/// Whether `address` is one that the node's API may have: an address of
-/// this machine. The node starts with no other.
-fn is_this_machine(address: &str) -> bool {
-    matches!(address, "127.0.0.1" | "::1" | "localhost")
+/// The host of the node's API as it is written before a port, where
+/// `address` is one that the API may have: an address of this machine.
+/// Otherwise, why it is not. The node starts with no other, and a command
+/// asks no other.
+///
+/// - `127.0.0.1`, and `::1`, which is written in brackets.
+/// - `localhost`, where this machine's resolver gives that name loopback
+///   addresses and no other. The name is not taken by its spelling: where
+///   it resolved to another machine, the node's token would go there.
+fn api_host(address: &str) -> Result<String, String> {
+    use std::net::ToSocketAddrs;
+    match address {
+        "127.0.0.1" => Ok(address.to_string()),
+        "::1" => Ok("[::1]".to_string()),
+        "localhost" => {
+            let resolved: Vec<_> = (address, 0)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .unwrap_or_default();
+            match !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback()) {
+                true => Ok(address.to_string()),
+                false => Err("`localhost` is not a name for this machine alone here".to_string()),
+            }
+        }
+        _ => Err("it is not an address the node listens on".to_string()),
+    }
 }
 
 /// How a command reaches its own node: the client, and the address of
-/// `path` there. A request carries the node's token, so it goes to this
-/// machine and nowhere else:
+/// `path` there. A request carries the node's token, so it goes to the
+/// node's own address and nowhere else:
 ///
-/// - **To no other address.** The node listens only on this machine. An
-///   API address that a setting, or `CORDELIA_BIND_ADDRESS`, has made
-///   another is refused here, before anything is sent.
+/// - **To no other address.** The node listens only on this machine
+///   ([`api_host`]). An API address that a setting, or
+///   `CORDELIA_BIND_ADDRESS`, has made another is refused here, before
+///   anything is sent.
 /// - **Through no proxy.** The HTTP client's default takes one from the
 ///   environment (`ALL_PROXY`, `HTTP_PROXY` and the rest). A proxy is for
 ///   the network, and a request to this machine is not sent to one.
+/// - **Following no redirect.** The node's API sends none, so an answer
+///   that is one did not come from the node.
 fn to_this_machine(
     config: &Config,
     path: &str,
@@ -1849,18 +1878,28 @@ fn to_this_machine(
     ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     String,
 )> {
-    let address = &config.api.bind_address;
-    if !is_this_machine(address) {
-        anyhow::bail!(
-            "the node's API address is set to '{address}', which is not this machine \
-             (127.0.0.1). A command sends the node's token nowhere else."
-        );
-    }
+    let host = api_host(&config.api.bind_address).map_err(not_asked(config))?;
     let client = ureq::Agent::config_builder()
         .proxy(None)
+        .max_redirects(0)
         .timeout_global(Some(limit));
-    let url = format!("http://{address}:{}{path}", config.node.http_port);
+    let url = format!("http://{host}:{}{path}", config.node.http_port);
     Ok((client, url))
+}
+
+/// What a command says where it does not ask the node, for `why`
+/// ([`api_host`]): the address, what the node listens on, and where the
+/// address is set.
+fn not_asked(config: &Config) -> impl Fn(String) -> anyhow::Error + '_ {
+    |why| {
+        anyhow::anyhow!(
+            "the node's API address is set to '{}': {why}. The node listens on 127.0.0.1, \
+             on ::1, or on a `localhost` that is this machine, and a command sends the \
+             node's token nowhere else. See `bind_address` under `[api]` in the \
+             configuration, and CORDELIA_BIND_ADDRESS.",
+            config.api.bind_address
+        )
+    }
 }
 
 /// Call the running node's local API (GET, or POST with an empty body)
@@ -3822,33 +3861,59 @@ mod tests {
     /// a client is made, so the node's token is sent nowhere else.
     #[test]
     fn test_a_command_asks_only_an_address_of_this_machine() {
-        for here in ["127.0.0.1", "::1", "localhost"] {
-            assert!(is_this_machine(here), "{here}");
-        }
+        use std::net::ToSocketAddrs;
+        assert_eq!(api_host("127.0.0.1").as_deref(), Ok("127.0.0.1"));
+        // An IPv6 address is written in brackets before a port.
+        assert_eq!(api_host("::1").as_deref(), Ok("[::1]"));
+        // The name, where this machine's resolver gives it loopback
+        // addresses and no other.
+        let resolved: Vec<_> = ("localhost", 0)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let here = !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback());
+        assert_eq!(api_host("localhost").is_ok(), here);
+        // Any other address, this machine's or not: the node listens on
+        // none of them.
         for elsewhere in [
             "192.0.2.1",
             "0.0.0.0",
             "127.0.0.2",
+            "[::1]",
+            "LOCALHOST",
             "example.org",
             "127.0.0.1.example.org",
             "",
         ] {
-            assert!(!is_this_machine(elsewhere), "{elsewhere}");
+            assert!(api_host(elsewhere).is_err(), "{elsewhere}");
         }
         let mut config = Config::default();
         let limit = std::time::Duration::from_secs(1);
-        let (_, url) = to_this_machine(&config, "/api/v1/status", limit)
-            .ok()
-            .unwrap();
         let port = config.node.http_port;
-        assert_eq!(url, format!("http://127.0.0.1:{port}/api/v1/status"));
+        let url_for = |config: &Config| {
+            let (_, url) = to_this_machine(config, "/api/v1/status", limit)
+                .ok()
+                .unwrap();
+            url
+        };
+        assert_eq!(
+            url_for(&config),
+            format!("http://127.0.0.1:{port}/api/v1/status")
+        );
+        config.api.bind_address = "::1".into();
+        assert_eq!(
+            url_for(&config),
+            format!("http://[::1]:{port}/api/v1/status")
+        );
         config.api.bind_address = "192.0.2.1".into();
         let refused = to_this_machine(&config, "/api/v1/status", limit)
             .err()
             .unwrap()
             .to_string();
         assert!(
-            refused.contains("192.0.2.1") && refused.contains("not this machine"),
+            refused.contains("'192.0.2.1'")
+                && refused.contains("nowhere else")
+                && refused.contains("CORDELIA_BIND_ADDRESS"),
             "{refused}"
         );
     }
