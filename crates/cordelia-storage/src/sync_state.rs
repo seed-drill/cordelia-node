@@ -7,10 +7,30 @@ use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 
+/// Who wrote the entry a folder agreed, as far as anything is rested on
+/// it (decision 2026-09-30-agent-memory-sync §4.5).
+///
+/// Stored in `sync_files.author`: `NULL` for [`Writer::NotRecorded`], an
+/// empty blob for [`Writer::Nobody`], and a device's 32 bytes. Anything
+/// else there is read as nobody: it shows nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Writer {
+    /// A row written before this was recorded says nothing of it.
+    NotRecorded,
+    /// The agreed entry says nothing of what it was written after, so its
+    /// text need never have been in its writer's folder: one published
+    /// again when a device is removed, one written through the API, one
+    /// from an earlier version. Nothing is rested on who wrote it.
+    Nobody,
+    /// The device that wrote the agreed entry, which says what it was
+    /// written after: a sync adapter wrote it, from the file in its
+    /// folder.
+    Device([u8; 32]),
+}
+
 /// Agreed state of one key: content hash (`None` = deleted), revision, and
-/// the key of the device that wrote the agreed entry (`None` for a row
-/// written before that was recorded).
-pub type Agreed = (Option<[u8; 32]>, u64, Option<[u8; 32]>);
+/// who wrote the agreed entry.
+pub type Agreed = (Option<[u8; 32]>, u64, Writer);
 
 /// Everything `folder` agreed with `channel_id`, by key.
 pub fn load(
@@ -36,10 +56,14 @@ pub fn load(
         })
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let as_key = |bytes: Option<Vec<u8>>| bytes.and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let as_writer = |bytes: Option<Vec<u8>>| match bytes {
+        None => Writer::NotRecorded,
+        Some(bytes) => <[u8; 32]>::try_from(bytes).map_or(Writer::Nobody, Writer::Device),
+    };
     let mut out = HashMap::new();
     for row in rows {
         let (key, hash, rev, author) = row.map_err(|e| CordeliaError::Storage(e.to_string()))?;
-        out.insert(key, (as_key(hash), rev.max(0) as u64, as_key(author)));
+        out.insert(key, (as_key(hash), rev.max(0) as u64, as_writer(author)));
     }
     Ok(out)
 }
@@ -52,6 +76,11 @@ pub fn save(
     key: &str,
     agreed: Agreed,
 ) -> Result<(), CordeliaError> {
+    let author: Option<Vec<u8>> = match agreed.2 {
+        Writer::NotRecorded => None,
+        Writer::Nobody => Some(Vec::new()),
+        Writer::Device(key) => Some(key.to_vec()),
+    };
     conn.execute(
         "INSERT INTO sync_files (folder, channel_id, key, hash, rev, author)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -63,7 +92,7 @@ pub fn save(
             key,
             agreed.0.map(|h| h.to_vec()),
             i64::try_from(agreed.1).unwrap_or(i64::MAX),
-            agreed.2.map(|a| a.to_vec())
+            author
         ],
     )
     .map_err(|e| CordeliaError::Storage(e.to_string()))?;
@@ -131,10 +160,38 @@ mod tests {
     #[test]
     fn test_forget_by_folder() {
         let conn = db::open_in_memory().unwrap();
-        save(&conn, "/m", "grp_a", "notes.md", (Some([7; 32]), 2, None)).unwrap();
-        save(&conn, "/m", "grp_b", "notes.md", (Some([7; 32]), 1, None)).unwrap();
-        save(&conn, "/other", "grp_a", "x.md", (None, 4, None)).unwrap();
-        save(&conn, "/third", "grp_c", "y.md", (None, 1, None)).unwrap();
+        save(
+            &conn,
+            "/m",
+            "grp_a",
+            "notes.md",
+            (Some([7; 32]), 2, Writer::NotRecorded),
+        )
+        .unwrap();
+        save(
+            &conn,
+            "/m",
+            "grp_b",
+            "notes.md",
+            (Some([7; 32]), 1, Writer::NotRecorded),
+        )
+        .unwrap();
+        save(
+            &conn,
+            "/other",
+            "grp_a",
+            "x.md",
+            (None, 4, Writer::NotRecorded),
+        )
+        .unwrap();
+        save(
+            &conn,
+            "/third",
+            "grp_c",
+            "y.md",
+            (None, 1, Writer::NotRecorded),
+        )
+        .unwrap();
 
         // One folder, whatever channels it agreed with.
         assert_eq!(forget_folder(&conn, "/m").unwrap(), 2);
@@ -154,9 +211,30 @@ mod tests {
     #[test]
     fn test_forget_except() {
         let conn = db::open_in_memory().unwrap();
-        save(&conn, "/m", "grp_a", "notes.md", (Some([7; 32]), 2, None)).unwrap();
-        save(&conn, "/m", "grp_b", "notes.md", (Some([7; 32]), 1, None)).unwrap();
-        save(&conn, "/other", "grp_a", "x.md", (None, 4, None)).unwrap();
+        save(
+            &conn,
+            "/m",
+            "grp_a",
+            "notes.md",
+            (Some([7; 32]), 2, Writer::NotRecorded),
+        )
+        .unwrap();
+        save(
+            &conn,
+            "/m",
+            "grp_b",
+            "notes.md",
+            (Some([7; 32]), 1, Writer::NotRecorded),
+        )
+        .unwrap();
+        save(
+            &conn,
+            "/other",
+            "grp_a",
+            "x.md",
+            (None, 4, Writer::NotRecorded),
+        )
+        .unwrap();
 
         let keep = [("/m".to_string(), "grp_a".to_string())];
         assert_eq!(forget_except(&conn, &keep).unwrap(), 2);
@@ -170,7 +248,7 @@ mod tests {
     #[test]
     fn test_save_and_load() {
         let conn = db::open_in_memory().unwrap();
-        let (a, b) = (Some([1; 32]), Some([2; 32]));
+        let (a, b) = (Writer::Device([1; 32]), Writer::Device([2; 32]));
         save(&conn, "/m", "grp_a", "notes.md", (Some([7; 32]), 2, a)).unwrap();
         save(&conn, "/m", "grp_a", "gone.md", (None, 5, b)).unwrap();
         save(&conn, "/m", "grp_a", "notes.md", (Some([8; 32]), 3, b)).unwrap();
@@ -181,10 +259,21 @@ mod tests {
         assert_eq!(state["notes.md"], (Some([8; 32]), 3, b));
         assert_eq!(state["gone.md"], (None, 5, b));
         // Each record is of one entry: the writer is replaced with the
-        // rest, by none as by another.
-        save(&conn, "/m", "grp_a", "gone.md", (None, 6, None)).unwrap();
+        // rest, by nobody and by none as by another. Nobody is not none.
+        for writer in [Writer::Nobody, Writer::NotRecorded] {
+            save(&conn, "/m", "grp_a", "gone.md", (None, 6, writer)).unwrap();
+            let state = load(&conn, "/m", "grp_a").unwrap();
+            assert_eq!(state["gone.md"], (None, 6, writer));
+            assert_eq!(state["notes.md"], (Some([8; 32]), 3, b));
+        }
+        // What is in the column and is no device's key shows nothing: it
+        // is read as nobody.
+        conn.execute(
+            "UPDATE sync_files SET author = x'0102' WHERE key = 'gone.md'",
+            [],
+        )
+        .unwrap();
         let state = load(&conn, "/m", "grp_a").unwrap();
-        assert_eq!(state["gone.md"], (None, 6, None));
-        assert_eq!(state["notes.md"], (Some([8; 32]), 3, b));
+        assert_eq!(state["gone.md"], (None, 6, Writer::Nobody));
     }
 }

@@ -747,7 +747,8 @@ mod tests {
     /// The step to version 9 adds a column, which cannot be done twice. The
     /// column and the version change together or not at all, so a start
     /// that fails between the two leaves a database that the next start
-    /// takes from the beginning. The rows are kept, with no writer.
+    /// takes from the beginning. The rows are kept, and say nothing of
+    /// the writer.
     #[test]
     fn test_v9_adds_the_writer_and_its_version_as_one() {
         let conn = at_v8();

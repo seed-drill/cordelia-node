@@ -18,8 +18,10 @@
 > - **v7:** `peer_sightings`, a relay's keyed-hash record for usage counts.
 > - **v8:** `state_offers`, the newest channel state sent to each member of
 >   each channel, kept until the member is seen to hold it (decision §4.1).
-> - **v9:** `sync_files` gains `author`, the device that wrote the entry a
->   folder agreed (decision §4.5).
+> - **v9:** `sync_files` gains `author`: who wrote the entry a folder agreed
+>   (decision §4.5). A device's key (32 bytes) where that entry says what it
+>   was written after, an empty value where it says nothing, and `NULL` in a
+>   row written before this version.
 >
 > PSK envelope items (§4) are replaced by sealed channel states, items of type
 > `invite` in inbox channels (decision §4.1). The search index (`search-indexing.md`,

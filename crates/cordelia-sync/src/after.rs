@@ -35,10 +35,13 @@ pub struct After {
     /// The hash of the text of the entry this one was published over, if
     /// that entry was a text.
     pub over: Option<[u8; 32]>,
-    /// Every entry at or below this revision is taken as followed. It is
-    /// the revision of the newest entry in this text's history that said
-    /// nothing of what it was written after: what came before that entry
-    /// is not known, and is decided by revision as it always was.
+    /// Every entry below this revision is taken as followed, and at this
+    /// revision one that said nothing itself. It is the revision of the
+    /// newest entry in this text's history that said nothing of what it
+    /// was written after: what came before that entry is not known, and is
+    /// decided by revision as it always was. An entry at this revision
+    /// that said something is another entry than that one, and is not
+    /// taken as followed for it.
     pub below: Option<u64>,
 }
 
@@ -104,7 +107,7 @@ impl After {
     ///
     /// Its history is the history of the entry it is published over, with
     /// that entry joined in. If that entry said nothing, all that is known
-    /// is the entry itself, and everything at or below it is left to its
+    /// is the entry itself: it, and everything below it, is left to its
     /// revision.
     pub fn written_over(over: Option<&Over>) -> After {
         let Some(over) = over else {
@@ -366,8 +369,8 @@ mod tests {
     }
 
     /// Over nothing, an entry shows nothing. Over an entry that said
-    /// nothing, it names that entry, and leaves everything at or below it
-    /// to its revision.
+    /// nothing, it names that entry, and leaves it and everything below
+    /// it to its revision.
     #[test]
     fn what_an_entry_says_over_nothing_and_over_an_entry_that_said_nothing() {
         assert_eq!(After::written_over(None), After::default());

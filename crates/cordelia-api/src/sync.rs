@@ -982,7 +982,7 @@ mod tests {
                 &memory,
                 "grp_x",
                 "notes.md",
-                (Some([7; 32]), 1, None),
+                (Some([7; 32]), 1, sync_state::Writer::NotRecorded),
             )
             .unwrap();
         }
@@ -1114,7 +1114,14 @@ mod tests {
         let there = memory_folder(other, "/home/sam/notes");
         s.map("/home/sam/notes", "lab");
         s.agreed("/home/sam/notes");
-        sync_state::save(&s.db, &there, "grp_x", "notes.md", (Some([7; 32]), 1, None)).unwrap();
+        sync_state::save(
+            &s.db,
+            &there,
+            "grp_x",
+            "notes.md",
+            (Some([7; 32]), 1, sync_state::Writer::NotRecorded),
+        )
+        .unwrap();
         s.claude(serde_json::json!({ "dir": other }));
         assert!(!s.remembers("/home/sam/notes"));
         assert!(sync_state::load(&s.db, &there, "grp_x").unwrap().is_empty());

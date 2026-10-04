@@ -46,7 +46,7 @@ enum Kind {
     /// after, records that carry the writer.
     Built,
     /// As it was before: the plan as it was, entries that say nothing,
-    /// records with no writer.
+    /// records that say nothing of the writer.
     Before,
 }
 
@@ -80,13 +80,13 @@ fn plan_before(
         Action::Record(Agreed {
             hash,
             rev: r.rev,
-            author: Some(r.author),
+            writer: Writer::NotRecorded,
         })
     };
     let pull = |r: &Remote, c: &Content| Action::Pull {
         text: c.text.clone(),
         rev: r.rev,
-        author: r.author,
+        writer: Writer::NotRecorded,
     };
     let merged = |r: &Remote, c: &Content, l: &Content| {
         let text = crate::memory_md::merge(&c.text, &l.text, deleted_files);
@@ -115,7 +115,7 @@ fn plan_before(
                 (None, None) => vec![record(r, None)],
                 (None, Some(_)) if follows => vec![Action::RemoveFile {
                     rev: r.rev,
-                    author: r.author,
+                    writer: Writer::NotRecorded,
                 }],
                 (None, Some(l)) => vec![Action::Publish(l.text.clone())],
                 (Some(c), None) => vec![pull(r, c)],

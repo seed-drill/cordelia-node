@@ -41,7 +41,7 @@ use cordelia_storage::{channels, meta, sync_state};
 use crate::after::{After, Over};
 use crate::discover::{self, Project};
 use crate::names;
-use crate::plan::{self, Action, Agreed, Content, Remote};
+use crate::plan::{self, Action, Agreed, Content, Remote, Writer};
 
 /// Seconds between sync cycles.
 pub const CYCLE_SECS: u64 = 5;
@@ -1338,7 +1338,7 @@ fn sync_folder_with(
         }
         let agreed: HashMap<String, Agreed> = sync_state::load(&db, &folder, channel)?
             .into_iter()
-            .map(|(k, (hash, rev, author))| (k, Agreed { hash, rev, author }))
+            .map(|(k, (hash, rev, writer))| (k, Agreed { hash, rev, writer }))
             .collect();
         (remote, deleted, taken, agreed)
     };
@@ -1733,9 +1733,12 @@ fn record_agreed(
 }
 
 /// Publish `text` under `full_key`, or a delete if there is none, and
-/// return the entry. `None`, with nothing published, if the settings
-/// have changed since the cycle read them, or the channel's version of the
-/// file is not the entry the plan took it to be (`Ctx::planned`).
+/// return the entry, with what a record of it says of its writer: this
+/// device, or nobody where the entry fitted only with nothing said of what
+/// it was written after ([`Remote::writer`]). `None`, with nothing
+/// published, if the settings have changed since the cycle read them, or
+/// the channel's version of the file is not the entry the plan took it to
+/// be (`Ctx::planned`).
 ///
 /// Both are looked at on `db`, and the entry is published on it: the caller
 /// holds the database lock for the whole of this, so neither can change
@@ -1745,7 +1748,7 @@ fn publish_over(
     db: &rusqlite::Connection,
     full_key: &str,
     text: Option<&str>,
-) -> Result<Option<entries::Published>, CordeliaError> {
+) -> Result<Option<(entries::Published, Writer)>, CordeliaError> {
     let Ctx {
         state,
         channel,
@@ -1790,8 +1793,9 @@ fn publish_over(
         };
         entries::publish(state, db, channel, &write)
     };
+    let said_nothing = |entry| Some((entry, Writer::Nobody));
     if says_nothing {
-        return write(None).map(Some);
+        return write(None).map(said_nothing);
     }
     // What the new entry is written after is what the plan read: the
     // entry just found to be the one it took, or nothing. Not what the
@@ -1813,8 +1817,11 @@ fn publish_over(
             // It fits, if at all, only with no such member. A text that
             // fitted before entries said anything still syncs, and is
             // taken by its revision.
-            Err(CordeliaError::TooLarge { .. }) => return write(None).map(Some),
-            published => return published.map(Some),
+            Err(CordeliaError::TooLarge { .. }) => return write(None).map(said_nothing),
+            published => {
+                let me = Writer::Device(state.identity.public_key());
+                return published.map(|entry| Some((entry, me)));
+            }
         }
     }
 }
@@ -1960,21 +1967,24 @@ fn apply(
     // A publish that is refused for what the entry is (its name's
     // revisions are used up, say) is this file's failure. Any other is
     // the folder's.
-    let publish = |text: Option<&str>| -> Result<Option<entries::Published>, Failure> {
+    let publish = |text: Option<&str>| -> Result<Option<(entries::Published, Writer)>, Failure> {
         let db = lock(state)?;
         publish_over(ctx, &db, &full_key, text).map_err(|e| match e {
             CordeliaError::Validation(why) => Failure::File(why),
             e => Failure::Folder(e),
         })
     };
-    // What is agreed is one entry: its text, its revision and the device
-    // that wrote it, which for what this device publishes is this device.
-    let record =
-        |hash: Option<[u8; 32]>, rev: u64, author: [u8; 32]| -> Result<(), CordeliaError> {
-            let agreed = (hash, rev, (!says_nothing).then_some(author));
-            record_agreed(state, generation, folder, channel, key, agreed)
+    // What is agreed is one entry: its text, its revision, and what a
+    // record says of who wrote it (`Remote::writer`). A device that says
+    // nothing (a test's) records nothing of the writer, as before entries
+    // said anything.
+    let record = |hash: Option<[u8; 32]>, rev: u64, writer: Writer| -> Result<(), CordeliaError> {
+        let writer = match says_nothing {
+            true => Writer::NotRecorded,
+            false => writer,
         };
-    let me = state.identity.public_key();
+        record_agreed(state, generation, folder, channel, key, (hash, rev, writer))
+    };
 
     // An entry holds the file's name beside its text, and the text is
     // escaped, so a file under MAX_FILE_BYTES can still be too large. It is
@@ -1987,10 +1997,10 @@ fn apply(
 
     match action {
         Action::Publish(text) => match publish(Some(&text)) {
-            Ok(Some(entry)) => {
+            Ok(Some((entry, writer))) => {
                 report.published += 1;
                 note_published(ctx, key, &text, &entry.item_id);
-                record(Some(Content::new(text).hash), entry.rev, me)?;
+                record(Some(Content::new(text).hash), entry.rev, writer)?;
             }
             Ok(None) => return Ok(false),
             Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
@@ -2000,22 +2010,22 @@ fn apply(
             Err(e) => return Err(e),
         },
         Action::PublishDelete => {
-            let Some(entry) = publish(None)? else {
+            let Some((entry, writer)) = publish(None)? else {
                 return Ok(false);
             };
             report.published += 1;
-            record(None, entry.rev, me)?;
+            record(None, entry.rev, writer)?;
         }
-        Action::Pull { text, rev, author } => {
+        Action::Pull { text, rev, writer } => {
             if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                 deferred();
                 return Ok(false);
             }
             report.pulled += 1;
             forget_kept(ctx, key);
-            record(Some(Content::new(text).hash), rev, author)?;
+            record(Some(Content::new(text).hash), rev, writer)?;
         }
-        Action::RemoveFile { rev, author } => {
+        Action::RemoveFile { rev, writer } => {
             match std::fs::remove_file(dir.join(key)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2023,7 +2033,7 @@ fn apply(
             }
             report.pulled += 1;
             forget_kept(ctx, key);
-            record(None, rev, author)?;
+            record(None, rev, writer)?;
         }
         Action::SaveConflict(text) => {
             // Not kept twice: a conflict file that holds this text and is
@@ -2069,7 +2079,7 @@ fn apply(
             // Published before the file is written: if the merged text does
             // not fit, the file stays as it was.
             match publish(Some(&text)) {
-                Ok(Some(entry)) => {
+                Ok(Some((entry, writer))) => {
                     report.published += 1;
                     if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                         // Published, and the file was written to meanwhile:
@@ -2078,7 +2088,7 @@ fn apply(
                         return Ok(false);
                     }
                     forget_kept(ctx, key);
-                    record(Some(Content::new(text).hash), entry.rev, me)?;
+                    record(Some(Content::new(text).hash), entry.rev, writer)?;
                 }
                 Ok(None) => return Ok(false),
                 Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
@@ -2088,17 +2098,7 @@ fn apply(
                 Err(e) => return Err(e),
             }
         }
-        Action::Record(a) => {
-            let author = a.author.filter(|_| !says_nothing);
-            record_agreed(
-                state,
-                generation,
-                folder,
-                channel,
-                key,
-                (a.hash, a.rev, author),
-            )?
-        }
+        Action::Record(a) => record(a.hash, a.rev, a.writer)?,
     }
     Ok(true)
 }
@@ -2168,11 +2168,11 @@ mod tests {
             Action::Pull {
                 text: "incoming\n".into(),
                 rev: 2,
-                author: OTHER,
+                writer: Writer::Device(OTHER),
             },
             Action::RemoveFile {
                 rev: 2,
-                author: OTHER,
+                writer: Writer::Device(OTHER),
             },
             Action::Merge("merged\n".into()),
         ] {
@@ -2194,7 +2194,7 @@ mod tests {
                 Action::Pull {
                     text: "incoming\n".into(),
                     rev: 2,
-                    author: OTHER,
+                    writer: Writer::Device(OTHER),
                 },
                 &mut report
             )
@@ -2270,13 +2270,13 @@ mod tests {
         let pull = || Action::Pull {
             text: "from another device\n".into(),
             rev: 2,
-            author: OTHER,
+            writer: Writer::Device(OTHER),
         };
         assert!(!apply(&ctx, "new.md", None, pull(), &mut report).unwrap());
         assert!(!apply(&ctx, "kept.md", seen, pull(), &mut report).unwrap());
         let gone = Action::RemoveFile {
             rev: 2,
-            author: OTHER,
+            writer: Writer::Device(OTHER),
         };
         assert!(!apply(&ctx, "kept.md", seen, gone, &mut report).unwrap());
         let beside = Action::SaveConflict("this device's\n".into());
@@ -2308,12 +2308,20 @@ mod tests {
             elsewhere,
             &channel,
             "late.md",
-            (None, 9, None),
+            (None, 9, Writer::NotRecorded),
         )
         .unwrap();
         assert!(!agreed(&st));
         let now = st.sync_control.generation();
-        record_agreed(&st, now, elsewhere, &channel, "late.md", (None, 9, None)).unwrap();
+        record_agreed(
+            &st,
+            now,
+            elsewhere,
+            &channel,
+            "late.md",
+            (None, 9, Writer::NotRecorded),
+        )
+        .unwrap();
         assert!(agreed(&st));
 
         // The next cycle, under the settings as they are now, carries on.
@@ -3136,8 +3144,8 @@ mod tests {
         assert_eq!(said("mine.md"), Some(after(&[(&me, 4)], None, None)));
 
         // Over an entry that says nothing (one from before entries said
-        // anything): it is named, and everything at or below it is left
-        // to its revision.
+        // anything): it is named, and it and everything below it are left
+        // to their revisions.
         p.other_writes("theirs.md", Some("one\n"));
         p.cycle();
         p.file("theirs.md", "two\n");
@@ -3343,6 +3351,16 @@ mod tests {
             assert_eq!(report.published, 1, "{:?}", report.too_large);
             assert_eq!(p.held("f.md").as_deref(), Some(text.as_str()));
             assert_eq!(said(&p.st, &p.channel, "f.md"), fits);
+            // The record names this device where the entry says anything,
+            // and nobody where it fitted only with nothing said.
+            let folder = p.mem.display().to_string();
+            let db = p.st.db.lock().unwrap();
+            let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
+            let writer = match fits {
+                Some(_) => Writer::Device(p.st.identity.public_key()),
+                None => Writer::Nobody,
+            };
+            assert_eq!(rows["f.md"].2, writer);
         };
         // Everything: its history, with the entry itself joined in.
         published_saying(Some(&|them| {
@@ -3372,16 +3390,19 @@ mod tests {
     }
 
     /// What a folder records of a file is one entry: its text, its
-    /// revision and the device that wrote it. A row from before the writer
-    /// was kept is decided by revision, until a cycle that finds it in
-    /// step with the channel gives it the writer.
+    /// revision, and who wrote it. That is the device that wrote the
+    /// entry, where the entry says what it was written after, and nobody
+    /// where it says nothing. A row from before the writer was kept is
+    /// decided by revision, until a cycle that finds it in step with the
+    /// channel gives it what the channel's version says.
     #[test]
-    fn a_record_names_the_writer_of_the_entry_it_agrees_with() {
+    fn a_record_says_who_wrote_the_entry_it_agrees_with() {
         let p = Pair::new();
-        let me = p.st.identity.public_key();
-        let them = p.other.identity.public_key();
+        let me = Writer::Device(p.st.identity.public_key());
+        let them = Writer::Device(p.other.identity.public_key());
+        let mine = p.st.identity.public_key();
         let folder = p.mem.display().to_string();
-        let writer = |name: &str| -> Option<[u8; 32]> {
+        let writer = |name: &str| -> Writer {
             let db = p.st.db.lock().unwrap();
             let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
             rows[name].2
@@ -3391,20 +3412,41 @@ mod tests {
             db.execute("UPDATE sync_files SET author = NULL", [])
                 .unwrap();
         };
+        // What an entry published over this device's first entry of a
+        // file says, so that it is known to follow it.
+        let follows = |text: &str| after(&[(&mine, 1)], Some(text), None);
 
-        // Published here: this device. Pulled, or removed for a delete:
-        // the device that wrote the channel's version.
-        p.file("a.md", "one\n");
-        p.file("b.md", "one\n");
+        // Published here: this device.
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            p.file(name, "one\n");
+        }
         p.cycle();
-        assert_eq!((writer("a.md"), writer("b.md")), (Some(me), Some(me)));
-        p.other_writes("a.md", Some("two\n"));
-        p.other_writes("b.md", None);
-        p.cycle();
-        assert_eq!((writer("a.md"), writer("b.md")), (Some(them), Some(them)));
+        assert_eq!((writer("a.md"), writer("b.md")), (me, me));
+        // Pulled, or removed for a delete: the device that wrote the
+        // channel's version, where that version says something.
+        p.other_says("a.md", "two\n", Some(&follows("one\n")));
+        p.other_puts("b.md", None, Some(&follows("one\n")));
+        // And nobody, where it says nothing.
+        p.other_writes("c.md", Some("two\n"));
+        p.other_writes("d.md", None);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (4, 0), "{report:?}");
+        assert_eq!((writer("a.md"), writer("b.md")), (them, them));
+        assert_eq!(
+            (writer("c.md"), writer("d.md")),
+            (Writer::Nobody, Writer::Nobody)
+        );
         std::fs::remove_file(p.mem.join("a.md")).unwrap();
         p.cycle();
-        assert_eq!(writer("a.md"), Some(me));
+        assert_eq!(writer("a.md"), me);
+        // A merged index is an entry that this device writes: this device.
+        p.file("MEMORY.md", "- mine\n");
+        p.cycle();
+        p.other_writes("MEMORY.md", Some("- theirs\n"));
+        p.file("MEMORY.md", "- mine\n- more\n");
+        let report = p.cycle();
+        assert_eq!((report.published, report.conflicts), (1, 0), "{report:?}");
+        assert_eq!(writer("MEMORY.md"), me);
 
         // A row with no writer, and a version of the channel's that says
         // something and shows nothing: taken by its revision, as before,
@@ -3414,23 +3456,59 @@ mod tests {
         p.file("new.md", "one\n");
         p.cycle();
         no_writers();
-        assert_eq!(writer("old.md"), None);
+        assert_eq!(writer("old.md"), Writer::NotRecorded);
         p.other_says("old.md", "two\n", Some(&nothing));
         let report = p.cycle();
         assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
-        assert_eq!(writer("old.md"), Some(them));
+        assert_eq!(writer("old.md"), them);
 
-        // A cycle that has nothing to do for a file gives its row the
-        // writer of the channel's version. From then on a version that is
-        // not known to follow it has what the file held kept first.
+        // A cycle that has nothing to do for a file gives its row what
+        // the channel's version says of its writer. From then on a
+        // version that is not known to follow it has what the file held
+        // kept first.
         no_writers();
         assert_eq!(p.cycle().pulled, 0);
-        assert_eq!(writer("new.md"), Some(me));
+        assert_eq!(writer("new.md"), me);
         p.other_says("new.md", "two\n", Some(&nothing));
         let report = p.cycle();
         assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
         assert_eq!(p.read("new.conflict-abcd.md").as_deref(), Some("one\n"));
         assert_eq!(p.read("new.md").as_deref(), Some("two\n"));
+    }
+
+    /// An entry published again when its writer is removed says nothing,
+    /// and carries the key of the device that published it. A folder that
+    /// holds its text records nobody for it. What that device writes
+    /// later, naming itself and not the text's writer, is then not known
+    /// to follow: the text is kept. Recorded as that device's, the later
+    /// entry was taken with nothing kept.
+    #[test]
+    fn a_text_is_kept_from_what_the_publisher_of_its_entry_writes_later() {
+        let p = Pair::new();
+        let them = p.other.identity.public_key();
+        let folder = p.mem.display().to_string();
+        let writer = |name: &str| -> Writer {
+            let db = p.st.db.lock().unwrap();
+            let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
+            rows[name].2
+        };
+        p.file("notes.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        // The other device publishes the same text again, a revision on,
+        // saying nothing: as a node does at a removal.
+        p.other_writes("notes.md", Some("mine\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.published), (0, 0), "{report:?}");
+        assert_eq!(writer("notes.md"), Writer::Nobody);
+        // Its next entry names itself at that revision, over another
+        // text: written from a folder that held something else.
+        let later = after(&[(&them, 2)], Some("something else\n"), None);
+        p.other_says("notes.md", "theirs\n", Some(&later));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("theirs\n"));
+        let kept = p.read("notes.conflict-abcd.md");
+        assert_eq!(kept.as_deref(), Some("mine\n"));
     }
 
     /// Where what a file holds was to be kept before a version at a higher
@@ -4806,7 +4884,7 @@ mod tests {
             Agreed {
                 hash: Some(Content::new("mine\n").hash),
                 rev: 1,
-                author: None,
+                writer: Writer::NotRecorded,
             },
         )]
         .into();
@@ -4833,7 +4911,7 @@ mod tests {
             &folder,
             &p.channel,
             "notes.md",
-            (None, 1, None),
+            (None, 1, Writer::NotRecorded),
         )
         .unwrap();
         assert!(!is(version, copy, "mine\n"));
@@ -4874,14 +4952,14 @@ mod tests {
                 Action::Pull {
                     text: "theirs\n".into(),
                     rev: 1,
-                    author: [9; 32],
+                    writer: Writer::Device([9; 32]),
                 },
             ),
             (
                 "notes.md",
                 Action::RemoveFile {
                     rev: 1,
-                    author: [9; 32],
+                    writer: Writer::Device([9; 32]),
                 },
             ),
             (index, Action::Merge("- [A](a.md) a\n".into())),
@@ -5532,7 +5610,7 @@ mod tests {
             "/a/memory",
             "grp_x",
             "notes.md",
-            (None, 1, None),
+            (None, 1, Writer::NotRecorded),
         )
         .unwrap();
         let mine: BTreeSet<String> = ["one".to_string()].into();
