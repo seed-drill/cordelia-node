@@ -39,7 +39,6 @@ use cordelia_core::protocol::{
     LABEL_COMMITMENT, LABEL_STATEMENT, MAX_DEVICE_LABEL_BYTES, MAX_STATEMENT_CHAIN,
     MAX_STATEMENT_DEVICES, MAX_STATEMENT_NUMBER, MAX_STATEMENT_REMOVED, STATEMENT_HASH_BYTES,
 };
-use cordelia_core::sync_name;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{NodeIdentity, is_usable_public_key, verify_signature};
@@ -78,11 +77,11 @@ pub enum StatementError {
     #[error("a device's label is from 1 to 64 bytes, and this is {0}")]
     LabelLength(usize),
 
-    #[error("a device's label is printable text")]
+    #[error("a device's label is printable ASCII text")]
     LabelNotPrintable,
 
-    #[error("a device's label is in its one spelling, tidied as a name is")]
-    LabelNotTidy,
+    #[error("a device's label has no space at either end")]
+    LabelSpaceAtAnEnd,
 
     #[error("a statement lists at most 256 removed keys, and this lists {0}")]
     TooManyRemoved(usize),
@@ -118,18 +117,21 @@ pub struct Device {
     /// The device's Ed25519 public key.
     pub key: [u8; 32],
     /// The label the person knows it by, as shown at a prompt: 1 to 64
-    /// bytes of printable text, tidied as a name is.
+    /// bytes of printable ASCII, with no space at either end. It is what a
+    /// person calls the device, kept as it was given: "Kitchen laptop" is
+    /// a label.
     pub label: String,
 }
 
 impl Device {
-    /// A device with `label` tidied as a name is
-    /// ([`sync_name::tidy`]). A label that is then not one a statement may
-    /// carry is refused.
+    /// A device with the label `label`, as it is given. A label that is
+    /// not one a statement may carry is refused, and not changed into one.
     pub fn new(key: [u8; 32], label: &str) -> Result<Self, StatementError> {
-        let label = sync_name::tidy(label);
-        check_label(&label)?;
-        Ok(Self { key, label })
+        check_label(label)?;
+        Ok(Self {
+            key,
+            label: label.to_string(),
+        })
     }
 }
 
@@ -567,21 +569,31 @@ impl SignedStatement {
 /// opened ([`crate::change_entry`]).
 ///
 /// - Rule 1: the key the device follows signed it. A statement that fails
-///   this is nothing to the device, and is an error here, as is one that
-///   is not well formed. Both statements are under the followed phrase.
+///   this is nothing to the device, and is an error here. Both statements
+///   are under the followed phrase.
 /// - Rule 2: its number is above the applied one's. One that is not is
-///   [`Judgement::Behind`] where it is the applied one or is on its chain,
-///   and otherwise a [`Judgement::Fork`].
+///   [`Judgement::Behind`] where it is on the applied one's chain, and
+///   otherwise a [`Judgement::Fork`].
 /// - Rule 6: the applied one is on its chain, by number and hash. One made
 ///   apart is a fork, even where it removes everything the applied one
 ///   removed: what the applied one decided besides would be dropped.
 /// - Rule 5: every key that the applied one removed is removed in it. One
-///   that lacks a removal is a fork. (That no key is in both of its lists
-///   is part of being well formed.)
+///   that lacks a removal is a fork.
 /// - Rule 3: the device is among its devices, and it
 ///   [`Judgement::Applies`]. A device that is not is
 ///   [`Judgement::Removed`] or [`Judgement::NotListed`], and only by a
 ///   statement that passes every rule above.
+///
+/// Two things that those rules do not say outright:
+///
+/// - **The applied statement, shown again, is [`Judgement::Behind`].** It
+///   has the applied one's number and hash. It is not above the applied
+///   one and is not apart from it, and nothing is done with it.
+/// - **A signed statement that is not well formed is an error, and not a
+///   fork.** A key in both of its lists is one such (the second half of
+///   rule 5), and so is anything else that [`Statement::validate`]
+///   refuses. It is no statement, whoever signed it, so a device is not
+///   stopped by it as a fork stops one.
 pub fn judge(
     shown: &SignedStatement,
     applied: &Statement,
@@ -626,10 +638,10 @@ fn under_label(bytes: &[u8]) -> Vec<u8> {
     signed
 }
 
-/// Whether `label` is one a statement may carry: 1 to 64 bytes of
-/// printable text, tidied as a name is. Printable is taken as the
-/// printable characters of ASCII, the space among them: what a prompt
-/// shows as it is, on any terminal.
+/// Whether `label` is one a statement may carry: 1 to 64 bytes of the
+/// printable characters of ASCII (0x20 to 0x7E), which a prompt shows as
+/// they are on any terminal, with no space at either end. Capitals and
+/// spaces within it stay as they are.
 fn check_label(label: &str) -> Result<(), StatementError> {
     if label.is_empty() || label.len() > MAX_DEVICE_LABEL_BYTES {
         return Err(StatementError::LabelLength(label.len()));
@@ -637,8 +649,8 @@ fn check_label(label: &str) -> Result<(), StatementError> {
     if !label.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
         return Err(StatementError::LabelNotPrintable);
     }
-    if sync_name::tidy(label) != label {
-        return Err(StatementError::LabelNotTidy);
+    if label.starts_with(' ') || label.ends_with(' ') {
+        return Err(StatementError::LabelSpaceAtAnEnd);
     }
     Ok(())
 }
@@ -1111,8 +1123,12 @@ mod tests {
             Err(StatementError::LabelNotPrintable)
         );
         assert_eq!(
-            raw.with(|raw| raw.devices[1].1 = b"Laptop".to_vec()),
-            Err(StatementError::LabelNotTidy)
+            raw.with(|raw| raw.devices[1].1 = b"laptop ".to_vec()),
+            Err(StatementError::LabelSpaceAtAnEnd)
+        );
+        assert!(
+            raw.with(|raw| raw.devices[1].1 = b"Kitchen laptop".to_vec())
+                .is_ok()
         );
         assert_eq!(
             raw.with(|raw| raw.number = 0),
@@ -1251,23 +1267,47 @@ mod tests {
         );
     }
 
-    /// A label is 1 to 64 bytes of printable text, tidied as a name is.
+    /// A label is 1 to 64 bytes of printable ASCII, with no space at either
+    /// end. It is what a person calls a device, and is kept as it is
+    /// given: not tidied as a name is, and not put in lower case.
     #[test]
-    fn a_label_is_printable_text_in_its_one_spelling() {
+    fn a_label_is_printable_text_with_no_space_at_either_end() {
         let statement = sample(&phrase());
         let said = |label: &str| with(&statement, |s| s.devices[1].label = label.to_string());
 
-        for label in ["a", "laptop", "work laptop (2)", "~", &"x".repeat(64)] {
+        for label in [
+            "a",
+            "laptop",
+            "Kitchen laptop",
+            "work laptop (2)",
+            "A  B",
+            "~",
+            "Laptop.git",
+            "repo/",
+            "!",
+            &"x".repeat(64),
+        ] {
             assert_eq!(said(label), Ok(()), "{label:?}");
+            // And it is in the statement as it was given.
+            assert_eq!(Device::new(key(1), label).unwrap().label, label);
         }
+        // Every printable character of ASCII, the first and the last among
+        // them, with one that is not a space at each end.
+        let all: String = (0x21..=0x7e_u8).map(char::from).collect();
+        assert_eq!(said(&all[..64]), Ok(()));
+        assert_eq!(said(&all[30..]), Ok(()));
+        assert_eq!(said("a b~"), Ok(()));
+
         assert_eq!(said(""), Err(StatementError::LabelLength(0)));
         assert_eq!(said(&"x".repeat(65)), Err(StatementError::LabelLength(65)));
         for label in [
             "lap\ttop",
             "lap\ntop",
             "lap\u{7f}top",
+            "lap\u{1f}top",
             "\u{1b}[31m",
             "büro",
+            "lap\u{a0}top",
             "lap\u{202e}top",
         ] {
             assert_eq!(
@@ -1275,25 +1315,26 @@ mod tests {
                 Err(StatementError::LabelNotPrintable),
                 "{label:?}"
             );
+            assert_eq!(
+                Device::new(key(1), label),
+                Err(StatementError::LabelNotPrintable)
+            );
         }
-        for label in ["Laptop", " laptop", "laptop ", "laptop.git", "laptop/"] {
-            assert_eq!(said(label), Err(StatementError::LabelNotTidy), "{label:?}");
+        for label in [" laptop", "laptop ", " Kitchen laptop ", " ", "  "] {
+            assert_eq!(
+                said(label),
+                Err(StatementError::LabelSpaceAtAnEnd),
+                "{label:?}"
+            );
+            // A device is not made with it, and it is not trimmed into one
+            // that is.
+            assert_eq!(
+                Device::new(key(1), label),
+                Err(StatementError::LabelSpaceAtAnEnd),
+                "{label:?}"
+            );
         }
-
-        // A device is made with its label tidied, and refused where the
-        // label is then not one a statement may carry.
-        assert_eq!(
-            Device::new(key(1), "  Work Laptop.GIT ").unwrap().label,
-            "work laptop"
-        );
-        assert_eq!(
-            Device::new(key(1), " "),
-            Err(StatementError::LabelLength(0))
-        );
-        assert_eq!(
-            Device::new(key(1), "Büro"),
-            Err(StatementError::LabelNotPrintable)
-        );
+        assert_eq!(Device::new(key(1), ""), Err(StatementError::LabelLength(0)));
         assert_eq!(
             Device::new(key(1), &"X".repeat(65)),
             Err(StatementError::LabelLength(65))

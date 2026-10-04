@@ -15,8 +15,11 @@
 //!   can open the secret.
 //! - **For the phrase**, under a key that only the phrase gives: the new
 //!   secret; the secrets of earlier generations, as many as eight, the
-//!   newest first, each with its statement's number; and, in an entry that
-//!   a recovery makes, the device keys of the statement it recovered from.
+//!   newest first, each with its statement's number; and a recovery's
+//!   list: every key by which the recovery read the generations it
+//!   recovered from, with the number of the recovery's statement. The list
+//!   is in the entry that a recovery makes, and in each later entry that
+//!   still holds the secret of a generation the list is for.
 //!
 //! ## Layout
 //!
@@ -35,7 +38,8 @@
 //!                   a count, and for each device the sealed secret (92)
 //! for the phrase    the secret (32), a count, and for each earlier
 //!                   generation its number and its secret (32), a count,
-//!                   and each listed key (32)
+//!                   and where that is not 0 the number of the recovery's
+//!                   statement and each listed key (32)
 //! ```
 //!
 //! Building refuses what does not fit, and never cuts it. At every bound
@@ -90,8 +94,20 @@ pub enum ChangeEntryError {
     #[error("the part for the phrase lists at most 64 device keys, and this lists {0}")]
     TooManyKeys(usize),
 
+    #[error("a list of keys in the part for the phrase holds at least one key")]
+    NoKeys,
+
     #[error("the part for the phrase lists a device key twice")]
     KeyTwice,
+
+    #[error("the listed keys are of a recovery at statement {0}, which is after this entry's")]
+    KeysFromLater(u64),
+
+    #[error(
+        "the listed keys are for the generations below statement {0}, and this entry holds the \
+         secret of none of them"
+    )]
+    KeysForNothingHeld(u64),
 
     #[error("device {0} of the statement has a key that nothing can be sealed to")]
     DeviceKey(usize),
@@ -122,10 +138,25 @@ pub struct ForPhrase {
     /// newest first. They are for what the relays hold in a generation
     /// that was left and that nobody carried.
     pub earlier: Vec<Earlier>,
-    /// In an entry that a recovery makes: the device keys of the statement
-    /// it recovered from, and as far as 64 keys allow those which that
-    /// statement's own entry listed. Empty in any other entry.
-    pub recovered_from: Vec<[u8; 32]>,
+    /// A recovery's list, in the entry that the recovery makes and in each
+    /// later one that still holds the secret of a generation the list is
+    /// for. In any other entry there is none.
+    pub recovery_keys: Option<RecoveryKeys>,
+}
+
+/// The list of a recovery (decision 2026-10-04 §9): every key by which the
+/// recovery read the generations it recovered from. With the secrets of
+/// those generations it lets a later recovery, or the same one taken up
+/// again, read what the first had not yet carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryKeys {
+    /// The number of the recovery's statement. The keys are for the
+    /// generations below it.
+    pub number: u64,
+    /// Every key that counted under the statement the recovery recovered
+    /// from, when it looked. After them, as far as 64 keys in all allow,
+    /// the keys that the entry it recovered from listed. None twice.
+    pub keys: Vec<[u8; 32]>,
 }
 
 /// What a device reads in a change entry: the statement, which the phrase
@@ -158,20 +189,27 @@ impl ForPhrase {
         Self {
             secret,
             earlier: Vec::new(),
-            recovered_from: Vec::new(),
+            recovery_keys: None,
         }
     }
 
     /// What the part says in the entry of a statement made after others:
-    /// its `secret`, and the secrets copied forward from the entries
-    /// `before` it, each given with its statement's number (decision
-    /// 2026-10-04 §9).
+    /// its `secret`, and the secrets and the list copied forward from the
+    /// entries `before` it, each given with its statement's number
+    /// (decision 2026-10-04 §9).
     ///
     /// One entry before for a statement made after one, and two for a
     /// settlement, which passes on the secrets of both branches. They are
     /// kept the newest first, each once, and only as many as eight. So a
     /// maker that never held a generation's secret passes it on all the
     /// same: it is read from the entry, with the phrase.
+    ///
+    /// A recovery's list goes forward with the secrets, under the number
+    /// it has, for as long as the entry that is built still holds the
+    /// secret of a generation below that number. After that it is dropped:
+    /// the entry holds nothing that the list is for. Where both entries of
+    /// a settlement carry a list, the later recovery's keeps its number
+    /// and its keys come first, as in a recovery after a recovery.
     pub fn following(secret: [u8; 32], before: &[(u64, &ForPhrase)]) -> Self {
         let mut earlier = Vec::new();
         for (number, entry) in before {
@@ -184,11 +222,59 @@ impl ForPhrase {
         earlier.sort_unstable_by(|a, b| by_age(b, a));
         earlier.dedup();
         earlier.truncate(MAX_EARLIER_SECRETS);
+
+        let mut lists: Vec<&RecoveryKeys> = before
+            .iter()
+            .filter_map(|(_, entry)| entry.recovery_keys.as_ref())
+            .filter(|list| holds_one_below(&earlier, list.number))
+            .collect();
+        lists.sort_unstable_by(|a, b| (b.number, &b.keys).cmp(&(a.number, &a.keys)));
+        let recovery_keys = lists.first().map(|latest| RecoveryKeys {
+            number: latest.number,
+            keys: each_once(lists.iter().map(|list| list.keys.as_slice())),
+        });
         Self {
             secret,
             earlier,
-            recovered_from: Vec::new(),
+            recovery_keys,
         }
+    }
+
+    /// What the part says in the entry that a recovery makes (decision
+    /// 2026-10-04 §9, step 4): its `secret`; the secrets copied forward
+    /// from the entries `before` it, as [`ForPhrase::following`] copies
+    /// them; and its list, of the keys that `counted` under the statement
+    /// it recovered from when it looked, by which it reads that
+    /// generation.
+    ///
+    /// The list has the number of the recovery's statement, which is one
+    /// above the highest of the entries before. Where an entry before
+    /// carried a list that still goes forward, its keys follow the
+    /// recovery's own, as far as 64 keys in all allow, none twice.
+    ///
+    /// The recovery's own keys are never cut: more than 64 of them are
+    /// refused, and so is a key twice among them, no key at all, and a
+    /// recovery from no entry.
+    pub fn recovering(
+        secret: [u8; 32],
+        before: &[(u64, &ForPhrase)],
+        counted: &[[u8; 32]],
+    ) -> Result<Self, ChangeEntryError> {
+        let number = before
+            .iter()
+            .map(|(number, _)| *number)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        check_keys(counted)?;
+        let mut said = Self::following(secret, before);
+        let copied = said.recovery_keys.take().map(|list| list.keys);
+        said.recovery_keys = Some(RecoveryKeys {
+            number,
+            keys: each_once([counted, copied.as_deref().unwrap_or_default()].into_iter()),
+        });
+        said.validate(number)?;
+        Ok(said)
     }
 
     /// Whether this is what the part may say in the entry of statement
@@ -208,13 +294,18 @@ impl ForPhrase {
         if !before_this || !in_order {
             return Err(ChangeEntryError::EarlierOrder);
         }
-        if self.recovered_from.len() > MAX_RECOVERY_KEYS {
-            return Err(ChangeEntryError::TooManyKeys(self.recovered_from.len()));
-        }
-        let mut keys: Vec<&[u8; 32]> = self.recovered_from.iter().collect();
-        keys.sort_unstable();
-        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(ChangeEntryError::KeyTwice);
+        if let Some(list) = &self.recovery_keys {
+            check_keys(&list.keys)?;
+            // The list is of a recovery's statement: this entry's, or one
+            // before it.
+            if list.number > number {
+                return Err(ChangeEntryError::KeysFromLater(list.number));
+            }
+            // And it goes forward only for as long as the entry holds the
+            // secret of a generation that it is for.
+            if !holds_one_below(&self.earlier, list.number) {
+                return Err(ChangeEntryError::KeysForNothingHeld(list.number));
+            }
         }
         Ok(())
     }
@@ -228,9 +319,15 @@ impl ForPhrase {
             out.extend_from_slice(&earlier.number.to_be_bytes());
             out.extend_from_slice(&earlier.secret);
         }
-        put_count(&mut out, self.recovered_from.len());
-        for key in &self.recovered_from {
-            out.extend_from_slice(key);
+        match &self.recovery_keys {
+            None => put_count(&mut out, 0),
+            Some(list) => {
+                put_count(&mut out, list.keys.len());
+                out.extend_from_slice(&list.number.to_be_bytes());
+                for key in &list.keys {
+                    out.extend_from_slice(key);
+                }
+            }
         }
         out
     }
@@ -254,14 +351,22 @@ impl ForPhrase {
             });
         }
 
+        // A count of 0 is no list. Any other is a list: the number of the
+        // recovery's statement, and that many keys.
         let count = reader.count().ok_or_else(short)?;
         if count > MAX_RECOVERY_KEYS {
             return Err(ChangeEntryError::TooManyKeys(count));
         }
-        let mut recovered_from = Vec::with_capacity(count);
-        for _ in 0..count {
-            recovered_from.push(reader.array().ok_or_else(short)?);
-        }
+        let recovery_keys = if count == 0 {
+            None
+        } else {
+            let number = reader.u64().ok_or_else(short)?;
+            let mut keys = Vec::with_capacity(count);
+            for _ in 0..count {
+                keys.push(reader.array().ok_or_else(short)?);
+            }
+            Some(RecoveryKeys { number, keys })
+        };
 
         if !only_zeros(reader.rest()) {
             return Err(ChangeEntryError::Malformed);
@@ -269,7 +374,7 @@ impl ForPhrase {
         Ok(Self {
             secret,
             earlier,
-            recovered_from,
+            recovery_keys,
         })
     }
 }
@@ -505,6 +610,40 @@ fn by_age(a: &Earlier, b: &Earlier) -> std::cmp::Ordering {
     (a.number, &a.secret).cmp(&(b.number, &b.secret))
 }
 
+/// Whether `earlier` holds the secret of a generation below statement
+/// `number`: one that a recovery's list of that number is for.
+fn holds_one_below(earlier: &[Earlier], number: u64) -> bool {
+    earlier.iter().any(|earlier| earlier.number < number)
+}
+
+/// Whether `keys` can be a recovery's list: 1 to 64 keys, none twice.
+fn check_keys(keys: &[[u8; 32]]) -> Result<(), ChangeEntryError> {
+    if keys.len() > MAX_RECOVERY_KEYS {
+        return Err(ChangeEntryError::TooManyKeys(keys.len()));
+    }
+    if keys.is_empty() {
+        return Err(ChangeEntryError::NoKeys);
+    }
+    let mut sorted: Vec<&[u8; 32]> = keys.iter().collect();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ChangeEntryError::KeyTwice);
+    }
+    Ok(())
+}
+
+/// The keys of `lists`, in the order of the lists and within each of its
+/// keys, each key once, and as far as 64 keys in all allow.
+fn each_once<'a>(lists: impl Iterator<Item = &'a [[u8; 32]]>) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = Vec::new();
+    for key in lists.flatten() {
+        if keys.len() < MAX_RECOVERY_KEYS && !keys.contains(key) {
+            keys.push(*key);
+        }
+    }
+    keys
+}
+
 fn only_zeros(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
@@ -526,7 +665,13 @@ impl fmt::Debug for ForPhrase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ForPhrase")
             .field("earlier", &self.earlier)
-            .field("recovered_from", &self.recovered_from.len())
+            .field(
+                "recovery_keys",
+                &self
+                    .recovery_keys
+                    .as_ref()
+                    .map(|list| (list.number, list.keys.len())),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -663,6 +808,26 @@ mod tests {
         said
     }
 
+    /// A recovery's list: the number of its statement, and the keys of the
+    /// devices numbered `devices`, in that order.
+    fn listed(number: u64, devices: &[u16]) -> Option<RecoveryKeys> {
+        Some(RecoveryKeys {
+            number,
+            keys: devices.iter().map(|n| key(*n)).collect(),
+        })
+    }
+
+    /// The part for the phrase in the entry of a recovery from statement 5
+    /// of [`statements`], under which devices 1, 0 and 3 counted.
+    fn recovery_from_5() -> ForPhrase {
+        ForPhrase::recovering(
+            secret(6),
+            &[(5, &for_phrase_of(5))],
+            &[key(1), key(0), key(3)],
+        )
+        .unwrap()
+    }
+
     fn opened_by(content: &[u8], number: u64, keys: &Keys, n: u16) -> ForDevice {
         open_for_device(
             content,
@@ -748,7 +913,9 @@ mod tests {
         assert!(!only_zeros(&said[end - 92..end]));
 
         // For the phrase: the secret, a count and each earlier secret
-        // behind its statement's number, a count and each listed key.
+        // behind its statement's number, and a count: 0 where there is no
+        // list, and otherwise the number of the recovery's statement and
+        // each listed key after it.
         let said = open_part(
             phrase_part,
             &keys.seal_key,
@@ -765,11 +932,12 @@ mod tests {
         assert!(only_zeros(&said[expected.len()..]));
 
         let listing = ForPhrase {
-            recovered_from: vec![key(4), key(1)],
+            recovery_keys: listed(2, &[4, 1]),
             ..for_phrase_of(2)
         };
         let mut expected = expected[..expected.len() - 2].to_vec();
         expected.extend_from_slice(&[0, 2]);
+        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 2]);
         expected.extend_from_slice(&key(4));
         expected.extend_from_slice(&key(1));
         assert_eq!(listing.to_bytes(), expected);
@@ -1420,10 +1588,17 @@ mod tests {
                     secret: secret(100 + n),
                 })
                 .collect(),
-            recovered_from: (100..164).map(key).collect(),
+            recovery_keys: Some(RecoveryKeys {
+                number: 256,
+                keys: (100..164).map(key).collect(),
+            }),
         };
         assert_eq!(said.earlier.len(), MAX_EARLIER_SECRETS);
-        assert_eq!(said.recovered_from.len(), MAX_RECOVERY_KEYS);
+        assert_eq!(
+            said.recovery_keys.as_ref().unwrap().keys.len(),
+            MAX_RECOVERY_KEYS
+        );
+        assert_eq!(said.validate(256), Ok(()));
 
         let content = build(&signed_full, &said, &keys.statement_key, &keys.seal_key).unwrap();
         assert_eq!(content.len(), 32_768);
@@ -1435,8 +1610,8 @@ mod tests {
         assert_eq!(devices_say, 26_676);
         assert_eq!(CHANGE_ENTRY_DEVICES_PART_BYTES - 12 - 16, 28_644);
         let phrase_says = said.to_bytes().len();
-        assert_eq!(phrase_says, 32 + 2 + 8 * 40 + 2 + 64 * 32);
-        assert_eq!(phrase_says, 2404);
+        assert_eq!(phrase_says, 32 + 2 + 8 * 40 + 2 + 8 + 64 * 32);
+        assert_eq!(phrase_says, 2412);
         assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES - 12 - 16, 4068);
 
         let (devices_part, _) = parts(&content).unwrap();
@@ -1473,14 +1648,11 @@ mod tests {
         let [.., five] = statements(&phrase);
         // A recovery from statement 5, on a new machine: it lists itself
         // alone, removes the device that is gone, and lists for the phrase
-        // the device keys of the statement it recovered from.
+        // the keys that counted under the statement it recovered from.
         let recovery = five
             .next(key(9), &secret(6), devices(&[9]), &[key(3)])
             .unwrap();
-        let said = ForPhrase {
-            recovered_from: vec![key(1), key(0), key(3)],
-            ..for_phrase_of(6)
-        };
+        let said = recovery_from_5();
         let content = entry(&phrase, &recovery, &said);
         let read = open_for_phrase(&content, 6, &keys.phrase_key, &keys.seal_key).unwrap();
         assert_eq!(read, said);
@@ -1491,12 +1663,14 @@ mod tests {
         for earlier in &read.earlier {
             assert_eq!(earlier.secret, secret(earlier.number as u8));
         }
-        // The listed keys keep the order they were given in.
-        assert_eq!(read.recovered_from, vec![key(1), key(0), key(3)]);
-        // An entry that no recovery made lists none.
+        // The listed keys keep the order they were given in, and have the
+        // number of the recovery's statement.
+        assert_eq!(read.recovery_keys, listed(6, &[1, 0, 3]));
+        // An entry that no recovery made, and that follows none, lists
+        // none.
         let plain = entry(&phrase, &five, &for_phrase_of(5));
         let read = open_for_phrase(&plain, 5, &keys.phrase_key, &keys.seal_key).unwrap();
-        assert!(read.recovered_from.is_empty());
+        assert_eq!(read.recovery_keys, None);
     }
 
     /// The command that has the phrase opens the part of the entry before,
@@ -1505,7 +1679,7 @@ mod tests {
     #[test]
     fn the_earlier_secrets_are_copied_forward_from_the_entry_before() {
         assert!(ForPhrase::first(secret(1)).earlier.is_empty());
-        assert!(ForPhrase::first(secret(1)).recovered_from.is_empty());
+        assert_eq!(ForPhrase::first(secret(1)).recovery_keys, None);
 
         let mut said = ForPhrase::first(secret(1));
         for n in 2..=12u8 {
@@ -1526,16 +1700,180 @@ mod tests {
         assert_eq!(said.earlier.first().unwrap().number, 11);
         assert_eq!(said.earlier.last().unwrap().number, 4);
 
-        // The keys that a recovery listed are that entry's own, and are
-        // not copied forward.
-        let recovery = ForPhrase {
-            recovered_from: vec![key(0), key(1)],
-            ..for_phrase_of(3)
+        // No recovery is among them, and none of them has a list.
+        assert_eq!(said.recovery_keys, None);
+    }
+
+    // ── A recovery's list ────────────────────────────────────────────
+
+    /// A recovery lists every key by which it read the generation it
+    /// recovered from, under the number of its own statement: the keys are
+    /// for the generations below that number.
+    #[test]
+    fn a_recovery_lists_the_keys_it_read_by_under_its_statements_number() {
+        let recovery = recovery_from_5();
+        assert_eq!(recovery.secret, secret(6));
+        assert_eq!(recovery.recovery_keys, listed(6, &[1, 0, 3]));
+        // Its secrets are copied forward as any statement's are.
+        assert_eq!(recovery.earlier, for_phrase_of(6).earlier);
+        assert_eq!(recovery.validate(6), Ok(()));
+
+        // A recovery that settles two branches is numbered above both, and
+        // so is its list.
+        let short = ForPhrase::following(secret(0xb3), &[(2, &for_phrase_of(2))]);
+        let settling =
+            ForPhrase::recovering(secret(9), &[(3, &short), (5, &for_phrase_of(5))], &[key(1)])
+                .unwrap();
+        assert_eq!(settling.recovery_keys, listed(6, &[1]));
+        assert_eq!(settling.validate(6), Ok(()));
+    }
+
+    /// A removal or a renewal made after a recovery copies the list forward
+    /// with the secrets, under the number it has, for as long as its entry
+    /// still holds the secret of a generation that the list is for. Once
+    /// none is held the list is dropped.
+    #[test]
+    fn a_recoverys_list_goes_forward_while_a_secret_it_is_for_is_held() {
+        let recovery = recovery_from_5();
+        // A removal that follows the recovery: statement 7.
+        let mut said = ForPhrase::following(secret(7), &[(6, &recovery)]);
+        assert_eq!(said.recovery_keys, listed(6, &[1, 0, 3]));
+        assert_eq!(said.validate(7), Ok(()));
+
+        // And each statement after it, up to statement 13, whose entry
+        // holds the secrets of 12 down to 5: one generation below 6.
+        for n in 8..=13u8 {
+            said = ForPhrase::following(secret(n), &[(u64::from(n) - 1, &said)]);
+            assert_eq!(said.recovery_keys, listed(6, &[1, 0, 3]), "{n}");
+            assert_eq!(said.validate(u64::from(n)), Ok(()), "{n}");
+        }
+        assert_eq!(said.earlier.len(), 8);
+        assert_eq!(said.earlier.last().unwrap().number, 5);
+
+        // The entry of statement 14 holds 13 down to 6: nothing that the
+        // list is for. It is dropped there, and it does not come back.
+        for n in 14..=16u8 {
+            said = ForPhrase::following(secret(n), &[(u64::from(n) - 1, &said)]);
+            assert_eq!(said.recovery_keys, None, "{n}");
+            assert_eq!(said.validate(u64::from(n)), Ok(()), "{n}");
+        }
+        assert_eq!(said.earlier.last().unwrap().number, 8);
+    }
+
+    /// A recovery after a recovery: its own keys first, then the earlier
+    /// list's, none twice, under the number of its own statement.
+    #[test]
+    fn a_recovery_after_a_recovery_lists_its_own_keys_first() {
+        let first = recovery_from_5();
+        assert_eq!(first.recovery_keys, listed(6, &[1, 0, 3]));
+
+        // The second recovers from statement 6, under which the first new
+        // machine counted (device 9), and device 1, added again since.
+        let second = ForPhrase::recovering(secret(7), &[(6, &first)], &[key(9), key(1)]).unwrap();
+        assert_eq!(second.recovery_keys, listed(7, &[9, 1, 0, 3]));
+        assert_eq!(second.validate(7), Ok(()));
+        // And a third, from the second.
+        let third = ForPhrase::recovering(secret(8), &[(7, &second)], &[key(8)]).unwrap();
+        assert_eq!(third.recovery_keys, listed(8, &[8, 9, 1, 0, 3]));
+        assert_eq!(third.validate(8), Ok(()));
+
+        // A recovery after a removal that followed a recovery: the removal
+        // copied the list forward, and the recovery copies it on.
+        let removal = ForPhrase::following(secret(7), &[(6, &first)]);
+        let later = ForPhrase::recovering(secret(8), &[(7, &removal)], &[key(9)]).unwrap();
+        assert_eq!(later.recovery_keys, listed(8, &[9, 1, 0, 3]));
+
+        // The earlier list is copied only while a secret that it is for is
+        // held. A recovery from statement 13, whose entry still carries the
+        // list, makes an entry that holds 13 down to 6: its list is its
+        // own keys alone.
+        let mut said = removal;
+        for n in 8..=13u8 {
+            said = ForPhrase::following(secret(n), &[(u64::from(n) - 1, &said)]);
+        }
+        assert_eq!(said.recovery_keys, listed(6, &[1, 0, 3]));
+        let far = ForPhrase::recovering(secret(14), &[(13, &said)], &[key(9)]).unwrap();
+        assert_eq!(far.recovery_keys, listed(14, &[9]));
+        assert_eq!(far.validate(14), Ok(()));
+    }
+
+    /// The order and the bound. A recovery's own keys are all listed, in
+    /// the order they were given. The earlier list's follow, as far as 64
+    /// keys in all allow. The recovery's own keys are never cut.
+    #[test]
+    fn a_recoverys_list_holds_its_own_keys_whole_and_64_keys_in_all() {
+        let keys_of =
+            |devices: &[u16]| -> Vec<[u8; 32]> { devices.iter().map(|n| key(*n)).collect() };
+        // The entry before carries a list of ten keys.
+        let earlier: Vec<u16> = (200..210).collect();
+        let before = ForPhrase {
+            recovery_keys: listed(5, &earlier),
+            ..for_phrase_of(5)
         };
-        assert!(
-            ForPhrase::following(secret(4), &[(3, &recovery)])
-                .recovered_from
-                .is_empty()
+        assert_eq!(before.validate(5), Ok(()));
+        let recovering =
+            |own: &[u16]| ForPhrase::recovering(secret(6), &[(5, &before)], &keys_of(own));
+
+        // Sixty of its own, two of which the earlier list has too: room
+        // for the first four others of the earlier list, in its order.
+        let mut own: Vec<u16> = (0..58).collect();
+        own.extend([203, 201]);
+        let mut all = own.clone();
+        all.extend([200, 202, 204, 205]);
+        assert_eq!(all.len(), 64);
+        assert_eq!(recovering(&own).unwrap().recovery_keys, listed(6, &all));
+
+        // A few of its own: every key of the earlier list after them.
+        let mut all = vec![7, 3];
+        all.extend(&earlier);
+        assert_eq!(recovering(&[7, 3]).unwrap().recovery_keys, listed(6, &all));
+
+        // Sixty-four of its own: none of the earlier list's.
+        let own: Vec<u16> = (0..64).collect();
+        assert_eq!(recovering(&own).unwrap().recovery_keys, listed(6, &own));
+        // Sixty-five: refused, and not cut to 64.
+        let own: Vec<u16> = (0..65).collect();
+        assert_eq!(recovering(&own), Err(ChangeEntryError::TooManyKeys(65)));
+        // A key twice among its own, and no key at all.
+        assert_eq!(recovering(&[1, 2, 1]), Err(ChangeEntryError::KeyTwice));
+        assert_eq!(recovering(&[]), Err(ChangeEntryError::NoKeys));
+        // A recovery from no entry: there is no generation for its list.
+        assert_eq!(
+            ForPhrase::recovering(secret(1), &[], &[key(0)]),
+            Err(ChangeEntryError::KeysForNothingHeld(1))
+        );
+    }
+
+    /// A settlement copies a recovery's list forward from either branch.
+    /// Where both branches carry one, the later recovery's keeps its
+    /// number and its keys come first.
+    #[test]
+    fn a_settlement_copies_a_recoverys_list_forward_from_either_branch() {
+        let two = for_phrase_of(2);
+        // One branch is a recovery at statement 3. The other is two
+        // statements with no recovery among them.
+        let recovered =
+            ForPhrase::recovering(secret(0xa3), &[(2, &two)], &[key(0), key(1)]).unwrap();
+        let b3 = ForPhrase::following(secret(0xb3), &[(2, &two)]);
+        let b4 = ForPhrase::following(secret(0xb4), &[(3, &b3)]);
+
+        let settled = ForPhrase::following(secret(5), &[(3, &recovered), (4, &b4)]);
+        assert_eq!(settled.recovery_keys, listed(3, &[0, 1]));
+        assert_eq!(settled.validate(5), Ok(()));
+        assert_eq!(
+            ForPhrase::following(secret(5), &[(4, &b4), (3, &recovered)]),
+            settled
+        );
+
+        // A recovery on the other branch too, at statement 5.
+        let other = ForPhrase::recovering(secret(0xb5), &[(4, &b4)], &[key(2), key(1)]).unwrap();
+        assert_eq!(other.recovery_keys, listed(5, &[2, 1]));
+        let both = ForPhrase::following(secret(6), &[(3, &recovered), (5, &other)]);
+        assert_eq!(both.recovery_keys, listed(5, &[2, 1, 0]));
+        assert_eq!(both.validate(6), Ok(()));
+        assert_eq!(
+            ForPhrase::following(secret(6), &[(5, &other), (3, &recovered)]),
+            both
         );
     }
 
@@ -1649,7 +1987,7 @@ mod tests {
         let nine = ForPhrase {
             secret: secret(11),
             earlier: earlier(&[10, 9, 8, 7, 6, 5, 4, 3, 2]),
-            recovered_from: Vec::new(),
+            recovery_keys: None,
         };
         refused(nine, 11, ChangeEntryError::TooManyEarlier(9));
 
@@ -1690,7 +2028,7 @@ mod tests {
 
         // The listed keys: 64 and no more, and none twice.
         let listing = |keys: Vec<[u8; 32]>| ForPhrase {
-            recovered_from: keys,
+            recovery_keys: Some(RecoveryKeys { number: 5, keys }),
             ..good.clone()
         };
         assert_eq!(listing((0..64).map(key).collect()).validate(5), Ok(()));
@@ -1703,6 +2041,42 @@ mod tests {
             listing(vec![key(0), key(1), key(0)]),
             5,
             ChangeEntryError::KeyTwice,
+        );
+        // A list is of at least one key: with none, there is no list.
+        let no_keys = listing(Vec::new());
+        assert_eq!(no_keys.validate(5), Err(ChangeEntryError::NoKeys));
+        assert_eq!(
+            build(
+                &signed(&five, &phrase),
+                &no_keys,
+                &keys.statement_key,
+                &keys.seal_key
+            ),
+            Err(ChangeEntryError::NoKeys)
+        );
+
+        // The list's number is that of a recovery's statement: this
+        // entry's or one before it, and one with the secret of a generation
+        // below it still held. This entry holds those of 4 down to 1.
+        let listing_at = |number: u64| ForPhrase {
+            recovery_keys: listed(number, &[0]),
+            ..good.clone()
+        };
+        for number in [2, 3, 4, 5] {
+            assert_eq!(listing_at(number).validate(5), Ok(()), "{number}");
+        }
+        refused(listing_at(6), 5, ChangeEntryError::KeysFromLater(6));
+        refused(listing_at(256), 5, ChangeEntryError::KeysFromLater(256));
+        refused(listing_at(1), 5, ChangeEntryError::KeysForNothingHeld(1));
+        refused(listing_at(0), 5, ChangeEntryError::KeysForNothingHeld(0));
+        // An entry that holds no earlier secret carries no list.
+        let alone = ForPhrase {
+            recovery_keys: listed(1, &[0]),
+            ..ForPhrase::first(secret(1))
+        };
+        assert_eq!(
+            alone.validate(1),
+            Err(ChangeEntryError::KeysForNothingHeld(1))
         );
     }
 
@@ -1718,7 +2092,7 @@ mod tests {
             open_for_phrase(&content, 5, &keys.phrase_key, &keys.seal_key)
         };
         let good = ForPhrase {
-            recovered_from: vec![key(0)],
+            recovery_keys: listed(5, &[0]),
             ..for_phrase_of(5)
         };
         let said = good.to_bytes();
@@ -1765,7 +2139,8 @@ mod tests {
         // A part that ends before what it counts: read alone, with no
         // zeros after it to stand for what is missing.
         let short = ChangeEntryError::Malformed;
-        for length in [0, 31, 33, 35, 74, said.len() - 1] {
+        assert_eq!(said.len(), 32 + 2 + 4 * 40 + 2 + 8 + 32);
+        for length in [0, 31, 33, 35, 74, 196, 199, 204, said.len() - 1] {
             assert_eq!(
                 ForPhrase::from_bytes(&said[..length]),
                 Err(short.clone()),
@@ -1783,11 +2158,14 @@ mod tests {
                 number: 3,
                 secret: [0x9d; 32],
             }],
-            recovered_from: vec![[0x9e; 32]],
+            recovery_keys: Some(RecoveryKeys {
+                number: 4,
+                keys: vec![[0x9e; 32]],
+            }),
         };
         assert_eq!(
             format!("{said:?}"),
-            "ForPhrase { earlier: [Earlier(3)], recovered_from: 1, .. }"
+            "ForPhrase { earlier: [Earlier(3)], recovery_keys: Some((4, 1)), .. }"
         );
         assert_eq!(
             format!(
