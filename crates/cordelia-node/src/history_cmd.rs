@@ -432,8 +432,8 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
             }
             None if wrote => out.push_str(
                 "  What it replaced is kept, but its record could not be made final. It is \
-                 listed, marked as not finished, after the next sweep of history: within the \
-                 hour, or when the node starts.\n",
+                 listed, marked as not finished, after the next sweep of history: within an \
+                 hour that the machine is awake, or when the node starts.\n",
             ),
             None => {}
         }
@@ -509,8 +509,18 @@ fn dropped(answer: &Value, all: bool) -> String {
     if all {
         return format!("Dropped {removed} records from this device.\n{left}{WHAT_STAYS}");
     }
+    // A record left unfinished that cannot be read is nobody's by what it
+    // says, and may hold the text all the same: a drop that names records
+    // leaves it, and says that it is there.
+    let unread = match answer["unreadable"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        unread => format!(
+            "{unread} unfinished records cannot be read, and may hold the same text: only \
+             `cordelia history drop --all` removes them.\n"
+        ),
+    };
     if removed == 0 && left.is_empty() {
-        return "No such records. Nothing was dropped.\n".to_string();
+        return format!("No such records. Nothing was dropped.\n{unread}");
     }
     // Each with the name its folder syncs under: what was typed is taken
     // as a name and as a directory, and can be two agents'.
@@ -525,6 +535,7 @@ fn dropped(answer: &Value, all: bool) -> String {
         ));
     }
     out.push_str(&left);
+    out.push_str(&unread);
     out.push_str(WHAT_STAYS);
     out
 }
@@ -909,6 +920,22 @@ mod tests {
             dropped(&none, false),
             "No such records. Nothing was dropped.\n"
         );
+        // An unfinished record that cannot be read is nobody's by what it
+        // says, and may hold the text: it is said to be there, whether or
+        // not anything else went.
+        let unread = json!({ "dropped": [], "removed": 0, "unreadable": 2 });
+        let out = dropped(&unread, false);
+        assert!(
+            out.starts_with("No such records. Nothing was dropped.\n2 unfinished records"),
+            "{out}"
+        );
+        assert!(out.contains("drop --all"), "{out}");
+        let both = json!({ "removed": 1, "unreadable": 1, "dropped": [
+            { "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
+              "at": "2026-10-03T11:00:00Z" },
+        ]});
+        let out = dropped(&both, false);
+        assert!(out.contains("1 unfinished records cannot be read"), "{out}");
         let some = json!({ "removed": 2, "dropped": [
             { "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
               "at": "2026-10-03T11:00:00Z" },

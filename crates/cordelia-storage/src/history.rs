@@ -574,9 +574,10 @@ impl Store {
     }
 
     /// Remove records from this device, each by itself: one that cannot
-    /// be removed is passed over, and the rest go. Returns how many went,
-    /// and the ids of those that are still there.
-    pub fn remove(&self, ids: &[Id]) -> (usize, Vec<Id>) {
+    /// be removed is passed over, and the rest go. Returns the ids of
+    /// those that went, and of those that are still there. One that was
+    /// not there to remove is in neither.
+    pub fn remove(&self, ids: &[Id]) -> (Vec<Id>, Vec<Id>) {
         self.remove_by(ids, &|path| std::fs::remove_file(path))
     }
 
@@ -585,13 +586,13 @@ impl Store {
         &self,
         ids: &[Id],
         unlink: &dyn Fn(&Path) -> std::io::Result<()>,
-    ) -> (usize, Vec<Id>) {
-        let mut removed = 0;
+    ) -> (Vec<Id>, Vec<Id>) {
+        let mut removed = Vec::new();
         let mut left = Vec::new();
         for id in ids {
             if let Some((path, _)) = self.path_of(id) {
                 match unlink(&path) {
-                    Ok(()) => removed += 1,
+                    Ok(()) => removed.push(id.clone()),
                     Err(_) => left.push(id.clone()),
                 }
             }
@@ -857,7 +858,7 @@ mod tests {
         assert_eq!(files(tmp.path()), [format!("{id}.pending")]);
         assert!(s.list().unwrap().records.is_empty());
         assert!(s.read(&id).unwrap().is_none());
-        assert_eq!(s.remove(std::slice::from_ref(&id)), (0, vec![]));
+        assert_eq!(s.remove(std::slice::from_ref(&id)), (vec![], vec![]));
 
         // The change is not made: the record goes with it.
         drop(pending);
@@ -886,7 +887,10 @@ mod tests {
             .map(|r| (r.id, r.interrupted))
             .collect();
         assert_eq!(listed, [(stopped.clone(), true), (id.clone(), false)]);
-        assert_eq!(s.remove(&[stopped, id]), (2, vec![]));
+        assert_eq!(
+            s.remove(&[stopped.clone(), id.clone()]),
+            (vec![stopped, id], vec![])
+        );
         assert!(files(tmp.path()).is_empty());
     }
 
@@ -1193,7 +1197,6 @@ mod tests {
         );
     }
 
-    /// What a sweep cannot remove does not stop it: the rest still go.
     /// A removal goes on past a record that cannot be removed: the rest
     /// go, and the answer names the one that is still there. (What removes
     /// a file is given here, so that this is shown for any user: a
@@ -1210,10 +1213,13 @@ mod tests {
             true => Err(std::io::Error::other("held")),
             false => std::fs::remove_file(path),
         };
-        assert_eq!(s.remove_by(&ids, &unlink), (2, vec![ids[1].clone()]));
+        let (went, stayed) = s.remove_by(&ids, &unlink);
+        assert_eq!(went, [ids[0].clone(), ids[2].clone()]);
+        assert_eq!(stayed, [ids[1].clone()]);
         assert_eq!(files(tmp.path()), [ids[1].as_str().to_string()]);
-        // One that is not there is passed over, and is not still there.
-        assert_eq!(s.remove(&ids), (1, vec![]));
+        // One that is not there is passed over: it neither went nor is
+        // still there.
+        assert_eq!(s.remove(&ids), (vec![ids[1].clone()], vec![]));
         assert_eq!(files(tmp.path()), Vec::<String>::new());
     }
 
@@ -1234,6 +1240,7 @@ mod tests {
         assert!(!s.remove_pending(&id).unwrap());
     }
 
+    /// What a sweep cannot remove does not stop it: the rest still go.
     #[test]
     fn test_a_sweep_goes_on_past_what_it_cannot_remove() {
         let tmp = tempfile::tempdir().unwrap();

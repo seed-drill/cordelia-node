@@ -2118,6 +2118,13 @@ fn api_post(
 const STILL_WAITING_AFTER: std::time::Duration =
     std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_TURN_WAIT_SECS + 2);
 
+/// When a command that waits for the node says that it is still waiting:
+/// only where it waits with no limit of its own, and then once
+/// [`STILL_WAITING_AFTER`] is up.
+fn said_after(limit: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    limit.is_none().then_some(STILL_WAITING_AFTER)
+}
+
 /// Run `say` if nothing has come on `done`, and its other end is still
 /// held, when `wait` is up. The other end is dropped when the node has
 /// answered.
@@ -2184,9 +2191,7 @@ fn api_post_within(
     })?;
 
     let agent: ureq::Agent = client.http_status_as_error(false).build().into();
-    // With no limit, the command says once that it is still waiting.
-    let say_after = limit.is_none().then_some(STILL_WAITING_AFTER);
-    let sent = saying_if_long(say_after, still_waiting, || {
+    let sent = saying_if_long(said_after(limit), still_waiting, || {
         agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", token.trim()))
@@ -4174,9 +4179,11 @@ mod tests {
             said.fetch_add(1, Ordering::SeqCst);
         };
         let soon = std::time::Duration::from_millis(20);
-        // Still waiting when the time is up.
+        // Still waiting when the time is up, and not before it is.
         let (answered, done) = std::sync::mpsc::channel::<()>();
+        let began = std::time::Instant::now();
         say_if_not_done(done, soon, say);
+        assert!(began.elapsed() >= soon, "said before the wait was up");
         assert_eq!(said.load(Ordering::SeqCst), 1);
         drop(answered);
         // Answered before it is.
@@ -4195,8 +4202,9 @@ mod tests {
     ///
     /// Nothing here has to happen inside a stretch of time. What says it
     /// holds something that is let go of with it, so the test learns when
-    /// nobody can say it any more; and each wait below is a limit on a
-    /// failure, not a time that a pass takes.
+    /// nobody can say it any more. The ten seconds and the ten minutes
+    /// below are limits on a failure: a pass waits the twenty
+    /// milliseconds of its first case, and no longer.
     #[test]
     fn test_work_that_takes_long_is_said_to() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4247,6 +4255,17 @@ mod tests {
         let until_let_go = move || let_go(&gone);
         assert!(saying_if_long(None, saying, until_let_go));
         assert_eq!(said.load(Ordering::SeqCst), 1);
+    }
+
+    /// A command says that it is still waiting only where it waits with
+    /// no limit of its own: a restore and a drop, which the node carries
+    /// out to the end. (That those two are the ones that wait so, and
+    /// that this is what they are given, is not under test here.)
+    #[test]
+    fn test_only_a_wait_with_no_limit_is_said() {
+        assert_eq!(said_after(None), Some(STILL_WAITING_AFTER));
+        let limit = Some(std::time::Duration::from_secs(30));
+        assert_eq!(said_after(limit), None);
     }
 
     /// What is done once in each hour (the sweep of local history) is due
