@@ -624,8 +624,14 @@ pub fn drop_records(
     // finished, or it could not be made final. Whoever holds the turn has
     // no change in hand, so each is marked first, and is then listed with
     // the rest. One that cannot be marked is in no listing: it is still
-    // looked at, by what it says of itself.
+    // looked at, by what it says of itself, and goes as it is if it was
+    // to go. (One that says nothing that can be read is no more this
+    // drop's than a record that cannot be read: only `--all` takes those.)
     let stuck = store.recover().map_err(io("cannot be read"))?.left;
+    let stuck: Vec<(&Id, &About)> = stuck
+        .iter()
+        .filter_map(|s| s.about.as_ref().map(|about| (&s.id, about)))
+        .collect();
     let of = request.of.as_deref().unwrap_or_default();
     let dir = claude_dir(state)?;
     let listing = store.list().map_err(io("cannot be read"))?;
@@ -637,7 +643,7 @@ pub fn drop_records(
         .records
         .iter()
         .map(|r| &r.about)
-        .chain(&stuck)
+        .chain(stuck.iter().map(|(_, about)| *about))
         .filter(|about| asked(about))
         .filter_map(|about| about.kept.as_ref().map(|k| k.sha256.as_str()))
         .collect();
@@ -650,18 +656,34 @@ pub fn drop_records(
     let to_go = |about: &About| asked(about) || same_text(about);
     let gone: Vec<&Record> = listing.records.iter().filter(|r| to_go(&r.about)).collect();
     let ids: Vec<Id> = gone.iter().map(|r| r.id.clone()).collect();
-    let (removed, left) = store.remove(&ids);
-    // What was to go and is still pending is still on this device. A drop
-    // that passed it over would say that nothing was left.
-    let stuck = stuck.iter().filter(|about| to_go(about)).count();
+    let (mut removed, left) = store.remove(&ids);
+    let mut dropped: Vec<Line> = gone
+        .into_iter()
+        .filter(|r| !left.contains(&r.id))
+        .map(Line::of)
+        .collect();
+    let mut left = left.len();
+    // What was to go and is still pending goes too, as it is. One that
+    // cannot be removed either is still on this device, and is counted: a
+    // drop that passed it over would say that nothing was left.
+    for (id, about) in stuck.into_iter().filter(|(_, about)| to_go(about)) {
+        match store.remove_pending(id) {
+            Ok(()) => {
+                removed += 1;
+                dropped.push(Line::of(&Record {
+                    id: id.clone(),
+                    about: about.clone(),
+                    interrupted: true,
+                    bytes: 0,
+                }));
+            }
+            Err(_) => left += 1,
+        }
+    }
     Ok(DropResponse {
-        dropped: gone
-            .into_iter()
-            .filter(|r| !left.contains(&r.id))
-            .map(Line::of)
-            .collect(),
+        dropped,
         removed,
-        left: left.len() + stuck,
+        left,
     })
 }
 
@@ -1413,11 +1435,11 @@ mod tests {
     }
 
     /// A record left pending that cannot be marked is in no listing. One
-    /// that was to go, for what was asked or for the text it holds, is
-    /// still on this device, and the answer counts it: a drop that passed
-    /// it over would say that there were no such records.
+    /// that was to go, for what was asked or for the text it holds, goes
+    /// all the same, as it is: a drop that passed it over would say that
+    /// there were no such records, with the text still on the disk.
     #[test]
-    fn test_a_drop_counts_a_pending_record_that_it_cannot_reach() {
+    fn test_a_drop_removes_a_pending_record_that_cannot_be_marked() {
         let n = node();
         let asked = n.left_pending("notes.md", "a token\n", 0);
         let copy = n.left_pending("notes.conflict-0a1b2c3d.md", "a token\n", 1);
@@ -1434,11 +1456,18 @@ mod tests {
             ..Default::default()
         };
         let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
-        assert!(dropped.dropped.is_empty());
-        assert_eq!((dropped.removed, dropped.left), (0, 2));
-        for id in [&asked, &copy, &other] {
-            assert!(history.join(format!("{id}.pending")).is_file());
+        assert_eq!((dropped.removed, dropped.left), (2, 0));
+        let mut ids: Vec<String> = dropped.dropped.iter().map(|l| l.id.clone()).collect();
+        ids.sort();
+        let mut expected = vec![asked.clone(), copy.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert!(dropped.dropped.iter().all(|l| l.interrupted));
+        for id in [&asked, &copy] {
+            assert!(!history.join(format!("{id}.pending")).exists());
         }
+        // Another file's, with another text, is not this drop's.
+        assert!(history.join(format!("{other}.pending")).is_file());
     }
 
     /// A record that cannot be removed is passed over, and the rest that
@@ -1450,6 +1479,9 @@ mod tests {
         let n = node();
         let first = n.kept("notes.md", Change::Pulled, Some("one\n"), 0);
         let second = n.kept("notes.md", Change::Pulled, Some("two\n"), 1);
+        // And one left pending, which in a directory that is closed can
+        // be neither marked nor removed.
+        let pending = n.left_pending("notes.md", "three\n", 2);
         let history = n.state.home_dir.join("history");
         let request = DropRequest {
             of: Some("lab".into()),
@@ -1461,14 +1493,15 @@ mod tests {
             return;
         }
         let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
-        // Neither could go, and each was tried.
-        assert_eq!((dropped.removed, dropped.left), (0, 2));
+        // None could go, and each was tried.
+        assert_eq!((dropped.removed, dropped.left), (0, 3));
         assert!(dropped.dropped.is_empty());
         std::fs::set_permissions(&history, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(n.ids(), [second, first]);
         let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
-        assert_eq!((dropped.removed, dropped.left), (2, 0));
-        assert_eq!(dropped.dropped.len(), 2);
+        assert_eq!((dropped.removed, dropped.left), (3, 0));
+        assert_eq!(dropped.dropped.len(), 3);
+        assert!(dropped.dropped.iter().any(|l| l.id == pending));
     }
 
     /// What a listing shows: how much is kept and from when, the agents

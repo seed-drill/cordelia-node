@@ -741,6 +741,12 @@ folder ends well inside a second, so ten seconds is a cycle that is stuck or
 very large. The node does nothing then, and nothing is queued, so nothing is
 carried out after that answer.
 
+A command that waits for the node with no limit of its own (a restore, a
+drop) says that it is still waiting two seconds after this wait is up, and
+not at the same moment: its wait begins before the request is sent, so at
+ten seconds it would say so just ahead of nearly every "busy" answer. It
+gives up nothing at twelve seconds: it only says that it is waiting.
+
 ### HISTORY_SWEEP_INTERVAL_SECS = 3600
 
 **Rationale:** How often records that are too old, or over the size, are

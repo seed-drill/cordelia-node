@@ -4201,21 +4201,38 @@ mod tests {
         };
         let soon = std::time::Duration::from_millis(20);
         let long = std::time::Duration::from_secs(60);
-        let slow = || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            7
+        // Work that goes on until it is said to once more, or until
+        // `limit` is up: no thread has to wake inside a window for it.
+        let until_said = |said: &Arc<AtomicUsize>, limit: u64| {
+            let said = said.clone();
+            let already = said.load(Ordering::SeqCst);
+            move || {
+                let began = std::time::Instant::now();
+                while said.load(Ordering::SeqCst) == already
+                    && began.elapsed() < std::time::Duration::from_secs(limit)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                7
+            }
         };
+        let slow = until_said(&said, 10);
         assert_eq!(saying_if_long(Some(soon), say(&said), slow), 7);
         assert_eq!(said.load(Ordering::SeqCst), 1);
+        // Done in time: the one who would have said it finds the work
+        // over, and says nothing.
         assert_eq!(saying_if_long(Some(long), say(&said), || 8), 8);
+        // With no wait there is nobody to say it, however long the work
+        // takes: this one goes on for its two seconds.
+        let slow = until_said(&said, 2);
         assert_eq!(saying_if_long(None, say(&said), slow), 7);
-        // Whatever thread was to say it has had its time by now.
-        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(said.load(Ordering::SeqCst), 1);
     }
 
-    /// Local history is swept once in each hour: not before one has
-    /// passed, and not again until another has.
+    /// What is done once in each hour (the sweep of local history) is due
+    /// once in each: not before one has passed, and not again until
+    /// another has. (That the node's loop sweeps when it is due is not
+    /// under test here.)
     #[test]
     fn test_what_is_done_each_hour_is_due_once_in_each() {
         let start = std::time::Instant::now();

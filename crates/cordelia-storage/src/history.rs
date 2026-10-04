@@ -193,10 +193,17 @@ pub struct Listing {
 pub struct Recovered {
     /// How many pending records were marked.
     pub marked: usize,
-    /// What each pending record that could not be marked says of itself,
-    /// where that can be read. These are left as they were, pending, and
-    /// are in no listing.
-    pub left: Vec<About>,
+    /// The pending records that could not be marked. They are left as
+    /// they were, pending, and are in no listing.
+    pub left: Vec<Stuck>,
+}
+
+/// A pending record that could not be marked.
+#[derive(Debug)]
+pub struct Stuck {
+    pub id: Id,
+    /// What it says of itself, where that can be read.
+    pub about: Option<About>,
 }
 
 /// What a sweep removed.
@@ -446,12 +453,20 @@ impl Store {
                     Ok(()) => found.marked += 1,
                     Err(error) => {
                         tracing::warn!(record = %id, %error, "a pending history record could not be marked");
-                        found.left.extend(read_about(&pending));
+                        let about = read_about(&pending);
+                        found.left.push(Stuck { id, about });
                     }
                 }
             }
         }
         Ok(found)
+    }
+
+    /// Remove a pending record that could not be marked: what a drop does
+    /// with one that was to go. Whoever does it holds the turn, so the
+    /// record belongs to no change in hand.
+    pub fn remove_pending(&self, id: &Id) -> std::io::Result<()> {
+        std::fs::remove_file(self.dir.join(format!("{id}{PENDING}")))
     }
 
     /// The names in the directory, sorted: oldest record first. A
