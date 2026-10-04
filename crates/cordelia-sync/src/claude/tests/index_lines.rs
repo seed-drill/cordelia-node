@@ -1354,10 +1354,19 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     entry_at(&p.other, &p.channel, INDEX, &theirs, 2, false);
     deliver(&p.other, &p.st, &p.channel);
     assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
+    // Here too the look finds neither, and no put-back comes as far as
+    // its hold.
+    let tried = std::cell::Cell::new(0);
+    let before_hold = || tried.set(tried.get() + 1);
     for look in 1..20 {
-        let report = cycle_at(&p, 20 + 5 * look);
+        let hooks = Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        };
+        let report = hooked_at(&p, 20 + 5 * look, &hooks);
         assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
     }
+    assert_eq!(tried.get(), 0);
     key_comes(&p.st);
 
     // And arriving at that revision between the cycle's read and the
@@ -1476,24 +1485,19 @@ fn an_entry_of_the_files_slot_that_cannot_be_read_holds_nothing_back() {
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 }
 
-/// An entry of the index's slot that a key this device holds opens, and
-/// that is not an entry's content, is not one that cannot be read: it
-/// counts for nothing, and the line goes back.
-#[test]
-fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
+/// The other device, which counts, stores under the index's name, at
+/// `rev`, an entry that the key both devices hold opens and that is not an
+/// entry's content: bytes that are no JSON.
+fn no_entry_at(p: &Pair, rev: u64) {
     use cordelia_crypto::signing::ItemMetadata;
     use cordelia_crypto::slots::{item_aad, slot_id};
     use cordelia_storage::{items, psk};
-    let p = back_unlisted();
-    // By the other device, which counts, above the entry this device
-    // reads, sealed under the key both hold: bytes that are no JSON.
     let st = &p.other;
     let author = st.identity.public_key();
     let slot = slot_id(
         &psk::read_slot_key(&st.home_dir, &p.channel).unwrap(),
         INDEX,
     );
-    let rev = 9;
     let blob = cordelia_crypto::item_encrypt(
         &psk::read_psk(&st.home_dir, &p.channel).unwrap(),
         b"not an entry",
@@ -1540,6 +1544,17 @@ fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
         .unwrap();
         assert!(stored);
     }
+}
+
+/// An entry of the index's slot that a key this device holds opens, and
+/// that is not an entry's content, is not one that cannot be read: it
+/// counts for nothing, and the line goes back.
+#[test]
+fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
+    let p = back_unlisted();
+    // Above the entry this device reads.
+    let rev = 9;
+    no_entry_at(&p, rev);
     deliver(&p.other, &p.st, &p.channel);
     assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE));
     assert_eq!(a_minute_from(&p, 25).published, 1);
@@ -1624,12 +1639,13 @@ fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
     assert_eq!(kept_in(&store), []);
 
     // An entry arrives under the index's name after the text was kept,
-    // one that this device passes over when it reads the channel (it is
-    // no version of the index), so that only the revision shows it: the
+    // one that this device passes over when it reads the channel (it
+    // opens and is no entry), so that only the revision shows it: the
     // record names a revision that the put-back would no longer have.
+    // Nothing is published, and no record stays.
     let (p, store) = due();
     let before_hold = || {
-        write(&p.other, &p.channel, INDEX, serde_json::json!({ "a": 1 }));
+        no_entry_at(&p, 9);
         deliver(&p.other, &p.st, &p.channel);
     };
     let report = hooked_at(
@@ -1643,6 +1659,18 @@ fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(kept_in(&store), []);
     assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+    // The next cycle's put-back is made above that entry, and its record
+    // names the revision it has.
+    assert_eq!(cycle_at(&p, 90).published, 1);
+    let kept = kept_in(&store);
+    assert_eq!(briefly(&kept), [(INDEX, Change::Merged, Some(OTHER_LINE))]);
+    let me = Pair::shown(&p.st.identity.public_key());
+    let put_back = history::Entry {
+        device: me,
+        rev: 10,
+    };
+    assert_eq!(kept[0].3.replaced_by, Replacement::Entry(put_back));
+    assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, 10);
 }
 
 /// A failure while lines are put back is the index's, reported as any
