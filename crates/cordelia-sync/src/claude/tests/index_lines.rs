@@ -240,21 +240,33 @@ fn what_this_device_publishes_is_written_down() {
 
     // An edit that is not published, because the channel's version moved
     // after the cycle read it, writes nothing down.
-    let before = p.read(INDEX).unwrap();
     p.file(INDEX, "# Memory\n");
     let report = cycle_with_at(&p, 70, &|| {
         p.other_writes(INDEX, Some("# Memory\n- [D](d.md)\n"))
     });
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(rows(&p).len(), 2);
-    let _ = before;
 
-    // The index's own delete is written down for no file.
+    // The index's own delete is written down for no file. (The cycle at
+    // 75 merges the edit that was not published with what arrived, which
+    // comes to what arrived: the folder and the channel agree an index
+    // again.)
+    let report = cycle_at(&p, 75);
+    assert_eq!((report.published, report.pulled), (0, 1), "{report:?}");
+    let agreed = p.held(INDEX);
+    assert_eq!(agreed, p.read(INDEX));
     std::fs::remove_file(p.mem.join(INDEX)).unwrap();
-    p.other_writes("zzz.md", Some("z\n"));
-    cycle_at(&p, 80);
-    cycle_at(&p, 85);
+    let report = cycle_at(&p, 80);
+    assert_eq!(report.published, 1, "{report:?}");
+    // (What the channel holds for the index is a delete: it has no text.)
+    assert_eq!(
+        p.held(INDEX).as_deref(),
+        Some(""),
+        "the delete was published"
+    );
+    assert_eq!(p.read(INDEX), None);
     assert!(rows(&p).iter().all(|(file, ..)| file != INDEX));
+    assert_eq!(rows(&p).len(), 2);
 }
 
 /// A cycle at `t`, with `between` done once it has read the folder and
@@ -843,7 +855,30 @@ fn the_lines_that_are_due_go_back_in_one_publish() {
         assert_eq!(records(&p).len(), 2);
         p
     };
-    // Both back in one cycle: one publish, `notes.md` before `other.md`.
+    // Both back in one cycle, where the index had listed them the other
+    // way round, and the records were made that way round too: one
+    // publish, `notes.md` before `other.md`, by their files' names.
+    let p = Pair::new();
+    p.file("notes.md", "one\n");
+    p.file("other.md", "x\n");
+    p.file(INDEX, &format!("{OTHER_LINE}{NOTES}"));
+    assert_eq!(cycle_at(&p, 0).published, 3);
+    p.file(INDEX, NOTES);
+    std::fs::remove_file(p.mem.join("other.md")).unwrap();
+    assert_eq!(cycle_at(&p, 5).published, 2);
+    p.file(INDEX, "# Memory\n");
+    std::fs::remove_file(p.mem.join("notes.md")).unwrap();
+    assert_eq!(cycle_at(&p, 10).published, 2);
+    p.other_writes("notes.md", Some("two\n"));
+    p.other_writes("other.md", Some("y\n"));
+    assert_eq!(cycle_at(&p, 20).pulled, 2);
+    assert_eq!(a_minute_from(&p, 25).published, 1);
+    assert_eq!(
+        p.read(INDEX).unwrap(),
+        format!("# Memory\n{NOTES}{OTHER_LINE}")
+    );
+
+    // Both back in one cycle: one publish.
     let p = both_deleted();
     p.other_writes("notes.md", Some("two\n"));
     p.other_writes("other.md", Some("y\n"));
@@ -1010,6 +1045,24 @@ fn stands_beside_as(p: &Pair, name: &str, text: &str, deleted: bool) -> AppState
     }
 }
 
+/// Another device's version of `name`, with `text`, takes the place of
+/// the channel's on this device at a tie: an entry at the channel's
+/// revision that wins it. What was the channel's version then stands
+/// beside. Returns that device.
+fn overtakes_at_a_tie(p: &Pair, name: &str, text: &str) -> AppState {
+    let (current, rev, _) = version(&p.st, &p.channel, name).unwrap();
+    let counts = hash_of(&p.st, &p.channel, &current);
+    loop {
+        let device = third(p);
+        let id = entry_at(&device, &p.channel, name, text, rev, false);
+        if hash_of(&device, &p.channel, &id) > counts {
+            deliver(&device, &p.st, &p.channel);
+            assert_eq!(version(&p.st, &p.channel, name).unwrap().0, id);
+            return device;
+        }
+    }
+}
+
 const EXTRA: &str = "- [Extra](extra.md) listed on another device\n";
 
 /// A put-back overtakes every version of the index that stands beside the
@@ -1111,6 +1164,44 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
     stands_beside_as(&p, INDEX, &format!("{OTHER_LINE}{EXTRA}"), true);
     assert_eq!(a_minute_from(&p, 25).published, 1);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+
+    // This device's own older version beside: its lines are taken like
+    // any. It listed a memory that another device then deleted; a third
+    // device's index, without that line, won the tie at its revision;
+    // this device's merge was that index as it stood, so nothing was
+    // published and its own version went on standing beside. The memory
+    // has come back since, and its line is in that version alone.
+    let p = Pair::new();
+    p.file("notes.md", "one\n");
+    p.file("other.md", "x\n");
+    p.file("extra.md", "e\n");
+    p.file(INDEX, &format!("{NOTES}{OTHER_LINE}{EXTRA}"));
+    assert_eq!(cycle_at(&p, 0).published, 4);
+    p.other_writes("extra.md", None);
+    assert_eq!(cycle_at(&p, 5).pulled, 1);
+    std::fs::remove_file(p.mem.join("notes.md")).unwrap();
+    p.file(INDEX, &format!("{OTHER_LINE}{EXTRA}"));
+    assert_eq!(cycle_at(&p, 10).published, 2);
+    let mine = version(&p.st, &p.channel, INDEX).unwrap().0;
+    overtakes_at_a_tie(&p, INDEX, OTHER_LINE);
+    let report = cycle_at(&p, 15);
+    assert_eq!((report.published, report.conflicts), (0, 0), "{report:?}");
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+    let beside: Vec<String> = {
+        let db = p.st.db.lock().unwrap();
+        let entry = entries::current_of(&p.st, &db, &p.channel, INDEX).unwrap();
+        let beside = entry.unwrap().conflicts;
+        beside.into_iter().map(|v| v.item_id).collect()
+    };
+    assert_eq!(beside, [mine], "this device's own version stands beside");
+    p.other_writes("notes.md", Some("two\n"));
+    p.other_writes("extra.md", Some("again\n"));
+    assert_eq!(cycle_at(&p, 20).pulled, 2);
+    assert_eq!(a_minute_from(&p, 25).published, 1);
+    assert_eq!(
+        p.read(INDEX).unwrap(),
+        format!("{OTHER_LINE}{EXTRA}{NOTES}")
+    );
 
     // A line of a version beside for a file that is deleted in the
     // channel is not taken; one for a file that is there is.
@@ -1254,6 +1345,56 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
     assert_eq!(a_minute_from(&p, 90).published, 0);
+
+    // At the revision this device reads, and not above it (this device
+    // reads its own entry, at 2): the same. It is a version that stands
+    // beside, which this device cannot see there.
+    let p = back_unlisted();
+    let key_comes = other_moves_to_a_new_key(&p);
+    entry_at(&p.other, &p.channel, INDEX, &theirs, 2, false);
+    deliver(&p.other, &p.st, &p.channel);
+    assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
+    for look in 1..20 {
+        let report = cycle_at(&p, 20 + 5 * look);
+        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+    }
+    key_comes(&p.st);
+
+    // And arriving at that revision between the cycle's read and the
+    // hold: nothing is published.
+    let p = back_unlisted();
+    for look in 1..13 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    let before_hold = || {
+        let _key_comes = other_moves_to_a_new_key(&p);
+        entry_at(&p.other, &p.channel, INDEX, &theirs, 2, false);
+        deliver(&p.other, &p.st, &p.channel);
+    };
+    let report = hooked_at(
+        &p,
+        85,
+        &Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        },
+    );
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+
+    // An entry that says it is under a key this device holds, and does
+    // not open under it, is one it cannot read: by a device that counts,
+    // above the entry read.
+    let p = back_unlisted();
+    let sealed_otherwise = third(&p);
+    cordelia_storage::psk::write_psk(&sealed_otherwise.home_dir, &p.channel, &[9u8; 32]).unwrap();
+    entry_at(&sealed_otherwise, &p.channel, INDEX, &theirs, 3, false);
+    deliver(&sealed_otherwise, &p.st, &p.channel);
+    assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
+    for look in 1..20 {
+        let report = cycle_at(&p, 20 + 5 * look);
+        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+    }
 
     // Below the revision this device reads: the line goes back. (The
     // other device's first entry for the index, at revision 1, under the
@@ -1405,4 +1546,183 @@ fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
     // Above the entry that counts for nothing.
     assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, rev + 1);
+}
+
+/// A file is not at rest where the channel has no version of it: what is
+/// under its name there is neither a text nor a delete (something written
+/// through the API). The plan has nothing to do for such a file, and it
+/// is still no file that the channel and the folder agree. No line goes
+/// back for it, and none goes back into an index that is in that state:
+/// nothing is published, and nothing is even kept in local history for
+/// a put-back that would then be refused.
+#[test]
+fn a_file_with_no_version_in_the_channel_is_not_at_rest() {
+    for name in ["notes.md", INDEX] {
+        let (p, store) = back_unlisted().with_history();
+        write(&p.other, &p.channel, name, serde_json::json!({ "a": 1 }));
+        deliver(&p.other, &p.st, &p.channel);
+        assert_eq!(version(&p.st, &p.channel, name).unwrap().2, "", "{name}");
+        for look in 1..20 {
+            let report = cycle_at(&p, 20 + 5 * look);
+            assert_eq!(
+                (report.published, report.pulled, report.failed.len()),
+                (0, 0, 0),
+                "{name}, look {look}: {report:?}"
+            );
+        }
+        assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE), "{name}");
+        assert_eq!(kept_in(&store), [], "{name}");
+        assert!(!p.st.home_dir.join("history").exists(), "{name}");
+        assert_eq!(records(&p).len(), 1, "{name}");
+    }
+}
+
+/// With local history on, as a node has it: the index as it was here goes
+/// into history before its lines are put back, as at a merge, in a record
+/// that names the put-back's revision. A put-back that is not made leaves
+/// no record: one that is refused under the hold, and one for which an
+/// entry arrives under the index's name after the text was kept.
+#[test]
+fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
+    use history::{Change, Replacement, Whose};
+    let due = || {
+        let (p, store) = back_unlisted().with_history();
+        for look in 1..13 {
+            assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+        }
+        assert_eq!(kept_in(&store), []);
+        (p, store)
+    };
+
+    let (p, store) = due();
+    let me = Pair::shown(&p.st.identity.public_key());
+    assert_eq!(cycle_at(&p, 85).published, 1);
+    let kept = kept_in(&store);
+    assert_eq!(briefly(&kept), [(INDEX, Change::Merged, Some(OTHER_LINE))]);
+    let about = &kept[0].3;
+    assert_eq!(
+        about.kept.as_ref().unwrap().whose,
+        Whose::Here { agreed: Some(2) }
+    );
+    let put_back = history::Entry { device: me, rev: 3 };
+    assert_eq!(about.replaced_by, Replacement::Entry(put_back));
+    assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, 3);
+
+    // Refused under the hold (the memory's entry changed in the channel
+    // meanwhile): nothing is published, and no record stays.
+    let (p, store) = due();
+    let before_hold = || p.other_writes("notes.md", Some("three\n"));
+    let report = hooked_at(
+        &p,
+        85,
+        &Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        },
+    );
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(kept_in(&store), []);
+
+    // An entry arrives under the index's name after the text was kept,
+    // one that this device passes over when it reads the channel (it is
+    // no version of the index), so that only the revision shows it: the
+    // record names a revision that the put-back would no longer have.
+    let (p, store) = due();
+    let before_hold = || {
+        write(&p.other, &p.channel, INDEX, serde_json::json!({ "a": 1 }));
+        deliver(&p.other, &p.st, &p.channel);
+    };
+    let report = hooked_at(
+        &p,
+        85,
+        &Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        },
+    );
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(kept_in(&store), []);
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+}
+
+/// A failure while lines are put back is the index's, reported as any
+/// file's is, and leaves the folder's other files done: here a file that
+/// arrives in the same cycle is taken. One that is not a file's (the
+/// database cannot be read) is the folder's, and the files are done all
+/// the same.
+#[test]
+fn a_failure_while_lines_are_put_back_leaves_the_other_files_done() {
+    // The index cannot be kept in local history: something that is no
+    // directory is where the history directory would be.
+    let (p, _store) = back_unlisted().with_history();
+    for look in 1..13 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    std::fs::write(p.st.home_dir.join("history"), "in the way").unwrap();
+    p.other_writes("later.md", Some("l\n"));
+    let report = cycle_at(&p, 85);
+    assert_eq!((report.published, report.pulled), (0, 1), "{report:?}");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].name, INDEX);
+    assert!(report.error.is_none(), "{report:?}");
+    assert_eq!(p.read("later.md").as_deref(), Some("l\n"));
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+
+    // The table of records cannot be read when the cycle comes to look.
+    let p = back_unlisted();
+    p.other_writes("later.md", Some("l\n"));
+    let away = |name: &str| {
+        if name == "later.md" {
+            let db = p.st.db.lock().unwrap();
+            db.execute_batch("ALTER TABLE index_lines RENAME TO index_lines_away")
+                .unwrap();
+        }
+    };
+    let report = hooked_at(
+        &p,
+        25,
+        &Hooks {
+            flushed: &away,
+            ..Hooks::NONE
+        },
+    );
+    assert!(report.error.is_some(), "{report:?}");
+    assert_eq!(report.pulled, 1, "{report:?}");
+    assert_eq!(p.read("later.md").as_deref(), Some("l\n"));
+}
+
+/// A record needs both halves, and both from this device. A line taken
+/// out here while the file is kept, where another device then deletes the
+/// file and this device's text beats the delete: no delete was published
+/// here, and nothing is put back. A file deleted here while its line is
+/// kept, which then comes back: the line never went.
+#[test]
+fn a_record_needs_both_of_this_devices_acts() {
+    // The line goes, the file stays; the other device deletes the file,
+    // and this device's edit of it wins.
+    let p = listed();
+    p.file(INDEX, OTHER_LINE);
+    assert_eq!(cycle_at(&p, 10).published, 1);
+    p.file("notes.md", "edited here\n");
+    p.other_writes("notes.md", None);
+    let report = cycle_at(&p, 20);
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(p.read("notes.md").as_deref(), Some("edited here\n"));
+    assert_eq!(
+        rows(&p),
+        [("notes.md".to_string(), true, false, false)],
+        "a line, and no delete of this device's"
+    );
+    assert_eq!(a_minute_from(&p, 25).published, 0);
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+
+    // The file goes, the line stays; the other device's edit brings the
+    // file back.
+    let p = listed();
+    std::fs::remove_file(p.mem.join("notes.md")).unwrap();
+    assert_eq!(cycle_at(&p, 10).published, 1);
+    assert_eq!(rows(&p), [("notes.md".to_string(), false, true, false)]);
+    comes_back_to(&p, 20, &format!("{NOTES}{OTHER_LINE}"));
+    assert_eq!(a_minute_from(&p, 25).published, 0);
+    assert_eq!(p.read(INDEX).unwrap(), format!("{NOTES}{OTHER_LINE}"));
 }

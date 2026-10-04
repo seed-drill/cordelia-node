@@ -65,6 +65,29 @@ pub fn line_removed(
     write_half(conn, folder, channel_id, file, Half::Line(line), now)
 }
 
+/// This device published an edit of the index that removed `lines`: each
+/// a file and the line that was removed for it. They are written as one:
+/// all of them, or none.
+pub fn lines_removed(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    lines: &[(&str, &str)],
+    now: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute_batch("SAVEPOINT index_lines")
+        .map_err(storage)?;
+    let written = lines.iter().try_for_each(|(file, line)| {
+        written(conn, folder, channel_id, file, Half::Line(line), now)
+    });
+    let end = match written {
+        Ok(()) => "RELEASE index_lines",
+        Err(_) => "ROLLBACK TO index_lines; RELEASE index_lines",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    written
+}
+
 /// This device published a delete of `file`.
 pub fn delete_published(
     conn: &Connection,
@@ -583,7 +606,8 @@ mod tests {
         assert_eq!(left(), [pair("/other", "grp_a")]);
     }
 
-    /// A folder has at most 1,024 records. The one that goes for a new
+    /// A folder has at most 1,024 records, and the one just written is
+    /// never the one that goes. The one that goes for a new
     /// one is never the new one: a record with one half before any that
     /// is whole; of those of one kind, the one whose later half is oldest;
     /// of two as old, the one whose file's name sorts first.

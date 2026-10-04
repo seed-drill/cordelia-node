@@ -137,16 +137,18 @@ pub(super) fn published(
             return Ok(());
         };
         let mut seen = HashSet::new();
+        let mut removed = Vec::new();
         for line in over.text.lines() {
             let Some(file) = line_for(line) else {
                 continue;
             };
             // The first of its lines there.
             if seen.insert(file) && !has_line_for(text, file) {
-                index_lines::line_removed(db, folder, channel, file, line.trim_end(), now)?;
+                removed.push((file, line.trim_end()));
             }
         }
-        return Ok(());
+        // One write for the edit, however many lines it dropped.
+        return index_lines::lines_removed(db, folder, channel, &removed, now);
     }
     if names::is_conflict_name(key) {
         return Ok(());
@@ -179,19 +181,23 @@ pub(super) struct Cycle<'a> {
 }
 
 impl Cycle<'_> {
-    /// The text of `key`, if it is at rest as a text: it is there, and
-    /// nothing is planned for it. The plan has nothing to do for a file
-    /// that is there only where the file, the channel's version as the
-    /// cycle read it and the folder's record are one text.
+    /// The text of `key`, if it is at rest as a text: the file, the
+    /// channel's version as the cycle read it and the folder's record are
+    /// one text, with nothing planned for it.
+    ///
+    /// Nothing planned is not enough by itself. The plan also has nothing
+    /// to do for a file that is as the folder agreed while the channel has
+    /// no version of it: what is under its name there is neither a text
+    /// nor a delete (something written through the API). Such a file is
+    /// not at rest.
     fn at_rest(&self, key: &str) -> Option<&Content> {
         if !self.quiet.contains(key) {
             return None;
         }
         let here = self.local.get(key)?;
-        let there = self.remote.get(key).and_then(|r| r.content.as_ref());
-        let agreed = self.agreed.get(key).and_then(|a| a.hash);
-        debug_assert!(there.map(|c| c.hash) == Some(here.hash) && agreed == Some(here.hash));
-        Some(here)
+        let there = self.remote.get(key)?.content.as_ref()?;
+        let agreed = self.agreed.get(key)?;
+        (here.hash == there.hash && agreed.hash == Some(here.hash)).then_some(here)
     }
 }
 
@@ -271,7 +277,7 @@ pub(super) fn look(ctx: &Ctx, cycle: &Cycle, report: &mut FolderReport) -> Resul
             Some(before)
                 if before.found == found
                     && same_beside
-                    && now - before.at.min(now) <= INDEX_LINE_LOOK_GAP_SECS =>
+                    && now - before.at <= INDEX_LINE_LOOK_GAP_SECS =>
             {
                 before.since.min(now)
             }
@@ -291,7 +297,6 @@ pub(super) fn look(ctx: &Ctx, cycle: &Cycle, report: &mut FolderReport) -> Resul
         let db = lock(state)?;
         for file in stayed {
             index_lines::drop_record(&db, folder, channel, file)?;
-            control.look_again(folder, channel, Some(file));
         }
     }
     match (index, due.is_empty()) {
@@ -498,8 +503,17 @@ fn put_back(
             Ok(entry) => {
                 // The count goes up of each record that was due in it,
                 // whether its own line went in or a version beside had
-                // one for its file.
-                index_lines::put_back(&db, folder, channel, &files)?;
+                // one for its file. The entry is published by now: a
+                // count that cannot be written is said, and the file is
+                // still written and the publish still reported.
+                if let Err(error) = index_lines::put_back(&db, folder, channel, &files) {
+                    tracing::warn!(
+                        folder,
+                        channel,
+                        %error,
+                        "lines were put back, and that could not be counted"
+                    );
+                }
                 (text, entry)
             }
             Err(CordeliaError::TooLarge { .. }) => {

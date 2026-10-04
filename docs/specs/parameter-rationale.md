@@ -791,7 +791,8 @@ file back over that delete, the line can still be put back.
 
 **Rationale:** A bound on a table that an agent's edits fill. A folder
 with more than a thousand memories deleted with their lines in ninety days
-is not a case to serve whole: past the bound a record with one half goes
+is not a case to serve whole: past the bound a record goes for each new
+one, and never the one just written. Of the others, one with one half goes
 before any that is whole (an index written anew drops many lines at once,
 and those halves go within the hour anyway), and then the oldest.
 

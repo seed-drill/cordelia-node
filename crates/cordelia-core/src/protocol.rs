@@ -657,8 +657,9 @@ pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
 ///   both in one go; the hour covers a node that was stopped in between.
 /// - A whole record lasts as long as a delete is kept: after that the
 ///   delete it answers to is gone from every node.
-/// - A folder keeps at most 1,024 records: the number of names a channel's
-///   state may list ([`MAX_STATE_KEYS`]).
+/// - A folder keeps at most 1,024 records: a bound on a table that an
+///   agent's edits fill. Past it a record goes for each new one, and
+///   never the one just written.
 /// - A line is put back at most three times for one record: twice past
 ///   the first, for a merge that takes it out again, and no more, so that
 ///   two devices cannot go on undoing each other.
