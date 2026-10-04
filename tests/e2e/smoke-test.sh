@@ -24,6 +24,19 @@ CORDELIA_HOME="$TMPDIR_ROOT/cordelia-home"
 CONFIG_FILE="$TMPDIR_ROOT/config.toml"
 DAEMON_PID=""
 
+# None of the caller's settings reach the node or the commands below. A
+# CORDELIA_ variable in the environment can move the data directory or a
+# port, and the home directory is where a node with no configuration
+# keeps its data: with either, this test would write in a directory that
+# is somebody's. And its requests are to this machine, with the node's
+# token in them: they go through no proxy.
+for var in $(compgen -e); do
+    case "$var" in CORDELIA_*) export -n "$var" ;; esac
+done
+export HOME="$TMPDIR_ROOT/home"
+mkdir -p "$HOME"
+unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+
 PASS=0
 FAIL=0
 TOTAL=0

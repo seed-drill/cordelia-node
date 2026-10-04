@@ -125,13 +125,12 @@ impl Node {
     /// The relays the node will dial if it is started now, as the node
     /// itself works them out from its configuration: its configured
     /// relays, or the default ones for a personal node that names none.
-    /// A bootnode dials nobody.
+    /// That is all a personal node or a relay dials, and a configuration
+    /// with any other role is refused here (see [`assert_a_role_that_is_checked`]).
     pub fn will_dial(&self) -> Vec<String> {
         let config = cordelia_core::config::Config::load(&self.config())
             .unwrap_or_else(|e| panic!("{}: its configuration cannot be read: {e}", self.name));
-        if config.network.role == "bootnode" {
-            return Vec::new();
-        }
+        assert_a_role_that_is_checked(self.name, &config.network.role);
         let named: Vec<(String, Option<String>)> = config
             .network
             .bootnodes
@@ -147,8 +146,9 @@ impl Node {
     }
 
     /// Start the node. Its configuration is read first, as the node will
-    /// read it, and the node is not started if it would dial anything
-    /// that is not on this machine: whatever wrote the configuration, and
+    /// read it, and the node is not started if a relay it would dial is
+    /// not on this machine, or if its role is one whose dialling cannot be
+    /// read from a configuration: whatever wrote the configuration, and
     /// whatever a test did to it since.
     pub fn start(&mut self) {
         for host in self.will_dial() {
@@ -340,13 +340,18 @@ pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 pub const NOWHERE: &str = "127.0.0.1:9";
 
 /// A test node dials nothing that is not on this machine, whatever a test
-/// gives it: an address of this machine's own, or `localhost` where that
-/// name leads nowhere else. No other name is looked up to find out: the
-/// check itself asks nothing of the network.
+/// gives it: a loopback address, or `localhost` where the machine's own
+/// resolver gives that name loopback addresses and no other. No other
+/// name is looked up to find out, so none passes, wherever it leads.
 pub fn assert_on_this_machine(name: &str, addr: &str) {
     use std::net::{IpAddr, ToSocketAddrs};
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    let here = match host.parse::<IpAddr>() {
+    // An IPv6 address is written in brackets where a port follows it.
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    let here = match literal.parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
         Err(_) if host == "localhost" => addr
             .to_socket_addrs()
@@ -356,6 +361,19 @@ pub fn assert_on_this_machine(name: &str, addr: &str) {
     assert!(
         here,
         "the test node {name} would dial {addr}, which is not on this machine"
+    );
+}
+
+/// A personal node and a relay dial the relays they are configured with
+/// and nothing else, so a configuration shows everything they will dial.
+/// A node of any other role also dials the addresses its peers hand it,
+/// which nothing read beforehand can show. The harness makes no such
+/// node, and starts none.
+pub fn assert_a_role_that_is_checked(name: &str, role: &str) {
+    assert!(
+        role == "personal" || role == "relay",
+        "the test node {name} has the role {role:?}: where such a node dials cannot be \
+         read from its configuration, and the harness does not run one"
     );
 }
 
@@ -391,6 +409,7 @@ pub fn node_with_relays(
     role: &str,
     relays: &[(String, Option<String>)],
 ) -> Node {
+    assert_a_role_that_is_checked(name, role);
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
     let mut p2p = free_port();

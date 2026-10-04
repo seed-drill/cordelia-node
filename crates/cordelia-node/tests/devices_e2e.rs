@@ -925,12 +925,39 @@ fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
         (!hosts.is_empty()).then_some(hosts)
     });
     assert_eq!(hosts, [NOWHERE]);
+    // Which is what the harness read from its configuration before it
+    // started the node: the two work the relays out alike.
+    assert_eq!(hosts, n.will_dial());
     n.stop();
 
     // A relay that is given none dials nothing, and is left with none.
     let relay = node("relay", "relay", None);
     let config = std::fs::read_to_string(relay.config()).unwrap();
     assert!(!config.contains("[[network.bootnodes]]"), "{config}");
+    assert!(relay.will_dial().is_empty());
+
+    // And of a relay that is given one, the harness reads what the relay
+    // then says of itself.
+    let mut second = node_with_bootnode("second", "relay", Some(NOWHERE.into()));
+    assert_eq!(second.will_dial(), [NOWHERE]);
+    second.start();
+    wait_for("relay healthy", &[&second], 30, || healthy(&second));
+    let hosts = wait_for("the relay lists its relays", &[&second], 30, || {
+        let hosts: Vec<String> = relays_of(&second)
+            .iter()
+            .filter_map(|relay| relay["host"].as_str().map(String::from))
+            .collect();
+        (!hosts.is_empty()).then_some(hosts)
+    });
+    assert_eq!(hosts, second.will_dial());
+}
+
+/// An address of this machine passes in each form it is written in.
+#[test]
+fn the_harness_takes_an_address_of_this_machine() {
+    for addr in ["127.0.0.1:9", "127.0.0.2:9474", "[::1]:9474", "localhost:9"] {
+        assert_on_this_machine("here", addr);
+    }
 }
 
 /// The harness refuses to give a node a relay that is not on this machine,
@@ -952,11 +979,15 @@ fn the_harness_refuses_to_add_a_relay_that_is_not_on_this_machine() {
     relay.add_relay("relay.example:9474", None);
 }
 
-/// A node is not started if it would dial anything that is not on this
-/// machine, whatever wrote its configuration. Here a test has taken the
-/// stand-in relay out of a personal node's configuration, so that the
-/// node would dial the default relays: the harness reads the configuration
-/// as the node will, and stops before any process exists.
+/// A node is not started if a relay it would dial is not on this machine,
+/// whatever wrote its configuration. Here a test has taken the stand-in
+/// relay out of a personal node's configuration, so that the node would
+/// dial the default relays: the harness reads the configuration as the
+/// node will, and stops before the node is started.
+///
+/// (In each of these tests the node's identity is taken away first. A
+/// node that finds none stops before it opens a socket, so that even with
+/// the check gone, and the node started, nothing would reach a relay.)
 #[test]
 #[should_panic(expected = "not on this machine")]
 fn a_node_that_would_dial_a_public_relay_is_not_started() {
@@ -970,6 +1001,7 @@ fn a_node_that_would_dial_a_public_relay_is_not_started() {
         cordelia_core::protocol::FALLBACK_PEERS.to_vec(),
         "a personal node that names no relay dials the default ones"
     );
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
     n.start();
 }
 
@@ -980,6 +1012,45 @@ fn a_node_that_would_dial_a_public_relay_is_not_started() {
 fn a_node_with_no_configuration_is_not_started() {
     let mut n = node("unconfigured", "personal", None);
     std::fs::remove_file(n.config()).unwrap();
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
+}
+
+/// And for a relay whose configuration has come to name a relay on
+/// another machine. (The address is one kept for documentation.)
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_relay_that_would_dial_another_machine_is_not_started() {
+    let mut relay = node("relay", "relay", None);
+    let mut config = std::fs::read_to_string(relay.config()).unwrap();
+    config.push_str("\n[[network.bootnodes]]\naddr = \"192.0.2.1:9474\"\n");
+    std::fs::write(relay.config(), config).unwrap();
+    assert_eq!(relay.will_dial(), ["192.0.2.1:9474"]);
+    std::fs::remove_file(relay.data_dir().join("identity.key")).unwrap();
+    relay.start();
+}
+
+/// The harness makes personal nodes and relays: a configuration shows
+/// everything those will dial. A node of another role also dials the
+/// addresses its peers hand it, which nothing read beforehand can show,
+/// so the harness makes none.
+#[test]
+#[should_panic(expected = "does not run one")]
+fn the_harness_makes_no_node_whose_dialling_it_cannot_check() {
+    node("boot", "bootnode", None);
+}
+
+/// And it starts none, where a configuration has come to name such a
+/// role.
+#[test]
+#[should_panic(expected = "does not run one")]
+fn a_node_whose_dialling_cannot_be_checked_is_not_started() {
+    let mut n = node("turned", "relay", None);
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    assert!(config.contains("role = \"relay\""), "{config}");
+    let turned = config.replace("role = \"relay\"", "role = \"bootnode\"");
+    std::fs::write(n.config(), turned).unwrap();
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
     n.start();
 }
 

@@ -19,10 +19,21 @@ fi
 CONFIG="$CORDELIA_DATA_DIR/config.toml"
 
 # A node started with no configuration runs on the defaults, and the
-# defaults dial the public relays. A test node never does.
+# defaults dial the public relays. A test node is not started so.
 if [ ! -f "$CONFIG" ]; then
     echo "FATAL: no configuration at /config/config.toml or $CONFIG." >&2
     echo "A test node is not started on the defaults: they dial the public relays." >&2
+    exit 1
+fi
+
+# Nor is a personal node whose configuration names no relay: it dials the
+# public ones as well. (Personal is also the role of a configuration that
+# states none.)
+ROLE=$(sed -n 's/^[[:space:]]*role[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)
+if [ "${ROLE:-personal}" = "personal" ] \
+    && ! grep -Eq '^[[:space:]]*\[\[network\.bootnodes\]\]' "$CONFIG"; then
+    echo "FATAL: $CONFIG is a personal node's and names no relay." >&2
+    echo "A test node is not started so: it would dial the public relays." >&2
     exit 1
 fi
 
