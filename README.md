@@ -15,10 +15,10 @@ Code's memory.
 
 **Pre-release (October 2026).** v1 is built and tested, including end-to-end
 tests with real processes over QUIC through a relay. Two relays are running,
-and `v0.2.0-alpha.6` is the current pre-release, for macOS and Linux:
+and `v0.2.0-alpha.7` is the current pre-release, for macOS and Linux:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.6 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.7 sh
 ```
 
 It is an alpha: expect rough edges, and keep your own backup of anything you
@@ -132,7 +132,9 @@ memory sync. For status bars:
   on. It prints nothing on a machine where Cordelia is not set up.
 - `cordelia status --json` gives the same `state` (`synced`, `syncing`,
   `offline`, `attention`, `off`, `stopped`) and `summary`, with everything a
-  panel or an agent needs: the connected relays, your devices, each folder
+  panel or an agent needs: whether the node is `running` (`null` where the
+  command did not ask it, with why in `not_asked`: the API's address is set to
+  something other than `127.0.0.1` or `::1`), the connected relays, your devices, each folder
   that syncs and its name, what was found and is not syncing, what your
   other devices sync, items waiting to reach a relay and any that a relay
   refused, last change, the conflict files waiting to be merged, the files
