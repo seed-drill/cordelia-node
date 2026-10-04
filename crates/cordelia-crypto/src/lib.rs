@@ -7,6 +7,7 @@
 pub mod aes_gcm;
 pub mod bech32;
 pub mod channel_state;
+pub mod derive;
 pub mod ecies;
 pub mod identity;
 pub mod psk_envelope;
@@ -15,7 +16,7 @@ pub mod slots;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};
-pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256};
+pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256, hkdf_sha256_of};
 pub use identity::{NodeIdentity, verify_swarm_child, x25519_from_ed25519_seed};
 
 use ring::rand::{SecureRandom, SystemRandom};

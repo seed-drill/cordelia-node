@@ -101,13 +101,24 @@ pub fn hkdf_sha256(
     salt: &[u8],
     info: &[u8],
 ) -> Result<[u8; 32], CryptoError> {
+    hkdf_sha256_of(shared_secret, salt, info)
+}
+
+/// [`hkdf_sha256`] from key material of any length: the 16 bytes that a
+/// recovery phrase encodes, or two secrets together (decision 2026-10-04
+/// §2.2, §5, §11).
+pub fn hkdf_sha256_of(
+    key_material: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<[u8; 32], CryptoError> {
     let effective_salt = if salt.is_empty() {
         &[0u8; 32][..]
     } else {
         salt
     };
     let hkdf_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, effective_salt);
-    let prk = hkdf_salt.extract(shared_secret);
+    let prk = hkdf_salt.extract(key_material);
     let info_refs = [info];
     let okm_material = prk
         .expand(&info_refs, WrapKeyLen)
@@ -298,6 +309,29 @@ mod tests {
         assert_eq!(
             hex::encode(okm),
             "f1f4ea6c1d40b1c6a968574803e9e21173846d7b184d522223e8a42705124f9a"
+        );
+    }
+
+    /// RFC 5869, test cases 1 and 3: key material that is not 32 bytes,
+    /// with a salt and with none. The first 32 bytes of each output.
+    #[test]
+    fn hkdf_from_key_material_of_any_length_gives_the_rfc_5869_vectors() {
+        let key_material = [0x0b_u8; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        assert_eq!(
+            hex::encode(hkdf_sha256_of(&key_material, &salt, &info).unwrap()),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+        assert_eq!(
+            hex::encode(hkdf_sha256_of(&key_material, &[], &[]).unwrap()),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+        );
+        // From 32 bytes it is the function that was here before.
+        let secret = [0x4a_u8; 32];
+        assert_eq!(
+            hkdf_sha256_of(&secret, &[], HKDF_INFO).unwrap(),
+            hkdf_sha256(&secret, &[], HKDF_INFO).unwrap()
         );
     }
 

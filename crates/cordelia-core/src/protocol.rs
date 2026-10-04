@@ -842,6 +842,89 @@ pub const MAX_STATEMENT_NUMBER: u64 = 256;
 // Checked at compile time: every statement's number is a band.
 const _: () = assert!(MAX_STATEMENT_NUMBER < 1 << REV_BAND_BITS);
 
+/// The label under which a channel's entry key is derived from its secret
+/// (decision 2026-10-04 §2.1). Every label below is the `info` of
+/// HKDF-SHA256 unless it says otherwise, and no label begins another, so
+/// that no two things can ever be derived alike.
+pub const LABEL_ENTRY_KEY: &[u8] = b"cordelia v2 entry";
+
+/// The label of a channel's slot key (decision 2026-10-04 §2.1).
+pub const LABEL_SLOT_KEY: &[u8] = b"cordelia v2 slot";
+
+/// The label of a channel's signing key, whose public half is the
+/// channel's ID (decision 2026-10-04 §2.1).
+pub const LABEL_CHANNEL_SIGN: &[u8] = b"cordelia v2 sign";
+
+/// The label of the personal channel's secret, from the person secret
+/// (decision 2026-10-04 §2.2).
+pub const LABEL_PERSONAL: &[u8] = b"cordelia v2 personal";
+
+/// The label of the secret of a channel of the person's own, by name. The
+/// name's length, as two bytes, and the name follow it (decision
+/// 2026-10-04 §2.2).
+pub const LABEL_OWN: &[u8] = b"cordelia v2 own";
+
+/// The label of a pair channel's secret. The two devices' public keys
+/// follow it, the lower first (decision 2026-10-04 §2.2).
+pub const LABEL_PAIR: &[u8] = b"cordelia v2 pair";
+
+/// The label of the secret of the phrase's channel, from the phrase
+/// (decision 2026-10-04 §2.2).
+pub const LABEL_RECOVERY: &[u8] = b"cordelia v2 recovery";
+
+/// The label of a locked channel's secret. The name's length, as two
+/// bytes, and the name follow it (decision 2026-10-04 §11).
+pub const LABEL_LOCKED: &[u8] = b"cordelia v2 locked";
+
+/// The label of the phrase's signing key, which signs statements and the
+/// change entry (decision 2026-10-04 §5).
+pub const LABEL_PHRASE_SIGN: &[u8] = b"cordelia v2 phrase sign";
+
+/// The label of the statement key, from the phrase: the key that the part
+/// of a change entry for the devices is under (decision 2026-10-04 §4.6).
+pub const LABEL_PHRASE_STATEMENT: &[u8] = b"cordelia v2 phrase statement";
+
+/// The label of the key that only the phrase gives, which seals the part
+/// of a change entry that is for the phrase (decision 2026-10-04 §4.6).
+pub const LABEL_PHRASE_SEAL: &[u8] = b"cordelia v2 phrase seal";
+
+/// The label a statement's commitment to its secret is hashed under: the
+/// commitment is SHA-256 of this label and the secret (decision 2026-10-04
+/// §4.1).
+pub const LABEL_COMMITMENT: &[u8] = b"cordelia v2 commitment";
+
+/// The label a statement is signed under: the phrase's key signs this
+/// label and the statement's canonical form (decision 2026-10-04 §4.1).
+pub const LABEL_STATEMENT: &[u8] = b"cordelia v2 statement";
+
+/// The label that binds the part of a change entry for the devices to its
+/// statement's number and the phrase's key: the three are the associated
+/// data of its encryption (decision 2026-10-04 §4.6).
+pub const LABEL_CHANGE_DEVICES: &[u8] = b"cordelia v2 change devices";
+
+/// The label that binds the part of a change entry for the phrase, as
+/// [`LABEL_CHANGE_DEVICES`] does the other part.
+pub const LABEL_CHANGE_PHRASE: &[u8] = b"cordelia v2 change phrase";
+
+/// Every label above, for the tests that set one against another.
+pub const LABELS: [&[u8]; 15] = [
+    LABEL_ENTRY_KEY,
+    LABEL_SLOT_KEY,
+    LABEL_CHANNEL_SIGN,
+    LABEL_PERSONAL,
+    LABEL_OWN,
+    LABEL_PAIR,
+    LABEL_RECOVERY,
+    LABEL_LOCKED,
+    LABEL_PHRASE_SIGN,
+    LABEL_PHRASE_STATEMENT,
+    LABEL_PHRASE_SEAL,
+    LABEL_COMMITMENT,
+    LABEL_STATEMENT,
+    LABEL_CHANGE_DEVICES,
+    LABEL_CHANGE_PHRASE,
+];
+
 // ── Assertion tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1290,5 +1373,30 @@ mod tests {
         assert_eq!(REV_BAND_SIZE, 1 << 44);
         assert_eq!(REV_BAND_HALF, 1 << 43);
         assert_eq!(MAX_REV, (1 << 53) - 1);
+    }
+
+    /// The labels the decision names are spelled as it spells them, and no
+    /// label is the beginning of another: two derivations under two labels
+    /// never have the same input, whatever follows the label.
+    #[test]
+    fn test_no_label_begins_another_decision_2026_10_04_2_2() {
+        assert_eq!(LABEL_ENTRY_KEY, b"cordelia v2 entry");
+        assert_eq!(LABEL_SLOT_KEY, b"cordelia v2 slot");
+        assert_eq!(LABEL_CHANNEL_SIGN, b"cordelia v2 sign");
+        assert_eq!(LABEL_PERSONAL, b"cordelia v2 personal");
+        assert_eq!(LABEL_OWN, b"cordelia v2 own");
+        assert_eq!(LABEL_PAIR, b"cordelia v2 pair");
+        assert_eq!(LABEL_RECOVERY, b"cordelia v2 recovery");
+        assert_eq!(LABEL_LOCKED, b"cordelia v2 locked");
+        for (i, one) in LABELS.iter().enumerate() {
+            for (j, other) in LABELS.iter().enumerate() {
+                assert!(
+                    i == j || !other.starts_with(one),
+                    "{:?} begins {:?}",
+                    String::from_utf8_lossy(one),
+                    String::from_utf8_lossy(other)
+                );
+            }
+        }
     }
 }
