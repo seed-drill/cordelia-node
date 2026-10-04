@@ -277,6 +277,7 @@ impl World {
                     relist: Default::default(),
                     sync_control: Default::default(),
                     usable_keys: Default::default(),
+                    history: Default::default(),
                 };
                 Device {
                     st,
@@ -553,6 +554,7 @@ impl World {
             &device.st,
             &device.mem,
             &self.channel,
+            "x",
             "",
             &tag,
             generation,
@@ -812,6 +814,64 @@ fn run(kinds: &[Kind], seed: u64, steps: &[Step]) -> Vec<Vec<(usize, Has)>> {
             devices.into_iter().map(|d| (d, world.has(d))).collect()
         })
         .collect()
+}
+
+/// A run with every device as built, and local history on or off: what
+/// each device has after each step, and how many records were kept.
+fn run_with_history(n: usize, seed: u64, steps: &[Step], on: bool) -> (Vec<Vec<Has>>, usize) {
+    let mut world = World::new(&vec![Kind::Built; n], seed);
+    if on {
+        for device in &world.devices {
+            let store = cordelia_storage::history::Store::new(&device.st.home_dir, 30, 1 << 30);
+            device.st.history.open(store);
+        }
+    }
+    let had = steps
+        .iter()
+        .map(|step| {
+            world.run(step);
+            (0..n).map(|d| world.has(d)).collect()
+        })
+        .collect();
+    let kept = world
+        .devices
+        .iter()
+        .filter_map(|device| device.st.history.store())
+        .map(|store| store.list().unwrap().records.len())
+        .sum();
+    (had, kept)
+}
+
+/// Local history changes nothing in what sync does. Each written
+/// sequence, and some generated ones, are run with every device as built,
+/// once with history off and once with it on: after every step every
+/// device has the same files, the same conflict files, the same versions
+/// of the channel's and the same records. And with history on texts are
+/// kept, so that the two runs are not the same for having done nothing.
+#[test]
+fn local_history_changes_nothing_in_what_sync_does() {
+    let mut sequences: Vec<(String, usize, Vec<Step>)> = written()
+        .into_iter()
+        .map(|(name, n, steps)| (name.to_string(), n, steps))
+        .collect();
+    for n in 2..=4 {
+        for seed in 1..=3 {
+            let mut steps = Dice(seed * 7919 + n as u64).steps(n, 60, true);
+            steps.extend(sync(n));
+            sequences.push((format!("generated, {n} devices, seed {seed}"), n, steps));
+        }
+    }
+    for (name, n, steps) in sequences {
+        for seed in [2, 3] {
+            let (off, none) = run_with_history(n, seed, &steps, false);
+            let (on, kept) = run_with_history(n, seed, &steps, true);
+            assert_eq!(none, 0, "{name}");
+            assert!(kept > 0, "{name}, seed {seed}: nothing was kept");
+            for (i, (off, on)) in off.iter().zip(&on).enumerate() {
+                assert_eq!(off, on, "{name}, seed {seed}, after step {i}");
+            }
+        }
+    }
 }
 
 /// The property, for one sequence: run with every device as before, and

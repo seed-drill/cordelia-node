@@ -2394,3 +2394,185 @@ fn an_edit_overtaken_while_apart_is_kept_on_both_machines() {
         },
     );
 }
+
+/// What sync replaces or removes on a machine can be put back from that
+/// machine (decision 2026-09-30 §4.5b). One machine edits a memory and then
+/// deletes it. Each keeps the text that each change replaced there. A
+/// restore of the text the edit replaced goes to the other machine as an
+/// ordinary edit, and so does its undo; a restore on the machine that did
+/// not make the delete brings the memory back on both. Then one machine
+/// empties the folder: the other lists what was removed, and restoring
+/// those brings every file back on both, with the index that points at
+/// them. Records dropped on one machine are gone from it and from no other.
+#[test]
+fn what_sync_replaced_or_removed_is_put_back_from_either_machine() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let a_mem = claude_folder(&a.home(), &a.home());
+    let b_mem = claude_folder(&b.home(), &b.home());
+
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    for n in [&a, &b] {
+        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        n.cli(&["sync", "map", &path(&n.home()), "--home"]);
+    }
+    // Both machines hold `name` with `text`, or neither holds it.
+    let both = |what: &str, name: &str, text: Option<&str>| {
+        wait_for(what, &[&relay, &a, &b], 180, || {
+            [&a_mem, &b_mem]
+                .iter()
+                .all(|mem| read(&mem.join(name)).as_deref() == text)
+                .then_some(())
+        });
+    };
+    // What a machine has kept for home memory: the file, the change and the
+    // text of each record, sorted.
+    let kept = |n: &Node| -> Vec<(String, String, Option<String>)> {
+        let listed = n.post("/api/v1/history/list", serde_json::json!({ "of": "~" }));
+        let mut records: Vec<(String, String, Option<String>)> = listed["records"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| {
+                let shown = n.post(
+                    "/api/v1/history/show",
+                    serde_json::json!({ "id": record["id"] }),
+                );
+                (
+                    record["file"].as_str().unwrap().to_string(),
+                    record["change"].as_str().unwrap().to_string(),
+                    shown["text"].as_str().map(String::from),
+                )
+            })
+            .collect();
+        records.sort();
+        records
+    };
+    let record = |file: &str, change: &str, text: Option<&str>| {
+        (file.to_string(), change.to_string(), text.map(String::from))
+    };
+    // The id of the record a machine has of `change`, keeping `text`.
+    let id_of = |n: &Node, change: &str, text: &str| -> Option<String> {
+        let listed = n.post("/api/v1/history/list", serde_json::json!({ "of": "~" }));
+        listed["records"].as_array()?.iter().find_map(|record| {
+            let id = record["id"].as_str()?;
+            let shown = n.post("/api/v1/history/show", serde_json::json!({ "id": id }));
+            (record["change"] == change && shown["text"] == text).then(|| id.to_string())
+        })
+    };
+    // The ids that `--removed` offers to put back, as a person would copy
+    // them from its last line.
+    let removed = |n: &Node| -> Vec<String> {
+        let listed = n.cli(&["history", "~", "--removed"]);
+        listed
+            .lines()
+            .find_map(|line| line.strip_prefix("To put them all back: cordelia restore "))
+            .map(|ids| ids.split_whitespace().map(String::from).collect())
+            .unwrap_or_default()
+    };
+
+    // One machine writes a memory and then edits it.
+    std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
+    both("both have the memory", "notes.md", Some("one\n"));
+    std::fs::write(a_mem.join("notes.md"), "two\n").unwrap();
+    both("both have the edit", "notes.md", Some("two\n"));
+    // Each has the text that the edit replaced: where it was made, as the
+    // channel's version, and on the other, as the file it replaced there.
+    // (A record is made final a moment after the file is replaced.)
+    wait_for(
+        "each has kept what the edit replaced",
+        &[&relay, &a, &b],
+        60,
+        || {
+            let on_a = [record("notes.md", "edited_here", Some("one\n"))];
+            let on_b = [
+                record("notes.md", "arrived", None),
+                record("notes.md", "pulled", Some("one\n")),
+            ];
+            (kept(&a) == on_a && kept(&b) == on_b).then_some(())
+        },
+    );
+
+    // The other machine puts back the text that the edit replaced there.
+    // Its folder syncs, and the command says so: the restored file goes to
+    // the first machine as an ordinary edit.
+    let before = id_of(&b, "pulled", "one\n").expect("the record of what was pulled over");
+    let said = b.cli(&["restore", &before]);
+    assert!(said.contains("at the next sync, as an edit"), "{said}");
+    both("the restored text is on both", "notes.md", Some("one\n"));
+    // And undoes it, by the id the restore gave: the record of what the
+    // restore replaced.
+    let undo = said
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("To undo: cordelia restore "))
+        .expect("the restore says how to undo it")
+        .to_string();
+    assert_eq!(id_of(&b, "restored", "two\n"), Some(undo.clone()));
+    b.cli(&["restore", &undo]);
+    both("the edit is back on both", "notes.md", Some("two\n"));
+
+    // It deletes the memory, and the other machine's file goes.
+    std::fs::remove_file(a_mem.join("notes.md")).unwrap();
+    both("the memory is gone from both", "notes.md", None);
+    wait_for(
+        "each has kept what the delete removed",
+        &[&relay, &a, &b],
+        60,
+        || {
+            (kept(&a).contains(&record("notes.md", "deleted_here", Some("two\n")))
+                && kept(&b).contains(&record("notes.md", "removed", Some("two\n"))))
+            .then_some(())
+        },
+    );
+    // A restore on the machine that did not make the delete brings it back
+    // on both.
+    let ids = removed(&b);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    b.cli(&["restore", &ids[0]]);
+    both("the memory is back on both", "notes.md", Some("two\n"));
+
+    // An index that points at the memory, and then the folder is emptied
+    // on one machine.
+    let index = "- [Notes](notes.md) what was noted\n";
+    std::fs::write(a_mem.join("MEMORY.md"), index).unwrap();
+    both("both have the index", "MEMORY.md", Some(index));
+    for name in ["notes.md", "MEMORY.md"] {
+        std::fs::remove_file(a_mem.join(name)).unwrap();
+    }
+    both("the memory is gone from both", "notes.md", None);
+    both("the index is gone from both", "MEMORY.md", None);
+    // The other machine lists what was removed, and puts it all back.
+    let ids = wait_for("both removals are listed", &[&relay, &a, &b], 60, || {
+        Some(removed(&b)).filter(|ids| ids.len() == 2)
+    });
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    b.cli(&[&["restore"], ids.as_slice()].concat());
+    both("the memory is back on both", "notes.md", Some("two\n"));
+    both("the index is back on both", "MEMORY.md", Some(index));
+
+    // Records dropped on one machine are gone from it, and stay on the
+    // other. Those of another file stay too.
+    let of = |n: &Node, file: &str| kept(n).iter().filter(|r| r.0 == file).count();
+    let (notes_on_a, index_on_b) = (of(&a, "notes.md"), of(&b, "MEMORY.md"));
+    assert!(of(&b, "notes.md") > 0 && notes_on_a > 0 && index_on_b > 0);
+    let said = b.cli(&["history", "drop", "~", "notes.md"]);
+    assert!(said.contains("records from this device"), "{said}");
+    assert_eq!(of(&b, "notes.md"), 0);
+    assert_eq!(of(&b, "MEMORY.md"), index_on_b);
+    assert_eq!(of(&a, "notes.md"), notes_on_a);
+    assert_eq!(read(&b_mem.join("notes.md")).as_deref(), Some("two\n"));
+}

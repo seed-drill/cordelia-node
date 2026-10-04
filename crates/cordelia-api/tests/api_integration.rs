@@ -35,6 +35,7 @@ fn test_state() -> web::Data<AppState> {
         relist: Default::default(),
         sync_control: Default::default(),
         usable_keys: Default::default(),
+        history: Default::default(),
     })
 }
 
@@ -1626,4 +1627,77 @@ async fn test_an_install_from_before_mappings_keeps_its_scope() {
     }
     cordelia_api::sync::keep_earlier_scope(&state).unwrap();
     assert_eq!(get(meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
+}
+
+/// Local history over HTTP (decision 2026-09-30 §4.5b): none of its four
+/// endpoints answers without the node's token, and a restore or a drop
+/// that is refused does nothing. With the token a kept text is listed,
+/// shown, put back, and dropped.
+#[actix_web::test]
+async fn test_history_needs_the_token_and_is_used_with_it() {
+    use cordelia_storage::history::{About, Change, Replacement, Store, Whose, kept};
+    let state = test_state();
+    let store = Store::new(&state.home_dir, 30, 1 << 20).unwrap();
+    state.history.open(Some(store.clone()));
+    let memory = state.home_dir.join("memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("notes.md"), "now\n").unwrap();
+    let about = About {
+        at: String::new(),
+        agent: "lab".into(),
+        folder: memory.display().to_string(),
+        file: "notes.md".into(),
+        change: Change::Pulled,
+        kept: Some(kept(Whose::Here { agreed: Some(1) }, "before\n")),
+        replaced_by: Replacement::Nothing,
+        behind: false,
+    };
+    let pending = store
+        .keep(about, Some("before\n"), chrono::Utc::now())
+        .unwrap();
+    let id = store.settle(pending).unwrap().to_string();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let asked = [
+        ("list", json!({ "of": "lab" })),
+        ("show", json!({ "id": id })),
+        ("restore", json!({ "ids": [id] })),
+        ("drop", json!({ "all": true })),
+    ];
+    let file = || std::fs::read_to_string(memory.join("notes.md")).unwrap();
+
+    for (what, body) in &asked {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/history/{what}"))
+            .set_json(body)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "{what}");
+    }
+    assert_eq!(file(), "now\n");
+    assert_eq!(store.list().unwrap().records.len(), 1);
+
+    let mut answers = Vec::new();
+    for (what, body) in &asked {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/history/{what}"))
+            .insert_header(auth_header())
+            .set_json(body)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "{what}");
+        let answer: serde_json::Value = test::read_body_json(resp).await;
+        answers.push(answer);
+    }
+    assert_eq!(answers[0]["records"][0]["id"], id.as_str());
+    assert_eq!(answers[1]["text"], "before\n");
+    assert_eq!(answers[2]["results"][0]["done"], true);
+    assert_eq!(file(), "before\n");
+    // The record that was listed, and the one of what the restore replaced.
+    assert_eq!(answers[3]["removed"], 2);
+    assert!(store.list().unwrap().records.is_empty());
 }

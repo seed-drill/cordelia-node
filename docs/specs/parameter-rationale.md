@@ -709,6 +709,56 @@ the writes to one row per peer every five minutes.
 weekly window plus a day of slack. Nothing about a peer outlives the count
 it is needed for.
 
+## 10. Local History Parameters
+
+Local history keeps the text of a memory file as it was just before sync
+replaced or removed it (decision 2026-09-30 §4.5b). Both bounds are settings
+(`[history]`, configuration.md §2.11), read when the node starts.
+
+### HISTORY_DAYS = 30
+
+**Rationale:** How long a kept text stays. History is for a mistake that a
+person notices: a month covers a holiday and a project picked up again after
+one. Longer keeps more of what was replaced on purpose, in the clear, on
+every device. 0 turns history off and removes what is kept.
+
+### HISTORY_MAX_BYTES = 256 MB
+
+**Rationale:** The most that is kept, the oldest going first. A memory file
+that syncs is at most 64 KB (`MAX_ITEM_BYTES`), and a record is a file's
+whole text, so 256 MB holds at least 4,000 replaced versions of the largest
+such file, and far more of ordinary ones. (What a restore replaces is kept
+whatever its size: a file too large to sync is still text.) It is a bound
+on what an agent that rewrites a file in a loop, or a device that floods,
+can make a disk hold, not a figure that ordinary use reaches. It is applied
+at intervals, not at every moment: see `HISTORY_SWEEP_SHARE`.
+
+### HISTORY_TURN_WAIT_SECS = 10
+
+**Rationale:** How long a restore or a drop waits for a sync cycle that is
+running before the node answers that it is busy. A cycle of an ordinary
+folder ends well inside a second, so ten seconds is a cycle that is stuck or
+very large. The node does nothing then, and nothing is queued, so nothing is
+carried out after that answer.
+
+### HISTORY_SWEEP_INTERVAL_SECS = 3600
+
+**Rationale:** How often records that are too old, or over the size, are
+dropped. Age is counted in days, so an hour is ample, and the sweep also
+runs when the node starts.
+
+### HISTORY_SWEEP_SHARE = 8
+
+**Rationale:** An hour is too long for the size. A cycle keeps up to 64 KB
+for each file it replaces, and a folder that an agent rewrites keeps that
+every few seconds. So the store is also swept at the end of a sync cycle
+once more than one part in eight of `max_bytes` (32 MB by default) has been
+kept since the last sweep. The store then passes its size by that eighth,
+by what one cycle keeps and by what restores keep meanwhile, and by no
+more. A sweep lists the whole directory, so it is not run after every
+cycle that keeps a text: an eighth makes it at most eight sweeps for each
+time the store's worth of text is kept.
+
 ---
 
 *Spec version: 1.4*

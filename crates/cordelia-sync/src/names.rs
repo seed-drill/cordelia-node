@@ -4,18 +4,8 @@
 //! memory folder, so only plain file names are accepted: anything that
 //! could name a path elsewhere, or a hidden file, is refused.
 
-/// Longest file name accepted (common filesystem limit).
-const MAX_NAME_BYTES: usize = 255;
-
-/// Whether `name` is a plain file name that is safe to create in a memory
-/// folder: no separators, no parent references, not hidden, no NUL.
-pub fn is_safe_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_NAME_BYTES
-        && !name.starts_with('.')
-        && !name.contains(['/', '\\', '\0'])
-        && name != ".."
-}
+use cordelia_core::claude_code::MAX_NAME_BYTES;
+pub use cordelia_core::claude_code::is_safe_file_name;
 
 /// Name of the file holding this device's version of `name` after a
 /// conflict: `notes.md` -> `notes.conflict-<tag>.md`.

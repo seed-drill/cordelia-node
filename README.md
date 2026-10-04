@@ -92,6 +92,23 @@ file, or one that is not plain text, is left as it is on the machine that has
 it, and your other machines keep the last version that did sync;
 `cordelia sync status` names it.
 
+Sync makes one machine's mistake every machine's: an edit or a delete is
+taken by the others within seconds. So each machine keeps, for 30 days, the
+text of a memory file as it was just before sync replaced or removed it
+there, and any of them can put a version back:
+
+```bash
+cordelia history                               # what is kept on this machine, and how far back
+cordelia history ~/Work/my-project             # its kept versions, newest first, each with an id
+cordelia history ~/Work/my-project --removed   # files that were removed and are still absent
+cordelia history show <id>                     # print one kept text
+cordelia restore <id>                          # put it back; where the folder syncs, every machine follows
+```
+
+History stays on the machine, readable as the memory folder is, and is not
+a backup: your other machines are. `cordelia history drop` removes it, and
+`days = 0` under `[history]` in the configuration turns it off.
+
 Other commands: `cordelia devices`, `cordelia invites`,
 `cordelia remove-device <key>` (removes a device from each channel in which
 this device finds it, and rotates those channels' keys), `cordelia sync off`.
@@ -194,8 +211,8 @@ cargo test --all               # unit, protocol, and end-to-end tests
 
 The local API (`127.0.0.1:9473`, bearer token in `~/.cordelia/node-token`)
 covers channels (`/api/v1/channels/*`, including `entries` and `delete-key` for
-keyed items), devices (`/api/v1/devices/*`), invites (`/api/v1/invites/*`), and
-sync (`/api/v1/sync/*`).
+keyed items), devices (`/api/v1/devices/*`), invites (`/api/v1/invites/*`),
+sync (`/api/v1/sync/*`) and local history (`/api/v1/history/*`).
 
 ## Security
 

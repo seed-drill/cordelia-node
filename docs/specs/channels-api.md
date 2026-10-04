@@ -20,7 +20,8 @@
 > - **`delete-item` (§3.12)** deletes only the caller's own items, in the
 >   channel named.
 > - **New, used by the CLI:** `/api/v1/devices/{add,accept,remove,list}`,
->   `/api/v1/invites/{list,process}` and `/api/v1/sync/{claude,status}`.
+>   `/api/v1/invites/{list,process}`, `/api/v1/sync/{claude,status}` and
+>   `/api/v1/history/{list,show,restore,drop}` (local history, decision §4.5b).
 > - **Not used by v1:** `dm` (§3.7), `group/invite` (§3.9), `group/remove`
 >   (§3.10) and `rotate-psk` (§3.11) still write key envelopes into the
 >   channel itself, which never reach other nodes. Open channels and PSK

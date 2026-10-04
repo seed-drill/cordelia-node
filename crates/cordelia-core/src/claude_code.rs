@@ -22,6 +22,19 @@ pub fn folder_name(path: &str) -> String {
         .collect()
 }
 
+/// Longest file name accepted (common filesystem limit).
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// Whether `name` is a plain file name that is safe to create in a memory
+/// folder: no separators, no parent references, not hidden, no NUL.
+pub fn is_safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_BYTES
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0'])
+        && name != ".."
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

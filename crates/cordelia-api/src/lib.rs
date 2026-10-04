@@ -7,6 +7,7 @@ pub mod devices;
 pub mod entries;
 pub mod error;
 pub mod handlers;
+pub mod history;
 pub mod membership;
 pub mod state;
 pub mod sync;
@@ -66,6 +67,14 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/map", web::post().to(sync::map))
             .route("/unmap", web::post().to(sync::unmap))
             .route("/status", web::post().to(sync::sync_status)),
+    );
+    // Local history (decision 2026-09-30-agent-memory-sync §4.5b)
+    cfg.service(
+        web::scope("/api/v1/history")
+            .route("/list", web::post().to(history::list_handler))
+            .route("/show", web::post().to(history::show_handler))
+            .route("/restore", web::post().to(history::restore_handler))
+            .route("/drop", web::post().to(history::drop_handler)),
     );
 
     // Health check (GET, unauthenticated, operations.md §8)

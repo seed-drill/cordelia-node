@@ -28,6 +28,7 @@ belongs to something that is not built or designed in public yet.
 | T18 | Anyone who carries or stores an entry | Move it to another channel, give it another name, present an old revision as a newer one, change its content, or forge its author | Each of these makes the entry fail its signature or fail to decrypt, and it is ignored | tested |
 | T19 | Someone who claims to be another device or relay, or answers for a relay's name | Connect, or answer, under another node's key, to take over its connection or be taken for it; pose as a device's relay and send the device elsewhere; say it is a relay, to be sent what relays are sent | A node's ID is the key its TLS certificate proves, so nobody can connect or answer under a key they do not hold. A node knows its relays by name and key, refuses any other key at a relay's address, and dials nothing but its configured relays. Being a relay is a matter of configuration: a node that merely says it is one is an ordinary peer, and is not told which channels a node holds | tested |
 | T20 | A device of yours that has been taken over | Slip a key that is not one of your devices into your channels; add or remove devices; fix a channel's list of members, fill its key ring or run its key version out, so that the list can never change and the device can never be removed | A state for one of your channels that names a key which is not one of your devices is not applied, whichever device sent it. Bytes that are not a usable key (not a point on the curve, or a point that is not of the order every real key has) are never a device and never a member. Such a key is not added and not accepted, nothing is sealed to it, and no channel state is taken from a sender that has one: under a point of small order the secret is one anyone can work out, and anyone can sign. Listed in a state, it is left out and the rest of the state is taken. One that was stored before is taken off the list when the node starts, and what was written under it no longer counts in a channel. No channel's key is changed on its account, and removing such a key is refused: a channel that listed one stays readable by whoever could open what was sealed to it, until its key changes for another reason (decision record, section 9). The counter that orders changes to a channel's members is bounded, and one change can move it only so far, so no device can put the list beyond change. The same holds for a channel's key version, and a key ring that is full is sent with its oldest keys left out, so a removal can always be made and sent. A new device is not yet announced on the others, and can change the list of devices at once | partly tested (#76) |
+| T21 | You, or an agent of yours, by mistake | Replace or delete memory on one device, so that every device follows | Every device on this version that took the change holds the text it replaced, for 30 days and within the newest 256 MB, and so does the device that made it. A person who looks can put any kept version back with one command, on any device that holds it, and where the folder syncs every device follows. A text that cannot be kept is not replaced. Nothing notices the mistake: a change that nobody looks for within 30 days is gone. History is on the device, in the clear, and an agent there can drop it or turn it off | tested |
 
 ## Tests
 
@@ -169,6 +170,27 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/tests/membership.rs`: `t20_what_a_stranger_sends_is_not_checked_key_by_key`
 - `crates/cordelia-api/tests/api_integration.rs`: `test_the_older_endpoints_seal_to_no_key_that_is_not_usable`
 - `crates/cordelia-node/tests/threat_model.rs`: `t20_a_key_that_is_no_devices_goes_when_the_node_starts`
+
+### T21
+- `crates/cordelia-sync/src/claude.rs`: `what_another_devices_change_replaces_here_is_kept_in_history`
+- `crates/cordelia-sync/src/claude.rs`: `what_this_devices_change_replaces_in_the_channel_is_kept_in_history`
+- `crates/cordelia-sync/src/claude.rs`: `an_index_as_it_was_before_a_merge_is_kept_in_history`
+- `crates/cordelia-sync/src/claude.rs`: `an_edit_that_was_overtaken_is_kept_in_history_as_well`
+- `crates/cordelia-sync/src/claude.rs`: `a_text_that_cannot_be_kept_is_not_replaced`
+- `crates/cordelia-sync/src/claude.rs`: `a_change_that_is_not_made_leaves_no_record`
+- `crates/cordelia-storage/src/history.rs`: `test_a_record_is_dropped_when_it_is_old`
+- `crates/cordelia-storage/src/history.rs`: `test_the_oldest_records_go_when_the_store_is_over_its_size`
+- `crates/cordelia-storage/src/history.rs`: `test_a_record_stands_only_if_its_change_was_made`
+- `crates/cordelia-api/src/history.rs`: `test_a_restore_puts_the_text_back_and_can_be_undone`
+- `crates/cordelia-api/src/history.rs`: `test_a_restore_that_cannot_keep_what_it_replaces_does_nothing`
+- `crates/cordelia-api/src/history.rs`: `test_a_restore_refuses_what_it_cannot_do_safely`
+- `crates/cordelia-api/src/history.rs`: `test_a_damaged_record_is_not_restored_or_shown`
+- `crates/cordelia-storage/src/history.rs`: `test_a_record_whose_text_is_not_the_one_kept_is_refused`
+- `crates/cordelia-sync/src/claude.rs`: `a_name_that_has_come_to_hold_what_cannot_be_read_is_not_written_over`
+- `crates/cordelia-sync/src/claude/sequences.rs`: `local_history_changes_nothing_in_what_sync_does`
+- `crates/cordelia-sync/tests/claude.rs`: `a_cycle_that_keeps_enough_sweeps_local_history`
+- `crates/cordelia-api/tests/api_integration.rs`: `test_history_needs_the_token_and_is_used_with_it`
+- `crates/cordelia-node/tests/devices_e2e.rs`: `what_sync_replaced_or_removed_is_put_back_from_either_machine`
 
 ## How CI checks this
 

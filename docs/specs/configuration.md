@@ -202,6 +202,17 @@ Log output configuration: level, format, rotation.
 
 ---
 
+### 2.11 `[history]`
+
+Local history: the text of a memory file as it was before sync replaced or removed it (decision 2026-09-30 §4.5b). Read when the node starts.
+
+| Parameter | Type | Default | Valid Range | Phase | Description | Source |
+|-----------|------|---------|-------------|-------|-------------|--------|
+| `days` | integer | `30` | >= 0 | 1 | How long a kept text stays. `0` turns history off and removes what is kept. | parameter-rationale.md §10 |
+| `max_bytes` | integer | `268435456` (256 MB) | >= 0 | 1 | The most that is kept. Over it, the oldest records go first. | parameter-rationale.md §10 |
+
+Both bounds are applied when the node starts, every hour, and at the end of a sync cycle once more than an eighth of `max_bytes` has been kept since they were last applied. Between two of those the store can hold more than `max_bytes`. A record larger than `max_bytes` goes the next time, and with `max_bytes = 0` nothing stays past it: texts are still kept before each change, and are there to restore only until then.
+
 ## 3. Example Configuration
 
 A complete annotated `config.toml` with all sections and default values:
@@ -315,6 +326,11 @@ format = "text"                            # text | json
 output = "stderr"                          # stderr | stdout | file path
 file_max_bytes = 10485760                  # 10 MB per log file (when output = file)
 file_max_count = 5                         # Rotated log files to retain
+
+# --- Local history ---
+[history]
+days = 30                                  # How long a replaced text is kept (0 = off, and removes what is kept)
+max_bytes = 268435456                      # 256 MB; over it the oldest records go first
 ```
 
 ---

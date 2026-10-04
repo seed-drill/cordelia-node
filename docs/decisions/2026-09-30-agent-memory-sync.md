@@ -199,6 +199,56 @@ It runs inside the node binary: one install, and the node stays the encryption b
 
 Other agents come later as further adapters that map their own memory locations onto the same channels.
 
+### 4.5b Local history
+
+Sync makes one device's mistake every device's. An edit or a delete, made by a person or by an agent, is taken by every other device within seconds, and a conflict file is kept only where two devices changed a file apart. A folder emptied by an agent syncs as deletes. Local history is the way back: on each device, the text of a memory file as it was just before sync replaced or removed it. It does not stop a mistake and it does not notice one. A person who notices can see what changed and put a version back.
+
+- **What is kept.** Each time the adapter replaces or removes a memory file's text, the text goes into history first:
+
+  | Change | Text kept | Recorded as |
+  |---|---|---|
+  | A version from another device replaces a file here | The file as it was here | pulled |
+  | A delete from another device removes a file here | The file as it was here | removed |
+  | The index (`MEMORY.md`) is merged with the channel's | The file as it was here | merged |
+  | An edit made here replaces the channel's version | The channel's version | edited here |
+  | A delete made here removes it from the channel | The channel's version | deleted here |
+  | A restore replaces a file here | The file as it was here | restored |
+  | A file arrives that was not here | None | arrived |
+
+  So the text before a change is on every device that took the change, and on the device that made it. A change that replaces no text keeps none. Of those, a file that arrives, and a restore that brings back a file that was absent, leave a record with no text. A first publish, a publish over a delete, and a conflict file being written leave no record.
+- **Each record says** when, by this device's clock; the name the folder syncs under; the memory folder; the file; the change; whose text it keeps (this device's file, with the revision it had last agreed, or the channel's version, with the device that wrote it and its revision); and what took its place. (The record of what a restore replaced does not say which revision the file had agreed.) Where this device's file was the version it had agreed, and a later one replaced it, the record says so, and a restore from it warns that another device may hold a newer copy.
+- **No kept copy, no replacement.** Where the text cannot be kept (the disk is full, the history directory cannot be written), that one change is not made: the file is not replaced or removed, and nothing is published over the channel's version. The file is reported as failed, as any file that fails is (4.5), and the cycle goes on with the files that need nothing kept. (Where both sides changed, the copy of this device's text is still written beside the file and published, as it replaces nothing; it is the file that is not then replaced.) It is tried again each cycle. A file that arrives replaces nothing, and arrives whether or not its arrival can be noted. With history turned off the rule does not apply.
+- **A record stays only if its change was made.** The text is kept as a pending record and flushed to the disk, the file is looked at once more, the change is made, and the record is then made final. A change that is refused or fails takes its pending record with it: the settings changed, the channel's version moved, another entry arrived under the file's name since the text was kept, the entry does not fit, the file was written to meanwhile, or the write or the removal failed. A pending record that belongs to no change in hand (the node stopped part of the way, or the record could not be made final) is kept and marked as interrupted, when the node starts and at each sweep: its change may or may not have been made.
+- **Where.** `history/` in the node's data directory, readable by the user alone. Each record is one file, named by an id that the node makes: a line of JSON about it, then the text as it was. Names of agents and files are inside the JSON, and no path in the store is made from them; an id from the command line is checked for its shape before it is looked up. (A restore writes to the folder and the file that its record names: see what it refuses.) There is no database to damage: a record that cannot be read is reported, counts towards the size and ages like the rest, and the others stand. A record is read back only while it still holds the text that was kept: one that was cut short, or changed on the disk, is not shown or restored as that text.
+- **Bounded two ways,** by settings read when the node starts (`[history]` in the configuration). By age: a record is dropped 30 days after it was written. By size: the newest 256 MB, and over that the oldest records go first, whatever file they are of. 0 days turns history off and removes what is kept. `cordelia history` says how much is kept and how far back it goes, so a busy day that has shortened it shows.
+  - The bounds are applied when the node starts, every hour, and at the end of a sync cycle once more than an eighth of the size has been kept since they were last applied. So between two of those the store can pass its size: by that eighth, by what one cycle keeps, and by what restores keep meanwhile.
+  - A record larger than the size goes the next time they are applied, and with the size at 0 nothing stays past it.
+- **Commands.**
+  ```
+  cordelia history                              # agents with records; how much is kept, and from when
+  cordelia history <name|folder>                # its records, newest first: id, when, file, change, whose text
+  cordelia history <name|folder> --removed      # only files removed and still absent, with the id to restore each
+  cordelia history show <id>                    # print one kept text, inside a labelled envelope
+  cordelia restore <id> [<id> ...]              # put versions back
+  cordelia history drop <name|folder> [<file>]  # remove records from this device
+  cordelia history drop --all                   # remove all of it from this device
+  ```
+  `--since <time>` narrows a listing. What is given as `<name|folder>` is taken as a name, and also as a folder where there is a directory of that name.
+  - **A restore is a local write.** It puts the kept text back in the memory folder it was kept from, and keeps what it replaces, whatever that is, so it can be undone by id. Where it put back a file that was absent, undoing it is deleting the file.
+  - **It takes ids, never "newest":** the newest kept version of a file is whatever was just taken out of it. To put back everything a mistake removed, list with `--removed --since`, look, and pass the ids. Several ids are taken in the order given, each by itself: one that fails does not stop the rest, the command says what happened to each, and it fails if any did.
+  - **The index is a file like any other.** Restoring `MEMORY.md` replaces it, and says which lines of the index as it was are not in the restored one.
+  - **The command says whether the folder syncs,** by the report of the node's last whole cycle.
+    - **If it synced then,** the next cycle publishes the restored file as an ordinary edit and every device follows.
+    - **If it did not** (sync is off, the folder is not mapped, or it is waiting to join its channel), the file stays here, and the command says what happens when the folder syncs: a text that the channel holds for the file replaces it, and the restored text is kept beside it as a conflict file (an index is merged instead); where the channel holds none, the restored text is sent. So the way back from a mistake is to leave sync on, or turn it on, and then restore.
+    - **Where the node cannot tell** (no cycle has finished since it started or since a setting changed, or the folder failed in the last one before it began), the command says both.
+  - **It refuses** a memory folder that is not there (one file written into a folder that has gone would make the folder look emptied, and the rest would sync as deletes); a record with no text; a record that names a path where a file's name should be; a record that no longer holds the text that was kept; and a file that is a link or cannot be read, since it could not keep what it replaces.
+  - **It takes turns with a cycle.** A cycle, a restore, a drop and the sweep of old records hold one lock in turn. A restore or a drop waits up to ten seconds for a running cycle; then the node answers that it is busy, and does nothing: nothing is queued, so nothing is carried out after that answer. One that has begun is carried out to its end, and the command waits for it however long it takes. A command that is interrupted before the node has answered is not taken back: what it asked for may still be done, and the listing shows whether it was.
+  - **`show` wraps the text** in a start and an end line that carry a random value, new each time, so that a reader, person or agent, can tell where a kept text starts and ends.
+  - **Nothing printed from a record acts on a terminal.** A file's name, an agent's name, a folder, a device's key and a time are printed with control characters, and the characters that turn text round, shown as escapes; and no command to copy is made from a name that has one. A kept text is printed as it is to a file or a pipe. On a terminal those characters in it are shown as escapes too, apart from line feeds and tabs, and the command says so.
+  - **`drop` removes the records it names and every other record on this device that holds the same text,** and lists them. A conflict file holds a copy of the text it was made from, so dropping one name alone would leave the text under the other.
+- **What `drop` does not remove:** a file in the memory folder that still holds the text, a conflict file among them, here or on another device (while one does, the next change to it keeps the text again: clear the folder first, then drop); records whose text differs by as little as a character; records that cannot be read, which only `drop --all` removes; the copies on the other devices, which keep their own history; an earlier revision of the file in the node's own database here, on the other devices and on relays, encrypted, with the keys on the same disk as each device's copy; copies in backups, and the bytes of a deleted file that the disk has not yet reused. A token pasted into a memory file is to be treated as leaked, and replaced.
+- **Not synced, and in the clear.** History is on the device, readable as the memory folder itself is. It is lost with the device. It is not a backup: the other devices are.
+
 ### 4.6 Two relays
 
 Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. **As built (0.2.0-alpha.3):** a personal node opens no listening socket at all. It dials out from a port the system picks, where earlier versions bound UDP 9474 and turned inbound peers away after the handshake. `listen = true` under `[network]` keeps a listener, for a node that others dial directly. We run two relays, each also serving as a bootnode, so that losing one doesn't stop sync:
@@ -268,7 +318,7 @@ This decision is expected to stand. If people later want notes in common, the an
 - Relays and Seed Drill see channel IDs, device public keys, item sizes, types and timing. They never see content, file names, member lists or keys.
   - For usage counts (distinct peers per day and week), a relay keeps a keyed hash of each peer's key, made with a secret that stays on the relay, for 8 days after the peer was last seen. It reports counts, never keys.
 - Only devices you added can read your memory. It is never shared with another person (4.7).
-- On your own machines, memory is as protected as your disk. The node's search index and Claude Code's own files are plaintext at rest.
+- On your own machines, memory is as protected as your disk. The node's search index, its local history (4.5b) and Claude Code's own files are plaintext at rest.
 
 This replaces the v2.3 whitepaper's "no plaintext at rest on any node, ever", which the code did not meet and v1 doesn't need.
 
@@ -340,6 +390,21 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 - Home memory does not sync between a device on 0.2.0-alpha.2 and one on 0.2.0-alpha.3, because the two keep it in different channels. Upgrade every device.
 - Where Claude Code keeps memory for a submodule, or for a worktree of a bare repository, is not confirmed. `cordelia sync map` says so when it maps one. Nor is its folder name confirmed for a path with accented characters on macOS.
 - The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
+
+- Local history (4.5b) keeps what sync replaced or removed. It does not cover:
+  - Noticing. Nothing tells a person that a folder was emptied, and a change that nobody notices for 30 days is gone.
+  - A busy month: more than 256 MB of replaced text inside 30 days shortens how far back it goes. `cordelia history` says how far.
+  - An agent on the device that drops history or turns it off.
+  - A power cut in the seconds after a change, on a volume that has no flush, or on a file system that does not write a new file's name with its contents: the kept text is flushed before the change is made, and its name in the history directory is not flushed by itself. A record whose text did not arrive whole is refused, not restored.
+  - A size that holds at every moment: between two of the times the bounds are applied the store can pass it (4.5b).
+  - A command that is interrupted while the node works on it: a restore that has begun is finished.
+  - A memory folder removed and then made again with one file in it: the rest sync as deletes, as before. History has them.
+  - A folder mapped to the wrong name: unmap it, restore what the merge replaced, and remove by hand what arrived. The "arrived" records say what and when.
+  - Files that take no part in sync (too large, not text, links), and text written and overwritten between two cycles, which the adapter never saw.
+  - A device on a version before history, and a node left running across an upgrade until it is restarted: they keep nothing.
+  - A device of yours that was taken over and floods history: the oldest records go first.
+  - A clock that is wrong when a version is kept, or set far ahead: age goes by the clock.
+  - The index line of a file that a restore brings back: a restore puts back the file it is asked for. Its line returns only if the index is restored too, or the file is listed again.
 
 ## 10. Done means
 

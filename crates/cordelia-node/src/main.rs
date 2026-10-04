@@ -11,6 +11,7 @@ use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
+mod history_cmd;
 mod indicator;
 mod p2p;
 
@@ -113,6 +114,27 @@ enum Commands {
         #[command(subcommand)]
         what: SyncCommand,
     },
+    /// List the versions of memory files that sync replaced or removed on
+    /// this device: with no argument, how much is kept and for which agents
+    #[command(args_conflicts_with_subcommands = true)]
+    History {
+        /// An agent's name, or the folder it works in
+        of: Option<String>,
+        /// Only files that were removed and are still absent
+        #[arg(long)]
+        removed: bool,
+        /// Only versions kept since a time (2026-10-03T09:00:00Z), or in
+        /// the last while (30m, 2h, 3d)
+        #[arg(long)]
+        since: Option<String>,
+        #[command(subcommand)]
+        what: Option<HistoryCommand>,
+    },
+    /// Put kept versions of memory files back, by id (see `cordelia history`)
+    Restore {
+        /// The ids of the versions, each restored by itself in this order
+        ids: Vec<String>,
+    },
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -126,6 +148,26 @@ enum Commands {
         /// Entity ID of the lead node (for swarm channel naming)
         #[arg(long)]
         lead_entity_id: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum HistoryCommand {
+    /// Print one kept version
+    Show {
+        /// The version's id
+        id: String,
+    },
+    /// Remove kept versions from this device, with every other kept
+    /// version here that holds the same text
+    Drop {
+        /// An agent's name, or the folder it works in
+        of: Option<String>,
+        /// One file of it
+        file: Option<String>,
+        /// Everything kept on this device
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -225,6 +267,19 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Devices) => cmd_devices(&cli.config),
         Some(Commands::Invites) => cmd_invites(&cli.config),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
+        Some(Commands::History {
+            of,
+            removed,
+            since,
+            what,
+        }) => match what {
+            None => history_cmd::list(&cli.config, of.as_deref(), removed, since.as_deref()),
+            Some(HistoryCommand::Show { id }) => history_cmd::show(&cli.config, &id),
+            Some(HistoryCommand::Drop { of, file, all }) => {
+                history_cmd::drop(&cli.config, of.as_deref(), file.as_deref(), all)
+            }
+        },
+        Some(Commands::Restore { ids }) => history_cmd::restore(&cli.config, &ids),
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -848,6 +903,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         relist: Default::default(),
         sync_control: Default::default(),
         usable_keys: Default::default(),
+        history: Default::default(),
     });
 
     // Personal nodes receive invites and channel states in an inbox channel
@@ -859,6 +915,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // stored before is taken off now, and the log says so. No
         // channel's key is changed by that.
         cordelia_api::membership::drop_unusable_keys(&state)?;
+        start_history(&state, &config.history);
     }
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -1145,6 +1202,61 @@ fn p2p_bind_addr(listen_addr: &str, p2p_port: u16) -> anyhow::Result<std::net::S
         .ok_or_else(|| anyhow::anyhow!("listen_addr host {host:?} resolved to no address"))
 }
 
+// ── Local history ──────────────────────────────────────────────────
+
+/// Set up local history as the configuration has it (decision 2026-09-30
+/// §4.5b). Turned off, what was kept is removed. Otherwise the records
+/// that were pending when the node last stopped are marked, and what is
+/// too old or over the size is dropped.
+///
+/// A store that cannot be prepared is still set: it keeps nothing, so the
+/// sync adapter makes no change that needs a text kept, and says why.
+fn start_history(state: &cordelia_api::state::AppState, config: &config::HistoryConfig) {
+    use cordelia_storage::history::{Start, Store};
+    let now = chrono::Utc::now();
+    let (store, interrupted, swept) = match Store::start(
+        &state.home_dir,
+        config.days,
+        config.max_bytes,
+        now,
+    ) {
+        Start::Off(removed) => {
+            match removed {
+                Ok(()) => tracing::info!("history: turned off"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "history: turned off, but what was kept could not be removed")
+                }
+            }
+            return;
+        }
+        Start::On {
+            store,
+            interrupted,
+            swept,
+        } => (store, interrupted, swept),
+    };
+    match interrupted {
+        Ok(0) => {}
+        Ok(interrupted) => tracing::warn!(
+            records = interrupted,
+            "history: the node stopped part-way through these changes; their texts are kept"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "history: cannot be written; sync replaces nothing until it can")
+        }
+    }
+    match swept {
+        Ok(swept) if swept.aged + swept.over > 0 => tracing::info!(
+            aged = swept.aged,
+            over = swept.over,
+            "history: dropped old records"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: could not drop old records"),
+    }
+    state.history.open(Some(store));
+}
+
 // ── Sync adapter loop ──────────────────────────────────────────────
 
 /// The one adapter the sync loop holds: the one in `slot` while `is_for`
@@ -1174,6 +1286,9 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         cordelia_sync::claude::CYCLE_SECS,
     ));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let sweep_every =
+        std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS);
+    let mut swept = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -1182,7 +1297,16 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         }
         let state = state.clone();
         let adapter = adapter.clone();
+        let sweep = swept.elapsed() >= sweep_every;
+        if sweep {
+            swept = std::time::Instant::now();
+        }
         let _ = tokio::task::spawn_blocking(move || {
+            // In its own turn, whether or not sync is on: history ages
+            // either way.
+            if sweep {
+                state.history.sweep(chrono::Utc::now());
+            }
             let (dir, generation) = match state.db.lock() {
                 Ok(db) => (
                     meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
@@ -1880,8 +2004,9 @@ fn not_the_nodes_own(address: &str) -> String {
     )
 }
 
-/// How a command reaches its own node: the client, and the address of
-/// `path` there. A request carries the node's token, so it goes to the
+/// How a command reaches its own node: the client, which waits for an
+/// answer for `limit` or, with none, for as long as it takes, and the
+/// address of `path` there. A request carries the node's token, so it goes to the
 /// node's own address and nowhere else:
 ///
 /// - **To no other address.** The node's API listens at one of two
@@ -1897,7 +2022,7 @@ fn not_the_nodes_own(address: &str) -> String {
 fn to_this_machine(
     config: &Config,
     path: &str,
-    limit: std::time::Duration,
+    limit: Option<std::time::Duration>,
 ) -> anyhow::Result<(
     ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     String,
@@ -1907,7 +2032,7 @@ fn to_this_machine(
     let client = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
-        .timeout_global(Some(limit));
+        .timeout_global(limit);
     let url = format!("http://{host}:{}{path}", config.node.http_port);
     Ok((client, url))
 }
@@ -1920,7 +2045,7 @@ fn local_api(
     path: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<serde_json::Value> {
-    let (client, url) = to_this_machine(config, path, timeout)?;
+    let (client, url) = to_this_machine(config, path, Some(timeout))?;
     let token = std::fs::read_to_string(config.token_path())?;
     let agent: ureq::Agent = client.build().into();
     let auth = format!("Bearer {}", token.trim());
@@ -1954,11 +2079,28 @@ fn api_post(
     path: &str,
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
+    api_post_within(
+        config_path,
+        path,
+        body,
+        Some(std::time::Duration::from_secs(30)),
+    )
+}
+
+/// [`api_post`], waiting for the answer for `limit`, or for as long as it
+/// takes: what the node carries out to the end whether or not anyone
+/// waits (a restore) is waited for, so that the command says what it did.
+fn api_post_within(
+    config_path: &str,
+    path: &str,
+    body: serde_json::Value,
+    limit: Option<std::time::Duration>,
+) -> anyhow::Result<serde_json::Value> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
 
-    let (client, url) = to_this_machine(&config, path, std::time::Duration::from_secs(30))?;
+    let (client, url) = to_this_machine(&config, path, limit)?;
     let token_path = config.token_path();
     let token = std::fs::read_to_string(&token_path).map_err(|e| {
         anyhow::anyhow!(
@@ -3905,7 +4047,7 @@ mod tests {
             assert_eq!(api_host(other), None, "{other}");
         }
         let mut config = Config::default();
-        let limit = std::time::Duration::from_secs(1);
+        let limit = Some(std::time::Duration::from_secs(1));
         let port = config.node.http_port;
         let url_for = |config: &Config| {
             let (_, url) = to_this_machine(config, "/api/v1/status", limit)

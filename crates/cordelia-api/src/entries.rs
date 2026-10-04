@@ -112,6 +112,19 @@ pub fn publish(
     publish_at(state, db, channel_id, write, None)
 }
 
+/// The revision that [`publish`] would give `key` now: the next after the
+/// highest this node holds for the slot. Asked under the hold of the lock
+/// that the publish is then made under, it is the revision the entry gets.
+pub fn next_rev(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    key: &str,
+) -> Result<u64, CordeliaError> {
+    let slot = slot_id(&slot_key(state, channel_id)?, key);
+    Ok(items::max_rev(db, channel_id, &slot)?.unwrap_or(0) + 1)
+}
+
 /// [`publish`], at a given revision when `at` is set.
 fn publish_at(
     state: &AppState,
