@@ -3,6 +3,14 @@
 //!
 //! Spec: seed-drill/specs/ecies-envelope-encryption.md
 //! Port source: cordelia-core/crates/cordelia-crypto (adapted for new spec)
+//!
+//! Also here, and not yet used by the node, is a channel from its secret
+//! (decision 2026-10-04): what is derived from a channel's secret and where
+//! each kind's secret comes from ([`derive`]), the recovery phrase
+//! ([`phrase`]), the statement of a person's devices ([`statement`]), and
+//! the entry that carries a statement to a device ([`change_entry`]). Each
+//! is pure functions, with vectors in
+//! `docs/reference/step4-test-vectors.json`.
 
 pub mod aes_gcm;
 pub mod bech32;
@@ -16,6 +24,9 @@ pub mod psk_envelope;
 pub mod signing;
 pub mod slots;
 pub mod statement;
+
+#[cfg(test)]
+mod vectors;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};
