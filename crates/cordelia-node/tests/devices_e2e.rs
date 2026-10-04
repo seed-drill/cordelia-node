@@ -1130,6 +1130,16 @@ fn a_relay_that_would_dial_another_machine_is_not_started() {
 /// be known before they are started. A node of another role dials the
 /// addresses its peers hand it, which nothing read beforehand can show,
 /// so the harness makes none.
+/// The harness starts a node with no variable but one it knows not to
+/// change where the node dials: its look at that is at the file, and a
+/// variable could stand in place of what the file says.
+#[test]
+#[should_panic(expected = "may not be started with")]
+fn the_harness_starts_a_node_with_no_variable_it_does_not_know() {
+    let mut n = node("alone", "personal", None);
+    n.start_given(&[("CORDELIA_BOOTNODES", "relay.example:9474")]);
+}
+
 #[test]
 #[should_panic(expected = "does not run one")]
 fn the_harness_makes_no_node_whose_dialling_it_cannot_check() {
@@ -1238,52 +1248,185 @@ fn a_command_asks_its_own_node_and_no_proxy() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// A command asks the node at one of the addresses the node listens on,
-/// and at no other: its request carries the node's token. With the API's
-/// address set to another, a command that reads and one that posts each
-/// say why they do not ask, `status` says that it has not asked (not that
-/// the node is stopped), and the node itself does not start.
+/// A command asks the node at one of the two addresses that the node's
+/// API may have, and at no other: its request carries the node's token.
+/// With the API's address set to another (an address, or a name), a
+/// command that reads and one that posts each say why they do not ask,
+/// every form of `status` says that the node was not asked (not that it
+/// is stopped), and the node itself does not start, and says the same.
 ///
-/// (The address here is another of this machine's own, so that nothing
-/// leaves the machine with the refusal taken out either.)
+/// (Neither value leaves this machine, so nothing does with a refusal
+/// taken out either: `127.0.0.2` is another address of the machine on
+/// Linux, and elsewhere traffic to it stays on the machine; `localhost`
+/// is the machine's name for itself.)
 #[test]
 fn a_command_asks_no_address_but_the_nodes_own() {
     let mut n = node("idle", "personal", None);
-    let elsewhere = [("CORDELIA_BIND_ADDRESS", "127.0.0.2")];
-    for args in [&["peers", "--json"][..], &["devices"]] {
-        let out = n.command_given(&elsewhere, args);
-        let said = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "cordelia {args:?}");
+    for other in ["127.0.0.2", "localhost"] {
+        let given = [("CORDELIA_BIND_ADDRESS", other)];
+        let named = format!("'{other}'");
+        for args in [&["peers", "--json"][..], &["devices"]] {
+            let out = n.command_given(&given, args);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "cordelia {args:?}");
+            assert!(
+                said.contains(&named) && said.contains("nowhere else"),
+                "cordelia {args:?}: {said}"
+            );
+        }
+        let out = n.command_given(&given, &["status"]);
+        let said = String::from_utf8_lossy(&out.stdout);
         assert!(
-            said.contains("'127.0.0.2'") && said.contains("nowhere else"),
-            "cordelia {args:?}: {said}"
+            said.contains("Running:   not asked") && said.contains(&named),
+            "{said}"
+        );
+        assert!(!said.contains("cordelia start"), "{said}");
+        // The forms that a bar and a panel read say it too.
+        let out = n.command_given(&given, &["status", "--line"]);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("not asked") && !said.contains("stopped"),
+            "{said}"
+        );
+        let out = n.command_given(&given, &["status", "--json"]);
+        let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(said["state"], "attention", "{said}");
+        let summary = said["summary"].as_str().unwrap();
+        assert!(summary.contains("not asked"), "{said}");
+
+        // The node holds itself to the same: it does not start there, and
+        // says which address, and where it is set.
+        n.start_given(&given);
+        let mut child = n.child.take().unwrap();
+        let told = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if told.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("a node started at {other}:\n{}", n.log_tail());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!status.success());
+        let log = std::fs::read_to_string(n.log()).unwrap();
+        assert!(
+            log.contains(&named) && log.contains("CORDELIA_BIND_ADDRESS"),
+            "{log}"
         );
     }
-    let out = n.command_given(&elsewhere, &["status"]);
-    let said = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        said.contains("Running:   not asked") && said.contains("'127.0.0.2'"),
-        "{said}"
-    );
-    assert!(!said.contains("cordelia start"), "{said}");
+}
 
-    // The node holds itself to the same: it does not start there.
-    n.start_given(&elsewhere);
-    let mut child = n.child.take().unwrap();
-    let told = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if told.elapsed() > Duration::from_secs(30) {
-            let _ = child.kill();
-            panic!("a node started at 127.0.0.2:\n{}", n.log_tail());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+/// A node whose API address is `::1` listens there and nowhere else, and
+/// a command reaches it there: the address is written in brackets before
+/// a port, by the node and by a command alike. (On a machine with no
+/// `::1` to listen on the test says so and shows nothing.)
+#[test]
+fn a_node_at_the_ipv6_address_is_reached_there() {
+    if let Err(e) = std::net::TcpListener::bind("[::1]:0") {
+        eprintln!("not run: this machine has no [::1] to listen on ({e})");
+        return;
+    }
+    let mut n = node("six", "personal", None);
+    let given = [("CORDELIA_BIND_ADDRESS", "::1")];
+    n.start_given(&given);
+    let running = || {
+        let out = n.command_given(&given, &["status"]);
+        let said = String::from_utf8_lossy(&out.stdout);
+        said.contains("Running:   yes").then_some(())
     };
-    assert!(!status.success());
+    wait_for("the node to answer at ::1", &[&n], 30, running);
+    let out = n.command_given(&given, &["devices"]);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && listed.contains("this device"),
+        "{listed}"
+    );
+
+    // There, as the node says when it starts, and not at the other.
     let log = std::fs::read_to_string(n.log()).unwrap();
-    assert!(log.contains("must be loopback"), "{log}");
+    assert!(log.contains(&format!("http://[::1]:{}/", n.http)), "{log}");
+    assert!(healthy(&n).is_none(), "the node answers at 127.0.0.1 too");
+    n.stop();
+}
+
+/// Read a request's head from `stream` and answer it with `head` (a
+/// status line and any header lines) and `body`, as JSON.
+fn answer(stream: &mut std::net::TcpStream, head: &str, body: &str) {
+    use std::io::{Read, Write};
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    while !seen.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+        seen.push(byte[0]);
+    }
+    let _ = stream.write_all(
+        format!(
+            "{head}content-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
+}
+
+/// A command follows no redirect, and reads none as the node's answer:
+/// the node's API sends none, and a request carries the node's token.
+/// Here what listens at the node's port answers every request with a
+/// redirect to another listener, which counts who calls it, and with what
+/// a node's status would be. A client that follows redirects is counted
+/// there. A command is not, and does not take the answer for the node's.
+#[test]
+fn a_command_follows_no_redirect() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = node("idle", "personal", None);
+    let status = r#"{"version":"0.0.0","uptime_secs":1}"#;
+
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let there = target.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    std::thread::spawn(move || {
+        for mut stream in target.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            answer(&mut stream, "HTTP/1.1 200 OK\r\n", status);
+        }
+    });
+    let stand_in = std::net::TcpListener::bind(("127.0.0.1", n.http)).unwrap();
+    let redirect = format!("HTTP/1.1 302 Found\r\nlocation: http://{there}/api/v1/status\r\n");
+    std::thread::spawn(move || {
+        for mut stream in stand_in.incoming().flatten() {
+            answer(&mut stream, &redirect, status);
+        }
+    });
+    // What stands in for the node does send a client on, and what it
+    // sends it to does count it: a client that follows redirects, asking
+    // what a command asks, gets its answer there.
+    let follows: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let asked = follows
+        .get(&format!("http://127.0.0.1:{}/api/v1/status", n.http))
+        .call();
+    assert!(asked.is_ok_and(|answer| answer.status() == 200));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // `status` succeeds whether or not it reached a node, and does not
+    // say that it reached one.
+    let out = n.command(&["status"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("Running:   no"), "{said}");
+    // One that reads, and one that posts: each fails.
+    for args in [&["peers", "--json"][..], &["devices"]] {
+        let out = n.command(args);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "cordelia {args:?}: {said}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

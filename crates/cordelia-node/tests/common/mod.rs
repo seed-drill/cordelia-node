@@ -72,7 +72,8 @@ impl Node {
     /// command does with one set their own). The rest of the environment
     /// is left. Of it the binary reads `NO_COLOR` and the user's name, and
     /// hands all of it to `git` where it asks which repository a folder is
-    /// in: no test here asks of those.
+    /// in. A test that rests on git's answer rests on the caller having
+    /// set none of git's own variables (`GIT_DIR` and the like).
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -182,16 +183,26 @@ impl Node {
     /// not started if a relay it would dial is not on this machine, or if
     /// its role is one whose dialling cannot be known beforehand: whatever
     /// wrote the configuration, and whatever a test did to it since. (The
-    /// node is given no `CORDELIA_` variable but its data directory, and
-    /// no `RUST_LOG`, so its settings are the file's.)
+    /// node is given no `RUST_LOG`, and no `CORDELIA_` variable but its
+    /// data directory and what [`Self::start_given`] lets through, so
+    /// where it dials is the file's to say.)
     pub fn start(&mut self) {
         self.start_given(&[]);
     }
 
-    /// [`Self::start`], with `vars` set for the node: after the same look
-    /// at where it will dial, which no variable a test may set changes
-    /// (the node reads its relays from its configuration alone).
+    /// [`Self::start`], with `vars` set for the node, after the same look
+    /// at where it will dial. That look is at the file, and a variable
+    /// could stand in place of what the file says. So only a variable
+    /// that is known not to change where a node dials is let through: the
+    /// address of its API.
     pub fn start_given(&mut self, vars: &[(&str, &str)]) {
+        for (variable, _) in vars {
+            assert!(
+                *variable == "CORDELIA_BIND_ADDRESS",
+                "{}: a test node may not be started with {variable}",
+                self.name
+            );
+        }
         for host in self.will_dial() {
             assert_on_this_machine(self.name, &host);
         }
