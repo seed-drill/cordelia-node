@@ -273,9 +273,16 @@ mod tests {
             assert_eq!(state["notes.md"], (Some([8; 32]), 3, b));
         }
         // What is in the column and is no device's key is read as
-        // nobody, whatever it is: a blob of another length, a text, a
-        // number.
-        for odd in ["x'0102'", "'a text'", "17", "1.5"] {
+        // nobody, whatever it is: a blob of another length, a text (of a
+        // key's length too: its bytes are not taken for a key), a number.
+        let text_of_a_keys_length = format!("'{}'", "k".repeat(32));
+        for odd in [
+            "x'0102'",
+            "'a text'",
+            text_of_a_keys_length.as_str(),
+            "17",
+            "1.5",
+        ] {
             let set = format!("UPDATE sync_files SET author = {odd} WHERE key = 'gone.md'");
             conn.execute(&set, []).unwrap();
             let state = load(&conn, "/m", "grp_a").unwrap();

@@ -1139,8 +1139,9 @@ mod tests {
         assert_eq!(planned(&agreed_by(Writer::NotRecorded, 2, "x")), theirs);
         assert_eq!(planned(&agreed_by(Writer::Device(THEM), 2, "x")), vec![]);
         // And a later version is then judged by that record. THEM's next
-        // entry names nobody: it follows what THEM wrote, and not what
-        // this device wrote at the same revision.
+        // entry names no device in what it says: it follows what THEM
+        // wrote, as any entry follows its own writer's, and not what this
+        // device wrote at the same revision.
         let next = Remote {
             rev: 3,
             content: Some(c("y")),

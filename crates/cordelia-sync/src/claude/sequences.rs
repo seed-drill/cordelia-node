@@ -719,6 +719,16 @@ impl World {
     }
 
     /// The devices that are still the person's.
+    /// What the device's record of a file says of who wrote the entry it
+    /// agreed, if it has a record of the file.
+    fn writer_of(&self, d: usize, name: &str) -> Option<Writer> {
+        let device = &self.devices[d];
+        let db = device.st.db.lock().unwrap();
+        let folder = device.mem.display().to_string();
+        let records = sync_state::load(&db, &folder, &self.channel).unwrap();
+        records.get(name).map(|(_, _, writer)| *writer)
+    }
+
     fn remaining(&self) -> Vec<usize> {
         (0..self.devices.len())
             .filter(|d| !self.removed.contains(d))
@@ -790,14 +800,16 @@ impl World {
 }
 
 /// Run `steps` on devices of `kinds`, and say what each device has after
-/// each step.
+/// each step: each device that remains, since one that was removed is in
+/// the channel no longer.
 fn run(kinds: &[Kind], seed: u64, steps: &[Step]) -> Vec<Vec<Has>> {
     let mut world = World::new(kinds, seed);
     steps
         .iter()
         .map(|step| {
             world.run(step);
-            (0..kinds.len()).map(|d| world.has(d)).collect()
+            let devices = world.remaining();
+            devices.into_iter().map(|d| world.has(d)).collect()
         })
         .collect()
 }
@@ -1105,34 +1117,65 @@ fn each_device_that_held_an_overtaken_entry_keeps_it() {
     }
 }
 
+/// The steps of [`a_text_is_kept_through_a_removal`]: those up to the
+/// cycle in which device 2 takes the entry published again, and the rest.
+fn a_removal_and_then_a_tie() -> (Vec<Step>, Vec<Step>) {
+    let mut until = vec![Edit(0, "a.md"), Cycle(0)];
+    until.extend(sync(4));
+    until.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 2), Cycle(2)]);
+    until.extend([Edit(3, "a.md"), Cycle(3)]);
+    // Device 1 holds device 0's entry, and has run no cycle since it came.
+    until.extend([Pass(0, 1), Remove(1, 0), Pass(1, 2), Cycle(2)]);
+    let then = vec![
+        Pass(3, 1),
+        Cycle(1),
+        Edit(1, "a.md"),
+        Cycle(1),
+        Pass(1, 2),
+        Cycle(2),
+    ];
+    (until, then)
+}
+
+/// The steps of [`an_edit_that_tied_with_an_entry_published_again_is_kept`].
+fn a_tie_and_then_a_removal() -> Vec<Step> {
+    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
+    steps.extend(sync(3));
+    steps.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 1), Cycle(1)]);
+    steps.extend([Edit(2, "a.md"), Cycle(2)]);
+    steps.extend([Remove(1, 0), Edit(1, "a.md"), Cycle(1)]);
+    steps.extend([Pass(1, 2), Cycle(2)]);
+    steps
+}
+
 /// A text is kept through a removal. Device 0 writes a text and is then
 /// removed by device 1, which never had that text in its folder: it holds
 /// the entry, and publishes it again under its own name, saying nothing,
 /// as the node does. Device 2 holds the text. Device 3 edited the file
-/// without it, and its entry ties with the removed device's.
+/// without it, at the same revision.
 ///
-/// Where device 3's entry wins that tie on device 1, device 1's file takes
-/// device 3's text, and its next edit is written from a folder that never
-/// held device 0's text. Recorded as the writer of the entry it published
-/// again, device 1 was then taken to follow that text on device 2, where
-/// it was replaced with nothing kept, and it was in no file anywhere. The
-/// record of an entry that says nothing names nobody, and the text is
-/// kept. (Each tie goes as the seed says, so the sequence is run with
-/// seeds enough for the tie to go each way.)
+/// Device 3's entry reaches device 1 after the removal, and ties there
+/// with the entry device 1 published again. Where device 3's wins, device
+/// 1's file takes device 3's text, and its next edit is written from a
+/// folder that never held device 0's text. Recorded as the writer of the
+/// entry it published again, device 1 was then taken to follow that text
+/// on device 2, where it was replaced with nothing kept, and it was in no
+/// file anywhere. The record of an entry that says nothing names nobody,
+/// and the text is kept. (Each tie goes as the seed says, so the sequence
+/// is run with seeds enough for the tie to go each way.)
 #[test]
 fn a_text_is_kept_through_a_removal() {
-    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
-    steps.extend(sync(4));
-    steps.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 2), Cycle(2)]);
-    steps.extend([Edit(3, "a.md"), Cycle(3)]);
-    // Device 1 holds device 0's entry and has run no cycle.
-    steps.extend([Pass(0, 1), Remove(1, 0), Pass(1, 2), Cycle(2)]);
-    steps.extend([Pass(3, 1), Cycle(1), Edit(1, "a.md"), Cycle(1)]);
-    steps.extend([Pass(1, 2), Cycle(2)]);
+    let (until, then) = a_removal_and_then_a_tie();
     let mut kept = 0;
     for seed in 0..8 {
         let mut world = World::new(&[Built; 4], seed);
-        for step in &steps {
+        for step in &until {
+            world.run(step);
+        }
+        // The entry was published again, and device 2 has taken it for
+        // the one it held: its record named device 0, and names nobody.
+        assert_eq!(world.writer_of(2, "a.md"), Some(Writer::Nobody), "{seed}");
+        for step in &then {
             world.run(step);
         }
         world.rest();
@@ -1151,19 +1194,16 @@ fn a_text_is_kept_through_a_removal() {
 /// removal is kept. Device 0 writes a text, device 1 takes it, and device
 /// 2 edits the file without it: a tie. Device 1 removes device 0,
 /// publishing its entry again, and edits the file. That edit says that
-/// everything at or below the entry it was written over is left to its
-/// revision, and device 2's own edit is at that revision. It said what it
-/// was written after, so it is not the entry that was written over, and
-/// its text is kept. It was replaced with nothing kept.
+/// everything below the entry it was written over is left to its
+/// revision, and at that revision whatever said nothing. Device 2's own
+/// edit is at that revision, and said what it was written after: so it is
+/// not the entry that was written over, and its text is kept. It was
+/// replaced with nothing kept. (No tie is read here, so every seed runs
+/// alike: two are run, to show that.)
 #[test]
 fn an_edit_that_tied_with_an_entry_published_again_is_kept() {
-    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
-    steps.extend(sync(3));
-    steps.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 1), Cycle(1)]);
-    steps.extend([Edit(2, "a.md"), Cycle(2)]);
-    steps.extend([Remove(1, 0), Edit(1, "a.md"), Cycle(1)]);
-    steps.extend([Pass(1, 2), Cycle(2)]);
-    for seed in 0..4 {
+    let steps = a_tie_and_then_a_removal();
+    for seed in 0..2 {
         let mut world = World::new(&[Built; 3], seed);
         for step in &steps {
             world.run(step);
@@ -1182,6 +1222,24 @@ fn an_edit_that_tied_with_an_entry_published_again_is_kept() {
         let lost = world.lost();
         assert!(lost.is_empty(), "seed {seed}: {lost:?}");
     }
+}
+
+/// The property holds through a removal: with the rule and without it,
+/// every device that remains has the same files, the same versions in the
+/// channel and the same records after every step of the two sequences
+/// above, and the rule only adds conflict files. In each of the two it
+/// does add one, for some seed.
+#[test]
+fn a_removal_changes_no_file_that_the_rule_does_not_keep() {
+    let (until, then) = a_removal_and_then_a_tie();
+    let first: Vec<Step> = until.into_iter().chain(then).collect();
+    let made_a_difference = |kinds: &[Kind], steps: &[Step]| {
+        (0..8)
+            .filter(|seed| same_as_before(kinds, *seed, steps))
+            .count()
+    };
+    assert!(made_a_difference(&[Built; 4], &first) > 0);
+    assert!(made_a_difference(&[Built; 3], &a_tie_and_then_a_removal()) > 0);
 }
 
 /// A record made before the writer was kept says nothing of who wrote
