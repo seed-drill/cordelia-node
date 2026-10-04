@@ -842,6 +842,41 @@ pub const MAX_STATEMENT_NUMBER: u64 = 256;
 // Checked at compile time: every statement's number is a band.
 const _: () = assert!(MAX_STATEMENT_NUMBER < 1 << REV_BAND_BITS);
 
+/// The most devices a statement may list (decision 2026-10-04 §4.1).
+pub const MAX_STATEMENT_DEVICES: usize = 64;
+
+/// The most removed keys a statement may list (decision 2026-10-04 §4.1).
+/// A statement lists every key removed so far, so this is also the most
+/// keys one phrase removes.
+pub const MAX_STATEMENT_REMOVED: usize = 256;
+
+/// The most statements a statement's chain may name (decision 2026-10-04
+/// §4.1): every statement it was made after, back to the first.
+pub const MAX_STATEMENT_CHAIN: usize = 256;
+
+/// The most a device's label may be in a statement, in bytes (decision
+/// 2026-10-04 §4.1).
+pub const MAX_DEVICE_LABEL_BYTES: usize = 64;
+
+/// How much of a statement's hash names it on a chain: its first 16 bytes
+/// (decision 2026-10-04 §4.1). Only the phrase signs a statement, so
+/// nothing is gained by forging one of these.
+pub const STATEMENT_HASH_BYTES: usize = 16;
+
+/// The most a statement takes in its canonical form, with its signature:
+/// every list at its bound and every label at its longest.
+/// Derived from the bounds above and the widths of the form: a number is
+/// eight bytes, a count or a length two, a key 32, a signature 64.
+pub const MAX_STATEMENT_BYTES: usize = 8 // number
+    + 32 // maker
+    + 2 + MAX_STATEMENT_CHAIN * (8 + STATEMENT_HASH_BYTES) // chain
+    + 32 // commitment
+    + 2 + MAX_STATEMENT_DEVICES * (32 + 2 + MAX_DEVICE_LABEL_BYTES) // devices
+    + 2 + MAX_STATEMENT_REMOVED * 32 // removed keys
+    + 32 // the phrase's key
+    + 2 // the reserved field, which is empty
+    + 64; // signature
+
 /// How many words a recovery phrase has (decision 2026-10-04 §5).
 pub const PHRASE_WORDS: usize = 12;
 
@@ -1380,6 +1415,18 @@ mod tests {
         assert_eq!(REV_BAND_SIZE, 1 << 44);
         assert_eq!(REV_BAND_HALF, 1 << 43);
         assert_eq!(MAX_REV, (1 << 53) - 1);
+    }
+
+    #[test]
+    fn test_statement_bounds_decision_2026_10_04_4_1() {
+        assert_eq!(MAX_STATEMENT_NUMBER, 256);
+        assert_eq!(MAX_STATEMENT_DEVICES, 64);
+        assert_eq!(MAX_STATEMENT_REMOVED, 256);
+        assert_eq!(MAX_STATEMENT_CHAIN, 256);
+        assert_eq!(MAX_DEVICE_LABEL_BYTES, 64);
+        assert_eq!(STATEMENT_HASH_BYTES, 16);
+        // About 21 KB at every bound together.
+        assert_eq!(MAX_STATEMENT_BYTES, 20_784);
     }
 
     #[test]

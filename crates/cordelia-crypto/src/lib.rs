@@ -14,6 +14,7 @@ pub mod phrase;
 pub mod psk_envelope;
 pub mod signing;
 pub mod slots;
+pub mod statement;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};
