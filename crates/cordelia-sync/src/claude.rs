@@ -41,6 +41,7 @@ use cordelia_storage::{channels, history, meta, sync_state};
 
 use crate::after::{After, Over};
 use crate::discover::{self, Project};
+use crate::memory_md;
 use crate::names;
 use crate::plan::{self, Action, Agreed, Content, Remote, Writer};
 
@@ -1176,17 +1177,27 @@ struct Hooks<'a> {
     /// nothing of the writer. With the plan of that version, a test has a
     /// device of that version.
     says_nothing: bool,
+    /// Write down the lines and the memories this device deletes, and put
+    /// a line back when its memory comes back ([`lines`]). Without it a
+    /// test has a device of the version before that.
+    lines: bool,
+    /// Run just before the hold under which lines are put back. A cycle
+    /// does nothing there. A test does what can arrive in that gap.
+    before_hold: &'a dyn Fn(),
 }
 
 impl Hooks<'_> {
-    /// What a cycle does: the plan, nothing at any of the three places,
-    /// and entries that say what they were written after.
+    /// What a cycle does: the plan, nothing at any of the four places,
+    /// entries that say what they were written after, and the index line
+    /// of a memory that comes back.
     const NONE: Hooks<'static> = Hooks {
         plan: plan::plan,
         listed: &|| {},
         between: &|| {},
         flushed: &|_| {},
         says_nothing: false,
+        lines: true,
+        before_hold: &|| {},
     };
 }
 
@@ -1226,12 +1237,14 @@ fn sync_folder_with(
     report.skipped = skipped;
     report.too_large = too_large;
 
-    let (remote, deleted, taken, agreed) = {
+    let (remote, deleted, taken, agreed, index_read) = {
         let db = lock(state)?;
         let mut remote: HashMap<String, Remote> = HashMap::new();
         let mut deleted: HashSet<String> = HashSet::new();
         // The entry each file was planned against: see `Ctx::planned`.
         let mut taken: HashMap<String, String> = HashMap::new();
+        // What stands beside the index's entry: see `lines`.
+        let mut beside = Vec::new();
         for e in entries::current(state, &db, channel)? {
             let Some(name) = e.key.strip_prefix(prefix) else {
                 continue;
@@ -1245,6 +1258,9 @@ fn sync_folder_with(
             let Some(item_id) = taken_as_a_version(&e) else {
                 continue;
             };
+            if name == memory_md::INDEX_FILE {
+                beside = lines::beside(&e);
+            }
             let content = if e.current.deleted {
                 deleted.insert(name.to_string());
                 None
@@ -1266,7 +1282,11 @@ fn sync_folder_with(
             .into_iter()
             .map(|(k, (hash, rev, writer))| (k, Agreed { hash, rev, writer }))
             .collect();
-        (remote, deleted, taken, agreed)
+        let index_read = match hooks.lines {
+            true => lines::read_index(state, &db, channel, prefix, beside)?,
+            false => lines::IndexRead::default(),
+        };
+        (remote, deleted, taken, agreed, index_read)
     };
 
     // What is not a file is listed only where the channel has a memory
@@ -1318,6 +1338,25 @@ fn sync_folder_with(
     keys.sort();
     keys.dedup();
 
+    // The files for which nothing is planned: see `lines`.
+    let mut quiet: HashSet<String> = HashSet::new();
+    let ctx_of = |key: &str| Ctx {
+        state,
+        dir,
+        channel,
+        prefix,
+        tag,
+        folder: &folder,
+        agent,
+        generation,
+        planned: taken.get(key).map(String::as_str),
+        over: remote.get(key),
+        agreed: &agreed,
+        flushed: hooks.flushed,
+        relied: RefCell::new(None),
+        says_nothing: hooks.says_nothing,
+        lines: hooks.lines,
+    };
     'files: for key in keys {
         if apart.contains(key) {
             // It takes no part, so nothing is kept beside it from one
@@ -1333,22 +1372,16 @@ fn sync_folder_with(
             agreed.get(key),
             &deleted,
         );
-        let ctx = Ctx {
-            state,
-            dir,
-            channel,
-            prefix,
-            tag,
-            folder: &folder,
-            agent,
-            generation,
-            planned: taken.get(key).map(String::as_str),
-            over: remote.get(key),
-            agreed: &agreed,
-            flushed: hooks.flushed,
-            relied: RefCell::new(None),
-            says_nothing: hooks.says_nothing,
-        };
+        let ctx = ctx_of(key);
+        // A minute of looking at a file's line starts again when a cycle
+        // applies any action to the file, or to the index, at that moment
+        // and whether or not the cycle reaches its end.
+        if actions.is_empty() {
+            quiet.insert(key.clone());
+        } else if hooks.lines {
+            let of_this = (key != memory_md::INDEX_FILE).then_some(key.as_str());
+            state.sync_control.look_again(&folder, channel, of_this);
+        }
         // What was kept beside this file lasts from one cycle to the next
         // only while the file is still planned with a text to keep. Any
         // other plan means that the conflict it was kept for is over,
@@ -1384,6 +1417,28 @@ fn sync_folder_with(
         if state.sync_control.generation() != generation {
             report.stopped = true;
             break;
+        }
+    }
+    // Only a cycle that dealt with every file of the folder looks at its
+    // lines: one ended by a failure that is not a file's asks nothing. (A
+    // file that failed was dealt with. And a cycle that a change of
+    // settings stopped makes no look: `look` asks that itself, under the
+    // lock.) A failure here is the index's, reported as any file's is:
+    // the folder's other files are done by then.
+    if hooks.lines && report.error.is_none() {
+        let cycle = lines::Cycle {
+            local: &local,
+            remote: &remote,
+            agreed: &agreed,
+            taken: &taken,
+            quiet: &quiet,
+            index: &index_read,
+            before_hold: hooks.before_hold,
+        };
+        match lines::look(&ctx_of(memory_md::INDEX_FILE), &cycle, &mut report) {
+            Ok(()) => {}
+            Err(Failure::File(error)) => report.fail(memory_md::INDEX_FILE, error),
+            Err(Failure::Folder(e)) => report.error = Some(e.to_string()),
         }
     }
     report.conflict_files = conflict_files(dir);
@@ -1438,6 +1493,8 @@ struct Ctx<'a> {
     relied: RefCell<Option<(String, [u8; 32])>>,
     /// See [`Hooks::says_nothing`]: `false` except in a test.
     says_nothing: bool,
+    /// See [`Hooks::lines`]: `true` except in a test.
+    lines: bool,
 }
 
 /// Why an action could not be done.
@@ -2068,6 +2125,7 @@ fn apply(
         flushed: _,
         relied: _,
         says_nothing,
+        lines: _,
     } = *ctx;
     let writes_file = matches!(
         action,
@@ -2142,6 +2200,24 @@ fn apply(
         let db = lock(state)?;
         publish_over(ctx, &db, &full_key, text, at).map_err(of_a_publish)
     };
+    // The same, for an edit or a delete that this device makes of its own
+    // (not a merge): what it published is written down for the file's
+    // index line ([`lines::published`]), under the hold of the lock that
+    // the publish was made under. An entry that is published, and of
+    // which nothing could be written down, is published all the same.
+    let publish_own = |text: Option<&str>,
+                       at: Option<u64>|
+     -> Result<Option<(entries::Published, Writer)>, Failure> {
+        let db = lock(state)?;
+        let published = publish_over(ctx, &db, &full_key, text, at).map_err(of_a_publish)?;
+        if ctx.lines
+            && published.is_some()
+            && let Err(error) = lines::published(ctx, &db, key, text)
+        {
+            tracing::warn!(file = %dir.join(key).display(), %error, "published, and what it means for the file's index line could not be written down");
+        }
+        Ok(published)
+    };
     // What is agreed is one entry: its text, its revision, and what a
     // record says of who wrote it (`Remote::writer`). A device that says
     // nothing (a test's) records nothing of the writer, as before entries
@@ -2179,7 +2255,7 @@ fn apply(
             // The channel's version is kept in history first. A publish
             // that is not made takes the record with it.
             let (ahead, at) = keep_channel(ctx, key, &full_key, history::Change::EditedHere)?;
-            match publish(Some(&text), at) {
+            match publish_own(Some(&text), at) {
                 Ok(Some((entry, writer))) => {
                     settle(ctx, ahead);
                     report.published += 1;
@@ -2198,7 +2274,7 @@ fn apply(
         }
         Action::PublishDelete => {
             let (ahead, at) = keep_channel(ctx, key, &full_key, history::Change::DeletedHere)?;
-            let Some((entry, writer)) = publish(None, at)? else {
+            let Some((entry, writer)) = publish_own(None, at)? else {
                 return Ok(false);
             };
             settle(ctx, ahead);
@@ -2348,6 +2424,7 @@ fn apply(
     Ok(true)
 }
 
+mod lines;
 #[cfg(test)]
 mod sequences;
 
@@ -2355,6 +2432,8 @@ mod sequences;
 mod tests {
     use super::*;
     use cordelia_storage::atomic::temporary_name;
+
+    mod index_lines;
 
     /// The device that wrote a version of the channel's, where a test
     /// makes an action by hand and does not look at whose it is.
@@ -2410,6 +2489,7 @@ mod tests {
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            lines: true,
             agent: "x",
         };
         let mut report = FolderReport::default();
@@ -2515,6 +2595,7 @@ mod tests {
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            lines: true,
             agent: "x",
         };
         let seen = Some(Content::new("here\n").hash);
@@ -2768,6 +2849,7 @@ mod tests {
                     flushed: &|_| {},
                     relied: RefCell::new(None),
                     says_nothing: false,
+                    lines: true,
                     agent: "x",
                 };
                 let seen = current_hash(&mem, key);
@@ -2799,6 +2881,7 @@ mod tests {
                     flushed: &|_| {},
                     relied: RefCell::new(None),
                     says_nothing: false,
+                    lines: true,
                     agent: "x",
                 };
                 let mut report = FolderReport::default();
@@ -5097,6 +5180,7 @@ mod tests {
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            lines: true,
             agent: "x",
         };
         let is = |planned, name: &str, text: &str| {
@@ -5271,6 +5355,7 @@ mod tests {
                 flushed: &|_| {},
                 relied: RefCell::new(None),
                 says_nothing: false,
+                lines: true,
                 agent: "x",
             };
             let copy = names::conflict_name(file, "abcd");
@@ -6442,6 +6527,7 @@ mod tests {
             flushed: &|_| {},
             relied: RefCell::new(None),
             says_nothing: false,
+            lines: true,
         };
         let publish = |at: Option<u64>| {
             let db = p.st.db.lock().unwrap();

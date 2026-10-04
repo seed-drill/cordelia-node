@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -284,6 +284,26 @@ const MIGRATION_V9: &str = r#"
 ALTER TABLE sync_files ADD COLUMN author BLOB;
 "#;
 
+/// Migration v10: the memories this device deleted with their index
+/// lines (decision 2026-09-30 §4.5, `index_lines`): for each file of a
+/// folder, the line this device removed for it and when, when it
+/// published the file's delete, whether the two were within an hour of
+/// each other, and how many times the line has been put back. Times are
+/// seconds, in UTC.
+const MIGRATION_V10: &str = r#"
+CREATE TABLE index_lines (
+    folder      TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    file        TEXT NOT NULL,
+    line        TEXT,
+    line_at     INTEGER,
+    deleted_at  INTEGER,
+    whole       INTEGER NOT NULL DEFAULT 0,
+    put_back    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (folder, channel_id, file)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -381,6 +401,11 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 9 {
         tracing::info!("applying migration v9 (who wrote what a folder agreed)");
         migrate_in_one(conn, MIGRATION_V9, 9)?;
+    }
+
+    if current < 10 {
+        tracing::info!("applying migration v10 (the lines of memories deleted here)");
+        migrate_in_one(conn, MIGRATION_V10, 10)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -765,9 +790,10 @@ mod tests {
         assert_eq!(version(&conn), 8);
         assert!(!has_writer(&conn), "the column goes with the version");
 
-        // The next start runs the step from the beginning.
+        // The next start runs the step from the beginning (and the steps
+        // after it).
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 9);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         let rows: Vec<(String, i64, Option<Vec<u8>>)> = conn
             .prepare("SELECT key, rev, author FROM sync_files ORDER BY key")
             .unwrap()
@@ -785,12 +811,47 @@ mod tests {
 
         // And a start after that changes nothing.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 9);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         assert!(has_writer(&conn));
 
         // Nor does the step itself, asked for again by a process that
         // read the version before another had run it.
         migrate_in_one(&conn, MIGRATION_V9, 9).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+    }
+
+    /// The table of the memories a device deleted is made in one step
+    /// with its version, as the step before it is: a failure between the
+    /// two leaves neither, and the step asked for twice is run once.
+    #[test]
+    fn test_v10_adds_the_table_of_lines_and_its_version_as_one() {
+        let conn = at_v8();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has_table = |conn: &Connection| conn.prepare("SELECT file FROM index_lines").is_ok();
+        migrate_in_one(&conn, MIGRATION_V9, 9).unwrap();
+
+        let failing = format!("{MIGRATION_V10} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 10).is_err());
         assert_eq!(version(&conn), 9);
+        assert!(!has_table(&conn), "the table goes with the version");
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 10);
+        assert!(has_table(&conn));
+        conn.execute(
+            "INSERT INTO index_lines (folder, channel_id, file) VALUES ('/m', 'grp_a', 'a.md')",
+            [],
+        )
+        .unwrap();
+        // A start after that, and the step asked for again, change nothing.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V10, 10).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM index_lines", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version(&conn), rows), (10, 1));
     }
 }

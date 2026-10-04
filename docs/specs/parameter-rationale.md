@@ -767,6 +767,54 @@ more. A sweep lists the whole directory, so it is not run after every
 cycle that keeps a text: an eighth makes it at most eight sweeps for each
 time the store's worth of text is kept.
 
+## 11. Index Line Parameters
+
+The index line of a memory that comes back (decision 2026-09-30 §4.5). A
+device writes down the line it takes out of the index and the delete of the
+line's file, and puts the line back if the file comes back unlisted.
+
+### INDEX_LINE_PAIR_SECS = 3600
+
+**Rationale:** How far apart the two acts may be published and still be one
+deleting of a memory. A person or an agent removes a file and its line in
+one sitting, and the two go out in one cycle or in the next. An hour allows
+for a cycle that fails between them, and is short enough that a line taken
+out today and a file deleted next week are not taken for one act.
+
+### INDEX_LINE_KEPT_DAYS = 90
+
+**Rationale:** As long as a node keeps a delete it has received
+(`KEYED_TOMBSTONE_RETENTION_DAYS`): while another device can still bring the
+file back over that delete, the line can still be put back.
+
+### INDEX_LINE_MAX_RECORDS = 1024
+
+**Rationale:** A bound on a table that an agent's edits fill. A folder
+with more than a thousand memories deleted with their lines in ninety days
+is not a case to serve whole: past the bound a record goes for each new
+one, and never the one just written. Of the others, one with one half goes
+before any that is whole (an index written anew drops many lines at once,
+and those halves go within the hour anyway), and then the oldest.
+
+### INDEX_LINE_MAX_PUT_BACKS = 3
+
+**Rationale:** A line that is put back can be taken out again by another
+device's merge or by an index that overtakes it, and is then put back
+again. Three times covers the reunions that follow one another closely,
+and stops two devices that disagree from answering each other for ever.
+
+### INDEX_LINE_LOOK_SECS = 60, INDEX_LINE_LOOK_GAP_SECS = 30
+
+**Rationale:** A device that has just lost a tie on the index merges, and
+its merge can publish nothing, so no entry shows that a tie has been merged.
+A device that is in step has merged within about half a minute. So a line
+goes back only once it has been due at every look for a minute, and a
+version that has just come to stand beside the index's starts the minute
+again. A cycle runs every five seconds, so a minute is about thirteen
+looks. Looks more than 30 seconds apart are not one run of looks: the
+machine slept, the clock was moved, or the cycles stopped, and what was
+found before says nothing of now.
+
 ---
 
 *Spec version: 1.4*

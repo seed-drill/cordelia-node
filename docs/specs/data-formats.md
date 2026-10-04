@@ -7,7 +7,7 @@
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, specs/search-indexing.md, specs/identity.md
 
-> **v1 status (2026-09-30).** The schema is at version 9. Migrations since
+> **v1 status (2026-09-30).** The schema is at version 10. Migrations since
 > this spec, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md):
 >
 > - **v4:** `channels` admits type `inbox` and gains `epoch` and
@@ -22,6 +22,13 @@
 >   (decision §4.5). A device's key (32 bytes) where that entry says what it
 >   was written after, an empty value where it says nothing, and `NULL` in a
 >   row written before this version.
+> - **v10:** `index_lines`, the adapter's record of each memory that this
+>   device deleted with its line in the index (decision §4.5): for a memory
+>   folder, a channel and a file, the line that was taken out and when, when
+>   the file's delete was published, whether both were within an hour (the
+>   record is then whole), and how many times the line has been put back.
+>   Times are seconds, in UTC. It holds index lines as text, where the rest
+>   of the database holds names and hashes of memory.
 >
 > PSK envelope items (§4) are replaced by sealed channel states, items of type
 > `invite` in inbox channels (decision §4.1). The search index (`search-indexing.md`,

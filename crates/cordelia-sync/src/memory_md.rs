@@ -14,7 +14,7 @@ use std::collections::HashSet;
 pub const INDEX_FILE: &str = "MEMORY.md";
 
 /// The file a line links to (`...](file.md)...`), if any.
-fn linked_file(line: &str) -> Option<&str> {
+pub(crate) fn linked_file(line: &str) -> Option<&str> {
     let start = line.find("](")? + 2;
     let end = start + line[start..].find(')')?;
     let target = line[start..end].trim();

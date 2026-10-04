@@ -648,6 +648,31 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 /// edit; 90 days covers a laptop left in a drawer for a season.
 pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
 
+/// The index line of a memory that a device deleted (decision 2026-09-30
+/// §4.5). Primitives:
+///
+/// - The two halves of a record (the line removed from the index, and the
+///   file's delete) are one deletion if they are published within an hour
+///   of each other. A person or an agent that deletes a memory removes
+///   both in one go; the hour covers a node that was stopped in between.
+/// - A whole record lasts as long as a delete is kept: after that the
+///   delete it answers to is gone from every node.
+/// - A folder keeps at most 1,024 records: a bound on a table that an
+///   agent's edits fill. Past it a record goes for each new one, and
+///   never the one just written.
+/// - A line is put back at most three times for one record: twice past
+///   the first, for a merge that takes it out again, and no more, so that
+///   two devices cannot go on undoing each other.
+/// - A line is put back once it has been due at every look for a minute,
+///   the looks no more than 30 seconds apart: a device that is in step has
+///   merged a tie on the index within about half a minute.
+pub const INDEX_LINE_PAIR_SECS: i64 = 60 * 60;
+pub const INDEX_LINE_KEPT_DAYS: u32 = KEYED_TOMBSTONE_RETENTION_DAYS;
+pub const INDEX_LINE_MAX_RECORDS: usize = 1024;
+pub const INDEX_LINE_MAX_PUT_BACKS: u32 = 3;
+pub const INDEX_LINE_LOOK_SECS: i64 = 60;
+pub const INDEX_LINE_LOOK_GAP_SECS: i64 = 30;
+
 /// The largest revision an entry may carry: 2^53 - 1.
 /// A revision is chosen by whoever writes the entry. Unbounded, one writer
 /// could set it so high that the next revision overflows and the name can

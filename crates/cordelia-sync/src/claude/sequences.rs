@@ -2,7 +2,9 @@
 //! syncs, for the rule that an entry says what it was written after
 //! (decision 2026-09-30 §4.5).
 //!
-//! Two things are checked, each over written and generated sequences:
+//! Two things are checked for that rule, each over written and generated
+//! sequences (and three more for the index line of a memory that comes
+//! back, further down, with a kind of device and steps of their own):
 //!
 //! - **The property.** The rule changes one thing: where a file would be
 //!   replaced by a version at a higher revision that is not known to
@@ -48,6 +50,9 @@ enum Kind {
     /// As it was before: the plan as it was, entries that say nothing,
     /// records that say nothing of the writer.
     Before,
+    /// As it is built, without the index line of a memory that comes back
+    /// ([`lines`]): what the rule for an overtaken edit shipped as.
+    Lineless,
 }
 
 /// The plan as it was before entries said what they were written after: a
@@ -179,6 +184,13 @@ enum Step {
     /// The device puts the text of its first conflict file into the file
     /// it is a copy of, after what the file holds, and deletes the copy.
     MergeCopy(usize),
+    /// The device adds a line for the file to its index: one with a link.
+    Listed(usize, &'static str),
+    /// The device takes every line for the file out of its index.
+    Unlist(usize, &'static str),
+    /// A minute of looks on the device: thirteen cycles, five seconds
+    /// apart by its clock.
+    Minute(usize),
 }
 
 /// A device in a sequence.
@@ -241,6 +253,16 @@ struct World {
     /// Each index line that a copy of the index held when a step edited
     /// or deleted that copy, and that the device's index did not have.
     let_go_lines: BTreeSet<String>,
+    /// The time, in seconds, by every device's clock. Only a minute of
+    /// looks moves it on.
+    now: i64,
+    /// Each file that a step deleted on some device.
+    deleted: BTreeSet<String>,
+    /// How many times a cycle put index lines back, on any device.
+    put_back: u64,
+    /// Each tie that was settled: the file, and whether the entry
+    /// published later won it.
+    ties: BTreeSet<(String, bool)>,
     _tmp: tempfile::TempDir,
 }
 
@@ -322,6 +344,10 @@ impl World {
             lines: BTreeSet::new(),
             let_go: BTreeSet::new(),
             let_go_lines: BTreeSet::new(),
+            now: 1_800_000_000,
+            deleted: BTreeSet::new(),
+            put_back: 0,
+            ties: BTreeSet::new(),
             _tmp: tmp,
         }
     }
@@ -392,7 +418,33 @@ impl World {
                 let path = self.devices[*d].mem.join(INDEX_FILE);
                 std::fs::write(path, format!("{index}{line}\n")).unwrap();
             }
-            Step::Delete(d, name) => self.put(*d, name, None),
+            Step::Delete(d, name) => {
+                self.deleted.insert(name.to_string());
+                self.put(*d, name, None);
+            }
+            Step::Listed(d, name) => {
+                let line = format!("- [{name}]({name}) listed on {d} at step {}", self.step);
+                let index = self.read(*d, INDEX_FILE).unwrap_or_default();
+                let path = self.devices[*d].mem.join(INDEX_FILE);
+                std::fs::write(path, format!("{index}{line}\n")).unwrap();
+            }
+            Step::Unlist(d, name) => {
+                if let Some(index) = self.read(*d, INDEX_FILE) {
+                    let kept: String = index
+                        .lines()
+                        .filter(|line| lines::line_for(line) != Some(*name))
+                        .map(|line| format!("{line}\n"))
+                        .collect();
+                    let path = self.devices[*d].mem.join(INDEX_FILE);
+                    std::fs::write(path, kept).unwrap();
+                }
+            }
+            Step::Minute(d) => {
+                for _ in 0..13 {
+                    self.now += 5;
+                    self.cycle(*d);
+                }
+            }
             Step::Cycle(d) => self.cycle(*d),
             Step::Pass(from, to) => self.send(*from, *to, None),
             Step::PassOne(from, to, name) => self.send(*from, *to, Some(name)),
@@ -541,14 +593,21 @@ impl World {
         let tag = hex::encode(&device.st.identity.public_key()[..4]);
         let hooks = Hooks {
             plan: match device.kind {
-                Kind::Built => plan::plan,
+                Kind::Built | Kind::Lineless => plan::plan,
                 Kind::Before => plan_before,
             },
             listed: &|| {},
             between: &|| {},
             flushed: &|_| {},
             says_nothing: device.kind == Kind::Before,
+            // A device as it was before entries said anything has no
+            // record of its lines either.
+            lines: device.kind == Kind::Built,
+            before_hold: &|| {},
         };
+        device.st.sync_control.set_now(Some(self.now));
+        let counted = self.times_put_back(d);
+        let device = &self.devices[d];
         let generation = device.st.sync_control.generation();
         let report = sync_folder_with(
             &device.st,
@@ -565,7 +624,22 @@ impl World {
             report.failed.is_empty() && report.error.is_none(),
             "{report:?}"
         );
+        // A cycle that put lines back counted each record that was due in
+        // it. (A third time takes the record with it, and is not seen
+        // here: nothing below needs it to be.)
+        self.put_back += self.times_put_back(d).saturating_sub(counted);
         self.settle_ties(d);
+    }
+
+    /// How many times the device's records say their lines were put back.
+    fn times_put_back(&self, d: usize) -> u64 {
+        let db = self.devices[d].st.db.lock().unwrap();
+        db.query_row(
+            "SELECT COALESCE(SUM(put_back), 0) FROM index_lines",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     /// Whether, of two entries for `name` at one revision, the one
@@ -614,6 +688,7 @@ impl World {
             let envelope = entries::decrypt(st, now, &it).expect("its own entry");
             let name = envelope["key"].as_str().unwrap().to_string();
             let wins = self.new_entry_wins(&name);
+            self.ties.insert((name.clone(), wins));
             let key = psk::read_psk_for_version(&st.home_dir, &self.channel, it.key_version, now)
                 .unwrap();
             let aad = item_aad(&self.channel, it.slot.as_deref(), it.rev);
@@ -1467,4 +1542,565 @@ fn the_check_sees_a_line_lost_after_a_copy_was_merged() {
     for line in ["- written on 1 at step", "- merged on 1 at step"] {
         assert!(lost.iter().any(|l| l.contains(line)), "{line}: {lost:?}");
     }
+}
+
+// ── The index line of a memory that comes back ─────────────────────
+//
+// [`lines`] over sequences in which memories are deleted with their lines
+// and come back. Three properties, each over written and generated
+// sequences:
+//
+// - **A.** Every file but the index and its copies is, on every device
+//   after every step, as in a run of the same steps on devices without
+//   the change.
+// - **B.** When everything has met, every line that the run without the
+//   change has in an index, and that has no link or whose file no step
+//   deleted, is in an index or in a copy of the index in the run with it.
+// - **C.** When everything has met and a minute of looks has passed on
+//   every device, as often as it takes for no line to go back, no device
+//   holds a whole record for a file that it has at rest as a text while
+//   its index, at rest, has no line for that file.
+
+use Kind::Lineless;
+
+/// The two memories of these sequences. One sorts before the index, and
+/// so is planned before it in a cycle; the other after.
+const MEMORIES: [&str; 2] = ["A.md", "notes.md"];
+
+impl Dice {
+    /// A sequence for `n` devices in which memories are listed, edited,
+    /// deleted with their lines and without, and minutes pass: both
+    /// memories written, listed and agreed, and then `len` rolls.
+    fn line_steps(&mut self, n: usize, len: usize) -> Vec<Step> {
+        let mut steps = Vec::new();
+        for file in MEMORIES {
+            steps.extend([Edit(0, file), Listed(0, file)]);
+        }
+        steps.push(Cycle(0));
+        steps.extend(sync(n));
+        for _ in 0..len {
+            let d = self.roll(n);
+            let other = (d + 1 + self.roll(n - 1)) % n;
+            let file = MEMORIES[self.roll(MEMORIES.len())];
+            match self.roll(24) {
+                0..=2 => steps.push(Edit(d, file)),
+                3 => steps.push(Listed(d, file)),
+                4 => steps.push(Line(d)),
+                5 => steps.push(Delete(d, file)),
+                6 => steps.push(Unlist(d, file)),
+                // A memory deleted with its line: the two acts in either
+                // order, in one cycle or in two, or with something
+                // arriving between them.
+                7..=10 => {
+                    let mut acts = [Unlist(d, file), Delete(d, file)];
+                    if self.roll(2) == 0 {
+                        acts.reverse();
+                    }
+                    let [first, second] = acts;
+                    steps.push(first);
+                    match self.roll(3) {
+                        0 => {}
+                        1 => steps.push(Cycle(d)),
+                        _ => steps.push(Pass(other, d)),
+                    }
+                    steps.extend([second, Cycle(d)]);
+                }
+                11..=15 => steps.push(Cycle(d)),
+                16..=19 => steps.push(Pass(d, other)),
+                20 => steps.push(PassOne(d, other, file)),
+                21 => steps.push(PassOne(d, other, INDEX_FILE)),
+                _ => steps.push(Minute(d)),
+            }
+        }
+        steps
+    }
+}
+
+/// One device deletes a memory with its line while another, apart, edits
+/// the memory; then everything meets, and a minute passes on the device
+/// that deleted. `line_first`: the line goes before the file. `two`: the
+/// two acts are published in two cycles.
+fn deleted_and_edited_apart(n: usize, line_first: bool, two: bool) -> Vec<Step> {
+    let file = "notes.md";
+    let mut steps = vec![Edit(0, file), Listed(0, file), Line(0), Cycle(0)];
+    steps.extend(sync(n));
+    let mut acts = [Unlist(0, file), Delete(0, file)];
+    if !line_first {
+        acts.reverse();
+    }
+    let [first, second] = acts;
+    steps.push(first);
+    if two {
+        steps.push(Cycle(0));
+    }
+    steps.extend([second, Cycle(0)]);
+    steps.extend([Edit(1, file), Cycle(1)]);
+    steps.extend(sync(n));
+    steps.push(Minute(0));
+    steps.extend(sync(n));
+    steps
+}
+
+/// The written sequences for the index line.
+fn written_for_lines() -> Vec<(String, usize, Vec<Step>)> {
+    let mut all = Vec::new();
+    for line_first in [true, false] {
+        for two in [true, false] {
+            let name =
+                format!("deleted and edited apart (line first: {line_first}, two cycles: {two})");
+            all.push((name, 2, deleted_and_edited_apart(2, line_first, two)));
+        }
+    }
+    // Two devices delete the memory with its line, from one agreed index,
+    // and the third's edit brings it back. A minute passes on both.
+    let file = "notes.md";
+    let mut both = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+    both.extend(sync(3));
+    for d in [0, 1] {
+        both.extend([Unlist(d, file), Delete(d, file), Cycle(d)]);
+    }
+    both.extend([Edit(2, file), Cycle(2)]);
+    both.extend(sync(3));
+    both.extend([Minute(0), Minute(1)]);
+    both.extend(sync(3));
+    all.push(("two devices deleted it".to_string(), 3, both));
+
+    // The cost: the other device edits its index while apart, and its
+    // edit is heard only after the put-back.
+    let mut apart = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+    apart.extend(sync(2));
+    apart.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+    apart.extend([Edit(1, file), Cycle(1), Pass(1, 0), Cycle(0)]);
+    apart.extend([Line(1), Cycle(1)]);
+    apart.push(Minute(0));
+    apart.extend(sync(2));
+    all.push((OVERTAKEN.to_string(), 2, apart));
+
+    // The other device adds a line to its index meanwhile: a tie on the
+    // file and a tie on the index. Everything reaches the device that
+    // deleted at once; or the file's entry a cycle before the index's; or
+    // a cycle after it.
+    for first in [None, Some(file), Some(INDEX_FILE)] {
+        let mut steps = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+        steps.extend(sync(2));
+        steps.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+        steps.extend([Edit(1, file), Line(1), Cycle(1)]);
+        if let Some(first) = first {
+            let second = if first == file { INDEX_FILE } else { file };
+            steps.extend([PassOne(1, 0, first), Cycle(0)]);
+            steps.extend([PassOne(1, 0, second), Cycle(0)]);
+        }
+        steps.extend(sync(2));
+        steps.push(Minute(0));
+        steps.extend(sync(2));
+        let name = match first {
+            None => TWO_TIES.to_string(),
+            Some(first) => format!("{TWO_TIES}, {first} first"),
+        };
+        all.push((name, 2, steps));
+    }
+
+    // The other device changes the memory's own line meanwhile.
+    let mut changed = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+    changed.extend(sync(2));
+    changed.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+    changed.extend([Unlist(1, file), Listed(1, file), Edit(1, file), Cycle(1)]);
+    changed.extend(sync(2));
+    changed.push(Minute(0));
+    changed.extend(sync(2));
+    all.push(("its own line changed apart".to_string(), 2, changed));
+
+    // The other device, apart, edits the memory and deletes a second
+    // memory with its line, and runs no cycle before the first device's
+    // minute is up.
+    let second = "second.md";
+    let mut two = vec![Edit(0, file), Listed(0, file)];
+    two.extend([Edit(0, second), Listed(0, second), Cycle(0)]);
+    two.extend(sync(2));
+    two.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+    two.extend([
+        Edit(1, file),
+        Unlist(1, second),
+        Delete(1, second),
+        Cycle(1),
+    ]);
+    two.extend([Pass(1, 0), Cycle(0), Minute(0)]);
+    two.extend(sync(2));
+    all.push(("a second memory deleted apart".to_string(), 2, two));
+
+    // Three devices: one deletes the memory with its line, one adds a
+    // line, and the third had taken the first's index; the second's index
+    // entry reaches the third a cycle before its edit of the file.
+    let mut three = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+    three.extend(sync(3));
+    three.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+    three.extend([Line(1), Cycle(1)]);
+    three.extend([PassOne(0, 2, INDEX_FILE), Cycle(2)]);
+    three.extend([PassOne(1, 2, INDEX_FILE), Cycle(2)]);
+    three.extend([Edit(2, file), Cycle(2)]);
+    three.extend(sync(3));
+    three.push(Minute(0));
+    three.extend(sync(3));
+    let name = "one deletes, one adds a line, a third edits";
+    all.push((name.to_string(), 3, three));
+
+    // A version of the index stands beside the channel's when the line
+    // goes back: two devices added a line each, at one revision.
+    let mut beside = vec![Edit(0, file), Listed(0, file), Cycle(0)];
+    beside.extend(sync(3));
+    beside.extend([Unlist(0, file), Delete(0, file), Cycle(0)]);
+    beside.extend([Edit(1, file), Cycle(1)]);
+    beside.extend(sync(3));
+    beside.extend([Line(0), Line(2), Cycle(0), Cycle(2), Pass(2, 0), Cycle(0)]);
+    beside.push(Minute(0));
+    beside.extend(sync(3));
+    all.push((BESIDE.to_string(), 3, beside));
+    all
+}
+
+/// The names of the written sequences that a test asks more of.
+const TWO_TIES: &str = "a line added apart";
+const OVERTAKEN: &str = "an index edited apart";
+const BESIDE: &str = "a version beside";
+
+/// The seeds the written sequences for the index line run with: four
+/// pairs, each pair deciding every tie the two ways round, and the pairs
+/// deciding them apart from each other. So a sequence with a tie on the
+/// file and a tie on the index runs with each of the four ways those two
+/// can go (`the_two_ties_go_each_of_the_four_ways` holds that).
+fn seeds() -> [u64; 8] {
+    [2, 3, 4, 5, 6, 7, 8, 9]
+}
+
+/// What a device has, without the index and its copies.
+fn but_the_index(has: &Has) -> Has {
+    let mut has = has.clone();
+    has.files.remove(INDEX_FILE);
+    has.channel.remove(INDEX_FILE);
+    has.records.remove(INDEX_FILE);
+    has.copies.retain(|(root, _)| root != INDEX_FILE);
+    has
+}
+
+/// Property A, for one sequence.
+fn every_other_file_is_as_without_it(n: usize, seed: u64, steps: &[Step]) {
+    let without = run(&vec![Lineless; n], seed, steps);
+    let with = run(&vec![Built; n], seed, steps);
+    for (i, (was, is)) in without.iter().zip(&with).enumerate() {
+        for ((d, was), (_, is)) in was.iter().zip(is) {
+            assert_eq!(
+                but_the_index(was),
+                but_the_index(is),
+                "seed {seed}, device {d}, after step {i} ({:?}) of {steps:?}",
+                steps[i]
+            );
+        }
+    }
+}
+
+impl World {
+    /// The world after `steps`, with everything met.
+    fn after(kinds: &[Kind], seed: u64, steps: &[Step]) -> World {
+        let mut world = World::new(kinds, seed);
+        for step in steps {
+            world.run(step);
+        }
+        world.rest();
+        world
+    }
+
+    /// Every line of an index on a device that remains, and with `copies`
+    /// every line of a copy of the index too.
+    fn lines_listed(&self, copies: bool) -> BTreeSet<String> {
+        let mut lines = BTreeSet::new();
+        for d in self.remaining() {
+            let has = self.has(d);
+            if let Some(index) = has.files.get(INDEX_FILE) {
+                lines.extend(index.lines().map(String::from));
+            }
+            for (root, text) in &has.copies {
+                if copies && root == INDEX_FILE {
+                    lines.extend(text.lines().map(String::from));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Everything meets and a minute of looks passes on every device,
+    /// again and again until nothing changes.
+    fn settle_lines(&mut self) {
+        for _ in 0..40 {
+            self.rest();
+            let devices = self.remaining();
+            let before: Vec<_> = devices.iter().map(|d| self.whole(*d)).collect();
+            for d in &devices {
+                self.run(&Step::Minute(*d));
+            }
+            let after: Vec<_> = devices.iter().map(|d| self.whole(*d)).collect();
+            if after == before {
+                return;
+            }
+        }
+        panic!("lines were still going back");
+    }
+
+    /// The files for which the device holds a whole record, has the file
+    /// at rest as a text, and has an index at rest with no line for it.
+    fn unlisted(&self, d: usize) -> Vec<String> {
+        let has = self.has(d);
+        let at_rest = |name: &str| -> Option<&String> {
+            let text = has.files.get(name)?;
+            let (_, there) = has.channel.get(name)?;
+            let (hash, _) = has.records.get(name)?;
+            let same =
+                there.as_ref() == Some(text) && *hash == Some(Content::new(text.as_str()).hash);
+            same.then_some(text)
+        };
+        let Some(index) = at_rest(INDEX_FILE) else {
+            return Vec::new();
+        };
+        let device = &self.devices[d];
+        let db = device.st.db.lock().unwrap();
+        let folder = device.mem.display().to_string();
+        let records =
+            cordelia_storage::index_lines::whole(&db, &folder, &self.channel, self.now).unwrap();
+        records
+            .into_iter()
+            .map(|record| record.file)
+            .filter(|file| at_rest(file).is_some())
+            .filter(|file| {
+                !index
+                    .lines()
+                    .any(|line| lines::line_for(line) == Some(file))
+            })
+            .collect()
+    }
+}
+
+/// Property B, for one sequence; `settled` asks it after the minutes of
+/// property C as well.
+fn no_line_is_lost_to_a_put_back(n: usize, seed: u64, steps: &[Step]) {
+    let without = World::after(&vec![Lineless; n], seed, steps);
+    let mut with = World::after(&vec![Built; n], seed, steps);
+    let expected: Vec<String> = without
+        .lines_listed(false)
+        .into_iter()
+        .filter(|line| lines::line_for(line).is_none_or(|file| !without.deleted.contains(file)))
+        .collect();
+    for settled in [false, true] {
+        if settled {
+            with.settle_lines();
+        }
+        let there = with.lines_listed(true);
+        for line in &expected {
+            assert!(
+                there.contains(line),
+                "seed {seed}, settled: {settled}: the line {line:?} is in no index and no copy \
+                 after {steps:?}"
+            );
+        }
+    }
+}
+
+/// Property C, for one sequence. Returns whether a line was put back.
+fn a_line_that_is_due_goes_back(n: usize, seed: u64, steps: &[Step]) -> bool {
+    let mut world = World::after(&vec![Built; n], seed, steps);
+    world.settle_lines();
+    for d in world.remaining() {
+        let unlisted = world.unlisted(d);
+        assert!(
+            unlisted.is_empty(),
+            "seed {seed}, device {d}: {unlisted:?} back and not listed after {steps:?}"
+        );
+    }
+    world.put_back > 0
+}
+
+/// The generated sequences for the index line: for two, three and four
+/// devices.
+fn generated_for_lines() -> Vec<(usize, u64, Vec<Step>)> {
+    let mut all = Vec::new();
+    for n in 2..=4 {
+        for seed in 1..=sequences() {
+            let mut steps = Dice(seed * 15_485_863 + n as u64).line_steps(n, 50);
+            steps.extend(sync(n));
+            all.push((n, seed, steps));
+        }
+    }
+    all
+}
+
+/// Property A: the index line of a memory that comes back changes no
+/// file but the index and its copies.
+#[test]
+fn the_index_line_changes_no_other_file() {
+    for (name, n, steps) in written_for_lines() {
+        for seed in seeds() {
+            eprintln!("{name}, seed {seed}");
+            every_other_file_is_as_without_it(n, seed, &steps);
+        }
+    }
+    for (n, seed, steps) in generated_for_lines() {
+        every_other_file_is_as_without_it(n, seed, &steps);
+    }
+}
+
+/// Property B: a put-back loses no line.
+#[test]
+fn a_put_back_loses_no_line() {
+    for (name, n, steps) in written_for_lines() {
+        for seed in seeds() {
+            eprintln!("{name}, seed {seed}");
+            no_line_is_lost_to_a_put_back(n, seed, &steps);
+        }
+    }
+    for (n, seed, steps) in generated_for_lines() {
+        no_line_is_lost_to_a_put_back(n, seed, &steps);
+    }
+}
+
+/// Property C: where a memory is back and its line is due, the line goes
+/// back. And the sequences reach the rule: in each written one, and in a
+/// good part of the generated ones, a line is put back. Without that the
+/// three properties could be true of nothing.
+#[test]
+fn a_memory_that_is_back_is_listed() {
+    for (name, n, steps) in written_for_lines() {
+        // With a tie in it, a sequence can leave the line in place one
+        // way round (the delete wins, the other device's index arrives
+        // with the line in it): it reaches the rule the other way.
+        let reached = seeds().map(|seed| {
+            eprintln!("{name}, seed {seed}");
+            a_line_that_is_due_goes_back(n, seed, &steps)
+        });
+        assert!(reached.contains(&true), "{name}: no line went back");
+    }
+    let (mut run, mut reached) = (0, 0);
+    for (n, seed, steps) in generated_for_lines() {
+        run += 1;
+        reached += usize::from(a_line_that_is_due_goes_back(n, seed, &steps));
+    }
+    eprintln!("a line went back in {reached} of {run} generated sequences");
+    assert!(4 * reached >= run, "a line went back in {reached} of {run}");
+}
+
+/// The written sequences end as they should: every device has the memory
+/// and one line for it.
+#[test]
+fn a_memory_deleted_here_and_edited_there_is_listed_once_everywhere() {
+    for (name, n, steps) in written_for_lines() {
+        for seed in seeds() {
+            for kinds in [vec![Built; n], {
+                // The other devices without the change: the device that
+                // deleted puts the line back all the same.
+                let mut kinds = vec![Lineless; n];
+                kinds[0] = Built;
+                kinds
+            }] {
+                // Two devices deleted it: both have the change.
+                let kinds = match name.starts_with("two devices") {
+                    true => vec![Built; n],
+                    false => kinds,
+                };
+                let mut world = World::after(&kinds, seed, &steps);
+                world.settle_lines();
+                world.rest();
+                for d in world.remaining() {
+                    let at = format!("{name}, seed {seed}, {kinds:?}, device {d}");
+                    assert!(world.read(d, "notes.md").is_some(), "{at}");
+                    let index = world.read(d, INDEX_FILE).unwrap();
+                    let listed = index
+                        .lines()
+                        .filter(|line| lines::line_for(line) == Some("notes.md"))
+                        .count();
+                    assert_eq!(listed, 1, "{at}: {index}");
+                }
+            }
+        }
+    }
+}
+
+/// The written sequence with a tie on the file and a tie on the index
+/// runs with each of the four ways the two can go: the properties above
+/// are asked of all four.
+#[test]
+fn the_two_ties_go_each_of_the_four_ways() {
+    let (_, n, steps) = written_for_lines()
+        .into_iter()
+        .find(|(name, ..)| name == TWO_TIES)
+        .unwrap();
+    let mut ways = BTreeSet::new();
+    for seed in seeds() {
+        let world = World::after(&vec![Built; n], seed, &steps);
+        let won = |name: &str| -> Vec<bool> {
+            let ties = world.ties.iter().filter(|(tied, _)| tied == name);
+            ties.map(|(_, won)| *won).collect()
+        };
+        let (file, index) = (won("notes.md"), won(INDEX_FILE));
+        assert_eq!(
+            (file.len(), index.len()),
+            (1, 1),
+            "seed {seed}: one tie each"
+        );
+        ways.insert((file[0], index[0]));
+    }
+    assert_eq!(ways.len(), 4, "{ways:?}");
+}
+
+/// What a put-back costs a device whose index it overtakes, and no more.
+///
+/// - A device that edited its index while apart, and whose edit is heard
+///   only after the put-back, has its index kept as a copy: the put-back
+///   is at a higher revision and is not known to follow what it holds.
+/// - A device whose version stood beside the channel's finds its lines in
+///   the index: every line of a copy of its index is in its index, or is
+///   for a file that a step deleted.
+#[test]
+fn a_put_back_overtakes_an_index_into_a_copy() {
+    let mut overtaken = 0;
+    for (name, n, steps) in written_for_lines() {
+        if name != OVERTAKEN && name != BESIDE {
+            continue;
+        }
+        for seed in seeds() {
+            let mut world = World::after(&vec![Built; n], seed, &steps);
+            let at = format!("{name}, seed {seed}");
+            if name == OVERTAKEN {
+                // The line went back before the other device's index edit
+                // was heard where the memory's edit won its tie at once:
+                // the other way round the memory comes back only when
+                // the two have met, and the indexes have merged by then.
+                if world.put_back > 0 {
+                    overtaken += 1;
+                    let copies = world.has(1).copies;
+                    assert!(
+                        copies.iter().any(|(root, _)| root == INDEX_FILE),
+                        "{at}: the overtaken index is in no copy"
+                    );
+                }
+                continue;
+            }
+            world.settle_lines();
+            world.rest();
+            for d in world.remaining() {
+                let has = world.has(d);
+                let index = has.files.get(INDEX_FILE).cloned().unwrap_or_default();
+                for (_, copy) in has.copies.iter().filter(|(root, _)| root == INDEX_FILE) {
+                    for line in copy.lines() {
+                        let gone =
+                            lines::line_for(line).is_some_and(|file| world.deleted.contains(file));
+                        assert!(
+                            gone || index.lines().any(|listed| listed == line),
+                            "{at}, device {d}: {line:?} is in a copy and not in the index"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        overtaken > 0,
+        "no seed staged an index overtaken by a put-back"
+    );
 }
