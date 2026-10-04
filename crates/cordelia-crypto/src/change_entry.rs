@@ -2,7 +2,7 @@
 //! §4.6, §9).
 //!
 //! Each statement is published as one entry in the phrase's channel. This
-//! module makes and opens that entry's content, which is always 32 KB. It
+//! module makes that entry and opens it. Its content is always 32 KB, and
 //! has two parts. Each is sealed with AES-256-GCM under a key of its own,
 //! and bound to the statement's number and the phrase's public key, so
 //! that a part is no part of another entry.
@@ -40,6 +40,27 @@
 //! Building refuses what does not fit, and never cuts it. At every bound
 //! together both parts fit, which `cordelia_core::protocol` checks when it
 //! is compiled.
+//!
+//! ## Opening
+//!
+//! A change entry is opened from an entry that passed the check, and from
+//! nothing else: [`open_statement`], [`open_for_device`] and
+//! [`open_for_phrase`] take the entry, the phrase key that the reader
+//! follows and the ID of that phrase's channel. They refuse an entry that
+//! the phrase's key did not write, one of another channel, one in another
+//! slot than the change entry's ([`slot`]), and one that says it is a
+//! delete. The statement's number is the entry's revision.
+//!
+//! The part for the devices is under the statement key, which every device
+//! that ever followed the phrase keeps, a removed one among them. Such a
+//! device can seal the true statement again with a list of its own making.
+//! It cannot sign an entry as the phrase, so what it seals is never
+//! opened.
+//!
+//! What the part for the devices says after its statement is the sealed
+//! list and the fill, for every reader: a count that is the number of the
+//! statement's devices, a sealed secret for each, and zeros. Anything else
+//! there is refused, whoever reads.
 
 use std::fmt;
 
@@ -51,7 +72,9 @@ use cordelia_core::protocol::{
 
 use crate::aes_gcm::{item_decrypt, item_encrypt};
 use crate::ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt};
+use crate::entry::CheckedEntry;
 use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
+use crate::slots::slot_id;
 use crate::statement::{Reader, SignedStatement, StatementError, put_count};
 
 /// Why a change entry's content was not made, or not opened.
@@ -62,6 +85,18 @@ pub enum ChangeEntryError {
 
     #[error("a part of the change entry would say {needed} bytes, and has room for {room}")]
     DoesNotFit { needed: usize, room: usize },
+
+    #[error("the entry is not in the channel of the phrase")]
+    AnotherChannel,
+
+    #[error("the entry was not written by the phrase's key")]
+    AnotherAuthor,
+
+    #[error("the entry is not in the change entry's slot")]
+    AnotherSlot,
+
+    #[error("the entry says it is a delete")]
+    Delete,
 
     #[error("the part did not open: it is not under this key, or not of this entry")]
     DidNotOpen,
@@ -293,9 +328,9 @@ pub fn build(
 /// key of the phrase's channel, as every entry is by its author and its
 /// channel, so only what was given the phrase can make one.
 ///
-/// The channel holds this one entry, in the slot of one name
-/// (`CHANGE_ENTRY_NAME`): each statement's entry takes the place of the
-/// one before it.
+/// The channel holds this one entry, in the change entry's slot
+/// ([`slot`]): each statement's entry takes the place of the one before
+/// it.
 ///
 /// Refused: a statement under another phrase than `phrase`, and whatever
 /// [`build`] refuses.
@@ -316,95 +351,134 @@ pub fn entry_of(
     )?;
     let channel = phrase.channel_secret().map_err(crypto)?;
     let channel_key = crate::derive::signing_key(&channel).map_err(crypto)?;
-    let slot_key = crate::derive::slot_key(&channel).map_err(crypto)?;
     Ok(crate::entry::signed(
         &channel_key,
         &author,
-        crate::slots::slot_id(&slot_key, CHANGE_ENTRY_NAME),
+        slot(&channel_key.public_key()),
         statement.statement.number,
         false,
         content,
     ))
 }
 
-/// Open the part of a change entry for the devices as far as its
-/// statement, which every device that follows the phrase can read, however
-/// far behind it is.
+/// The change entry's slot, in the phrase's channel whose ID is `channel`:
+/// the slot of the change entry's name (`CHANGE_ENTRY_NAME`) under the
+/// channel's ID.
 ///
-/// `number` is the entry's revision and `phrase_key` its author, which is
-/// the key the device follows. The statement that is returned is under
-/// that phrase, has that number, and was signed by that key.
-pub fn open_statement(
-    content: &[u8],
-    number: u64,
+/// A name's slot in any other channel is under the channel's slot key,
+/// which hides the name from a relay. The phrase's channel holds one
+/// entry, whose name is no secret, and no device holds a key of that
+/// channel. So its slot is under the channel's ID, which every device that
+/// follows the phrase keeps: a device can tell the change entry's slot
+/// from any other.
+pub fn slot(channel: &[u8; 32]) -> [u8; 32] {
+    slot_id(channel, CHANGE_ENTRY_NAME)
+}
+
+/// Whether `entry` can be the change entry of the phrase whose key is
+/// `phrase_key` and whose channel's ID is `phrase_channel`: it is in that
+/// channel, that key wrote it, it is in the change entry's slot, and it is
+/// no delete.
+fn the_phrases(
+    entry: &CheckedEntry,
     phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
+) -> Result<(), ChangeEntryError> {
+    if entry.channel != *phrase_channel {
+        return Err(ChangeEntryError::AnotherChannel);
+    }
+    if entry.author != *phrase_key {
+        return Err(ChangeEntryError::AnotherAuthor);
+    }
+    if entry.slot != slot(phrase_channel) {
+        return Err(ChangeEntryError::AnotherSlot);
+    }
+    if entry.delete {
+        return Err(ChangeEntryError::Delete);
+    }
+    Ok(())
+}
+
+/// Open a change entry as far as its statement, which every device that
+/// follows the phrase can read, however far behind it is.
+///
+/// `entry` has passed the check. `phrase_key` is the key the reader
+/// follows and `phrase_channel` the ID of that phrase's channel: an entry
+/// that is not that phrase's change entry is refused (see the module's
+/// documentation). The statement that is returned is under that phrase,
+/// has the entry's revision for its number, and was signed by that key.
+pub fn open_statement(
+    entry: &CheckedEntry,
+    phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
     statement_key: &[u8; 32],
 ) -> Result<SignedStatement, ChangeEntryError> {
-    Ok(open_devices_part(content, number, phrase_key, statement_key)?.0)
+    Ok(open_devices_part(entry, phrase_key, phrase_channel, statement_key)?.0)
 }
 
 /// Open a change entry as the device `device`: the statement, and the
 /// secret where the statement lists the device and what was sealed to it
 /// opens to the statement's commitment.
 ///
-/// A fault in what comes with the statement is no error here: the
-/// statement was read, and a device that it lists is told that its secret
-/// did not open ([`DeviceSecret::DidNotOpen`]). What the statement is to
-/// the device is [`crate::statement::judge`]'s to say.
+/// `entry`, `phrase_key` and `phrase_channel` are as [`open_statement`]
+/// takes them.
+///
+/// A secret that does not open is no error here: the statement was read,
+/// and a device that it lists is told that its secret did not open
+/// ([`DeviceSecret::DidNotOpen`]). What the statement is to the device is
+/// [`crate::statement::judge`]'s to say.
 pub fn open_for_device(
-    content: &[u8],
-    number: u64,
+    entry: &CheckedEntry,
     phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
     statement_key: &[u8; 32],
     device: &NodeIdentity,
 ) -> Result<ForDevice, ChangeEntryError> {
-    let (statement, sealed) = open_devices_part(content, number, phrase_key, statement_key)?;
-    let listed = &statement.statement.devices;
+    let (statement, sealed) = open_devices_part(entry, phrase_key, phrase_channel, statement_key)?;
     let own = device.public_key();
+    let listed = &statement.statement.devices;
     let secret = match listed.iter().position(|one| one.key == own) {
         None => DeviceSecret::NotListed,
-        Some(place) => {
-            let opened = sealed_secrets(&sealed, listed.len())
-                .and_then(|sealed| open_sealed(&sealed[place], device));
-            match opened {
-                Some(secret) if statement.statement.commits_to(&secret) => {
-                    DeviceSecret::Opened(secret)
-                }
-                _ => DeviceSecret::DidNotOpen,
-            }
-        }
+        Some(place) => match open_sealed(&sealed[place], device) {
+            Some(secret) if statement.statement.commits_to(&secret) => DeviceSecret::Opened(secret),
+            _ => DeviceSecret::DidNotOpen,
+        },
     };
     Ok(ForDevice { statement, secret })
 }
 
 /// Open the part of a change entry that is for the phrase, with the key
-/// that only the phrase gives.
+/// that only the phrase gives. `entry`, `phrase_key` and `phrase_channel`
+/// are as [`open_statement`] takes them.
 pub fn open_for_phrase(
-    content: &[u8],
-    number: u64,
+    entry: &CheckedEntry,
     phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
     seal_key: &[u8; 32],
 ) -> Result<ForPhrase, ChangeEntryError> {
-    let (_, part) = parts(content)?;
+    the_phrases(entry, phrase_key, phrase_channel)?;
+    let (_, part) = parts(&entry.content)?;
     let said = open_part(
         part,
         seal_key,
-        &bound_to(LABEL_CHANGE_PHRASE, number, phrase_key),
+        &bound_to(LABEL_CHANGE_PHRASE, entry.rev, phrase_key),
     )?;
     let for_phrase = ForPhrase::from_bytes(&said)?;
-    for_phrase.validate(number)?;
+    for_phrase.validate(entry.rev)?;
     Ok(for_phrase)
 }
 
-/// The statement of the part for the devices, checked, and what the part
-/// says after it.
+/// The statement of the part for the devices, checked, and the secrets
+/// sealed to its devices, one for each and in their order.
 fn open_devices_part(
-    content: &[u8],
-    number: u64,
+    entry: &CheckedEntry,
     phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
     statement_key: &[u8; 32],
-) -> Result<(SignedStatement, Vec<u8>), ChangeEntryError> {
-    let (part, _) = parts(content)?;
+) -> Result<(SignedStatement, Vec<[u8; SEALED_SECRET_BYTES]>), ChangeEntryError> {
+    the_phrases(entry, phrase_key, phrase_channel)?;
+    let number = entry.rev;
+    let (part, _) = parts(&entry.content)?;
     let said = open_part(
         part,
         statement_key,
@@ -427,7 +501,11 @@ fn open_devices_part(
             statement: statement.statement.number,
         });
     }
-    Ok((statement, reader.rest().to_vec()))
+    // What follows the statement is the sealed list and the fill, whoever
+    // reads: a device that the statement does not list is held to it too.
+    let sealed = sealed_secrets(reader.rest(), statement.statement.devices.len())
+        .ok_or(ChangeEntryError::Malformed)?;
+    Ok((statement, sealed))
 }
 
 /// The secrets sealed to a statement's devices, one for each and in their
@@ -549,8 +627,11 @@ mod tests {
     use crate::statement::{Device, Judgement, Statement, judge};
 
     /// What an entry of one phrase is made and opened with.
+    #[derive(Clone, Copy)]
     struct Keys {
         phrase_key: [u8; 32],
+        /// The ID of the phrase's channel.
+        channel: [u8; 32],
         statement_key: [u8; 32],
         seal_key: [u8; 32],
     }
@@ -558,9 +639,86 @@ mod tests {
     fn keys(phrase: &Phrase) -> Keys {
         Keys {
             phrase_key: phrase.public_key().unwrap(),
+            channel: derive::channel_id(&phrase.channel_secret().unwrap()).unwrap(),
             statement_key: phrase.statement_key().unwrap(),
             seal_key: phrase.seal_key().unwrap(),
         }
+    }
+
+    /// An entry of the channel whose secret is `channel`, in that channel's
+    /// change slot, that `author` wrote at `number` with `content`,
+    /// whatever the content says. It passes the check, which reads no
+    /// content.
+    fn written_by(
+        author: &NodeIdentity,
+        channel: &[u8; 32],
+        number: u64,
+        content: &[u8],
+    ) -> CheckedEntry {
+        let channel_key = derive::signing_key(channel).unwrap();
+        let slot = slot(&channel_key.public_key());
+        crate::entry::signed(&channel_key, author, slot, number, false, content.to_vec())
+            .check()
+            .unwrap()
+    }
+
+    /// The entry of the phrase's channel that the phrase's key wrote at
+    /// `number` with `content`: the phrase of these tests.
+    fn carrying(content: &[u8], number: u64) -> CheckedEntry {
+        let phrase = phrase();
+        written_by(
+            &phrase.signing_key().unwrap(),
+            &phrase.channel_secret().unwrap(),
+            number,
+            content,
+        )
+    }
+
+    /// The statement of the entry that carries `content` at `number`, as a
+    /// device reads it with what `keys` gives.
+    fn read_statement(
+        content: &[u8],
+        number: u64,
+        keys: &Keys,
+    ) -> Result<SignedStatement, ChangeEntryError> {
+        open_statement(
+            &carrying(content, number),
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.statement_key,
+        )
+    }
+
+    /// The entry that carries `content` at `number`, as device `n` reads
+    /// it with what `keys` gives.
+    fn read_as(
+        content: &[u8],
+        number: u64,
+        keys: &Keys,
+        n: u16,
+    ) -> Result<ForDevice, ChangeEntryError> {
+        open_for_device(
+            &carrying(content, number),
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.statement_key,
+            &identity(n),
+        )
+    }
+
+    /// The part for the phrase of the entry that carries `content` at
+    /// `number`, as the phrase reads it with what `keys` gives.
+    fn read_for_phrase(
+        content: &[u8],
+        number: u64,
+        keys: &Keys,
+    ) -> Result<ForPhrase, ChangeEntryError> {
+        open_for_phrase(
+            &carrying(content, number),
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.seal_key,
+        )
     }
 
     /// The content of the entry of `statement`, as the phrase makes it.
@@ -663,14 +821,7 @@ mod tests {
     }
 
     fn opened_by(content: &[u8], number: u64, keys: &Keys, n: u16) -> ForDevice {
-        open_for_device(
-            content,
-            number,
-            &keys.phrase_key,
-            &keys.statement_key,
-            &identity(n),
-        )
-        .unwrap()
+        read_as(content, number, keys, n).unwrap()
     }
 
     // ── What an entry is ─────────────────────────────────────────────
@@ -699,17 +850,22 @@ mod tests {
             .count();
         assert!(same < 400, "{same} bytes of 32768 are the same");
 
-        // Content of any other size is no change entry.
+        // Content of any other size that an entry may have is no change
+        // entry.
         let keys = keys(&phrase);
-        for length in [0, 1, 4096, 28_672, 32_767, 32_769, 65_536] {
+        for length in [256, 4096, 16_384, 65_536] {
             let mut other = first_entry.clone();
             other.resize(length, 0);
             assert_eq!(
-                open_statement(&other, 1, &keys.phrase_key, &keys.statement_key),
+                read_statement(&other, 1, &keys),
                 Err(ChangeEntryError::Size(length))
             );
             assert_eq!(
-                open_for_phrase(&other, 1, &keys.phrase_key, &keys.seal_key),
+                read_as(&other, 1, &keys, 0),
+                Err(ChangeEntryError::Size(length))
+            );
+            assert_eq!(
+                read_for_phrase(&other, 1, &keys),
                 Err(ChangeEntryError::Size(length))
             );
         }
@@ -779,7 +935,7 @@ mod tests {
             assert_eq!(opened.secret, DeviceSecret::Opened(secret(2)));
         }
         assert_eq!(
-            open_statement(&content, 2, &keys.phrase_key, &keys.statement_key).unwrap(),
+            read_statement(&content, 2, &keys).unwrap(),
             signed(&two, &phrase)
         );
 
@@ -882,9 +1038,14 @@ mod tests {
 
         // It holds the statement key, and still opens nothing that is
         // sealed in the entry: not with its own key, in any place.
-        let (statement, after) =
-            open_devices_part(&content, 3, &keys.phrase_key, &keys.statement_key).unwrap();
-        let sealed = sealed_secrets(&after, statement.statement.devices.len()).unwrap();
+        let (statement, sealed) = open_devices_part(
+            &carrying(&content, 3),
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.statement_key,
+        )
+        .unwrap();
+        assert_eq!(sealed.len(), statement.statement.devices.len());
         assert_eq!(sealed.len(), 2);
         for one in &sealed {
             assert_eq!(open_sealed(one, &identity(2)), None);
@@ -979,31 +1140,224 @@ mod tests {
                 stranger.clone()
             ]
         );
+    }
 
-        // Not there: nothing after the statement, or a list for fewer
-        // devices than the statement has.
-        let none = [not.clone(), not.clone(), not.clone(), stranger.clone()];
-        assert_eq!(secrets_of(&[]), none);
-        assert_eq!(secrets_of(&counted(0, &[])), none);
-        assert_eq!(secrets_of(&counted(2, &[right(0), right(1)])), none);
+    /// What follows the statement is the sealed list and the fill, for
+    /// every reader: a count that is the number of the statement's
+    /// devices, a sealed secret for each, and zeros. Anything else is
+    /// refused, also for a device that the statement does not list, and
+    /// for one that reads the statement alone.
+    #[test]
+    fn what_follows_the_statement_is_the_sealed_list_and_the_fill() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [_, two, ..] = statements(&phrase);
+        let signed_two = signed(&two, &phrase);
+        let right = |n: u16| sealed_to(n, &secret(2));
+        let refused = |after: &[u8], what: &str| {
+            let content = content_saying(&statement_and(&signed_two, after), 2, &keys);
+            assert_eq!(
+                read_statement(&content, 2, &keys),
+                Err(ChangeEntryError::Malformed),
+                "{what}"
+            );
+            // A device it lists, one it does not, and a stranger.
+            for n in [0, 1, 2, 7] {
+                assert_eq!(
+                    read_as(&content, 2, &keys, n),
+                    Err(ChangeEntryError::Malformed),
+                    "{what}, to device {n}"
+                );
+            }
+        };
+
+        // The control: the list as `build` makes it is read by each.
+        let good = counted(3, &[right(0), right(1), right(2)]);
+        let content = content_saying(&statement_and(&signed_two, &good), 2, &keys);
+        assert_eq!(read_statement(&content, 2, &keys), Ok(signed_two.clone()));
+        assert_eq!(
+            opened_by(&content, 2, &keys, 7).secret,
+            DeviceSecret::NotListed
+        );
+
+        // Not there: nothing after the statement, or a list of none.
+        refused(&[], "nothing");
+        refused(&counted(0, &[]), "a list of none");
+        // A list for fewer devices than the statement has, or for more.
+        refused(&counted(2, &[right(0), right(1)]), "two of three");
+        refused(
+            &counted(4, &[right(0), right(1), right(2), right(2)]),
+            "four of three",
+        );
         // A count that is not the number of devices, with a secret for
         // each device after it.
-        assert_eq!(
-            secrets_of(&counted(4, &[right(0), right(1), right(2)])),
-            none
-        );
-        assert_eq!(
-            secrets_of(&counted(2, &[right(0), right(1), right(2)])),
-            none
-        );
+        refused(&counted(4, &[right(0), right(1), right(2)]), "a count of 4");
+        refused(&counted(2, &[right(0), right(1), right(2)]), "a count of 2");
         // More than the list after it: a fourth secret, and one byte.
-        assert_eq!(
-            secrets_of(&counted(3, &[right(0), right(1), right(2), right(2)])),
-            none
+        refused(
+            &counted(3, &[right(0), right(1), right(2), right(2)]),
+            "a fourth secret",
         );
-        let mut and_a_byte = counted(3, &[right(0), right(1), right(2)]);
+        let mut and_a_byte = good.clone();
         and_a_byte.extend_from_slice(&[0, 0, 0, 1]);
-        assert_eq!(secrets_of(&and_a_byte), none);
+        refused(&and_a_byte, "a byte after the list");
+        let mut and_the_last_byte = good;
+        let room = CHANGE_ENTRY_DEVICES_PART_BYTES - ITEM_SEAL_OVERHEAD_BYTES;
+        let after_the_statement = room - 2 - signed_two.to_bytes().unwrap().len();
+        and_the_last_byte.resize(after_the_statement, 0);
+        *and_the_last_byte.last_mut().unwrap() = 1;
+        refused(&and_the_last_byte, "the part's last byte");
+    }
+
+    /// A change entry is opened from the phrase's own entry, and from no
+    /// other: one in the phrase's channel, that the phrase's key wrote, in
+    /// the change entry's slot, that is no delete. The statement's number
+    /// is the entry's revision.
+    #[test]
+    fn a_change_entry_is_opened_only_from_the_phrases_own_entry() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [_, two, ..] = statements(&phrase);
+        let content = entry(&phrase, &two, &for_phrase_of(2));
+        let channel = phrase.channel_secret().unwrap();
+        let channel_key = derive::signing_key(&channel).unwrap();
+        let author = phrase.signing_key().unwrap();
+        // Each of the three readers refuses an entry alike.
+        let refused = |entry: &CheckedEntry, keys: &Keys, why: ChangeEntryError| {
+            let (key, id) = (&keys.phrase_key, &keys.channel);
+            assert_eq!(
+                open_statement(entry, key, id, &keys.statement_key),
+                Err(why.clone())
+            );
+            assert_eq!(
+                open_for_device(entry, key, id, &keys.statement_key, &identity(0)),
+                Err(why.clone())
+            );
+            assert_eq!(open_for_phrase(entry, key, id, &keys.seal_key), Err(why));
+        };
+
+        // The control: the phrase's own entry, read by each.
+        let own = carrying(&content, 2);
+        assert_eq!(own.slot, slot(&keys.channel));
+        assert_eq!(
+            open_statement(&own, &keys.phrase_key, &keys.channel, &keys.statement_key),
+            Ok(signed(&two, &phrase))
+        );
+        assert!(open_for_phrase(&own, &keys.phrase_key, &keys.channel, &keys.seal_key).is_ok());
+
+        // The same content, in the phrase's channel and in the change
+        // entry's slot, written by another key: a device of the person's.
+        let by_a_device = written_by(&identity(2), &channel, 2, &content);
+        assert_eq!(by_a_device.channel, keys.channel);
+        refused(&by_a_device, &keys, ChangeEntryError::AnotherAuthor);
+        // Read as that key's own, it is still nothing: its parts are bound
+        // to the phrase's key.
+        let as_its_own = Keys {
+            phrase_key: key(2),
+            ..keys
+        };
+        refused(&by_a_device, &as_its_own, ChangeEntryError::DidNotOpen);
+
+        // In another channel, whose key the writer holds: by the phrase's
+        // key, and by another.
+        let elsewhere = [0x44; 32];
+        refused(
+            &written_by(&author, &elsewhere, 2, &content),
+            &keys,
+            ChangeEntryError::AnotherChannel,
+        );
+        refused(
+            &written_by(&identity(2), &elsewhere, 2, &content),
+            &keys,
+            ChangeEntryError::AnotherChannel,
+        );
+
+        // In the phrase's channel, by the phrase's key, in another slot:
+        // the slot of the name under the channel's slot key, as a name's
+        // slot is in any other channel, and the slot of another name.
+        for slot in [
+            slot_id(&derive::slot_key(&channel).unwrap(), "change"),
+            slot_id(&keys.channel, "another name"),
+            [0u8; 32],
+        ] {
+            let moved =
+                crate::entry::signed(&channel_key, &author, slot, 2, false, content.clone())
+                    .check()
+                    .unwrap();
+            refused(&moved, &keys, ChangeEntryError::AnotherSlot);
+        }
+
+        // One that says it is a delete.
+        let a_delete = crate::entry::signed(
+            &channel_key,
+            &author,
+            slot(&keys.channel),
+            2,
+            true,
+            content.clone(),
+        )
+        .check()
+        .unwrap();
+        refused(&a_delete, &keys, ChangeEntryError::Delete);
+
+        // The number is the entry's revision: at another, no part opens.
+        refused(&carrying(&content, 3), &keys, ChangeEntryError::DidNotOpen);
+    }
+
+    /// A device that was removed still holds the statement key. It seals
+    /// the true statement again, with a list that opens for nobody, in an
+    /// entry that it signs: it cannot sign one as the phrase. No device
+    /// reads that the secret did not open: the entry is refused.
+    #[test]
+    fn the_true_statement_sealed_again_by_another_key_is_refused() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [_, _, three, ..] = statements(&phrase);
+        let removed = identity(2);
+        // Statement 3, which lists devices 0 and 1, with a secret of the
+        // removed device's own sealed to each.
+        let broken = counted(2, &[sealed_to(0, &secret(9)), sealed_to(1, &secret(9))]);
+        let content = content_saying(&statement_and(&signed(&three, &phrase), &broken), 3, &keys);
+
+        // In a channel of its own, and in the phrase's channel were it to
+        // hold that channel's key.
+        let its_own = [0x44; 32];
+        let own_id = derive::channel_id(&its_own).unwrap();
+        let in_its_own = written_by(&removed, &its_own, 3, &content);
+        let in_the_phrases = written_by(&removed, &phrase.channel_secret().unwrap(), 3, &content);
+        for n in [0, 1] {
+            let read = |entry: &CheckedEntry, channel: &[u8; 32]| {
+                open_for_device(
+                    entry,
+                    &keys.phrase_key,
+                    channel,
+                    &keys.statement_key,
+                    &identity(n),
+                )
+            };
+            assert_eq!(
+                read(&in_its_own, &keys.channel),
+                Err(ChangeEntryError::AnotherChannel)
+            );
+            // Were a device to take the entry's own channel for the
+            // phrase's, the entry is still not the phrase's.
+            assert_eq!(
+                read(&in_its_own, &own_id),
+                Err(ChangeEntryError::AnotherAuthor)
+            );
+            assert_eq!(
+                read(&in_the_phrases, &keys.channel),
+                Err(ChangeEntryError::AnotherAuthor)
+            );
+        }
+
+        // The control: what the removed device sealed is read where the
+        // phrase's key wrote the entry, and there the secret does not open.
+        for n in [0, 1] {
+            let opened = opened_by(&content, 3, &keys, n);
+            assert_eq!(opened.statement, signed(&three, &phrase));
+            assert_eq!(opened.secret, DeviceSecret::DidNotOpen);
+        }
     }
 
     // ── What an entry is bound to, and who can open it ───────────────
@@ -1020,11 +1374,8 @@ mod tests {
         let said = for_phrase_of(2);
         let content = entry(&phrase, &two, &said);
 
-        assert!(open_statement(&content, 2, &keys.phrase_key, &keys.statement_key).is_ok());
-        assert_eq!(
-            open_for_phrase(&content, 2, &keys.phrase_key, &keys.seal_key).unwrap(),
-            said
-        );
+        assert!(read_statement(&content, 2, &keys).is_ok());
+        assert_eq!(read_for_phrase(&content, 2, &keys).unwrap(), said);
 
         // What a relay holds of the phrase's channel, what a device holds,
         // and what another phrase gives.
@@ -1041,12 +1392,16 @@ mod tests {
             [0u8; 32],
         ];
         for wrong in not_the_statement_key {
+            let with = Keys {
+                statement_key: wrong,
+                ..keys
+            };
             assert_eq!(
-                open_statement(&content, 2, &keys.phrase_key, &wrong),
+                read_statement(&content, 2, &with),
                 Err(ChangeEntryError::DidNotOpen)
             );
             assert_eq!(
-                open_for_device(&content, 2, &keys.phrase_key, &wrong, &identity(0)),
+                read_as(&content, 2, &with, 0),
                 Err(ChangeEntryError::DidNotOpen)
             );
         }
@@ -1061,8 +1416,12 @@ mod tests {
             [0u8; 32],
         ];
         for wrong in not_the_seal_key {
+            let with = Keys {
+                seal_key: wrong,
+                ..keys
+            };
             assert_eq!(
-                open_for_phrase(&content, 2, &keys.phrase_key, &wrong),
+                read_for_phrase(&content, 2, &with),
                 Err(ChangeEntryError::DidNotOpen)
             );
         }
@@ -1090,25 +1449,30 @@ mod tests {
         let [_, two, three, ..] = statements(&phrase);
         let content = entry(&phrase, &two, &for_phrase_of(2));
 
-        for number in [0, 1, 3, 258, u64::MAX] {
+        // An entry at another revision than the content was sealed for.
+        for number in [1, 3, 258, cordelia_core::protocol::MAX_REV] {
             assert_eq!(
-                open_statement(&content, number, &keys.phrase_key, &keys.statement_key),
+                read_statement(&content, number, &keys),
                 Err(ChangeEntryError::DidNotOpen),
                 "{number}"
             );
             assert_eq!(
-                open_for_phrase(&content, number, &keys.phrase_key, &keys.seal_key),
+                read_for_phrase(&content, number, &keys),
                 Err(ChangeEntryError::DidNotOpen),
                 "{number}"
             );
         }
-        for not_the_phrase in [other.public_key().unwrap(), key(0), [0u8; 32]] {
+        // An entry that another key wrote, in a channel of its own, and
+        // that is read as that key's: the parts name the phrase's key.
+        for author in [other.signing_key().unwrap(), identity(0)] {
+            let moved = written_by(&author, &other.channel_secret().unwrap(), 2, &content);
+            let not_the_phrase = author.public_key();
             assert_eq!(
-                open_statement(&content, 2, &not_the_phrase, &keys.statement_key),
+                open_statement(&moved, &not_the_phrase, &moved.channel, &keys.statement_key),
                 Err(ChangeEntryError::DidNotOpen)
             );
             assert_eq!(
-                open_for_phrase(&content, 2, &not_the_phrase, &keys.seal_key),
+                open_for_phrase(&moved, &not_the_phrase, &moved.channel, &keys.seal_key),
                 Err(ChangeEntryError::DidNotOpen)
             );
         }
@@ -1118,20 +1482,20 @@ mod tests {
         let next = entry(&phrase, &three, &for_phrase_of(3));
         let mut mixed = parts(&content).unwrap().0.to_vec();
         mixed.extend_from_slice(parts(&next).unwrap().1);
-        assert!(open_statement(&mixed, 2, &keys.phrase_key, &keys.statement_key).is_ok());
+        assert!(read_statement(&mixed, 2, &keys).is_ok());
         assert_eq!(
-            open_for_phrase(&mixed, 2, &keys.phrase_key, &keys.seal_key),
+            read_for_phrase(&mixed, 2, &keys),
             Err(ChangeEntryError::DidNotOpen)
         );
         assert_eq!(
-            open_statement(&mixed, 3, &keys.phrase_key, &keys.statement_key),
+            read_statement(&mixed, 3, &keys),
             Err(ChangeEntryError::DidNotOpen)
         );
         // Nor does a part open as the other part.
         let mut swapped = vec![0u8; CHANGE_ENTRY_BYTES];
         swapped[..4096].copy_from_slice(parts(&content).unwrap().1);
         assert_eq!(
-            open_statement(&swapped, 2, &keys.phrase_key, &keys.statement_key),
+            read_statement(&swapped, 2, &keys),
             Err(ChangeEntryError::DidNotOpen)
         );
     }
@@ -1153,20 +1517,8 @@ mod tests {
             entry: 2,
             statement: 3,
         };
-        assert_eq!(
-            open_statement(&content, 2, &keys.phrase_key, &keys.statement_key),
-            Err(number.clone())
-        );
-        assert_eq!(
-            open_for_device(
-                &content,
-                2,
-                &keys.phrase_key,
-                &keys.statement_key,
-                &identity(0)
-            ),
-            Err(number)
-        );
+        assert_eq!(read_statement(&content, 2, &keys), Err(number.clone()));
+        assert_eq!(read_as(&content, 2, &keys, 0), Err(number));
         // The control: sealed as its own, it opens.
         let content = content_saying(&statement_and(&signed(&three, &phrase), &after), 3, &keys);
         assert_eq!(
@@ -1179,7 +1531,7 @@ mod tests {
         assert_eq!(theirs.verify(), Ok(()));
         let content = content_saying(&statement_and(&theirs, &[]), 1, &keys);
         assert_eq!(
-            open_statement(&content, 1, &keys.phrase_key, &keys.statement_key),
+            read_statement(&content, 1, &keys),
             Err(ChangeEntryError::AnotherPhrase)
         );
     }
@@ -1201,20 +1553,8 @@ mod tests {
         forged.signature = signed(&theirs, &other).signature;
         let unsigned = ChangeEntryError::Statement(StatementError::Signature);
         let content = content_saying(&statement_and(&forged, &[]), 2, &keys);
-        assert_eq!(
-            open_statement(&content, 2, &keys.phrase_key, &keys.statement_key),
-            Err(unsigned.clone())
-        );
-        assert_eq!(
-            open_for_device(
-                &content,
-                2,
-                &keys.phrase_key,
-                &keys.statement_key,
-                &identity(0)
-            ),
-            Err(unsigned.clone())
-        );
+        assert_eq!(read_statement(&content, 2, &keys), Err(unsigned.clone()));
+        assert_eq!(read_as(&content, 2, &keys, 0), Err(unsigned.clone()));
         // And no entry is made around it.
         assert_eq!(
             build(
@@ -1227,14 +1567,7 @@ mod tests {
         );
 
         // Bytes that are no statement, where the statement should be.
-        let open = |said: &[u8]| {
-            open_statement(
-                &content_saying(said, 2, &keys),
-                2,
-                &keys.phrase_key,
-                &keys.statement_key,
-            )
-        };
+        let open = |said: &[u8]| read_statement(&content_saying(said, 2, &keys), 2, &keys);
         let truncated = ChangeEntryError::Statement(StatementError::Truncated);
         assert_eq!(open(&[]), Err(truncated.clone()));
         assert_eq!(open(&counted(10, &[vec![0xab; 10]])), Err(truncated));
@@ -1266,14 +1599,11 @@ mod tests {
             let mut damaged = content.clone();
             damaged[at] ^= 0x04;
             assert_eq!(
-                open_statement(&damaged, 2, &keys.phrase_key, &keys.statement_key),
+                read_statement(&damaged, 2, &keys),
                 Err(ChangeEntryError::DidNotOpen),
                 "{at}"
             );
-            assert_eq!(
-                open_for_phrase(&damaged, 2, &keys.phrase_key, &keys.seal_key).unwrap(),
-                said
-            );
+            assert_eq!(read_for_phrase(&damaged, 2, &keys).unwrap(), said);
         }
         for at in [
             devices_end,
@@ -1284,7 +1614,7 @@ mod tests {
             let mut damaged = content.clone();
             damaged[at] ^= 0x04;
             assert_eq!(
-                open_for_phrase(&damaged, 2, &keys.phrase_key, &keys.seal_key),
+                read_for_phrase(&damaged, 2, &keys),
                 Err(ChangeEntryError::DidNotOpen),
                 "{at}"
             );
@@ -1446,10 +1776,7 @@ mod tests {
             opened_by(&content, 256, &keys, 64).secret,
             DeviceSecret::NotListed
         );
-        assert_eq!(
-            open_for_phrase(&content, 256, &keys.phrase_key, &keys.seal_key).unwrap(),
-            said
-        );
+        assert_eq!(read_for_phrase(&content, 256, &keys).unwrap(), said);
     }
 
     // ── The part for the phrase ──────────────────────────────────────
@@ -1464,7 +1791,7 @@ mod tests {
         let [.., five] = statements(&phrase);
         let said = for_phrase_of(5);
         let content = entry(&phrase, &five, &said);
-        let read = open_for_phrase(&content, 5, &keys.phrase_key, &keys.seal_key).unwrap();
+        let read = read_for_phrase(&content, 5, &keys).unwrap();
         assert_eq!(read, said);
         assert_eq!(read.secret, secret(5));
         assert!(five.commits_to(&read.secret));
@@ -1479,7 +1806,7 @@ mod tests {
         // The first statement's entry holds its secret alone.
         let [one, ..] = statements(&phrase);
         let alone = entry(&phrase, &one, &ForPhrase::first(secret(1)));
-        let read = open_for_phrase(&alone, 1, &keys.phrase_key, &keys.seal_key).unwrap();
+        let read = read_for_phrase(&alone, 1, &keys).unwrap();
         assert_eq!(read, ForPhrase::first(secret(1)));
         assert!(read.earlier.is_empty());
     }
@@ -1610,10 +1937,7 @@ mod tests {
             }
             let mut content = vec![0u8; CHANGE_ENTRY_DEVICES_PART_BYTES];
             content.extend_from_slice(&phrase_part_saying(&said.to_bytes(), number, &keys));
-            assert_eq!(
-                open_for_phrase(&content, number, &keys.phrase_key, &keys.seal_key),
-                Err(why)
-            );
+            assert_eq!(read_for_phrase(&content, number, &keys), Err(why));
         };
 
         assert_eq!(good.validate(5), Ok(()));
@@ -1669,7 +1993,7 @@ mod tests {
         let open = |said: &[u8]| {
             let mut content = vec![0u8; CHANGE_ENTRY_DEVICES_PART_BYTES];
             content.extend_from_slice(&phrase_part_saying(said, 5, &keys));
-            open_for_phrase(&content, 5, &keys.phrase_key, &keys.seal_key)
+            read_for_phrase(&content, 5, &keys)
         };
         let good = for_phrase_of(5);
         let said = good.to_bytes();
@@ -1772,21 +2096,31 @@ mod tests {
         assert_eq!(made.rev, 2);
         assert!(!made.delete);
         assert_eq!(made.content.len(), CHANGE_ENTRY_BYTES);
-        // Its slot is the slot of its one name, under the channel's slot
-        // key.
-        assert_eq!(
+        // Its slot is the slot of its one name under the channel's ID,
+        // which a device that follows the phrase can work out.
+        assert_eq!(made.slot, slot_id(&made.channel, "change"));
+        assert_eq!(made.slot, slot(&keys.channel));
+        assert_ne!(
             made.slot,
-            crate::slots::slot_id(&derive::slot_key(&channel).unwrap(), "change")
+            slot_id(&derive::slot_key(&channel).unwrap(), "change")
         );
 
         // It passes the check that needs no key, and a device that the
         // statement lists opens it.
         let checked = made.clone().check().unwrap();
-        let opened = opened_by(&checked.content, checked.rev, &keys, 1);
+        let opened = open_for_device(
+            &checked,
+            &keys.phrase_key,
+            &keys.channel,
+            &keys.statement_key,
+            &identity(1),
+        )
+        .unwrap();
         assert_eq!(opened.statement, signed(&two, &phrase));
         assert_eq!(opened.secret, DeviceSecret::Opened(secret(2)));
         // The phrase opens its part.
-        let said = open_for_phrase(&checked.content, 2, &keys.phrase_key, &keys.seal_key).unwrap();
+        let said =
+            open_for_phrase(&checked, &keys.phrase_key, &keys.channel, &keys.seal_key).unwrap();
         assert_eq!(said, for_phrase_of(2));
 
         // Each statement's entry is in the one slot of the one channel, at

@@ -1086,8 +1086,10 @@ pub const MAX_ADDITION_BYTES: usize =
 /// The name whose slot the change entry is in, in the phrase's channel
 /// (decision 2026-10-04 §2.2, §4.6). The channel holds that one entry. Its
 /// content is the two sealed parts of a change entry and holds no name:
-/// the name gives the slot, under the channel's slot key, and nothing
-/// else.
+/// the name gives the slot, and nothing else. The slot is under the
+/// channel's ID, and not under a key of the channel: a device holds no
+/// key of the phrase's channel, and has to know the change entry's slot
+/// from any other.
 pub const CHANGE_ENTRY_NAME: &str = "change";
 
 /// The name of the entry in a pair channel that hands a device what it

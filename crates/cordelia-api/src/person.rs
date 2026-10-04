@@ -85,7 +85,7 @@ pub enum PersonError {
     #[error("the secret is not the one that the statement commits to")]
     SecretNotCommitted,
 
-    #[error("the change entry is not the entry of the statement, in the phrase's channel")]
+    #[error("the change entry carries another statement than the one given with it")]
     NotTheStatementsEntry,
 
     #[error("the record is made under another statement than the one this device has applied")]
@@ -404,17 +404,13 @@ pub enum Refused {
     /// This device has stopped: it was removed, is in no list, or was
     /// listed in a change it could not open. The way on is a person's.
     Stopped,
-    /// It is not in the channel of the phrase this device follows.
-    AnotherChannel,
-    /// The key of the phrase this device follows did not write it.
-    AnotherAuthor,
-    /// It says it is a delete.
-    Delete,
-    /// It is in another slot than the change entry this device keeps.
-    AnotherSlot,
-    /// Its content is no change entry of this phrase at its number: it is
-    /// of another size, it does not open, or the statement in it is none,
-    /// is under another phrase, or has another number.
+    /// It is not the change entry of the phrase this device follows, or
+    /// is not well formed, and says which: another key than the phrase's
+    /// wrote it; it is in another channel, or in another slot than the
+    /// change entry's; it says it is a delete; its content is of another
+    /// size, or does not open; the statement in it is none, is under
+    /// another phrase, or has another number; or what follows its
+    /// statement is not the list of sealed secrets.
     NotAChangeEntry(ChangeEntryError),
 }
 
@@ -466,24 +462,14 @@ pub fn shown(
             return Ok(Shown::Refused(Refused::Stopped));
         }
 
-        // Whether it is the phrase's.
+        // Whether it is the phrase's, and what it says to this device: it
+        // is opened as the entry it is, and one that the phrase's key did
+        // not write in its channel's one slot is not opened at all.
         let following = &held.following;
-        if entry.channel != following.phrase_channel {
-            return Ok(Shown::Refused(Refused::AnotherChannel));
-        }
-        if entry.author != following.phrase_key {
-            return Ok(Shown::Refused(Refused::AnotherAuthor));
-        }
-        if entry.delete {
-            return Ok(Shown::Refused(Refused::Delete));
-        }
-        if entry.slot != latest.slot {
-            return Ok(Shown::Refused(Refused::AnotherSlot));
-        }
         let opened = match change_entry::open_for_device(
-            &entry.content,
-            entry.rev,
+            entry,
             &following.phrase_key,
+            &following.phrase_channel,
             &following.statement_key,
             identity,
         ) {
@@ -555,9 +541,9 @@ fn beside_the_one_apart(
     let not_held = |what: String| PersonError::Held(format!("the entry kept apart: {what}"));
     let apart = kept_entry(conn, Kept::Apart)?.ok_or_else(|| not_held("there is none".into()))?;
     let apart = change_entry::open_statement(
-        &apart.content,
-        apart.rev,
+        &apart,
         &held.following.phrase_key,
+        &held.following.phrase_channel,
         &held.following.statement_key,
     )
     .map_err(|e| not_held(e.to_string()))?;
@@ -622,8 +608,8 @@ struct Change<'a> {
 /// device follows signed it, its number is above, the device is among its
 /// devices, no removal is undone, and it was made after the one applied.
 /// The secret opens to its commitment. And the entry is that statement's:
-/// the phrase's key wrote it, in the phrase's channel, and the statement
-/// key opens it to this very statement.
+/// it is the phrase's change entry, and the statement key opens it to
+/// this very statement.
 ///
 /// Refused otherwise, with nothing changed. A statement that this device
 /// is shown and cannot apply stops it only through [`shown`].
@@ -647,9 +633,6 @@ pub fn apply(
             entry,
         };
         its_own_entry(&change)?;
-        if entry.slot != latest_entry(conn)?.slot {
-            return Err(PersonError::NotTheStatementsEntry);
-        }
         let judgement = judge(
             statement,
             &held.statement.statement,
@@ -705,23 +688,14 @@ pub fn first_statement(
 }
 
 /// Whether the change's entry is its statement's own, under what the
-/// device follows: in the phrase's channel, written by the phrase's key
-/// at the statement's number, no delete, and opened by the statement key
-/// to this very statement.
+/// device follows: it is opened as the phrase's change entry, and the
+/// statement key opens it to this very statement.
 fn its_own_entry(change: &Change) -> Result<(), PersonError> {
-    let (entry, following) = (change.entry, change.following);
-    let statement = &change.statement.statement;
-    if entry.channel != following.phrase_channel
-        || entry.author != following.phrase_key
-        || entry.rev != statement.number
-        || entry.delete
-    {
-        return Err(PersonError::NotTheStatementsEntry);
-    }
+    let following = change.following;
     let carried = change_entry::open_statement(
-        &entry.content,
-        entry.rev,
+        change.entry,
         &following.phrase_key,
+        &following.phrase_channel,
         &following.statement_key,
     )?;
     if carried != *change.statement {
@@ -1426,7 +1400,7 @@ mod tests {
 
     /// The slot of the change entry in the phrase's channel.
     fn change_slot(phrase: &Phrase) -> [u8; 32] {
-        slot_of(&phrase.channel_secret().unwrap(), CHANGE_ENTRY_NAME)
+        change_entry::slot(&id_of(&phrase.channel_secret().unwrap()))
     }
 
     /// An entry of the phrase's channel, in the change entry's slot, that
@@ -2110,16 +2084,18 @@ mod tests {
         }
     }
 
-    /// A statement that lists this device, with a secret that does not
-    /// open, is not the one committed to, or is not there: the device
-    /// stops, and keeps the entry. Nothing of what it holds is carried or
-    /// dropped.
+    /// A statement that lists this device, in the phrase's own entry, with
+    /// a secret in this device's place that does not open, or is not the
+    /// one committed to: the device stops, and keeps the entry. Nothing of
+    /// what it holds is carried or dropped. (An entry whose list of
+    /// secrets is not there, or is not whole, is no change entry at all,
+    /// and is refused.)
     #[test]
     fn test_a_secret_that_does_not_open_or_is_not_there_stops_the_device() {
         let phrase = phrase();
         let [_, two, three, _] = statements(&phrase);
         // Statement 3 lists devices 0 and 1, in that order.
-        let ways: [(&str, Vec<u8>); 5] = [
+        let ways: [(&str, Vec<u8>); 4] = [
             (
                 "sealed to another key",
                 sealed(&[sealed_to(0, &secret(3)), sealed_to(9, &secret(3))]),
@@ -2128,9 +2104,14 @@ mod tests {
                 "another secret than the one committed to",
                 sealed(&[sealed_to(0, &secret(3)), sealed_to(1, &secret(9))]),
             ),
-            ("none sealed", sealed(&[])),
-            ("one too few", sealed(&[sealed_to(0, &secret(3))])),
-            ("nothing after the statement", Vec::new()),
+            (
+                "bytes that are no sealed secret",
+                sealed(&[sealed_to(0, &secret(3)), vec![0x55; 92]]),
+            ),
+            (
+                "the secrets in another order than the devices",
+                sealed(&[sealed_to(1, &secret(3)), sealed_to(0, &secret(3))]),
+            ),
         ];
         for (what, after) in ways {
             let conn = db::open_in_memory().unwrap();
@@ -2487,12 +2468,44 @@ mod tests {
             entry: 4,
             statement: 3,
         };
+        // What a device that was removed can make: it holds the statement
+        // key, and seals the true statement with a list of its own, which
+        // opens for nobody. It signs the entry itself, in a channel whose
+        // key it holds, or names the phrase's channel as it can.
+        let broken = sealed(&[sealed_to(0, &secret(9)), sealed_to(1, &secret(9))]);
+        let sealed_again = content_saying(&phrase, 3, &signed, &broken);
+        let its_own = [0x44; 32];
+        let in_its_own = signed_in(
+            &its_own,
+            &device(2),
+            change_entry::slot(&id_of(&its_own)),
+            3,
+            false,
+            sealed_again.clone(),
+        );
+        let in_the_phrases = signed_in(&channel, &device(2), slot, 3, false, sealed_again);
+
+        let not = Refused::NotAChangeEntry;
         let refused: Vec<(&str, CheckedEntry, Refused)> = vec![
-            ("another phrase's", under_another, Refused::AnotherChannel),
+            (
+                "another phrase's",
+                under_another,
+                not(ChangeEntryError::AnotherChannel),
+            ),
             (
                 "written by another key",
                 signed_in(&channel, &device(9), slot, 3, false, good.content.clone()),
-                Refused::AnotherAuthor,
+                not(ChangeEntryError::AnotherAuthor),
+            ),
+            (
+                "the true statement with a broken list, in a channel of another key's",
+                in_its_own,
+                not(ChangeEntryError::AnotherChannel),
+            ),
+            (
+                "the true statement with a broken list, signed by another key",
+                in_the_phrases,
+                not(ChangeEntryError::AnotherAuthor),
             ),
             (
                 "a delete",
@@ -2504,19 +2517,39 @@ mod tests {
                     true,
                     good.content.clone(),
                 ),
-                Refused::Delete,
+                not(ChangeEntryError::Delete),
             ),
             (
                 "in another slot",
                 signed_in(
                     &channel,
                     &phrase.signing_key().unwrap(),
-                    slot_of(&channel, "another name"),
+                    slot_of(&channel, CHANGE_ENTRY_NAME),
                     3,
                     false,
                     good.content.clone(),
                 ),
-                Refused::AnotherSlot,
+                not(ChangeEntryError::AnotherSlot),
+            ),
+            (
+                "with no sealed secret after its statement",
+                change_sealing(&phrase, &three, &[]),
+                not(ChangeEntryError::Malformed),
+            ),
+            (
+                "with a list of none",
+                change_sealing(&phrase, &three, &sealed(&[])),
+                not(ChangeEntryError::Malformed),
+            ),
+            (
+                "with a list of one too few",
+                change_sealing(&phrase, &three, &sealed(&[sealed_to(0, &secret(3))])),
+                not(ChangeEntryError::Malformed),
+            ),
+            (
+                "with more than the list after its statement",
+                change_sealing(&phrase, &three, &[&both[..], &[0, 0, 1]].concat()),
+                not(ChangeEntryError::Malformed),
             ),
             (
                 "of another size",
@@ -3567,10 +3600,11 @@ mod tests {
         let entry = kept_entry(&conn, Kept::Latest).unwrap().unwrap();
         assert_eq!(entry.channel, now.following.phrase_channel);
         assert_eq!((entry.author, entry.rev), (phrase.public_key().unwrap(), 1));
+        assert_eq!(entry.slot, change_slot(&phrase));
         let opened = change_entry::open_for_device(
-            &entry.content,
-            1,
+            &entry,
             &now.following.phrase_key,
+            &now.following.phrase_channel,
             &now.following.statement_key,
             &device(0),
         )
@@ -3578,9 +3612,9 @@ mod tests {
         assert_eq!(opened.statement, now.statement);
         assert_eq!(opened.secret, DeviceSecret::Opened(made));
         let for_phrase = change_entry::open_for_phrase(
-            &entry.content,
-            1,
+            &entry,
             &phrase.public_key().unwrap(),
+            &now.following.phrase_channel,
             &phrase.seal_key().unwrap(),
         )
         .unwrap();
@@ -3695,7 +3729,7 @@ mod tests {
         let (statement, entry) = (sign(&theirs, &other), change(&other, &theirs, secret(1)));
         assert!(matches!(
             apply(&conn, &me, &statement, &secret(1), &entry, NOW),
-            Err(PersonError::NotTheStatementsEntry)
+            Err(PersonError::ChangeEntry(ChangeEntryError::AnotherChannel))
         ));
         let mut forged = sign(&four, &phrase);
         forged.signature[0] ^= 1;
@@ -3705,8 +3739,9 @@ mod tests {
             Err(PersonError::NotTheStatementsEntry)
         ));
 
-        // The entry is the statement's own: not another statement's, and
-        // not one in another slot of the phrase's channel.
+        // The entry is the statement's own: not another statement's, not
+        // one in another slot of the phrase's channel, and not one that
+        // another key wrote there.
         let (statement, _) = given(&four, 4);
         let (_, of_another) = given(&three, 3);
         assert!(matches!(
@@ -3724,7 +3759,19 @@ mod tests {
         );
         assert!(matches!(
             apply(&conn, &me, &statement, &secret(4), &elsewhere, NOW),
-            Err(PersonError::NotTheStatementsEntry)
+            Err(PersonError::ChangeEntry(ChangeEntryError::AnotherSlot))
+        ));
+        let by_another = signed_in(
+            &phrase.channel_secret().unwrap(),
+            &device(0),
+            change_slot(&phrase),
+            4,
+            false,
+            good.content.clone(),
+        );
+        assert!(matches!(
+            apply(&conn, &me, &statement, &secret(4), &by_another, NOW),
+            Err(PersonError::ChangeEntry(ChangeEntryError::AnotherAuthor))
         ));
 
         // None of them changed anything, and none stopped the device.

@@ -36,8 +36,9 @@
 //! - a statement that its phrase's key did not sign;
 //! - a secret that the statement does not commit to;
 //! - a change entry whose signatures do not hold, or that is not the entry
-//!   of that statement: the statement key does not open it, or it carries
-//!   another statement;
+//!   of that statement: the phrase's key did not write it, it is not in
+//!   the change entry's slot of its channel, the statement key does not
+//!   open it, or it carries another statement;
 //! - a record that its adder did not sign, or that is made under another
 //!   statement than the one handed over;
 //! - a record that adds a key the statement lists as removed, or one it
@@ -82,7 +83,7 @@ pub enum HandOverError {
     #[error("the change entry is not the entry of the statement that is handed over")]
     NotTheStatementsEntry,
 
-    #[error("the statement key does not open the change entry: {0}")]
+    #[error("the change entry is not opened: {0}")]
     ChangeEntry(#[from] ChangeEntryError),
 
     #[error("a hand-over carries at most 2 records, and this carries {0}")]
@@ -151,17 +152,15 @@ impl HandOver {
         }
 
         // The change entry is an entry, by the check that needs no key, and
-        // it is this statement's: the phrase's key wrote it at the
-        // statement's number, and the statement key opens it to this very
-        // statement.
+        // it is this statement's. It is opened as a device opens one: the
+        // phrase's key wrote it, in the change entry's slot of the channel
+        // it names, and it is no delete. And the statement key opens it to
+        // this very statement, whose number is its revision.
         let entry = self.change_entry.clone().check()?;
-        if entry.author != statement.phrase_key || entry.rev != statement.number || entry.delete {
-            return Err(HandOverError::NotTheStatementsEntry);
-        }
         let carried = open_statement(
-            &entry.content,
-            entry.rev,
+            &entry,
             &statement.phrase_key,
+            &entry.channel,
             &self.statement_key,
         )?;
         if carried != self.statement {
@@ -607,13 +606,40 @@ mod tests {
             ..hand_over.clone()
         };
         assert_eq!(other.validate(), Err(HandOverError::NotTheStatementsEntry));
-        // An entry that says it is a delete.
+        // An entry that says it is a delete: one that was made to say so
+        // after it was signed, and one that the phrase signed so.
         let mut deleted = hand_over.clone();
         deleted.change_entry.delete = true;
         assert!(matches!(
             deleted.validate(),
             Err(HandOverError::Entry(EntryError::AuthorSignature))
         ));
+        let channel_key = crate::derive::signing_key(&phrase.channel_secret().unwrap()).unwrap();
+        let by_the_phrase = |slot: [u8; 32], delete: bool| HandOver {
+            change_entry: crate::entry::signed(
+                &channel_key,
+                &phrase.signing_key().unwrap(),
+                slot,
+                2,
+                delete,
+                hand_over.change_entry.content.clone(),
+            ),
+            ..hand_over.clone()
+        };
+        assert_eq!(
+            by_the_phrase(hand_over.change_entry.slot, true).validate(),
+            Err(HandOverError::ChangeEntry(ChangeEntryError::Delete))
+        );
+        // An entry that the phrase's key wrote in another slot of its
+        // channel than the change entry's.
+        assert_eq!(
+            by_the_phrase([7u8; 32], false).validate(),
+            Err(HandOverError::ChangeEntry(ChangeEntryError::AnotherSlot))
+        );
+        assert_eq!(
+            by_the_phrase(hand_over.change_entry.slot, false).validate(),
+            Ok(())
+        );
         // An entry of the same content that another key wrote, in a
         // channel of its own: the phrase's key did not sign it.
         let secret_of_another = [0x44; 32];
@@ -633,7 +659,7 @@ mod tests {
         };
         assert_eq!(
             with_theirs.validate(),
-            Err(HandOverError::NotTheStatementsEntry)
+            Err(HandOverError::ChangeEntry(ChangeEntryError::AnotherAuthor))
         );
         // Written out, its author is read as the phrase's key, under
         // which its signature does not hold.
