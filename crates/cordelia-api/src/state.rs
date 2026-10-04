@@ -145,11 +145,36 @@ pub struct RefusedSnapshot {
     pub refusals: u32,
 }
 
+/// A text that the sync adapter has kept beside a file, in a conflict
+/// file, for as long as the file has still to take the version it was
+/// kept against (decision 2026-09-30 §4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    /// The channel's version that the file is to take: its item ID.
+    pub version: Option<String>,
+    /// The name of the conflict file the text is kept in.
+    pub copy: String,
+    /// The hash of the text.
+    pub hash: [u8; 32],
+    /// The channel's entry under the conflict file's name (its item ID),
+    /// if there is one: the entry that was there when the name was taken,
+    /// and then the entry that the folder published the copy as.
+    pub under: Option<String>,
+}
+
+/// What is kept, for each (memory folder, channel, file).
+type KeptByFile = std::collections::HashMap<(String, String, String), Kept>;
+
 /// How the settings handlers and the sync adapter's loop keep in step.
 #[derive(Default)]
 pub struct SyncControl {
     wake: tokio::sync::Notify,
     generation: AtomicU64,
+    /// What the adapter has kept beside files. It is held here and not in
+    /// the database, so that it lasts for one run of the node and under
+    /// one set of settings, and no longer: a record that outlived either
+    /// could be of a conflict that is over (see [`Self::changed`]).
+    kept: Mutex<KeptByFile>,
 }
 
 impl SyncControl {
@@ -162,9 +187,80 @@ impl SyncControl {
     /// has already replaced and answered for. A handler calls it before
     /// the first thing it writes, so that a change that fails part-way has
     /// still stopped the cycle that was running.
+    ///
+    /// What the adapter had kept beside files is forgotten with it: the
+    /// change may be one that makes a folder forget what it had agreed,
+    /// and every handler that does so counts the change first.
     pub fn changed(&self, _db: &rusqlite::Connection) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.kept().clear();
         self.wake.notify_one();
+    }
+
+    fn kept(&self) -> std::sync::MutexGuard<'_, KeptByFile> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What `folder` has kept beside `key`, if anything.
+    pub fn kept_beside(&self, folder: &str, channel: &str, key: &str) -> Option<Kept> {
+        let file = (folder.to_string(), channel.to_string(), key.to_string());
+        self.kept().get(&file).cloned()
+    }
+
+    /// Record what `folder` is keeping beside `key`, in place of whatever
+    /// it had recorded for that file.
+    ///
+    /// It is called with the database lock held, which is what `_db` is
+    /// for: the caller has read the count under that lock and found it
+    /// unchanged, so the record cannot be made after a change of settings
+    /// that has already forgotten the rest.
+    pub fn keep(
+        &self,
+        _db: &rusqlite::Connection,
+        folder: &str,
+        channel: &str,
+        key: &str,
+        kept: Kept,
+    ) {
+        let file = (folder.to_string(), channel.to_string(), key.to_string());
+        self.kept().insert(file, kept);
+    }
+
+    /// Forget what `folder` has kept beside `key`.
+    pub fn unkeep(&self, folder: &str, channel: &str, key: &str) {
+        let file = (folder.to_string(), channel.to_string(), key.to_string());
+        self.kept().remove(&file);
+    }
+
+    /// `folder` has published the conflict file `copy` itself, with the
+    /// text of `hash`, as the entry `under`: a text it has kept in that
+    /// file is under that entry now.
+    pub fn kept_published(
+        &self,
+        folder: &str,
+        channel: &str,
+        copy: &str,
+        hash: &[u8; 32],
+        under: &str,
+    ) {
+        for ((in_folder, in_channel, _), kept) in self.kept().iter_mut() {
+            if in_folder == folder
+                && in_channel == channel
+                && kept.copy == copy
+                && kept.hash == *hash
+            {
+                kept.under = Some(under.to_string());
+            }
+        }
+    }
+
+    /// Forget what every folder has kept, except the (folder, channel)
+    /// pairs in `syncing`: as a cycle forgets what a folder that no
+    /// longer syncs had agreed.
+    pub fn forget_kept_except(&self, syncing: &[(String, String)]) {
+        self.kept().retain(|(folder, channel, _), _| {
+            syncing.iter().any(|(f, c)| f == folder && c == channel)
+        });
     }
 
     /// How many times the settings have changed since the node started. A
@@ -344,5 +440,93 @@ mod tests {
         assert_eq!(key_checks(), before);
         assert_eq!(UsableKeys::MOST, 65_536);
         assert_eq!(UsableKeys::default().most, UsableKeys::MOST);
+    }
+
+    fn kept(copy: &str, hash: u8) -> Kept {
+        Kept {
+            version: Some("ci_version".into()),
+            copy: copy.into(),
+            hash: [hash; 32],
+            under: None,
+        }
+    }
+
+    /// What is kept beside a file is held for that file, in that folder
+    /// and channel; replaced by the next thing kept beside it; brought up
+    /// to date when that copy is published with that text, and for no
+    /// other record; and gone when asked.
+    #[test]
+    fn test_what_is_kept_beside_a_file() {
+        let db = Connection::open_in_memory().unwrap();
+        let control = SyncControl::default();
+        assert_eq!(control.kept_beside("/m", "grp_a", "notes.md"), None);
+        control.keep(&db, "/m", "grp_a", "notes.md", kept("first", 7));
+        assert_eq!(
+            control.kept_beside("/m", "grp_a", "notes.md"),
+            Some(kept("first", 7))
+        );
+        assert_eq!(control.kept_beside("/m", "grp_a", "other.md"), None);
+        assert_eq!(control.kept_beside("/m", "grp_b", "notes.md"), None);
+        assert_eq!(control.kept_beside("/n", "grp_a", "notes.md"), None);
+
+        control.keep(&db, "/m", "grp_a", "notes.md", kept("second", 8));
+        assert_eq!(
+            control.kept_beside("/m", "grp_a", "notes.md"),
+            Some(kept("second", 8))
+        );
+
+        control.keep(&db, "/n", "grp_a", "notes.md", kept("second", 8));
+        control.keep(&db, "/m", "grp_b", "notes.md", kept("second", 8));
+        let under = |folder: &str, channel: &str| {
+            let kept = control.kept_beside(folder, channel, "notes.md");
+            kept.and_then(|kept| kept.under)
+        };
+        let published = |copy: &str, hash: u8| {
+            control.kept_published("/m", "grp_a", copy, &[hash; 32], "ci_published");
+            under("/m", "grp_a")
+        };
+        assert_eq!(published("first", 8), None);
+        assert_eq!(published("second", 7), None);
+        assert_eq!(published("notes.md", 8), None);
+        assert_eq!(published("second", 8).as_deref(), Some("ci_published"));
+        assert_eq!(under("/n", "grp_a"), None);
+        assert_eq!(under("/m", "grp_b"), None);
+
+        control.unkeep("/m", "grp_a", "notes.md");
+        assert_eq!(control.kept_beside("/m", "grp_a", "notes.md"), None);
+        assert!(control.kept_beside("/n", "grp_a", "notes.md").is_some());
+        // Nothing to forget is nothing done.
+        control.unkeep("/m", "grp_a", "notes.md");
+    }
+
+    /// What is kept is forgotten for every folder but those that still
+    /// sync, and for every folder when a setting changes.
+    #[test]
+    fn test_what_is_kept_is_forgotten_with_what_is_agreed() {
+        let db = Connection::open_in_memory().unwrap();
+        let control = SyncControl::default();
+        let fill = || {
+            control.keep(&db, "/m", "grp_a", "notes.md", kept("a", 1));
+            control.keep(&db, "/m", "grp_b", "notes.md", kept("b", 1));
+            control.keep(&db, "/n", "grp_a", "notes.md", kept("c", 1));
+        };
+        let left = || -> Vec<bool> {
+            [("/m", "grp_a"), ("/m", "grp_b"), ("/n", "grp_a")]
+                .iter()
+                .map(|(folder, channel)| control.kept_beside(folder, channel, "notes.md").is_some())
+                .collect()
+        };
+        fill();
+        control.forget_kept_except(&[("/m".to_string(), "grp_a".to_string())]);
+        assert_eq!(left(), [true, false, false]);
+        fill();
+        control.forget_kept_except(&[]);
+        assert_eq!(left(), [false, false, false]);
+
+        fill();
+        let before = control.generation();
+        control.changed(&db);
+        assert_eq!(control.generation(), before + 1);
+        assert_eq!(left(), [false, false, false]);
     }
 }
