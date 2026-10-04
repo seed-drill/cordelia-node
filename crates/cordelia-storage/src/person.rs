@@ -311,6 +311,14 @@ pub fn forget_left_secrets(conn: &Connection, now: i64) -> Result<usize, Cordeli
     .map_err(storage)
 }
 
+/// Forget every secret the device holds, the applied one among them: it
+/// leaves the phrase it followed, and starts afresh under another
+/// (decision 2026-10-04 §4.2, §5.1). Returns how many were forgotten.
+pub fn forget_secrets(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_secrets", [])
+        .map_err(storage)
+}
+
 // ── The change entries it keeps ──────────────────────────────────────
 
 /// A change entry the device keeps, as it was stored: whoever reads it
@@ -430,6 +438,24 @@ pub fn keep_addition(
     )
     .map(|rows| rows > 0)
     .map_err(storage)
+}
+
+/// A record that was kept as not counted counts from now on (decision
+/// 2026-10-04 §6): `seen` is its place in the order the device saw the
+/// records, which it keeps. A place that holds no record is refused.
+pub fn count_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE person_additions SET counted = 1 WHERE seen = ?1",
+            params![seen],
+        )
+        .map_err(storage)?;
+    if changed != 1 {
+        return Err(CordeliaError::Storage(format!(
+            "the device keeps no record at place {seen}"
+        )));
+    }
+    Ok(())
 }
 
 /// Keep no record of an addition: the next statement's own list is what
@@ -876,6 +902,32 @@ mod tests {
         assert_eq!(KEPT_SECS, 7_776_000);
     }
 
+    /// A device that leaves its phrase forgets every secret it holds, the
+    /// applied one among them, and can then apply the first it is given
+    /// under another.
+    #[test]
+    fn test_a_device_that_leaves_its_phrase_forgets_every_secret() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(forget_secrets(&conn).unwrap(), 0);
+        apply_secret(&conn, 1, &[0xa1; 32], NOW).unwrap();
+        apply_secret(&conn, 2, &[0xa2; 32], NOW + 1).unwrap();
+        apply_secret(&conn, 3, &[0xa3; 32], NOW + 2).unwrap();
+        assert_eq!(forget_secrets(&conn).unwrap(), 3);
+        assert!(secrets(&conn).unwrap().is_empty());
+        assert_eq!(applied_secret(&conn).unwrap(), None);
+
+        // Under another phrase a secret of a number it held before.
+        apply_secret(&conn, 2, &[0xb2; 32], NOW + 3).unwrap();
+        assert_eq!(
+            secrets(&conn).unwrap(),
+            [Secret {
+                number: 2,
+                secret: [0xb2; 32],
+                left_at: None
+            }]
+        );
+    }
+
     // ── The change entries it keeps ──────────────────────────────────
 
     #[test]
@@ -994,6 +1046,33 @@ mod tests {
                 "{column}"
             );
         }
+    }
+
+    /// A record that was kept as not counted comes to count, and keeps its
+    /// place in the order the records were seen. No other record changes.
+    #[test]
+    fn test_a_record_kept_as_not_counted_comes_to_count_in_its_place() {
+        let conn = db::open_in_memory().unwrap();
+        for (n, counted) in [(3u8, true), (1, false), (2, false)] {
+            keep_addition(&conn, &[n; 100], &[n; 32], &[0xd0; 32], counted, NOW).unwrap();
+        }
+        let before = additions(&conn).unwrap();
+        count_addition(&conn, before[1].seen).unwrap();
+        let after = additions(&conn).unwrap();
+        let said: Vec<(u8, bool)> = after
+            .iter()
+            .map(|kept| (kept.key[0], kept.counted))
+            .collect();
+        assert_eq!(said, [(3, true), (1, true), (2, false)]);
+        let places = |kept: &[KeptAddition]| kept.iter().map(|one| one.seen).collect::<Vec<_>>();
+        assert_eq!(places(&after), places(&before));
+        assert_eq!(after[1].record, before[1].record);
+
+        // One that counts already stays so, and a place that holds no
+        // record is refused.
+        count_addition(&conn, before[0].seen).unwrap();
+        assert!(count_addition(&conn, before[2].seen + 1).is_err());
+        assert_eq!(additions(&conn).unwrap(), after);
     }
 
     // ── The names it holds ───────────────────────────────────────────
