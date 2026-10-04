@@ -1208,12 +1208,12 @@ fn a_command_asks_its_own_node_and_no_proxy() {
     let run = |args: &[&str]| {
         let mut command = n.command_for(&given, args);
         // The command has them: the test is not passing for want of them.
-        for name in named {
+        for (name, value) in &given {
             let set = command
                 .get_envs()
                 .find(|(key, _)| *key == std::ffi::OsStr::new(name))
                 .and_then(|(_, value)| value);
-            assert_eq!(set, Some(std::ffi::OsStr::new(&proxy)), "{name}");
+            assert_eq!(set, Some(std::ffi::OsStr::new(value)), "{name}");
         }
         command.output().unwrap()
     };
@@ -1235,32 +1235,55 @@ fn a_command_asks_its_own_node_and_no_proxy() {
     assert!(listed.contains("this device"), "{listed}");
     let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
     assert!(status.contains("Running:   yes"), "{status}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// A command asks the node at an address of this machine and at no
-/// other: its request carries the node's token. With the API's address
-/// set to another machine's, a command that reads and one that posts
-/// each say why they will not ask, and ask nothing.
+/// A command asks the node at one of the addresses the node listens on,
+/// and at no other: its request carries the node's token. With the API's
+/// address set to another, a command that reads and one that posts each
+/// say why they do not ask, `status` says that it has not asked (not that
+/// the node is stopped), and the node itself does not start.
+///
+/// (The address here is another of this machine's own, so that nothing
+/// leaves the machine with the refusal taken out either.)
 #[test]
-fn a_command_asks_no_address_but_this_machines() {
-    let n = node("idle", "personal", None);
-    // (An address kept for documentation: nothing is there.)
-    let elsewhere = [("CORDELIA_BIND_ADDRESS", "192.0.2.1")];
+fn a_command_asks_no_address_but_the_nodes_own() {
+    let mut n = node("idle", "personal", None);
+    let elsewhere = [("CORDELIA_BIND_ADDRESS", "127.0.0.2")];
     for args in [&["peers", "--json"][..], &["devices"]] {
-        let asked = std::time::Instant::now();
         let out = n.command_given(&elsewhere, args);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "cordelia {args:?}");
         assert!(
-            said.contains("192.0.2.1") && said.contains("not this machine"),
+            said.contains("'127.0.0.2'") && said.contains("nowhere else"),
             "cordelia {args:?}: {said}"
         );
-        // Refused, and not given up on after a wait for an answer.
-        assert!(
-            asked.elapsed() < Duration::from_secs(2),
-            "cordelia {args:?}"
-        );
     }
+    let out = n.command_given(&elsewhere, &["status"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("Running:   not asked") && said.contains("'127.0.0.2'"),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
+
+    // The node holds itself to the same: it does not start there.
+    n.start_given(&elsewhere);
+    let mut child = n.child.take().unwrap();
+    let told = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if told.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("a node started at 127.0.0.2:\n{}", n.log_tail());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let log = std::fs::read_to_string(n.log()).unwrap();
+    assert!(log.contains("must be loopback"), "{log}");
 }
 
 #[test]

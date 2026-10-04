@@ -69,8 +69,10 @@ impl Node {
     /// and home, and without three things of whoever runs the tests: any
     /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
     /// the node's configuration), and any proxy (the tests of what a
-    /// command does with one set their own). What else the binary reads
-    /// from the environment is left: `NO_COLOR`, which no test asks of.
+    /// command does with one set their own). The rest of the environment
+    /// is left. Of it the binary reads `NO_COLOR` and the user's name, and
+    /// hands all of it to `git` where it asks which repository a folder is
+    /// in: no test here asks of those.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -183,14 +185,20 @@ impl Node {
     /// node is given no `CORDELIA_` variable but its data directory, and
     /// no `RUST_LOG`, so its settings are the file's.)
     pub fn start(&mut self) {
+        self.start_given(&[]);
+    }
+
+    /// [`Self::start`], with `vars` set for the node: after the same look
+    /// at where it will dial, which no variable a test may set changes
+    /// (the node reads its relays from its configuration alone).
+    pub fn start_given(&mut self, vars: &[(&str, &str)]) {
         for host in self.will_dial() {
             assert_on_this_machine(self.name, &host);
         }
         let log = std::fs::File::create(self.log()).unwrap();
         std::fs::create_dir_all(self.home()).unwrap();
         let child = self
-            .binary()
-            .arg("start")
+            .command_for(vars, &["start"])
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
