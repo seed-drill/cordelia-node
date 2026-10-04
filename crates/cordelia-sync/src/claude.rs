@@ -1550,23 +1550,25 @@ fn lists(dir: &Path, name: &str) -> std::io::Result<bool> {
 ///   file's text: the record made for that name replaces this one (there
 ///   is one record for a file);
 /// - each time the node takes a settings command, which is any
-///   `cordelia sync` command but `status`. The node takes a command when
-///   what the command asks passes the node's checks, whether or not the
-///   command then changes anything. A command that the node refuses is
-///   not taken, and nor is one that the command line answers by itself,
-///   as the command line answers a `map` of a mapping that is already
-///   declared;
+///   `cordelia sync` command but `status` (what the node counts is the
+///   request such a command sends, whoever sends it). The node takes a
+///   command when what the command asks passes the node's checks, whether
+///   or not the command then changes anything. A command that the node
+///   refuses is not taken, and nor is one that the command line answers
+///   without sending it, as the command line answers a `map` of a mapping
+///   that is already declared;
 /// - when the folder stops syncing, and when the node stops.
 ///
 /// So a copy is relied on from one cycle to the next only while the file
 /// has still to take the version the copy was made against, and only
 /// until the node takes a settings command or stops. In every other case
 /// a conflict file that holds the text is not relied on, and the text is
-/// kept again under the first name that is free. That is one copy more
-/// than was needed where the conflict file was this conflict's own:
-/// after each restart, after each settings command that the node takes,
-/// and each time the folder stops syncing and syncs again, for a file
-/// that still cannot take the channel's version. It is what keeps the
+/// kept again under the first name that is free and can be taken. That
+/// is one copy more than was needed where the conflict file was this
+/// conflict's own. It is made once, in the first cycle that reaches the
+/// file after the record has gone in one of the ways above, where the
+/// file still cannot take the channel's version: after a restart, say,
+/// or after a settings command that the node took. It is what keeps the
 /// text where the conflict file is from an earlier conflict: that file
 /// has been with the other devices, and a delete or an edit of it may be
 /// on its way back from one that did not know the text would be relied
