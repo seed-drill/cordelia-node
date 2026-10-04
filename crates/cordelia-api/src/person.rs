@@ -213,6 +213,15 @@ impl Counting {
         self.listed.len() + self.added.len()
     }
 
+    /// Whether the key that a link names counts: a key that counts has
+    /// those first 16 bytes ([`Link::signer_of`]). It is what a chain is
+    /// read with ([`cordelia_crypto::entry::known_to_follow`]).
+    pub fn signer_counts(&self, signer: &[u8; 16]) -> bool {
+        self.keys()
+            .iter()
+            .any(|key| Link::signer_of(key) == *signer)
+    }
+
     /// Every key that counts: those of the statement, in its order, and
     /// then those added since, in the order the device saw their records.
     pub fn keys(&self) -> Vec<[u8; 32]> {
@@ -901,7 +910,7 @@ impl Carry<'_> {
 /// and that signer. So the chain says who signed the entry it was carried
 /// from, in the word of a device that held it.
 ///
-/// The chain keeps to its 40 links: the oldest fall off. A link is in it
+/// The chain keeps to its 100 links: the oldest fall off. A link is in it
 /// once. An entry that lacks its chain is carried with none after the
 /// first link: it is known to follow nothing more than it was.
 fn carried_entry(
@@ -1504,6 +1513,12 @@ mod tests {
         assert!(!counting.counts(&key(3)) && !counting.may_add(&key(3)));
         assert_eq!(counting.devices(), 3);
         assert_eq!(counting.keys(), [key(0), key(1), key(2)]);
+        // A link names a key by its first 16 bytes, and is asked so.
+        for n in [0, 1, 2] {
+            assert!(counting.signer_counts(&Link::signer_of(&key(n))), "{n}");
+        }
+        assert!(!counting.signer_counts(&Link::signer_of(&key(3))));
+        assert!(!counting.signer_counts(&[0u8; 16]));
 
         // A device that follows no phrase has nobody who counts.
         let alone = db::open_in_memory().unwrap();
@@ -1526,6 +1541,7 @@ mod tests {
         );
         let counting = who_counts(&conn).unwrap();
         assert!(counting.counts(&key(7)));
+        assert!(counting.signer_counts(&Link::signer_of(&key(7))));
         // It may add in its turn: a chain is two long.
         assert!(counting.may_add(&key(7)));
         assert_eq!(counting.devices(), 4);
@@ -1646,6 +1662,7 @@ mod tests {
         held_rows::keep_addition(&conn, b"written past", &key(2), &key(0), true, NOW).unwrap();
         let counting = who_counts(&conn).unwrap();
         assert!(!counting.counts(&key(2)) && !counting.may_add(&key(2)));
+        assert!(!counting.signer_counts(&Link::signer_of(&key(2))));
         assert_eq!(counting.keys(), [key(0), key(1)]);
     }
 
@@ -2863,8 +2880,8 @@ mod tests {
         assert_eq!(
             delete.chain,
             [Link {
-                hash: [0u8; 32],
-                signer: key(2)
+                hash: [0u8; 16],
+                signer: Link::signer_of(&key(2))
             }]
         );
         assert_eq!(delete.value, Value::Delete);
@@ -2872,7 +2889,9 @@ mod tests {
         // What that gives a reader under statement 3, for whom device 2
         // does not count. A folder that holds "agreed" is not told that
         // "late" follows it: the removed key signed a version between.
-        let counts = |key: &[u8; 32]| three.lists(key);
+        let counting = who_counts(&conn).unwrap();
+        assert_eq!(counting.keys(), [key(0), key(1)]);
+        let counts = |by: &[u8; 16]| counting.signer_counts(by);
         let hash = |said: &str| text(said).chain_hash();
         assert!(!known_to_follow(Some(&late.chain), &hash("agreed"), counts));
         // A folder that took "late" itself holds the version, and nothing
@@ -3086,7 +3105,9 @@ mod tests {
             assert_eq!(version.entries.len(), 1);
             assert_eq!(version.entries[0].author, key(1));
             let chain = version.entries[0].chain.clone().unwrap();
-            let counts = |key: &[u8; 32]| next.lists(key);
+            let counting = who_counts(&conn).unwrap();
+            assert_eq!(counting.keys(), [key(1), key(stays)]);
+            let counts = |by: &[u8; 16]| counting.signer_counts(by);
 
             if gone == low {
                 // Carried from the lower key's entry, with that signer in
@@ -3104,8 +3125,9 @@ mod tests {
                 assert!(!known_to_follow(Some(&chain), &hash_of_t, |_| true));
             }
             // Either way one signer is named, and it is the lower key.
-            assert_eq!(chain[0].signer, key(low));
-            assert!(chain.iter().all(|link| link.signer != key(high)));
+            assert_eq!(chain[0].signer, Link::signer_of(&key(low)));
+            let higher = Link::signer_of(&key(high));
+            assert!(chain.iter().all(|link| link.signer != higher));
         }
 
         // Where the device holds an entry of its own, it carries from
@@ -3147,20 +3169,20 @@ mod tests {
         }
     }
 
-    /// A carried chain keeps to its 40 links: with one put first, the
+    /// A carried chain keeps to its 100 links: with one put first, the
     /// oldest falls off. And a link is in it once: where the link that
     /// would be put first is in the chain already, it is not there twice.
     #[test]
-    fn test_a_carried_chain_keeps_to_forty_links_with_none_twice() {
+    fn test_a_carried_chain_keeps_to_a_hundred_links_with_none_twice() {
         let conn = device_at(1, 2);
         let phrase = phrase();
         let [_, _, three, _] = statements(&phrase);
         hold_name(&conn, "team", NOW).unwrap();
         let team = own(2, "team");
-        let forty: Vec<Link> = (0..40).map(|n| link(&format!("text {n}"), 0)).collect();
-        put(&conn, &team, 0, 5, "long.md", text("the newest"), &forty);
-        // Device 1 carries its own with all 40: nothing is put first.
-        put(&conn, &team, 1, 5, "own.md", text("the newest"), &forty);
+        let hundred: Vec<Link> = (0..100).map(|n| link(&format!("text {n}"), 0)).collect();
+        put(&conn, &team, 0, 5, "long.md", text("the newest"), &hundred);
+        // Device 1 carries its own with all 100: nothing is put first.
+        put(&conn, &team, 1, 5, "own.md", text("the newest"), &hundred);
         // The same text, signed by the same key, two versions before.
         let again = [link("between", 1), link("the same", 0), link("first", 1)];
         put(&conn, &team, 0, 5, "again.md", text("the same"), &again);
@@ -3169,11 +3191,11 @@ mod tests {
         let new = own(3, "team");
 
         let long = carried(&conn, &new, "long.md").unwrap().chain;
-        assert_eq!(long.len(), 40);
+        assert_eq!(long.len(), 100);
         assert_eq!(long[0], link("the newest", 0));
-        assert_eq!(long[1..], forty[..39]);
-        assert!(!long.contains(&forty[39]));
-        assert_eq!(carried(&conn, &new, "own.md").unwrap().chain, forty);
+        assert_eq!(long[1..], hundred[..99]);
+        assert!(!long.contains(&hundred[99]));
+        assert_eq!(carried(&conn, &new, "own.md").unwrap().chain, hundred);
 
         let once = carried(&conn, &new, "again.md").unwrap().chain;
         assert_eq!(

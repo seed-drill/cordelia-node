@@ -939,14 +939,26 @@ const _: () = assert!(MIN_ENTRY_CONTENT_BYTES <= MAX_ITEM_BYTES);
 
 /// The most links an entry's chain may have (decision 2026-10-04 §2.3):
 /// one for each version the entry descends from, the newest first. What
-/// is older than the fortieth is not said.
-pub const MAX_ENTRY_LINKS: usize = 40;
+/// is older than the hundredth is not said.
+pub const MAX_ENTRY_LINKS: usize = 100;
+
+/// How much of a hash a link holds: the first 16 bytes of the SHA-256 of
+/// a version's value (decision 2026-10-04 §2.3). A link names a version
+/// to whoever holds its text, and a hash of this length is not met by
+/// another text by chance.
+pub const ENTRY_LINK_HASH_BYTES: usize = 16;
+
+/// How much of a key a link holds: the first 16 bytes of the key that
+/// signed the entry the version was taken from (decision 2026-10-04
+/// §2.3). It is asked of a reader's own devices, which are few, so the
+/// start of a key says which of them it is.
+pub const ENTRY_LINK_SIGNER_BYTES: usize = 16;
 
 /// The most an entry's chain takes in its content.
 /// Derived from MAX_ENTRY_LINKS and the widths of the form: a count is
-/// two bytes, and a link is the hash of a version's text and the key that
-/// signed the entry it was taken from, 32 bytes each.
-pub const MAX_ENTRY_CHAIN_BYTES: usize = 2 + MAX_ENTRY_LINKS * (32 + 32);
+/// two bytes, and a link is the start of a hash and the start of a key.
+pub const MAX_ENTRY_CHAIN_BYTES: usize =
+    2 + MAX_ENTRY_LINKS * (ENTRY_LINK_HASH_BYTES + ENTRY_LINK_SIGNER_BYTES);
 
 /// The most an entry's name and its value may be together: 60 KB (decision
 /// 2026-10-04 §2.3). The rest of the 64 KB is kept for the entry's chain,
@@ -1631,24 +1643,27 @@ mod tests {
     }
 
     /// The bounds of an entry, and the room that is kept in every entry
-    /// for its chain: at every bound together the content is 64,035 bytes
+    /// for its chain: at every bound together the content is 64,675 bytes
     /// of the 65,536 it may be.
     #[test]
     fn test_entry_bounds_decision_2026_10_04_2_3() {
         assert_eq!(MIN_ENTRY_CONTENT_BYTES, 256);
-        assert_eq!(MAX_ENTRY_LINKS, 40);
+        assert_eq!(MAX_ENTRY_LINKS, 100);
         assert_eq!(MAX_ENTRY_NAME_AND_VALUE_BYTES, 61_440); // 60 KB
-        // A count, and 40 links of a hash and a key: 2,560 bytes of links.
-        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 2 + 40 * 64);
-        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 2_562);
+        // A link is 32 bytes: the first 16 of a hash, and of a key.
+        assert_eq!(ENTRY_LINK_HASH_BYTES, 16);
+        assert_eq!(ENTRY_LINK_SIGNER_BYTES, 16);
+        // A count, and 100 links: 3,200 bytes of links.
+        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 2 + 100 * 32);
+        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 3_202);
         let at_every_bound = ITEM_SEAL_OVERHEAD_BYTES
             + 2
             + 1
             + 2
             + MAX_ENTRY_NAME_AND_VALUE_BYTES
             + MAX_ENTRY_CHAIN_BYTES;
-        assert_eq!(at_every_bound, 64_035);
-        assert_eq!(MAX_ITEM_BYTES - at_every_bound, 1_501);
+        assert_eq!(at_every_bound, 64_675);
+        assert_eq!(MAX_ITEM_BYTES - at_every_bound, 861);
         // Nine sizes: each power of two from 256 bytes to 64 KB.
         let sizes = (MIN_ENTRY_CONTENT_BYTES..=MAX_ITEM_BYTES)
             .filter(|size| size.is_power_of_two())

@@ -339,12 +339,12 @@ mod tests {
             value: Value::Text("what the file holds".to_string()),
             chain: Some(vec![
                 Link {
-                    hash: [0x7e; 32],
-                    signer: key(3),
+                    hash: [0x7e; 16],
+                    signer: Link::signer_of(&key(3)),
                 },
                 Link {
-                    hash: [0; 32],
-                    signer: key(2),
+                    hash: [0; 16],
+                    signer: Link::signer_of(&key(2)),
                 },
             ]),
         };

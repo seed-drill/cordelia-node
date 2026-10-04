@@ -38,19 +38,20 @@
 //! name     its length, then the name: text, of at least one byte
 //! value    1: 0 nothing (a delete), 1 a text, 2 other bytes; and for a
 //!          text and for other bytes its length, then the bytes
-//! chain    a count, from 0 to 40, then for each link: the hash of a
-//!          version's value 32, which is all zeros for a delete, and the
-//!          key that signed the entry it was taken from 32
+//! chain    a count, from 0 to 100, then for each link: the first 16
+//!          bytes of the hash of a version's value, which are zeros for
+//!          a delete, and the first 16 bytes of the key that signed the
+//!          entry it was taken from
 //! ```
 //!
 //! The chain is what the entry says it was written after ([`Link`]): the
 //! versions it descends from, the newest first. Room is kept for it in
 //! every entry: a name and a value may together be 60 KB, and at that
-//! bound, with 40 links, the content is within 64 KB
+//! bound, with 100 links, the content is within 64 KB
 //! (`cordelia_core::protocol` checks it when it is compiled). So what an
 //! entry says always fits, whatever its value.
 //!
-//! The chain is read strictly. A count over 40, a link that is there
+//! The chain is read strictly. A count over 100, a link that is there
 //! twice, or anything left over after the last link but the zeros that
 //! fill the content to its size, and the entry lacks what it should say:
 //! it is a version all the same, and shows nothing. [`known_to_follow`] is
@@ -72,9 +73,9 @@ use std::fmt;
 use std::ops::Deref;
 
 use cordelia_core::protocol::{
-    ITEM_SEAL_OVERHEAD_BYTES, LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT,
-    MAX_ENTRY_LINKS, MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, MAX_REV,
-    MIN_ENTRY_CONTENT_BYTES,
+    ENTRY_LINK_HASH_BYTES, ENTRY_LINK_SIGNER_BYTES, ITEM_SEAL_OVERHEAD_BYTES, LABEL_ENTRY_AUTHOR,
+    LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT, MAX_ENTRY_LINKS, MAX_ENTRY_NAME_AND_VALUE_BYTES,
+    MAX_ITEM_BYTES, MAX_REV, MIN_ENTRY_CONTENT_BYTES,
 };
 
 use crate::aes_gcm::{item_decrypt, item_encrypt};
@@ -98,7 +99,7 @@ pub enum EntryError {
     #[error("an entry that is made says its chain")]
     NoChain,
 
-    #[error("an entry's chain has at most 40 links, and this has {0}")]
+    #[error("an entry's chain has at most 100 links, and this has {0}")]
     TooManyLinks(usize),
 
     #[error("a link is in an entry's chain once")]
@@ -177,10 +178,14 @@ impl Value {
         (!self.is_delete()).then(|| crate::sha256(self.bytes()))
     }
 
-    /// What a chain names this value by: its hash, or 32 bytes of zeros
-    /// where it is a delete.
-    pub fn chain_hash(&self) -> [u8; 32] {
-        self.hash().unwrap_or([0u8; 32])
+    /// What a chain names this value by: the first 16 bytes of its hash,
+    /// or 16 bytes of zeros where it is a delete.
+    pub fn chain_hash(&self) -> [u8; ENTRY_LINK_HASH_BYTES] {
+        let mut named = [0u8; ENTRY_LINK_HASH_BYTES];
+        if let Some(hash) = self.hash() {
+            named.copy_from_slice(&hash[..ENTRY_LINK_HASH_BYTES]);
+        }
+        named
     }
 
     /// The byte that says which of the three a value is.
@@ -210,24 +215,33 @@ impl fmt::Debug for Value {
 }
 
 /// One link of an entry's chain (decision 2026-10-04 §2.3): a version
-/// that the entry descends from.
+/// that the entry descends from. It is 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
-    /// What the version held: SHA-256 of its text, or of its bytes that
-    /// are not a text. All zeros stands for a delete.
-    pub hash: [u8; 32],
-    /// The key that signed the entry the version was taken from.
-    pub signer: [u8; 32],
+    /// What the version held: the first 16 bytes of the SHA-256 of its
+    /// text, or of its bytes that are not a text. All zeros stands for a
+    /// delete.
+    pub hash: [u8; ENTRY_LINK_HASH_BYTES],
+    /// The first 16 bytes of the key that signed the entry the version
+    /// was taken from.
+    pub signer: [u8; ENTRY_LINK_SIGNER_BYTES],
 }
 
 impl Link {
-    /// The link that an entry holding `value` and signed by `signer` is
-    /// in the chain of what is written over it.
+    /// The link that an entry holding `value` and signed by the key
+    /// `signer` is in the chain of what is written over it.
     pub fn of(value: &Value, signer: [u8; 32]) -> Self {
         Self {
             hash: value.chain_hash(),
-            signer,
+            signer: Self::signer_of(&signer),
         }
+    }
+
+    /// What a link names the key `key` by: its first 16 bytes.
+    pub fn signer_of(key: &[u8; 32]) -> [u8; ENTRY_LINK_SIGNER_BYTES] {
+        let mut named = [0u8; ENTRY_LINK_SIGNER_BYTES];
+        named.copy_from_slice(&key[..ENTRY_LINK_SIGNER_BYTES]);
+        named
     }
 }
 
@@ -236,8 +250,10 @@ impl Link {
 ///
 /// `chain` is the version's chain, or `None` where its entry lacks what it
 /// should say. `agreed` is what a chain names the agreed value by
-/// ([`Value::chain_hash`]): the hash of the text, or zeros where the
-/// folder agreed a delete. `counts` says whether a key counts.
+/// ([`Value::chain_hash`]): the start of the hash of the text, or zeros
+/// where the folder agreed a delete. `counts` says whether a key counts,
+/// and is asked about a key as a link names it: by its first 16 bytes
+/// ([`Link::signer_of`]).
 ///
 /// Yes, where some link has that hash and every link before it, which is
 /// every version newer than it, was signed by a key that counts. Where
@@ -248,8 +264,8 @@ impl Link {
 /// where the entry lacks what it should say.
 pub fn known_to_follow(
     chain: Option<&[Link]>,
-    agreed: &[u8; 32],
-    counts: impl Fn(&[u8; 32]) -> bool,
+    agreed: &[u8; ENTRY_LINK_HASH_BYTES],
+    counts: impl Fn(&[u8; ENTRY_LINK_SIGNER_BYTES]) -> bool,
 ) -> bool {
     let Some(chain) = chain else {
         return false;
@@ -269,7 +285,7 @@ pub struct Inside {
     pub name: String,
     pub value: Value,
     /// What the entry says it was written after: for each version it
-    /// descends from, the newest first, a link. At most 40, none of them
+    /// descends from, the newest first, a link. At most 100, none of them
     /// twice. Two links may have one hash, where two entries were one
     /// version, and a new name's chain is empty.
     ///
@@ -359,7 +375,7 @@ impl Inside {
 /// a content that held `filled` bytes. `None` where the entry lacks what
 /// it should say:
 ///
-/// - the count is not there, or is over 40;
+/// - the count is not there, or is over 100;
 /// - a link is not whole;
 /// - a link is there twice (two links with one hash and two keys are two
 ///   links);
@@ -435,7 +451,7 @@ impl Entry {
     ///
     /// Refused, and never cut to fit: a revision that is not from 1 to
     /// 2^53 - 1; a name of no bytes; a name and a value over their bound
-    /// together; no chain; a chain of more than 40 links; and a link that
+    /// together; no chain; a chain of more than 100 links; and a link that
     /// is in the chain twice.
     pub fn seal(
         secret: &[u8; 32],
@@ -754,6 +770,16 @@ pub(crate) mod testing {
         Link::of(&Value::Text(said.to_string()), key(n))
     }
 
+    /// What a chain names the text `said` by: the start of its hash.
+    pub(crate) fn named(said: &str) -> [u8; 16] {
+        Value::Text(said.to_string()).chain_hash()
+    }
+
+    /// What a link names the key of device `n` by: its start.
+    pub(crate) fn signer(n: u8) -> [u8; 16] {
+        Link::signer_of(&key(n))
+    }
+
     /// `name` holding `value`, in an entry of a new name: its chain is
     /// empty.
     pub(crate) fn holding(name: &str, value: Value) -> Inside {
@@ -851,8 +877,8 @@ mod tests {
     fn chain_of(links: usize) -> Vec<Link> {
         (0..links)
             .map(|n| Link {
-                hash: [n as u8; 32],
-                signer: [0xd0 + (n % 8) as u8; 32],
+                hash: [n as u8; 16],
+                signer: [0xd0 + (n % 8) as u8; 16],
             })
             .collect()
     }
@@ -1350,16 +1376,20 @@ mod tests {
     }
 
     /// Room is kept in every entry for what it says: at the bound on a
-    /// name and a value, a chain of 40 links still fits.
+    /// name and a value, a chain of 100 links still fits.
     #[test]
-    fn forty_links_fit_beside_a_value_at_the_bound() {
-        assert_eq!(MAX_ENTRY_LINKS, 40);
+    fn a_hundred_links_fit_beside_a_value_at_the_bound() {
+        assert_eq!(MAX_ENTRY_LINKS, 100);
         let longest = Inside {
-            chain: Some(chain_of(40)),
+            chain: Some(chain_of(100)),
             ..holding("n", Value::Delete)
         };
         let nothing = holding("n", Value::Delete);
-        assert_eq!(longest.to_bytes().len() - nothing.to_bytes().len(), 40 * 64);
+        // A link is 32 bytes: the start of a hash, and the start of a key.
+        assert_eq!(
+            longest.to_bytes().len() - nothing.to_bytes().len(),
+            100 * 32
+        );
         assert_eq!(
             longest.to_bytes().len() - nothing.to_bytes().len() + 2,
             MAX_ENTRY_CHAIN_BYTES
@@ -1372,18 +1402,18 @@ mod tests {
             let inside = Inside {
                 name: "n".to_string(),
                 value,
-                chain: Some(chain_of(40)),
+                chain: Some(chain_of(100)),
             };
-            // The largest content there is: 64,035 bytes of the 65,536.
+            // The largest content there is: 64,675 bytes of the 65,536.
             let largest = inside.to_bytes().len() + ITEM_SEAL_OVERHEAD_BYTES;
-            assert_eq!(largest, 64_035);
-            assert_eq!(MAX_ITEM_BYTES - largest, 1_501);
+            assert_eq!(largest, 64_675);
+            assert_eq!(MAX_ITEM_BYTES - largest, 861);
 
             let entry = Entry::seal(&SECRET, &device(1), 9, &inside).unwrap();
             assert_eq!(entry.content.len(), MAX_ITEM_BYTES);
             let opened = entry.check().unwrap().open(&SECRET).unwrap();
             assert_eq!(opened, inside);
-            assert_eq!(opened.chain.unwrap().len(), 40);
+            assert_eq!(opened.chain.unwrap().len(), 100);
         }
     }
 
@@ -1399,9 +1429,9 @@ mod tests {
             Entry::seal(&SECRET, &device(1), 5, &inside).map(|_| ())
         };
 
-        // A chain of more than 40 links.
-        assert_eq!(seal(Some(chain_of(40))), Ok(()));
-        for links in [41, 42, 100] {
+        // A chain of more than 100 links.
+        assert_eq!(seal(Some(chain_of(100))), Ok(()));
+        for links in [101, 102, 200] {
             assert_eq!(
                 seal(Some(chain_of(links))),
                 Err(EntryError::TooManyLinks(links))
@@ -1446,12 +1476,12 @@ mod tests {
             value: Value::Text("hey".to_string()),
             chain: Some(vec![
                 Link {
-                    hash: [0x7e; 32],
-                    signer: [0xa1; 32],
+                    hash: [0x7e; 16],
+                    signer: [0xa1; 16],
                 },
                 Link {
-                    hash: [0; 32],
-                    signer: [0xb2; 32],
+                    hash: [0; 16],
+                    signer: [0xb2; 16],
                 },
             ]),
         };
@@ -1461,11 +1491,12 @@ mod tests {
         said.extend_from_slice(&[1, 0, 3]);
         said.extend_from_slice(b"hey");
         said.extend_from_slice(&[0, 2]);
-        said.extend_from_slice(&[0x7e; 32]);
-        said.extend_from_slice(&[0xa1; 32]);
-        said.extend_from_slice(&[0; 32]);
-        said.extend_from_slice(&[0xb2; 32]);
+        said.extend_from_slice(&[0x7e; 16]);
+        said.extend_from_slice(&[0xa1; 16]);
+        said.extend_from_slice(&[0; 16]);
+        said.extend_from_slice(&[0xb2; 16]);
         assert_eq!(inside.to_bytes(), said);
+        assert_eq!(said.len(), 2 + 4 + 3 + 3 + 2 + 2 * 32);
 
         // Read back, with the zeros that fill a content after it.
         let mut filled = said.clone();
@@ -1712,12 +1743,12 @@ mod tests {
         };
         let (a, b, c) = (link("a", 1), link("a", 2), link("b", 1));
 
-        // The controls: no links, two links, and 40 of them.
+        // The controls: no links, two links, and 100 of them.
         assert_eq!(open(&with(&counted(0, &[]), 256)), saying(Vec::new()));
         assert_eq!(open(&with(&counted(2, &[a, b]), 256)), saying(vec![a, b]));
         assert_eq!(
-            open(&with(&counted(40, &chain_of(40)), 4096)),
-            saying(chain_of(40))
+            open(&with(&counted(100, &chain_of(100)), 4096)),
+            saying(chain_of(100))
         );
         // Two links with one hash and two keys, and two with one key and
         // two hashes, are two links.
@@ -1726,8 +1757,8 @@ mod tests {
             saying(vec![a, b, c])
         );
 
-        // A count over 40, with every link there.
-        for links in [41, 42, 60] {
+        // A count over 100, with every link there.
+        for links in [101, 102, 120] {
             let chain = counted(links, &chain_of(usize::from(links)));
             assert_eq!(open(&with(&chain, 4096)), lacking, "{links}");
         }
@@ -1735,12 +1766,12 @@ mod tests {
         assert_eq!(open(&with(&counted(2, &[a, a]), 256)), lacking);
         assert_eq!(open(&with(&counted(3, &[a, b, a]), 256)), lacking);
         assert_eq!(
-            open(&with(&counted(4, &chain_of(4)), 512)),
+            open(&with(&counted(4, &chain_of(4)), 256)),
             saying(chain_of(4))
         );
-        let mut twice = chain_of(40);
-        twice[39] = twice[0];
-        assert_eq!(open(&with(&counted(40, &twice), 4096)), lacking);
+        let mut twice = chain_of(100);
+        twice[99] = twice[0];
+        assert_eq!(open(&with(&counted(100, &twice), 4096)), lacking);
 
         // Bytes left over after the last link: anything but zeros,
         // wherever it is.
@@ -1750,7 +1781,7 @@ mod tests {
             assert_eq!(open(&filled), lacking, "{place}");
         }
         let mut filled = with(&counted(2, &[a, b]), 256);
-        filled[14 + 128] = 0xff;
+        filled[14 + 64] = 0xff;
         assert_eq!(open(&filled), lacking);
         // And more zeros than fill the smallest size that holds what is
         // said: a content in a larger size than it needs.
@@ -1760,10 +1791,11 @@ mod tests {
         }
 
         // A link that is not whole: the content ends before the chain
-        // does.
-        let chain = counted(4, &[a, b, c]);
+        // does. Six links are there, three of them zeros, and 22 bytes of
+        // a seventh.
+        let chain = counted(7, &[a, b, c]);
         let filled = with(&chain, 256);
-        assert_eq!(14 + 3 * 64 + 22, filled.len());
+        assert_eq!(14 + 6 * 32 + 22, filled.len());
         assert_eq!(open(&filled), lacking);
         // A count that is not whole, and one that is not there: the value
         // ends one byte before the content does, and at its end.
@@ -1784,9 +1816,9 @@ mod tests {
     #[test]
     fn a_version_follows_the_text_of_its_first_link() {
         let chain = [link("agreed", 1), link("older", 2), link("oldest", 9)];
-        let agreed = crate::sha256(b"agreed");
-        let nobody = |_: &[u8; 32]| false;
-        let everyone = |_: &[u8; 32]| true;
+        let agreed = named("agreed");
+        let nobody = |_: &[u8; 16]| false;
+        let everyone = |_: &[u8; 16]| true;
         assert!(known_to_follow(Some(&chain), &agreed, everyone));
         assert!(known_to_follow(Some(&chain), &agreed, nobody));
         assert!(known_to_follow(Some(&chain[..1]), &agreed, nobody));
@@ -1803,28 +1835,24 @@ mod tests {
             link("agreed", 9),
             link("older", 8),
         ];
-        let agreed = crate::sha256(b"agreed");
-        let counts = |signer: &[u8; 32]| [key(1), key(2)].contains(signer);
+        let agreed = named("agreed");
+        let counts = |by: &[u8; 16]| [signer(1), signer(2)].contains(by);
         assert!(known_to_follow(Some(&chain), &agreed, counts));
         // The signer of the agreed version itself is not asked about, nor
         // any signer below it: devices 9 and 8 do not count.
-        assert!(!counts(&key(9)) && !counts(&key(8)));
+        assert!(!counts(&signer(9)) && !counts(&signer(8)));
         // The second link, and the last.
-        assert!(known_to_follow(
-            Some(&chain),
-            &crate::sha256(b"newer"),
-            counts
-        ));
-        let all = |signer: &[u8; 32]| [key(1), key(2), key(9)].contains(signer);
-        assert!(known_to_follow(Some(&chain), &crate::sha256(b"older"), all));
+        assert!(known_to_follow(Some(&chain), &named("newer"), counts));
+        let all = |by: &[u8; 16]| [signer(1), signer(2), signer(9)].contains(by);
+        assert!(known_to_follow(Some(&chain), &named("older"), all));
     }
 
     /// No, where one link before it was signed by a key that does not
     /// count, wherever among them it is.
     #[test]
     fn a_version_does_not_follow_past_a_signer_that_does_not_count() {
-        let agreed = crate::sha256(b"agreed");
-        let counts = |signer: &[u8; 32]| [key(1), key(2)].contains(signer);
+        let agreed = named("agreed");
+        let counts = |by: &[u8; 16]| [signer(1), signer(2)].contains(by);
         for place in 0..3 {
             let mut chain = vec![
                 link("newest", 1),
@@ -1833,7 +1861,7 @@ mod tests {
                 link("agreed", 1),
             ];
             assert!(known_to_follow(Some(&chain), &agreed, counts));
-            chain[place].signer = key(9);
+            chain[place].signer = signer(9);
             assert!(!known_to_follow(Some(&chain), &agreed, counts), "{place}");
             // What is above that link is still followed, and the link's
             // own text.
@@ -1849,22 +1877,15 @@ mod tests {
     #[test]
     fn a_version_does_not_follow_a_text_that_is_not_in_its_chain() {
         let chain = [link("newest", 1), link("newer", 2)];
-        let everyone = |_: &[u8; 32]| true;
-        assert!(!known_to_follow(
-            Some(&chain),
-            &crate::sha256(b"agreed"),
-            everyone
-        ));
-        // A key is no hash, and the hash of a text is not the text's.
-        assert!(!known_to_follow(Some(&chain), &key(1), everyone));
-        let mut other = crate::sha256(b"newest");
-        other[31] ^= 1;
+        let everyone = |_: &[u8; 16]| true;
+        assert!(!known_to_follow(Some(&chain), &named("agreed"), everyone));
+        // A key is no hash, and a hash that differs in its last bit is
+        // another text's.
+        assert!(!known_to_follow(Some(&chain), &signer(1), everyone));
+        let mut other = named("newest");
+        other[15] ^= 1;
         assert!(!known_to_follow(Some(&chain), &other, everyone));
-        assert!(known_to_follow(
-            Some(&chain),
-            &crate::sha256(b"newest"),
-            everyone
-        ));
+        assert!(known_to_follow(Some(&chain), &named("newest"), everyone));
     }
 
     /// Two entries that were one version are two links with one hash. The
@@ -1872,8 +1893,8 @@ mod tests {
     /// link after it is asked about.
     #[test]
     fn of_two_links_with_one_hash_the_first_decides() {
-        let agreed = crate::sha256(b"agreed");
-        let counts = |signer: &[u8; 32]| [key(1), key(2)].contains(signer);
+        let agreed = named("agreed");
+        let counts = |by: &[u8; 16]| [signer(1), signer(2)].contains(by);
 
         // Both below signers that count: yes, also where the second of
         // them was signed by a key that does not count.
@@ -1894,23 +1915,19 @@ mod tests {
 
     #[test]
     fn a_version_with_an_empty_chain_follows_nothing() {
-        let everyone = |_: &[u8; 32]| true;
-        assert!(!known_to_follow(
-            Some(&[]),
-            &crate::sha256(b"agreed"),
-            everyone
-        ));
+        let everyone = |_: &[u8; 16]| true;
+        assert!(!known_to_follow(Some(&[]), &named("agreed"), everyone));
         // Not a delete either, which a chain names by zeros.
-        assert!(!known_to_follow(Some(&[]), &[0; 32], everyone));
+        assert!(!known_to_follow(Some(&[]), &[0; 16], everyone));
     }
 
-    /// A chain names a delete by 32 bytes of zeros, and a delete is
+    /// A chain names a delete by 16 bytes of zeros, and a delete is
     /// followed as a text is.
     #[test]
     fn a_delete_is_followed_as_a_text_is() {
-        let counts = |signer: &[u8; 32]| [key(1), key(2)].contains(signer);
+        let counts = |by: &[u8; 16]| [signer(1), signer(2)].contains(by);
         let deleted = Value::Delete.chain_hash();
-        assert_eq!(deleted, [0; 32]);
+        assert_eq!(deleted, [0; 16]);
 
         let a_delete = Link::of(&Value::Delete, key(1));
         let chain = [a_delete, link("older", 2)];
@@ -1922,30 +1939,22 @@ mod tests {
         // A folder that agreed a text is not followed by way of a delete,
         // nor one that agreed a delete by way of a text.
         let chain = [a_delete];
-        assert!(!known_to_follow(Some(&chain), &crate::sha256(b""), counts));
+        assert!(!known_to_follow(Some(&chain), &named(""), counts));
         let chain = [link("", 1)];
         assert!(!known_to_follow(Some(&chain), &deleted, counts));
         // And a delete is passed as any version is.
         let chain = [Link::of(&Value::Delete, key(2)), link("agreed", 1)];
-        assert!(known_to_follow(
-            Some(&chain),
-            &crate::sha256(b"agreed"),
-            counts
-        ));
+        assert!(known_to_follow(Some(&chain), &named("agreed"), counts));
         let chain = [Link::of(&Value::Delete, key(9)), link("agreed", 1)];
-        assert!(!known_to_follow(
-            Some(&chain),
-            &crate::sha256(b"agreed"),
-            counts
-        ));
+        assert!(!known_to_follow(Some(&chain), &named("agreed"), counts));
     }
 
     /// An entry that lacks what it should say is known to follow nothing.
     #[test]
     fn an_entry_that_lacks_what_it_should_say_follows_nothing() {
-        let everyone = |_: &[u8; 32]| true;
-        assert!(!known_to_follow(None, &crate::sha256(b"agreed"), everyone));
-        assert!(!known_to_follow(None, &[0; 32], everyone));
+        let everyone = |_: &[u8; 16]| true;
+        assert!(!known_to_follow(None, &named("agreed"), everyone));
+        assert!(!known_to_follow(None, &[0; 16], everyone));
 
         // As it is opened: an entry whose chain names a link twice.
         let twice = Inside {
@@ -1956,7 +1965,7 @@ mod tests {
             .open(&SECRET)
             .unwrap();
         assert_eq!(opened.chain, None);
-        let agreed = crate::sha256(b"agreed");
+        let agreed = named("agreed");
         assert!(!known_to_follow(opened.chain.as_deref(), &agreed, everyone));
         // The control: named once, it follows.
         let once = Inside {
@@ -1967,30 +1976,41 @@ mod tests {
         assert!(known_to_follow(opened.chain.as_deref(), &agreed, everyone));
     }
 
-    /// A link is a version by the hash of what it held, which is zeros for
-    /// a delete, and the key that signed the entry it was taken from.
+    /// A link is a version by the start of the hash of what it held, which
+    /// is zeros for a delete, and the start of the key that signed the
+    /// entry it was taken from: 16 bytes of each.
     #[test]
     fn a_link_names_a_value_by_its_hash_and_a_delete_by_zeros() {
         let text = Value::Text("hello".to_string());
-        assert_eq!(
-            Link::of(&text, key(1)),
-            Link {
-                hash: crate::sha256(b"hello"),
-                signer: key(1)
-            }
-        );
-        assert_eq!(text.chain_hash(), crate::sha256(b"hello"));
+        let hash = crate::sha256(b"hello");
+        let made = Link::of(&text, key(1));
+        assert_eq!(made.hash[..], hash[..16]);
+        assert_eq!(made.signer[..], key(1)[..16]);
+        assert_eq!(std::mem::size_of::<Link>(), 32);
+        assert_eq!(text.chain_hash(), made.hash);
+        assert_eq!(named("hello"), made.hash);
+        assert_eq!(signer(1), made.signer);
+        assert_eq!(Link::signer_of(&key(1)), made.signer);
+        // The start of a hash, and of nothing else of it: a text whose
+        // hash differs in its first 16 bytes is another, and one byte of
+        // a key's first 16 is another key.
+        assert_ne!(named("hello"), named("hello."));
+        assert_ne!(signer(1), signer(2));
+
         let bytes = Value::Other(vec![0xff]);
-        assert_eq!(Link::of(&bytes, key(2)).hash, crate::sha256(&[0xff]));
+        assert_eq!(
+            Link::of(&bytes, key(2)).hash[..],
+            crate::sha256(&[0xff])[..16]
+        );
         assert_eq!(
             Link::of(&Value::Delete, key(2)),
             Link {
-                hash: [0; 32],
-                signer: key(2)
+                hash: [0; 16],
+                signer: signer(2)
             }
         );
         // An empty text is a text, and no delete.
-        assert_ne!(Value::Text(String::new()).chain_hash(), [0; 32]);
+        assert_ne!(Value::Text(String::new()).chain_hash(), [0; 16]);
     }
 
     // ── What is shown of one ─────────────────────────────────────────
