@@ -183,7 +183,7 @@ REST API binding and authentication.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `bind_address` | string | `"127.0.0.1"` | Loopback only | REST API bind address. MUST be `127.0.0.1` or `::1`, written so. A name is not taken, `localhost` included (up to 0.2.0-alpha.6 it was): what a name stands for is asked again by whatever binds or connects. With any other value the node refuses to start, and a command refuses to ask it: a command's request carries the node's token. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
+| `bind_address` | string | `"127.0.0.1"` | `127.0.0.1` or `::1` | REST API bind address. MUST be `127.0.0.1` or `::1`, written so. A name is not taken, `localhost` included (up to 0.2.0-alpha.6 it was): what a name stands for is asked again by whatever binds or connects. With any other value the node refuses to start, and a command refuses to ask it: a command's request carries the node's token. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
 | `token_path` | string | `"~/.cordelia/node-token"` | Valid file path | Path to the bearer token file for HTTP API authentication. Tilde expanded at startup. | operations.md SS5.1 |
 
 **Note:** network-protocol.md SS12.2 includes `api_addr` (combining address and port) under `[network]`. operations.md SS5.1 splits this into `api.bind_address` and `node.http_port`. This document follows the split form: bind address under `[api]`, port under `[node]`, as this is more granular and allows independent overrides via environment variables.
@@ -305,7 +305,7 @@ embedding_queue_size = 1000                  # Pending embedding request cap
 
 # --- API ---
 [api]
-bind_address = "127.0.0.1"                # MUST be loopback (non-loopback = refuse to start)
+bind_address = "127.0.0.1"                # MUST be 127.0.0.1 or ::1 (any other = refuse to start)
 token_path = "~/.cordelia/node-token"      # Bearer token file path
 
 # --- Logging ---
@@ -335,7 +335,7 @@ Environment variables override `config.toml` values. All use the `CORDELIA_` pre
 | `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` | operations.md SS5.2 |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` | operations.md SS5.2 |
 
-No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. The node also reads `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1.
+No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. Which file that is can be set: the binary takes `CORDELIA_CONFIG` for the path of the configuration, where `--config` is not given. The node also reads `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1.
 
 See SS4.2 for SDK-specific variables (`CORDELIA_TOKEN`).
 

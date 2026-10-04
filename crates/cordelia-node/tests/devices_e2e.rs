@@ -977,10 +977,10 @@ fn the_harness_refuses_what_the_node_would_take_for_a_name() {
 }
 
 /// A node, and each command that the harness runs, is run without three
-/// things of the caller's: any `CORDELIA_` variable (the specs name one,
-/// `CORDELIA_BOOTNODES`, that would move a node's relays past the look at
-/// its configuration once it is built), `RUST_LOG`, and any proxy. It is
-/// given its own data directory and home, and the rest is left.
+/// things of the caller's: any `CORDELIA_` variable, `RUST_LOG` and any
+/// proxy; and none of git's own variables, which would point the `git`
+/// that a node runs, and the one a test runs, at the caller's repository.
+/// It is given its own data directory and home, and the rest is left.
 ///
 /// This is a test of the function that removes them, given the names: no
 /// node is spawned here with such a variable set, and that the harness
@@ -996,6 +996,9 @@ fn a_node_is_given_none_of_the_callers_settings() {
         "no_proxy",
         "PATH",
         "RUST_LOG",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GITHUB_SHA",
     ];
     let command = n.binary_given(inherited.iter().map(std::ffi::OsString::from));
     let set = |name: &str| -> Option<Option<PathBuf>> {
@@ -1009,14 +1012,17 @@ fn a_node_is_given_none_of_the_callers_settings() {
         "all_proxy",
         "no_proxy",
         "RUST_LOG",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
     ] {
         assert_eq!(set(name), Some(None), "{name}");
     }
     // Its own.
     assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
     assert_eq!(set("HOME"), Some(Some(n.home())));
-    // Left as it is.
+    // Left as it is: what is not git's own is not taken for it.
     assert_eq!(set("PATH"), None);
+    assert_eq!(set("GITHUB_SHA"), None);
 }
 
 /// A node with no identity does not start: it stops before it opens a
@@ -1126,10 +1132,6 @@ fn a_relay_that_would_dial_another_machine_is_not_started() {
     relay.start();
 }
 
-/// The harness makes personal nodes and relays: what those will dial can
-/// be known before they are started. A node of another role dials the
-/// addresses its peers hand it, which nothing read beforehand can show,
-/// so the harness makes none.
 /// The harness starts a node with no variable but one it knows not to
 /// change where the node dials: its look at that is at the file, and a
 /// variable could stand in place of what the file says.
@@ -1140,6 +1142,10 @@ fn the_harness_starts_a_node_with_no_variable_it_does_not_know() {
     n.start_given(&[("CORDELIA_BOOTNODES", "relay.example:9474")]);
 }
 
+/// The harness makes personal nodes and relays: what those will dial can
+/// be known before they are started. A node of another role dials the
+/// addresses its peers hand it, which nothing read beforehand can show,
+/// so the harness makes none.
 #[test]
 #[should_panic(expected = "does not run one")]
 fn the_harness_makes_no_node_whose_dialling_it_cannot_check() {
@@ -1257,10 +1263,12 @@ fn a_command_asks_its_own_node_and_no_proxy() {
 ///
 /// (Neither value leaves this machine, so nothing does with a refusal
 /// taken out either: `127.0.0.2` is another address of the machine on
-/// Linux, and elsewhere traffic to it stays on the machine; `localhost`
-/// is the machine's name for itself.)
+/// Linux, and elsewhere traffic to it stays on the machine; and
+/// `localhost` is looked up first, as the harness looks up a relay's
+/// name, and the test goes no further where it is not this machine.)
 #[test]
 fn a_command_asks_no_address_but_the_nodes_own() {
+    assert_on_this_machine("idle", "localhost:9");
     let mut n = node("idle", "personal", None);
     for other in ["127.0.0.2", "localhost"] {
         let given = [("CORDELIA_BIND_ADDRESS", other)];
@@ -1293,6 +1301,20 @@ fn a_command_asks_no_address_but_the_nodes_own() {
         assert_eq!(said["state"], "attention", "{said}");
         let summary = said["summary"].as_str().unwrap();
         assert!(summary.contains("not asked"), "{said}");
+        // It is not said to be stopped, or running, and the reason is there.
+        assert!(said["running"].is_null(), "{said}");
+        assert!(
+            said["not_asked"].as_str().unwrap().contains(&named),
+            "{said}"
+        );
+        let out = n.command_given(&given, &["status", "--waybar"]);
+        let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(said["class"][0], "attention", "{said}");
+        let tooltip = said["tooltip"].as_str().unwrap();
+        assert!(
+            tooltip.contains("not asked") && tooltip.contains(&named),
+            "{said}"
+        );
 
         // The node holds itself to the same: it does not start there, and
         // says which address, and where it is set.
@@ -1315,13 +1337,18 @@ fn a_command_asks_no_address_but_the_nodes_own() {
             log.contains(&named) && log.contains("CORDELIA_BIND_ADDRESS"),
             "{log}"
         );
+        // A person who upgrades with the name in their configuration is
+        // told what to write.
+        assert_eq!(log.contains("write `127.0.0.1`"), other == "localhost");
     }
 }
 
-/// A node whose API address is `::1` listens there and nowhere else, and
-/// a command reaches it there: the address is written in brackets before
-/// a port, by the node and by a command alike. (On a machine with no
-/// `::1` to listen on the test says so and shows nothing.)
+/// A node whose API address is `::1` listens there and not at
+/// `127.0.0.1`, and a command reaches it there: the address is written in
+/// brackets before a port, by the node and by a command alike. (On a
+/// machine with no `::1` to listen on the test says so and shows nothing:
+/// what it says is seen only where the run prints what a passing test
+/// printed.)
 #[test]
 fn a_node_at_the_ipv6_address_is_reached_there() {
     if let Err(e) = std::net::TcpListener::bind("[::1]:0") {
@@ -1329,6 +1356,10 @@ fn a_node_at_the_ipv6_address_is_reached_there() {
         return;
     }
     let mut n = node("six", "personal", None);
+    // The other address at the node's port is held here for as long as
+    // the test runs: a node that listened there too could not start, and
+    // nothing else can come to answer there.
+    let _held = std::net::TcpListener::bind(("127.0.0.1", n.http)).unwrap();
     let given = [("CORDELIA_BIND_ADDRESS", "::1")];
     n.start_given(&given);
     let running = || {
@@ -1344,10 +1375,9 @@ fn a_node_at_the_ipv6_address_is_reached_there() {
         "{listed}"
     );
 
-    // There, as the node says when it starts, and not at the other.
+    // There, as the node says when it starts.
     let log = std::fs::read_to_string(n.log()).unwrap();
     assert!(log.contains(&format!("http://[::1]:{}/", n.http)), "{log}");
-    assert!(healthy(&n).is_none(), "the node answers at 127.0.0.1 too");
     n.stop();
 }
 
@@ -1381,7 +1411,8 @@ fn a_command_follows_no_redirect() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let n = node("idle", "personal", None);
-    let status = r#"{"version":"0.0.0","uptime_secs":1}"#;
+    let status =
+        r#"{"version":"0.0.0","uptime_secs":1,"error":{"message":"said by what answered"}}"#;
 
     let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let there = target.local_addr().unwrap();
@@ -1419,12 +1450,17 @@ fn a_command_follows_no_redirect() {
     let out = n.command(&["status"]);
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}");
-    assert!(said.contains("Running:   no"), "{said}");
-    // One that reads, and one that posts: each fails.
+    assert!(said.contains("Running:   no (start it"), "{said}");
+    // One that reads, and one that posts: each fails, says that what
+    // answered is not the node, and repeats nothing of what it said.
     for args in [&["peers", "--json"][..], &["devices"]] {
         let out = n.command(args);
-        let said = String::from_utf8_lossy(&out.stdout);
+        let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "cordelia {args:?}: {said}");
+        assert!(
+            said.contains("is not the node") && !said.contains("said by what answered"),
+            "cordelia {args:?}: {said}"
+        );
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -1477,9 +1513,16 @@ fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
             "https://github.com/seed-drill/cordelia-node.git",
         ],
     ] {
+        // Without git's own variables: `GIT_DIR`, where the caller has
+        // it set, would make these act on the caller's repository.
+        let mut git = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("GIT_")) {
+                git.env_remove(&name);
+            }
+        }
         assert!(
-            Command::new("git")
-                .arg("-C")
+            git.arg("-C")
                 .arg(&repo)
                 .args(&args)
                 .output()

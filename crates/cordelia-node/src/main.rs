@@ -383,6 +383,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
 
     if waybar {
         let mut details = Vec::new();
+        if let Some(why) = &status.not_asked {
+            details.push(format!("Not asked: {why}"));
+        }
         if status.facts.running {
             let relays = status.facts.peers_hot;
             details.push(match relays {
@@ -447,6 +450,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         if let Some(device) = &status.device {
             out["device"] = device.clone().into();
             out["role"] = status.facts.role.clone().into();
+        }
+        // A node that was not asked is not known to be stopped, or to be
+        // running: `running` says neither, and `not_asked` says why.
+        if let Some(why) = &status.not_asked {
+            out["running"] = serde_json::Value::Null;
+            out["not_asked"] = why.clone().into();
         }
         if let Some(live) = &status.live {
             // The node's own version: `version` above is this command's.
@@ -1858,11 +1867,16 @@ fn api_host(address: &str) -> Option<&'static str> {
 /// node, which does not start, and by a command, which does not ask. It
 /// names the address, the two it may be, and where it is set.
 fn not_the_nodes_own(address: &str) -> String {
+    // The one value that an earlier version took and this one does not.
+    let was_taken = match address {
+        "localhost" => " (Up to 0.2.0-alpha.6 the name `localhost` was taken: write `127.0.0.1`.)",
+        _ => "",
+    };
     format!(
         "the node's API address is set to '{address}', which is neither `127.0.0.1` nor \
-         `::1`, written so. The node's API listens at one of those two and at no other, \
-         and a command sends the node's token nowhere else. See `bind_address` under \
-         `[api]` in the configuration, and CORDELIA_BIND_ADDRESS."
+         `::1`, written so.{was_taken} The API of a node of this version listens at one of \
+         those two and at no other, and a command sends the node's token nowhere else. See \
+         `bind_address` under `[api]` in the configuration, and CORDELIA_BIND_ADDRESS."
     )
 }
 
@@ -1965,6 +1979,10 @@ fn api_post(
         })?;
 
     let status = resp.status();
+    // A redirect did not come from the node: nothing of it is read.
+    if status.is_redirection() {
+        anyhow::bail!("what answered at {url} is not the node (HTTP {status})");
+    }
     let json: serde_json::Value = resp
         .body_mut()
         .read_json()
@@ -3910,6 +3928,14 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(refused, not_the_nodes_own("192.0.2.1"));
+        // Only the name that an earlier version took is said to have been.
+        assert!(!refused.contains("0.2.0-alpha.6"), "{refused}");
+        let was_taken = not_the_nodes_own("localhost");
+        assert!(
+            was_taken.contains("0.2.0-alpha.6") && was_taken.contains("write `127.0.0.1`"),
+            "{was_taken}"
+        );
+        assert!(!not_the_nodes_own("LOCALHOST").contains("0.2.0-alpha.6"));
         assert!(
             refused.contains("'192.0.2.1'")
                 && refused.contains("nowhere else")
