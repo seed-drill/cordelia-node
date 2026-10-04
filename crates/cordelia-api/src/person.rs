@@ -435,8 +435,13 @@ pub struct Applied {
     pub left: Option<u64>,
     /// How many entries were carried into the new generation.
     pub carried: usize,
-    /// The names in whose channel a slot held no version at all: what was
-    /// there no longer opens. Such a slot is passed over.
+    /// The names in whose channel a slot held no version at all, though
+    /// it held an entry of a key that counts: what was there no longer
+    /// opens. Such a slot is passed over.
+    ///
+    /// A slot that held only entries of keys that do not count is not
+    /// among them. Those entries are not read: for this device the slot
+    /// held nothing, and there is nothing to say of it.
     pub no_version: Vec<String>,
 }
 
@@ -877,7 +882,9 @@ impl Carry<'_> {
     /// again as this device's own entry in the channel whose secret is
     /// `to`, where `carries` says so. Then everything the store holds of
     /// the channel it left is dropped (§7.5). Returns how many entries
-    /// were carried, and how many slots held no version at all.
+    /// were carried, and how many slots held no version at all though
+    /// they held an entry of a key that is read: a slot with entries of
+    /// other keys alone holds nothing here, and is not counted.
     ///
     /// `counts` says whose entries are read. In a name's channel they are
     /// the keys that count under the statement. In the personal channel
@@ -901,7 +908,9 @@ impl Carry<'_> {
             let held = entries::slot_entries(conn, &channel, &slot)?;
             let read = version::current(&held, from, self.statement, &counts)?;
             let Some(version) = read.current else {
-                no_version += 1;
+                if held.iter().any(|entry| counts(&entry.author)) {
+                    no_version += 1;
+                }
                 continue;
             };
             if !carries(&version) {
@@ -3498,13 +3507,15 @@ mod tests {
 
     /// A slot that holds no version at all is passed over: what was there
     /// no longer opens. The change is applied all the same, and says in
-    /// which names there were such slots.
+    /// which names there were such slots. A slot that holds only entries
+    /// of keys that do not count is passed over too, and is not said: for
+    /// this device it held nothing.
     #[test]
     fn test_a_slot_that_holds_no_version_is_passed_over_and_its_name_is_reported() {
         let conn = device_at(1, 2);
         let phrase = phrase();
         let [_, _, three, _] = statements(&phrase);
-        for name in ["team", "notes", "empty"] {
+        for name in ["team", "notes", "empty", "others", "both"] {
             hold_name(&conn, name, NOW).unwrap();
         }
         let (team, notes) = (own(2, "team"), own(2, "notes"));
@@ -3514,6 +3525,17 @@ mod tests {
         // Only an entry of a key that does not count.
         put(&conn, &team, 9, 6, "theirs.md", text("a stranger's"), &[]);
         put(&conn, &notes, 0, 5, "e.md", text("e"), &[]);
+        // A name whose slots hold only entries of a key that does not
+        // count: one that opens, and one that does not. It is not said.
+        let others = own(2, "others");
+        put(&conn, &others, 9, 6, "theirs.md", text("a stranger's"), &[]);
+        put_what_does_not_open(&conn, &others, 9, 7, "more.md");
+        // And one with a slot that holds an entry of each kind, of which
+        // neither is a version: the entry of the key that counts no longer
+        // opens, and the name is said.
+        let both = own(2, "both");
+        put(&conn, &both, 9, 6, "f.md", text("a stranger's"), &[]);
+        put_what_does_not_open(&conn, &both, 0, 5, "f.md");
         // In the personal channel such a slot is passed over, and is no
         // name's.
         put_what_does_not_open(&conn, &personal(2), 1, 6, "syncing/me");
@@ -3525,7 +3547,7 @@ mod tests {
                 number: 3,
                 left: Some(2),
                 carried: 2,
-                no_version: vec!["team".to_string()],
+                no_version: vec!["both".to_string(), "team".to_string()],
             })
         );
         assert_eq!(applied_number(&conn), 3);
@@ -3533,6 +3555,11 @@ mod tests {
         assert!(carried(&conn, &new, "a.md").is_some());
         assert!(carried(&conn, &new, "gone.md").is_none());
         assert!(carried(&conn, &new, "theirs.md").is_none());
+        // Nothing of the stranger's is carried, in any name.
+        for name in ["others", "both"] {
+            let channel = id_of(&own(3, name));
+            assert!(entries::channel_slots(&conn, &channel).unwrap().is_empty());
+        }
         assert_eq!(
             entries::channel_slots(&conn, &id_of(&new)).unwrap().len(),
             1
