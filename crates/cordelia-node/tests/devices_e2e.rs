@@ -926,7 +926,7 @@ fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
     });
     assert_eq!(hosts, [NOWHERE]);
     // Which is what the harness read from its configuration before it
-    // started the node: the two work the relays out alike.
+    // started the node.
     assert_eq!(hosts, n.will_dial());
     n.stop();
 
@@ -952,12 +952,91 @@ fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
     assert_eq!(hosts, second.will_dial());
 }
 
-/// An address of this machine passes in each form it is written in.
+/// A loopback address passes in each form the node reads as one, and so
+/// does `localhost`.
 #[test]
 fn the_harness_takes_an_address_of_this_machine() {
     for addr in ["127.0.0.1:9", "127.0.0.2:9474", "[::1]:9474", "localhost:9"] {
         assert_on_this_machine("here", addr);
     }
+}
+
+/// What the node would not read as an address it takes for a name, and
+/// looks up: such a form does not pass, though the address inside it is
+/// this machine's.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_what_the_node_would_take_for_a_name() {
+    assert_on_this_machine("odd", "[127.0.0.1]:9");
+}
+
+/// A node, and each command, is run with nothing of the caller's that the
+/// node reads a setting from: no `CORDELIA_` variable (one could move a
+/// node's relays past the look at its configuration), and no proxy. It
+/// is given its own data directory and home, and the rest is left.
+#[test]
+fn a_node_is_given_none_of_the_callers_settings() {
+    let n = node("alone", "personal", None);
+    let inherited = [
+        "CORDELIA_BOOTNODES",
+        "CORDELIA_DATA_DIR",
+        "HTTP_PROXY",
+        "all_proxy",
+        "no_proxy",
+        "PATH",
+        "RUST_LOG",
+    ];
+    let command = n.binary_given(inherited.iter().map(std::ffi::OsString::from));
+    let set = |name: &str| -> Option<Option<PathBuf>> {
+        let found = command.get_envs().find(|(key, _)| *key == name)?;
+        Some(found.1.map(PathBuf::from))
+    };
+    // Removed.
+    for name in ["CORDELIA_BOOTNODES", "HTTP_PROXY", "all_proxy", "no_proxy"] {
+        assert_eq!(set(name), Some(None), "{name}");
+    }
+    // Its own.
+    assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
+    assert_eq!(set("HOME"), Some(Some(n.home())));
+    // Left as they are.
+    for name in ["PATH", "RUST_LOG"] {
+        assert_eq!(set(name), None, "{name}");
+    }
+}
+
+/// A node with no identity does not start: it stops before it opens a
+/// socket or looks a name up. The tests below rest on that. Each starts a
+/// node that the harness should have refused, with its identity taken
+/// away, so that even with the refusal gone nothing reaches a relay.
+#[test]
+fn a_node_with_no_identity_stops_before_it_dials() {
+    let mut n = node("bare", "personal", None);
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
+    let mut child = n.child.take().unwrap();
+    let told = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if told.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!(
+                "a node with no identity is still running:\n{}",
+                n.log_tail()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let log = std::fs::read_to_string(n.log()).unwrap();
+    assert!(log.contains("Node not initialised"), "{log}");
+    // Nothing of the network was begun: not its transport, and not the
+    // relays it would then have worked out.
+    assert!(
+        !log.contains("P2P transport") && !log.contains("relays configured"),
+        "{log}"
+    );
 }
 
 /// The harness refuses to give a node a relay that is not on this machine,
@@ -1030,8 +1109,8 @@ fn a_relay_that_would_dial_another_machine_is_not_started() {
     relay.start();
 }
 
-/// The harness makes personal nodes and relays: a configuration shows
-/// everything those will dial. A node of another role also dials the
+/// The harness makes personal nodes and relays: what those will dial can
+/// be known before they are started. A node of another role dials the
 /// addresses its peers hand it, which nothing read beforehand can show,
 /// so the harness makes none.
 #[test]

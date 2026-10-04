@@ -29,7 +29,13 @@ fi
 # Nor is a personal node whose configuration names no relay: it dials the
 # public ones as well. (Personal is also the role of a configuration that
 # states none.)
-ROLE=$(sed -n 's/^[[:space:]]*role[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)
+# (The role is the one in the `[network]` table. A `role` in any other
+# table is not the node's.)
+ROLE=$(awk '
+    /^[[:space:]]*\[/ { network = ($0 ~ /^[[:space:]]*\[network\][[:space:]]*(#.*)?$/) }
+    network && /^[[:space:]]*role[[:space:]]*=[[:space:]]*"[^"]*"/ {
+        sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+    }' "$CONFIG")
 if [ "${ROLE:-personal}" = "personal" ] \
     && ! grep -Eq '^[[:space:]]*\[\[network\.bootnodes\]\]' "$CONFIG"; then
     echo "FATAL: $CONFIG is a personal node's and names no relay." >&2

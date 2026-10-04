@@ -65,30 +65,43 @@ impl Node {
             .to_string()
     }
 
-    /// A CLI command against this node, run as on its machine.
-    pub fn command(&self, args: &[&str]) -> std::process::Output {
-        Command::new(BIN)
+    /// The binary, told to use this node's configuration, data directory
+    /// and home, and nothing of whoever runs the tests: no `CORDELIA_`
+    /// variable of theirs, which the node would read a setting from in
+    /// place of its configuration, and no proxy of theirs.
+    fn binary(&self) -> Command {
+        self.binary_given(std::env::vars_os().map(|(name, _)| name))
+    }
+
+    /// [`Self::binary`], given the names of the variables it would
+    /// inherit: the environment's, except in the test of this.
+    pub fn binary_given(&self, inherited: impl Iterator<Item = std::ffi::OsString>) -> Command {
+        let mut command = Command::new(BIN);
+        for name in inherited {
+            let theirs = name.to_str().is_some_and(|name| {
+                name.starts_with("CORDELIA_") || name.to_lowercase().ends_with("_proxy")
+            });
+            if theirs {
+                command.env_remove(&name);
+            }
+        }
+        command
             .arg("--config")
             .arg(self.config())
-            .args(args)
             .env("CORDELIA_DATA_DIR", self.data_dir())
-            .env("HOME", self.home())
-            .output()
-            .unwrap()
+            .env("HOME", self.home());
+        command
+    }
+
+    /// A CLI command against this node, run as on its machine.
+    pub fn command(&self, args: &[&str]) -> std::process::Output {
+        self.binary().args(args).output().unwrap()
     }
 
     /// As [`Self::command`], run in the directory `dir`: for what a
     /// command makes of a relative path.
     pub fn command_in(&self, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-        Command::new(BIN)
-            .arg("--config")
-            .arg(self.config())
-            .args(args)
-            .env("CORDELIA_DATA_DIR", self.data_dir())
-            .env("HOME", self.home())
-            .current_dir(dir)
-            .output()
-            .unwrap()
+        self.binary().args(args).current_dir(dir).output().unwrap()
     }
 
     /// Run a CLI command against this node and return its stdout.
@@ -122,11 +135,13 @@ impl Node {
         self.dir.path().canonicalize().unwrap().join("home")
     }
 
-    /// The relays the node will dial if it is started now, as the node
-    /// itself works them out from its configuration: its configured
-    /// relays, or the default ones for a personal node that names none.
-    /// That is all a personal node or a relay dials, and a configuration
-    /// with any other role is refused here (see [`assert_a_role_that_is_checked`]).
+    /// The relays the node will dial if it is started now: its
+    /// configuration, read with the node's own reader, and given to the
+    /// function the node itself asks when it starts
+    /// (`bootstrap::relays_dialled`). So the harness and the node cannot
+    /// come to differ on it. Those relays are all a personal node or a
+    /// relay dials, and a configuration with any other role is refused
+    /// here (see [`assert_a_role_that_is_checked`]).
     pub fn will_dial(&self) -> Vec<String> {
         let config = cordelia_core::config::Config::load(&self.config())
             .unwrap_or_else(|e| panic!("{}: its configuration cannot be read: {e}", self.name));
@@ -137,31 +152,28 @@ impl Node {
             .iter()
             .map(|b| (b.addr.clone(), b.key.clone()))
             .collect();
-        let personal = config.network.role == "personal";
-        cordelia_network::bootstrap::configured_relays(&named, personal)
+        cordelia_network::bootstrap::relays_dialled(&config.network.role, &named)
             .unwrap_or_else(|e| panic!("{}: its relays cannot be read: {e}", self.name))
             .into_iter()
             .map(|relay| relay.host)
             .collect()
     }
 
-    /// Start the node. Its configuration is read first, as the node will
-    /// read it, and the node is not started if a relay it would dial is
-    /// not on this machine, or if its role is one whose dialling cannot be
-    /// read from a configuration: whatever wrote the configuration, and
-    /// whatever a test did to it since.
+    /// Start the node. Its configuration is read first, and the node is
+    /// not started if a relay it would dial is not on this machine, or if
+    /// its role is one whose dialling cannot be known beforehand: whatever
+    /// wrote the configuration, and whatever a test did to it since. (The
+    /// node is given no `CORDELIA_` variable but its data directory, so
+    /// its settings are the file's.)
     pub fn start(&mut self) {
         for host in self.will_dial() {
             assert_on_this_machine(self.name, &host);
         }
         let log = std::fs::File::create(self.log()).unwrap();
         std::fs::create_dir_all(self.home()).unwrap();
-        let child = Command::new(BIN)
-            .arg("--config")
-            .arg(self.config())
+        let child = self
+            .binary()
             .arg("start")
-            .env("CORDELIA_DATA_DIR", self.data_dir())
-            .env("HOME", self.home())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -340,19 +352,17 @@ pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 pub const NOWHERE: &str = "127.0.0.1:9";
 
 /// A test node dials nothing that is not on this machine, whatever a test
-/// gives it: a loopback address, or `localhost` where the machine's own
-/// resolver gives that name loopback addresses and no other. No other
-/// name is looked up to find out, so none passes, wherever it leads.
+/// gives it: a loopback address with its port, read as the node first
+/// reads what it is given (so `[::1]:9474` is one, and `[127.0.0.1]:9`,
+/// which the node would take for a name, is not); or `localhost` where
+/// the machine's own resolver gives that name loopback addresses and no
+/// other. No other name is looked up to find out, so none passes,
+/// wherever it leads.
 pub fn assert_on_this_machine(name: &str, addr: &str) {
-    use std::net::{IpAddr, ToSocketAddrs};
+    use std::net::{SocketAddr, ToSocketAddrs};
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    // An IPv6 address is written in brackets where a port follows it.
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    let here = match literal.parse::<IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
+    let here = match addr.parse::<SocketAddr>() {
+        Ok(literal) => literal.ip().is_loopback(),
         Err(_) if host == "localhost" => addr
             .to_socket_addrs()
             .is_ok_and(|mut found| found.all(|a| a.ip().is_loopback())),
@@ -364,11 +374,12 @@ pub fn assert_on_this_machine(name: &str, addr: &str) {
     );
 }
 
-/// A personal node and a relay dial the relays they are configured with
-/// and nothing else, so a configuration shows everything they will dial.
-/// A node of any other role also dials the addresses its peers hand it,
-/// which nothing read beforehand can show. The harness makes no such
-/// node, and starts none.
+/// A personal node and a relay dial relays and nothing else: the ones
+/// their configuration names, or for a personal node that names none,
+/// the default ones. So what they will dial can be known before they are
+/// started ([`Node::will_dial`]). A node of any other role dials the
+/// addresses its peers hand it, which nothing read beforehand can show.
+/// The harness makes no such node, and starts none.
 pub fn assert_a_role_that_is_checked(name: &str, role: &str) {
     assert!(
         role == "personal" || role == "relay",
@@ -389,8 +400,8 @@ fn relays_for(role: &str, relays: &[(String, Option<String>)]) -> Vec<(String, O
     relays.to_vec()
 }
 
-/// A node whose one bootnode is `bootnode` (`host:port`: `localhost`, or an
-/// address on this machine).
+/// A node whose one bootnode is `bootnode` (`host:port`: `localhost`, or a
+/// loopback address).
 pub fn node_with_bootnode(name: &'static str, role: &str, bootnode: Option<String>) -> Node {
     node_with_bootnodes(name, role, &bootnode.into_iter().collect::<Vec<_>>())
 }
