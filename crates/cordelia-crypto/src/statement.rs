@@ -652,8 +652,8 @@ fn all_of(lists: &[&[[u8; 32]]]) -> Vec<[u8; 32]> {
 }
 
 /// Write a count or a length as two bytes. Every one written is within a
-/// bound far below what two bytes hold: the statement was checked first.
-fn put_count(out: &mut Vec<u8>, count: usize) {
+/// bound far below what two bytes hold: what it counts was checked first.
+pub(crate) fn put_count(out: &mut Vec<u8>, count: usize) {
     out.extend_from_slice(&(count as u16).to_be_bytes());
 }
 
@@ -692,6 +692,11 @@ impl<'a> Reader<'a> {
     pub(crate) fn count(&mut self) -> Option<usize> {
         self.array()
             .map(|bytes| usize::from(u16::from_be_bytes(bytes)))
+    }
+
+    /// What has not been read.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        self.bytes
     }
 
     /// Whether everything has been read.

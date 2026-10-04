@@ -6,6 +6,7 @@
 
 pub mod aes_gcm;
 pub mod bech32;
+pub mod change_entry;
 pub mod channel_state;
 pub mod derive;
 pub mod ecies;

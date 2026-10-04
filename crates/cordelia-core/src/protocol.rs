@@ -877,6 +877,57 @@ pub const MAX_STATEMENT_BYTES: usize = 8 // number
     + 2 // the reserved field, which is empty
     + 64; // signature
 
+/// The size of a change entry's content, always: 32 KB (decision
+/// 2026-10-04 §4.6). One size, so that the entry of one statement takes
+/// the room of the one before it at a relay, and its size says nothing.
+pub const CHANGE_ENTRY_BYTES: usize = 32 * 1024;
+
+// Checked at compile time: a change entry is one entry. Its content is a
+// power of two, as every entry's is, and within the size every entry must
+// fit in.
+const _: () = assert!(CHANGE_ENTRY_BYTES.is_power_of_two());
+const _: () = assert!(CHANGE_ENTRY_BYTES <= MAX_ITEM_BYTES);
+
+/// How much of a change entry's content is the part for the phrase, sealed:
+/// the last 4 KB. The rest is the part for the devices.
+pub const CHANGE_ENTRY_PHRASE_PART_BYTES: usize = 4096;
+
+/// How much of a change entry's content is the part for the devices,
+/// sealed.
+/// Derived: what the part for the phrase leaves.
+pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize =
+    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
+
+/// The size of a secret sealed to one device's key, as the node seals to a
+/// key: an ephemeral key, a nonce, the 32 bytes and a tag.
+pub const SEALED_SECRET_BYTES: usize = 32 + 12 + 32 + 16;
+
+/// The most secrets of earlier generations that a change entry carries for
+/// the phrase (decision 2026-10-04 §4.6).
+pub const MAX_EARLIER_SECRETS: usize = 8;
+
+/// The most device keys that a recovery's change entry lists for the
+/// phrase (decision 2026-10-04 §9).
+pub const MAX_RECOVERY_KEYS: usize = 64;
+
+// Checked at compile time: at every bound together, each part of a change
+// entry fits its share of the 32 KB. The part for the devices is the
+// statement with its length, and a count and a sealed secret for each
+// device. The part for the phrase is a secret, a count and the earlier
+// secrets with their numbers, and a count and the listed keys.
+const _: () = assert!(
+    ITEM_SEAL_OVERHEAD_BYTES
+        + 2
+        + MAX_STATEMENT_BYTES
+        + 2
+        + MAX_STATEMENT_DEVICES * SEALED_SECRET_BYTES
+        <= CHANGE_ENTRY_DEVICES_PART_BYTES
+);
+const _: () = assert!(
+    ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32) + 2 + MAX_RECOVERY_KEYS * 32
+        <= CHANGE_ENTRY_PHRASE_PART_BYTES
+);
+
 /// How many words a recovery phrase has (decision 2026-10-04 §5).
 pub const PHRASE_WORDS: usize = 12;
 
@@ -1427,6 +1478,18 @@ mod tests {
         assert_eq!(STATEMENT_HASH_BYTES, 16);
         // About 21 KB at every bound together.
         assert_eq!(MAX_STATEMENT_BYTES, 20_784);
+    }
+
+    #[test]
+    fn test_change_entry_decision_2026_10_04_4_6() {
+        assert_eq!(CHANGE_ENTRY_BYTES, 32_768);
+        assert_eq!(
+            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES,
+            CHANGE_ENTRY_BYTES
+        );
+        assert_eq!(SEALED_SECRET_BYTES, 92);
+        assert_eq!(MAX_EARLIER_SECRETS, 8);
+        assert_eq!(MAX_RECOVERY_KEYS, 64);
     }
 
     #[test]
