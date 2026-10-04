@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -304,6 +304,36 @@ CREATE TABLE index_lines (
 );
 "#;
 
+/// Migration v11: entries in the form of a channel from its secret
+/// (decision 2026-10-04 §2.3, §2.4, `entries`), beside `items`, which
+/// stays as it is. One row for each author in each slot of each channel:
+/// the newest revision that author signed there. A channel is known by
+/// its ID, and the table refers to no other: a relay stores an entry with
+/// no list of members and no state of the channel.
+///
+/// `seq` is the order in which this node stored its entries, from a
+/// counter of its own that never goes backwards, as the arrival order of
+/// `items` is. `stored_at` is in seconds, in UTC.
+const MIGRATION_V11: &str = r#"
+CREATE TABLE entries (
+    channel_id   BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot         BLOB NOT NULL CHECK(length(slot) = 32),
+    author       BLOB NOT NULL CHECK(length(author) = 32),
+    rev          INTEGER NOT NULL CHECK(rev >= 1),
+    is_delete    INTEGER NOT NULL CHECK(is_delete IN (0, 1)),
+    content      BLOB NOT NULL,
+    author_sig   BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig  BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    seq          INTEGER NOT NULL,
+    stored_at    INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, slot, author)
+);
+
+CREATE UNIQUE INDEX idx_entries_channel_seq ON entries(channel_id, seq);
+
+INSERT OR IGNORE INTO counters (name, value) VALUES ('entry_seq', 0);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -406,6 +436,11 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 10 {
         tracing::info!("applying migration v10 (the lines of memories deleted here)");
         migrate_in_one(conn, MIGRATION_V10, 10)?;
+    }
+
+    if current < 11 {
+        tracing::info!("applying migration v11 (entries of a channel from its secret)");
+        migrate_in_one(conn, MIGRATION_V11, 11)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -839,7 +874,7 @@ mod tests {
         assert!(!has_table(&conn), "the table goes with the version");
 
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 10);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         assert!(has_table(&conn));
         conn.execute(
             "INSERT INTO index_lines (folder, channel_id, file) VALUES ('/m', 'grp_a', 'a.md')",
@@ -852,6 +887,185 @@ mod tests {
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM index_lines", [], |row| row.get(0))
             .unwrap();
-        assert_eq!((version(&conn), rows), (10, 1));
+        assert_eq!((version(&conn), rows), (SCHEMA_VERSION, 1));
+    }
+
+    /// A database at version 10, as the version before the entries of a
+    /// channel from its secret leaves it: with a channel, entries of the
+    /// old form in `items`, the counter of their arrival order, what a
+    /// folder agreed, and a line.
+    fn at_v10() -> Connection {
+        let conn = at_v8();
+        migrate_in_one(&conn, MIGRATION_V9, 9).unwrap();
+        migrate_in_one(&conn, MIGRATION_V10, 10).unwrap();
+        conn.execute_batch(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES ('grp_a', 'group', 'realtime', 'invite_only', X'AA',
+                     '2026-01-01', '2026-01-01');
+             INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length,
+                                seq, slot, rev)
+             VALUES ('ci_1', 'grp_a', X'AA', 'memory', '2026-01-01', X'01', X'02', X'03', 1,
+                     41, X'0505', 3),
+                    ('ci_2', 'grp_a', X'BB', 'memory', '2026-01-02', X'04', X'05', X'0607', 2,
+                     42, X'0505', 4);
+             UPDATE counters SET value = 42 WHERE name = 'item_seq';
+             INSERT INTO index_lines (folder, channel_id, file, line, line_at)
+             VALUES ('/m', 'grp_a', 'gone.md', '- [Gone](gone.md)', 1800000000);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Everything a database holds but the new table and its index: each
+    /// table's definition, and each row of the tables an older binary
+    /// wrote.
+    fn held_before_v11(conn: &Connection) -> Vec<String> {
+        let mut held: Vec<String> = conn
+            .prepare(
+                "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name NOT IN ('entries', 'idx_entries_channel_seq')
+                   AND name NOT LIKE 'sqlite_autoindex_entries%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for rows in [
+            "SELECT item_id || channel_id || hex(author_id) || item_type || published_at
+                 || is_tombstone || hex(content_hash) || hex(signature) || hex(encrypted_blob)
+                 || content_length || seq || hex(slot) || rev FROM items ORDER BY item_id",
+            "SELECT channel_id || channel_type || scope || epoch FROM channels",
+            "SELECT name || value FROM counters WHERE name != 'entry_seq'",
+            "SELECT folder || channel_id || key || COALESCE(hex(hash), '') || rev FROM sync_files
+                 ORDER BY key",
+            "SELECT folder || channel_id || file || line || line_at FROM index_lines",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// The table of entries is made in one step with its version and the
+    /// counter of its order, as the steps before it are: a failure between
+    /// them leaves none, and the step asked for twice is run once.
+    #[test]
+    fn test_v11_adds_the_table_of_entries_and_its_version_as_one() {
+        let conn = at_v10();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has_table = |conn: &Connection| conn.prepare("SELECT rev FROM entries").is_ok();
+        let counter = |conn: &Connection| -> Option<i64> {
+            conn.query_row(
+                "SELECT value FROM counters WHERE name = 'entry_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(version(&conn), 10);
+        assert!(!has_table(&conn));
+
+        let failing = format!("{MIGRATION_V11} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 11).is_err());
+        assert_eq!(version(&conn), 10);
+        assert!(!has_table(&conn), "the table goes with the version");
+        assert_eq!(counter(&conn), None, "and so does its counter");
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert!(has_table(&conn));
+        assert_eq!(counter(&conn), Some(0));
+
+        // A start after that, and the step asked for again, change
+        // nothing: the counter stays where storing has brought it.
+        conn.execute("UPDATE counters SET value = 7 WHERE name = 'entry_seq'", [])
+            .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V11, 11).unwrap();
+        assert_eq!((version(&conn), counter(&conn)), (SCHEMA_VERSION, Some(7)));
+    }
+
+    /// A database at version 10 that an older binary wrote is taken to
+    /// version 11 with everything it held as it was: the step adds a
+    /// table, an index and a counter, and touches nothing else. Entries of
+    /// the old form stay in `items`, and none is moved to the new table.
+    #[test]
+    fn test_a_database_at_v10_that_an_older_binary_wrote_is_taken_to_v11() {
+        let conn = at_v10();
+        let before = held_before_v11(&conn);
+        assert!(before.iter().any(|row| row.starts_with("items: ")));
+        assert!(before.iter().any(|row| row.starts_with("ci_2grp_a")));
+
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 10);
+
+        // The step by itself, and then a start, which has no more to do
+        // for it.
+        migrate_in_one(&conn, MIGRATION_V11, 11).unwrap();
+        assert_eq!(version(&conn), 11);
+        assert_eq!(held_before_v11(&conn), before);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(held_before_v11(&conn), before);
+
+        // What is new: the table, with nothing in it, its index, and its
+        // counter beside the old one.
+        let new: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name IN ('entries', 'idx_entries_channel_seq') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(new, ["entries", "idx_entries_channel_seq"]);
+        let (entries, entry_seq, item_seq): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries),
+                        (SELECT value FROM counters WHERE name = 'entry_seq'),
+                        (SELECT value FROM counters WHERE name = 'item_seq')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((entries, entry_seq, item_seq), (0, 0, 42));
+
+        // The old table is written as before, by its own counter.
+        conn.execute_batch(
+            "UPDATE counters SET value = value + 1 WHERE name = 'item_seq';
+             INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length, seq)
+             VALUES ('ci_3', 'grp_a', X'AA', 'memory', '2026-01-03', X'08', X'02', X'03', 1, 43);",
+        )
+        .unwrap();
+        let (items, entry_seq): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM items),
+                        (SELECT value FROM counters WHERE name = 'entry_seq')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((items, entry_seq), (3, 0));
     }
 }
