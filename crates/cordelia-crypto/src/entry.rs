@@ -137,6 +137,9 @@ pub enum EntryError {
     #[error("the entry is a delete in clear and not in its content, or the other way round")]
     DeleteNotAsSigned,
 
+    #[error("the entries are not all of one slot")]
+    NotOneSlot,
+
     #[error("sealing failed: {0}")]
     Crypto(String),
 }
