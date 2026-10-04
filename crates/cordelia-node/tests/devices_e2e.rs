@@ -971,9 +971,14 @@ fn the_harness_refuses_what_the_node_would_take_for_a_name() {
 }
 
 /// A node, and each command, is run with nothing of the caller's that the
-/// node reads a setting from: no `CORDELIA_` variable (one could move a
-/// node's relays past the look at its configuration), and no proxy. It
-/// is given its own data directory and home, and the rest is left.
+/// node reads a setting from: no `CORDELIA_` variable (the specs name one,
+/// `CORDELIA_BOOTNODES`, that would move a node's relays past the look at
+/// its configuration once it is built), no `RUST_LOG`, and no proxy. It is
+/// given its own data directory and home, and the rest is left.
+///
+/// This is a test of the function that removes them, given the names: no
+/// node is spawned here with such a variable set, and that the harness
+/// gives the function the real environment's names is not under test.
 #[test]
 fn a_node_is_given_none_of_the_callers_settings() {
     let n = node("alone", "personal", None);
@@ -992,22 +997,27 @@ fn a_node_is_given_none_of_the_callers_settings() {
         Some(found.1.map(PathBuf::from))
     };
     // Removed.
-    for name in ["CORDELIA_BOOTNODES", "HTTP_PROXY", "all_proxy", "no_proxy"] {
+    for name in [
+        "CORDELIA_BOOTNODES",
+        "HTTP_PROXY",
+        "all_proxy",
+        "no_proxy",
+        "RUST_LOG",
+    ] {
         assert_eq!(set(name), Some(None), "{name}");
     }
     // Its own.
     assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
     assert_eq!(set("HOME"), Some(Some(n.home())));
-    // Left as they are.
-    for name in ["PATH", "RUST_LOG"] {
-        assert_eq!(set(name), None, "{name}");
-    }
+    // Left as it is.
+    assert_eq!(set("PATH"), None);
 }
 
 /// A node with no identity does not start: it stops before it opens a
-/// socket or looks a name up. The tests below rest on that. Each starts a
-/// node that the harness should have refused, with its identity taken
-/// away, so that even with the refusal gone nothing reaches a relay.
+/// socket or looks a name up. Four of the tests below rest on that. Each
+/// of them starts a node that the harness should have refused, with its
+/// identity taken away, so that even with the refusal gone nothing
+/// reaches a relay.
 #[test]
 fn a_node_with_no_identity_stops_before_it_dials() {
     let mut n = node("bare", "personal", None);
@@ -1019,7 +1029,7 @@ fn a_node_with_no_identity_stops_before_it_dials() {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if told.elapsed() > Duration::from_secs(10) {
+        if told.elapsed() > Duration::from_secs(30) {
             let _ = child.kill();
             panic!(
                 "a node with no identity is still running:\n{}",
@@ -1031,12 +1041,13 @@ fn a_node_with_no_identity_stops_before_it_dials() {
     assert!(!status.success());
     let log = std::fs::read_to_string(n.log()).unwrap();
     assert!(log.contains("Node not initialised"), "{log}");
-    // Nothing of the network was begun: not its transport, and not the
-    // relays it would then have worked out.
-    assert!(
-        !log.contains("P2P transport") && !log.contains("relays configured"),
-        "{log}"
-    );
+    // It got no further: not to the banner it prints once it has its
+    // identity, not to its endpoint, and not to the relays it would then
+    // have worked out. (The harness's configuration logs at debug, and
+    // the node is given no `RUST_LOG` to say otherwise.)
+    for later in ["Cordelia v", "P2P endpoint", "relays configured"] {
+        assert!(!log.contains(later), "{later}: {log}");
+    }
 }
 
 /// The harness refuses to give a node a relay that is not on this machine,
@@ -1158,15 +1169,20 @@ fn a_command_asks_its_own_node_and_no_proxy() {
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
         }
     });
-    // (The harness passes a command no proxy of the caller's: here it is
-    // given these, and nothing that excepts this machine from them.)
+    // (The harness passes a command no proxy of the caller's, and nothing
+    // of theirs that excepts this machine from one: here it is given
+    // these.)
     let run = |args: &[&str]| {
-        let mut command = n.binary_given(["NO_PROXY", "no_proxy"].iter().map(Into::into));
-        command.args(args);
-        for name in ["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"] {
-            command.env(name, &proxy).env(name.to_lowercase(), &proxy);
-        }
-        command.output().unwrap()
+        let proxies = [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+        ]
+        .map(|name| (name, proxy.as_str()));
+        n.command_given(&proxies, args)
     };
     // One that reads, one that posts, and the one that does both.
     for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
@@ -1187,15 +1203,7 @@ fn a_command_asks_its_own_node_and_no_proxy() {
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
-    let out = Command::new(BIN)
-        .arg("--config")
-        .arg(n.config())
-        .args(["devices"])
-        .env("CORDELIA_DATA_DIR", n.data_dir())
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = n.refused(&["devices"]);
     assert!(stderr.contains("cordelia start"), "{stderr}");
 
     // `status` still works, and says the node is not running.

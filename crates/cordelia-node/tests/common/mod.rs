@@ -66,9 +66,10 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and nothing of whoever runs the tests: no `CORDELIA_`
-    /// variable of theirs, which the node would read a setting from in
-    /// place of its configuration, and no proxy of theirs.
+    /// and home, and nothing of whoever runs the tests that it reads a
+    /// setting from: no `CORDELIA_` variable of theirs, no `RUST_LOG`
+    /// (either would stand in place of the node's configuration), and no
+    /// proxy of theirs.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -79,7 +80,9 @@ impl Node {
         let mut command = Command::new(BIN);
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
-                name.starts_with("CORDELIA_") || name.to_lowercase().ends_with("_proxy")
+                name.starts_with("CORDELIA_")
+                    || name == "RUST_LOG"
+                    || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
                 command.env_remove(&name);
@@ -96,6 +99,16 @@ impl Node {
     /// A CLI command against this node, run as on its machine.
     pub fn command(&self, args: &[&str]) -> std::process::Output {
         self.binary().args(args).output().unwrap()
+    }
+
+    /// As [`Self::command`], with `vars` set for it: the caller's own are
+    /// taken out first, as for any command.
+    pub fn command_given(&self, vars: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+        self.binary()
+            .envs(vars.iter().copied())
+            .args(args)
+            .output()
+            .unwrap()
     }
 
     /// As [`Self::command`], run in the directory `dir`: for what a
@@ -163,8 +176,8 @@ impl Node {
     /// not started if a relay it would dial is not on this machine, or if
     /// its role is one whose dialling cannot be known beforehand: whatever
     /// wrote the configuration, and whatever a test did to it since. (The
-    /// node is given no `CORDELIA_` variable but its data directory, so
-    /// its settings are the file's.)
+    /// node is given no `CORDELIA_` variable but its data directory, and
+    /// no `RUST_LOG`, so its settings are the file's.)
     pub fn start(&mut self) {
         for host in self.will_dial() {
             assert_on_this_machine(self.name, &host);
