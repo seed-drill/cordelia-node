@@ -122,7 +122,38 @@ impl Node {
         self.dir.path().canonicalize().unwrap().join("home")
     }
 
+    /// The relays the node will dial if it is started now, as the node
+    /// itself works them out from its configuration: its configured
+    /// relays, or the default ones for a personal node that names none.
+    /// A bootnode dials nobody.
+    pub fn will_dial(&self) -> Vec<String> {
+        let config = cordelia_core::config::Config::load(&self.config())
+            .unwrap_or_else(|e| panic!("{}: its configuration cannot be read: {e}", self.name));
+        if config.network.role == "bootnode" {
+            return Vec::new();
+        }
+        let named: Vec<(String, Option<String>)> = config
+            .network
+            .bootnodes
+            .iter()
+            .map(|b| (b.addr.clone(), b.key.clone()))
+            .collect();
+        let personal = config.network.role == "personal";
+        cordelia_network::bootstrap::configured_relays(&named, personal)
+            .unwrap_or_else(|e| panic!("{}: its relays cannot be read: {e}", self.name))
+            .into_iter()
+            .map(|relay| relay.host)
+            .collect()
+    }
+
+    /// Start the node. Its configuration is read first, as the node will
+    /// read it, and the node is not started if it would dial anything
+    /// that is not on this machine: whatever wrote the configuration, and
+    /// whatever a test did to it since.
     pub fn start(&mut self) {
+        for host in self.will_dial() {
+            assert_on_this_machine(self.name, &host);
+        }
         let log = std::fs::File::create(self.log()).unwrap();
         std::fs::create_dir_all(self.home()).unwrap();
         let child = Command::new(BIN)
@@ -202,7 +233,8 @@ impl Node {
 
     pub fn get(&self, path: &str) -> Option<serde_json::Value> {
         let url = format!("http://127.0.0.1:{}{path}", self.http);
-        let mut resp = ureq::get(&url)
+        let mut resp = direct()
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", self.token()))
             .call()
             .ok()?;
@@ -211,7 +243,8 @@ impl Node {
 
     pub fn get_text(&self, path: &str) -> String {
         let url = format!("http://127.0.0.1:{}{path}", self.http);
-        ureq::get(&url)
+        direct()
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", self.token()))
             .call()
             .unwrap_or_else(|e| panic!("{}: GET {path} failed: {e}", self.name))
@@ -222,7 +255,8 @@ impl Node {
 
     pub fn post(&self, path: &str, body: serde_json::Value) -> serde_json::Value {
         let url = format!("http://127.0.0.1:{}{path}", self.http);
-        let mut resp = ureq::post(&url)
+        let mut resp = direct()
+            .post(&url)
             .header("Authorization", &format!("Bearer {}", self.token()))
             .send_json(&body)
             .unwrap_or_else(|e| panic!("{}: POST {path} failed: {e}", self.name));
@@ -306,13 +340,19 @@ pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 pub const NOWHERE: &str = "127.0.0.1:9";
 
 /// A test node dials nothing that is not on this machine, whatever a test
-/// gives it.
-fn assert_on_this_machine(name: &str, addr: &str) {
+/// gives it: an address of this machine's own, or `localhost` where that
+/// name leads nowhere else. No other name is looked up to find out: the
+/// check itself asks nothing of the network.
+pub fn assert_on_this_machine(name: &str, addr: &str) {
+    use std::net::{IpAddr, ToSocketAddrs};
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    let here = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    let here = match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) if host == "localhost" => addr
+            .to_socket_addrs()
+            .is_ok_and(|mut found| found.all(|a| a.ip().is_loopback())),
+        Err(_) => false,
+    };
     assert!(
         here,
         "the test node {name} would dial {addr}, which is not on this machine"
@@ -320,17 +360,19 @@ fn assert_on_this_machine(name: &str, addr: &str) {
 }
 
 /// The relays a node is configured with: those it is given, or
-/// [`NOWHERE`] for a personal node that is given none. (A relay that is
-/// given none dials nothing, and is left with none.)
+/// [`NOWHERE`] for a personal node that is given none, which is the one
+/// kind of node that dials the default relays where it has none of its
+/// own. (A relay that is given none dials nothing, and is left with
+/// none.)
 fn relays_for(role: &str, relays: &[(String, Option<String>)]) -> Vec<(String, Option<String>)> {
-    if relays.is_empty() && role != "relay" {
+    if relays.is_empty() && role == "personal" {
         return vec![(NOWHERE.to_string(), None)];
     }
     relays.to_vec()
 }
 
-/// A node whose one bootnode is `bootnode` (`host:port`; a name, like the
-/// default relays, or an address).
+/// A node whose one bootnode is `bootnode` (`host:port`: `localhost`, or an
+/// address on this machine).
 pub fn node_with_bootnode(name: &'static str, role: &str, bootnode: Option<String>) -> Node {
     node_with_bootnodes(name, role, &bootnode.into_iter().collect::<Vec<_>>())
 }
@@ -442,7 +484,14 @@ pub fn wait_for<T>(
 
 pub fn healthy(n: &Node) -> Option<()> {
     let url = format!("http://127.0.0.1:{}/api/v1/health", n.http);
-    ureq::get(&url).call().ok().map(|_| ())
+    direct().get(&url).call().ok().map(|_| ())
+}
+
+/// An HTTP client that goes straight to the address it is given. The
+/// default one takes a proxy from the environment, and a test's requests
+/// to this machine, with a node's token in them, are not for a proxy.
+pub fn direct() -> ureq::Agent {
+    ureq::Agent::config_builder().proxy(None).build().into()
 }
 
 pub fn has_hot_peer(n: &Node) -> Option<()> {

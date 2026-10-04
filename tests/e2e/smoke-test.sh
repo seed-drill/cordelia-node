@@ -136,6 +136,12 @@ bind_address = "127.0.0.1"
 [network]
 role = "personal"
 
+# A personal node that names no relay dials the default ones, which are
+# real and public. This one is given an address on this machine where
+# nothing listens.
+[[network.bootnodes]]
+addr = "127.0.0.1:9"
+
 [logging]
 level = "warn"
 TOML
@@ -280,12 +286,13 @@ public_key = ""
 [node]
 http_port = 19999
 p2p_port = 19998
-[storage]
 data_dir = "$PEER_DIR"
 [api]
 bind_address = "127.0.0.1"
 [network]
 role = "personal"
+[[network.bootnodes]]
+addr = "127.0.0.1:9"
 [logging]
 level = "warn"
 TOML

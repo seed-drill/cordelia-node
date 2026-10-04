@@ -18,6 +18,14 @@ fi
 
 CONFIG="$CORDELIA_DATA_DIR/config.toml"
 
+# A node started with no configuration runs on the defaults, and the
+# defaults dial the public relays. A test node never does.
+if [ ! -f "$CONFIG" ]; then
+    echo "FATAL: no configuration at /config/config.toml or $CONFIG." >&2
+    echo "A test node is not started on the defaults: they dial the public relays." >&2
+    exit 1
+fi
+
 # Pre-seeded identity: if /keys/lead.identity.key exists and this is a lead
 # (not a swarm child), copy it to the data dir BEFORE init so `cordelia init`
 # uses the pre-generated key instead of generating a new one.

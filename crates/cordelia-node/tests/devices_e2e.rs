@@ -933,6 +933,56 @@ fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
     assert!(!config.contains("[[network.bootnodes]]"), "{config}");
 }
 
+/// The harness refuses to give a node a relay that is not on this machine,
+/// when the node is made. Nothing is started, and nothing is asked of the
+/// network to find out. (The address is one kept for documentation, which
+/// no machine has.)
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_a_relay_that_is_not_on_this_machine() {
+    node_with_bootnode("far", "personal", Some("192.0.2.1:9474".into()));
+}
+
+/// And when a relay is added to a node that is already made, and when it
+/// is given by a name other than `localhost`.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_to_add_a_relay_that_is_not_on_this_machine() {
+    let relay = node("relay", "relay", None);
+    relay.add_relay("relay.example:9474", None);
+}
+
+/// A node is not started if it would dial anything that is not on this
+/// machine, whatever wrote its configuration. Here a test has taken the
+/// stand-in relay out of a personal node's configuration, so that the
+/// node would dial the default relays: the harness reads the configuration
+/// as the node will, and stops before any process exists.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_node_that_would_dial_a_public_relay_is_not_started() {
+    let mut n = node("bare", "personal", None);
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    let stand_in = format!("[[network.bootnodes]]\naddr = \"{NOWHERE}\"\n");
+    assert!(config.contains(&stand_in), "{config}");
+    std::fs::write(n.config(), config.replace(&stand_in, "")).unwrap();
+    assert_eq!(
+        n.will_dial(),
+        cordelia_core::protocol::FALLBACK_PEERS.to_vec(),
+        "a personal node that names no relay dials the default ones"
+    );
+    n.start();
+}
+
+/// The same for a node whose configuration is not there at all: the node
+/// would run on its defaults, which name the public relays.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_node_with_no_configuration_is_not_started() {
+    let mut n = node("unconfigured", "personal", None);
+    std::fs::remove_file(n.config()).unwrap();
+    n.start();
+}
+
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
