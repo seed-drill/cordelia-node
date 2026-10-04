@@ -396,8 +396,9 @@ pub fn current_of(
 /// behind sees a newer revision. (The new entry is one more entry at its
 /// revision. Where another remaining device has an entry there, which of
 /// the two counts is decided between them as any tie is, whatever counted
-/// before, and a device whose file holds the text that counted before
-/// treats the other as it treats any tie.) Two cases differ:
+/// before, and a device that had agreed an entry at that revision, and
+/// whose file holds the text that counted before, treats the other as it
+/// treats any tie.) Two cases differ:
 ///
 /// - This device already has a revision that high for the key (it lost a
 ///   tie to `leaving`): the next one up is used.

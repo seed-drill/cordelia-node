@@ -1254,7 +1254,8 @@ fn sync_the_rest(n: usize) -> Vec<Step> {
 /// the two, for some seed. (The harness's removal reaches every device at
 /// once, and changes no key: what a node does besides is not in it. And
 /// the two runs can differ only in the mixes where the device that removes
-/// and the device that holds the overtaken text are both as built: in the
+/// and the device that holds the overtaken text (in the first sequence
+/// device 2 or device 3, as the tie goes) are both as built: in the
 /// others either nothing that is published after the removal says
 /// anything, or the device that holds the overtaken text reads none of
 /// it, and the two runs come to the same.)
