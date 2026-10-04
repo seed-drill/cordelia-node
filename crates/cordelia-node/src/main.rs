@@ -760,7 +760,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
 
     // Validate bind address is loopback
     let bind_addr = &config.api.bind_address;
-    if bind_addr != "127.0.0.1" && bind_addr != "::1" && bind_addr != "localhost" {
+    if !is_this_machine(bind_addr) {
         anyhow::bail!(
             "API bind_address must be loopback (127.0.0.1), got '{bind_addr}'. \
              Non-loopback binding is not supported in Phase 1."
@@ -1825,17 +1825,42 @@ fn api_get(config_path: &str, path: &str) -> anyhow::Result<serde_json::Value> {
     local_api(&config, false, path, std::time::Duration::from_secs(3))
 }
 
-/// How a command reaches its own node: straight to the address, within
-/// `limit`. The HTTP client's default takes a proxy from the environment
-/// (`ALL_PROXY`, `HTTP_PROXY` and the rest). A proxy is for the network:
-/// a request to this machine, with the node's token in it, is not sent
-/// to one.
+/// Whether `address` is one that the node's API may have: an address of
+/// this machine. The node starts with no other.
+fn is_this_machine(address: &str) -> bool {
+    matches!(address, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// How a command reaches its own node: the client, and the address of
+/// `path` there. A request carries the node's token, so it goes to this
+/// machine and nowhere else:
+///
+/// - **To no other address.** The node listens only on this machine. An
+///   API address that a setting, or `CORDELIA_BIND_ADDRESS`, has made
+///   another is refused here, before anything is sent.
+/// - **Through no proxy.** The HTTP client's default takes one from the
+///   environment (`ALL_PROXY`, `HTTP_PROXY` and the rest). A proxy is for
+///   the network, and a request to this machine is not sent to one.
 fn to_this_machine(
-    limit: Option<std::time::Duration>,
-) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
-    ureq::Agent::config_builder()
+    config: &Config,
+    path: &str,
+    limit: std::time::Duration,
+) -> anyhow::Result<(
+    ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    String,
+)> {
+    let address = &config.api.bind_address;
+    if !is_this_machine(address) {
+        anyhow::bail!(
+            "the node's API address is set to '{address}', which is not this machine \
+             (127.0.0.1). A command sends the node's token nowhere else."
+        );
+    }
+    let client = ureq::Agent::config_builder()
         .proxy(None)
-        .timeout_global(limit)
+        .timeout_global(Some(limit));
+    let url = format!("http://{address}:{}{path}", config.node.http_port);
+    Ok((client, url))
 }
 
 /// Call the running node's local API (GET, or POST with an empty body)
@@ -1846,12 +1871,9 @@ fn local_api(
     path: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<serde_json::Value> {
+    let (client, url) = to_this_machine(config, path, timeout)?;
     let token = std::fs::read_to_string(config.token_path())?;
-    let url = format!(
-        "http://{}:{}{path}",
-        config.api.bind_address, config.node.http_port
-    );
-    let agent: ureq::Agent = to_this_machine(Some(timeout)).build().into();
+    let agent: ureq::Agent = client.build().into();
     let auth = format!("Bearer {}", token.trim());
     let resp = if post {
         agent
@@ -1882,6 +1904,7 @@ fn api_post(
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
 
+    let (client, url) = to_this_machine(&config, path, std::time::Duration::from_secs(30))?;
     let token_path = config.token_path();
     let token = std::fs::read_to_string(&token_path).map_err(|e| {
         anyhow::anyhow!(
@@ -1889,15 +1912,8 @@ fn api_post(
             token_path.display()
         )
     })?;
-    let url = format!(
-        "http://{}:{}{path}",
-        config.api.bind_address, config.node.http_port
-    );
 
-    let agent: ureq::Agent = to_this_machine(Some(std::time::Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent: ureq::Agent = client.http_status_as_error(false).build().into();
     let mut resp = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
@@ -3799,6 +3815,42 @@ mod tests {
         );
         let said = mapping_meant("x", None, None).unwrap_err().to_string();
         assert!(said.contains("not mapped on this device"), "{said}");
+    }
+
+    /// A command asks the node only at an address of this machine: the
+    /// three that the node itself starts with. Any other is refused before
+    /// a client is made, so the node's token is sent nowhere else.
+    #[test]
+    fn test_a_command_asks_only_an_address_of_this_machine() {
+        for here in ["127.0.0.1", "::1", "localhost"] {
+            assert!(is_this_machine(here), "{here}");
+        }
+        for elsewhere in [
+            "192.0.2.1",
+            "0.0.0.0",
+            "127.0.0.2",
+            "example.org",
+            "127.0.0.1.example.org",
+            "",
+        ] {
+            assert!(!is_this_machine(elsewhere), "{elsewhere}");
+        }
+        let mut config = Config::default();
+        let limit = std::time::Duration::from_secs(1);
+        let (_, url) = to_this_machine(&config, "/api/v1/status", limit)
+            .ok()
+            .unwrap();
+        let port = config.node.http_port;
+        assert_eq!(url, format!("http://127.0.0.1:{port}/api/v1/status"));
+        config.api.bind_address = "192.0.2.1".into();
+        let refused = to_this_machine(&config, "/api/v1/status", limit)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            refused.contains("192.0.2.1") && refused.contains("not this machine"),
+            "{refused}"
+        );
     }
 
     #[test]
