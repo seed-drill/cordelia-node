@@ -237,12 +237,17 @@ pub fn set_state(conn: &Connection, state: State) -> Result<(), CordeliaError> {
 // ── Its secrets ──────────────────────────────────────────────────────
 
 /// Every secret the device holds: the one it has applied first, and then
-/// those it left, the one it left last first.
+/// those it left, by the number of their statement, the highest first. Of
+/// two at one number, the greater secret is first.
+///
+/// The time a secret was left is not what orders them: it is the device's
+/// own clock, and a clock that was set back would list an older secret
+/// ahead of a newer one.
 pub fn secrets(conn: &Connection) -> Result<Vec<Secret>, CordeliaError> {
     let mut stmt = conn
         .prepare(
             "SELECT number, secret, left_at FROM person_secrets
-             ORDER BY left_at IS NOT NULL, left_at DESC, number DESC, secret",
+             ORDER BY left_at IS NOT NULL, number DESC, secret DESC",
         )
         .map_err(storage)?;
     let rows = stmt
@@ -738,6 +743,52 @@ mod tests {
                 left_at: None
             })
         );
+    }
+
+    /// The secrets that were left are listed by the number of their
+    /// statement, the highest first, and not by the time they were left: a
+    /// clock that was set back does not reorder them.
+    #[test]
+    fn test_the_secrets_that_were_left_are_listed_by_number_and_not_by_time() {
+        let conn = db::open_in_memory().unwrap();
+        apply_secret(&conn, 1, &[0xa1; 32], NOW).unwrap();
+        apply_secret(&conn, 2, &[0xa2; 32], NOW + 50).unwrap();
+        // The clock was set back before the next two were applied: secret
+        // 2 was left before secret 1 by the clock, and secret 4 at the
+        // very time that secret 2 was.
+        apply_secret(&conn, 4, &[0xa4; 32], NOW - 1000).unwrap();
+        apply_secret(&conn, 5, &[0xa5; 32], NOW - 1000).unwrap();
+        apply_secret(&conn, 9, &[0xa9; 32], NOW + 7).unwrap();
+        let said: Vec<(u64, Option<i64>)> = secrets(&conn)
+            .unwrap()
+            .iter()
+            .map(|secret| (secret.number, secret.left_at))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (9, None),
+                (5, Some(NOW + 7)),
+                (4, Some(NOW - 1000)),
+                (2, Some(NOW - 1000)),
+                (1, Some(NOW + 50)),
+            ]
+        );
+
+        // Two that were left at one number, as a device holds that was
+        // written to past the rule: the greater secret first, whichever
+        // was left last.
+        let conn = db::open_in_memory().unwrap();
+        apply_secret(&conn, 3, &[0xb3; 32], NOW).unwrap();
+        apply_secret(&conn, 3, &[0xa3; 32], NOW + 1).unwrap();
+        apply_secret(&conn, 3, &[0xc3; 32], NOW + 2).unwrap();
+        apply_secret(&conn, 4, &[0xa4; 32], NOW + 3).unwrap();
+        let said: Vec<u8> = secrets(&conn)
+            .unwrap()
+            .iter()
+            .map(|secret| secret.secret[0])
+            .collect();
+        assert_eq!(said, [0xa4, 0xc3, 0xb3, 0xa3]);
     }
 
     /// The table holds one applied secret at most, and a secret once. A
