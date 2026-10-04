@@ -117,6 +117,11 @@ pub enum PersonError {
     #[error("this device counts 64 devices already: a statement makes room")]
     NoRoom,
 
+    #[error(
+        "a device of the applied statement is neither among those that stay nor among the removed"
+    )]
+    NeitherStaysNorRemoved,
+
     #[error("what this device holds of its person does not hold together: {0}")]
     Held(String),
 

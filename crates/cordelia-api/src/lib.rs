@@ -1,9 +1,19 @@
 //! REST API endpoints, bearer token auth, Prometheus metrics, health checks.
 //!
 //! Spec: seed-drill/specs/channels-api.md
+//!
+//! Also here, and not yet used by the node, is what a device does under a
+//! channel from its secret (decision 2026-10-04), as plain functions over
+//! the node's database: what it holds of its person, who counts and how a
+//! statement is applied ([`person`]); publishing in a name it holds, and
+//! reading one ([`publish`]); the one door for an entry from outside
+//! ([`take`]); adding a device, in its two halves ([`adding`]); and the
+//! part of a change that needs the phrase ([`change`]). No handler, command
+//! or adapter calls them yet.
 
 pub mod adding;
 pub mod auth;
+pub mod change;
 pub mod devices;
 pub mod entries;
 pub mod error;
