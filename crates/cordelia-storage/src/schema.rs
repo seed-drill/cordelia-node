@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -277,6 +277,26 @@ CREATE TABLE IF NOT EXISTS state_offers (
 );
 "#;
 
+/// Migration v9: a text that a folder has kept beside a file (decision
+/// 2026-09-30 §4.5). For each file that is still to take a version of the
+/// channel's: the conflict file its text was kept in, the version it was
+/// kept against, the hash of the text, and the entry the channel has under
+/// the conflict file's name: the one that was there when it was written,
+/// and then the one its folder published it as. The row goes when the file
+/// is replaced or removed, and when the file and the channel next agree.
+const MIGRATION_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_kept (
+    folder      TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    copy        TEXT NOT NULL,
+    hash        BLOB NOT NULL,
+    under       TEXT,
+    PRIMARY KEY (folder, channel_id, key)
+);
+"#;
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -340,6 +360,12 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v8 (channel states sent, until confirmed)");
         conn.execute_batch(MIGRATION_V8)?;
         conn.pragma_update(None, "user_version", 8)?;
+    }
+
+    if current < 9 {
+        tracing::info!("applying migration v9 (texts kept beside a file)");
+        conn.execute_batch(MIGRATION_V9)?;
+        conn.pragma_update(None, "user_version", 9)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
