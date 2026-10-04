@@ -1477,9 +1477,9 @@ struct Ctx<'a> {
     /// See [`Hooks::flushed`]: nothing, except in a test.
     flushed: &'a dyn Fn(&str),
     /// The conflict file that this file's text is kept in, and the hash
-    /// of that text, once the plan's first step has kept it or found it
-    /// kept. The file is replaced only while that copy still holds the
-    /// text (see `apply`).
+    /// of that text, once a step of the file's plan has kept the text or
+    /// found it kept. The file is replaced only while that copy still
+    /// holds the text (see `apply`).
     relied: RefCell<Option<(String, [u8; 32])>>,
 }
 
@@ -1546,23 +1546,27 @@ fn lists(dir: &Path, name: &str) -> std::io::Result<bool> {
 ///   file is recorded;
 /// - when a cycle plans the file with no text to keep, whatever it plans
 ///   in its place, or passes the file over as one that takes no part;
-/// - when the copy could not be written, and when another name is taken
+/// - when the copy cannot be written, and when another name is taken
 ///   for the file's text (there is one record for a file);
-/// - when a command changes a setting or is run and changes none, when
-///   the folder stops syncing, and when the node stops.
+/// - each time the node takes a settings command, which is each time one
+///   passes the node's checks, whether or not it then changes anything.
+///   A command that the node refuses is not taken, and nor is one that
+///   the command line answers itself, as it does a mapping that is
+///   already declared;
+/// - when the folder stops syncing, and when the node stops.
 ///
 /// So a copy is relied on from one cycle to the next only while the file
-/// has still to take the version the copy was made against, under the
-/// settings and in the run it was made in. In every other case a conflict
-/// file that holds the text is not relied on, and the text is kept again
-/// under the next free name. That is one copy more than was needed where
-/// the conflict file was this conflict's own: after each restart and each
-/// settings command, for a file that still cannot take the channel's
-/// version. It is what keeps the text where the conflict file is from an
-/// earlier conflict: that file has been with the other devices, and a
-/// delete or an edit of it may be on its way back from one that did not
-/// know the text would be relied on again. The text would then be in no
-/// file.
+/// has still to take the version the copy was made against, and only
+/// until the node takes a settings command or stops. In every other case
+/// a conflict file that holds the text is not relied on, and the text is
+/// kept again under the next free name. That is one copy more than was
+/// needed where the conflict file was this conflict's own: after each
+/// restart, and each settings command that the node takes, for a file
+/// that still cannot take the channel's version. It is what keeps the
+/// text where the conflict file is from an earlier conflict: that file
+/// has been with the other devices, and a delete or an edit of it may be
+/// on its way back from one that did not know the text would be relied
+/// on again. The text would then be in no file.
 fn is_the_copy(ctx: &Ctx, key: &str, name: &str, text: &str) -> Result<bool, CordeliaError> {
     let control = &ctx.state.sync_control;
     let Some(kept) = control.kept_beside(ctx.folder, ctx.channel, key) else {
@@ -1640,11 +1644,12 @@ fn note_published(ctx: &Ctx, key: &str, text: &str, entry: &str) {
     control.kept_published(ctx.folder, ctx.channel, key, &hash, entry);
 }
 
-/// Forget what this folder has kept beside `key`. Where the file has been
-/// replaced or removed, it no longer holds the text that was kept, and a
-/// copy of that text is the copy of a conflict that is over: forgotten
-/// whatever the settings are now, and before anything is recorded. Where
-/// the copy could not be written, nothing was kept.
+/// Forget what this folder has written down as kept beside `key`. Where
+/// the file has been replaced or removed, it no longer holds the text
+/// that was kept, and a copy of that text is the copy of a conflict that
+/// is over. What was written down is forgotten whatever the settings are
+/// now, and before anything is recorded. Where the copy could not be
+/// written, nothing was kept.
 fn forget_kept(ctx: &Ctx, key: &str) {
     let control = &ctx.state.sync_control;
     control.unkeep(ctx.folder, ctx.channel, key);
@@ -1764,9 +1769,10 @@ fn publish_over(
 ///   never overwritten. A file that is to be written is looked at for
 ///   this as the last thing before it is replaced ([`write_atomic`]).
 /// - The action would replace or remove the file, and the conflict file
-///   that the plan's first step kept its text in no longer holds that
-///   text: someone removed or changed the copy meanwhile. The text would
-///   be in no file. The next cycle keeps it again.
+///   in which an earlier step of the plan kept the file's text, or found
+///   it kept, no longer holds that text: someone removed or changed the
+///   copy meanwhile. The text would be in no file. The next cycle keeps
+///   it again.
 /// - The settings have changed since the cycle read them. A command that
 ///   stops this folder syncing may have answered, and nothing more of the
 ///   folder is to be published or written after that. An entry is
@@ -1819,10 +1825,10 @@ fn apply(
     // Whether the file is still as the cycle saw it, and the copy that
     // its text is kept in, if the plan kept one, still holds that text: a
     // copy that someone removes while the file's new text is flushed
-    // would leave the text in no file. A file that is removed, or merged,
-    // is asked this before anything is done. A file that is written (by
-    // `Pull`, or as the file of a `Merge`) is asked it by `write_atomic`,
-    // as the last thing before it is replaced.
+    // would leave the text in no file. This is asked of a file that is
+    // removed, or merged, before anything is done. Of a file that is
+    // written (by `Pull`, or as the file of a `Merge`) `write_atomic`
+    // asks it, as the last thing before the file is replaced.
     let unchanged = || {
         let kept = ctx.relied.borrow();
         current_hash(dir, key) == seen
