@@ -1034,11 +1034,34 @@ mod tests {
         assert!(hold_name(&conn, "other", &[0x71; 32], NOW).is_err());
         assert!(hold_name(&conn, "", &[0x74; 32], NOW).is_err());
         assert_eq!(names(&conn).unwrap(), held);
-        // A channel's ID is 32 bytes.
-        assert!(
-            conn.execute("UPDATE person_names SET channel = X'0102'", [])
-                .is_err()
-        );
+        // A channel's ID is 32 bytes. A row with another length, written
+        // by SQL past the function, is refused: as a new name's, and as
+        // the channel of one name that is held.
+        for other in ["X'0102'", "zeroblob(0)", "zeroblob(31)", "zeroblob(33)"] {
+            let written = conn.execute(
+                &format!(
+                    "INSERT INTO person_names (name, channel, held_at)
+                     VALUES ('of another length', {other}, 5)"
+                ),
+                [],
+            );
+            assert!(written.is_err(), "{other}");
+            let changed = conn.execute(
+                &format!("UPDATE person_names SET channel = {other} WHERE name = 'team'"),
+                [],
+            );
+            assert!(changed.is_err(), "{other}");
+        }
+        assert_eq!(names(&conn).unwrap(), held);
+        // The control: one of 32 bytes, written the same way, is taken.
+        conn.execute(
+            "INSERT INTO person_names (name, channel, held_at)
+             VALUES ('of 32 bytes', zeroblob(32), 5)",
+            [],
+        )
+        .unwrap();
+        assert!(drop_name(&conn, "of 32 bytes").unwrap());
+        assert_eq!(names(&conn).unwrap(), held);
 
         // At a statement a name's channel is another: the name is found
         // from the new one, and from the old one no more.
