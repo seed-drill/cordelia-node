@@ -869,7 +869,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // ── Connection manager ─────────────────────────────────────
         let roles = vec![config.network.role.clone()];
         let allow_private = config.network.allow_private_addresses;
-        let is_bootnode = config.network.role == "bootnode";
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
@@ -881,24 +880,18 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // ── The relays this node dials ───────────────────────────────
         // Its configured relays or, for a personal node that names none,
         // the default ones, each with the key that must answer (decision
-        // 2026-09-30 §4.6). The P2P loop dials them and keeps trying the
-        // ones that are not connected, so starting never waits on a relay
-        // that is unreachable. Bootnodes dial nobody.
-        let relays = if is_bootnode {
-            Vec::new()
-        } else {
-            let configured: Vec<(String, Option<String>)> = config
-                .network
-                .bootnodes
-                .iter()
-                .map(|b| (b.addr.clone(), b.key.clone()))
-                .collect();
-            cordelia_network::bootstrap::configured_relays(
-                &configured,
-                config.network.role == "personal",
-            )
-            .map_err(|e| anyhow::anyhow!("network.bootnodes: {e}"))?
-        };
+        // 2026-09-30 §4.6); none for a bootnode. The P2P loop dials them
+        // and keeps trying the ones that are not connected, so starting
+        // never waits on a relay that is unreachable.
+        let configured: Vec<(String, Option<String>)> = config
+            .network
+            .bootnodes
+            .iter()
+            .map(|b| (b.addr.clone(), b.key.clone()))
+            .collect();
+        let relays =
+            cordelia_network::bootstrap::relays_dialled(&config.network.role, &configured)
+                .map_err(|e| anyhow::anyhow!("network.bootnodes: {e}"))?;
         for relay in &relays {
             if relay.key.is_none() {
                 tracing::warn!(
