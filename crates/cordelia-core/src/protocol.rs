@@ -842,6 +842,13 @@ pub const MAX_STATEMENT_NUMBER: u64 = 256;
 // Checked at compile time: every statement's number is a band.
 const _: () = assert!(MAX_STATEMENT_NUMBER < 1 << REV_BAND_BITS);
 
+/// How many words a recovery phrase has (decision 2026-10-04 §5).
+pub const PHRASE_WORDS: usize = 12;
+
+/// How many bytes the words of a recovery phrase encode: 128 bits.
+/// Everything that comes from the phrase is derived from these.
+pub const PHRASE_BYTES: usize = 16;
+
 /// The label under which a channel's entry key is derived from its secret
 /// (decision 2026-10-04 §2.1). Every label below is the `info` of
 /// HKDF-SHA256 unless it says otherwise, and no label begins another, so
@@ -1373,6 +1380,14 @@ mod tests {
         assert_eq!(REV_BAND_SIZE, 1 << 44);
         assert_eq!(REV_BAND_HALF, 1 << 43);
         assert_eq!(MAX_REV, (1 << 53) - 1);
+    }
+
+    #[test]
+    fn test_phrase_decision_2026_10_04_5() {
+        assert_eq!(PHRASE_WORDS, 12);
+        assert_eq!(PHRASE_BYTES, 16);
+        // Twelve words of eleven bits: the bytes, and four bits of checksum.
+        assert_eq!(PHRASE_WORDS * 11, PHRASE_BYTES * 8 + PHRASE_BYTES / 4);
     }
 
     /// The labels the decision names are spelled as it spells them, and no

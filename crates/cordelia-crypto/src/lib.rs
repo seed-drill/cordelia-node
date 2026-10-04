@@ -10,6 +10,7 @@ pub mod channel_state;
 pub mod derive;
 pub mod ecies;
 pub mod identity;
+pub mod phrase;
 pub mod psk_envelope;
 pub mod signing;
 pub mod slots;
