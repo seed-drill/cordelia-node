@@ -1789,10 +1789,23 @@ mod tests {
         small[0] = 1;
         let mut listing = two.clone();
         listing.devices[1] = Device::new(small, "nobody").unwrap();
-        assert_eq!(listing.validate(), Ok(()));
+        // It is no statement, so the phrase signs none, and no entry is
+        // made of one that is handed over as signed.
+        assert_eq!(listing.validate(), Err(StatementError::DeviceKeyNotUsable));
+        let as_if_signed = SignedStatement {
+            statement: listing,
+            signature: [0u8; 64],
+        };
         assert_eq!(
-            make(&listing, &for_phrase_of(2)),
-            Err(ChangeEntryError::DeviceKey(1))
+            build(
+                &as_if_signed,
+                &for_phrase_of(2),
+                &keys.statement_key,
+                &keys.seal_key
+            ),
+            Err(ChangeEntryError::Statement(
+                StatementError::DeviceKeyNotUsable
+            ))
         );
         // A statement that is none.
         let mut not_one = signed(&two, &phrase);

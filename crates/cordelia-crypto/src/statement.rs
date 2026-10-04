@@ -33,7 +33,8 @@
 //!
 //! Decoding refuses anything else: a statement that ends early, bytes
 //! after its end, a list or a label over its bound, a list that is not in
-//! its order, a key that is listed twice or in both lists.
+//! its order, a key that is listed twice or in both lists, and a device's
+//! key, or the maker's, that is not a usable public key.
 
 use cordelia_core::protocol::{
     LABEL_COMMITMENT, LABEL_STATEMENT, MAX_DEVICE_LABEL_BYTES, MAX_STATEMENT_CHAIN,
@@ -73,6 +74,12 @@ pub enum StatementError {
 
     #[error("the device a statement was made on is among its devices")]
     MakerNotListed,
+
+    #[error("a device's key is not a usable public key")]
+    DeviceKeyNotUsable,
+
+    #[error("the key of the device a statement was made on is not a usable public key")]
+    MakerKeyNotUsable,
 
     #[error("a device's label is from 1 to 64 bytes, and this is {0}")]
     LabelLength(usize),
@@ -350,11 +357,21 @@ impl Statement {
         }
         for device in &self.devices {
             check_label(&device.label)?;
+            // A device holds the secret, which is sealed to its key, and
+            // signs entries with it. Nothing can be sealed to a key that
+            // is no point, or a point of small order, and anyone can sign
+            // for one.
+            if !found_usable(&device.key) {
+                return Err(StatementError::DeviceKeyNotUsable);
+            }
         }
         let mut keys: Vec<&[u8; 32]> = self.devices.iter().map(|device| &device.key).collect();
         keys.sort_unstable();
         if keys.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(StatementError::DeviceTwice);
+        }
+        if !found_usable(&self.maker) {
+            return Err(StatementError::MakerKeyNotUsable);
         }
         if !self.lists(&self.maker) {
             return Err(StatementError::MakerNotListed);
@@ -639,6 +656,39 @@ pub fn judge(
     } else {
         Judgement::NotListed
     })
+}
+
+thread_local! {
+    /// The keys that this thread has found to be usable public keys.
+    static FOUND_USABLE: std::cell::RefCell<std::collections::HashSet<[u8; 32]>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// How many keys a thread remembers as usable before it starts again.
+const FOUND_USABLE_KEPT: usize = 1024;
+
+/// Whether `key` is a usable public key ([`is_usable_public_key`]).
+///
+/// The check costs a multiplication on the curve, and a statement's
+/// devices are checked each time the statement is read, written, hashed
+/// or judged. Whether a key is usable never changes, so a key that was
+/// found usable is remembered, and the check is made once for it. A key
+/// that is not usable is checked each time, and refused each time.
+fn found_usable(key: &[u8; 32]) -> bool {
+    if FOUND_USABLE.with(|found| found.borrow().contains(key)) {
+        return true;
+    }
+    if !is_usable_public_key(key) {
+        return false;
+    }
+    FOUND_USABLE.with(|found| {
+        let mut found = found.borrow_mut();
+        if found.len() >= FOUND_USABLE_KEPT {
+            found.clear();
+        }
+        found.insert(*key);
+    });
+    true
 }
 
 /// What the phrase's key signs: the statement's label, and its canonical
@@ -1277,6 +1327,94 @@ mod tests {
                 s.devices[0].label.clone()),
             Ok(())
         );
+    }
+
+    /// A device's key, and the key of the device a statement was made on,
+    /// is a usable public key: a point of the order that every real key
+    /// has. Nothing can be sealed to any other, and anyone can sign for a
+    /// point of small order. A statement that lists one is no statement,
+    /// where it is made and where it is read.
+    #[test]
+    fn a_devices_key_and_the_makers_are_usable_public_keys() {
+        let phrase = phrase();
+        let statement = sample(&phrase);
+        // The identity, which is of small order, and bytes that are no
+        // point at all.
+        let mut small = [0u8; 32];
+        small[0] = 1;
+        let no_point = [0x02; 32];
+        for unusable in [small, no_point] {
+            assert!(!is_usable_public_key(&unusable));
+            // A device that is not the maker, wherever it is listed.
+            assert_eq!(
+                with(&statement, |s| s.devices[1].key = unusable),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            assert_eq!(
+                with(&statement, |s| s
+                    .devices
+                    .push(Device::new(unusable, "another").unwrap())),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            // The maker, which is among the devices.
+            assert_eq!(
+                with(&statement, |s| {
+                    s.maker = unusable;
+                    s.devices[0].key = unusable;
+                }),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            // A maker that is not, and is no usable key either.
+            assert_eq!(
+                with(&statement, |s| s.maker = unusable),
+                Err(StatementError::MakerKeyNotUsable)
+            );
+
+            // Where one is made: the first statement, and the next.
+            let nobody = Device::new(unusable, "desktop").unwrap();
+            assert_eq!(
+                Statement::first(nobody.clone(), &secret(1), statement.phrase_key),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            let one = first(&phrase);
+            assert_eq!(
+                one.next(key(0), &secret(2), vec![device(0), nobody.clone()], &[]),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            assert_eq!(
+                one.next(unusable, &secret(2), devices(&[0, 1]), &[]),
+                Err(StatementError::MakerKeyNotUsable)
+            );
+
+            // Where one is read: the form says the same, and is refused. It
+            // has no bytes, no hash and no signature of the phrase's.
+            let raw = Raw::of(&statement);
+            assert_eq!(
+                raw.with(|r| r.devices[1].0 = unusable),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            assert_eq!(
+                raw.with(|r| r.maker = unusable),
+                Err(StatementError::MakerKeyNotUsable)
+            );
+            let mut listing = statement.clone();
+            listing.devices[1].key = unusable;
+            assert_eq!(listing.to_bytes(), Err(StatementError::DeviceKeyNotUsable));
+            assert_eq!(listing.hash(), Err(StatementError::DeviceKeyNotUsable));
+            assert_eq!(
+                listing.clone().sign(&phrase.signing_key().unwrap()),
+                Err(StatementError::DeviceKeyNotUsable)
+            );
+            // It is refused each time it is asked, and a statement of real
+            // keys is one each time.
+            assert_eq!(listing.validate(), Err(StatementError::DeviceKeyNotUsable));
+            assert_eq!(statement.validate(), Ok(()));
+            assert_eq!(statement.validate(), Ok(()));
+        }
+
+        // A key that was removed is a key that some statement listed, or
+        // that a person declined: it is not held to this.
+        assert_eq!(with(&statement, |s| s.removed = vec![small]), Ok(()));
     }
 
     /// A label is 1 to 64 bytes of printable ASCII, with no space at either
