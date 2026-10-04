@@ -22,6 +22,8 @@ pub mod history;
 pub mod membership;
 pub mod person;
 pub mod publish;
+#[cfg(test)]
+mod several;
 pub mod state;
 pub mod sync;
 pub mod take;

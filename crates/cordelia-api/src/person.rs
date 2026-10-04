@@ -4688,6 +4688,128 @@ mod tests {
         assert_eq!(secrets(&conn), [(2, secret(2), None)]);
     }
 
+    /// A device that the statement does not list applies it only where a
+    /// record of its own addition comes with it, under that statement,
+    /// and each record that comes with it counts. It then counts by the
+    /// record, which it keeps.
+    #[test]
+    fn test_a_device_is_applied_as_added_only_where_the_record_of_its_addition_counts() {
+        let phrase = phrase();
+        let [one, two, ..] = statements(&phrase);
+        let following = following(&phrase);
+        // Device `n` is added under `statement`, which commits to secret
+        // 2, with these records.
+        let join = |conn: &Connection,
+                    n: u16,
+                    statement: &Statement,
+                    addition: &SignedAddition,
+                    adders_own: Option<&SignedAddition>| {
+            let entry = change(&phrase, statement, secret(2));
+            let signed = sign(statement, &phrase);
+            let change = Change {
+                following: &following,
+                statement: &signed,
+                secret: &secret(2),
+                entry: &entry,
+            };
+            in_one(conn, || {
+                apply_added(conn, &device(n), None, &change, addition, adders_own, NOW)
+            })
+        };
+
+        // A device of the statement added it.
+        let conn = db::open_in_memory().unwrap();
+        let empty = everything(&conn);
+        let applied = join(&conn, 7, &two, &added(&two, 0, 7), None).unwrap();
+        assert_eq!(
+            applied,
+            Applied {
+                number: 2,
+                left: None,
+                carried: 0,
+                no_version: Vec::new(),
+            }
+        );
+        let counting = who_counts(&conn).unwrap();
+        assert_eq!(counting.keys(), [key(0), key(1), key(2), key(7)]);
+        assert!(counting.may_add(&key(7)));
+        let kept = held_rows::additions(&conn).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].key, kept[0].counted), (key(7), true));
+        // It has written that it has applied, under its own name.
+        let word = read(
+            &conn,
+            &personal(2),
+            2,
+            &applied_name(&key(7)).unwrap(),
+            &[7],
+        );
+        assert_eq!(word.current.unwrap().value, text("2"));
+
+        // A device that was itself added since added it: the record of
+        // that device's addition comes too, and is seen first.
+        let conn = db::open_in_memory().unwrap();
+        join(&conn, 7, &two, &added(&two, 9, 7), Some(&added(&two, 0, 9))).unwrap();
+        let counting = who_counts(&conn).unwrap();
+        assert_eq!(counting.keys(), [key(0), key(1), key(2), key(9), key(7)]);
+        assert!(counting.may_add(&key(9)) && !counting.may_add(&key(7)));
+
+        // Refused, with nothing changed.
+        let refused = |n: u16,
+                       statement: &Statement,
+                       addition: &SignedAddition,
+                       adders_own: Option<&SignedAddition>| {
+            let conn = db::open_in_memory().unwrap();
+            let outcome = join(&conn, n, statement, addition, adders_own);
+            assert_eq!(held(&conn).unwrap(), None);
+            assert_eq!(everything(&conn), empty);
+            outcome.unwrap_err()
+        };
+        // A record that adds another device, and one made under another
+        // statement: no record of this device's addition comes with it.
+        assert!(matches!(
+            refused(7, &two, &added(&two, 0, 8), None),
+            PersonError::NotApplied(Judgement::NotListed)
+        ));
+        assert!(matches!(
+            refused(7, &two, &added(&one, 0, 7), None),
+            PersonError::NotApplied(Judgement::NotListed)
+        ));
+        // A record that a key which does not count signed, with no record
+        // of that key's addition, and with one that such a key signed.
+        assert!(matches!(
+            refused(7, &two, &added(&two, 9, 7), None),
+            PersonError::RecordByAKeyThatDoesNotCount
+        ));
+        assert!(matches!(
+            refused(7, &two, &added(&two, 9, 7), Some(&added(&two, 8, 9))),
+            PersonError::RecordByAKeyThatDoesNotCount
+        ));
+        // A record that does not verify.
+        let mut forged = added(&two, 0, 7);
+        forged.signature[0] ^= 1;
+        assert!(matches!(
+            refused(7, &two, &forged, None),
+            PersonError::Addition(AdditionError::Signature)
+        ));
+        // A statement that lists 64 devices has no room for one more: the
+        // record does not count, and the device is not in the statement.
+        let numbers: Vec<u16> = (0..64).collect();
+        let many = one.next(key(0), &secret(2), listed(&numbers), &[]).unwrap();
+        assert!(matches!(
+            refused(100, &many, &added(&many, 0, 100), None),
+            PersonError::RecordNotCounted(NotCounted::NoRoom)
+        ));
+
+        // A record of an addition is under the name of the key it adds.
+        let name = added_name(&key(7)).unwrap();
+        assert_eq!(
+            name,
+            format!("added/{}", encode_public_key(&key(7)).unwrap())
+        );
+        assert!(name.starts_with("added/cordelia_pk1"));
+    }
+
     /// The first statement of a phrase is made on a device that follows
     /// none: a new secret, statement 1 with this one device, and its
     /// change entry, applied in one step.

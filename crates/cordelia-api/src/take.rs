@@ -230,3 +230,517 @@ fn record_in(
     let came_to_count = who_counts(conn)?.devices() - before;
     Ok((Some(Record::Seen(seen)), came_to_count))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::person::{NotCounted, Refused};
+    use crate::several::{Machine, Several, entry_by, signed_in, text};
+    use cordelia_core::protocol::{HAND_OVER_NAME, REV_BAND_HALF, REV_BAND_SIZE, REV_COUNT_BITS};
+    use cordelia_crypto::addition::Addition;
+    use cordelia_crypto::change_entry::{self, ChangeEntryError};
+    use cordelia_crypto::statement::Link as StatementLink;
+
+    /// An ordinary entry that the store took.
+    const STORED: Taken = Taken::Own {
+        stored: Outcome::Stored,
+        record: None,
+        came_to_count: 0,
+    };
+
+    /// The revision at `count` in `band`.
+    fn at(band: u64, count: u64) -> u64 {
+        (band << REV_COUNT_BITS) + count
+    }
+
+    /// Two devices of one person, each holding the name `notes`.
+    fn two() -> Several {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s
+    }
+
+    /// Device `n` is given `entry`.
+    fn given(s: &Several, n: usize, entry: &CheckedEntry) -> Taken {
+        let on = &s[n];
+        take(&on.conn, &on.identity, entry, s.now).unwrap()
+    }
+
+    /// The record that `adder` adds `new`, under the statement that
+    /// device `n` has applied, signed by the adder.
+    fn record(s: &Several, n: usize, adder: &Machine, new: &Machine) -> SignedAddition {
+        let statement = s[n].held().statement.statement;
+        Addition::under(&statement, new.listed(), adder.key(), s.now as u64)
+            .unwrap()
+            .sign(&adder.identity)
+            .unwrap()
+    }
+
+    /// The entry of `record` in the personal channel of device `n`, as
+    /// the device that adds writes it.
+    fn record_entry(
+        s: &Several,
+        n: usize,
+        adder: &Machine,
+        record: &SignedAddition,
+    ) -> CheckedEntry {
+        entry_by(
+            &adder.identity,
+            &s[n].personal(),
+            1,
+            &added_name(&record.addition.device.key).unwrap(),
+            Value::Other(record.to_bytes().unwrap()),
+            &[],
+        )
+    }
+
+    /// An entry of a name that this device holds, in the generation it
+    /// has applied, is stored only if its signer counts: and then by the
+    /// store's own rule, whatever the entry says.
+    #[test]
+    fn test_an_entry_of_a_name_held_is_stored_only_if_its_signer_counts() {
+        let s = two();
+        let channel = s[0].own("notes");
+        let by = |author: &NodeIdentity, rev: u64, file: &str, said: &str| {
+            entry_by(author, &channel, rev, file, text(said), &[])
+        };
+
+        let first = by(&s[1].identity, 5, "a.md", "by a device that counts");
+        assert_eq!(given(&s, 0, &first), STORED);
+        assert_eq!(s[0].stored_in(&channel), std::slice::from_ref(&first));
+        assert_eq!(
+            s[0].text("notes", "a.md").as_deref(),
+            Some("by a device that counts")
+        );
+        // What the store says of it is given back: the entry it holds, and
+        // one below it.
+        let held = |stored: Outcome| Taken::Own {
+            stored,
+            record: None,
+            came_to_count: 0,
+        };
+        assert_eq!(given(&s, 0, &first), held(Outcome::AlreadyHeld));
+        let older = by(&s[1].identity, 4, "a.md", "older");
+        assert_eq!(given(&s, 0, &older), held(Outcome::OlderThanHeld));
+        assert_eq!(s[0].stored_in(&channel), std::slice::from_ref(&first));
+
+        // A key that does not count: nothing is stored.
+        let stranger = Machine::new(9);
+        let before = s[0].everything();
+        let late = by(&stranger.identity, 9, "a.md", "by a stranger");
+        assert_eq!(
+            given(&s, 0, &late),
+            Taken::Refused(NotTaken::SignerDoesNotCount)
+        );
+        assert_eq!(s[0].everything(), before);
+
+        // An entry that does not open is stored where its signer counts:
+        // it is no version, and the next revision is above it.
+        let slot = first.slot;
+        let elsewhere = entry_by(&s[1].identity, &[0xee; 32], 8, "a.md", text("x"), &[]);
+        let unread = signed_in(&channel, &s[1].identity, slot, 8, elsewhere.content.clone());
+        assert_eq!(given(&s, 0, &unread), STORED);
+        assert_eq!(s[0].slot("notes", "a.md").next, Some(9));
+
+        // This device's own entry, come back to it: it counts for itself.
+        let own = by(&s[0].identity, 3, "b.md", "its own");
+        assert_eq!(given(&s, 0, &own), STORED);
+    }
+
+    /// A record of an addition in the personal channel is stored as any
+    /// entry is, and is also taken as a record: the key it adds counts.
+    #[test]
+    fn test_a_record_in_the_personal_channel_is_also_taken_as_a_record() {
+        let mut s = Several::of_one_person(2);
+        let new = Machine::new(7);
+        // Device 0 adds a device, and device 1 is given what it wrote.
+        let now = s.tick();
+        let added = add_device_on(&s, 0, &new, now);
+        assert!(!s[1].counts(&new.key()));
+        assert_eq!(
+            given(&s, 1, &added),
+            Taken::Own {
+                stored: Outcome::Stored,
+                record: Some(Record::Seen(AdditionSeen::Counted)),
+                came_to_count: 1,
+            }
+        );
+        assert!(s[1].counts(&new.key()));
+        assert_eq!(held_rows::additions(&s[1].conn).unwrap().len(), 2);
+        // Given again, the store holds it, and nothing is seen again.
+        assert_eq!(
+            given(&s, 1, &added),
+            Taken::Own {
+                stored: Outcome::AlreadyHeld,
+                record: None,
+                came_to_count: 0,
+            }
+        );
+
+        // Any other entry of the personal channel is stored, and is no
+        // record: under another name, and one that does not open.
+        let personal = s[1].personal();
+        let word = entry_by(&s[0].identity, &personal, 1, "syncing", text("notes"), &[]);
+        assert_eq!(given(&s, 1, &word), STORED);
+        let elsewhere = entry_by(&s[0].identity, &[0xee; 32], 3, "added/x", text("x"), &[]);
+        let unread = signed_in(
+            &personal,
+            &s[0].identity,
+            [7; 32],
+            3,
+            elsewhere.content.clone(),
+        );
+        assert_eq!(given(&s, 1, &unread), STORED);
+        // What the new device signs is taken from now on.
+        let theirs = entry_by(&new.identity, &personal, 1, "syncing", text("notes"), &[]);
+        assert_eq!(given(&s, 1, &theirs), STORED);
+    }
+
+    /// The entry that device `n` writes in its personal channel when it
+    /// adds `new`.
+    fn add_device_on(s: &Several, n: usize, new: &Machine, now: i64) -> CheckedEntry {
+        let on = &s[n];
+        crate::adding::add_device(&on.conn, &on.identity, &new.key(), &new.label, now)
+            .unwrap()
+            .record
+            .unwrap()
+    }
+
+    /// A record that is taken can let a record count that was kept as not
+    /// counted: the outcome says how many keys came to count by it.
+    #[test]
+    fn test_a_record_says_how_many_keys_came_to_count_by_it() {
+        let s = Several::of_one_person(2);
+        let (a, b, c) = (Machine::new(7), Machine::new(8), Machine::new(9));
+        let listed = Machine::new(0);
+        let seen = |adder: &Machine, new: &Machine| {
+            let record = record(&s, 1, adder, new);
+            given(&s, 1, &record_entry(&s, 1, adder, &record))
+        };
+        let taken = |seen: AdditionSeen, came_to_count: usize| Taken::Own {
+            stored: Outcome::Stored,
+            record: Some(Record::Seen(seen)),
+            came_to_count,
+        };
+
+        assert_eq!(seen(&listed, &a), taken(AdditionSeen::Counted, 1));
+        assert_eq!(seen(&a, &b), taken(AdditionSeen::Counted, 1));
+        // Device b was added by a device added since: it may not add.
+        let may_not = AdditionSeen::NotCounted(NotCounted::MayNotAdd);
+        assert_eq!(seen(&b, &c), taken(may_not, 0));
+        assert!(!s[1].counts(&c.key()));
+        // A device of the statement adds b too: b counts already, and the
+        // record that b signed comes to count with this one.
+        let already = AdditionSeen::NotCounted(NotCounted::CountsAlready);
+        assert_eq!(seen(&listed, &b), taken(already, 1));
+        assert!(s[1].counts(&c.key()));
+    }
+
+    /// A record is the word of the device that adds: it is read only from
+    /// that device's own entry, under the name of the key it adds, and
+    /// only where it verifies and is under the statement applied. The
+    /// entry is stored all the same, and no key comes to count.
+    #[test]
+    fn test_a_record_is_read_only_from_its_signers_own_entry_under_its_keys_name() {
+        let s = Several::of_one_person(2);
+        let personal = s[1].personal();
+        let (listed, other, new) = (Machine::new(0), Machine::new(1), Machine::new(7));
+        let good = record(&s, 1, &listed, &new);
+        let name = added_name(&new.key()).unwrap();
+        let not_read = |entry: &CheckedEntry| match given(&s, 1, entry) {
+            Taken::Own {
+                stored: Outcome::Stored,
+                record: Some(Record::NotRead(why)),
+                came_to_count: 0,
+            } => why,
+            other => panic!("{other:?}"),
+        };
+        let holding = |author: &Machine, rev: u64, name: &str, value: Value| {
+            entry_by(&author.identity, &personal, rev, name, value, &[])
+        };
+        let bytes = |record: &SignedAddition| Value::Other(record.to_bytes().unwrap());
+
+        // Another device's entry that holds device 0's record.
+        let relayed = holding(&other, 1, &name, bytes(&good));
+        assert_eq!(not_read(&relayed), NotRead::NotItsSigners);
+        // The adder's own entry, under the name of another key.
+        let elsewhere = added_name(&Machine::new(8).key()).unwrap();
+        let misnamed = holding(&listed, 1, &elsewhere, bytes(&good));
+        assert_eq!(not_read(&misnamed), NotRead::NotItsSigners);
+        // A text, and bytes that are no record.
+        let a_text = holding(&listed, 1, "added/a text", text("a record"));
+        assert_eq!(not_read(&a_text), NotRead::NoBytes);
+        let no_record = holding(&listed, 1, "added/bytes", Value::Other(vec![1, 2, 3]));
+        assert!(matches!(not_read(&no_record), NotRead::NotARecord(_)));
+        // A record that does not verify.
+        let mut forged = good.clone();
+        forged.signature[0] ^= 1;
+        let unverified = holding(&listed, 2, &name, bytes(&forged));
+        assert_eq!(
+            not_read(&unverified),
+            NotRead::DoesNotVerify(AdditionError::Signature)
+        );
+        // A record under another statement than the one applied.
+        let mut apart = good.addition.clone();
+        apart.under = StatementLink {
+            number: 1,
+            hash: [9; 16],
+        };
+        let apart = apart.sign(&listed.identity).unwrap();
+        let under_another = holding(&listed, 3, &name, bytes(&apart));
+        assert_eq!(not_read(&under_another), NotRead::UnderAnotherStatement);
+
+        assert!(!s[1].counts(&new.key()));
+        assert_eq!(held_rows::additions(&s[1].conn).unwrap().len(), 1);
+
+        // The control: the adder's own entry, under the key's name.
+        let own = holding(&listed, 4, &name, bytes(&good));
+        assert_eq!(
+            given(&s, 1, &own),
+            Taken::Own {
+                stored: Outcome::Stored,
+                record: Some(Record::Seen(AdditionSeen::Counted)),
+                came_to_count: 1,
+            }
+        );
+        assert!(s[1].counts(&new.key()));
+    }
+
+    /// An entry of the phrase's channel is shown to the device, which
+    /// does with it what a change entry has it do.
+    #[test]
+    fn test_an_entry_of_the_phrases_channel_is_shown() {
+        let mut s = two();
+        s.write(1, "notes", "a.md", "one");
+        let change = s.change(0, &[0, 1], &[]);
+        let before = s[1].latest();
+        assert_eq!(given(&s, 1, &before), Taken::Shown(Shown::Held));
+
+        // An entry of that channel that the phrase's key did not write.
+        let channel = s.phrase.channel_secret().unwrap();
+        let slot = change_entry::slot(&derive::channel_id(&channel).unwrap());
+        let forged = signed_in(&channel, &s[0].identity, slot, 2, change.content.clone());
+        let stood = s[1].everything();
+        assert_eq!(
+            given(&s, 1, &forged),
+            Taken::Shown(Shown::Refused(Refused::NotAChangeEntry(
+                ChangeEntryError::AnotherAuthor
+            )))
+        );
+        assert_eq!(s[1].everything(), stood);
+
+        // The change entry: it is applied, in the same step.
+        assert!(matches!(
+            given(&s, 1, &change),
+            Taken::Shown(Shown::Applied(crate::person::Applied {
+                number: 2,
+                left: Some(1),
+                carried: 1,
+                ..
+            }))
+        ));
+        assert_eq!(s[1].number(), 2);
+        assert_eq!(given(&s, 1, &change), Taken::Shown(Shown::Held));
+        assert_eq!(given(&s, 1, &before), Taken::Shown(Shown::Behind));
+    }
+
+    /// An entry of a channel of a generation that the device has left is
+    /// refused, and so is one of any other channel. Nothing is stored.
+    #[test]
+    fn test_an_entry_of_a_generation_that_was_left_or_of_another_channel_is_refused() {
+        let mut s = two();
+        let old = (s[1].personal(), s[1].own("notes"), s[1].secret());
+        let change = s.change(0, &[0, 1], &[]);
+        assert!(matches!(
+            given(&s, 1, &change),
+            Taken::Shown(Shown::Applied(_))
+        ));
+        let new = (s[1].personal(), s[1].own("notes"));
+        let by = |channel: &[u8; 32], name: &str| {
+            entry_by(
+                &s[0].identity,
+                channel,
+                7,
+                name,
+                text("by a device that counts"),
+                &[],
+            )
+        };
+        let before = s[1].everything();
+
+        // The channels it left: the personal channel, and that of a name
+        // it holds.
+        for channel in [&old.0, &old.1] {
+            assert_eq!(
+                given(&s, 1, &by(channel, "a.md")),
+                Taken::Refused(NotTaken::OldChannel)
+            );
+        }
+        // A channel of a name it does not hold, in either generation; a
+        // pair channel; and a channel that is nobody's.
+        let other_name = [
+            derive::own_secret(&old.2, "other").unwrap(),
+            derive::own_secret(&s[1].secret(), "other").unwrap(),
+        ];
+        let pair = derive::pair_secret(&s[0].identity, &s.key(1)).unwrap();
+        for channel in [&other_name[0], &other_name[1], &[0x33; 32]] {
+            assert_eq!(
+                given(&s, 1, &by(channel, "a.md")),
+                Taken::Refused(NotTaken::AnotherChannel)
+            );
+        }
+        assert_eq!(
+            given(&s, 1, &by(&pair, HAND_OVER_NAME)),
+            Taken::Refused(NotTaken::AnotherChannel)
+        );
+        assert_eq!(s[1].everything(), before);
+
+        // The control: the same entries, in the channels of the
+        // generation it has applied.
+        for channel in [&new.0, &new.1] {
+            assert_eq!(given(&s, 1, &by(channel, "a.md")), STORED);
+        }
+
+        // Once a secret that was left is forgotten, its channels are
+        // channels like any other: refused all the same.
+        let later = s.now + 91 * 24 * 60 * 60;
+        assert_eq!(
+            held_rows::forget_left_secrets(&s[1].conn, later).unwrap(),
+            1
+        );
+        assert_eq!(
+            given(&s, 1, &by(&old.1, "a.md")),
+            Taken::Refused(NotTaken::AnotherChannel)
+        );
+    }
+
+    /// A device that has stopped takes nothing in its own channels: it
+    /// was removed, is in no list, could not open a change, or is in a
+    /// fork. It still looks at the phrase's channel.
+    #[test]
+    fn test_a_device_that_has_stopped_takes_nothing_in_its_own_channels() {
+        let mut s = two();
+        s.write(0, "notes", "a.md", "one");
+        let in_notes = entry_by(
+            &s[0].identity,
+            &s[1].own("notes"),
+            2,
+            "a.md",
+            text("two"),
+            &[],
+        );
+        let in_personal = entry_by(
+            &s[0].identity,
+            &s[1].personal(),
+            1,
+            "syncing",
+            text("n"),
+            &[],
+        );
+        let change = s.change(0, &[0, 1], &[]);
+
+        for state in [
+            State::Fork,
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(&s[1].conn, state).unwrap();
+            let before = s[1].everything();
+            for entry in [&in_notes, &in_personal] {
+                assert_eq!(
+                    given(&s, 1, entry),
+                    Taken::Refused(NotTaken::Stopped(state)),
+                    "{state:?}"
+                );
+            }
+            // An entry of another channel is refused as that.
+            let elsewhere = entry_by(&s[0].identity, &[0x33; 32], 1, "a.md", text("x"), &[]);
+            assert_eq!(
+                given(&s, 1, &elsewhere),
+                Taken::Refused(NotTaken::AnotherChannel)
+            );
+            assert_eq!(s[1].everything(), before, "{state:?}");
+        }
+        // It still looks at the phrase's channel: there it is told that
+        // the way on is a person's.
+        held_rows::set_state(&s[1].conn, State::Removed).unwrap();
+        assert_eq!(
+            given(&s, 1, &change),
+            Taken::Shown(Shown::Refused(Refused::Stopped))
+        );
+
+        // The control: it has not stopped, and takes each.
+        held_rows::set_state(&s[1].conn, State::Applied).unwrap();
+        for entry in [&in_notes, &in_personal] {
+            assert_eq!(given(&s, 1, entry), STORED);
+        }
+    }
+
+    #[test]
+    fn test_a_device_that_follows_no_phrase_takes_nothing() {
+        let mut s = two();
+        let new = Machine::new(7);
+        s.write(0, "notes", "a.md", "one");
+        // An entry of each kind of channel: the personal channel, that of
+        // a name, the phrase's, and the pair channel of the two.
+        let mut given_it = s[0].stored();
+        given_it.push(s[0].latest());
+        let pair = derive::pair_secret(&s[0].identity, &new.key()).unwrap();
+        given_it.push(entry_by(
+            &s[0].identity,
+            &pair,
+            1,
+            HAND_OVER_NAME,
+            text("x"),
+            &[],
+        ));
+        assert!(given_it.len() >= 5);
+        for entry in &given_it {
+            assert_eq!(
+                take(&new.conn, &new.identity, entry, s.now).unwrap(),
+                Taken::Refused(NotTaken::FollowsNoPhrase)
+            );
+        }
+        assert!(new.stored().is_empty() && !new.follows_a_phrase());
+    }
+
+    /// An entry in a band above the applied statement's counts for
+    /// nothing, and is refused: what the store holds from its author
+    /// stays. One in the statement's own band is stored, to its last
+    /// revision, and so is one in the top half of a lower band, which is
+    /// no version and counts for the next revision.
+    #[test]
+    fn test_an_entry_in_a_band_above_the_applied_statements_is_refused() {
+        let mut s = two();
+        s.write(1, "notes", "a.md", "one");
+        s.pass(1, 0);
+        let channel = s[0].own("notes");
+        let by = |rev: u64, file: &str| {
+            entry_by(
+                &s[1].identity,
+                &channel,
+                rev,
+                file,
+                text("at a revision"),
+                &[],
+            )
+        };
+
+        let before = s[0].everything();
+        for rev in [at(2, 0), at(2, 5), at(3, REV_BAND_HALF), at(256, 1)] {
+            assert_eq!(
+                given(&s, 0, &by(rev, "a.md")),
+                Taken::Refused(NotTaken::BandAboveTheStatements),
+                "{rev}"
+            );
+        }
+        assert_eq!(s[0].everything(), before);
+        assert_eq!(s[0].text("notes", "a.md").as_deref(), Some("one"));
+
+        assert_eq!(given(&s, 0, &by(at(1, REV_BAND_SIZE - 1), "b.md")), STORED);
+        assert_eq!(given(&s, 0, &by(at(0, REV_BAND_HALF + 1), "c.md")), STORED);
+        let slot = s[0].slot("notes", "c.md");
+        assert_eq!((slot.current, slot.next), (None, Some(at(1, 2))));
+    }
+}

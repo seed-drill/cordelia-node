@@ -596,3 +596,1100 @@ fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     held_rows::forget_secrets(conn)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::person::{first_statement, who_counts};
+    use crate::several::{
+        Machine, OTHER_WORDS, Several, change_that_does_not_open_for, entry_by, listed_as,
+        signed_in, text,
+    };
+    use crate::take::Taken;
+    use cordelia_crypto::change_entry::ForPhrase;
+    use cordelia_crypto::phrase::Phrase;
+
+    const HOUR: i64 = 60 * 60;
+
+    /// What a device applies that joins a person's devices, or moves to
+    /// them: statement 1, with nothing left and nothing carried.
+    fn first() -> Applied {
+        Applied {
+            number: 1,
+            left: None,
+            carried: 0,
+            no_version: Vec::new(),
+        }
+    }
+
+    /// Device `new` accepts `hand_over` with the key of device `typed`,
+    /// typed just now.
+    fn accepted(
+        s: &Several,
+        new: usize,
+        typed: &[u8; 32],
+        sync_on: bool,
+        hand_over: &CheckedEntry,
+    ) -> Accepted {
+        let on = &s[new];
+        accept(
+            &on.conn,
+            &on.identity,
+            typed,
+            s.now,
+            sync_on,
+            hand_over,
+            s.now,
+        )
+        .unwrap()
+    }
+
+    /// The bytes of the hand-over in `entry`, an entry of the pair channel
+    /// whose secret is `pair`.
+    fn bytes_in(entry: &CheckedEntry, pair: &[u8; 32]) -> Vec<u8> {
+        match entry.open(pair).unwrap().value {
+            Value::Other(bytes) => bytes,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The hand-over in `entry`, which device `adder` made for the device
+    /// whose key is `new`.
+    fn hand_over_of(s: &Several, adder: usize, new: &[u8; 32], entry: &CheckedEntry) -> HandOver {
+        let pair = derive::pair_secret(&s[adder].identity, new).unwrap();
+        HandOver::from_bytes(&bytes_in(entry, &pair)).unwrap()
+    }
+
+    /// A device that follows another phrase, and what it hands the device
+    /// whose key is `new`: a hand-over under that other phrase.
+    fn handed_by_a_stranger(new: &Machine, now: i64) -> (Machine, CheckedEntry) {
+        let stranger = Machine::new(90);
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        first_statement(&stranger.conn, &stranger.identity, &other, "stranger", now).unwrap();
+        let added = add_device(
+            &stranger.conn,
+            &stranger.identity,
+            &new.key(),
+            "theirs",
+            now,
+        );
+        (stranger, added.unwrap().hand_over)
+    }
+
+    // ── The device that adds ─────────────────────────────────────────
+
+    /// The device that adds makes the record of the addition, writes it
+    /// in the personal channel, and makes the hand-over in the pair
+    /// channel of the two keys. Both wait in its store.
+    #[test]
+    fn test_the_device_that_adds_writes_the_record_and_makes_the_hand_over() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        let (adder, new) = (&s[0], &s[1]);
+        let personal = adder.personal();
+
+        // The record: this device's own entry in the personal channel,
+        // under the name of the key it adds, holding bytes.
+        let entry = added.record.clone().unwrap();
+        assert_eq!(entry.channel, derive::channel_id(&personal).unwrap());
+        assert_eq!((entry.author, entry.rev), (adder.key(), 1));
+        let inside = entry.open(&personal).unwrap();
+        assert_eq!(inside.name, added_name(&new.key()).unwrap());
+        assert_eq!(inside.chain, Some(Vec::new()));
+        let Value::Other(bytes) = inside.value else {
+            panic!("a record is bytes");
+        };
+        let record = SignedAddition::from_bytes(&bytes).unwrap();
+        record.verify().unwrap();
+        let statement = adder.held().statement;
+        assert_eq!(record.addition.device, new.listed());
+        assert_eq!(record.addition.adder, adder.key());
+        assert_eq!(record.addition.under, statement.statement.link().unwrap());
+        assert_eq!(record.addition.at, s.now as u64);
+        // The device that adds counts the key from then.
+        assert_eq!(added.seen, Some(AdditionSeen::Counted));
+        assert!(adder.counts(&new.key()));
+
+        // The hand-over: this device's own entry under `hand-over` in the
+        // pair channel, which each of the two derives.
+        let pair = derive::pair_secret(&adder.identity, &new.key()).unwrap();
+        assert_eq!(
+            pair,
+            derive::pair_secret(&new.identity, &adder.key()).unwrap()
+        );
+        let entry = &added.hand_over;
+        assert_eq!(entry.channel, derive::channel_id(&pair).unwrap());
+        assert_eq!((entry.author, entry.rev), (adder.key(), 1));
+        let inside = entry.open(&pair).unwrap();
+        assert_eq!(inside.name, HAND_OVER_NAME);
+        assert_eq!(inside.chain, Some(Vec::new()));
+        let hand_over = hand_over_of(&s, 0, &new.key(), entry);
+        assert_eq!(hand_over.statement, statement);
+        assert_eq!(hand_over.secret, adder.secret());
+        assert_eq!(
+            hand_over.statement_key,
+            adder.held().following.statement_key
+        );
+        assert_eq!(hand_over.change_entry, adder.latest().into_entry());
+        assert_eq!(hand_over.addition, Some(record));
+        assert_eq!(hand_over.adders_own, None);
+        assert!(hand_over.is_for(&new.key()));
+
+        // The record waits in the store. The hand-over, which holds the
+        // secret, is not stored: nothing of the pair channel is.
+        let stored = adder.stored();
+        assert!(stored.contains(added.record.as_ref().unwrap()));
+        assert!(!stored.contains(&added.hand_over));
+        assert!(adder.stored_in(&pair).is_empty());
+
+        // Added again: a record above the first, for a key that counts
+        // already, and a hand-over of the same statement, at its number.
+        let again = s.hand(0, 1);
+        assert_eq!(again.record.as_ref().unwrap().rev, 2);
+        assert_eq!(
+            again.seen,
+            Some(AdditionSeen::NotCounted(NotCounted::CountsAlready))
+        );
+        assert_eq!(again.hand_over.rev, 1);
+        assert_ne!(again.hand_over, added.hand_over);
+        assert!(s[0].stored_in(&pair).is_empty());
+        assert_eq!(who_counts(&s[0].conn).unwrap().devices(), 2);
+    }
+
+    /// A key that the statement already lists is handed the change again,
+    /// with no record: it is one of the person's devices already.
+    #[test]
+    fn test_a_key_that_the_statement_lists_is_handed_the_change_with_no_record() {
+        let mut s = Several::of_one_person(2);
+        let change = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        let (adder, listed) = (&s[0], &s[1]);
+        let before = adder.stored().len();
+        // The label is the statement's: what is given here is not used.
+        let added = add_device(&adder.conn, &adder.identity, &listed.key(), "", now).unwrap();
+        assert_eq!((added.record, added.seen), (None, None));
+        assert!(held_rows::additions(&adder.conn).unwrap().is_empty());
+        // Nothing is written. The hand-over is at the number of the
+        // statement it hands over: at a relay it takes the place of the
+        // one that added the device, under the statement before.
+        assert_eq!(adder.stored().len(), before);
+        assert_eq!(added.hand_over.rev, 2);
+
+        let hand_over = hand_over_of(&s, 0, &listed.key(), &added.hand_over);
+        assert_eq!((&hand_over.addition, &hand_over.adders_own), (&None, &None));
+        assert_eq!(hand_over.statement.statement.number, 2);
+        assert_eq!(hand_over.change_entry, change.clone().into_entry());
+        assert!(hand_over.is_for(&listed.key()));
+    }
+
+    /// A device that was itself added since the statement hands over the
+    /// record of its own addition with the record it makes.
+    #[test]
+    fn test_a_device_that_was_added_hands_over_the_record_of_its_own_addition() {
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        let first = s.hand(0, 1);
+        assert!(matches!(
+            s.accept(1, 0, &first.hand_over),
+            Accepted::Joined(_)
+        ));
+        let its_own = hand_over_of(&s, 0, &s.key(1), &first.hand_over).addition;
+
+        let second = s.hand(1, 2);
+        assert_eq!(second.seen, Some(AdditionSeen::Counted));
+        let hand_over = hand_over_of(&s, 1, &s.key(2), &second.hand_over);
+        assert_eq!(hand_over.adders_own, its_own);
+        let record = hand_over.addition.unwrap();
+        assert_eq!(
+            (record.addition.adder, record.addition.device.key),
+            (s.key(1), s.key(2))
+        );
+        // The device that is added counts both by them.
+        assert!(matches!(
+            s.accept(2, 1, &second.hand_over),
+            Accepted::Joined(_)
+        ));
+        let kept = held_rows::additions(&s[2].conn).unwrap();
+        let said: Vec<([u8; 32], [u8; 32], bool)> = kept
+            .iter()
+            .map(|one| (one.adder, one.key, one.counted))
+            .collect();
+        assert_eq!(
+            said,
+            [(s.key(0), s.key(1), true), (s.key(1), s.key(2), true)]
+        );
+
+        // Device 2 was added by a device added since, and may not add. A
+        // device of the statement adds it too: it may then, and what it
+        // hands over has that record with it, and not the first it kept.
+        let by_a_listed = s.hand(0, 2);
+        let lets_it_add = hand_over_of(&s, 0, &s.key(2), &by_a_listed.hand_over).addition;
+        s.pass(0, 2);
+        let third = s.hand(2, 3);
+        let hand_over = hand_over_of(&s, 2, &s.key(3), &third.hand_over);
+        assert_eq!(hand_over.adders_own, lets_it_add);
+        assert_eq!(hand_over.adders_own.unwrap().addition.adder, s.key(0));
+        assert!(matches!(
+            s.accept(3, 2, &third.hand_over),
+            Accepted::Joined(_)
+        ));
+    }
+
+    /// Adding is refused on a device that is not in, for a key that was
+    /// removed, on a device that may not add, and where the device counts
+    /// 64 already. Nothing is written.
+    #[test]
+    fn test_adding_is_refused_on_a_device_or_for_a_key_that_may_not() {
+        let new = Machine::new(7);
+        let add = |on: &Machine, key: &[u8; 32], label: &str| {
+            let before = on.everything();
+            let added = add_device(&on.conn, &on.identity, key, label, 5);
+            if added.is_err() {
+                assert_eq!(on.everything(), before);
+            }
+            added
+        };
+
+        // A device that follows no phrase.
+        let alone = Machine::new(8);
+        assert!(matches!(
+            add(&alone, &new.key(), "new"),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let on = &s[0];
+        // A key that the statement lists as removed.
+        assert!(matches!(
+            add(on, &s.key(2), "back again"),
+            Err(PersonError::KeyRemoved)
+        ));
+        // Its own key, a key that is no usable public key, and a label
+        // that a statement could not carry.
+        assert!(matches!(
+            add(on, &on.key(), "itself"),
+            Err(PersonError::Derive(DeriveError::OwnKey))
+        ));
+        assert!(matches!(
+            add(on, &[0u8; 32], "no key"),
+            Err(PersonError::Derive(_))
+        ));
+        assert!(matches!(
+            add(on, &new.key(), ""),
+            Err(PersonError::Statement(StatementError::LabelLength(0)))
+        ));
+        assert!(matches!(
+            add(on, &new.key(), " new"),
+            Err(PersonError::Statement(StatementError::LabelSpaceAtAnEnd))
+        ));
+
+        // A device that has stopped: in a fork, removed, in no list, or
+        // listed in a change it could not open.
+        for state in [
+            State::Fork,
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(&on.conn, state).unwrap();
+            assert!(matches!(
+                add(on, &new.key(), "new"),
+                Err(PersonError::Stopped(stopped)) if stopped == state
+            ));
+        }
+        held_rows::set_state(&on.conn, State::Applied).unwrap();
+
+        // The statement lists devices 0 and 1. With 62 more that count,
+        // the device counts 64: it adds no other, and still hands the
+        // change to a key that the statement lists.
+        let statement = on.held().statement.statement;
+        for n in 100..162 {
+            let record = Addition::under(&statement, listed_as(n), on.key(), 5)
+                .unwrap()
+                .sign(&on.identity)
+                .unwrap();
+            assert_eq!(
+                see_addition(&on.conn, &record, 5).unwrap(),
+                AdditionSeen::Counted
+            );
+        }
+        assert_eq!(who_counts(&on.conn).unwrap().devices(), 64);
+        assert!(matches!(
+            add(on, &new.key(), "new"),
+            Err(PersonError::NoRoom)
+        ));
+        let listed = add(on, &s.key(1), "device 1").unwrap();
+        assert_eq!(listed.record, None);
+        // The control: with room for one, it is added.
+        held_rows::clear_additions(&on.conn).unwrap();
+        assert_eq!(
+            add(on, &new.key(), "new").unwrap().seen,
+            Some(AdditionSeen::Counted)
+        );
+    }
+
+    // ── The device that accepts ──────────────────────────────────────
+
+    /// The entry is taken only if the key that was typed signed it, in
+    /// the pair channel of that key and this device, under the name
+    /// `hand-over`, and only if the key was typed within the last hour.
+    #[test]
+    fn test_a_hand_over_is_taken_only_from_the_key_typed_within_the_last_hour() {
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        assert!(matches!(s.add(0, 3), Accepted::Joined(_)));
+        let added = s.hand(0, 1);
+        let (adder, new, now) = (&s[0], &s[1], s.now);
+        let pair = derive::pair_secret(&adder.identity, &new.key()).unwrap();
+        let bytes = bytes_in(&added.hand_over, &pair);
+        let empty = new.everything();
+        let refused = |typed: &[u8; 32], typed_at: i64, entry: &CheckedEntry| {
+            let outcome =
+                accept(&new.conn, &new.identity, typed, typed_at, false, entry, now).unwrap();
+            assert_eq!(new.everything(), empty);
+            match outcome {
+                Accepted::Refused(why) => why,
+                other => panic!("{other:?}"),
+            }
+        };
+        let adder_key = adder.key();
+
+        // Typed an hour ago, longer ago, and at a time that is yet to
+        // come.
+        for typed_at in [now - HOUR, now - HOUR - 1, now - 9 * HOUR, now + 1] {
+            assert_eq!(
+                refused(&adder_key, typed_at, &added.hand_over),
+                NotAccepted::NotTypedInTheLastHour,
+                "{}",
+                now - typed_at
+            );
+        }
+        // Another key was typed than the one that signed: the entry is of
+        // another pair channel than that key's. And this device's own
+        // key, or one that is no key, has none.
+        assert_eq!(
+            refused(&s.key(3), now, &added.hand_over),
+            NotAccepted::NotThePairChannel
+        );
+        assert_eq!(
+            refused(&new.key(), now, &added.hand_over),
+            NotAccepted::NoPairChannel
+        );
+        assert_eq!(
+            refused(&[0u8; 32], now, &added.hand_over),
+            NotAccepted::NoPairChannel
+        );
+        // An entry of the pair channel that another key signed than the
+        // one typed: this device's own.
+        let own = entry_by(
+            &new.identity,
+            &pair,
+            5,
+            HAND_OVER_NAME,
+            Value::Other(bytes.clone()),
+            &[],
+        );
+        assert_eq!(
+            refused(&adder_key, now, &own),
+            NotAccepted::SignedByAnotherKey
+        );
+
+        // Nothing else in a pair channel is read: an entry under another
+        // name, one that holds a text, and one that does not open.
+        let by_the_adder =
+            |name: &str, value: Value| entry_by(&adder.identity, &pair, 5, name, value, &[]);
+        let misnamed = by_the_adder("hand-over-2", Value::Other(bytes.clone()));
+        assert_eq!(
+            refused(&adder_key, now, &misnamed),
+            NotAccepted::NotAHandOver
+        );
+        let a_text = by_the_adder(HAND_OVER_NAME, text("a hand-over"));
+        assert_eq!(refused(&adder_key, now, &a_text), NotAccepted::NotAHandOver);
+        let elsewhere = entry_by(
+            &adder.identity,
+            &[0xee; 32],
+            5,
+            HAND_OVER_NAME,
+            text("x"),
+            &[],
+        );
+        let unread = signed_in(
+            &pair,
+            &adder.identity,
+            added.hand_over.slot,
+            5,
+            elsewhere.content.clone(),
+        );
+        assert_eq!(refused(&adder_key, now, &unread), NotAccepted::NotAHandOver);
+        // Bytes that are no hand-over, and a hand-over that does not hold
+        // together: its secret is another than the statement commits to.
+        let no_hand_over = by_the_adder(HAND_OVER_NAME, Value::Other(vec![1, 2, 3]));
+        assert!(matches!(
+            refused(&adder_key, now, &no_hand_over),
+            NotAccepted::HandOver(_)
+        ));
+        let mut changed = bytes.clone();
+        let secret_at = 2 + adder.held().statement.to_bytes().unwrap().len();
+        changed[secret_at] ^= 1;
+        let does_not_hold = by_the_adder(HAND_OVER_NAME, Value::Other(changed));
+        assert_eq!(
+            refused(&adder_key, now, &does_not_hold),
+            NotAccepted::HandOver(HandOverError::SecretNotCommitted)
+        );
+
+        // A hand-over that is for another device: device 0 made it for
+        // device 2.
+        let for_another = s.hand(0, 2);
+        let theirs = derive::pair_secret(&s[0].identity, &s.key(2)).unwrap();
+        let moved = entry_by(
+            &s[0].identity,
+            &pair,
+            6,
+            HAND_OVER_NAME,
+            Value::Other(bytes_in(&for_another.hand_over, &theirs)),
+            &[],
+        );
+        let (new, now) = (&s[1], s.now);
+        let refused = |typed: &[u8; 32], entry: &CheckedEntry| {
+            let outcome = accept(&new.conn, &new.identity, typed, now, false, entry, now).unwrap();
+            assert_eq!(new.everything(), empty);
+            outcome
+        };
+        assert_eq!(
+            refused(&adder_key, &moved),
+            Accepted::Refused(NotAccepted::NotForThisDevice)
+        );
+        // A record of this device's addition that another device signed
+        // than the one whose key was typed: device 3 made it.
+        let by_another = s.hand(3, 1);
+        let (new, now) = (&s[1], s.now);
+        let theirs = derive::pair_secret(&s[3].identity, &new.key()).unwrap();
+        let relayed = entry_by(
+            &s[0].identity,
+            &pair,
+            7,
+            HAND_OVER_NAME,
+            Value::Other(bytes_in(&by_another.hand_over, &theirs)),
+            &[],
+        );
+        let outcome = accept(
+            &new.conn,
+            &new.identity,
+            &adder_key,
+            now,
+            false,
+            &relayed,
+            now,
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            Accepted::Refused(NotAccepted::AddedByAnotherKey)
+        );
+        assert_eq!(new.everything(), empty);
+
+        // The control: the entry that the key typed signed, typed one
+        // second less than an hour ago.
+        let joined = accept(
+            &new.conn,
+            &new.identity,
+            &adder_key,
+            now - HOUR + 1,
+            false,
+            &added.hand_over,
+            now,
+        );
+        assert_eq!(joined.unwrap(), Accepted::Joined(first()));
+    }
+
+    /// The first row of the table: a device that follows no phrase takes
+    /// the statement, the secret and the phrase it then follows, keeps the
+    /// change entry, applies, and writes that it has.
+    #[test]
+    fn test_a_device_that_follows_no_phrase_takes_the_statement_the_secret_and_the_phrase() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        assert_eq!(s.accept(1, 0, &added.hand_over), Accepted::Joined(first()));
+        let (adder, new) = (&s[0], &s[1]);
+        assert_eq!(new.held(), adder.held());
+        assert_eq!(new.secret(), adder.secret());
+        assert_eq!(new.latest(), adder.latest());
+        assert_eq!(new.state(), State::Applied);
+        // It keeps the record of its addition, counted: the statement does
+        // not list it, and it counts by the record.
+        assert!(!new.held().statement.statement.lists(&new.key()));
+        let kept = held_rows::additions(&new.conn).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].key, kept[0].adder, kept[0].counted),
+            (new.key(), adder.key(), true)
+        );
+        assert!(new.counts(&new.key()) && new.counts(&adder.key()));
+        // It has written that it has applied the statement.
+        assert_eq!(new.word_of(&new.key()), Some(text("1")));
+        assert_eq!(new.stored().len(), 1);
+
+        // Whether sync is on there makes no difference: what its folders
+        // hold has stayed on the machine.
+        let added = s.hand(0, 2);
+        assert_eq!(
+            accepted(&s, 2, &s.key(0), true, &added.hand_over),
+            Accepted::Joined(first())
+        );
+    }
+
+    /// A device applies a statement that does not list it only where the
+    /// record of its addition counts under that statement: one that
+    /// lists 64 devices has no room for it.
+    #[test]
+    fn test_a_device_is_not_added_under_a_statement_that_has_no_room_for_it() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let mut stay = s.listed(&[0]);
+        stay.extend((100..163).map(listed_as));
+        let on = &s[0];
+        let change = make_change_on(&s, 0, stay);
+        assert!(matches!(
+            shown(&on.conn, &on.identity, &change, s.now).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert_eq!(who_counts(&on.conn).unwrap().devices(), 64);
+
+        // The hand-over, made past the device that adds, which refuses.
+        let new = &s[1];
+        let statement = on.held().statement;
+        let record = Addition::under(&statement.statement, new.listed(), on.key(), 5)
+            .unwrap()
+            .sign(&on.identity)
+            .unwrap();
+        let hand_over = HandOver {
+            statement,
+            secret: on.secret(),
+            statement_key: on.held().following.statement_key,
+            change_entry: on.latest().into_entry(),
+            addition: Some(record),
+            adders_own: None,
+        };
+        let pair = derive::pair_secret(&on.identity, &new.key()).unwrap();
+        let entry = entry_by(
+            &on.identity,
+            &pair,
+            1,
+            HAND_OVER_NAME,
+            Value::Other(hand_over.to_bytes().unwrap()),
+            &[],
+        );
+        let empty = new.everything();
+        assert_eq!(
+            accepted(&s, 1, &on.key(), false, &entry),
+            Accepted::Refused(NotAccepted::RecordDoesNotCount(NotCounted::NoRoom))
+        );
+        assert_eq!(new.everything(), empty);
+        assert!(!new.follows_a_phrase());
+    }
+
+    /// A change made on device `maker` with the fixture's phrase, in which
+    /// the devices `stay` stay. It is not shown to any device.
+    fn make_change_on(s: &Several, maker: usize, stay: Vec<Device>) -> CheckedEntry {
+        let on = &s[maker];
+        crate::change::make_change(
+            &s.phrase,
+            &on.held().statement,
+            &on.latest(),
+            &on.key(),
+            stay,
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The second row: a device that is alone under a phrase is refused
+    /// while sync is on there. With sync off it leaves that phrase and
+    /// takes this one, and its names forget what they held.
+    #[test]
+    fn test_a_device_alone_under_a_phrase_leaves_it_only_with_sync_off() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        for n in [1, 2] {
+            let on = &s[n];
+            first_statement(&on.conn, &on.identity, &other, &on.label, s.now).unwrap();
+        }
+        s.hold(&[1], "notes");
+        s.write(1, "notes", "a.md", "under the phrase it made");
+        let old = (s[1].personal(), s[1].own("notes"));
+        assert_eq!(s[1].stored().len(), 2);
+
+        let added = s.hand(0, 1);
+        let before = s[1].everything();
+        assert_eq!(
+            accepted(&s, 1, &s.key(0), true, &added.hand_over),
+            Accepted::Refused(NotAccepted::SyncIsOn)
+        );
+        assert_eq!(s[1].everything(), before);
+
+        // A device that has stopped under the phrase it follows is not
+        // moved to another, though its statement lists it alone: it takes
+        // only a hand-over under its own phrase.
+        for state in [State::NotListed, State::NotOpened] {
+            held_rows::set_state(&s[1].conn, state).unwrap();
+            let stopped = s[1].everything();
+            assert_eq!(
+                accepted(&s, 1, &s.key(0), false, &added.hand_over),
+                Accepted::Refused(NotAccepted::AnotherPhrase),
+                "{state:?}"
+            );
+            assert_eq!(s[1].everything(), stopped);
+        }
+        held_rows::set_state(&s[1].conn, State::Applied).unwrap();
+
+        assert_eq!(
+            accepted(&s, 1, &s.key(0), false, &added.hand_over),
+            Accepted::Moved(first())
+        );
+        let (adder, moved) = (&s[0], &s[1]);
+        assert_eq!(moved.held(), adder.held());
+        assert_eq!(moved.secret(), adder.secret());
+        assert_eq!(moved.latest(), adder.latest());
+        assert_eq!(moved.apart(), None);
+        // It holds the one secret, and none of the phrase it left.
+        assert_eq!(held_rows::secrets(&moved.conn).unwrap().len(), 1);
+        // It keeps its name, in the name's channel under the secret it
+        // took, and the name holds nothing of what it held.
+        let names = held_rows::names(&moved.conn).unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            (names[0].name.as_str(), names[0].channel),
+            ("notes", derive::channel_id(&moved.own("notes")).unwrap())
+        );
+        assert_eq!(moved.slot("notes", "a.md").current, None);
+        assert!(moved.stored_in(&old.0).is_empty() && moved.stored_in(&old.1).is_empty());
+        // What its store holds is its word that it has applied.
+        assert_eq!(moved.stored().len(), 1);
+        assert_eq!(moved.word_of(&moved.key()), Some(text("1")));
+        assert!(moved.counts(&adder.key()) && moved.counts(&moved.key()));
+        assert_eq!(who_counts(&moved.conn).unwrap().devices(), 2);
+
+        // A device that has added one is not alone, though its statement
+        // lists no other: it is not moved, with sync off.
+        let on = &s[2];
+        add_device(
+            &on.conn,
+            &on.identity,
+            &Machine::new(7).key(),
+            "device 7",
+            s.now,
+        )
+        .unwrap();
+        let added = s.hand(0, 2);
+        let before = s[2].everything();
+        assert_eq!(
+            accepted(&s, 2, &s.key(0), false, &added.hand_over),
+            Accepted::Refused(NotAccepted::AnotherPhrase)
+        );
+        assert_eq!(s[2].everything(), before);
+    }
+
+    /// The third row: a device that is one of several takes only a
+    /// hand-over under the phrase it already follows that brings a change
+    /// it can apply. One whose statement was made apart shows as a fork.
+    /// Any other moves nothing.
+    #[test]
+    fn test_one_of_several_takes_only_a_change_it_can_apply_under_its_phrase() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", "a.md", "one");
+
+        // Under another phrase: nothing, with sync off as with it on.
+        let (stranger, theirs) = handed_by_a_stranger(&s[1], s.now);
+        let before = s[1].everything();
+        for sync_on in [false, true] {
+            assert_eq!(
+                accepted(&s, 1, &stranger.key(), sync_on, &theirs),
+                Accepted::Refused(NotAccepted::AnotherPhrase)
+            );
+        }
+        // Under its own phrase, with the statement it has applied: no
+        // change is brought.
+        let again = s.hand(0, 1);
+        assert_eq!(
+            accepted(&s, 1, &s.key(0), false, &again.hand_over),
+            Accepted::Refused(NotAccepted::BringsNoChange)
+        );
+        assert_eq!(s[1].everything(), before);
+
+        // A change that no relay has told it of, told by hand: it applies
+        // it, and carries what it holds.
+        let change = s.change(0, &[0, 1, 2], &[]);
+        let told = s.hand(0, 1);
+        assert_eq!(told.record, None);
+        assert_eq!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Applied(Applied {
+                number: 2,
+                left: Some(1),
+                carried: 1,
+                no_version: Vec::new(),
+            })
+        );
+        assert_eq!(s[1].secret(), s[0].secret());
+        assert_eq!(s[1].latest(), change);
+        assert_eq!(s[1].text("notes", "a.md").as_deref(), Some("one"));
+        // Told again, it brings no change.
+        assert_eq!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Refused(NotAccepted::BringsNoChange)
+        );
+        // It keeps no record of an addition now, and its statement lists
+        // the others: it is one of several still, and is not moved.
+        assert!(held_rows::additions(&s[1].conn).unwrap().is_empty());
+        assert_eq!(
+            accepted(&s, 1, &stranger.key(), false, &theirs),
+            Accepted::Refused(NotAccepted::AnotherPhrase)
+        );
+
+        // Device 2 has made a change of its own, apart. Handed the other,
+        // it is in a fork, as where it is shown that entry.
+        let its_own = s.change(2, &[0, 1, 2], &[]);
+        let told = s.hand(0, 2);
+        assert_eq!(s.accept(2, 0, &told.hand_over), Accepted::Fork);
+        assert_eq!(s[2].state(), State::Fork);
+        assert_eq!(s[2].latest(), its_own);
+        assert_eq!(s[2].apart(), Some(change));
+        assert_eq!(s[2].number(), 2);
+    }
+
+    /// The fourth row: a device that is in no list takes only a hand-over
+    /// under the phrase it already follows, and then carries what it
+    /// holds.
+    #[test]
+    fn test_a_device_in_no_list_takes_only_a_hand_over_under_its_phrase_and_carries() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(2, "notes", "a.md", "what device 2 holds");
+        // Device 1 stays. Device 2 was added since, and is neither kept
+        // nor removed: it is in no list.
+        let change = s.change(0, &[0, 1], &[]);
+        assert_eq!(s.pass(0, 2)[0], Taken::Shown(Shown::NotListed));
+        assert_eq!((s[2].state(), s[2].number()), (State::NotListed, 1));
+        let stopped = s[2].everything();
+
+        // Under another phrase.
+        let (stranger, theirs) = handed_by_a_stranger(&s[2], s.now);
+        assert_eq!(
+            accepted(&s, 2, &stranger.key(), false, &theirs),
+            Accepted::Refused(NotAccepted::AnotherPhrase)
+        );
+        // From a device that has not heard of the change: the statement
+        // it hands over is the one this device has applied.
+        let behind = s.hand(1, 2);
+        assert_eq!(
+            s.accept(2, 1, &behind.hand_over),
+            Accepted::Refused(NotAccepted::BringsNoChange)
+        );
+        // A statement made apart from the one that stopped it, though it
+        // lists this device: it is not brought behind the change it has
+        // seen.
+        s.change(1, &[0, 1, 2], &[]);
+        let apart = s.hand(1, 2);
+        assert_eq!(apart.record, None);
+        assert_eq!(
+            s.accept(2, 1, &apart.hand_over),
+            Accepted::Refused(NotAccepted::NotAfterTheChangeThatStoppedIt)
+        );
+        assert_eq!(s[2].everything(), stopped);
+
+        // From a device that has applied the change, with a record of its
+        // addition under it: it applies, keeps what it held, and carries
+        // it.
+        let added = s.hand(0, 2);
+        assert_eq!(added.seen, Some(AdditionSeen::Counted));
+        assert_eq!(
+            s.accept(2, 0, &added.hand_over),
+            Accepted::Applied(Applied {
+                number: 2,
+                left: Some(1),
+                carried: 1,
+                no_version: Vec::new(),
+            })
+        );
+        let back = &s[2];
+        assert_eq!((back.state(), back.number()), (State::Applied, 2));
+        assert_eq!(back.secret(), s[0].secret());
+        assert_eq!(back.latest(), change);
+        assert_eq!(
+            back.text("notes", "a.md").as_deref(),
+            Some("what device 2 holds")
+        );
+        for n in 0..3 {
+            assert!(back.counts(&s.key(n)), "{n}");
+        }
+        assert_eq!(back.word_of(&back.key()), Some(text("2")));
+    }
+
+    /// The fourth row, for a device that is listed in a change it could
+    /// not open: handed the change by a device that has it, it applies.
+    #[test]
+    fn test_a_device_that_could_not_open_a_change_is_handed_it() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(1, "notes", "a.md", "one");
+        // Statement 2 lists both, and what is sealed to device 1 does not
+        // open.
+        let secret = [0x42; 32];
+        let next = s[0].held().statement.statement;
+        let next = next
+            .next(s.key(0), &secret, s.listed(&[0, 1]), &[])
+            .unwrap()
+            .sign(&s.phrase.signing_key().unwrap())
+            .unwrap();
+        let change = change_that_does_not_open_for(&s.phrase, &next, secret, 1);
+        let now = s.tick();
+        let (maker, listed) = (&s[0], &s[1]);
+        assert!(matches!(
+            shown(&maker.conn, &maker.identity, &change, now).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert_eq!(
+            shown(&listed.conn, &listed.identity, &change, now).unwrap(),
+            Shown::NotOpened
+        );
+        assert_eq!((listed.state(), listed.number()), (State::NotOpened, 1));
+
+        // Under another phrase it takes nothing.
+        let (stranger, theirs) = handed_by_a_stranger(listed, now);
+        let stopped = listed.everything();
+        assert_eq!(
+            accepted(&s, 1, &stranger.key(), false, &theirs),
+            Accepted::Refused(NotAccepted::AnotherPhrase)
+        );
+        assert_eq!(s[1].everything(), stopped);
+
+        let told = s.hand(0, 1);
+        assert_eq!(told.record, None);
+        assert_eq!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Applied(Applied {
+                number: 2,
+                left: Some(1),
+                carried: 1,
+                no_version: Vec::new(),
+            })
+        );
+        assert_eq!((s[1].state(), s[1].secret()), (State::Applied, secret));
+        assert_eq!(s[1].text("notes", "a.md").as_deref(), Some("one"));
+    }
+
+    /// The entry of `hand_over` as device `adder` writes it in its pair
+    /// channel with device `new`: whatever the device that adds would
+    /// have made.
+    fn written_by(s: &Several, adder: usize, new: usize, hand_over: &HandOver) -> CheckedEntry {
+        let pair = derive::pair_secret(&s[adder].identity, &s.key(new)).unwrap();
+        entry_by(
+            &s[adder].identity,
+            &pair,
+            9,
+            HAND_OVER_NAME,
+            Value::Other(hand_over.to_bytes().unwrap()),
+            &[],
+        )
+    }
+
+    /// What hands a device `statement`, which lists it and commits to
+    /// `secret`, with its change entry as the phrase makes it.
+    fn handing(s: &Several, statement: Statement, secret: [u8; 32]) -> HandOver {
+        let signed = statement.sign(&s.phrase.signing_key().unwrap()).unwrap();
+        let entry = change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret)).unwrap();
+        HandOver {
+            statement: signed,
+            secret,
+            statement_key: s.phrase.statement_key().unwrap(),
+            change_entry: entry,
+            addition: None,
+            adders_own: None,
+        }
+    }
+
+    /// A device that has stopped takes only the statement that stopped
+    /// it, or one made after it that keeps its removals. A statement made
+    /// apart from the one it has applied moves nothing, and does not show
+    /// as a fork there: the device has stopped.
+    #[test]
+    fn test_a_device_that_has_stopped_takes_only_what_was_made_after_the_change_that_stopped_it() {
+        let mut s = Several::of_one_person(3);
+        // Statement 2 lists all three, and device 2 applies it. Device 1
+        // has not heard, and makes a change of its own, which lists
+        // device 2 too.
+        s.change(0, &[0, 1, 2], &[]);
+        assert!(matches!(s.pass(0, 2)[0], Taken::Shown(Shown::Applied(_))));
+        s.change(1, &[0, 1, 2], &[]);
+        let apart = s.hand(1, 2);
+        assert_eq!(apart.record, None);
+
+        // Statement 3, made after statement 2, removes device 1 and has
+        // device 2 in neither list: as a settlement leaves a device out.
+        let second = s[0].held().statement.statement;
+        let third = second
+            .next(s.key(0), &[0x43; 32], s.listed(&[0]), &[s.key(1)])
+            .unwrap();
+        let stopper = handing(&s, third.clone(), [0x43; 32]);
+        let entry = stopper.change_entry.clone().check().unwrap();
+        let on = &s[2];
+        assert_eq!(
+            shown(&on.conn, &on.identity, &entry, s.now).unwrap(),
+            Shown::NotListed
+        );
+        let stopped = on.everything();
+
+        // The statement made apart from the one it has applied.
+        assert_eq!(
+            s.accept(2, 1, &apart.hand_over),
+            Accepted::Refused(NotAccepted::NotAfterTheChangeThatStoppedIt)
+        );
+        assert_eq!(
+            (s[2].everything(), s[2].state()),
+            (stopped.clone(), State::NotListed)
+        );
+
+        // A statement that has the one that stopped it on its chain, lists
+        // this device, and lacks the removal that the other made.
+        let mut chain = third.chain.clone();
+        chain.push(third.link().unwrap());
+        let undoing = Statement {
+            number: 4,
+            maker: s.key(0),
+            chain,
+            commitment: cordelia_crypto::statement::commitment(&[0x44; 32]),
+            devices: s.listed(&[0, 2]),
+            removed: Vec::new(),
+            phrase_key: third.phrase_key,
+        };
+        let handed = written_by(&s, 0, 2, &handing(&s, undoing, [0x44; 32]));
+        assert_eq!(
+            s.accept(2, 0, &handed),
+            Accepted::Refused(NotAccepted::NotAfterTheChangeThatStoppedIt)
+        );
+        assert_eq!(s[2].everything(), stopped);
+
+        // The control: a statement made after the one that stopped it,
+        // which keeps its removal and lists this device.
+        let fourth = third
+            .next(s.key(0), &[0x45; 32], s.listed(&[0, 2]), &[])
+            .unwrap();
+        let handed = written_by(&s, 0, 2, &handing(&s, fourth, [0x45; 32]));
+        assert!(matches!(
+            s.accept(2, 0, &handed),
+            Accepted::Applied(Applied {
+                number: 4,
+                left: Some(2),
+                ..
+            })
+        ));
+        assert_eq!((s[2].state(), s[2].secret()), (State::Applied, [0x45; 32]));
+
+        // It has applied statement 4, which keeps the removal. A statement
+        // made after that one that lacks the removal is none that it
+        // takes: it is refused where it is judged, and nothing moves.
+        let fourth = s[2].held().statement.statement;
+        let mut chain = fourth.chain.clone();
+        chain.push(fourth.link().unwrap());
+        let undoing = Statement {
+            number: 5,
+            maker: s.key(0),
+            chain,
+            commitment: cordelia_crypto::statement::commitment(&[0x47; 32]),
+            devices: s.listed(&[0, 2]),
+            removed: Vec::new(),
+            phrase_key: fourth.phrase_key,
+        };
+        let handed = written_by(&s, 0, 2, &handing(&s, undoing, [0x47; 32]));
+        let before = s[2].everything();
+        assert_eq!(
+            s.accept(2, 0, &handed),
+            Accepted::Refused(NotAccepted::Statement(StatementError::UndoesARemoval))
+        );
+        assert_eq!(s[2].everything(), before);
+    }
+
+    /// The change entry that a hand-over brings is the one a device keeps
+    /// and shows. Under the phrase a device already follows, it is that
+    /// phrase's own: an entry of another channel is refused, whoever
+    /// signed it.
+    #[test]
+    fn test_a_hand_over_whose_change_entry_is_of_another_channel_is_refused() {
+        let mut s = Several::of_one_person(2);
+        let secret = [0x46; 32];
+        let next = s[0].held().statement.statement;
+        let next = next
+            .next(s.key(0), &secret, s.listed(&[0, 1]), &[])
+            .unwrap();
+        let mut hand_over = handing(&s, next, secret);
+        let genuine = written_by(&s, 0, 1, &hand_over);
+
+        // The same content, signed by the phrase's key in a channel that
+        // is not the phrase's.
+        let elsewhere = [0x55; 32];
+        let moved = signed_in(
+            &elsewhere,
+            &s.phrase.signing_key().unwrap(),
+            change_entry::slot(&derive::channel_id(&elsewhere).unwrap()),
+            2,
+            hand_over.change_entry.content.clone(),
+        );
+        hand_over.change_entry = moved.into_entry();
+        hand_over.validate().unwrap();
+        let handed = written_by(&s, 0, 1, &hand_over);
+        let before = s[1].everything();
+        assert_eq!(
+            s.accept(1, 0, &handed),
+            Accepted::Refused(NotAccepted::HandOver(HandOverError::ChangeEntry(
+                change_entry::ChangeEntryError::AnotherChannel
+            )))
+        );
+        assert_eq!(s[1].everything(), before);
+
+        // The control: with the phrase's own entry it is applied.
+        assert!(matches!(
+            s.accept(1, 0, &genuine),
+            Accepted::Applied(Applied { number: 2, .. })
+        ));
+    }
+
+    /// The last two rows: a device that was removed accepts nothing, and
+    /// nor does one that is in a fork.
+    #[test]
+    fn test_a_device_that_was_removed_or_is_in_a_fork_accepts_nothing() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        assert_eq!(s.pass(0, 2)[0], Taken::Shown(Shown::Removed));
+        // Device 1 has not heard, and makes a change of its own. Shown
+        // the other, it is in a fork.
+        s.change(1, &[0, 1], &[2]);
+        assert_eq!(s.pass(0, 1)[0], Taken::Shown(Shown::Fork));
+
+        let (stranger, for_the_removed) = handed_by_a_stranger(&s[2], s.now);
+        let (_, for_the_forked) = handed_by_a_stranger(&s[1], s.now);
+        // What device 0 hands device 1: its change, which lists device 1.
+        let told = s.hand(0, 1);
+        // What device 1 had handed device 2 before either change.
+        let before = (s[1].everything(), s[2].everything());
+        for sync_on in [false, true] {
+            assert_eq!(
+                accepted(&s, 2, &stranger.key(), sync_on, &for_the_removed),
+                Accepted::Refused(NotAccepted::Removed)
+            );
+            assert_eq!(
+                accepted(&s, 1, &stranger.key(), sync_on, &for_the_forked),
+                Accepted::Refused(NotAccepted::InAFork)
+            );
+            assert_eq!(
+                accepted(&s, 1, &s.key(0), sync_on, &told.hand_over),
+                Accepted::Refused(NotAccepted::InAFork)
+            );
+        }
+        assert_eq!((s[1].everything(), s[2].everything()), before);
+        assert_eq!((s[1].state(), s[2].state()), (State::Fork, State::Removed));
+    }
+}

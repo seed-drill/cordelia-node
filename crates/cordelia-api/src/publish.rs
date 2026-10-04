@@ -393,3 +393,702 @@ fn the_one_entry<'a>(
         .or(version.entries.first())
         .ok_or_else(|| PersonError::Held("a version with no entry".into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::several::{Machine, Several, entry_by, link, signed_in, text};
+    use cordelia_core::protocol::{
+        MAX_ENTRY_NAME_AND_VALUE_BYTES, REV_BAND_HALF, REV_BAND_SIZE, REV_COUNT_BITS,
+    };
+    use cordelia_crypto::entry::EntryError;
+
+    /// The revision at `count` in `band`.
+    fn at(band: u64, count: u64) -> u64 {
+        (band << REV_COUNT_BITS) + count
+    }
+
+    fn hash(said: &str) -> [u8; 32] {
+        value_hash(&text(said))
+    }
+
+    /// One device, alone under its phrase, which holds the name `notes`.
+    fn alone() -> Several {
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        s.hold(&[0], "notes");
+        s
+    }
+
+    /// Device `n` publishes `value` under `file` in `notes`, over what it
+    /// reads there.
+    fn published(s: &mut Several, n: usize, file: &str, value: Value) -> Published {
+        let now = s.tick();
+        let on = &s[n];
+        let write = Write {
+            name: "notes",
+            file,
+            value,
+            planned: PlannedAgainst::what_is_in(&on.slot("notes", file)),
+            merge: None,
+        };
+        publish(&on.conn, &on.identity, &write, now).unwrap()
+    }
+
+    fn made(published: Published) -> CheckedEntry {
+        match published {
+            Published::Made(entry) => *entry,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The one entry of the current version of `file` in `notes`, as
+    /// device `n` reads it: its chain.
+    fn chain_of(s: &Several, n: usize, file: &str) -> Vec<Link> {
+        let version = s[n].slot("notes", file).current.unwrap();
+        let own = s.key(n);
+        let one = version.entries.iter().find(|one| one.author == own);
+        one.unwrap().chain.clone().unwrap()
+    }
+
+    /// The store of device `n` is given `entry`, past the door: what it
+    /// holds is what it holds, however it came by it.
+    fn holds(s: &Several, n: usize, entry: &CheckedEntry) {
+        assert_eq!(
+            entries::store(&s[n].conn, entry, s.now).unwrap(),
+            Outcome::Stored
+        );
+    }
+
+    /// A new file's entry is this device's own, at revision 1, with an
+    /// empty chain, and the store holds it. What is written over it says
+    /// what it was written over: a text, a delete, bytes that are no text.
+    #[test]
+    fn test_a_value_is_published_as_this_devices_own_entry_over_what_the_slot_holds() {
+        let mut s = alone();
+        let own = s.key(0);
+        let channel = s[0].own("notes");
+
+        let first = made(published(&mut s, 0, "a.md", text("one")));
+        assert_eq!(first.channel, derive::channel_id(&channel).unwrap());
+        assert_eq!((first.author, first.rev, first.delete), (own, 1, false));
+        assert_eq!(
+            first.open(&channel).unwrap(),
+            Inside {
+                name: "a.md".to_string(),
+                value: text("one"),
+                chain: Some(Vec::new()),
+            }
+        );
+        // The store holds it, and it is what the slot is read as.
+        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        let version = slot.current.clone().unwrap();
+        assert_eq!((version.value, version.rev), (text("one"), 1));
+        assert_eq!(version.entries.len(), 1);
+        assert_eq!(version.entries[0].id, first.id());
+        assert_eq!((slot.lost.len(), slot.next), (0, Some(2)));
+
+        // A delete over it, and a text over the delete, and bytes that are
+        // no text over that: each at the slot's next revision, each with
+        // the link of what it was written over put first.
+        let delete = made(published(&mut s, 0, "a.md", Value::Delete));
+        assert_eq!((delete.rev, delete.delete), (2, true));
+        assert_eq!(chain_of(&s, 0, "a.md"), [link("one", own)]);
+        let again = made(published(&mut s, 0, "a.md", text("two")));
+        assert_eq!(again.rev, 3);
+        assert_eq!(
+            chain_of(&s, 0, "a.md"),
+            [Link::of(&Value::Delete, own), link("one", own)]
+        );
+        let bytes = made(published(&mut s, 0, "a.md", Value::Other(vec![0, 0xff])));
+        assert_eq!(bytes.rev, 4);
+        assert_eq!(
+            chain_of(&s, 0, "a.md"),
+            [
+                link("two", own),
+                Link::of(&Value::Delete, own),
+                link("one", own)
+            ]
+        );
+        // Another file of the name is another slot.
+        let other = made(published(&mut s, 0, "b.md", text("one")));
+        assert_eq!(other.rev, 1);
+        assert_ne!(other.slot, first.slot);
+        assert_eq!(s[0].stored_in(&channel).len(), 2);
+    }
+
+    /// What a caller plans against is a value at a revision, or no
+    /// version. A value is named by the hash of its text or of its bytes,
+    /// and a delete by zeros.
+    #[test]
+    fn test_what_is_planned_against_is_a_value_at_a_revision() {
+        assert_eq!(hash("one"), cordelia_crypto::sha256(b"one"));
+        assert_eq!(
+            value_hash(&Value::Other(vec![1, 2])),
+            cordelia_crypto::sha256(&[1, 2])
+        );
+        assert_eq!(value_hash(&Value::Delete), [0u8; 32]);
+        // A chain names a value by the start of that hash.
+        assert_eq!(named(&hash("one")), text("one").chain_hash());
+        assert_eq!(named(&[0u8; 32]), Value::Delete.chain_hash());
+
+        let mut s = alone();
+        let on = |s: &Several| PlannedAgainst::what_is_in(&s[0].slot("notes", "a.md"));
+        assert_eq!(on(&s), PlannedAgainst::NoVersion);
+        published(&mut s, 0, "a.md", text("one"));
+        assert_eq!(
+            on(&s),
+            PlannedAgainst::Version {
+                rev: 1,
+                hash: hash("one")
+            }
+        );
+        published(&mut s, 0, "a.md", Value::Delete);
+        assert_eq!(
+            on(&s),
+            PlannedAgainst::Version {
+                rev: 2,
+                hash: [0u8; 32]
+            }
+        );
+    }
+
+    /// An entry is made only where the slot's current version is still
+    /// the one that was planned against. Otherwise nothing is written.
+    #[test]
+    fn test_an_entry_is_made_only_over_the_version_that_was_planned_against() {
+        let mut s = alone();
+        let attempt = |s: &mut Several, file: &str, planned: PlannedAgainst| {
+            let now = s.tick();
+            let on = &s[0];
+            let write = Write {
+                name: "notes",
+                file,
+                value: text("an edit"),
+                planned,
+                merge: None,
+            };
+            let before = on.everything();
+            let outcome = publish(&on.conn, &on.identity, &write, now).unwrap();
+            if !matches!(outcome, Published::Made(_)) {
+                assert_eq!(on.everything(), before);
+            }
+            outcome
+        };
+        let version = |rev: u64, said: &str| PlannedAgainst::Version {
+            rev,
+            hash: hash(said),
+        };
+
+        // The slot holds no version: a caller that read one finds it
+        // changed.
+        assert_eq!(
+            attempt(&mut s, "a.md", version(1, "one")),
+            Published::Changed
+        );
+        published(&mut s, 0, "a.md", text("one"));
+        published(&mut s, 0, "a.md", text("two"));
+
+        // It holds "two" at revision 2. A caller that read no version,
+        // the version before, that text at another revision, or another
+        // text at that revision, finds it changed.
+        for planned in [
+            PlannedAgainst::NoVersion,
+            version(1, "one"),
+            version(1, "two"),
+            version(3, "two"),
+            version(2, "one"),
+            PlannedAgainst::Version {
+                rev: 2,
+                hash: [0u8; 32],
+            },
+        ] {
+            assert_eq!(
+                attempt(&mut s, "a.md", planned),
+                Published::Changed,
+                "{planned:?}"
+            );
+        }
+        assert_eq!(s[0].text("notes", "a.md").as_deref(), Some("two"));
+
+        // The version it holds: the edit is made.
+        let entry = made(attempt(&mut s, "a.md", version(2, "two")));
+        assert_eq!(entry.rev, 3);
+        assert_eq!(s[0].text("notes", "a.md").as_deref(), Some("an edit"));
+        // And over no version, in a slot that holds none.
+        let entry = made(attempt(&mut s, "b.md", PlannedAgainst::NoVersion));
+        assert_eq!(entry.rev, 1);
+    }
+
+    /// Two entries that are one version are one for the check, whichever
+    /// of them the caller read: a second device's entry of the same text
+    /// at the same revision changes nothing that was planned against.
+    #[test]
+    fn test_two_entries_that_are_one_version_are_one_for_what_was_planned_against() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(0, "notes", "a.md", "the same edit");
+        let planned = PlannedAgainst::what_is_in(&s[0].slot("notes", "a.md"));
+
+        // Device 1 made the same edit apart.
+        let same = entry_by(
+            &s[1].identity,
+            &s[0].own("notes"),
+            1,
+            "a.md",
+            text("the same edit"),
+            &[],
+        );
+        holds(&s, 0, &same);
+        assert_eq!(s[0].slot("notes", "a.md").current.unwrap().entries.len(), 2);
+        let now = s.tick();
+        let on = &s[0];
+        let write = Write {
+            name: "notes",
+            file: "a.md",
+            value: text("over both"),
+            planned,
+            merge: None,
+        };
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &write, now).unwrap(),
+            Published::Made(_)
+        ));
+
+        // Another text at that revision is another version: where it wins
+        // the tie, what was planned against is no longer current.
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(0, "notes", "b.md", "one text");
+        let planned = PlannedAgainst::what_is_in(&s[0].slot("notes", "b.md"));
+        let (mut n, mut other) = (0u8, String::new());
+        while other.is_empty() || hash(&other) < hash("one text") {
+            other = format!("another text {n}");
+            n += 1;
+        }
+        let tie = entry_by(
+            &s[1].identity,
+            &s[0].own("notes"),
+            1,
+            "b.md",
+            text(&other),
+            &[],
+        );
+        holds(&s, 0, &tie);
+        let slot = s[0].slot("notes", "b.md");
+        assert_eq!(slot.current.unwrap().value, text(&other));
+        assert_eq!(slot.lost.len(), 1);
+        let now = s.tick();
+        let on = &s[0];
+        let write = Write {
+            name: "notes",
+            file: "b.md",
+            value: text("over the loser"),
+            planned,
+            merge: None,
+        };
+        assert_eq!(
+            publish(&on.conn, &on.identity, &write, now).unwrap(),
+            Published::Changed
+        );
+    }
+
+    /// A device writes over a version from one of its entries: its own
+    /// where it holds one, and otherwise the one whose signer has the
+    /// lowest key. That entry's signer and that entry's chain are what
+    /// the new chain is built from.
+    #[test]
+    fn test_an_entry_is_written_over_this_devices_own_entry_or_the_lowest_keys() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        // The device that writes is the one with the highest key, so that
+        // its own entry is not the first of a version's entries.
+        let mut by_key = [0, 1, 2];
+        by_key.sort_by_key(|n| s.key(*n));
+        let (lowest, between, writer) = (by_key[0], by_key[1], by_key[2]);
+        let keys = [s.key(lowest), s.key(between), s.key(writer)];
+        let channel = s[writer].own("notes");
+        let of = |n: usize, file: &str, chain: &[Link]| {
+            entry_by(&s[n].identity, &channel, 5, file, text("the same"), chain)
+        };
+
+        // One version in two entries, neither of them this device's.
+        let chains = [
+            vec![link("x", keys[0])],
+            vec![link("y", keys[1]), link("z", keys[2])],
+        ];
+        holds(&s, writer, &of(lowest, "a.md", &chains[0]));
+        holds(&s, writer, &of(between, "a.md", &chains[1]));
+        // And in three, of which one is this device's own.
+        let own_chain = [link("w", keys[2])];
+        holds(&s, writer, &of(lowest, "b.md", &chains[0]));
+        holds(&s, writer, &of(between, "b.md", &chains[1]));
+        holds(&s, writer, &of(writer, "b.md", &own_chain));
+
+        let over_anothers = made(published(&mut s, writer, "a.md", text("an edit")));
+        assert_eq!(over_anothers.rev, 6);
+        assert_eq!(
+            chain_of(&s, writer, "a.md"),
+            [link("the same", keys[0]), link("x", keys[0])]
+        );
+        let over_its_own = made(published(&mut s, writer, "b.md", text("an edit")));
+        assert_eq!(over_its_own.rev, 6);
+        assert_eq!(
+            chain_of(&s, writer, "b.md"),
+            [link("the same", keys[2]), link("w", keys[2])]
+        );
+    }
+
+    /// A merge is written over a version: where the slot holds none there
+    /// is nothing to merge with, and nothing is written.
+    #[test]
+    fn test_a_merge_over_no_version_is_refused() {
+        let s = alone();
+        let on = &s[0];
+        let other = OtherSource {
+            hash: hash("what the file held"),
+            signer: on.key(),
+            chain: Some(Vec::new()),
+        };
+        let write = Write {
+            name: "notes",
+            file: "MEMORY.md",
+            value: text("merged"),
+            planned: PlannedAgainst::NoVersion,
+            merge: Some(&other),
+        };
+        let before = on.everything();
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &write, s.now),
+            Err(PersonError::MergeOverNoVersion)
+        ));
+        assert_eq!(on.everything(), before);
+        // The other source as a chain names it: the start of its hash, and
+        // of its signer's key.
+        assert_eq!(other.link(), link("what the file held", on.key()));
+    }
+
+    /// An entry's revision is the slot's next: one above the highest that
+    /// counts for it, an entry that is no version among them. Where there
+    /// is none until the next statement, the name is out of reach, and
+    /// nothing is written.
+    #[test]
+    fn test_the_revision_is_the_slots_next_and_a_name_out_of_reach_is_said_to_be() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let channel = s[0].own("notes");
+        // Device 1, which counts: its key signs what device 0 comes to hold.
+        let other = &Machine::new(1).identity;
+        assert_eq!(other.public_key(), s.key(1));
+        let top = at(1, REV_BAND_SIZE - 1);
+
+        // At the top of the statement's band nothing can be written above.
+        holds(
+            &s,
+            0,
+            &entry_by(other, &channel, top, "a.md", text("at the top"), &[]),
+        );
+        let before = s[0].everything();
+        assert_eq!(
+            published(&mut s, 0, "a.md", text("above it")),
+            Published::OutOfReach
+        );
+        assert_eq!(s[0].everything(), before);
+        // One below the top, the last revision is still there to write.
+        let below = entry_by(other, &channel, top - 1, "b.md", text("below the top"), &[]);
+        holds(&s, 0, &below);
+        assert_eq!(
+            made(published(&mut s, 0, "b.md", text("the last"))).rev,
+            top
+        );
+
+        // An entry that does not open is no version: the slot holds none,
+        // and the next revision is above it all the same.
+        let slot = slot_id(&derive::slot_key(&channel).unwrap(), "c.md");
+        let elsewhere = entry_by(
+            other,
+            &[0xee; 32],
+            40,
+            "c.md",
+            text("sealed elsewhere"),
+            &[],
+        );
+        let unread = signed_in(&channel, other, slot, 40, elsewhere.content.clone());
+        holds(&s, 0, &unread);
+        assert_eq!(s[0].slot("notes", "c.md").current, None);
+        let over = made(published(
+            &mut s,
+            0,
+            "c.md",
+            text("over what does not open"),
+        ));
+        assert_eq!(over.rev, 41);
+        assert_eq!(chain_of(&s, 0, "c.md"), []);
+
+        // An entry in the top half of a lower band is no version either,
+        // and the next revision is moved as a move would move it.
+        let jumped = at(0, REV_BAND_HALF + 5);
+        holds(
+            &s,
+            0,
+            &entry_by(other, &channel, jumped, "d.md", text("jumped"), &[]),
+        );
+        assert_eq!(
+            made(published(&mut s, 0, "d.md", text("after a jump"))).rev,
+            at(1, 6)
+        );
+        // One in a band above the statement's counts for nothing.
+        holds(
+            &s,
+            0,
+            &entry_by(other, &channel, at(2, 7), "e.md", text("above"), &[]),
+        );
+        assert_eq!(made(published(&mut s, 0, "e.md", text("the first"))).rev, 1);
+
+        // Nor does this device's own entry up there. The store holds it
+        // above the slot's next revision, and takes no entry of this
+        // device's below it: nothing is written, and it is said so.
+        let own = &Machine::new(0).identity;
+        let above = entry_by(own, &channel, at(2, 7), "f.md", text("its own"), &[]);
+        holds(&s, 0, &above);
+        let on = &s[0];
+        let write = Write {
+            name: "notes",
+            file: "f.md",
+            value: text("below its own"),
+            planned: PlannedAgainst::NoVersion,
+            merge: None,
+        };
+        let before = on.everything();
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &write, s.now),
+            Err(PersonError::Held(_))
+        ));
+        assert_eq!(on.everything(), before);
+    }
+
+    #[test]
+    fn test_a_name_and_a_value_over_their_bound_are_refused() {
+        let mut s = alone();
+        let room = MAX_ENTRY_NAME_AND_VALUE_BYTES - "a.md".len();
+        let before = s[0].everything();
+        let attempt = |s: &Several, file: &str, value: Value| {
+            let on = &s[0];
+            let write = Write {
+                name: "notes",
+                file,
+                value,
+                planned: PlannedAgainst::NoVersion,
+                merge: None,
+            };
+            publish(&on.conn, &on.identity, &write, s.now)
+        };
+        for value in [text(&"x".repeat(room + 1)), Value::Other(vec![7; room + 1])] {
+            assert!(matches!(
+                attempt(&s, "a.md", value),
+                Err(PersonError::Entry(EntryError::OverTheBound(61_441)))
+            ));
+        }
+        // A file's name of no bytes.
+        assert!(matches!(
+            attempt(&s, "", text("a text")),
+            Err(PersonError::Entry(EntryError::NameEmpty))
+        ));
+        assert_eq!(s[0].everything(), before);
+
+        // The control: at the bound it is made, whole.
+        let whole = made(published(&mut s, 0, "a.md", text(&"x".repeat(room))));
+        let inside = whole.open(&s[0].own("notes")).unwrap();
+        assert_eq!(inside.value.bytes().len(), room);
+    }
+
+    /// A device that follows no phrase has no secret, and publishes
+    /// nothing. Nor does one that has stopped, or is in a fork, though it
+    /// reads what it holds. And a name that the device does not hold has
+    /// no channel here.
+    #[test]
+    fn test_a_device_with_no_phrase_or_that_has_stopped_publishes_nothing() {
+        let new = Machine::new(7);
+        let write = Write {
+            name: "notes",
+            file: "a.md",
+            value: text("one"),
+            planned: PlannedAgainst::NoVersion,
+            merge: None,
+        };
+        assert!(matches!(
+            publish(&new.conn, &new.identity, &write, 5),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+        assert!(matches!(
+            current(&new.conn, "notes", "a.md"),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+        assert!(matches!(
+            known_to_follow(&new.conn, "notes", "a.md", &hash("one")),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+        assert!(new.stored().is_empty());
+
+        let mut s = alone();
+        published(&mut s, 0, "a.md", text("one"));
+        let on = &s[0];
+        // A name it does not hold.
+        let elsewhere = Write {
+            name: "other",
+            ..write.clone()
+        };
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &elsewhere, s.now),
+            Err(PersonError::NameNotHeld(name)) if name == "other"
+        ));
+        assert!(matches!(
+            current(&on.conn, "other", "a.md"),
+            Err(PersonError::NameNotHeld(_))
+        ));
+        assert!(matches!(
+            known_to_follow(&on.conn, "other", "a.md", &hash("one")),
+            Err(PersonError::NameNotHeld(_))
+        ));
+
+        let over = Write {
+            planned: PlannedAgainst::what_is_in(&on.slot("notes", "a.md")),
+            ..write.clone()
+        };
+        for state in [
+            State::Fork,
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(&on.conn, state).unwrap();
+            let before = on.everything();
+            assert!(matches!(
+                publish(&on.conn, &on.identity, &over, s.now),
+                Err(PersonError::Stopped(stopped)) if stopped == state
+            ));
+            assert_eq!(on.everything(), before);
+            // It reads what it holds.
+            assert_eq!(on.text("notes", "a.md").as_deref(), Some("one"));
+        }
+        // The control: it has not stopped, and the entry is made.
+        held_rows::set_state(&on.conn, State::Applied).unwrap();
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &over, s.now).unwrap(),
+            Published::Made(_)
+        ));
+
+        // A name whose channel, as it is kept, is not the name's channel
+        // in the generation applied: what is held does not hold together,
+        // and nothing is read or written there.
+        held_rows::move_name(&on.conn, "notes", &[0x44; 32]).unwrap();
+        let before = on.everything();
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &write, s.now),
+            Err(PersonError::Held(_))
+        ));
+        assert!(matches!(
+            current(&on.conn, "notes", "a.md"),
+            Err(PersonError::Held(_))
+        ));
+        assert_eq!(on.everything(), before);
+    }
+
+    /// A slot is read under the statement applied, with the device's word
+    /// on who counts: an entry of a key that does not count is nothing
+    /// there, and a version that lost a tie is given as that.
+    #[test]
+    fn test_a_slot_is_read_under_the_statement_applied_with_who_counts() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let channel = s[0].own("notes");
+        s.write(0, "notes", "a.md", "by a device that counts");
+        let stranger = Machine::new(9);
+        let late = entry_by(
+            &stranger.identity,
+            &channel,
+            9,
+            "a.md",
+            text("a stranger's"),
+            &[],
+        );
+        holds(&s, 0, &late);
+        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        assert_eq!(slot.current.unwrap().value, text("by a device that counts"));
+        assert_eq!((slot.highest, slot.next), (Some(1), Some(2)));
+
+        // A tie between two devices that count: the loser is given.
+        let tie = entry_by(
+            &s[1].identity,
+            &channel,
+            1,
+            "a.md",
+            text("at the same revision"),
+            &[],
+        );
+        holds(&s, 0, &tie);
+        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        let (won, lost) = (slot.current.unwrap(), slot.lost);
+        assert_eq!(lost.len(), 1);
+        assert_eq!((won.rev, lost[0].rev), (1, 1));
+        assert!(value_hash(&won.value) > value_hash(&lost[0].value));
+        let authors = [won.entries[0].author, lost[0].entries[0].author];
+        assert!(authors.contains(&s.key(0)) && authors.contains(&s.key(1)));
+    }
+
+    /// A version is known to follow a text where the text's hash is in
+    /// the chain of every entry held of the version, and in each every
+    /// newer link was signed by a key that counts.
+    #[test]
+    fn test_a_version_is_known_to_follow_only_if_each_entry_held_of_it_shows_it() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        let keys = [s.key(0), s.key(1), s.key(2)];
+        let stranger = Machine::new(9).key();
+        let channel = s[0].own("notes");
+        let put = |n: usize, file: &str, chain: &[Link]| {
+            let entry = entry_by(&s[n].identity, &channel, 5, file, text("the same"), chain);
+            holds(&s, 0, &entry);
+        };
+        let agreed = link("agreed", keys[0]);
+        let follows_agreed =
+            |file: &str| known_to_follow(&s[0].conn, "notes", file, &hash("agreed")).unwrap();
+
+        // One entry, which shows it.
+        put(1, "one.md", &[agreed]);
+        assert!(follows_agreed("one.md"));
+        // Two entries, and each shows it: one through a newer link that a
+        // key which counts signed.
+        put(1, "both.md", &[agreed]);
+        put(2, "both.md", &[link("between", keys[1]), agreed]);
+        assert!(follows_agreed("both.md"));
+        // Two entries, and one does not show it.
+        put(1, "one of two.md", &[agreed]);
+        put(2, "one of two.md", &[link("another", keys[0])]);
+        assert!(!follows_agreed("one of two.md"));
+        // One entry, where a key that does not count signed a version
+        // between.
+        put(1, "between.md", &[link("between", stranger), agreed]);
+        assert!(!follows_agreed("between.md"));
+        // An entry with an empty chain, and a slot with no version.
+        put(1, "new.md", &[]);
+        assert!(!follows_agreed("new.md"));
+        assert!(!follows_agreed("none.md"));
+
+        // What a folder agreed can be a delete, which a chain names by
+        // zeros.
+        put(1, "deleted.md", &[Link::of(&Value::Delete, keys[0])]);
+        assert!(known_to_follow(&s[0].conn, "notes", "deleted.md", &[0u8; 32]).unwrap());
+        assert!(!follows_agreed("deleted.md"));
+
+        // An entry that lacks its chain shows nothing, and a version with
+        // one such entry is known to follow nothing.
+        let counting = crate::person::who_counts(&s[0].conn).unwrap();
+        let mut version = s[0].slot("notes", "both.md").current.unwrap();
+        assert!(follows(&version, &hash("agreed"), &counting));
+        version.entries[1].chain = None;
+        assert!(!follows(&version, &hash("agreed"), &counting));
+        version.entries.clear();
+        assert!(!follows(&version, &hash("agreed"), &counting));
+    }
+}
