@@ -14,7 +14,8 @@
 //!   is where the device that carries signed it, and otherwise as one
 //!   written over it.
 //! - **A merge of two versions** ([`merged`]): written over the one, with
-//!   the other and what it descends from woven in.
+//!   the other and what it descends from woven in, as far as the two
+//!   chains say nothing of one version at two places.
 //!
 //! A chain holds 100 links at most, and each of the three cuts it there,
 //! from the old end: what is older than the hundredth is not said. A link
@@ -80,12 +81,22 @@ pub fn carried_from(
 ///   between the two stays between them.
 /// - **Where it is not,** the two were written apart. The other's link
 ///   comes second, and after it the links of the two chains, one from
-///   each in turn, the channel's first. A hash that stands in both chains
-///   comes at the later of its two places: the link at the earlier place
-///   is left out. So a version that both descend from stands after every
-///   link of either chain that is newer than it, and whoever signed any
-///   of those is asked about before a folder at that version is told that
-///   the merge follows it.
+///   each in turn, the channel's first.
+/// - **A link whose hash stands further on in the other chain is left
+///   out, and nothing more is taken from its chain.** The other chain
+///   goes on whole. The two descend from that version, and the chain that
+///   goes on says it at its own place, behind every link of its own that
+///   is newer. What stood behind the link that was left out would
+///   otherwise come to stand ahead of that version, with the link gone
+///   that stood ahead of it in its own chain: a folder at such a version
+///   would be told that the merge follows its text, though whoever signed
+///   the link that was left out was never asked about. So nothing behind
+///   that link is said at all, unless the other chain says it.
+///
+/// Only one chain stops: the first link to be left out decides which, and
+/// from then no link of the other is left out. "Further on" is in the
+/// order of the turns: of two links at one place, the other chain's is
+/// further on than the channel's.
 ///
 /// The result is cut to 100 links from the old end. A chain that could
 /// not be read (`None`) gives no links.
@@ -112,13 +123,21 @@ pub fn merged(
     }
 
     let mut built = vec![over, *other];
+    // The chain that has stopped, where one has: whether it is the
+    // channel's.
+    let mut stopped = None;
     for (place, (link, is_ours)) in in_turn.iter().enumerate() {
-        let stands_later_in_the_other = in_turn[place + 1..]
+        if stopped == Some(*is_ours) {
+            continue;
+        }
+        let stands_further_on_in_the_other = in_turn[place + 1..]
             .iter()
             .any(|(later, later_is_ours)| later.hash == link.hash && later_is_ours != is_ours);
-        if !stands_later_in_the_other {
-            built.push(*link);
+        if stopped.is_none() && stands_further_on_in_the_other {
+            stopped = Some(*is_ours);
+            continue;
         }
+        built.push(*link);
     }
     built.truncate(MAX_ENTRY_LINKS);
     built
@@ -461,11 +480,12 @@ mod tests {
         }
     }
 
-    /// A hash that stands in both chains comes at the later of its two
-    /// places, so that every link of either chain that is newer than it
-    /// stands above it.
+    /// A link whose hash stands further on in the other chain is left out,
+    /// and nothing more is taken from its chain: the other goes on whole,
+    /// and says that version at its own place, behind every link of its
+    /// own that is newer.
     #[test]
-    fn a_hash_in_both_chains_of_a_merge_comes_at_the_later_of_its_two_places() {
+    fn once_a_link_is_left_out_nothing_more_is_taken_from_its_chain() {
         let value = text_of("the channel's");
         let held = link("the file's", 2);
         // Both descend from "common", and from "first" before it. The
@@ -503,7 +523,8 @@ mod tests {
             only(&[1, 2])
         ));
 
-        // The other way round: the channel's is the longer branch.
+        // The other way round: the channel's is the longer branch, and the
+        // other's chain is the one that stops.
         let built = merged(&value, &key(1), Some(&theirs), &held, Some(&ours));
         assert_eq!(
             built,
@@ -523,7 +544,7 @@ mod tests {
         ));
 
         // Where two keys signed the entries that the two were taken from,
-        // the link at the later place stands, with its own signer.
+        // the link of the chain that goes on stands, with its own signer.
         let theirs = [link("y1", 2), link("common", 3)];
         let built = merged(&value, &key(1), Some(&ours[..1]), &held, Some(&theirs));
         assert_eq!(
@@ -533,6 +554,20 @@ mod tests {
                 link("the file's", 2),
                 link("y1", 2),
                 link("common", 3),
+            ]
+        );
+        // Of two links at one place, the other chain's is further on: the
+        // channel's is left out, and its chain stops.
+        let ours = [link("common", 1), link("x2", 1)];
+        let theirs = [link("common", 3), link("y2", 2)];
+        let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs));
+        assert_eq!(
+            built,
+            [
+                link("the channel's", 1),
+                link("the file's", 2),
+                link("common", 3),
+                link("y2", 2),
             ]
         );
 
@@ -554,8 +589,7 @@ mod tests {
         );
 
         // A hash that stands twice in one chain, and once in the other:
-        // each of its links is left out that has the other chain's link
-        // with that hash further on.
+        // its first link is left out, and with it everything behind it.
         let ours = [link("A", 1), link("B", 1), link("A", 1)];
         let theirs = [link("A", 2)];
         let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs));
@@ -564,10 +598,120 @@ mod tests {
             [
                 link("the channel's", 1),
                 link("the file's", 2),
-                link("B", 1),
-                link("A", 1),
+                link("A", 2),
             ]
         );
+
+        // Only one chain stops. The chain that goes on is whole: a link of
+        // its own is not left out for a hash that stands further on in the
+        // chain that has stopped, where nothing more is taken.
+        let ours = [link("common", 1), link("x2", 1), link("late", 1)];
+        let theirs = [link("y1", 2), link("late", 2), link("common", 3)];
+        let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs));
+        assert_eq!(
+            built,
+            [
+                link("the channel's", 1),
+                link("the file's", 2),
+                link("y1", 2),
+                link("late", 2),
+                link("common", 3),
+            ]
+        );
+    }
+
+    /// What stood behind a link that is left out does not come to stand
+    /// ahead of that link's version. The channel's version was written
+    /// over H, which a key signed that does not count, and H over T. The
+    /// file's version descends from H too. A folder at T is not told that
+    /// the merge follows its text: T is not in the chain at all.
+    #[test]
+    fn nothing_behind_a_link_that_is_left_out_stands_ahead_of_its_version() {
+        let value = text_of("the channel's");
+        let held = link("the file's", 2);
+        // Device 9 does not count. Device 3 signed T, and the file's H.
+        let ours = [link("H", 9), link("T", 3)];
+        let theirs = [link("Y", 4), link("H", 3)];
+        let counting = only(&[1, 2, 3, 4]);
+
+        // On the channel's chain alone, device 9's link stands ahead of T.
+        let over = written_over(&value, &key(1), Some(&ours));
+        assert!(!known_to_follow(Some(&over), &named("T"), &counting));
+
+        let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs));
+        assert_eq!(
+            built,
+            [
+                link("the channel's", 1),
+                link("the file's", 2),
+                link("Y", 4),
+                link("H", 3),
+            ]
+        );
+        assert!(built.iter().all(|link| link.hash != named("T")));
+        assert!(!known_to_follow(Some(&built), &named("T"), &counting));
+        assert!(!known_to_follow(Some(&built), &named("T"), |_| true));
+        // A folder at H is told so by the file's chain, whose links are
+        // all of keys that count.
+        assert!(known_to_follow(Some(&built), &named("H"), &counting));
+        assert!(!known_to_follow(
+            Some(&built),
+            &named("H"),
+            only(&[1, 2, 3])
+        ));
+        is_sealed_and_read(&built);
+
+        // The other way round: the file's chain is the one that stops.
+        let built = merged(&value, &key(1), Some(&theirs), &held, Some(&ours));
+        assert_eq!(
+            built,
+            [
+                link("the channel's", 1),
+                link("the file's", 2),
+                link("Y", 4),
+                link("H", 3),
+            ]
+        );
+    }
+
+    /// The other chain was cut at its 100 links just behind the version
+    /// that both descend from, and T fell off it. The channel's chain is
+    /// short, and holds H ahead of T. The merged chain is cut at 100 too:
+    /// neither H nor T is in it, and T does not stand ahead of the links
+    /// that were ahead of H.
+    #[test]
+    fn a_chain_cut_behind_the_shared_version_puts_nothing_ahead_of_it() {
+        let value = text_of("the channel's");
+        let held = link("the file's", 2);
+        let ours = [link("H", 9), link("T", 3)];
+        let mut theirs = chain_of(0, 98, 4);
+        theirs.extend([link("H", 5), link("H", 9)]);
+        assert_eq!(theirs.len(), 100);
+
+        let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs));
+        assert_eq!(built.len(), 100);
+        assert_eq!(built[..2], [link("the channel's", 1), held]);
+        assert_eq!(built[2..], theirs[..98]);
+        for said in ["H", "T"] {
+            assert!(built.iter().all(|link| link.hash != named(said)), "{said}");
+            assert!(
+                !known_to_follow(Some(&built), &named(said), |_| true),
+                "{said}"
+            );
+        }
+        is_sealed_and_read(&built);
+
+        // With room for them, the file's two links of H stand behind every
+        // link of its chain, and T is still not said.
+        let built = merged(&value, &key(1), Some(&ours), &held, Some(&theirs[90..]));
+        assert_eq!(built[2..], theirs[90..]);
+        assert!(built.iter().all(|link| link.hash != named("T")));
+        assert!(!known_to_follow(
+            Some(&built),
+            &named("H"),
+            only(&[1, 2, 5, 9])
+        ));
+        assert!(known_to_follow(Some(&built), &named("H"), only(&[1, 2, 4])));
     }
 
     #[test]
