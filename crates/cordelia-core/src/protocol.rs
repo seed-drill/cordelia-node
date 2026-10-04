@@ -936,6 +936,55 @@ const _: () = assert!(
         <= CHANGE_ENTRY_PHRASE_PART_BYTES
 );
 
+/// The smallest an entry's content may be: 256 bytes (decision 2026-10-04
+/// §2.3). A content is a nonce, a ciphertext and a tag, and its length is
+/// a power of two from this up to MAX_ITEM_BYTES: what it holds is filled
+/// up inside the encryption, so that a relay sees a size class and no
+/// length.
+pub const MIN_ENTRY_CONTENT_BYTES: usize = 256;
+
+// Checked at compile time: both ends of the range are powers of two, so
+// the sizes between them are the powers of two between them.
+const _: () = assert!(MIN_ENTRY_CONTENT_BYTES.is_power_of_two());
+const _: () = assert!(MAX_ITEM_BYTES.is_power_of_two());
+const _: () = assert!(MIN_ENTRY_CONTENT_BYTES <= MAX_ITEM_BYTES);
+
+/// The most links an entry's chain may have (decision 2026-10-04 §2.3):
+/// one for each version the entry descends from, the newest first. What
+/// is older than the fortieth is not said.
+pub const MAX_ENTRY_LINKS: usize = 40;
+
+/// The most an entry's chain takes in its content.
+/// Derived from MAX_ENTRY_LINKS and the widths of the form: a count is
+/// two bytes, and a link is the hash of a version's text and the key that
+/// signed the entry it was taken from, 32 bytes each.
+pub const MAX_ENTRY_CHAIN_BYTES: usize = 2 + MAX_ENTRY_LINKS * (32 + 32);
+
+/// The most an entry's name and its value may be together: 60 KB (decision
+/// 2026-10-04 §2.3). The rest of the 64 KB is kept for the entry's chain,
+/// so that it always fits, whatever the value: no link is ever left out
+/// for room.
+pub const MAX_ENTRY_NAME_AND_VALUE_BYTES: usize = 60 * 1024;
+
+// Checked at compile time: at every bound together an entry's content fits
+// the size every entry must fit in. It is the nonce and the tag, the
+// name's length, the value's kind and its length, the name and the value
+// at their bound, and the entry's chain at its longest.
+const _: () = assert!(
+    ITEM_SEAL_OVERHEAD_BYTES + 2 + 1 + 2 + MAX_ENTRY_NAME_AND_VALUE_BYTES + MAX_ENTRY_CHAIN_BYTES
+        <= MAX_ITEM_BYTES
+);
+
+/// What an entry takes in clear beside its content (decision 2026-10-04
+/// §2.3): the channel's ID, the slot, the author's key, the revision,
+/// whether it is a delete, and the two signatures.
+pub const ENTRY_CLEAR_BYTES: usize = 32 + 32 + 32 + 8 + 1 + 64 + 64;
+
+// Checked at compile time: the clear fields and the signatures are within
+// what every entry is counted with beyond its content, twice over: once
+// as they are stored, and once for their place in each index.
+const _: () = assert!(2 * ENTRY_CLEAR_BYTES <= ENTRY_OVERHEAD_BYTES);
+
 /// How many words a recovery phrase has (decision 2026-10-04 §5).
 pub const PHRASE_WORDS: usize = 12;
 
@@ -1007,8 +1056,22 @@ pub const LABEL_CHANGE_DEVICES: &[u8] = b"cordelia v2 change devices";
 /// [`LABEL_CHANGE_DEVICES`] does the other part.
 pub const LABEL_CHANGE_PHRASE: &[u8] = b"cordelia v2 change phrase";
 
+/// The label an entry's author signs it under: the author's key signs this
+/// label and what is signed of the entry (decision 2026-10-04 §2.3).
+pub const LABEL_ENTRY_AUTHOR: &[u8] = b"cordelia v2 author";
+
+/// The label the channel's signing key signs an entry under, over the
+/// same bytes as the author's (decision 2026-10-04 §2.3). Each signature
+/// has a label of its own, so that neither is ever taken for the other.
+pub const LABEL_ENTRY_CHANNEL: &[u8] = b"cordelia v2 channel";
+
+/// The label that binds an entry's content to its channel's ID, its slot
+/// and its revision: the four are the associated data of its encryption
+/// (decision 2026-10-04 §2.3).
+pub const LABEL_ENTRY_CONTENT: &[u8] = b"cordelia v2 content";
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 15] = [
+pub const LABELS: [&[u8]; 18] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1024,6 +1087,9 @@ pub const LABELS: [&[u8]; 15] = [
     LABEL_STATEMENT,
     LABEL_CHANGE_DEVICES,
     LABEL_CHANGE_PHRASE,
+    LABEL_ENTRY_AUTHOR,
+    LABEL_ENTRY_CHANNEL,
+    LABEL_ENTRY_CONTENT,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -1498,6 +1564,34 @@ mod tests {
         assert_eq!(SEALED_SECRET_BYTES, 92);
         assert_eq!(MAX_EARLIER_SECRETS, 8);
         assert_eq!(MAX_RECOVERY_KEYS, 64);
+    }
+
+    /// The bounds of an entry, and the room that is kept in every entry
+    /// for its chain: at every bound together the content is 64,035 bytes
+    /// of the 65,536 it may be.
+    #[test]
+    fn test_entry_bounds_decision_2026_10_04_2_3() {
+        assert_eq!(MIN_ENTRY_CONTENT_BYTES, 256);
+        assert_eq!(MAX_ENTRY_LINKS, 40);
+        assert_eq!(MAX_ENTRY_NAME_AND_VALUE_BYTES, 61_440); // 60 KB
+        // A count, and 40 links of a hash and a key: 2,560 bytes of links.
+        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 2 + 40 * 64);
+        assert_eq!(MAX_ENTRY_CHAIN_BYTES, 2_562);
+        let at_every_bound = ITEM_SEAL_OVERHEAD_BYTES
+            + 2
+            + 1
+            + 2
+            + MAX_ENTRY_NAME_AND_VALUE_BYTES
+            + MAX_ENTRY_CHAIN_BYTES;
+        assert_eq!(at_every_bound, 64_035);
+        assert_eq!(MAX_ITEM_BYTES - at_every_bound, 1_501);
+        // Nine sizes: each power of two from 256 bytes to 64 KB.
+        let sizes = (MIN_ENTRY_CONTENT_BYTES..=MAX_ITEM_BYTES)
+            .filter(|size| size.is_power_of_two())
+            .count();
+        assert_eq!(sizes, 9);
+        // The clear fields and the two signatures.
+        assert_eq!(ENTRY_CLEAR_BYTES, 233);
     }
 
     #[test]

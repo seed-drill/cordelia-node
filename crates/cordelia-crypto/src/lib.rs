@@ -10,7 +10,9 @@
 //! ([`phrase`]), the statement of a person's devices ([`statement`]), and
 //! the entry that carries a statement to a device ([`change_entry`]). Each
 //! is pure functions, with vectors in
-//! `docs/reference/step4-test-vectors.json`.
+//! `docs/reference/step4-test-vectors.json`. Beside them is an entry in
+//! the form such a channel has, with its seal, its two signatures and its
+//! chain ([`entry`]).
 
 pub mod aes_gcm;
 pub mod bech32;
@@ -18,6 +20,7 @@ pub mod change_entry;
 pub mod channel_state;
 pub mod derive;
 pub mod ecies;
+pub mod entry;
 pub mod identity;
 pub mod phrase;
 pub mod psk_envelope;
