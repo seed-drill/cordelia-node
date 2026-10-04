@@ -305,10 +305,10 @@ channel. Each of them starts to use the new key when it applies the channel's
 new state. Once it has applied that state and the personal channel's, each
 stops taking what the removed device writes there. A device that has not
 applied the channel's new state still writes under the key from before, and
-still takes what the removed device writes there (decision record §9). What the
-removed device last wrote in a channel is kept, as far as the device that
-changes that channel's key holds it: that device publishes those entries
-again.
+still takes what the removed device writes there (decision record §9). Each
+entry in a channel whose current value the removed device wrote is published
+again by the device that changes that channel's key, as far as that device
+holds it, can read it and can publish it again.
 
 The threats Cordelia defends against, the ones it does not, and the tests
 that prove each claim are in

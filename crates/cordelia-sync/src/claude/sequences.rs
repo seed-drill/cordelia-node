@@ -10,8 +10,8 @@
 //!   So a run with every device as it is built, and a run of the same
 //!   sequence with every device as it was before, end every step with
 //!   the same files, the same versions in the channel and the same
-//!   records, on every device that is still the person's. Only the conflict files may differ, and only by there being
-//!   more of them.
+//!   records, on every device that is still the person's. Only the
+//!   conflict files may differ, and only by there being more of them.
 //! - **The keep.** With every device as built, no text that an edit wrote
 //!   is in no file at the end, unless someone edited or deleted a file
 //!   while it held that text.
@@ -1252,7 +1252,13 @@ fn sync_the_rest(n: usize) -> Vec<Step> {
 /// channel and the same records after every step, and the rule only adds
 /// conflict files. With every device as built it does add one, in each of
 /// the two, for some seed. (The harness's removal reaches every device at
-/// once, and changes no key: what a node does besides is not in it.)
+/// once, and changes no key: what a node does besides is not in it. And
+/// the two runs can differ only in the mixes where the device that removes
+/// and the device that holds the overtaken text (in the first sequence
+/// device 2 or device 3, as the tie goes) are both as built: in the
+/// others either nothing that is published after the removal says
+/// anything, or the device that holds the overtaken text reads none of
+/// it, and the two runs come to the same.)
 #[test]
 fn the_rule_changes_no_file_through_a_removal() {
     let (until, then) = a_removal_and_then_a_tie();
