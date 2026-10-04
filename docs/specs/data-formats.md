@@ -435,8 +435,8 @@ millisecond within it; the last three are random. So names sort by age, two
 records made in different milliseconds are in the order they were made, and a
 record that cannot be read still has an age. A record whose change has not been
 made yet has `.pending` after its id. One that was pending and belonged to
-no change in hand (found when the node started, or at a sweep) has
-`.interrupted`: its change may or may not have been made. Nothing else in
+no change in hand (found when the node started, at a sweep, or before a drop)
+has `.interrupted`: its change may or may not have been made. Nothing else in
 the directory is a record.
 
 **A record's content** is one line of JSON, a line break, and then the text

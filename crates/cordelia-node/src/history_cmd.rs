@@ -437,7 +437,7 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
             ),
             None => {}
         }
-        if result["behind"] == true {
+        if wrote && result["behind"] == true {
             out.push_str(
                 "  This device's copy was behind the version that replaced it. Another device \
                  may hold a newer text than the one restored.\n",
@@ -463,10 +463,10 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
                  for now. When it has joined, {WHEN_IT_SYNCS}.\n"
             )),
             _ => out.push_str(&format!(
-                "  Whether this folder syncs cannot be told just now: `cordelia sync status` \
-                 says, once a sync cycle has finished. If it syncs, this text goes to your \
-                 other devices at the next sync, as an edit. If it does not, the file stays on \
-                 this device, and when the folder syncs again, {WHEN_IT_SYNCS}.\n"
+                "  Whether this folder syncs cannot be told from the last sync cycle: \
+                 `cordelia sync status` says how the folder stands. If it syncs, this text \
+                 goes to your other devices at the next sync, as an edit. If it does not, the \
+                 file stays on this device, and when the folder syncs again, {WHEN_IT_SYNCS}.\n"
             )),
         }
         let gone: Vec<&str> = result["lines_gone"]
@@ -495,7 +495,7 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
 /// What `cordelia history drop` prints.
 fn dropped(answer: &Value, all: bool) -> String {
     let removed = answer["removed"].as_u64().unwrap_or(0);
-    // What was to go and is still there is said first, and last.
+    // What was to go and is still there is said once, after what went.
     let left = match answer["left"].as_u64().unwrap_or(0) {
         0 => String::new(),
         left => format!(
@@ -807,7 +807,7 @@ mod tests {
             { "id": "68dfb3a4c91e0a", "done": true,
               "message": "/m/same.md already holds that text. Nothing changed",
               "file": "/m/same.md", "undo": null, "was_absent": false, "syncs": "yes",
-              "behind": false, "lines_gone": [] },
+              "behind": true, "lines_gone": [] },
         ]});
         let (out, failed) = restored(&answer, "a1b2c3d4e5f6", false);
         assert_eq!(failed, 1);
@@ -839,6 +839,9 @@ mod tests {
         let same = out.find("already holds that text").unwrap();
         assert!(!out[same..].contains("To undo"), "{out}");
         assert!(!out[same..].contains("your other devices"), "{out}");
+        // Nor that another device may hold a newer text than the one
+        // restored, though the record is marked so: none was restored.
+        assert!(!out[same..].contains("may hold a newer text"), "{out}");
 
         // What is said of the folder, for each answer the node gives.
         let said = |syncs: Value| {
@@ -865,7 +868,10 @@ mod tests {
         // outcomes are said.
         for unknown in [json!("unknown"), json!("later"), Value::Null] {
             let out = said(unknown);
-            assert!(out.contains("cannot be told just now"), "{out}");
+            assert!(
+                out.contains("cannot be told from the last sync cycle"),
+                "{out}"
+            );
             assert!(
                 out.contains("If it syncs") && out.contains("If it does not"),
                 "{out}"

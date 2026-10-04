@@ -623,8 +623,9 @@ pub fn drop_records(
     // A record left pending holds a text too: its change could not be
     // finished, or it could not be made final. Whoever holds the turn has
     // no change in hand, so each is marked first, and is then listed with
-    // the rest.
-    store.recover().map_err(io("cannot be read"))?;
+    // the rest. One that cannot be marked is in no listing: it is still
+    // looked at, by what it says of itself.
+    let stuck = store.recover().map_err(io("cannot be read"))?.left;
     let of = request.of.as_deref().unwrap_or_default();
     let dir = claude_dir(state)?;
     let listing = store.list().map_err(io("cannot be read"))?;
@@ -635,8 +636,10 @@ pub fn drop_records(
     let texts: Vec<&str> = listing
         .records
         .iter()
-        .filter(|r| asked(&r.about))
-        .filter_map(|r| r.about.kept.as_ref().map(|k| k.sha256.as_str()))
+        .map(|r| &r.about)
+        .chain(&stuck)
+        .filter(|about| asked(about))
+        .filter_map(|about| about.kept.as_ref().map(|k| k.sha256.as_str()))
         .collect();
     let same_text = |about: &About| {
         about
@@ -644,13 +647,13 @@ pub fn drop_records(
             .as_ref()
             .is_some_and(|k| texts.contains(&k.sha256.as_str()))
     };
-    let gone: Vec<&Record> = listing
-        .records
-        .iter()
-        .filter(|r| asked(&r.about) || same_text(&r.about))
-        .collect();
+    let to_go = |about: &About| asked(about) || same_text(about);
+    let gone: Vec<&Record> = listing.records.iter().filter(|r| to_go(&r.about)).collect();
     let ids: Vec<Id> = gone.iter().map(|r| r.id.clone()).collect();
     let (removed, left) = store.remove(&ids);
+    // What was to go and is still pending is still on this device. A drop
+    // that passed it over would say that nothing was left.
+    let stuck = stuck.iter().filter(|about| to_go(about)).count();
     Ok(DropResponse {
         dropped: gone
             .into_iter()
@@ -658,7 +661,7 @@ pub fn drop_records(
             .map(Line::of)
             .collect(),
         removed,
-        left: left.len(),
+        left: left.len() + stuck,
     })
 }
 
@@ -1407,6 +1410,35 @@ mod tests {
         assert_eq!((all.removed, all.left), (3, 1));
         assert!(n.ids().is_empty());
         assert!(stuck.is_dir());
+    }
+
+    /// A record left pending that cannot be marked is in no listing. One
+    /// that was to go, for what was asked or for the text it holds, is
+    /// still on this device, and the answer counts it: a drop that passed
+    /// it over would say that there were no such records.
+    #[test]
+    fn test_a_drop_counts_a_pending_record_that_it_cannot_reach() {
+        let n = node();
+        let asked = n.left_pending("notes.md", "a token\n", 0);
+        let copy = n.left_pending("notes.conflict-0a1b2c3d.md", "a token\n", 1);
+        let other = n.left_pending("other.md", "something else\n", 2);
+        // Something that is not a file has the name each would be marked
+        // under, so none can be.
+        let history = n.state.home_dir.join("history");
+        for id in [&asked, &copy, &other] {
+            std::fs::create_dir(history.join(format!("{id}.interrupted"))).unwrap();
+        }
+        let request = DropRequest {
+            of: Some("lab".into()),
+            file: Some("notes.md".into()),
+            ..Default::default()
+        };
+        let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
+        assert!(dropped.dropped.is_empty());
+        assert_eq!((dropped.removed, dropped.left), (0, 2));
+        for id in [&asked, &copy, &other] {
+            assert!(history.join(format!("{id}.pending")).is_file());
+        }
     }
 
     /// A record that cannot be removed is passed over, and the rest that

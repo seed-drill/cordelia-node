@@ -37,8 +37,9 @@ use serde::{Deserialize, Serialize};
 const DIR: &str = "history";
 /// A record whose change has not been made yet.
 const PENDING: &str = ".pending";
-/// A pending record found when the node started: its change may or may
-/// not have been made.
+/// A pending record that belonged to no change in hand when it was found
+/// (as the node started, at a sweep, or before a drop): its change may or
+/// may not have been made.
 const INTERRUPTED: &str = ".interrupted";
 
 /// A record's id: 14 lower-case hex digits.
@@ -168,8 +169,8 @@ pub struct About {
 pub struct Record {
     pub id: Id,
     pub about: About,
-    /// It was pending when the node started: its change may or may not
-    /// have been made.
+    /// It was pending, and belonged to no change in hand, when it was
+    /// found: its change may or may not have been made.
     pub interrupted: bool,
     /// The size of the record's file.
     pub bytes: u64,
@@ -187,12 +188,24 @@ pub struct Listing {
     pub bytes: u64,
 }
 
+/// What [`Store::recover`] found.
+#[derive(Debug, Default)]
+pub struct Recovered {
+    /// How many pending records were marked.
+    pub marked: usize,
+    /// What each pending record that could not be marked says of itself,
+    /// where that can be read. These are left as they were, pending, and
+    /// are in no listing.
+    pub left: Vec<About>,
+}
+
 /// What a sweep removed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Swept {
     /// Records older than the age kept.
     pub aged: usize,
-    /// Records removed, oldest first, to bring the store under its size.
+    /// Records removed to bring the store under its size: one that is
+    /// over the size by itself, and otherwise the oldest first.
     pub over: usize,
     /// What was to go and could not be removed. It is passed over, and
     /// the sweep goes on.
@@ -287,7 +300,10 @@ impl Store {
         let Some(store) = Self::new(home, days, max_bytes) else {
             return Start::Off(Self::turn_off(home));
         };
-        let interrupted = store.prepare().and_then(|()| store.recover());
+        let interrupted = store
+            .prepare()
+            .and_then(|()| store.recover())
+            .map(|found| found.marked);
         let swept = store.sweep(now);
         Start::On {
             store,
@@ -408,7 +424,8 @@ impl Store {
     /// record stands.
     pub fn settle(&self, mut pending: Pending) -> std::io::Result<Id> {
         // The change was made, so the text stays whatever becomes of the
-        // rename: left pending, it is found and marked at the next start.
+        // rename: left pending, it is found and marked at the next sweep,
+        // drop or start.
         pending.settled = true;
         std::fs::rename(&pending.path, self.dir.join(pending.id.as_str()))?;
         Ok(pending.id.clone())
@@ -417,17 +434,19 @@ impl Store {
     /// Mark the pending records that belong to no change in hand: the
     /// node stopped between keeping the text and finishing the change, or
     /// a record could not be made final, so the change may or may not
-    /// have been made. Returns how many were marked. One that cannot be
-    /// marked is left, and the rest are.
-    pub fn recover(&self) -> std::io::Result<usize> {
-        let mut found = 0;
+    /// have been made. One that cannot be marked is left, and the rest
+    /// are: the answer says how many were marked, and what was left.
+    pub fn recover(&self) -> std::io::Result<Recovered> {
+        let mut found = Recovered::default();
         for name in self.names()? {
             if let Some((id, PENDING)) = record_name(&name) {
+                let pending = self.dir.join(&name);
                 let marked = self.dir.join(format!("{id}{INTERRUPTED}"));
-                match std::fs::rename(self.dir.join(&name), marked) {
-                    Ok(()) => found += 1,
+                match std::fs::rename(&pending, marked) {
+                    Ok(()) => found.marked += 1,
                     Err(error) => {
-                        tracing::warn!(record = %id, %error, "a pending history record could not be marked")
+                        tracing::warn!(record = %id, %error, "a pending history record could not be marked");
+                        found.left.extend(read_about(&pending));
                     }
                 }
             }
@@ -551,10 +570,11 @@ impl Store {
         (removed, left)
     }
 
-    /// Remove what is older than the age kept, then, while the store is
-    /// over its size, the oldest records, whatever file they are of.
-    /// Records that cannot be read go by the same rules: their age is in
-    /// their name. What cannot be removed is counted and passed over.
+    /// Remove what is older than the age kept. Then, while the store is
+    /// over its size, a record that is over the size by itself, and after
+    /// that the oldest records, whatever file they are of. Records that
+    /// cannot be read go by the same rules: their age is in their name.
+    /// What cannot be removed is counted and passed over.
     ///
     /// Whoever sweeps holds the turn, or runs before anything else does,
     /// so no change is in hand: a pending record was left behind, and is
@@ -823,8 +843,9 @@ mod tests {
         let pending = s.keep(about("b.md", Some("y")), Some("y"), at(2)).unwrap();
         let stopped = pending.id().clone();
         std::mem::forget(pending);
-        assert_eq!(s.recover().unwrap(), 1);
-        assert_eq!(s.recover().unwrap(), 0);
+        assert_eq!(s.recover().unwrap().marked, 1);
+        let again = s.recover().unwrap();
+        assert_eq!((again.marked, again.left.len()), (0, 0));
         let (record, text) = s.read(&stopped).unwrap().unwrap();
         assert!(record.interrupted);
         assert_eq!(text.as_deref(), Some("y"));

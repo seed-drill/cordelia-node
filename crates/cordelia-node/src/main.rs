@@ -1273,9 +1273,33 @@ fn adapter_for<A>(
     slot.get_or_insert_with(make)
 }
 
+/// What is done once in every `every`: when it was last due, or when the
+/// count began.
+struct Every {
+    since: std::time::Instant,
+    every: std::time::Duration,
+}
+
+impl Every {
+    fn from(since: std::time::Instant, every: std::time::Duration) -> Self {
+        Self { since, every }
+    }
+
+    /// Whether it is due at `now`: `every` has passed since it last was.
+    /// Asked again before another has passed, it is not.
+    fn is_due(&mut self, now: std::time::Instant) -> bool {
+        let due = now.duration_since(self.since) >= self.every;
+        if due {
+            self.since = now;
+        }
+        due
+    }
+}
+
 /// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
 /// adapter cycle (if sync is on) off the async runtime, and store its
-/// report for `cordelia sync status`.
+/// report for `cordelia sync status`. Once in every
+/// `HISTORY_SWEEP_INTERVAL_SECS` it sweeps local history first.
 async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
     use cordelia_storage::meta;
     use cordelia_sync::claude::ClaudeAdapter;
@@ -1286,9 +1310,10 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         cordelia_sync::claude::CYCLE_SECS,
     ));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let sweep_every =
-        std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS);
-    let mut swept = std::time::Instant::now();
+    let mut sweep = Every::from(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS),
+    );
 
     loop {
         tokio::select! {
@@ -1297,10 +1322,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         }
         let state = state.clone();
         let adapter = adapter.clone();
-        let sweep = swept.elapsed() >= sweep_every;
-        if sweep {
-            swept = std::time::Instant::now();
-        }
+        let sweep = sweep.is_due(std::time::Instant::now());
         let _ = tokio::task::spawn_blocking(move || {
             // In its own turn, whether or not sync is on: history ages
             // either way.
@@ -2088,10 +2110,13 @@ fn api_post(
 }
 
 /// How long a command that waits without a limit waits before it says so:
-/// as long as the node waits for its turn before it answers that it is
-/// busy. A wait longer than that is for work the node has begun.
+/// a little longer than the node waits for its turn before it answers
+/// that it is busy, so that the answer comes first, and this is not said
+/// a moment ahead of it. (The command's wait begins before the request is
+/// sent, and the node's when it takes the request up.) A wait longer
+/// than this is for work the node has begun.
 const STILL_WAITING_AFTER: std::time::Duration =
-    std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_TURN_WAIT_SECS);
+    std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_TURN_WAIT_SECS + 2);
 
 /// Run `say` if nothing has come on `done`, and its other end is still
 /// held, when `wait` is up. The other end is dropped when the node has
@@ -2104,6 +2129,22 @@ fn say_if_not_done(
     if done.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
         say();
     }
+}
+
+/// Do `work`, and run `say` once, from another thread, if it is still
+/// going when `wait` is up. With no `wait` nothing is said.
+fn saying_if_long<T>(
+    wait: Option<std::time::Duration>,
+    say: impl FnOnce() + Send + 'static,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (answered, done) = std::sync::mpsc::channel::<()>();
+    if let Some(wait) = wait {
+        std::thread::spawn(move || say_if_not_done(done, wait, say));
+    }
+    let out = work();
+    drop(answered);
+    out
 }
 
 /// What a command says while it waits for the node with no limit. A
@@ -2140,15 +2181,13 @@ fn api_post_within(
 
     let agent: ureq::Agent = client.http_status_as_error(false).build().into();
     // With no limit, the command says once that it is still waiting.
-    let (answered, done) = std::sync::mpsc::channel::<()>();
-    if limit.is_none() {
-        std::thread::spawn(move || say_if_not_done(done, STILL_WAITING_AFTER, still_waiting));
-    }
-    let sent = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {}", token.trim()))
-        .send_json(&body);
-    drop(answered);
+    let say_after = limit.is_none().then_some(STILL_WAITING_AFTER);
+    let sent = saying_if_long(say_after, still_waiting, || {
+        agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", token.trim()))
+            .send_json(&body)
+    });
     let mut resp = sent.map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
@@ -4141,11 +4180,55 @@ mod tests {
         drop(answered);
         say_if_not_done(done, std::time::Duration::from_secs(60), say);
         assert_eq!(said.load(Ordering::SeqCst), 1);
-        // And it waits as long as the node waits for its turn.
-        assert_eq!(
-            STILL_WAITING_AFTER.as_secs(),
-            cordelia_core::protocol::HISTORY_TURN_WAIT_SECS
-        );
+        // And it waits longer than the node waits for its turn: a node
+        // that is busy says so first.
+        assert!(STILL_WAITING_AFTER.as_secs() > cordelia_core::protocol::HISTORY_TURN_WAIT_SECS);
+    }
+
+    /// Work that takes long is said to, once, while it goes on, and its
+    /// answer is what comes back. Work that is done in time has nothing
+    /// said of it, and nor has any where no wait is given.
+    #[test]
+    fn test_work_that_takes_long_is_said_to() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let said = Arc::new(AtomicUsize::new(0));
+        let say = |said: &Arc<AtomicUsize>| {
+            let said = said.clone();
+            move || {
+                said.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let soon = std::time::Duration::from_millis(20);
+        let long = std::time::Duration::from_secs(60);
+        let slow = || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            7
+        };
+        assert_eq!(saying_if_long(Some(soon), say(&said), slow), 7);
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+        assert_eq!(saying_if_long(Some(long), say(&said), || 8), 8);
+        assert_eq!(saying_if_long(None, say(&said), slow), 7);
+        // Whatever thread was to say it has had its time by now.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+    }
+
+    /// Local history is swept once in each hour: not before one has
+    /// passed, and not again until another has.
+    #[test]
+    fn test_what_is_done_each_hour_is_due_once_in_each() {
+        let start = std::time::Instant::now();
+        let hour =
+            std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS);
+        let second = std::time::Duration::from_secs(1);
+        let mut sweep = Every::from(start, hour);
+        assert!(!sweep.is_due(start));
+        assert!(!sweep.is_due(start + hour - second));
+        assert!(sweep.is_due(start + hour));
+        assert!(!sweep.is_due(start + hour + second));
+        assert!(!sweep.is_due(start + hour * 2 - second));
+        assert!(sweep.is_due(start + hour * 2));
     }
 
     #[test]

@@ -1643,14 +1643,30 @@ fn current_hash(dir: &Path, key: &str) -> Option<[u8; 32]> {
 /// Whether the file is as the cycle saw it: the same bytes, or still not
 /// there. A name that has come to hold something that cannot be read (a
 /// directory, a link to nowhere) is not absent: what it holds could not
-/// be kept, so it is not replaced. A name that cannot be looked at is
-/// taken as still not there: the write is then tried, and its failure is
-/// the file's, reported as any is, where a name passed over here would be
-/// passed over in silence every cycle.
+/// be kept, so it is not replaced. Nor is a name that cannot be looked
+/// at: nothing says that it is free ([`cannot_be_looked_at`]).
 fn as_seen(dir: &Path, key: &str, seen: Option<[u8; 32]>) -> bool {
     match seen {
         Some(hash) => current_hash(dir, key) == Some(hash),
-        None => std::fs::symlink_metadata(dir.join(key)).is_err(),
+        None => {
+            let there = std::fs::symlink_metadata(dir.join(key));
+            matches!(there, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+    }
+}
+
+/// Why a name that had no file when the cycle listed the folder cannot be
+/// looked at now, if it cannot: the name is too long for the volume, say,
+/// or the volume does not answer. Such a name is not taken for free, and
+/// what arrives for it is not written: a file made under it since would be
+/// replaced unseen. It is the file's failure, said in each cycle, where a
+/// name that was only passed over would be passed over in silence.
+fn cannot_be_looked_at(dir: &Path, key: &str) -> Option<String> {
+    match std::fs::symlink_metadata(dir.join(key)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!(
+            "its name cannot be looked at ({e}), so what arrived for it was not written"
+        )),
+        _ => None,
     }
 }
 
@@ -1859,8 +1875,8 @@ fn entry_of(device: &[u8; 32], rev: u64) -> history::Entry {
 }
 
 /// The change that a text was kept for has been made: its record stands.
-/// One that cannot be made final is left pending, and is marked when the
-/// node next starts: the text is kept either way.
+/// One that cannot be made final is left pending, and is marked at the
+/// next sweep, drop or start: the text is kept either way.
 fn settle(ctx: &Ctx, ahead: Ahead) {
     if let (Some(pending), Some(store)) = (ahead, ctx.state.history.store())
         && let Err(error) = store.settle(pending)
@@ -2171,6 +2187,8 @@ fn apply(
                     record(Some(Content::new(text).hash), entry.rev, writer)?;
                 }
                 Ok(None) => return Ok(false),
+                // Asked above, by the publish's own test: not met unless
+                // the two come to differ.
                 Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
                     too_large(report);
                     return Ok(false);
@@ -2188,6 +2206,12 @@ fn apply(
             record(None, entry.rev, writer)?;
         }
         Action::Pull { text, rev, writer } => {
+            // Asked before anything is kept, or noted, for the write.
+            if seen.is_none()
+                && let Some(why) = cannot_be_looked_at(dir, key)
+            {
+                return Err(Failure::File(why));
+            }
             // The file as it is here is kept first, or its arrival noted.
             // The last look at the file comes after: `write_atomic` makes
             // it. A write that is not made takes the record with it. What
@@ -6266,9 +6290,9 @@ mod tests {
     }
 
     /// A record stays only if its change was made. A publish that is
-    /// refused, an entry that does not fit, and a file that is written to
-    /// while its new text is flushed each take their record with them,
-    /// cycle after cycle.
+    /// refused, and a file that is written to while its new text is
+    /// flushed, each take their record with them, cycle after cycle. For
+    /// an entry that does not fit, none is made.
     #[test]
     fn a_change_that_is_not_made_leaves_no_record() {
         use history::Change;
@@ -6448,21 +6472,63 @@ mod tests {
         assert_eq!(entry.map(|(entry, _)| entry.rev), Some(3));
     }
 
-    /// A name that cannot be looked at is taken as still not there, so
-    /// that the write is tried and its failure reported: passed over, it
-    /// would be passed over in silence every cycle. (Here a name longer
-    /// than any volume takes.) A name that holds something is another
-    /// matter, and is not written over.
+    /// A name that cannot be looked at is not taken for free, and is not
+    /// passed over either: it has a reason, which the cycle reports as the
+    /// file's failure. (Here a name longer than any volume takes.) A name
+    /// with nothing under it, and one that holds something, have none:
+    /// the first is written, and the second is left for the next cycle.
     #[test]
-    fn a_name_that_cannot_be_looked_at_is_not_passed_over() {
+    fn a_name_that_cannot_be_looked_at_is_not_taken_for_free() {
         let dir = tempfile::tempdir().unwrap();
         let long = "n".repeat(4096);
         let looked = std::fs::symlink_metadata(dir.path().join(&long));
         assert!(looked.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound));
-        assert!(as_seen(dir.path(), &long, None));
+        assert!(!as_seen(dir.path(), &long, None));
+        let why = cannot_be_looked_at(dir.path(), &long).unwrap();
+        assert!(why.contains("cannot be looked at"), "{why}");
+
         assert!(as_seen(dir.path(), "absent.md", None));
+        assert_eq!(cannot_be_looked_at(dir.path(), "absent.md"), None);
         std::fs::create_dir(dir.path().join("taken.md")).unwrap();
         assert!(!as_seen(dir.path(), "taken.md", None));
+        assert_eq!(cannot_be_looked_at(dir.path(), "taken.md"), None);
+    }
+
+    /// What arrives for a name that cannot be looked at is not written, and
+    /// nothing is noted for it: a file made under the name since the folder
+    /// was listed would be replaced unseen. The cycle says so, as the
+    /// file's failure, each time, and the version is taken once the name
+    /// can be looked at.
+    #[test]
+    fn nothing_is_written_under_a_name_that_cannot_be_looked_at() {
+        use std::os::unix::fs::PermissionsExt;
+        let (p, store) = Pair::new().with_history();
+        p.other_writes("notes.md", Some("theirs\n"));
+        let mode = |mode: u32| {
+            std::fs::set_permissions(&p.mem, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o444);
+        let open_to_all = std::fs::symlink_metadata(p.mem.join("notes.md"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        mode(0o755);
+        if open_to_all {
+            eprintln!("not run: this user can look into any folder");
+            return;
+        }
+        for _ in 0..2 {
+            let report = p.cycle_with(&|| mode(0o444));
+            mode(0o755);
+            assert_eq!((report.pulled, report.failed.len()), (0, 1), "{report:?}");
+            assert_eq!(report.failed[0].name, "notes.md");
+            let why = &report.failed[0].error;
+            assert!(why.contains("cannot be looked at"), "{why}");
+            assert_eq!(p.read("notes.md"), None);
+            assert_eq!(kept_in(&store), []);
+            assert_eq!(std::fs::read_dir(&p.mem).unwrap().count(), 0);
+        }
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.failed.len()), (1, 0), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("theirs\n"));
     }
 
     /// A name that had no file when the cycle listed the folder, and has

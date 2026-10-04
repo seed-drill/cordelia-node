@@ -2599,6 +2599,18 @@ fn local_history_is_kept_as_the_configuration_says() {
     );
     let kept = n.data_dir().join("history");
     assert!(kept.is_dir());
+    // A drop that leaves something behind says so, and fails. (A
+    // directory under a record's name cannot be removed as a file.)
+    let stuck = kept.join("00000000000abc");
+    std::fs::create_dir(&stuck).unwrap();
+    let said = n.refused(&["history", "drop", "--all"]);
+    assert!(said.contains("1 records could not be removed"), "{said}");
+    assert!(stuck.is_dir());
+    std::fs::remove_dir(&stuck).unwrap();
+    assert!(
+        n.cli(&["history", "drop", "--all"])
+            .contains("Dropped all history")
+    );
     n.stop();
 
     with("[history]\ndays = 0\n");
