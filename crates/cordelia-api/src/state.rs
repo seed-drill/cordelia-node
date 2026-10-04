@@ -347,7 +347,8 @@ impl History {
     }
 
     /// Drop what is too old or over the size, in a turn of its own: the
-    /// node does every hour, whether or not sync is on.
+    /// node does every hour that the machine is awake, whether or not
+    /// sync is on.
     pub fn sweep(&self, now: chrono::DateTime<chrono::Utc>) {
         if let Some(store) = self.store() {
             let _turn = self.turn();

@@ -449,7 +449,8 @@ pub const HISTORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 pub const HISTORY_TURN_WAIT_SECS: u64 = 10;
 
 /// How often local history drops what is too old or over its size: every
-/// hour, and when the node starts (parameter-rationale.md §10).
+/// hour that the machine is awake, and when the node starts
+/// (parameter-rationale.md §10).
 pub const HISTORY_SWEEP_INTERVAL_SECS: u64 = 3600;
 
 /// And sooner, at the end of a sync cycle, once more than one part in

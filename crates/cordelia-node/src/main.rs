@@ -2132,15 +2132,19 @@ fn say_if_not_done(
 }
 
 /// Do `work`, and run `say` once, from another thread, if it is still
-/// going when `wait` is up. With no `wait` nothing is said.
+/// going when `wait` is up. With no `wait` nothing is said: `say` is let
+/// go of before the work begins.
 fn saying_if_long<T>(
     wait: Option<std::time::Duration>,
     say: impl FnOnce() + Send + 'static,
     work: impl FnOnce() -> T,
 ) -> T {
     let (answered, done) = std::sync::mpsc::channel::<()>();
-    if let Some(wait) = wait {
-        std::thread::spawn(move || say_if_not_done(done, wait, say));
+    match wait {
+        Some(wait) => {
+            std::thread::spawn(move || say_if_not_done(done, wait, say));
+        }
+        None => drop(say),
     }
     let out = work();
     drop(answered);
@@ -4188,44 +4192,60 @@ mod tests {
     /// Work that takes long is said to, once, while it goes on, and its
     /// answer is what comes back. Work that is done in time has nothing
     /// said of it, and nor has any where no wait is given.
+    ///
+    /// Nothing here has to happen inside a stretch of time. What says it
+    /// holds something that is let go of with it, so the test learns when
+    /// nobody can say it any more; and each wait below is a limit on a
+    /// failure, not a time that a pass takes.
     #[test]
     fn test_work_that_takes_long_is_said_to() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        let limit = std::time::Duration::from_secs(10);
         let said = Arc::new(AtomicUsize::new(0));
-        let say = |said: &Arc<AtomicUsize>| {
+        let say = || {
             let said = said.clone();
-            move || {
+            let (held, gone) = mpsc::channel::<()>();
+            let say = move || {
+                let _held = held;
                 said.fetch_add(1, Ordering::SeqCst);
+            };
+            (say, gone)
+        };
+        // Nobody holds what says it any more, within the limit.
+        let let_go = |gone: &mpsc::Receiver<()>| {
+            gone.recv_timeout(limit) == Err(mpsc::RecvTimeoutError::Disconnected)
+        };
+
+        // Work that goes on until it is said to: it is said to, once.
+        let (saying, gone) = say();
+        let counted = said.clone();
+        let slow = move || {
+            let began = std::time::Instant::now();
+            while counted.load(Ordering::SeqCst) == 0 && began.elapsed() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            7
         };
         let soon = std::time::Duration::from_millis(20);
-        let long = std::time::Duration::from_secs(60);
-        // Work that goes on until it is said to once more, or until
-        // `limit` is up: no thread has to wake inside a window for it.
-        let until_said = |said: &Arc<AtomicUsize>, limit: u64| {
-            let said = said.clone();
-            let already = said.load(Ordering::SeqCst);
-            move || {
-                let began = std::time::Instant::now();
-                while said.load(Ordering::SeqCst) == already
-                    && began.elapsed() < std::time::Duration::from_secs(limit)
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                7
-            }
-        };
-        let slow = until_said(&said, 10);
-        assert_eq!(saying_if_long(Some(soon), say(&said), slow), 7);
+        assert_eq!(saying_if_long(Some(soon), saying, slow), 7);
+        assert!(let_go(&gone));
         assert_eq!(said.load(Ordering::SeqCst), 1);
+
         // Done in time: the one who would have said it finds the work
         // over, and says nothing.
-        assert_eq!(saying_if_long(Some(long), say(&said), || 8), 8);
+        let (saying, gone) = say();
+        let long = std::time::Duration::from_secs(600);
+        assert_eq!(saying_if_long(Some(long), saying, || 8), 8);
+        assert!(let_go(&gone));
+        assert_eq!(said.load(Ordering::SeqCst), 1);
+
         // With no wait there is nobody to say it, however long the work
-        // takes: this one goes on for its two seconds.
-        let slow = until_said(&said, 2);
-        assert_eq!(saying_if_long(None, say(&said), slow), 7);
+        // takes: what says it is let go of before the work begins, and
+        // this work goes on until it has been.
+        let (saying, gone) = say();
+        let until_let_go = move || let_go(&gone);
+        assert!(saying_if_long(None, saying, until_let_go));
         assert_eq!(said.load(Ordering::SeqCst), 1);
     }
 

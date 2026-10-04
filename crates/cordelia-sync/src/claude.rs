@@ -6524,6 +6524,9 @@ mod tests {
             assert!(why.contains("cannot be looked at"), "{why}");
             assert_eq!(p.read("notes.md"), None);
             assert_eq!(kept_in(&store), []);
+            // Nothing was noted and then taken back either: the first
+            // text that is kept makes the directory, and it is not there.
+            assert!(!p.st.home_dir.join("history").exists());
             assert_eq!(std::fs::read_dir(&p.mem).unwrap().count(), 0);
         }
         let report = p.cycle();

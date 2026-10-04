@@ -142,7 +142,7 @@ pub struct Restored {
     /// one undoes it. `None` where the file was absent, when undoing is
     /// deleting it; and where the record could not be made final, when it
     /// is listed, as interrupted, after the next sweep of history (within
-    /// the hour, and when the node starts).
+    /// an hour of the machine being awake, and when the node starts).
     pub undo: Option<String>,
     /// There was no file: the restore brought it back.
     pub was_absent: bool,
@@ -605,6 +605,17 @@ pub fn drop_records(
     request: &DropRequest,
     wait: Duration,
 ) -> Result<DropResponse, ApiError> {
+    drop_with(state, request, wait, &|| {})
+}
+
+/// [`drop_records`], with what a test does once the drop has found what
+/// is to go, and before it removes anything.
+fn drop_with(
+    state: &AppState,
+    request: &DropRequest,
+    wait: Duration,
+    removing: &dyn Fn(),
+) -> Result<DropResponse, ApiError> {
     let store = store_of(state)?;
     if request.all == request.of.is_some() {
         return Err(ApiError::BadRequest(
@@ -613,6 +624,7 @@ pub fn drop_records(
     }
     let _turn = turn(state, wait)?;
     if request.all {
+        removing();
         let (removed, left) = store.clear().map_err(io("could not be cleared"))?;
         return Ok(DropResponse {
             dropped: Vec::new(),
@@ -656,6 +668,7 @@ pub fn drop_records(
     let to_go = |about: &About| asked(about) || same_text(about);
     let gone: Vec<&Record> = listing.records.iter().filter(|r| to_go(&r.about)).collect();
     let ids: Vec<Id> = gone.iter().map(|r| r.id.clone()).collect();
+    removing();
     let (mut removed, left) = store.remove(&ids);
     let mut dropped: Vec<Line> = gone
         .into_iter()
@@ -665,10 +678,12 @@ pub fn drop_records(
     let mut left = left.len();
     // What was to go and is still pending goes too, as it is. One that
     // cannot be removed either is still on this device, and is counted: a
-    // drop that passed it over would say that nothing was left.
+    // drop that passed it over would say that nothing was left. (One that
+    // is no longer there is neither.)
     for (id, about) in stuck.into_iter().filter(|(_, about)| to_go(about)) {
         match store.remove_pending(id) {
-            Ok(()) => {
+            Ok(false) => {}
+            Ok(true) => {
                 removed += 1;
                 dropped.push(Line::of(&Record {
                     id: id.clone(),
@@ -1468,6 +1483,93 @@ mod tests {
         }
         // Another file's, with another text, is not this drop's.
         assert!(history.join(format!("{other}.pending")).is_file());
+    }
+
+    /// A record left pending that cannot be marked, and says nothing of
+    /// itself that can be read, is not a named drop's: nothing shows whose
+    /// it is. It is not counted, and it stays. `--all` takes it.
+    #[test]
+    fn test_a_pending_record_that_cannot_be_read_goes_only_with_all() {
+        let n = node();
+        let unread = n.left_pending("notes.md", "a token\n", 0);
+        let history = n.state.home_dir.join("history");
+        let pending = history.join(format!("{unread}.pending"));
+        std::fs::write(&pending, "not a line of JSON\na token\n").unwrap();
+        let held = history.join(format!("{unread}.interrupted"));
+        std::fs::create_dir(&held).unwrap();
+        let request = DropRequest {
+            of: Some("lab".into()),
+            file: Some("notes.md".into()),
+            ..Default::default()
+        };
+        let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
+        assert_eq!((dropped.removed, dropped.left), (0, 0));
+        assert!(dropped.dropped.is_empty());
+        assert!(pending.is_file());
+        // Everything: the record goes. (What holds the name it would be
+        // marked under is no file, and is counted as still there.)
+        let request = DropRequest {
+            all: true,
+            ..Default::default()
+        };
+        let all = drop_records(&n.state, &request, NO_WAIT).unwrap();
+        assert_eq!((all.removed, all.left), (1, 1));
+        assert!(!pending.exists());
+    }
+
+    /// A record left pending that cannot be marked, and has gone by the
+    /// time the drop would remove it, is neither dropped nor still there:
+    /// nothing of it is left on this device.
+    #[test]
+    fn test_a_pending_record_that_has_gone_is_not_counted() {
+        let n = node();
+        let kept = n.kept("notes.md", Change::Pulled, Some("one\n"), 0);
+        let stuck = n.left_pending("notes.md", "two\n", 1);
+        let history = n.state.home_dir.join("history");
+        std::fs::create_dir(history.join(format!("{stuck}.interrupted"))).unwrap();
+        let pending = history.join(format!("{stuck}.pending"));
+        let request = DropRequest {
+            of: Some("lab".into()),
+            ..Default::default()
+        };
+        // Something else removes it once the drop has found it.
+        let removing = || std::fs::remove_file(&pending).unwrap();
+        let dropped = drop_with(&n.state, &request, NO_WAIT, &removing).unwrap();
+        assert_eq!((dropped.removed, dropped.left), (1, 0));
+        let ids: Vec<&str> = dropped.dropped.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, [kept.as_str()]);
+    }
+
+    /// A drop holds the turn while it removes, whichever it was asked
+    /// for: no cycle keeps a text, and no other command reads the store,
+    /// between its look at what is there and its removing.
+    #[test]
+    fn test_a_drop_holds_the_turn_while_it_removes() {
+        let n = node();
+        n.kept("notes.md", Change::Pulled, Some("one\n"), 0);
+        n.left_pending("notes.md", "two\n", 1);
+        let asked = std::cell::Cell::new(0);
+        let removing = || {
+            let free = n.state.history.turn_within(Duration::ZERO).is_some();
+            assert!(!free, "the drop let go of the turn before it removed");
+            asked.set(asked.get() + 1);
+        };
+        let named = DropRequest {
+            of: Some("lab".into()),
+            ..Default::default()
+        };
+        let dropped = drop_with(&n.state, &named, NO_WAIT, &removing).unwrap();
+        assert_eq!((dropped.removed, dropped.left), (2, 0));
+        n.kept("notes.md", Change::Pulled, Some("three\n"), 2);
+        let all = DropRequest {
+            all: true,
+            ..Default::default()
+        };
+        let dropped = drop_with(&n.state, &all, NO_WAIT, &removing).unwrap();
+        assert_eq!((dropped.removed, dropped.left), (1, 0));
+        assert_eq!(asked.get(), 2);
+        // And lets go of it when it is done.
+        assert!(n.state.history.turn_within(Duration::ZERO).is_some());
     }
 
     /// A record that cannot be removed is passed over, and the rest that

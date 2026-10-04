@@ -211,7 +211,7 @@ Local history: the text of a memory file as it was before sync replaced or remov
 | `days` | integer | `30` | >= 0 | 1 | How long a kept text stays. `0` turns history off and removes what is kept. | parameter-rationale.md §10 |
 | `max_bytes` | integer | `268435456` (256 MB) | >= 0 | 1 | The most that is kept. Over it, the oldest records go first. | parameter-rationale.md §10 |
 
-Both bounds are applied when the node starts, every hour, and at the end of a sync cycle once more than an eighth of `max_bytes` has been kept since they were last applied. Between two of those the store can hold more than `max_bytes`. A record larger than `max_bytes` goes the next time, and with `max_bytes = 0` nothing stays past it: texts are still kept before each change, and are there to restore only until then.
+Both bounds are applied when the node starts, every hour that the machine is awake, and at the end of a sync cycle once more than an eighth of `max_bytes` has been kept since they were last applied. Between two of those the store can hold more than `max_bytes`. A record larger than `max_bytes` goes the next time, and with `max_bytes = 0` nothing stays past it: texts are still kept before each change, and are there to restore only until then.
 
 ## 3. Example Configuration
 

@@ -464,9 +464,14 @@ impl Store {
 
     /// Remove a pending record that could not be marked: what a drop does
     /// with one that was to go. Whoever does it holds the turn, so the
-    /// record belongs to no change in hand.
-    pub fn remove_pending(&self, id: &Id) -> std::io::Result<()> {
-        std::fs::remove_file(self.dir.join(format!("{id}{PENDING}")))
+    /// record belongs to no change in hand. `false` where it is no longer
+    /// there: something else has removed it, and nothing of it is left.
+    pub fn remove_pending(&self, id: &Id) -> std::io::Result<bool> {
+        match std::fs::remove_file(self.dir.join(format!("{id}{PENDING}"))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The names in the directory, sorted: oldest record first. A
@@ -572,11 +577,20 @@ impl Store {
     /// be removed is passed over, and the rest go. Returns how many went,
     /// and the ids of those that are still there.
     pub fn remove(&self, ids: &[Id]) -> (usize, Vec<Id>) {
+        self.remove_by(ids, &|path| std::fs::remove_file(path))
+    }
+
+    /// [`Self::remove`], given what removes a file.
+    fn remove_by(
+        &self,
+        ids: &[Id],
+        unlink: &dyn Fn(&Path) -> std::io::Result<()>,
+    ) -> (usize, Vec<Id>) {
         let mut removed = 0;
         let mut left = Vec::new();
         for id in ids {
             if let Some((path, _)) = self.path_of(id) {
-                match std::fs::remove_file(path) {
+                match unlink(&path) {
                     Ok(()) => removed += 1,
                     Err(_) => left.push(id.clone()),
                 }
@@ -619,7 +633,7 @@ impl Store {
         }
         let mut total: u64 = held.iter().map(|(_, bytes, _)| bytes).sum();
         // A record that is over the size by itself goes first, and alone:
-        // taken oldest first, every other record would go before it, and
+        // taken oldest first, the older records would go before it, and
         // then it. After that the oldest go, until the store is within
         // its size.
         for alone in [true, false] {
@@ -1180,6 +1194,46 @@ mod tests {
     }
 
     /// What a sweep cannot remove does not stop it: the rest still go.
+    /// A removal goes on past a record that cannot be removed: the rest
+    /// go, and the answer names the one that is still there. (What removes
+    /// a file is given here, so that this is shown for any user: a
+    /// directory that is closed stops nobody who is root.)
+    #[test]
+    fn test_a_removal_goes_on_past_a_record_that_cannot_be_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let ids: Vec<Id> = (0..3)
+            .map(|n| keep(&s, "a.md", Some("x\n"), at(n)))
+            .collect();
+        let held = tmp.path().join(DIR).join(ids[1].as_str());
+        let unlink = |path: &Path| match path == held {
+            true => Err(std::io::Error::other("held")),
+            false => std::fs::remove_file(path),
+        };
+        assert_eq!(s.remove_by(&ids, &unlink), (2, vec![ids[1].clone()]));
+        assert_eq!(files(tmp.path()), [ids[1].as_str().to_string()]);
+        // One that is not there is passed over, and is not still there.
+        assert_eq!(s.remove(&ids), (1, vec![]));
+        assert_eq!(files(tmp.path()), Vec::<String>::new());
+    }
+
+    /// A pending record that could not be marked is removed as it is. One
+    /// that has gone meanwhile is not an error: nothing of it is left.
+    #[test]
+    fn test_a_pending_record_is_removed_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let pending = s
+            .keep(about("a.md", Some("x\n")), Some("x\n"), at(0))
+            .unwrap();
+        let id = pending.id().clone();
+        std::mem::forget(pending);
+        assert_eq!(files(tmp.path()), [format!("{id}{PENDING}")]);
+        assert!(s.remove_pending(&id).unwrap());
+        assert_eq!(files(tmp.path()), Vec::<String>::new());
+        assert!(!s.remove_pending(&id).unwrap());
+    }
+
     #[test]
     fn test_a_sweep_goes_on_past_what_it_cannot_remove() {
         let tmp = tempfile::tempdir().unwrap();
