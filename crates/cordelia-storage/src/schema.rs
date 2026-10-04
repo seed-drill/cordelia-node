@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -334,6 +334,72 @@ CREATE UNIQUE INDEX idx_entries_channel_seq ON entries(channel_id, seq);
 INSERT OR IGNORE INTO counters (name, value) VALUES ('entry_seq', 0);
 "#;
 
+/// Migration v12: what a device holds of its person (decision 2026-10-04
+/// §3 to §6, `person`), beside everything that is there, which stays as it
+/// is. It is in the node's database so that it changes in one transaction
+/// with a statement (§3).
+///
+/// - `person`: one row, or none where the device follows no phrase. What
+///   it follows (the phrase's public key, the statement key and the ID of
+///   the phrase's channel: never the words), the statement it has applied
+///   as its signed bytes, and the state it is in.
+/// - `person_secrets`: its secrets by statement number. The one it has
+///   applied has no time. Each one it left has the time it left it, by
+///   its own clock, in seconds.
+/// - `person_change_entries`: the latest change entry it has seen, whole,
+///   and the one made apart from it where it is in a fork.
+/// - `person_additions`: the records of additions it has seen under the
+///   applied statement, in the order it saw them, each counted or not.
+/// - `person_names`: the names it holds in the current generation, each
+///   with its channel's ID, so that either is found from the other.
+const MIGRATION_V12: &str = r#"
+CREATE TABLE person (
+    one             INTEGER PRIMARY KEY CHECK(one = 1),
+    state           TEXT NOT NULL
+                    CHECK(state IN ('applied', 'fork', 'removed', 'not_listed', 'not_opened')),
+    phrase_key      BLOB NOT NULL CHECK(length(phrase_key) = 32),
+    statement_key   BLOB NOT NULL CHECK(length(statement_key) = 32),
+    phrase_channel  BLOB NOT NULL CHECK(length(phrase_channel) = 32),
+    statement       BLOB NOT NULL
+);
+
+CREATE TABLE person_secrets (
+    number   INTEGER NOT NULL CHECK(number BETWEEN 1 AND 256),
+    secret   BLOB NOT NULL CHECK(length(secret) = 32),
+    left_at  INTEGER,
+    PRIMARY KEY (number, secret)
+);
+
+CREATE UNIQUE INDEX idx_person_secrets_applied ON person_secrets((left_at IS NULL))
+    WHERE left_at IS NULL;
+
+CREATE TABLE person_change_entries (
+    kept            TEXT PRIMARY KEY CHECK(kept IN ('latest', 'apart')),
+    channel         BLOB NOT NULL CHECK(length(channel) = 32),
+    slot            BLOB NOT NULL CHECK(length(slot) = 32),
+    author          BLOB NOT NULL CHECK(length(author) = 32),
+    rev             INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+    content         BLOB NOT NULL,
+    author_sig      BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig     BLOB NOT NULL CHECK(length(channel_sig) = 64)
+);
+
+CREATE TABLE person_additions (
+    seen     INTEGER PRIMARY KEY,
+    record   BLOB NOT NULL UNIQUE,
+    key      BLOB NOT NULL CHECK(length(key) = 32),
+    adder    BLOB NOT NULL CHECK(length(adder) = 32),
+    counted  INTEGER NOT NULL CHECK(counted IN (0, 1)),
+    seen_at  INTEGER NOT NULL
+);
+
+CREATE TABLE person_names (
+    name     TEXT PRIMARY KEY CHECK(length(name) >= 1),
+    channel  BLOB NOT NULL UNIQUE CHECK(length(channel) = 32),
+    held_at  INTEGER NOT NULL
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -441,6 +507,11 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 11 {
         tracing::info!("applying migration v11 (entries of a channel from its secret)");
         migrate_in_one(conn, MIGRATION_V11, 11)?;
+    }
+
+    if current < 12 {
+        tracing::info!("applying migration v12 (what a device holds of its person)");
+        migrate_in_one(conn, MIGRATION_V12, 12)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -920,13 +991,15 @@ mod tests {
 
     /// Everything a database holds but the new table and its index: each
     /// table's definition, and each row of the tables an older binary
-    /// wrote.
+    /// wrote. What a later step adds is left out too: the tables of what
+    /// a device holds of its person.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
                 "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
                  WHERE name NOT IN ('entries', 'idx_entries_channel_seq')
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
+                   AND name NOT LIKE '%person%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1067,5 +1140,168 @@ mod tests {
             )
             .unwrap();
         assert_eq!((items, entry_seq), (3, 0));
+    }
+
+    /// A database at version 11, as the version before what a device
+    /// holds of its person leaves it: what [`at_v10`] holds, and an entry
+    /// in the new form with the counter of its order.
+    fn at_v11() -> Connection {
+        let conn = at_v10();
+        migrate_in_one(&conn, MIGRATION_V11, 11).unwrap();
+        conn.execute_batch(
+            "UPDATE counters SET value = 9 WHERE name = 'entry_seq';
+             INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                  author_sig, channel_sig, seq, stored_at)
+             VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 7, 0, X'0A0B',
+                     zeroblob(64), zeroblob(64), 9, 1800000000);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The tables and the index that the step to version 12 adds.
+    const NEW_IN_V12: [&str; 6] = [
+        "idx_person_secrets_applied",
+        "person",
+        "person_additions",
+        "person_change_entries",
+        "person_names",
+        "person_secrets",
+    ];
+
+    /// Everything a database at version 11 holds: each table's definition
+    /// but those of the step to version 12, and each row of every table an
+    /// older binary wrote, the entries of the new form among them.
+    fn held_before_v12(conn: &Connection) -> Vec<String> {
+        let mut held = held_before_v11(conn);
+        for rows in [
+            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name IN ('entries', 'idx_entries_channel_seq')
+                    OR name LIKE 'sqlite_autoindex_entries%' ORDER BY name",
+            "SELECT hex(channel_id) || hex(slot) || hex(author) || rev || is_delete
+                 || hex(content) || hex(author_sig) || hex(channel_sig) || seq || stored_at
+                 FROM entries",
+            "SELECT name || value FROM counters ORDER BY name",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// What a database holds of the step to version 12, by name.
+    fn new_in_v12(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE '%person%' AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// The tables of what a device holds of its person are made in one
+    /// step with their version, as the steps before it are: a failure
+    /// between them leaves none, and the step asked for twice is run once.
+    #[test]
+    fn test_v12_adds_what_a_device_holds_of_its_person_and_its_version_as_one() {
+        let conn = at_v11();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 11);
+        assert!(new_in_v12(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V12} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 12).is_err());
+        assert_eq!(version(&conn), 11);
+        assert!(
+            new_in_v12(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 12);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v12(&conn), NEW_IN_V12);
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device holds stays.
+        conn.execute(
+            "INSERT INTO person_names (name, channel, held_at) VALUES ('team', zeroblob(32), 7)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V12, 12).unwrap();
+        let names: i64 = conn
+            .query_row("SELECT COUNT(*) FROM person_names", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version(&conn), names), (SCHEMA_VERSION, 1));
+    }
+
+    /// A database at version 11 that an older binary wrote is taken to
+    /// version 12 with everything it held as it was: the step adds five
+    /// tables and an index, with nothing in them, and touches nothing
+    /// else. A device that takes this version follows no phrase.
+    #[test]
+    fn test_a_database_at_v11_that_an_older_binary_wrote_is_taken_to_v12() {
+        let conn = at_v11();
+        let before = held_before_v12(&conn);
+        assert!(before.iter().any(|row| row.starts_with("entries: ")));
+        assert!(before.iter().any(|row| row.starts_with("entry_seq9")));
+        assert!(before.iter().any(|row| row.starts_with("ci_2grp_a")));
+
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 11);
+
+        // The step by itself, and then a start, which has no more to do
+        // for it.
+        migrate_in_one(&conn, MIGRATION_V12, 12).unwrap();
+        assert_eq!(version(&conn), 12);
+        assert_eq!(held_before_v12(&conn), before);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(held_before_v12(&conn), before);
+
+        // What is new: the tables, with nothing in them, and the index.
+        assert_eq!(new_in_v12(&conn), NEW_IN_V12);
+        for table in NEW_IN_V12.iter().filter(|name| !name.starts_with("idx_")) {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+
+        // The store of entries is written as before, by its own counter.
+        conn.execute_batch(
+            "UPDATE counters SET value = value + 1 WHERE name = 'entry_seq';
+             INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                  author_sig, channel_sig, seq, stored_at)
+             VALUES (zeroblob(32), zeroblob(32),
+                     X'0101010101010101010101010101010101010101010101010101010101010101',
+                     8, 0, X'0C', zeroblob(64), zeroblob(64), 10, 1800000001);",
+        )
+        .unwrap();
+        let entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(entries, 2);
     }
 }

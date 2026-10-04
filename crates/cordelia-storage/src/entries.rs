@@ -166,6 +166,27 @@ pub fn slot_entries(
     Ok(entries)
 }
 
+/// Every slot of a channel in which the store holds an entry, in the order
+/// in which each slot's oldest entry was stored. A device reads a whole
+/// channel of its own by its slots, to carry what it holds of it (decision
+/// 2026-10-04 §7.3).
+pub fn channel_slots(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT slot FROM entries WHERE channel_id = ?1
+             GROUP BY slot
+             ORDER BY MIN(seq)",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], |row| row.get(0))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// The entries of a channel that this node stored after the place
 /// `after_seq`, in the order it stored them, and at most `limit` of them:
 /// one page of the channel, for sending. The place of the last one is
@@ -548,6 +569,47 @@ mod tests {
         assert_eq!(remove_channel(&conn, &channel()).unwrap(), 5);
         store(&conn, &entries[0], NOW).unwrap();
         assert_eq!(page(0, 100), [(8, id(1))]);
+    }
+
+    /// A channel's slots are each given once, in the order in which the
+    /// first of their entries was stored, and no other channel's.
+    #[test]
+    fn test_a_channels_slots_are_each_given_once() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(channel_slots(&conn, &channel()).unwrap().is_empty());
+
+        for entry in [
+            text(1, 5, "b.md", "one"),
+            text(2, 5, "a.md", "two"),
+            text(2, 7, "b.md", "three"),
+            text(3, 1, "c.md", "four"),
+        ] {
+            store(&conn, &entry, NOW).unwrap();
+        }
+        let others = made(&OTHER_SECRET, 1, 5, "d.md", Value::Delete);
+        store(&conn, &others, NOW).unwrap();
+        assert_eq!(
+            channel_slots(&conn, &channel()).unwrap(),
+            [slot("b.md"), slot("a.md"), slot("c.md")]
+        );
+        assert_eq!(
+            channel_slots(&conn, &other_channel()).unwrap(),
+            [others.slot]
+        );
+
+        // A newer revision by one author moves no slot: its other entry is
+        // where it was. Once every entry of a slot is replaced, the slot's
+        // oldest entry is a later one.
+        store(&conn, &text(1, 6, "b.md", "five"), NOW).unwrap();
+        assert_eq!(
+            channel_slots(&conn, &channel()).unwrap(),
+            [slot("a.md"), slot("b.md"), slot("c.md")]
+        );
+
+        // A channel that was removed has none.
+        remove_channel(&conn, &channel()).unwrap();
+        assert!(channel_slots(&conn, &channel()).unwrap().is_empty());
+        assert_eq!(channel_slots(&conn, &other_channel()).unwrap().len(), 1);
     }
 
     #[test]
