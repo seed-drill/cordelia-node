@@ -12,13 +12,14 @@
 //! is pure functions, with vectors in
 //! `docs/reference/step4-test-vectors.json`. Beside them are an entry in
 //! the form such a channel has, with its seal, its two signatures and its
-//! chain ([`entry`]), and how a slot's current version is read
-//! ([`version`]); and, for a device that is added, the record of its
+//! chain ([`entry`]), the one place that builds a chain ([`chain`]), and
+//! how a slot's current version is read ([`version`]); and, for a device that is added, the record of its
 //! addition ([`addition`]) and what it is handed ([`hand_over`]).
 
 pub mod addition;
 pub mod aes_gcm;
 pub mod bech32;
+pub mod chain;
 pub mod change_entry;
 pub mod channel_state;
 pub mod derive;

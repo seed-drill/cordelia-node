@@ -47,12 +47,13 @@ use rusqlite::Connection;
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    MAX_COUNTED_DEVICES, MAX_ENTRY_LINKS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
+    MAX_COUNTED_DEVICES, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
 use cordelia_crypto::addition::{AdditionError, SignedAddition};
 use cordelia_crypto::bech32::encode_public_key;
+use cordelia_crypto::chain;
 use cordelia_crypto::change_entry::{self, ChangeEntryError, DeviceSecret, ForPhrase};
 use cordelia_crypto::derive::{self, DeriveError};
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError, Inside, Link, Value};
@@ -905,14 +906,10 @@ impl Carry<'_> {
 ///
 /// It is carried from one entry of the version: this device's own where
 /// it holds one, and otherwise the one whose signer has the lowest key.
-/// It has that entry's chain. Where that entry's signer is another key,
-/// one link is put first, for the version itself: the hash of its value,
-/// and that signer. So the chain says who signed the entry it was carried
-/// from, in the word of a device that held it.
-///
-/// The chain keeps to its 100 links: the oldest fall off. A link is in it
-/// once. An entry that lacks its chain is carried with none after the
-/// first link: it is known to follow nothing more than it was.
+/// That entry's signer and that entry's chain are what its chain is built
+/// from ([`chain::carried_from`]): the entry's chain as it is where this
+/// device signed it, and otherwise that entry's link first and then its
+/// chain. One entry's chain is never put behind another entry's signer.
 fn carried_entry(
     identity: &NodeIdentity,
     to: &[u8; 32],
@@ -926,19 +923,7 @@ fn carried_entry(
         .find(|entry| entry.author == own)
         .or(version.entries.first())
         .ok_or_else(|| PersonError::Held("a version with no entry".into()))?;
-
-    let mut chain = Vec::new();
-    if from.author != own {
-        chain.push(Link::of(&version.value, from.author));
-    }
-    for link in from.chain.iter().flatten() {
-        if chain.len() >= MAX_ENTRY_LINKS {
-            break;
-        }
-        if !chain.contains(link) {
-            chain.push(*link);
-        }
-    }
+    let chain = chain::carried_from(&version.value, &from.author, from.chain.as_deref(), &own);
 
     let inside = Inside {
         name: version.name.clone(),
@@ -3170,10 +3155,10 @@ mod tests {
     }
 
     /// A carried chain keeps to its 100 links: with one put first, the
-    /// oldest falls off. And a link is in it once: where the link that
-    /// would be put first is in the chain already, it is not there twice.
+    /// oldest falls off. And a link may stand in it twice: where the link
+    /// that is put first is in the chain already, both stand.
     #[test]
-    fn test_a_carried_chain_keeps_to_a_hundred_links_with_none_twice() {
+    fn test_a_carried_chain_keeps_to_a_hundred_links() {
         let conn = device_at(1, 2);
         let phrase = phrase();
         let [_, _, three, _] = statements(&phrase);
@@ -3183,11 +3168,21 @@ mod tests {
         put(&conn, &team, 0, 5, "long.md", text("the newest"), &hundred);
         // Device 1 carries its own with all 100: nothing is put first.
         put(&conn, &team, 1, 5, "own.md", text("the newest"), &hundred);
-        // The same text, signed by the same key, two versions before.
+        // A file that held a text, another, and the first again, each
+        // written by device 0: the same text, signed by the same key, two
+        // versions before.
         let again = [link("between", 1), link("the same", 0), link("first", 1)];
         put(&conn, &team, 0, 5, "again.md", text("the same"), &again);
+        // And one that device 1 wrote itself, whose chain names one link
+        // twice.
+        let twice = [link("A", 1), link("B", 1), link("A", 1)];
+        put(&conn, &team, 1, 5, "twice.md", text("C"), &twice);
 
-        shown(&conn, &device(1), &change(&phrase, &three, secret(3)), NOW).unwrap();
+        let entry = change(&phrase, &three, secret(3));
+        assert!(matches!(
+            shown(&conn, &device(1), &entry, NOW).unwrap(),
+            Shown::Applied(Applied { carried: 4, .. })
+        ));
         let new = own(3, "team");
 
         let long = carried(&conn, &new, "long.md").unwrap().chain;
@@ -3197,11 +3192,16 @@ mod tests {
         assert!(!long.contains(&hundred[99]));
         assert_eq!(carried(&conn, &new, "own.md").unwrap().chain, hundred);
 
-        let once = carried(&conn, &new, "again.md").unwrap().chain;
         assert_eq!(
-            once,
-            [link("the same", 0), link("between", 1), link("first", 1)]
+            carried(&conn, &new, "again.md").unwrap().chain,
+            [
+                link("the same", 0),
+                link("between", 1),
+                link("the same", 0),
+                link("first", 1)
+            ]
         );
+        assert_eq!(carried(&conn, &new, "twice.md").unwrap().chain, twice);
     }
 
     /// An entry that lacks its chain is known to follow nothing, and is
