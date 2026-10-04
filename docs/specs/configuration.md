@@ -183,7 +183,7 @@ REST API binding and authentication.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `bind_address` | string | `"127.0.0.1"` | Loopback only | REST API bind address. MUST be `127.0.0.1`, `::1`, or `localhost` where that name resolves to loopback addresses and no other. With any other the node refuses to start, and a command refuses to ask it: a command's request carries the node's token. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
+| `bind_address` | string | `"127.0.0.1"` | Loopback only | REST API bind address. MUST be `127.0.0.1` or `::1`, written so. A name is not taken, `localhost` included (up to 0.2.0-alpha.6 it was): what a name stands for is asked again by whatever binds or connects. With any other value the node refuses to start, and a command refuses to ask it: a command's request carries the node's token. Phase 2 adds TLS for non-loopback binding. | operations.md SS5.4, network-protocol.md SS12.2 |
 | `token_path` | string | `"~/.cordelia/node-token"` | Valid file path | Path to the bearer token file for HTTP API authentication. Tilde expanded at startup. | operations.md SS5.1 |
 
 **Note:** network-protocol.md SS12.2 includes `api_addr` (combining address and port) under `[network]`. operations.md SS5.1 splits this into `api.bind_address` and `node.http_port`. This document follows the split form: bind address under `[api]`, port under `[node]`, as this is more granular and allows independent overrides via environment variables.
@@ -332,12 +332,10 @@ Environment variables override `config.toml` values. All use the `CORDELIA_` pre
 | `CORDELIA_DATA_DIR` | `node.data_dir` | `/data/cordelia` | operations.md SS5.2 |
 | `CORDELIA_LOG_LEVEL` | `logging.level` | `debug` | operations.md SS5.2 |
 | `CORDELIA_LOG_FORMAT` | `logging.format` | `json` | operations.md SS5.2 |
-| `CORDELIA_BOOTNODES` | `network.bootnodes` | `host1:9474,host2:9474` | operations.md SS5.2 |
 | `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` | operations.md SS5.2 |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` | operations.md SS5.2 |
-| `CORDELIA_MAX_STORAGE` | `node.max_storage_bytes` | `1073741824` | operations.md SS5.2 |
 
-`CORDELIA_BOOTNODES` accepts a comma-separated list of `host:port` pairs when used as an environment variable, even though the config file uses TOML array-of-tables syntax.
+No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. The node also reads `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1.
 
 See SS4.2 for SDK-specific variables (`CORDELIA_TOKEN`).
 
@@ -373,7 +371,7 @@ The node validates configuration at startup. Invalid configuration prevents the 
 
 | Condition | Error |
 |-----------|-------|
-| `api.bind_address` is not a loopback address | `CRITICAL: non-loopback API bind address` |
+| `api.bind_address` is neither `127.0.0.1` nor `::1` (SS2.9) | `the node's API address is set to '...'`, with the two it may be and where it is set |
 | `config.toml` contains invalid TOML syntax | `config parse error` |
 | Key files (`identity.key`, `node-token`, `channel-keys/*.key`) are world-readable (mode & 0044 != 0) | `permission denied on key file` |
 | `node.http_port` or `node.p2p_port` already in use | `address already in use` |
@@ -406,7 +404,7 @@ The `identity.entity_id` and `identity.public_key` fields are written by `cordel
 
 These are hard invariants enforced at startup (operations.md SS5.4, network-protocol.md SS12.2):
 
-1. **API loopback binding**: `api.bind_address` MUST resolve to a loopback interface (`127.0.0.1`, `::1`). Non-loopback addresses cause the node to log a CRITICAL error and refuse to start. Phase 2 adds TLS and permits non-loopback binding.
+1. **API loopback binding**: `api.bind_address` MUST be `127.0.0.1` or `::1` (SS2.9). With any other value the node refuses to start, and says why. Phase 2 adds TLS and permits non-loopback binding.
 
 2. **Key file permissions**: Files at `~/.cordelia/identity.key`, `~/.cordelia/node-token`, and `~/.cordelia/channel-keys/*.key` MUST have mode 0600. The node warns on startup if permissions are too open and MUST refuse to start if key files are world-readable.
 

@@ -19,6 +19,9 @@ pub struct Facts {
     pub initialised: bool,
     /// The node answers on its local API.
     pub running: bool,
+    /// The node was not asked: its API address is not one that a command
+    /// asks. It is then not known to be stopped.
+    pub not_asked: bool,
     pub role: String,
     pub peers_hot: u64,
     /// Items written here that no relay has stored yet.
@@ -82,6 +85,12 @@ pub fn derive(f: &Facts) -> (State, String) {
     use State::*;
     if !f.initialised {
         return (Uninitialised, "cordelia not set up".into());
+    }
+    if f.not_asked {
+        return (
+            Attention,
+            "memory: node not asked (see `cordelia status`)".into(),
+        );
     }
     if !f.running {
         return (Stopped, "memory: node stopped".into());
@@ -248,6 +257,18 @@ mod tests {
             with(&|f| f.running = false),
             (State::Stopped, "memory: node stopped".into())
         );
+        // A node that was not asked is not said to be stopped.
+        let (not_asked, summary) = with(&|f| {
+            f.running = false;
+            f.not_asked = true;
+        });
+        assert_eq!(not_asked, State::Attention);
+        assert!(summary.contains("not asked"), "{summary}");
+        let not_set_up = with(&|f| {
+            f.initialised = false;
+            f.not_asked = true;
+        });
+        assert_eq!(not_set_up.0, State::Uninitialised);
         assert_eq!(
             with(&|f| f.sync_enabled = false),
             (State::Off, "memory sync off".into())

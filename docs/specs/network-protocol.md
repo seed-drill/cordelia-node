@@ -1849,7 +1849,7 @@ addr = "boot2.cordelia.seeddrill.ai:9474"
 # addr = "relay1.example.com:9474"
 ```
 
-**API loopback binding (Phase 1):** Phase 1 nodes MUST bind the channels API (`api_addr`) to `127.0.0.1` only. If configuration specifies a non-loopback address, the node MUST log a CRITICAL error and refuse to start. Phase 2 adds TLS and allows non-loopback binding.
+**API loopback binding (Phase 1):** Phase 1 nodes MUST bind the channels API (`api_addr`) to `127.0.0.1` or `::1` only (configuration.md SS2.9). With any other address configured, the node refuses to start, and says why. Phase 2 adds TLS and allows non-loopback binding.
 
 ### 12.2 Governor Section
 
