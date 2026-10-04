@@ -606,8 +606,9 @@ pub fn item_owner(
 ///
 /// What anyone else stored there does not count: not a stranger, and not a
 /// device that has been removed. Otherwise either could put the revision
-/// out of reach. A removed device's last entries are published again by
-/// the devices that remain, just before it stops counting (see
+/// out of reach. Each entry whose current value a removed device wrote is
+/// published again by the device that removes it, just before it stops
+/// counting (see
 /// `entries::take_over` in cordelia-api), so the number does not go back.
 pub fn max_rev(
     conn: &Connection,
