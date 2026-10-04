@@ -1467,6 +1467,8 @@ pub async fn status(
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
+        // So that a command can tell when the node is not the version it is.
+        "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime as u64,
         "peers_hot": peers_hot,
         "peers_warm": peers_warm,

@@ -6,7 +6,8 @@
 //! person's devices: the personal channel maps it to a channel
 //! (`project/<name>` -> channel ID), created by the first device to sync
 //! it and joined by each device that maps the same name. Home memory is
-//! the mapping of the home directory, under the name `~`.
+//! the mapping of the home directory: under the name `~` unless it is
+//! given another, and `~` names nothing else.
 //!
 //! - With declared mappings only (the default), nothing else syncs. Other
 //!   memory found on the machine is reported, with the name each would
@@ -58,7 +59,7 @@ const PROJECT_CACHE: Duration = Duration::from_secs(300);
 /// made may still be arriving, and creating its own would only compete.
 const NEW_DEVICE_GRACE: Duration = Duration::from_secs(60);
 
-/// The name home memory syncs under.
+/// The name home memory syncs under unless it is given another.
 pub const HOME_NAME: &str = "~";
 
 /// Keys in the personal channel that map a name to its channel.
@@ -106,6 +107,10 @@ pub struct FolderReport {
     pub last_published_at: Option<String>,
     /// Why this folder did not sync this cycle.
     pub error: Option<String>,
+    /// The settings changed while this folder was being synced, and the
+    /// cycle stopped there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 /// When a device last received and last sent a memory under one name.
@@ -146,6 +151,15 @@ pub struct CycleReport {
     /// sorted.
     pub available: Vec<String>,
     pub errors: Vec<String>,
+    /// How many times the settings had changed when this cycle read them
+    /// (see `SyncControl`). A reader can tell a report made before a
+    /// change from one made after it.
+    pub generation: u64,
+    /// The settings changed during the cycle, and it stopped there: a
+    /// command that stops a folder syncing has stopped it when it answers.
+    /// The next cycle starts from the new settings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 /// A declared mapping: Claude's memory for sessions started in `folder`
@@ -168,11 +182,18 @@ pub struct Settings {
     /// With `all`: whether home memory syncs on this device.
     pub home: bool,
     pub mappings: Vec<Mapping>,
+    /// The Claude Code directory sync is on for; `None` when sync is off.
+    pub dir: Option<String>,
+    /// How many times the settings had changed when these were read. Both
+    /// are read under one hold of the database lock, and a handler counts
+    /// its change under that lock, so these are the settings of exactly
+    /// this count.
+    pub generation: u64,
 }
 
 impl Settings {
-    /// Read from node metadata: `sync.claude.all`, `.mappings`, `.exclude`
-    /// and `.home`.
+    /// Read from node metadata: `sync.claude.all`, `.mappings`, `.exclude`,
+    /// `.home` and `.dir`, with the count of changes to them.
     pub fn load(state: &AppState) -> Result<Self, CordeliaError> {
         let db = lock(state)?;
         let json = |key: &str| -> Result<Option<String>, CordeliaError> { meta::get(&db, key) };
@@ -185,6 +206,8 @@ impl Settings {
             mappings: json(meta::SYNC_CLAUDE_MAPPINGS)?
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default(),
+            dir: json(meta::SYNC_CLAUDE_DIR)?,
+            generation: state.sync_control.generation_under(&db),
         })
     }
 
@@ -197,7 +220,10 @@ impl Settings {
                 .iter()
                 .filter(|entry| !entry.starts_with('/'))
                 .any(|pattern| {
-                    let pattern = pattern.to_lowercase();
+                    // In the spelling a project is found under. The node
+                    // stores it so; an earlier version could store one
+                    // that ended in `.git`.
+                    let pattern = cordelia_core::sync_name::tidy(pattern);
                     match pattern.strip_suffix('*') {
                         Some(prefix) => remote.starts_with(prefix),
                         None => *remote == pattern,
@@ -286,6 +312,16 @@ impl ClaudeAdapter {
             seen: HashMap::new(),
             moved: HashMap::new(),
         }
+    }
+
+    /// Whether this adapter is for the Claude Code directory `dir`, which
+    /// is the text that is stored as the setting, not the path it spells.
+    /// What a folder agrees is recorded under that text, and the handlers
+    /// forget by it. So an adapter made for another spelling of the same
+    /// path is not for it: the node's loop makes a new one, and a cycle
+    /// of the old one does nothing.
+    pub fn is_for(&self, dir: &str) -> bool {
+        self.claude_dir.as_os_str() == std::ffi::OsStr::new(dir)
     }
 
     /// The project a directory belongs to, if it has a name to sync under.
@@ -408,14 +444,33 @@ impl ClaudeAdapter {
     /// Run one sync cycle: the declared mappings, and with `all` on,
     /// everything else found.
     pub fn run_cycle(&mut self, state: &AppState) -> CycleReport {
-        let mut report = CycleReport::default();
-        let settings = match Settings::load(state) {
-            Ok(s) => s,
-            Err(e) => {
-                report.errors.push(format!("settings: {e}"));
-                return report;
-            }
+        match Settings::load(state) {
+            Ok(settings) => self.run_cycle_under(state, settings),
+            Err(e) => CycleReport {
+                generation: state.sync_control.generation(),
+                errors: vec![format!("settings: {e}")],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Run one sync cycle under `settings`, as they were read. If they have
+    /// been changed since, by the time the cycle gets to a folder or to an
+    /// entry, it stops there (see [`CycleReport::stopped`]).
+    pub fn run_cycle_under(&mut self, state: &AppState, settings: Settings) -> CycleReport {
+        let generation = settings.generation;
+        let mut report = CycleReport {
+            generation,
+            ..Default::default()
         };
+        // Whether sync is on, and for which directory, is a setting like
+        // the others. It was looked at before these were read, and may
+        // have been turned off or changed since: then there is nothing to
+        // do.
+        if !settings.dir.as_deref().is_some_and(|dir| self.is_for(dir)) {
+            report.stopped = true;
+            return report;
+        }
         let personal = match membership::personal_channel_id(state) {
             Ok(id) => id,
             Err(e) => {
@@ -494,6 +549,11 @@ impl ClaudeAdapter {
         let stored = load_activity(state);
         let mut activity: HashMap<String, Activity> = HashMap::new();
         for target in targets {
+            // A setting changed: this folder may be one it stopped.
+            if state.sync_control.generation() != generation {
+                report.stopped = true;
+                break;
+            }
             let label = target.dir.display().to_string();
             let memory = target.dir.join("memory");
             wanted.insert(target.name.clone());
@@ -501,10 +561,12 @@ impl ClaudeAdapter {
                 Ok(Some(channel)) => {
                     joined.insert(target.name.clone());
                     syncing.push((memory.display().to_string(), channel.clone()));
-                    sync_folder(state, &memory, &channel, "", &self.device_tag).map(|mut r| {
-                        r.channel_id = Some(channel);
-                        r
-                    })
+                    sync_folder(state, &memory, &channel, "", &self.device_tag, generation).map(
+                        |mut r| {
+                            r.channel_id = Some(channel);
+                            r
+                        },
+                    )
                 }
                 Ok(None) => Ok(FolderReport {
                     waiting: true,
@@ -553,7 +615,24 @@ impl ClaudeAdapter {
             r.cwd = target.cwd;
             r.project = target.name;
             r.mapped = target.mapped;
+            let stopped = r.stopped;
             report.folders.push(r);
+            if stopped {
+                report.stopped = true;
+                break;
+            }
+        }
+        // A cycle that stopped did not reach every folder, and one whose
+        // settings changed as it finished worked from settings that no
+        // longer stand. Either way what it has is not what syncs now, so
+        // nothing is concluded from it. A folder that a command stopped
+        // has already forgotten what it had agreed: the handler that
+        // stopped it saw to that.
+        if state.sync_control.generation() != generation {
+            report.stopped = true;
+        }
+        if report.stopped {
+            return report;
         }
         // Kept for the names that sync now; written only when it changes.
         if activity != stored
@@ -563,11 +642,11 @@ impl ClaudeAdapter {
         }
         // A folder that no longer syncs starts afresh if it syncs again:
         // what it lost in between is not taken for deletes.
-        if looked_up_all && let Err(e) = forget_other_folders(state, &syncing) {
+        if looked_up_all && let Err(e) = forget_other_folders(state, &syncing, generation) {
             report.errors.push(format!("agreements: {e}"));
         }
 
-        match exchange_names(state, &personal, &joined, &wanted) {
+        match exchange_names(state, &personal, &joined, &wanted, generation) {
             Ok(available) => report.available = available,
             Err(e) => report.errors.push(format!("names: {e}")),
         }
@@ -576,12 +655,19 @@ impl ClaudeAdapter {
 }
 
 /// Forget what every folder agreed with its channel, except those in
-/// `syncing` (memory folder, channel).
+/// `syncing` (memory folder, channel), which is what syncs under the
+/// settings of `generation`. Nothing is forgotten if the settings have
+/// changed since: a folder they now sync may not be in `syncing`.
 fn forget_other_folders(
     state: &AppState,
     syncing: &[(String, String)],
+    generation: u64,
 ) -> Result<(), CordeliaError> {
-    let forgotten = sync_state::forget_except(&*lock(state)?, syncing)?;
+    let db = lock(state)?;
+    if state.sync_control.generation_under(&db) != generation {
+        return Ok(());
+    }
+    let forgotten = sync_state::forget_except(&db, syncing)?;
     if forgotten > 0 {
         tracing::info!(
             files = forgotten,
@@ -610,14 +696,18 @@ fn store_activity(
 }
 
 /// Sync was turned off: tell this person's other devices that this one
-/// no longer syncs anything, and forget what its folders had agreed, so
-/// that turning sync on again merges rather than replays what changed in
-/// between.
-pub fn withdraw(state: &AppState) -> Result<(), CordeliaError> {
-    forget_other_folders(state, &[])?;
+/// no longer syncs anything. (What its folders had agreed was forgotten by
+/// the handler that turned sync off.)
+///
+/// `generation` is the settings count read with the setting that says sync
+/// is off. Returns `false` if the settings have changed since: sync may be
+/// on again, the list may not have been published, and whoever asked
+/// looks again. Looking again when it had been published does no harm.
+pub fn withdraw(state: &AppState, generation: u64) -> Result<bool, CordeliaError> {
     let personal = membership::personal_channel_id(state)?;
     let none = BTreeSet::new();
-    exchange_names(state, &personal, &none, &none).map(|_| ())
+    exchange_names(state, &personal, &none, &none, generation)?;
+    Ok(state.sync_control.generation() == generation)
 }
 
 /// Publish the names this device syncs (`mine`), if they changed, and
@@ -626,12 +716,15 @@ pub fn withdraw(state: &AppState) -> Result<(), CordeliaError> {
 /// a list is read only from the device its key names, and only the names
 /// in it that could be mapped. (Another member writing a later revision
 /// under a device's key can therefore hide that device's list until it
-/// next publishes, but cannot add to it.)
+/// next publishes, but cannot add to it.) Nothing is published if the
+/// settings are no longer those of `generation`: the names were worked out
+/// from settings that have since been replaced.
 fn exchange_names(
     state: &AppState,
     personal: &str,
     mine: &BTreeSet<String>,
     wanted: &BTreeSet<String>,
+    generation: u64,
 ) -> Result<Vec<String>, CordeliaError> {
     let crypto = |e: cordelia_crypto::CryptoError| CordeliaError::Crypto(e.to_string());
     let me = state.identity.public_key();
@@ -663,7 +756,7 @@ fn exchange_names(
             others.extend(names.filter(|n| cordelia_api::sync::valid_sync_name(n)));
         }
     }
-    if published != *mine {
+    if published != *mine && state.sync_control.generation_under(&db) == generation {
         entries::publish(
             state,
             &db,
@@ -856,13 +949,17 @@ fn conflict_target(dir: &Path, key: &str, tag: &str, text: &str) -> Option<Strin
     unreachable!()
 }
 
-/// Sync one memory folder with one channel (keys under `prefix`).
+/// Sync one memory folder with one channel (keys under `prefix`), under
+/// the settings of `generation`. It stops, and says so in its report, as
+/// soon as it finds that the settings have changed: the change may be the
+/// one that stops this folder syncing.
 fn sync_folder(
     state: &AppState,
     dir: &Path,
     channel: &str,
     prefix: &str,
     tag: &str,
+    generation: u64,
 ) -> Result<FolderReport, CordeliaError> {
     let folder = dir.display().to_string();
     let mut report = FolderReport::default();
@@ -954,11 +1051,16 @@ fn sync_folder(
             prefix,
             tag,
             folder: &folder,
+            generation,
         };
         for action in actions {
             if !apply(&ctx, key, seen, action, &mut report)? {
                 break; // the file changed under us; re-plan it next cycle
             }
+        }
+        if state.sync_control.generation() != generation {
+            report.stopped = true;
+            break;
         }
     }
     report.conflict_files = conflict_files(dir);
@@ -987,6 +1089,8 @@ struct Ctx<'a> {
     prefix: &'a str,
     tag: &'a str,
     folder: &'a str,
+    /// The settings count this cycle runs under.
+    generation: u64,
 }
 
 /// Hash of the file as it is on disk right now (`None` if absent).
@@ -996,10 +1100,37 @@ fn current_hash(dir: &Path, key: &str) -> Option<[u8; 32]> {
         .map(|bytes| cordelia_crypto::sha256(&bytes))
 }
 
-/// Apply one action. Returns `false`, doing nothing, if the action would
-/// replace or remove the file but the file changed since it was scanned:
-/// an agent wrote to it mid-cycle. The next cycle plans with that write, so
-/// it is published or kept as a conflict, never overwritten.
+/// Record what `folder` and `channel` now agree on for `key`, under the
+/// settings of `generation`. Nothing is recorded once the settings have
+/// changed: the folder may have been stopped, and what it had agreed
+/// forgotten, since the change this would record. If it still syncs, the
+/// next cycle finds both sides the same and records it then.
+fn record_agreed(
+    state: &AppState,
+    generation: u64,
+    folder: &str,
+    channel: &str,
+    key: &str,
+    agreed: sync_state::Agreed,
+) -> Result<(), CordeliaError> {
+    let db = lock(state)?;
+    if state.sync_control.generation_under(&db) != generation {
+        return Ok(());
+    }
+    sync_state::save(&db, folder, channel, key, agreed)
+}
+
+/// Apply one action. Returns `false`, doing nothing, in two cases:
+///
+/// - The action would replace or remove the file, but the file changed
+///   since it was scanned: an agent wrote to it mid-cycle. The next cycle
+///   plans with that write, so it is published or kept as a conflict,
+///   never overwritten.
+/// - The settings have changed since the cycle read them. A command that
+///   stops this folder syncing may have answered, and nothing more of the
+///   folder is to be published or written after that. An entry is
+///   published only after the count is read under the database lock, which
+///   is the lock a handler holds while it changes a setting and counts it.
 fn apply(
     ctx: &Ctx,
     key: &str,
@@ -1014,7 +1145,15 @@ fn apply(
         prefix,
         tag,
         folder,
+        generation,
     } = *ctx;
+    let writes_file = matches!(
+        action,
+        Action::Pull { .. } | Action::RemoveFile { .. } | Action::SaveConflict(_)
+    );
+    if writes_file && state.sync_control.generation() != generation {
+        return Ok(false);
+    }
     let replaces_file = matches!(
         action,
         Action::Pull { .. } | Action::RemoveFile { .. } | Action::Merge(_)
@@ -1026,26 +1165,31 @@ fn apply(
     let io =
         |e: std::io::Error| CordeliaError::Internal(format!("{}: {e}", dir.join(key).display()));
     let full_key = format!("{prefix}{key}");
-    let publish = |text: Option<&str>| -> Result<u64, CordeliaError> {
+    // `None`: not published, because the settings have changed.
+    let publish = |text: Option<&str>| -> Result<Option<u64>, CordeliaError> {
         let db = lock(state)?;
+        if state.sync_control.generation_under(&db) != generation {
+            return Ok(None);
+        }
         let content = text.map_or(Value::Null, |t| Value::String(t.to_string()));
-        Ok(entries::publish(
-            state,
-            &db,
-            channel,
-            &Write {
-                key: &full_key,
-                content: &content,
-                metadata: None,
-                item_type: ITEM_TYPE,
-                deleted: text.is_none(),
-            },
-        )?
-        .rev)
+        Ok(Some(
+            entries::publish(
+                state,
+                &db,
+                channel,
+                &Write {
+                    key: &full_key,
+                    content: &content,
+                    metadata: None,
+                    item_type: ITEM_TYPE,
+                    deleted: text.is_none(),
+                },
+            )?
+            .rev,
+        ))
     };
     let record = |hash: Option<[u8; 32]>, rev: u64| -> Result<(), CordeliaError> {
-        let db = lock(state)?;
-        sync_state::save(&db, folder, channel, key, (hash, rev))
+        record_agreed(state, generation, folder, channel, key, (hash, rev))
     };
 
     // An entry holds the file's name beside its text, and the text is
@@ -1059,10 +1203,11 @@ fn apply(
 
     match action {
         Action::Publish(text) => match publish(Some(&text)) {
-            Ok(rev) => {
+            Ok(Some(rev)) => {
                 record(Some(Content::new(text).hash), rev)?;
                 report.published += 1;
             }
+            Ok(None) => return Ok(false),
             Err(CordeliaError::TooLarge { .. }) => {
                 too_large(report);
                 return Ok(false);
@@ -1070,7 +1215,9 @@ fn apply(
             Err(e) => return Err(e),
         },
         Action::PublishDelete => {
-            let rev = publish(None)?;
+            let Some(rev) = publish(None)? else {
+                return Ok(false);
+            };
             record(None, rev)?;
             report.published += 1;
         }
@@ -1099,11 +1246,12 @@ fn apply(
             // Published before the file is written: if the merged text does
             // not fit, the file stays as it was.
             match publish(Some(&text)) {
-                Ok(rev) => {
+                Ok(Some(rev)) => {
                     write_atomic(dir, key, &text).map_err(io)?;
                     record(Some(Content::new(text).hash), rev)?;
                     report.published += 1;
                 }
+                Ok(None) => return Ok(false),
                 Err(CordeliaError::TooLarge { .. }) => {
                     too_large(report);
                     return Ok(false);
@@ -1161,6 +1309,7 @@ mod tests {
             prefix: "",
             tag: "abcd",
             folder: "f",
+            generation: 0,
         };
         let mut report = FolderReport::default();
         for action in [
@@ -1198,5 +1347,165 @@ mod tests {
             std::fs::read_to_string(mem.join("notes.md")).unwrap(),
             "incoming\n"
         );
+    }
+    /// A command that stops a folder syncing has stopped it when it
+    /// answers. Its handler counts the change while it holds the database
+    /// lock. A cycle that started before reads the count under that lock
+    /// before each entry it publishes, and reads it before each file it
+    /// writes; once it differs, the cycle does nothing more.
+    #[test]
+    fn a_cycle_stops_when_the_settings_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        membership::ensure_own_inbox(&st).unwrap();
+        let channel = membership::create_project_group(&st, "project:x").unwrap();
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        // The files the channel holds, and whether each is live.
+        let held = |st: &AppState| -> Vec<(String, bool)> {
+            entries::current(st, &st.db.lock().unwrap(), &channel)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.key, !e.current.deleted))
+                .collect()
+        };
+        let cycle =
+            |generation: u64| sync_folder(&st, &mem, &channel, "", "abcd", generation).unwrap();
+
+        // Under the settings it started from, a cycle publishes.
+        std::fs::write(mem.join("a.md"), "one\n").unwrap();
+        let started = st.sync_control.generation();
+        let report = cycle(started);
+        assert_eq!((report.published, report.stopped), (1, false));
+        assert_eq!(held(&st), [("a.md".to_string(), true)]);
+
+        // A setting changes. A cycle still running under the old settings
+        // publishes no edit and no delete...
+        st.sync_control.changed(&st.db.lock().unwrap());
+        std::fs::write(mem.join("b.md"), "two\n").unwrap();
+        let report = cycle(started);
+        assert_eq!((report.published, report.stopped), (0, true));
+        std::fs::remove_file(mem.join("a.md")).unwrap();
+        std::fs::remove_file(mem.join("b.md")).unwrap();
+        let report = cycle(started);
+        assert_eq!((report.published, report.stopped), (0, true));
+        assert_eq!(held(&st), [("a.md".to_string(), true)]);
+
+        // ...and writes, replaces and removes no file.
+        std::fs::write(mem.join("kept.md"), "here\n").unwrap();
+        let folder = mem.display().to_string();
+        let ctx = Ctx {
+            state: &st,
+            dir: &mem,
+            channel: &channel,
+            prefix: "",
+            tag: "abcd",
+            folder: &folder,
+            generation: started,
+        };
+        let seen = Some(Content::new("here\n").hash);
+        let mut report = FolderReport::default();
+        let pull = || Action::Pull {
+            text: "from another device\n".into(),
+            rev: 2,
+        };
+        assert!(!apply(&ctx, "new.md", None, pull(), &mut report).unwrap());
+        assert!(!apply(&ctx, "kept.md", seen, pull(), &mut report).unwrap());
+        let gone = Action::RemoveFile { rev: 2 };
+        assert!(!apply(&ctx, "kept.md", seen, gone, &mut report).unwrap());
+        let beside = Action::SaveConflict("this device's\n".into());
+        assert!(!apply(&ctx, "kept.md", seen, beside, &mut report).unwrap());
+        let mut names: Vec<String> = std::fs::read_dir(&mem)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["kept.md"]);
+        assert_eq!(
+            std::fs::read_to_string(mem.join("kept.md")).unwrap(),
+            "here\n"
+        );
+        assert_eq!((report.pulled, report.conflicts), (0, 0));
+
+        // ...and records nothing: the handler that changed the setting may
+        // have forgotten what a folder agreed, and a record made after it
+        // would bring a part of that back.
+        let elsewhere = "/another/memory";
+        let agreed = |st: &AppState| {
+            let db = st.db.lock().unwrap();
+            let all = sync_state::load(&db, elsewhere, &channel).unwrap();
+            all.contains_key("late.md")
+        };
+        record_agreed(&st, started, elsewhere, &channel, "late.md", (None, 9)).unwrap();
+        assert!(!agreed(&st));
+        let now = st.sync_control.generation();
+        record_agreed(&st, now, elsewhere, &channel, "late.md", (None, 9)).unwrap();
+        assert!(agreed(&st));
+
+        // The next cycle, under the settings as they are now, carries on.
+        let report = cycle(st.sync_control.generation());
+        assert!(!report.stopped);
+        assert_eq!(report.published, 2, "the delete of a.md, and kept.md");
+    }
+    /// The bookkeeping at the end of a cycle is done under the settings
+    /// the cycle read, or not at all. A list of names worked out from
+    /// settings that have since changed is not published, and nothing is
+    /// forgotten on their say: a folder the new settings sync would not be
+    /// among those the old ones kept.
+    #[test]
+    fn nothing_is_concluded_from_settings_that_have_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        membership::ensure_own_inbox(&st).unwrap();
+        let personal = membership::personal_channel_id(&st).unwrap();
+        let listed = |st: &AppState| -> usize {
+            entries::current(st, &st.db.lock().unwrap(), &personal)
+                .unwrap()
+                .iter()
+                .filter(|e| e.key.starts_with(SYNCING_PREFIX))
+                .count()
+        };
+        let agreed = |st: &AppState| -> usize {
+            let db = st.db.lock().unwrap();
+            sync_state::load(&db, "/a/memory", "grp_x").unwrap().len()
+        };
+        sync_state::save(
+            &st.db.lock().unwrap(),
+            "/a/memory",
+            "grp_x",
+            "notes.md",
+            (None, 1),
+        )
+        .unwrap();
+        let mine: BTreeSet<String> = ["one".to_string()].into();
+
+        let started = st.sync_control.generation();
+        st.sync_control.changed(&st.db.lock().unwrap());
+        exchange_names(&st, &personal, &mine, &mine, started).unwrap();
+        forget_other_folders(&st, &[], started).unwrap();
+        assert_eq!((listed(&st), agreed(&st)), (0, 1));
+
+        let now = st.sync_control.generation();
+        exchange_names(&st, &personal, &mine, &mine, now).unwrap();
+        forget_other_folders(&st, &[], now).unwrap();
+        assert_eq!((listed(&st), agreed(&st)), (1, 0));
+
+        // Withdrawing, once sync is off, is the same: it is done under the
+        // count read with that setting, or not at all, and says which.
+        // Sync may be on again.
+        let names = |st: &AppState| -> usize {
+            let db = st.db.lock().unwrap();
+            let all = entries::current(st, &db, &personal).unwrap();
+            let list = all.iter().find(|e| e.key.starts_with(SYNCING_PREFIX));
+            list.unwrap().current.content["names"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        st.sync_control.changed(&st.db.lock().unwrap());
+        assert!(!withdraw(&st, now).unwrap());
+        assert_eq!(names(&st), 1);
+        assert!(withdraw(&st, st.sync_control.generation()).unwrap());
+        assert_eq!(names(&st), 0);
     }
 }

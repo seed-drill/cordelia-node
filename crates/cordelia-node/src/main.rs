@@ -87,7 +87,7 @@ enum Commands {
     AddDevice {
         /// The other device's key, from `cordelia id` on that device
         key: String,
-        /// A name for the device, e.g. "imac"
+        /// A name for the device, e.g. "desktop"
         #[arg(long)]
         name: Option<String>,
     },
@@ -95,7 +95,7 @@ enum Commands {
     Accept {
         /// The key printed by `add-device` on the other device
         key: String,
-        /// A name for the device, e.g. "macbook"
+        /// A name for the device, e.g. "laptop"
         #[arg(long)]
         name: Option<String>,
     },
@@ -147,7 +147,8 @@ enum SyncCommand {
         mapped_only: bool,
         /// With --all: never sync this project from this device (its git
         /// remote, e.g. github.com/client-co/app, or a prefix ending in *).
-        /// Repeatable; replaces the current list.
+        /// Repeatable; replaces the names in the current list. A folder
+        /// that was unmapped stays out (unless --reset is given).
         #[arg(long)]
         exclude: Vec<String>,
         /// Do not sync home-folder memory on this device (unmaps it too)
@@ -160,15 +161,17 @@ enum SyncCommand {
     },
     /// Sync Claude's memory for a folder under a name. The name is what
     /// your devices share: map the same name on each of them. For a git
-    /// project it defaults to the remote (github.com/owner/repo). Claude
-    /// Code keeps one memory per repository, so any folder of a repository
-    /// maps the whole repository.
+    /// project it defaults to the remote (github.com/owner/repo), and for
+    /// your home directory to `~`. Claude Code keeps one memory per
+    /// repository, so any folder of a repository maps the whole repository.
     Map {
         /// The folder you run Claude Code in
         folder: String,
-        /// The name to sync under (default: the folder's git remote)
+        /// The name to sync under (default: the folder's git remote; `~`
+        /// for the home directory)
         name: Option<String>,
-        /// Map the home directory itself: home memory
+        /// Map the home directory itself: home memory, under `~` or under
+        /// the name given
         #[arg(long)]
         home: bool,
     },
@@ -446,6 +449,8 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             out["role"] = status.facts.role.clone().into();
         }
         if let Some(live) = &status.live {
+            // The node's own version: `version` above is this command's.
+            out["node_version"] = live["version"].clone();
             out["uptime_secs"] = live["uptime_secs"].clone();
             out["peers"] = serde_json::json!({
                 "hot": live["peers_hot"],
@@ -483,6 +488,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 "all": sync["all"],
                 "mappings": sync["mappings"],
                 "home": sync["home"],
+                "home_name": sync["home_name"],
                 "exclude": sync["exclude"],
                 "unmapped": report["unmapped"],
                 "available": report["available"],
@@ -568,6 +574,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         Some(live) => {
             let n = |k: &str| live[k].as_u64().unwrap_or(0);
             println!("  Running:   yes, up {}", format_uptime(n("uptime_secs")));
+            if let Some(note) = version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION")) {
+                println!("  Version:   {note}");
+            }
             println!(
                 "  Peers:     {} hot, {} warm",
                 n("peers_hot"),
@@ -911,8 +920,9 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
 
         // ── Sync adapter (decision 2026-09-30 §4.5) ─────────────────
-        // Runs while a Claude Code directory is configured; `cordelia sync
-        // claude` / `cordelia sync off` take effect on the next cycle.
+        // Runs while a Claude Code directory is configured. A change of
+        // setting takes effect at once: it wakes the loop, and a cycle
+        // that was already running stops (see `SyncControl`).
         if config.network.role == "personal" {
             if let Err(e) = cordelia_api::sync::keep_earlier_scope(&state) {
                 tracing::warn!(error = %e, "sync: could not read the stored scope");
@@ -1113,6 +1123,20 @@ fn p2p_bind_addr(listen_addr: &str, p2p_port: u16) -> anyhow::Result<std::net::S
 
 // ── Sync adapter loop ──────────────────────────────────────────────
 
+/// The one adapter the sync loop holds: the one in `slot` while `is_for`
+/// says it is for the Claude Code directory that is set, and otherwise a
+/// new one from `make`, in its place.
+fn adapter_for<A>(
+    slot: &mut Option<A>,
+    is_for: impl Fn(&A) -> bool,
+    make: impl FnOnce() -> A,
+) -> &mut A {
+    if !slot.as_ref().is_some_and(is_for) {
+        *slot = None;
+    }
+    slot.get_or_insert_with(make)
+}
+
 /// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
 /// adapter cycle (if sync is on) off the async runtime, and store its
 /// report for `cordelia sync status`.
@@ -1120,7 +1144,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
     use cordelia_storage::meta;
     use cordelia_sync::claude::ClaudeAdapter;
 
-    let adapter: std::sync::Arc<Mutex<Option<(std::path::PathBuf, ClaudeAdapter)>>> =
+    let adapter: std::sync::Arc<Mutex<Option<ClaudeAdapter>>> =
         std::sync::Arc::new(Mutex::new(None));
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
         cordelia_sync::claude::CYCLE_SECS,
@@ -1135,35 +1159,47 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         let state = state.clone();
         let adapter = adapter.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let dir = match state.db.lock() {
-                Ok(db) => meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
+            let (dir, generation) = match state.db.lock() {
+                Ok(db) => (
+                    meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
+                    state.sync_control.generation_under(&db),
+                ),
                 Err(_) => return,
             };
             let Ok(mut slot) = adapter.lock() else { return };
-            let Some(dir) = dir.map(std::path::PathBuf::from) else {
+            let Some(dir) = dir else {
                 // Sync was just turned off: this person's other devices
-                // stop listing what this one synced.
-                if slot.take().is_some()
-                    && let Err(e) = cordelia_sync::claude::withdraw(&state)
-                {
-                    tracing::warn!(error = %e, "sync: could not withdraw this device's names");
+                // stop listing what this one synced. If the settings
+                // change under it, the adapter is kept, and the next turn
+                // looks again.
+                if slot.is_some() {
+                    match cordelia_sync::claude::withdraw(&state, generation) {
+                        Ok(false) => return,
+                        Ok(true) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "sync: could not withdraw this device's names");
+                        }
+                    }
+                    *slot = None;
                 }
                 return;
             };
-            if slot.as_ref().is_none_or(|(d, _)| *d != dir) {
-                let home = std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default();
-                let pk = state.identity.public_key();
-                *slot = Some((dir.clone(), ClaudeAdapter::new(dir, home, &pk)));
-                tracing::info!("sync adapter started");
-            }
-            let Some((_, running)) = slot.as_mut() else {
-                return;
-            };
-            // Read before the cycle: a setting changed during it makes
-            // this report one from before the change.
-            let generation = state.sync_control.generation();
+            // One adapter, for the directory that is set, as it is stored:
+            // a cycle of any other does nothing.
+            let running = adapter_for(
+                &mut slot,
+                |held: &ClaudeAdapter| held.is_for(&dir),
+                || {
+                    let home = std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default();
+                    tracing::info!("sync adapter started");
+                    ClaudeAdapter::new(dir.as_str().into(), home, &state.identity.public_key())
+                },
+            );
+            // The report carries the settings count it was made under: a
+            // setting changed during the cycle makes it a report from
+            // before the change.
             let report = running.run_cycle(&state);
             for e in &report.errors {
                 tracing::warn!(error = %e, "sync cycle error");
@@ -1172,9 +1208,10 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             let changed = report.folders.iter().any(|f| f.published + f.pulled > 0);
             let mut json = serde_json::to_value(&report).unwrap_or_default();
             json["at"] = serde_json::Value::String(now.clone());
-            json["generation"] = generation.into();
             if let Ok(db) = state.db.lock() {
-                let _ = meta::set(&db, meta::SYNC_CLAUDE_REPORT, &json.to_string());
+                if report_stands(&report, state.sync_control.generation_under(&db)) {
+                    let _ = meta::set(&db, meta::SYNC_CLAUDE_REPORT, &json.to_string());
+                }
                 if changed {
                     let _ = meta::set(&db, meta::SYNC_CLAUDE_LAST_CHANGE, &now);
                 }
@@ -1182,6 +1219,32 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         })
         .await;
     }
+}
+
+/// What status says beside home memory (`~`) that other devices sync and
+/// this one does not: the command that maps it here, or why there is none.
+/// A home directory has one name on a device. `here` is the name this
+/// device's home is mapped under, and `last` the name it last synced
+/// under. Where either is another name than `~`, mapping home as `~`
+/// would take it to another channel than the one it is in, or left.
+fn home_memory_elsewhere(here: Option<&str>, last: Option<&str>) -> String {
+    let home = cordelia_sync::claude::HOME_NAME;
+    match (here, last) {
+        (Some(here), _) => format!("home memory on this device syncs as {here}"),
+        (None, Some(last)) if last != home => {
+            format!("home memory on this device last synced as {last}")
+        }
+        _ => "cordelia sync map ~ --home".to_string(),
+    }
+}
+
+/// Whether a cycle's report is a report of what syncs now, to be kept for
+/// `cordelia sync status`. One from a cycle that stopped saw only some of
+/// the folders, and one made under settings that have changed since (`now`
+/// is the count of changes as it stands) saw the wrong ones. The change
+/// that did either has already woken the next cycle.
+fn report_stands(report: &cordelia_sync::claude::CycleReport, now: u64) -> bool {
+    !report.stopped && report.generation == now
 }
 
 // ── cordelia peers ─────────────────────────────────────────────────
@@ -1507,9 +1570,210 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 // Thin clients of the running node's local API: all logic lives in the
 // node (cordelia_api::membership), which must be started first.
 
-/// A project as the exclude list stores it: lower case, no `.git`.
+/// A project's name in its one spelling: as the exclude list stores it,
+/// as the node cleans one, and as a project is found from its remote.
 fn normalise_project(project: &str) -> String {
-    project.trim().trim_end_matches(".git").to_lowercase()
+    cordelia_core::sync_name::tidy(project)
+}
+
+/// The name `map` was given, as it is sent to the node. A shell hands an
+/// unquoted `~` over as the home directory's path, in whatever spelling
+/// `$HOME` has (it may reach the directory through a link), so that path
+/// is taken for `~`.
+fn name_given(typed: &str, home_dir: &std::path::Path) -> String {
+    let typed = typed.trim();
+    let path = std::path::Path::new(typed);
+    let is_home = path == home_dir
+        || (path.is_absolute() && std::fs::canonicalize(path).is_ok_and(|real| real == home_dir));
+    if is_home {
+        cordelia_sync::claude::HOME_NAME.to_string()
+    } else {
+        normalise_project(typed)
+    }
+}
+
+/// Whether the name `map` was given is the name the folder is mapped
+/// under: none was given, or it is that name as it would be sent, or it
+/// is that name as it is stored. (A name stored by an earlier version can
+/// end in `.git`, which is taken off a name that is sent.)
+fn is_the_name_it_has(typed: Option<&str>, home_dir: &std::path::Path, mapped: &str) -> bool {
+    typed.is_none_or(|typed| {
+        name_given(typed, home_dir) == mapped || typed.trim().to_lowercase() == mapped
+    })
+}
+
+/// What `map` offers when the home directory is named with a name and
+/// without `--home`: the command that was typed, with the flag.
+///
+/// - The name `~`, however a shell handed it over (see [`name_given`]):
+///   `map` with the flag and no name, which is `~`.
+/// - A name home memory can take: `map` with the flag and the name as it
+///   was typed, quoted for a shell where it needs to be. Run, it maps
+///   home under the name the typed command would have.
+/// - Anything else is `Err`, with the name as typed: it is said to be
+///   unusable, and no name is offered in its place.
+fn home_offer(typed: &str, home_dir: &std::path::Path) -> Result<String, String> {
+    let typed = typed.trim();
+    let sent = name_given(typed, home_dir);
+    if sent == cordelia_sync::claude::HOME_NAME {
+        Ok("cordelia sync map ~ --home".to_string())
+    } else if cordelia_api::sync::valid_sync_name(&sent) {
+        Ok(format!("cordelia sync map ~ {} --home", shell_word(typed)))
+    } else {
+        Err(typed.to_string())
+    }
+}
+
+/// The mapping a word names, if it names one: by the name as it is
+/// stored, or else in its one spelling. (An earlier version could store a
+/// name that ends in `.git`, which the one spelling takes off. Where one
+/// mapping is stored as `x.git` and another as `x`, `x.git` names the
+/// first.)
+///
+/// A word that ends in `/` is a folder, as a shell completes one, and
+/// names no mapping.
+fn mapping_named<'a>(mappings: &'a [(String, String)], word: &str) -> Option<&'a (String, String)> {
+    let word = word.trim();
+    if word.ends_with('/') {
+        return None;
+    }
+    let as_stored = word.to_lowercase();
+    let as_name = normalise_project(word);
+    [as_stored, as_name]
+        .iter()
+        .find_map(|spelt| mappings.iter().find(|(_, name)| name == spelt))
+}
+
+/// The mapping that stands in the way of an exclusion: one whose name or
+/// folder is what would be stored (`project`), or that the word as typed
+/// names. A mapped folder syncs whatever is excluded, so excluding it
+/// would say something that is not so.
+fn mapping_in_the_way<'a>(
+    mappings: &'a [(String, String)],
+    project: &str,
+    typed: &str,
+) -> Option<&'a (String, String)> {
+    mappings
+        .iter()
+        .find(|(folder, name)| name == project || folder == project)
+        .or_else(|| mapping_named(mappings, typed))
+}
+
+/// The mapping of a folder, given the folder's spellings in the order
+/// they are meant: the first spelling that is a mapping's folder decides.
+/// So a folder that is mapped is found before the repository it is in,
+/// whichever of the two was mapped first.
+fn mapping_at<'a>(
+    mappings: &'a [(String, String)],
+    spellings: &[String],
+) -> Option<&'a (String, String)> {
+    spellings
+        .iter()
+        .find_map(|spelt| mappings.iter().find(|(folder, _)| folder == spelt))
+}
+
+/// The exclude list that `cordelia sync claude --exclude` sends: what was
+/// typed, each taken as `cordelia sync exclude` takes it, in place of the
+/// names in the stored list; and the folders in the stored list. A folder
+/// is there because it was unmapped, or was excluded as a folder, and it
+/// stays out until it is mapped again or included. With `--reset` nothing
+/// of the stored list is kept.
+fn exclude_list_to_send(
+    typed: &[String],
+    stored: &[String],
+    reset: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut list: Vec<String> = Vec::new();
+    for given in typed {
+        let entry = exclusion(given)?;
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+    }
+    for folder in stored.iter().filter(|e| !reset && e.starts_with('/')) {
+        if !list.contains(folder) {
+            list.push(folder.clone());
+        }
+    }
+    Ok(list)
+}
+
+/// The mappings as the node's own check takes them.
+fn as_mappings(mappings: &[(String, String)]) -> Vec<cordelia_api::types::SyncMapping> {
+    mappings
+        .iter()
+        .map(|(folder, name)| cordelia_api::types::SyncMapping {
+            folder: folder.clone(),
+            name: name.clone(),
+        })
+        .collect()
+}
+
+/// What a refusal of `map` says about syncing home memory, where no name
+/// was given for it: `home on`, which puts home memory back under the name
+/// it last had on this device, if the node would take that; and how to map
+/// it under a name if it would not (another folder has that name now).
+fn home_on_offer(
+    last_name: Option<&str>,
+    home_dir: &std::path::Path,
+    mappings: &[(String, String)],
+) -> String {
+    let name = last_name.unwrap_or(cordelia_sync::claude::HOME_NAME);
+    let request = cordelia_api::types::SyncMapRequest {
+        folder: home_dir.display().to_string(),
+        name: name.to_string(),
+        home: true,
+    };
+    match cordelia_api::sync::check_mapping(&request, home_dir, &as_mappings(mappings)) {
+        Ok(_) => "To sync home memory: cordelia sync home on".to_string(),
+        Err(why) => format!(
+            "Home memory cannot be put back as {} ({why}). To sync it under a name: \
+             cordelia sync map ~ <name> --home",
+            sync_label(name)
+        ),
+    }
+}
+
+/// What `map` does about a folder that is not already mapped as asked.
+#[derive(Debug, PartialEq)]
+enum MapStep {
+    /// Ask the node. It takes the request, or refuses it for a reason
+    /// that unmapping the folder would not change.
+    Send,
+    /// The folder is mapped under another name, and nothing else stands
+    /// in the way: unmapping it first is the way.
+    UnmapFirst(String),
+}
+
+/// Whether to advise an unmap. `request` is what would be sent, and
+/// `mappings` what the node holds.
+///
+/// Unmapping is not free: the folder stops syncing, forgets what it agreed
+/// and is excluded. So it is advised only when the request would be taken
+/// once the folder was unmapped, which is asked of the node's own check
+/// (`cordelia_api::sync::check_mapping`) with the folder's mapping left
+/// out. A request that would be refused anyway is sent, and the node says
+/// why.
+fn map_step(
+    request: &cordelia_api::types::SyncMapRequest,
+    home_dir: &std::path::Path,
+    mappings: &[(String, String)],
+) -> MapStep {
+    let Some((_, mapped)) = mappings
+        .iter()
+        .find(|(folder, _)| *folder == request.folder)
+    else {
+        return MapStep::Send;
+    };
+    let others: Vec<(String, String)> = mappings
+        .iter()
+        .filter(|(folder, _)| *folder != request.folder)
+        .cloned()
+        .collect();
+    match cordelia_api::sync::check_mapping(request, home_dir, &as_mappings(&others)) {
+        Ok(_) => MapStep::UnmapFirst(mapped.clone()),
+        Err(_) => MapStep::Send,
+    }
 }
 
 /// The sync settings of the running node. Sync must be on.
@@ -1638,13 +1902,81 @@ fn api_post(
         .read_json()
         .unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        let message = json["error"]["message"]
+        let mut message = json["error"]["message"]
             .as_str()
             .map(|m| m.strip_prefix("bad request: ").unwrap_or(m).to_string())
             .unwrap_or_else(|| format!("HTTP {status}"));
+        // An install leaves the old node running until it is restarted.
+        // A refusal may then mean only that the node is another version
+        // than this command.
+        let timeout = std::time::Duration::from_secs(3);
+        if !VERSION_NOTED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(node) = local_api(&config, false, "/api/v1/status", timeout)
+            && let Some(note) = version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+        {
+            message.push_str(&format!("\n{note}"));
+        }
         anyhow::bail!("{message}");
     }
     Ok(json)
+}
+
+/// Set once this command has said that the node is another version, so that
+/// it is not said again beside a refusal.
+static VERSION_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What to say about the running node, if it answers and is not the version
+/// this command is.
+fn node_version_note(config_path: &str) -> Option<String> {
+    let mut config = Config::load(&config::expand_tilde(config_path)).ok()?;
+    config.apply_env_overrides();
+    let timeout = std::time::Duration::from_secs(3);
+    let node = local_api(&config, false, "/api/v1/status", timeout).ok()?;
+    version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+}
+
+/// What to say when the running node is not the version this command is
+/// (`own`). A node from before it reported its version reports none.
+fn version_note(node: Option<&str>, own: &str) -> Option<String> {
+    // Which of the two is the older is not judged: version strings are
+    // not compared, only found to differ.
+    let after = "They should be the same: an upgrade leaves the old node running until it \
+                 is restarted.";
+    match node {
+        Some(node) if node == own => None,
+        Some(node) => Some(format!(
+            "The running node is version {node} and this command is version {own}. {after}"
+        )),
+        None => Some(format!(
+            "The running node is from before nodes said their version, and this command \
+             is version {own}. {after}"
+        )),
+    }
+}
+
+/// The mapping `cordelia sync unmap <word>` means, given the mapping whose
+/// name the word is and the mapping whose folder it is. One word that
+/// means two mappings is refused: it is not for the command to pick.
+fn mapping_meant<'a>(
+    word: &str,
+    by_name: Option<&'a (String, String)>,
+    by_folder: Option<&'a (String, String)>,
+) -> anyhow::Result<&'a (String, String)> {
+    match (by_name, by_folder) {
+        (Some(named), Some(at)) if named.0 != at.0 => anyhow::bail!(
+            "{word} is the name {} syncs under, and also a folder, which syncs as {}. \
+             To unmap the folder: cordelia sync unmap {}. To unmap the other: \
+             cordelia sync unmap {}.",
+            short_path(&named.0),
+            sync_label(&at.1),
+            shell_arg(&at.0),
+            shell_arg(&named.0)
+        ),
+        (Some(found), _) | (None, Some(found)) => Ok(found),
+        (None, None) => anyhow::bail!(
+            "{word} is not mapped on this device. `cordelia sync status` shows what is."
+        ),
+    }
 }
 
 fn cmd_add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
@@ -1787,6 +2119,13 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
 
+    // An install leaves the old node running until it is restarted. Said
+    // first, and whether or not the command then works: a node of another
+    // version may take a request and mean something else by it.
+    if let Some(note) = node_version_note(config_path) {
+        eprintln!("{note}\n");
+        VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let set = |body: serde_json::Value| api_post(config_path, "/api/v1/sync/claude", body);
     // The settings generation a change left behind: the scope printed at
     // the end waits for a report made after it.
@@ -1812,14 +2151,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             if all || mapped_only {
                 body["all"] = all.into();
             }
-            if !exclude.is_empty() {
-                body["exclude"] = serde_json::json!(exclude);
-            }
             if no_home {
                 body["home"] = false.into();
             }
             // Nothing changes silently: say what this run changed.
             let before = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
+            if !exclude.is_empty() {
+                let stored = excluded_projects(&before);
+                body["exclude"] =
+                    serde_json::json!(exclude_list_to_send(&exclude, &stored, reset)?);
+            }
             let after = set(body)?;
             since = after["generation"].as_u64();
             for line in setting_changes(&before, &after) {
@@ -1836,120 +2177,222 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             // Claude Code keeps one memory per repository, in the folder
             // of its main working tree: that is the folder to map.
             let root = discover::memory_root(&given);
+            let mapped_folder = root.display().to_string();
             let home_dir = real_home();
             let is_home = root == home_dir;
-            if is_home && !home {
-                if given == root {
+            let settings = sync_settings(config_path)?;
+            let mappings = declared_mappings(&settings);
+            let home_on = || home_on_offer(settings["home_name"].as_str(), &home_dir, &mappings);
+            let mapped = mappings
+                .iter()
+                .find(|(folder, _)| *folder == mapped_folder)
+                .map(|(_, name)| name.clone());
+            // The name asked for, as it would be sent.
+            let asked = name.as_deref().map(|typed| name_given(typed, &home_dir));
+            // Mapped already, and no name given, or the name it has: there
+            // is nothing to change, and the name it has is the answer. It
+            // is never refused, not for a flag left out either.
+            let already = mapped
+                .clone()
+                .filter(|mapped| is_the_name_it_has(name.as_deref(), &home_dir, mapped));
+            // What is said of a folder mapped under another name, once
+            // nothing else stands in the way of the request.
+            let unmap_first = |mapped: &str| {
+                anyhow::anyhow!(
+                    "{0} is already mapped to {1}. To sync it under another name, unmap it \
+                     first: cordelia sync unmap {2}",
+                    short_path(&mapped_folder),
+                    sync_label(mapped),
+                    shell_arg(&mapped_folder)
+                )
+            };
+            if let Some(mapped) = already {
+                println!(
+                    "{} is already mapped to {}. Nothing changed.",
+                    short_path(&mapped_folder),
+                    sync_label(&mapped)
+                );
+                println!();
+                since = None;
+            } else {
+                // Home memory syncs only when it is asked for, and by
+                // naming the home directory itself: never by a slip, and
+                // never because a folder inside it was named.
+                let names_home = given == home_dir;
+                // The first two refusals say how to sync home memory
+                // under the name it last had here: the name that was
+                // given, if any, was for another folder.
+                if home && !names_home {
+                    anyhow::bail!("--home is for the home directory itself. {}", home_on());
+                }
+                if is_home && !names_home {
                     anyhow::bail!(
-                        "that is your home directory. To sync home memory: cordelia sync map ~ --home"
+                        "Claude Code keeps the memory for {} with your home directory's, because \
+                         your home directory is a git repository. {}",
+                        given.display(),
+                        home_on()
                     );
                 }
-                anyhow::bail!(
-                    "Claude Code keeps the memory for {} with your home directory's, because \
-                     your home directory is a git repository. To sync home memory: \
-                     cordelia sync map ~ --home",
-                    given.display()
-                );
-            }
-            if home && !is_home {
-                anyhow::bail!("--home maps the home directory itself: cordelia sync map ~ --home");
-            }
-            let name = match name {
-                Some(name) if is_home && name != HOME_NAME => {
-                    anyhow::bail!("home memory has no other name ({name}): leave the name out")
-                }
-                _ if is_home => HOME_NAME.to_string(),
-                Some(name) => normalise_project(&name),
-                None => {
-                    let needs_name = |why: &str| {
-                        anyhow::anyhow!(
-                            "{0} {why}, so it needs a name: cordelia sync map {0} <name>\n\
-                             Use the same name on your other devices.",
-                            shell_arg(&root.display().to_string())
-                        )
+                if is_home && !home {
+                    // No name: the name home memory last had on this
+                    // device.
+                    let Some(typed) = name.as_deref() else {
+                        anyhow::bail!("that is your home directory. {}", home_on());
                     };
-                    match discover::project_for(&root, &home_dir) {
-                        Some(Project::Repo(remote))
-                            if cordelia_api::sync::valid_sync_name(&remote) =>
-                        {
-                            remote
-                        }
-                        Some(Project::Repo(remote)) => {
-                            return Err(needs_name(&format!(
-                                "has a remote that does not make a usable name ({remote})"
-                            )));
-                        }
-                        _ => return Err(needs_name("is not a git project with a remote")),
+                    let command = home_offer(typed, &home_dir).map_err(|name| {
+                        anyhow::anyhow!(
+                            "that is your home directory, and {name:?} is not a name it can \
+                             sync under: use lower-case letters, digits and . _ - / ~ + % @, \
+                             and do not start it with - or ~. To sync home memory under a \
+                             name: cordelia sync map ~ <name> --home"
+                        )
+                    })?;
+                    // The command offered is one the node would take: it
+                    // is asked here, of the same check, with the flag.
+                    let with_flag = cordelia_api::types::SyncMapRequest {
+                        folder: mapped_folder.clone(),
+                        name: asked.clone().unwrap_or_default(),
+                        home: true,
+                    };
+                    // Mapped under another name, and nothing else in the
+                    // way. The command as typed would be refused for the
+                    // flag once home was unmapped, so both steps are said
+                    // at once, after saying that this is the home
+                    // directory: if naming it was a slip, nothing is
+                    // unmapped for it.
+                    if let MapStep::UnmapFirst(mapped) = map_step(&with_flag, &home_dir, &mappings)
+                    {
+                        anyhow::bail!(
+                            "that is your home directory, and it is already mapped to {}. To \
+                             sync home memory under another name, unmap it and then map it \
+                             with --home:\n  cordelia sync unmap {}\n  {command}",
+                            sync_label(&mapped),
+                            shell_arg(&mapped_folder)
+                        );
+                    }
+                    let held = as_mappings(&mappings);
+                    match cordelia_api::sync::check_mapping(&with_flag, &home_dir, &held) {
+                        Ok(_) => anyhow::bail!(
+                            "that is your home directory. To sync home memory: {command}"
+                        ),
+                        Err(why) => anyhow::bail!(
+                            "that is your home directory, and it cannot sync under that \
+                             name: {why}"
+                        ),
                     }
                 }
-            };
-            let settings = api_post(
-                config_path,
-                "/api/v1/sync/map",
-                serde_json::json!({
-                    "folder": root.display().to_string(),
-                    "name": name,
-                    "home": is_home,
-                }),
-            )?;
-            since = settings["generation"].as_u64();
-            if root != given {
+                let name = match asked {
+                    Some(name) => name,
+                    None if is_home => HOME_NAME.to_string(),
+                    None => {
+                        let needs_name = |why: &str| {
+                            anyhow::anyhow!(
+                                "{0} {why}, so it needs a name: cordelia sync map {0} <name>\n\
+                                 Use the same name on your other devices.",
+                                shell_arg(&mapped_folder)
+                            )
+                        };
+                        match discover::project_for(&root, &home_dir) {
+                            Some(Project::Repo(remote))
+                                if cordelia_api::sync::valid_sync_name(&remote) =>
+                            {
+                                remote
+                            }
+                            Some(Project::Repo(remote)) => {
+                                return Err(needs_name(&format!(
+                                    "has a remote that does not make a usable name ({remote})"
+                                )));
+                            }
+                            _ => return Err(needs_name("is not a git project with a remote")),
+                        }
+                    }
+                };
+                let request = cordelia_api::types::SyncMapRequest {
+                    folder: mapped_folder.clone(),
+                    name: name.clone(),
+                    home: is_home,
+                };
+                if let MapStep::UnmapFirst(mapped) = map_step(&request, &home_dir, &mappings) {
+                    return Err(unmap_first(&mapped));
+                }
+                let settings = api_post(
+                    config_path,
+                    "/api/v1/sync/map",
+                    serde_json::json!({
+                        "folder": request.folder,
+                        "name": request.name,
+                        "home": request.home,
+                    }),
+                )?;
+                since = settings["generation"].as_u64();
+                if root != given {
+                    println!(
+                        "Claude Code keeps one memory for a repository, shared by its folders and worktrees."
+                    );
+                }
                 println!(
-                    "Claude Code keeps one memory for a repository, shared by its folders and worktrees."
+                    "Mapped {} to {}.",
+                    short_path(&mapped_folder),
+                    sync_label(&name)
                 );
+                // Say so when the folder synced may not be the one Claude Code
+                // uses, rather than report "syncing" and leave it to be found.
+                let claude_dir = settings["dir"].as_str().unwrap_or_default();
+                if discover::memory_root_is_assumed(&given) {
+                    println!(
+                        "Note: this is a submodule, or a worktree of a bare repository. Where Claude \
+                         Code keeps memory for those is not confirmed: check that it uses {}.",
+                        discover::claude_folder(std::path::Path::new(claude_dir), &root)
+                            .map(|f| short_path(&f.display().to_string()))
+                            .unwrap_or_default()
+                    );
+                }
+                if std::path::Path::new(claude_dir) != home_dir.join(".claude") {
+                    println!(
+                        "Note: sync uses {}, not ~/.claude: the memory is kept under that directory.",
+                        short_path(claude_dir)
+                    );
+                }
+                println!();
             }
-            println!(
-                "Mapped {} to {}.",
-                short_path(&root.display().to_string()),
-                sync_label(&name)
-            );
-            // Say so when the folder synced may not be the one Claude Code
-            // uses, rather than report "syncing" and leave it to be found.
-            let claude_dir = settings["dir"].as_str().unwrap_or_default();
-            if discover::memory_root_is_assumed(&given) {
-                println!(
-                    "Note: this is a submodule, or a worktree of a bare repository. Where Claude \
-                     Code keeps memory for those is not confirmed: check that it uses {}.",
-                    discover::claude_folder(std::path::Path::new(claude_dir), &root)
-                        .map(|f| short_path(&f.display().to_string()))
-                        .unwrap_or_default()
-                );
-            }
-            if std::path::Path::new(claude_dir) != home_dir.join(".claude") {
-                println!(
-                    "Note: sync uses {}, not ~/.claude: the memory is kept under that directory.",
-                    short_path(claude_dir)
-                );
-            }
-            println!();
         }
         SyncCommand::Unmap { folder } => {
             let settings = sync_settings(config_path)?;
             let mappings = declared_mappings(&settings);
             // A name; or a folder, which may be any folder of a mapped
             // repository, or one that is no longer on disk.
-            let as_name = normalise_project(&folder);
-            let found = mappings
-                .iter()
-                .find(|(_, name)| *name == folder || *name == as_name)
-                .or_else(|| {
-                    let trimmed = match folder.trim_end_matches('/') {
-                        "" => "/",
-                        other => other,
-                    };
-                    let path = config::expand_tilde(trimmed);
-                    let mut spellings = vec![path.display().to_string()];
-                    if let Ok(real) = std::fs::canonicalize(&path) {
-                        spellings.push(discover::memory_root(&real).display().to_string());
-                        spellings.push(real.display().to_string());
-                    }
-                    mappings.iter().find(|(f, _)| spellings.contains(f))
-                });
-            let Some((mapped, name)) = found else {
-                anyhow::bail!(
-                    "{folder} is not mapped on this device. `cordelia sync status` shows what is."
-                );
+            let by_name = mapping_named(&mappings, &folder);
+            let by_folder = {
+                let trimmed = match folder.trim_end_matches('/') {
+                    "" => "/",
+                    other => other,
+                };
+                let path = config::expand_tilde(trimmed);
+                // The folder as typed, then its real path, then the
+                // repository it is in.
+                let mut spellings = vec![path.display().to_string()];
+                if let Ok(real) = std::fs::canonicalize(&path) {
+                    spellings.push(real.display().to_string());
+                    spellings.push(discover::memory_root(&real).display().to_string());
+                }
+                mapping_at(&mappings, &spellings)
             };
+            // A word that ends in `/` is a folder. If it is not a mapped
+            // one, and is a mapping's name without the `/`, say so.
+            if by_folder.is_none()
+                && let Some((named, name)) =
+                    mapping_named(&mappings, folder.trim().trim_end_matches('/'))
+                && by_name.is_none()
+            {
+                anyhow::bail!(
+                    "{folder} is taken for a folder, and it is not mapped on this device. To \
+                     unmap {}, which syncs as {}: cordelia sync unmap {}",
+                    short_path(named),
+                    sync_label(name),
+                    shell_word(name)
+                );
+            }
+            let (mapped, name) = mapping_meant(&folder, by_name, by_folder)?;
             let after = api_post(
                 config_path,
                 "/api/v1/sync/unmap",
@@ -1977,36 +2420,61 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
         SyncCommand::Status => since = None,
         SyncCommand::Home { state } => {
             let on = state == "on";
-            let mapped = declared_mappings(&sync_settings(config_path)?)
-                .iter()
-                .any(|(_, name)| name == HOME_NAME);
-            // Off unmaps it as well. On maps it, so that it syncs whichever
-            // scope this device uses.
-            set(serde_json::json!({ "enabled": true, "home": on }))?;
-            if on && !mapped {
+            // The home directory's mapping, whatever name it has.
+            let home_dir = real_home().display().to_string();
+            let mapped_as = |settings: &serde_json::Value| {
+                declared_mappings(settings)
+                    .into_iter()
+                    .find(|(folder, _)| *folder == home_dir)
+                    .map(|(_, name)| name)
+            };
+            let before = sync_settings(config_path)?;
+            let after = if on && mapped_as(&before).is_none() {
+                // On maps it, so that it syncs whichever scope this device
+                // uses: under the name it last had here, so that off and
+                // on again leaves it in the channel it was in. Mapping it
+                // is also what turns the setting on, in one step.
+                let name = before["home_name"].as_str().unwrap_or(HOME_NAME);
                 api_post(
                     config_path,
                     "/api/v1/sync/map",
-                    serde_json::json!({
-                        "folder": real_home().display().to_string(),
-                        "name": HOME_NAME,
-                        "home": true,
-                    }),
-                )?;
+                    serde_json::json!({ "folder": home_dir, "name": name, "home": true }),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "home memory was not mapped as {}: {e}\nTo map it under a name: \
+                         cordelia sync map ~ <name> --home",
+                        sync_label(name)
+                    )
+                })?
+            } else {
+                // Off unmaps it as well.
+                set(serde_json::json!({ "enabled": true, "home": on }))?
+            };
+            // Said from what the node holds now, not from what was asked.
+            match mapped_as(&after) {
+                Some(name) if on && name != HOME_NAME => println!(
+                    "Home-folder memory syncs on this device, as {}.",
+                    sync_label(&name)
+                ),
+                Some(_) if on => println!("Home-folder memory syncs on this device."),
+                None if !on => println!("Home-folder memory is not synced on this device."),
+                Some(name) => anyhow::bail!(
+                    "home memory is still mapped on this device (as {}): the node did not \
+                     unmap it. To stop it syncing: cordelia sync unmap {}",
+                    sync_label(&name),
+                    shell_word(&name)
+                ),
+                None => anyhow::bail!("home memory could not be mapped"),
             }
-            println!(
-                "Home-folder memory {} on this device.",
-                if on { "syncs" } else { "is not synced" }
-            );
             return Ok(());
         }
         SyncCommand::Exclude { project } => {
-            let project = exclusion(&project);
+            let typed = project;
+            let project = exclusion(&typed)?;
             let settings = sync_settings(config_path)?;
-            if let Some((folder, name)) = declared_mappings(&settings)
-                .iter()
-                .find(|(folder, name)| *name == project || *folder == project)
-            {
+            let mappings = declared_mappings(&settings);
+            if let Some((folder, name)) = mapping_in_the_way(&mappings, &project, &typed) {
                 anyhow::bail!(
                     "{} is mapped on this device. To stop syncing it: cordelia sync unmap {}",
                     short_path(folder),
@@ -2022,7 +2490,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             return Ok(());
         }
         SyncCommand::Include { project } => {
-            let project = exclusion(&project);
+            let project = exclusion(&project)?;
             let settings = sync_settings(config_path)?;
             let mut exclude = excluded_projects(&settings);
             exclude.retain(|e| *e != project);
@@ -2043,17 +2511,28 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
 }
 
 /// What `cordelia sync exclude` and `include` are given, as the exclude
-/// list stores it: a project name or prefix, or a folder as the real path
-/// of the repository it is in.
-fn exclusion(given: &str) -> String {
+/// list stores it: a folder as the real path of the repository it is in;
+/// or a project's name, which is the name it is found under. A remote that
+/// is pasted (`https://...`, `git@host:...`) is taken for the name it
+/// gives. Anything else is a name or a prefix, cleaned as the node cleans
+/// one, with no space round it: what is typed and is no folder on disk is
+/// not a folder whose name ends in a space. It is an error if nothing is
+/// left.
+fn exclusion(given: &str) -> anyhow::Result<String> {
     let looks_like_a_path = given.starts_with(['/', '~', '.']);
-    match std::fs::canonicalize(config::expand_tilde(given)) {
-        Ok(real) if looks_like_a_path => cordelia_sync::discover::memory_root(&real)
-            .display()
-            .to_string(),
-        _ if given.starts_with('/') => given.trim_end_matches('/').to_string(),
-        _ => normalise_project(given),
-    }
+    let typed = given.trim();
+    let as_stored = match std::fs::canonicalize(config::expand_tilde(given)) {
+        Ok(real) if looks_like_a_path => Some(
+            cordelia_sync::discover::memory_root(&real)
+                .display()
+                .to_string(),
+        ),
+        _ => cordelia_sync::discover::normalize_remote(typed)
+            .or_else(|| cordelia_api::sync::clean_exclusion(typed)),
+    };
+    as_stored.ok_or_else(|| {
+        anyhow::anyhow!("{given:?} is not a project's name, a prefix ending in *, or a folder")
+    })
 }
 
 /// What a run of `cordelia sync claude` changed, one line each, from the
@@ -2180,7 +2659,7 @@ fn shell_word(word: &str) -> String {
         && !word.starts_with('-')
         && word
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-+@%".contains(&b));
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+@".contains(&b));
     if plain {
         word.to_string()
     } else {
@@ -2336,8 +2815,16 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
                 // `map` takes folders in the home directory only.
                 let mappable = std::path::Path::new(cwd).starts_with(real_home());
                 let (mut what, command) = match u["name"].as_str() {
+                    // Under the name it last had here, if it had another:
+                    // mapped as `~` it would go to another channel.
                     Some(name) if name == cordelia_sync::claude::HOME_NAME => {
-                        (sync_label(name), "cordelia sync map ~ --home".to_string())
+                        match resp["home_name"].as_str() {
+                            Some(last) if last != name => (
+                                format!("{} (last synced as {last})", sync_label(name)),
+                                "cordelia sync home on".to_string(),
+                            ),
+                            _ => (sync_label(name), "cordelia sync map ~ --home".to_string()),
+                        }
                     }
                     Some(name) if !mappable => (
                         name.to_string(),
@@ -2356,9 +2843,13 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
                         format!("cordelia sync map {} <name>", shell_arg(cwd)),
                     ),
                 };
+                // Not said of a home that last synced under another
+                // name: what the other devices sync is `~`, and turning
+                // home on here would not join that.
                 if u["name"]
                     .as_str()
                     .is_some_and(|n| available.iter().any(|a| a == n))
+                    && !command.ends_with("sync home on")
                 {
                     what.push_str(" (your other devices sync it)");
                 }
@@ -2368,6 +2859,11 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         print_columns(&rows);
     }
 
+    let home_dir = real_home().display().to_string();
+    let home_here: Option<String> = declared_mappings(&resp)
+        .into_iter()
+        .find(|(folder, _)| *folder == home_dir)
+        .map(|(_, name)| name);
     let elsewhere: Vec<Vec<String>> = available
         .iter()
         .filter(|name| {
@@ -2377,7 +2873,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         })
         .map(|name| {
             let command = if name == cordelia_sync::claude::HOME_NAME {
-                "cordelia sync map ~ --home".to_string()
+                home_memory_elsewhere(home_here.as_deref(), resp["home_name"].as_str())
             } else {
                 format!("cordelia sync map <folder> {}", shell_word(name))
             };
@@ -2735,15 +3231,520 @@ mod tests {
                 "github.com/seed-drill/cordelia-node",
                 "github.com/seed-drill/cordelia-node",
             ),
-            ("host.example/a%20b/c+d", "host.example/a%20b/c+d"),
+            ("host.example/a/c+d", "host.example/a/c+d"),
             // A tilde is expanded by the shell at the start of a word.
             ("git.sr.ht/~sam/proj", "'git.sr.ht/~sam/proj'"),
+            // fish expands `%self`; a percent sign is quoted wherever it is.
+            ("%self", "'%self'"),
+            ("host.example/a%20b", "'host.example/a%20b'"),
             ("x; rm -rf ~", "'x; rm -rf ~'"),
             ("-rf", "'-rf'"),
             ("", "''"),
         ] {
             assert_eq!(shell_word(name), want);
         }
+    }
+
+    /// An install leaves the old node running. A command says so, beside
+    /// what the node answered, when the node is not the version it is.
+    #[test]
+    fn test_a_node_of_another_version_is_named() {
+        assert_eq!(version_note(Some("0.2.0-alpha.6"), "0.2.0-alpha.6"), None);
+        let other = version_note(Some("0.2.0-alpha.5"), "0.2.0-alpha.6").unwrap();
+        assert!(
+            other.contains("node is version 0.2.0-alpha.5")
+                && other.contains("command is version 0.2.0-alpha.6")
+                && other.contains("restarted"),
+            "{other}"
+        );
+        // A node from before it said its version.
+        let older = version_note(None, "0.2.0-alpha.6").unwrap();
+        assert!(
+            older.contains("from before nodes said their version")
+                && older.contains("command is version 0.2.0-alpha.6")
+                && older.contains("restarted"),
+            "{older}"
+        );
+    }
+
+    /// Another device's `~` is offered to this device only where its home
+    /// has no other name: a home has one name on a device.
+    #[test]
+    fn test_home_memory_elsewhere_is_offered_only_to_a_home_without_a_name() {
+        let offer = "cordelia sync map ~ --home";
+        assert_eq!(home_memory_elsewhere(None, None), offer);
+        assert_eq!(home_memory_elsewhere(None, Some("~")), offer);
+        let mapped = home_memory_elsewhere(Some("team"), Some("team"));
+        assert!(mapped.contains("syncs as team") && !mapped.contains("cordelia"));
+        let off = home_memory_elsewhere(None, Some("team"));
+        assert!(off.contains("last synced as team") && !off.contains("cordelia"));
+    }
+
+    /// Status shows the last report of what syncs. A report from a cycle
+    /// that stopped, or from before the settings last changed, is not one.
+    #[test]
+    fn test_only_a_report_of_what_syncs_now_is_kept() {
+        use cordelia_sync::claude::CycleReport;
+        let report = |generation: u64, stopped: bool| CycleReport {
+            generation,
+            stopped,
+            ..Default::default()
+        };
+        assert!(report_stands(&report(4, false), 4));
+        assert!(!report_stands(&report(4, true), 4));
+        assert!(!report_stands(&report(3, false), 4));
+    }
+
+    /// What `map` offers when the home directory is named, with a name and
+    /// without the flag, is the command that was typed, with the flag: the
+    /// name as typed, so that it maps home under the name that command
+    /// would have, and quoted where a shell would read it otherwise.
+    #[test]
+    fn test_what_map_offers_for_the_home_directory() {
+        let home = std::path::Path::new("/home/sam");
+        let offer = |name: &str| home_offer(name, home);
+        // `~`, quoted or as a shell hands it over.
+        for home_itself in ["~", " ~ ", "/home/sam"] {
+            assert_eq!(
+                offer(home_itself).unwrap(),
+                "cordelia sync map ~ --home",
+                "{home_itself:?}"
+            );
+        }
+        for (typed, offered) in [
+            ("team", "cordelia sync map ~ team --home"),
+            (" team ", "cordelia sync map ~ team --home"),
+            ("Team", "cordelia sync map ~ Team --home"),
+            (
+                "github.com/Owner/Repo.git",
+                "cordelia sync map ~ github.com/Owner/Repo.git --home",
+            ),
+            // An ending in capitals, and one with a space before it: the
+            // typed command would map `repo` and `team`, which are names.
+            ("Repo.GIT", "cordelia sync map ~ Repo.GIT --home"),
+            ("team .git", "cordelia sync map ~ 'team .git' --home"),
+            (
+                "git.sr.ht/~sam/proj",
+                "cordelia sync map ~ 'git.sr.ht/~sam/proj' --home",
+            ),
+            ("100%mine", "cordelia sync map ~ '100%mine' --home"),
+        ] {
+            assert_eq!(offer(typed).unwrap(), offered, "{typed}");
+        }
+        // Not a name. It is said as it was typed, not as it was tidied.
+        for not_a_name in [
+            "my team",
+            "My Team",
+            "a/../b",
+            "it's",
+            "-x",
+            "~x",
+            "",
+            ".git",
+            "/home/sam/x",
+        ] {
+            assert_eq!(offer(not_a_name).unwrap_err(), not_a_name, "{not_a_name:?}");
+        }
+    }
+
+    /// The name `map` sends: in its one spelling, and `~` for the home
+    /// directory's path, which is what a shell makes of an unquoted `~`.
+    #[test]
+    fn test_the_name_map_sends() {
+        let home = std::path::Path::new("/home/sam");
+        for (typed, sent) in [
+            ("~", "~"),
+            (" ~ ", "~"),
+            ("/home/sam", "~"),
+            ("/home/sam/", "~"),
+            ("Team", "team"),
+            ("Repo.GIT", "repo"),
+            ("team .git", "team"),
+            // Another path is no name, and is sent as it is to be refused.
+            ("/home/sam/x", "/home/sam/x"),
+            ("/home/samantha", "/home/samantha"),
+        ] {
+            assert_eq!(name_given(typed, home), sent, "{typed:?}");
+        }
+    }
+
+    /// `$HOME` may reach the home directory through a link. A shell hands
+    /// that spelling over for an unquoted `~`, and the home directory is
+    /// known by its real path: it is still `~`.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_home_directory_by_another_spelling_is_still_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let within = dir.path().canonicalize().unwrap();
+        let (real, other, link) = (
+            within.join("real"),
+            within.join("other"),
+            within.join("link"),
+        );
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.to_str().unwrap();
+        assert_eq!(name_given(link, &real), "~");
+        assert_eq!(
+            home_offer(link, &real).unwrap(),
+            "cordelia sync map ~ --home"
+        );
+        // A directory that is not the home directory is not.
+        assert_ne!(name_given(other.to_str().unwrap(), &real), "~");
+        // Nor a path that does not exist.
+        assert_ne!(
+            name_given(within.join("gone").to_str().unwrap(), &real),
+            "~"
+        );
+        // Nor a word that happens to lead there from where the command is
+        // run: a shell makes an absolute path of `~`.
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(name_given(".", &here), ".");
+    }
+
+    /// `map` changes nothing when it is given the name the folder has, or
+    /// none: the name as it would be sent, or as it is stored.
+    #[test]
+    fn test_the_name_a_folder_has_is_no_change() {
+        let home = std::path::Path::new("/home/sam");
+        for (typed, mapped) in [
+            (None, "team"),
+            (Some("team"), "team"),
+            (Some(" Team "), "team"),
+            (Some("team.git"), "team"),
+            (Some("~"), "~"),
+            // An unquoted `~`, as a shell hands it over.
+            (Some("/home/sam"), "~"),
+            // A name an earlier version stored with its ending, typed as
+            // it is stored.
+            (Some("x.git"), "x.git"),
+            (Some("X.GIT"), "x.git"),
+        ] {
+            assert!(
+                is_the_name_it_has(typed, home, mapped),
+                "{typed:?} {mapped}"
+            );
+        }
+        for (typed, mapped) in [
+            ("other", "team"),
+            ("x", "x.git"),
+            ("~", "team"),
+            ("/home/sam", "team"),
+            ("team", "~"),
+        ] {
+            assert!(
+                !is_the_name_it_has(Some(typed), home, mapped),
+                "{typed} {mapped}"
+            );
+        }
+    }
+
+    /// A folder mapped under another name is told to unmap first only when
+    /// that would help: when the request would be taken once it was
+    /// unmapped. Unmapping is not free, so a request that would be refused
+    /// anyway is sent, and the node says why.
+    #[test]
+    fn test_an_unmap_is_advised_only_when_it_would_help() {
+        let home = std::path::Path::new("/home/sam");
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let mappings = [
+            pair("/home/sam", "team"),
+            pair("/home/sam/notes", "lab-notes"),
+            pair("/home/sam/Work", "work"),
+        ];
+        let step = |folder: &str, name: &str, flag: bool| {
+            let request = cordelia_api::types::SyncMapRequest {
+                folder: folder.into(),
+                name: name.into(),
+                home: flag,
+            };
+            map_step(&request, home, &mappings)
+        };
+        // Mapped under another name, and nothing else stands in the way.
+        assert_eq!(
+            step("/home/sam/notes", "other", false),
+            MapStep::UnmapFirst("lab-notes".into())
+        );
+        assert_eq!(
+            step("/home/sam", "other", true),
+            MapStep::UnmapFirst("team".into())
+        );
+        // Mapped under another name, and refused whatever is unmapped.
+        for (folder, name, flag, why) in [
+            ("/home/sam/notes", "lab notes", false, "not a usable name"),
+            ("/home/sam/notes", "~", false, "the name of home memory"),
+            (
+                "/home/sam/notes",
+                "work",
+                false,
+                "another folder has the name",
+            ),
+            ("/home/sam/notes", "other", true, "the flag is for home"),
+            ("/home/sam", "my team", true, "not a usable name"),
+            ("/home/sam", "work", true, "another folder has the name"),
+            ("/home/sam", "other", false, "home, without the flag"),
+        ] {
+            assert_eq!(step(folder, name, flag), MapStep::Send, "{why}");
+        }
+        // Not mapped at all.
+        assert_eq!(step("/home/sam/new", "new", false), MapStep::Send);
+        assert_eq!(step("/home/sam/new", "work", false), MapStep::Send);
+    }
+
+    /// One adapter is held, for the Claude Code directory that is set: the
+    /// one there is while it is for that directory, and another when it is
+    /// not, or when there is none. (The loop passes `ClaudeAdapter::is_for`
+    /// as the question; that call is not under test here.)
+    #[test]
+    fn test_an_adapter_is_kept_only_while_it_is_for_the_directory() {
+        let made = std::cell::Cell::new(0);
+        let make = |dir: &'static str| {
+            made.set(made.get() + 1);
+            dir
+        };
+        let mut slot: Option<&'static str> = None;
+        // None held: one is made.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/a", || make("/a")), "/a");
+        // Held, and for the directory: kept.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/a", || make("/a")), "/a");
+        assert_eq!(made.get(), 1);
+        // Held, for another: one is made for the new directory.
+        assert_eq!(*adapter_for(&mut slot, |d| *d == "/b", || make("/b")), "/b");
+        assert_eq!((made.get(), slot), (2, Some("/b")));
+    }
+
+    /// A word names a mapping as the name is stored, or else in its one
+    /// spelling. An earlier version could store a name that ends in
+    /// `.git`: the one spelling takes that off, so such a name is found as
+    /// it is stored, in whatever case it is typed, and before a mapping
+    /// that has the name without the ending.
+    #[test]
+    fn test_a_mapping_is_named_as_stored_or_tidied() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        // The mapping with the shorter name comes first, so that taking
+        // the first that matches in any spelling would take the wrong one.
+        let mappings = [
+            pair("/home/sam/c", "old"),
+            pair("/home/sam/a", "team"),
+            pair("/home/sam/b", "old.git"),
+            pair("/home/sam", "~"),
+        ];
+        for (word, folder) in [
+            ("team", "/home/sam/a"),
+            (" Team ", "/home/sam/a"),
+            ("team.git", "/home/sam/a"),
+            ("old.git", "/home/sam/b"),
+            ("OLD.GIT", "/home/sam/b"),
+            (" Old.Git ", "/home/sam/b"),
+            ("old", "/home/sam/c"),
+            ("old.git.git", "/home/sam/c"),
+            ("~", "/home/sam"),
+        ] {
+            let found = mapping_named(&mappings, word).map(|(folder, _)| folder.as_str());
+            assert_eq!(found, Some(folder), "{word:?}");
+        }
+        // A word that ends in `/` is a folder, and names nothing.
+        for word in ["other", "/home/sam/a", "", "team/", "old.git/", " team/ "] {
+            assert_eq!(mapping_named(&mappings, word), None, "{word:?}");
+        }
+    }
+
+    /// An exclusion is refused for a mapping whose name or folder is what
+    /// would be stored, and for one the word as typed names: a name that
+    /// an earlier version stored with `.git` is not what the exclusion is
+    /// stored as, and is still in the way.
+    #[test]
+    fn test_a_mapping_stands_in_the_way_of_an_exclusion() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let mappings = [pair("/home/sam/a", "team"), pair("/home/sam/b", "old.git")];
+        for (typed, folder) in [
+            ("team", Some("/home/sam/a")),
+            ("Team.git", Some("/home/sam/a")),
+            ("/home/sam/a", Some("/home/sam/a")),
+            // Stored as `old`, which is no mapping's name: found by the
+            // word as typed.
+            ("old.git", Some("/home/sam/b")),
+            ("OLD.GIT", Some("/home/sam/b")),
+            ("old", None),
+            ("github.com/o/r", None),
+        ] {
+            let project = cordelia_api::sync::clean_exclusion(typed).unwrap();
+            let found = mapping_in_the_way(&mappings, &project, typed).map(|(f, _)| f.as_str());
+            assert_eq!(found, folder, "{typed:?}");
+        }
+    }
+
+    /// What `exclude` and `include` take: a project's name as it is found
+    /// (a pasted remote gives it), a prefix, or a folder, each as the
+    /// exclude list stores it. Nothing is an error, not an empty entry.
+    #[test]
+    fn test_what_exclude_and_include_take() {
+        for (given, stored) in [
+            ("github.com/Client-Co/App.git", "github.com/client-co/app"),
+            ("github.com/client-co/app/", "github.com/client-co/app"),
+            (
+                "https://github.com/Client-Co/App.git",
+                "github.com/client-co/app",
+            ),
+            (
+                "git@github.com:client-co/app.GIT",
+                "github.com/client-co/app",
+            ),
+            ("Client-Co/*", "client-co/*"),
+            ("X.GIT", "x"),
+            // A folder that is not there, spelled as the node spells one.
+            ("/cordelia-test-not-there//x/", "/cordelia-test-not-there/x"),
+            // What is typed and is no folder on disk has no space round
+            // it: it is not taken for a folder whose name ends in one.
+            ("/cordelia-test-not-there/x ", "/cordelia-test-not-there/x"),
+            (" client-co/app ", "client-co/app"),
+        ] {
+            assert_eq!(exclusion(given).unwrap(), stored, "{given:?}");
+        }
+        for nothing in [".GIT", "  ", ""] {
+            assert!(exclusion(nothing).is_err(), "{nothing:?}");
+        }
+        // A folder that is on disk, and whose name does end in a space, is
+        // taken as it is. (It is made a repository of its own, so that it
+        // is the folder Claude Code keeps memory for wherever the test's
+        // temporary directory happens to be.)
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().canonicalize().unwrap().join("odd ");
+        std::fs::create_dir(&odd).unwrap();
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&odd)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let given = odd.display().to_string();
+        assert_eq!(exclusion(&given).unwrap(), given);
+    }
+
+    /// `cordelia sync claude --exclude` replaces the names in the exclude
+    /// list and keeps the folders in it. A folder is there because it was
+    /// unmapped, and it stays out of what `--all` finds until it is mapped
+    /// again or included, whatever names are then excluded.
+    #[test]
+    fn test_what_the_exclude_option_sends() {
+        let list =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        let stored = list(&[
+            "old-name",
+            "/cordelia-test-not-there/notes",
+            "client-co/*",
+            "/cordelia-test-not-there/odd ",
+        ]);
+        let typed = list(&["Team.GIT", "https://github.com/Client-Co/App.git", "team"]);
+        // Each typed as `exclude` takes it, once; then the folders, as
+        // they are stored. The names that were stored go.
+        assert_eq!(
+            exclude_list_to_send(&typed, &stored, false).unwrap(),
+            list(&[
+                "team",
+                "github.com/client-co/app",
+                "/cordelia-test-not-there/notes",
+                "/cordelia-test-not-there/odd ",
+            ])
+        );
+        // A folder that is typed and is already there is there once.
+        let typed_folder = list(&["/cordelia-test-not-there/notes"]);
+        assert_eq!(
+            exclude_list_to_send(&typed_folder, &stored, false).unwrap(),
+            list(&[
+                "/cordelia-test-not-there/notes",
+                "/cordelia-test-not-there/odd "
+            ])
+        );
+        // With a reset nothing of the stored list is kept.
+        assert_eq!(
+            exclude_list_to_send(&typed, &stored, true).unwrap(),
+            list(&["team", "github.com/client-co/app"])
+        );
+        // What leaves nothing is refused, and does not empty the list.
+        assert!(exclude_list_to_send(&list(&["x", " .GIT.git"]), &stored, false).is_err());
+    }
+
+    /// `cordelia sync unmap <folder>` means the mapping of that folder
+    /// before the mapping of the repository it is in, whichever of the two
+    /// was mapped first.
+    #[test]
+    fn test_unmap_takes_the_folder_named_before_the_repository_it_is_in() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let list =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        // Home was mapped first, then a folder in it; later the home
+        // directory became a git repository, so it is the repository the
+        // folder is in.
+        let mappings = [pair("/home/sam", "~"), pair("/home/sam/notes", "lab")];
+        let folder = |spellings: &[&str]| {
+            mapping_at(&mappings, &list(spellings)).map(|(folder, _)| folder.as_str())
+        };
+        // As typed, its real path, the repository.
+        let notes = ["notes", "/home/sam/notes", "/home/sam"];
+        assert_eq!(folder(&notes), Some("/home/sam/notes"));
+        // A folder that is not mapped means the repository it is in.
+        let other = ["other", "/home/sam/other", "/home/sam"];
+        assert_eq!(folder(&other), Some("/home/sam"));
+        assert_eq!(folder(&["/elsewhere"]), None);
+        assert_eq!(folder(&[]), None);
+    }
+
+    /// A refusal that points at `home on` says so only where the node
+    /// would take it. `home on` puts home memory back under the name it
+    /// last had on this device, and another folder may have that name now.
+    #[test]
+    fn test_home_on_is_offered_only_where_the_node_would_take_it() {
+        let home = std::path::Path::new("/home/sam");
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        let on = "To sync home memory: cordelia sync home on";
+        // Never mapped; mapped before under a name that is free; mapped now.
+        assert_eq!(home_on_offer(None, home, &[]), on);
+        let others = [pair("/home/sam/notes", "lab")];
+        assert_eq!(home_on_offer(Some("team"), home, &others), on);
+        let mapped = [pair("/home/sam", "team")];
+        assert_eq!(home_on_offer(Some("team"), home, &mapped), on);
+        // The name it last had is another folder's now.
+        let taken = [pair("/home/sam/Work", "team")];
+        let said = home_on_offer(Some("team"), home, &taken);
+        assert!(!said.contains("home on"), "{said}");
+        assert!(
+            said.contains("cannot be put back as team")
+                && said.contains("already mapped from /home/sam/Work")
+                && said.ends_with("cordelia sync map ~ <name> --home"),
+            "{said}"
+        );
+    }
+
+    /// `cordelia sync unmap <word>`: a name, or a folder. A word that is
+    /// one mapping's name and another mapping's folder is refused.
+    #[test]
+    fn test_a_word_that_means_two_mappings_is_refused() {
+        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
+        // Paths under nobody's home directory, so that none is shortened
+        // to `~` wherever the tests run.
+        let home = pair("/srv/agents/sam", "work");
+        let folder = pair("/srv/agents/sam/work", "client");
+
+        let said = mapping_meant("work", Some(&home), Some(&folder))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            said.contains("cordelia sync unmap /srv/agents/sam/work")
+                && said.contains("cordelia sync unmap /srv/agents/sam."),
+            "{said}"
+        );
+        // One meaning, by either route or by both.
+        assert_eq!(mapping_meant("work", Some(&home), None).unwrap(), &home);
+        assert_eq!(mapping_meant("work", None, Some(&folder)).unwrap(), &folder);
+        assert_eq!(
+            mapping_meant("x", Some(&folder), Some(&folder)).unwrap(),
+            &folder
+        );
+        let said = mapping_meant("x", None, None).unwrap_err().to_string();
+        assert!(said.contains("not mapped on this device"), "{said}");
     }
 
     #[test]

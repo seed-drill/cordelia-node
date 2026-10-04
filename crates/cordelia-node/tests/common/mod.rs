@@ -76,6 +76,20 @@ impl Node {
             .unwrap()
     }
 
+    /// As [`Self::command`], run in the directory `dir`: for what a
+    /// command makes of a relative path.
+    pub fn command_in(&self, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        Command::new(BIN)
+            .arg("--config")
+            .arg(self.config())
+            .args(args)
+            .env("CORDELIA_DATA_DIR", self.data_dir())
+            .env("HOME", self.home())
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    }
+
     /// Run a CLI command against this node and return its stdout.
     pub fn cli(&self, args: &[&str]) -> String {
         let out = self.command(args);
