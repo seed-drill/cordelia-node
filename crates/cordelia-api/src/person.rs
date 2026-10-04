@@ -36,7 +36,7 @@
 //!
 //! One transaction. The statement and the secret are stored, the device
 //! leaves the generation it was in, and it carries: every current version
-//! it holds, in each name it holds and of what it wrote itself in the
+//! it holds, in each name it holds, and its own entry in each slot of the
 //! personal channel, is sealed again as its own entry in the new
 //! generation, at the revision that the renumbering gives it. What the
 //! store holds of the generation it left is then dropped, and the device
@@ -795,18 +795,24 @@ fn apply_judged(
         let carry = Carry {
             identity,
             statement: from.number,
-            counting: &counting,
             now,
         };
-        let (carried, _) = carry.channel(conn, &personal.0, &personal.1, |version| {
-            wrote_it_itself(version, &own)
-        })?;
+        // From the personal channel, its own entry in each slot: what
+        // another key wrote there is not looked at.
+        let (carried, _) = carry.channel(
+            conn,
+            &personal.0,
+            &personal.1,
+            |key| *key == own,
+            is_its_word_to_carry,
+        )?;
         applied.carried += carried;
 
         for name in &names {
             let old = derive::own_secret(&from.secret, &name.name)?;
             let new = derive::own_secret(&to.secret, &name.name)?;
-            let (carried, no_version) = carry.channel(conn, &old, &new, |_| true)?;
+            let (carried, no_version) =
+                carry.channel(conn, &old, &new, |key| counting.counts(key), |_| true)?;
             applied.carried += carried;
             if no_version > 0 {
                 applied.no_version.push(name.name.clone());
@@ -862,8 +868,6 @@ struct Carry<'a> {
     identity: &'a NodeIdentity,
     /// The number of the statement the device is leaving.
     statement: u64,
-    /// Who counts under that statement.
-    counting: &'a Counting,
     now: i64,
 }
 
@@ -875,6 +879,12 @@ impl Carry<'_> {
     /// the channel it left is dropped (§7.5). Returns how many entries
     /// were carried, and how many slots held no version at all.
     ///
+    /// `counts` says whose entries are read. In a name's channel they are
+    /// the keys that count under the statement. In the personal channel
+    /// it is this device's key alone: the device carries its own entry in
+    /// each slot, whatever another key wrote there and at whatever
+    /// revision.
+    ///
     /// An entry that lost a tie is not current, and is not carried. Nor
     /// is one that is no version.
     fn channel(
@@ -882,14 +892,14 @@ impl Carry<'_> {
         conn: &Connection,
         from: &[u8; 32],
         to: &[u8; 32],
+        counts: impl Fn(&[u8; 32]) -> bool,
         carries: impl Fn(&Version) -> bool,
     ) -> Result<(usize, usize), PersonError> {
         let channel = derive::channel_id(from)?;
         let (mut carried, mut no_version) = (0, 0);
         for slot in entries::channel_slots(conn, &channel)? {
             let held = entries::slot_entries(conn, &channel, &slot)?;
-            let read =
-                version::current(&held, from, self.statement, |key| self.counting.counts(key))?;
+            let read = version::current(&held, from, self.statement, &counts)?;
             let Some(version) = read.current else {
                 no_version += 1;
                 continue;
@@ -946,13 +956,12 @@ fn carried_entry(
     Ok(Entry::seal(to, identity, lifted(version.rev), &inside)?.check()?)
 }
 
-/// Whether a version of the personal channel is carried: the device wrote
-/// it there itself, and it is neither a record of an addition nor a word
-/// that a statement is applied. The next statement's own list is what
-/// stands, and the device writes that it has applied the next statement.
-fn wrote_it_itself(version: &Version, own: &[u8; 32]) -> bool {
-    version.entries.iter().any(|entry| entry.author == *own)
-        && !version.name.starts_with(PERSONAL_ADDED_PREFIX)
+/// Whether an entry of this device's own in the personal channel is
+/// carried: it is neither a record of an addition nor a word that a
+/// statement is applied. The next statement's own list is what stands,
+/// and the device writes that it has applied the next statement.
+fn is_its_word_to_carry(version: &Version) -> bool {
+    !version.name.starts_with(PERSONAL_ADDED_PREFIX)
         && !version.name.starts_with(PERSONAL_APPLIED_PREFIX)
 }
 
@@ -3607,12 +3616,14 @@ mod tests {
         assert_eq!(carried(&conn, &new, "own.md").unwrap().chain, []);
     }
 
-    /// From the personal channel a device carries what it wrote there
-    /// itself. What another device wrote there is that device's to carry.
-    /// Records of additions are not carried, and nor is the word that the
-    /// statement before was applied.
+    /// From the personal channel a device carries its own entry in each
+    /// slot, whether or not another key's entry there has a higher
+    /// revision: what it carries there is its own word, and no other
+    /// key's entry stops that. What another device wrote there is that
+    /// device's to carry. Records of additions are not carried, and nor
+    /// is the word that the statement before was applied.
     #[test]
-    fn test_from_the_personal_channel_a_device_carries_what_it_wrote_itself() {
+    fn test_from_the_personal_channel_a_device_carries_its_own_entry_in_each_slot() {
         let conn = device_at(1, 2);
         let phrase = phrase();
         let [_, _, three, _] = statements(&phrase);
@@ -3630,12 +3641,38 @@ mod tests {
             &[link("t", 1)],
         );
         put(&conn, &old, 0, 6, "syncing/zero", text("notes"), &[]);
-        // A name that two devices wrote under: the current version is
-        // device 0's in one, and device 1's in the other.
-        put(&conn, &old, 1, 3, "project/x", text("an older word"), &[]);
+        // A name that two devices wrote under: device 0's entry is the
+        // higher in one, and device 1's in the other.
+        put(
+            &conn,
+            &old,
+            1,
+            3,
+            "project/x",
+            text("this device's word"),
+            &[link("before", 1)],
+        );
         put(&conn, &old, 0, 4, "project/x", text("a newer word"), &[]);
         put(&conn, &old, 0, 3, "project/y", text("an older word"), &[]);
         put(&conn, &old, 1, 4, "project/y", text("a newer word"), &[]);
+        // And one where a key that the next statement removes wrote far
+        // above this device, and wrote a delete.
+        put(&conn, &old, 1, 2, "names", text("team"), &[]);
+        put(&conn, &old, 2, at(2, 900), "names", Value::Delete, &[]);
+        // Under the statement it is leaving, the current version of each
+        // is the other key's.
+        for (name, said) in [
+            ("project/x", text("a newer word")),
+            ("names", Value::Delete),
+        ] {
+            assert_eq!(
+                read(&conn, &old, 2, name, &[0, 1, 2])
+                    .current
+                    .unwrap()
+                    .value,
+                said
+            );
+        }
         // A record of an addition that device 1 wrote there.
         put(
             &conn,
@@ -3659,7 +3696,7 @@ mod tests {
             Shown::Applied(Applied {
                 number: 3,
                 left: Some(2),
-                carried: 2,
+                carried: 4,
                 no_version: Vec::new(),
             })
         );
@@ -3673,9 +3710,24 @@ mod tests {
                 rev: 6,
             }
         );
+        // Its own word, with its own chain as it was, though another
+        // key's entry stood above it.
+        assert_eq!(
+            carried(&conn, &new, "project/x").unwrap(),
+            Carried {
+                author: key(1),
+                chain: vec![link("before", 1)],
+                value: text("this device's word"),
+                rev: 3,
+            }
+        );
+        let names = carried(&conn, &new, "names").unwrap();
+        assert_eq!((names.value, names.rev), (text("team"), 2));
+        assert_eq!(names.chain, []);
         let newer = carried(&conn, &new, "project/y").unwrap();
         assert_eq!((newer.value, newer.rev), (text("a newer word"), 4));
-        for not_carried in ["syncing/zero", "project/x", "added/seven", theirs.as_str()] {
+        assert_eq!(newer.chain, []);
+        for not_carried in ["syncing/zero", "added/seven", theirs.as_str()] {
             assert!(carried(&conn, &new, not_carried).is_none(), "{not_carried}");
         }
 
@@ -3684,7 +3736,7 @@ mod tests {
         assert_eq!((word.value, word.rev), (text("3"), 1));
         assert_eq!(
             entries::channel_slots(&conn, &id_of(&new)).unwrap().len(),
-            3
+            5
         );
         assert!(
             entries::channel_slots(&conn, &id_of(&old))
