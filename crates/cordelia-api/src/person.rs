@@ -2042,6 +2042,57 @@ mod tests {
             Err(PersonError::Stopped(State::Removed))
         ));
         assert!(held_rows::additions(&conn).unwrap().is_empty());
+
+        // Device 2 is in neither list of another statement 3.
+        let conn = device_at(2, 2);
+        let without = two.next(key(0), &secret(3), listed(&[0, 1]), &[]).unwrap();
+        let entry = change(&phrase, &without, secret(3));
+        assert_eq!(
+            shown(&conn, &device(2), &entry, NOW).unwrap(),
+            Shown::NotListed
+        );
+        assert!(matches!(
+            see_addition(&conn, &added(&two, 0, 7), NOW),
+            Err(PersonError::Stopped(State::NotListed))
+        ));
+        assert!(held_rows::additions(&conn).unwrap().is_empty());
+
+        // Device 1 is listed in statement 3, and its secret does not open.
+        let conn = device_at(1, 2);
+        let entry = change_sealing(
+            &phrase,
+            &three,
+            &sealed(&[sealed_to(0, &secret(3)), sealed_to(9, &secret(3))]),
+        );
+        assert_eq!(
+            shown(&conn, &device(1), &entry, NOW).unwrap(),
+            Shown::NotOpened
+        );
+        assert!(matches!(
+            see_addition(&conn, &added(&two, 0, 7), NOW),
+            Err(PersonError::Stopped(State::NotOpened))
+        ));
+        assert!(held_rows::additions(&conn).unwrap().is_empty());
+
+        // Device 0 has applied statement 3, and is in a fork: who counts
+        // is not settled, and it takes no record under either statement.
+        let [apart, ..] = made_apart(&phrase);
+        let conn = device_at(0, 3);
+        // A record it took before the fork is still kept.
+        assert_eq!(
+            see_addition(&conn, &added(&three, 0, 7), NOW).unwrap(),
+            AdditionSeen::Counted
+        );
+        let entry = change(&phrase, &apart, secret(13));
+        assert_eq!(shown(&conn, &device(0), &entry, NOW).unwrap(), Shown::Fork);
+        for under in [&three, &apart] {
+            assert!(matches!(
+                see_addition(&conn, &added(under, 0, 8), NOW),
+                Err(PersonError::Stopped(State::Fork))
+            ));
+        }
+        assert_eq!(held_rows::additions(&conn).unwrap().len(), 1);
+        assert!(!who_counts(&conn).unwrap().counts(&key(8)));
     }
 
     // ── A change entry that a device is shown ────────────────────────
@@ -2666,6 +2717,81 @@ mod tests {
         assert_eq!(kept(&conn, Kept::Latest), Some(entry.id()));
         assert_eq!(kept(&conn, Kept::Apart), None);
         assert_eq!(applied_number(&conn), 3);
+    }
+
+    /// A device in a fork is shown the statement that settles the two,
+    /// which lists it, with a secret that does not open: it stops as any
+    /// listed device does whose secret does not open. It is in no fork any
+    /// more, keeps that entry alone, and has applied nothing.
+    #[test]
+    fn test_a_device_in_a_fork_that_cannot_open_the_settlement_stops() {
+        let phrase = phrase();
+        let [_, _, three, four] = statements(&phrase);
+        let [apart, ..] = made_apart(&phrase);
+        let settled =
+            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0, 1]), &[]).unwrap();
+        let ways: [(&str, Vec<u8>); 3] = [
+            (
+                "sealed to another key",
+                sealed(&[sealed_for(4, 9, &secret(20)), sealed_for(4, 1, &secret(20))]),
+            ),
+            (
+                "another secret than the one committed to",
+                sealed(&[sealed_for(4, 0, &secret(9)), sealed_for(4, 1, &secret(20))]),
+            ),
+            ("no list after the statement", Vec::new()),
+        ];
+        for (what, after) in ways {
+            let conn = db::open_in_memory().unwrap();
+            follow(&conn, 0, &phrase, &three, secret(3));
+            hold_name(&conn, "team", NOW).unwrap();
+            put(&conn, &own(3, "team"), 0, 5, "a.md", text("a"), &[]);
+            let other = change(&phrase, &apart, secret(13));
+            assert_eq!(shown(&conn, &device(0), &other, NOW).unwrap(), Shown::Fork);
+            let store_of = |conn: &Connection| -> Vec<String> {
+                everything(conn)
+                    .into_iter()
+                    .filter(|row| row.starts_with("entries:") || row.starts_with("person_names:"))
+                    .collect()
+            };
+            let store_before = store_of(&conn);
+
+            // A statement of its own branch, that it could not open
+            // either: it was not made after both, and is a fork still.
+            // The device does not stop for its secret.
+            let in_the_fork = everything(&conn);
+            let on_its_branch = change_sealing(&phrase, &four, &[]);
+            assert_eq!(
+                shown(&conn, &device(0), &on_its_branch, NOW).unwrap(),
+                Shown::Fork,
+                "{what}"
+            );
+            assert_eq!(everything(&conn), in_the_fork, "{what}");
+
+            let entry = change_sealing(&phrase, &settled, &after);
+            assert_eq!(
+                shown(&conn, &device(0), &entry, NOW).unwrap(),
+                Shown::NotOpened,
+                "{what}"
+            );
+            assert_eq!(state(&conn), State::NotOpened, "{what}");
+            assert_eq!(kept(&conn, Kept::Latest), Some(entry.id()), "{what}");
+            assert_eq!(kept(&conn, Kept::Apart), None, "{what}");
+            assert_eq!(applied_number(&conn), 3);
+            assert_eq!(secrets(&conn), [(3, secret(3), None)]);
+            assert_eq!(store_of(&conn), store_before, "{what}");
+
+            // The way on is a person's: the settlement in an entry that
+            // opens is not taken.
+            let stopped = everything(&conn);
+            let good = change(&phrase, &settled, secret(20));
+            assert_eq!(
+                shown(&conn, &device(0), &good, NOW).unwrap(),
+                Shown::Refused(Refused::Stopped),
+                "{what}"
+            );
+            assert_eq!(everything(&conn), stopped);
+        }
     }
 
     /// A device in a fork refuses a statement that has both on its chain
@@ -3753,6 +3879,65 @@ mod tests {
         assert_eq!(theirs.value, text("a text"));
         assert_eq!(theirs.chain, [link("a text", 0)]);
         assert_eq!(carried(&conn, &new, "own.md").unwrap().chain, []);
+    }
+
+    /// A device carries into a generation it has not come to, where its
+    /// store holds nothing of its own. Where the store does hold an entry
+    /// of this device's in a slot it carries into, at the carried revision
+    /// or above it, the entry is not stored and the change is not
+    /// applied: nothing is carried over what is there, and nothing
+    /// changes.
+    #[test]
+    fn test_a_carried_entry_that_the_store_does_not_take_stops_the_applying() {
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        let entry = change(&phrase, &three, secret(3));
+        let holding = |n: u16, rev: u64| {
+            let conn = device_at(1, 2);
+            hold_name(&conn, "team", NOW).unwrap();
+            put(&conn, &own(2, "team"), 0, 5, "a.md", text("a"), &[]);
+            put(&conn, &own(2, "team"), 0, 6, "b.md", text("b"), &[]);
+            // What the store holds already in the generation it would
+            // come to: an entry of device `n` under the same name.
+            put(&conn, &own(3, "team"), n, rev, "a.md", text("there"), &[]);
+            conn
+        };
+
+        // At the carried revision, and above it.
+        for rev in [5, 9] {
+            let conn = holding(1, rev);
+            let before = everything(&conn);
+            let failed = shown(&conn, &device(1), &entry, NOW);
+            assert!(
+                matches!(&failed, Err(PersonError::Held(why)) if why.contains("has not come to")),
+                "{rev}: {failed:?}"
+            );
+            assert_eq!(everything(&conn), before, "{rev}");
+            assert_eq!(state(&conn), State::Applied);
+            assert_eq!(applied_number(&conn), 2);
+            assert!(conn.is_autocommit());
+            // What it holds in the generation it is in is still read.
+            let version = read(&conn, &own(2, "team"), 2, "b.md", &[0, 1, 2]);
+            assert_eq!(version.current.unwrap().value, text("b"));
+        }
+
+        // The control: below the carried revision, the carried entry takes
+        // its place, and another device's entry there stops nothing.
+        for (n, rev) in [(1, 4), (0, 9)] {
+            let conn = holding(n, rev);
+            assert!(matches!(
+                shown(&conn, &device(1), &entry, NOW).unwrap(),
+                Shown::Applied(Applied { carried: 2, .. })
+            ));
+            let held = entries::slot_entries(
+                &conn,
+                &id_of(&own(3, "team")),
+                &slot_of(&own(3, "team"), "a.md"),
+            )
+            .unwrap();
+            let own_entry = held.iter().find(|entry| entry.author == key(1)).unwrap();
+            assert_eq!(own_entry.rev, 5);
+        }
     }
 
     /// From the personal channel a device carries its own entry in each
