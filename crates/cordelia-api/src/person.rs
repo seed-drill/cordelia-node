@@ -25,8 +25,8 @@
 //!
 //! - it is the one the device keeps, or it is behind: nothing;
 //! - it can be applied: it is applied, in the same step;
-//! - it lists this device and the secret did not open, or it does not list
-//!   this device: the device stops, and keeps the entry;
+//! - it lists this device and the secret did not open, or is not there, or
+//!   it does not list this device: the device stops, and keeps the entry;
 //! - it was made apart from the one applied: the device stops, and keeps
 //!   both;
 //! - it is not the phrase's, or not well formed: it is refused, and
@@ -419,7 +419,9 @@ pub enum Refused {
     /// change entry's; it says it is a delete; its content is of another
     /// size, or does not open; the statement in it is none, is under
     /// another phrase, or has another number; or what follows its
-    /// statement is not the list of sealed secrets.
+    /// statement is no list of sealed secrets at all, or, for a device
+    /// that the statement does not list, is a list that is missing or
+    /// short.
     NotAChangeEntry(ChangeEntryError),
 }
 
@@ -486,7 +488,7 @@ pub fn shown(
             Err(e) => return Ok(Shown::Refused(Refused::NotAChangeEntry(e))),
         };
 
-        let judgement = match judged(conn, &held, &opened.statement, &identity.public_key())? {
+        let judgement = match judged(conn, &held, &opened.statement, identity)? {
             Ok(judgement) => judgement,
             Err(e) => return Ok(Shown::Refused(Refused::NotAChangeEntry(e.into()))),
         };
@@ -527,9 +529,9 @@ pub fn shown(
     })
 }
 
-/// What the statement `shown` is to this device, whose key is `own`: it
-/// is judged beside the statement the device has applied ([`judge`]), and
-/// on a device that is in a fork beside the one kept apart as well.
+/// What the statement `shown` is to this device: it is judged beside the
+/// statement the device has applied ([`judge`]), and on a device that is
+/// in a fork beside the one kept apart as well.
 ///
 /// The error inside is the statement's: it is no statement that this
 /// device takes, and nothing is done with it. The error outside is this
@@ -552,26 +554,32 @@ fn judged(
     conn: &Connection,
     held: &Held,
     shown: &SignedStatement,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
 ) -> Result<Result<Judgement, StatementError>, PersonError> {
     let following = &held.following;
     let applied = &held.statement.statement;
-    let judgement = match judge(shown, applied, own, &following.phrase_key) {
+    let own = identity.public_key();
+    let judgement = match judge(shown, applied, &own, &following.phrase_key) {
         Ok(judgement) => judgement,
         Err(e) => return Ok(Err(e)),
     };
     if held.state != State::Fork || matches!(judgement, Judgement::Behind | Judgement::Fork) {
         return Ok(Ok(judgement));
     }
+    // The entry kept apart is opened as this device opened it when it was
+    // shown: one whose list of secrets is short was read so, by a device
+    // that it lists, and is read so again.
     let not_held = |what: String| PersonError::Held(format!("the entry kept apart: {what}"));
     let apart = kept_entry(conn, Kept::Apart)?.ok_or_else(|| not_held("there is none".into()))?;
-    let apart = change_entry::open_statement(
+    let apart = change_entry::open_for_device(
         &apart,
         &following.phrase_key,
         &following.phrase_channel,
         &following.statement_key,
+        identity,
     )
-    .map_err(|e| not_held(e.to_string()))?;
+    .map_err(|e| not_held(e.to_string()))?
+    .statement;
     let (shown, apart) = (&shown.statement, &apart.statement);
     if !shown.has_on_chain(&apart.link()?) {
         return Ok(Ok(Judgement::Fork));
@@ -663,7 +671,7 @@ pub fn apply(
             entry,
         };
         its_own_entry(&change)?;
-        let judgement = judged(conn, &held, statement, &identity.public_key())??;
+        let judgement = judged(conn, &held, statement, identity)??;
         if judgement != Judgement::Applies {
             return Err(PersonError::NotApplied(judgement));
         }
@@ -2192,17 +2200,23 @@ mod tests {
     }
 
     /// A statement that lists this device, in the phrase's own entry, with
-    /// a secret in this device's place that does not open, or is not the
-    /// one committed to: the device stops, and keeps the entry. Nothing of
-    /// what it holds is carried or dropped. (An entry whose list of
-    /// secrets is not there, or is not whole, is no change entry at all,
-    /// and is refused.)
+    /// a secret in this device's place that does not open, is not the one
+    /// committed to, or is not there: the list is missing, or short. The
+    /// device stops, and keeps the entry. Nothing of what it holds is
+    /// carried or dropped.
     #[test]
     fn test_a_secret_that_does_not_open_or_is_not_there_stops_the_device() {
         let phrase = phrase();
         let [_, two, three, _] = statements(&phrase);
         // Statement 3 lists devices 0 and 1, in that order.
-        let ways: [(&str, Vec<u8>); 6] = [
+        let ways: [(&str, Vec<u8>); 10] = [
+            ("no list after the statement", Vec::new()),
+            ("a list of none", sealed(&[])),
+            ("a list of one too few", sealed(&[sealed_to(0, &secret(3))])),
+            (
+                "a list of this device's secret alone",
+                sealed(&[sealed_to(1, &secret(3))]),
+            ),
             (
                 "sealed to another key",
                 sealed(&[sealed_to(0, &secret(3)), sealed_to(9, &secret(3))]),
@@ -2682,6 +2696,69 @@ mod tests {
         assert_eq!(state(&conn), State::Applied);
     }
 
+    /// A list that is missing or short says nothing to a device that the
+    /// statement does not list: the entry is refused, and nothing changes.
+    /// A device that it lists is told that its secret is not there, and
+    /// keeps the entry: so a device in a fork, which kept such an entry
+    /// apart, still takes the statement that settles the two.
+    #[test]
+    fn test_a_list_that_is_missing_or_short_stops_only_a_device_that_is_listed() {
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let whole = sealed(&[sealed_to(0, &secret(3)), sealed_to(1, &secret(3))]);
+        let short = sealed(&[sealed_to(0, &secret(3))]);
+        let malformed = Shown::Refused(Refused::NotAChangeEntry(ChangeEntryError::Malformed));
+
+        // Device 2, which statement 3 removes.
+        let conn = device_at(2, 2);
+        let before = everything(&conn);
+        for after in [&[][..], &short] {
+            let entry = change_sealing(&phrase, &three, after);
+            assert_eq!(shown(&conn, &device(2), &entry, NOW).unwrap(), malformed);
+            assert_eq!(everything(&conn), before);
+        }
+        // The control: with the list whole, it reads that it was removed.
+        let entry = change_sealing(&phrase, &three, &whole);
+        assert_eq!(
+            shown(&conn, &device(2), &entry, NOW).unwrap(),
+            Shown::Removed
+        );
+
+        // Device 2, which another statement 3 has in neither list.
+        let without = two.next(key(0), &secret(3), listed(&[0, 1]), &[]).unwrap();
+        let conn = device_at(2, 2);
+        let before = everything(&conn);
+        for after in [&[][..], &short] {
+            let entry = change_sealing(&phrase, &without, after);
+            assert_eq!(shown(&conn, &device(2), &entry, NOW).unwrap(), malformed);
+            assert_eq!(everything(&conn), before);
+        }
+        let entry = change_sealing(&phrase, &without, &whole);
+        assert_eq!(
+            shown(&conn, &device(2), &entry, NOW).unwrap(),
+            Shown::NotListed
+        );
+
+        // Device 0 has applied statement 3, and is shown one made apart
+        // that lists it, in an entry with no list: it is in a fork, and
+        // keeps that entry apart.
+        let [apart, ..] = made_apart(&phrase);
+        let conn = db::open_in_memory().unwrap();
+        follow(&conn, 0, &phrase, &three, secret(3));
+        let other = change_sealing(&phrase, &apart, &[]);
+        assert_eq!(shown(&conn, &device(0), &other, NOW).unwrap(), Shown::Fork);
+        assert_eq!(kept(&conn, Kept::Apart), Some(other.id()));
+        // It still takes the statement that settles the two.
+        let settled =
+            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0, 1]), &[]).unwrap();
+        let entry = change(&phrase, &settled, secret(20));
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert_eq!(state(&conn), State::Applied);
+    }
+
     /// An entry that is not the phrase's, or is not well formed, is
     /// refused: nothing changes, and the device is in no fork.
     #[test]
@@ -2797,23 +2874,30 @@ mod tests {
                 not(ChangeEntryError::AnotherSlot),
             ),
             (
-                "with no sealed secret after its statement",
-                change_sealing(&phrase, &three, &[]),
-                not(ChangeEntryError::Malformed),
-            ),
-            (
-                "with a list of none",
-                change_sealing(&phrase, &three, &sealed(&[])),
-                not(ChangeEntryError::Malformed),
-            ),
-            (
-                "with a list of one too few",
-                change_sealing(&phrase, &three, &sealed(&[sealed_to(0, &secret(3))])),
-                not(ChangeEntryError::Malformed),
-            ),
-            (
                 "with more than the list after its statement",
                 change_sealing(&phrase, &three, &[&both[..], &[0, 0, 1]].concat()),
+                not(ChangeEntryError::Malformed),
+            ),
+            (
+                "with a list for more devices than its statement has",
+                change_sealing(
+                    &phrase,
+                    &three,
+                    &sealed(&[
+                        sealed_to(0, &secret(3)),
+                        sealed_to(1, &secret(3)),
+                        sealed_to(1, &secret(3)),
+                    ]),
+                ),
+                not(ChangeEntryError::Malformed),
+            ),
+            (
+                "with a short list, and more after it",
+                change_sealing(
+                    &phrase,
+                    &three,
+                    &[&sealed(&[sealed_to(1, &secret(3))])[..], &[0, 0, 1]].concat(),
+                ),
                 not(ChangeEntryError::Malformed),
             ),
             (
