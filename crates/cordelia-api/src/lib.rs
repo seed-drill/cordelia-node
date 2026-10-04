@@ -9,6 +9,7 @@ pub mod error;
 pub mod handlers;
 pub mod history;
 pub mod membership;
+pub mod person;
 pub mod state;
 pub mod sync;
 pub mod types;
