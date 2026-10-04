@@ -24,6 +24,20 @@ CORDELIA_HOME="$TMPDIR_ROOT/cordelia-home"
 CONFIG_FILE="$TMPDIR_ROOT/config.toml"
 DAEMON_PID=""
 
+# The node and the commands below get no CORDELIA_ variable of the
+# caller's, and not the caller's home directory. Such a variable can move
+# the data directory or a port, and the home directory is where a node
+# with no configuration keeps its data: with either, this test would
+# write in a directory that is somebody's. And its requests are to this
+# machine, with the node's token in them: no proxy variable is passed on,
+# and curl reads no configuration file of the caller's (`-q`).
+for var in $(compgen -e); do
+    case "$var" in CORDELIA_*) export -n "$var" ;; esac
+done
+export HOME="$TMPDIR_ROOT/home"
+mkdir -p "$HOME"
+unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+
 PASS=0
 FAIL=0
 TOTAL=0
@@ -74,7 +88,7 @@ assert_not_empty() {
 
 api_post() {
     local endpoint="$1" body="$2"
-    curl -s -w "\n%{http_code}" \
+    curl -q -s -w "\n%{http_code}" \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
         -d "$body" \
@@ -83,7 +97,7 @@ api_post() {
 
 api_get() {
     local endpoint="$1"
-    curl -s -w "\n%{http_code}" \
+    curl -q -s -w "\n%{http_code}" \
         -H "Authorization: Bearer $TOKEN" \
         "$BASE_URL/$endpoint"
 }
@@ -91,7 +105,7 @@ api_get() {
 wait_for_server() {
     local max_attempts=30
     for i in $(seq 1 $max_attempts); do
-        if curl -s -o /dev/null "http://127.0.0.1:${PORT}/api/v1/channels/identity" 2>/dev/null; then
+        if curl -q -s -o /dev/null "http://127.0.0.1:${PORT}/api/v1/channels/identity" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
@@ -135,6 +149,12 @@ bind_address = "127.0.0.1"
 
 [network]
 role = "personal"
+
+# A personal node that names no relay dials the default ones, which are
+# real and public. This one is given an address on this machine where
+# nothing listens.
+[[network.bootnodes]]
+addr = "127.0.0.1:9"
 
 [logging]
 level = "warn"
@@ -280,12 +300,13 @@ public_key = ""
 [node]
 http_port = 19999
 p2p_port = 19998
-[storage]
 data_dir = "$PEER_DIR"
 [api]
 bind_address = "127.0.0.1"
 [network]
 role = "personal"
+[[network.bootnodes]]
+addr = "127.0.0.1:9"
 [logging]
 level = "warn"
 TOML
@@ -397,13 +418,13 @@ echo "  $PASS/$TOTAL passed"
 
 echo "Phase 14: Auth enforcement"
 
-NO_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+NO_AUTH_CODE=$(curl -q -s -o /dev/null -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -d '{}' \
     "$BASE_URL/channels/identity")
 assert_eq "auth: no token -> 401" "401" "$NO_AUTH_CODE"
 
-BAD_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+BAD_AUTH_CODE=$(curl -q -s -o /dev/null -w "%{http_code}" \
     -H "Authorization: Bearer wrong-token" \
     -H "Content-Type: application/json" \
     -d '{}' \

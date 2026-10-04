@@ -51,6 +51,34 @@ pub fn configured_relays(
     configured: &[(String, Option<String>)],
     use_defaults: bool,
 ) -> Result<Vec<Relay>, String> {
+    relays_from(configured, use_defaults)
+}
+
+/// The relays a node of `role` dials, given the relays its configuration
+/// names. This is the one place that says so: the node asks it when it
+/// starts, and so does whatever needs to know beforehand where a node
+/// will dial.
+///
+/// - A bootnode dials no relay, whatever it names. (It dials the addresses
+///   its peers share.)
+/// - A personal node dials the relays it names, or the default ones where
+///   it names none.
+/// - Any other node dials the relays it names, and none where it names
+///   none.
+pub fn relays_dialled(
+    role: &str,
+    configured: &[(String, Option<String>)],
+) -> Result<Vec<Relay>, String> {
+    if role == "bootnode" {
+        return Ok(Vec::new());
+    }
+    relays_from(configured, role == "personal")
+}
+
+fn relays_from(
+    configured: &[(String, Option<String>)],
+    use_defaults: bool,
+) -> Result<Vec<Relay>, String> {
     if configured.is_empty() {
         if !use_defaults {
             return Ok(Vec::new());
@@ -180,6 +208,33 @@ mod tests {
         }
         // A relay given none stands alone.
         assert!(configured_relays(&[], false).unwrap().is_empty());
+    }
+
+    /// Which relays a node dials goes by its role: a personal node that
+    /// names none dials the default ones, and is the only one that does; a
+    /// bootnode dials none, whatever it names; any other node dials the
+    /// ones it names.
+    #[test]
+    fn the_relays_a_node_dials_go_by_its_role() {
+        let hosts = |role: &str, named: &[&str]| -> Vec<String> {
+            let named: Vec<(String, Option<String>)> =
+                named.iter().map(|host| (host.to_string(), None)).collect();
+            let relays = relays_dialled(role, &named).unwrap();
+            relays.into_iter().map(|relay| relay.host).collect()
+        };
+        let one = ["relay.example.org:9474"];
+        assert_eq!(hosts("personal", &[]), protocol::FALLBACK_PEERS);
+        assert_eq!(hosts("personal", &one), one);
+        for role in ["relay", "keeper", ""] {
+            assert!(hosts(role, &[]).is_empty(), "{role}");
+            assert_eq!(hosts(role, &one), one, "{role}");
+        }
+        assert!(hosts("bootnode", &[]).is_empty());
+        assert!(hosts("bootnode", &one).is_empty());
+        // A key that does not parse is an error for a node that would
+        // dial the relay it is given for.
+        let bad = [(one[0].to_string(), Some("not a key".to_string()))];
+        assert!(relays_dialled("relay", &bad).is_err());
     }
 
     /// T19. A configured relay keeps the key it was given; a default relay

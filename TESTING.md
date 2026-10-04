@@ -38,8 +38,8 @@ cargo test -p cordelia-network test_batched_sync_two_channels
 cargo test -p cordelia-network -- --nocapture
 ```
 
-**Current baseline:** 467 tests (315 Rust unit/integration + SDK + E2E smoke).
-All must pass before any E2E testing.
+**Baseline:** every test of `cargo test --all` passes. (The count changes with
+almost every change: the pull request that changed it last says what it is.)
 
 ## E2E topology and scale suites (stale)
 
@@ -104,7 +104,7 @@ bash tests/e2e/run-e2e.sh                # Runs all T1-T7
 |-------|----------|---------------|-------------|
 | Unit | `crates/*/src/**` | Per-module logic | `cargo test --all` |
 | Integration | `crates/cordelia-network/tests/` | Two-node QUIC | `cargo test -p cordelia-network` |
-| E2E Smoke | `tests/e2e/smoke-test.sh` | Single node API | `bash tests/e2e/smoke-test.sh` |
+| E2E Smoke (stale) | `tests/e2e/smoke-test.sh` | Single node API as it was before v1: four of its checks no longer match. Its node is given a relay on this machine where nothing listens, so it dials nothing else | `bash tests/e2e/smoke-test.sh` |
 | S2 Scale | `tests/e2e/scale/run-s2.sh` | Relay mesh + delivery | `bash tests/e2e/scale/run-s2.sh R` |
 | S3 Scale | `tests/e2e/scale/run-s3.sh` | PAN swarm | `bash tests/e2e/scale/run-s3.sh N` |
 

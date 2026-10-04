@@ -925,12 +925,212 @@ fn a_test_node_that_is_given_no_relay_dials_none_of_the_public_ones() {
         (!hosts.is_empty()).then_some(hosts)
     });
     assert_eq!(hosts, [NOWHERE]);
+    // Which is what the harness read from its configuration before it
+    // started the node.
+    assert_eq!(hosts, n.will_dial());
     n.stop();
 
     // A relay that is given none dials nothing, and is left with none.
     let relay = node("relay", "relay", None);
     let config = std::fs::read_to_string(relay.config()).unwrap();
     assert!(!config.contains("[[network.bootnodes]]"), "{config}");
+    assert!(relay.will_dial().is_empty());
+
+    // And of a relay that is given one, the harness reads what the relay
+    // then says of itself.
+    let mut second = node_with_bootnode("second", "relay", Some(NOWHERE.into()));
+    assert_eq!(second.will_dial(), [NOWHERE]);
+    second.start();
+    wait_for("relay healthy", &[&second], 30, || healthy(&second));
+    let hosts = wait_for("the relay lists its relays", &[&second], 30, || {
+        let hosts: Vec<String> = relays_of(&second)
+            .iter()
+            .filter_map(|relay| relay["host"].as_str().map(String::from))
+            .collect();
+        (!hosts.is_empty()).then_some(hosts)
+    });
+    assert_eq!(hosts, second.will_dial());
+}
+
+/// A loopback address passes in each form the node reads as one, and so
+/// does `localhost`.
+#[test]
+fn the_harness_takes_an_address_of_this_machine() {
+    for addr in ["127.0.0.1:9", "127.0.0.2:9474", "[::1]:9474", "localhost:9"] {
+        assert_on_this_machine("here", addr);
+    }
+}
+
+/// What the node would not read as an address it takes for a name, and
+/// looks up: such a form does not pass, though the address inside it is
+/// this machine's.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_what_the_node_would_take_for_a_name() {
+    assert_on_this_machine("odd", "[127.0.0.1]:9");
+}
+
+/// A node, and each command, is run with nothing of the caller's that the
+/// node reads a setting from: no `CORDELIA_` variable (one could move a
+/// node's relays past the look at its configuration), and no proxy. It
+/// is given its own data directory and home, and the rest is left.
+#[test]
+fn a_node_is_given_none_of_the_callers_settings() {
+    let n = node("alone", "personal", None);
+    let inherited = [
+        "CORDELIA_BOOTNODES",
+        "CORDELIA_DATA_DIR",
+        "HTTP_PROXY",
+        "all_proxy",
+        "no_proxy",
+        "PATH",
+        "RUST_LOG",
+    ];
+    let command = n.binary_given(inherited.iter().map(std::ffi::OsString::from));
+    let set = |name: &str| -> Option<Option<PathBuf>> {
+        let found = command.get_envs().find(|(key, _)| *key == name)?;
+        Some(found.1.map(PathBuf::from))
+    };
+    // Removed.
+    for name in ["CORDELIA_BOOTNODES", "HTTP_PROXY", "all_proxy", "no_proxy"] {
+        assert_eq!(set(name), Some(None), "{name}");
+    }
+    // Its own.
+    assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
+    assert_eq!(set("HOME"), Some(Some(n.home())));
+    // Left as they are.
+    for name in ["PATH", "RUST_LOG"] {
+        assert_eq!(set(name), None, "{name}");
+    }
+}
+
+/// A node with no identity does not start: it stops before it opens a
+/// socket or looks a name up. The tests below rest on that. Each starts a
+/// node that the harness should have refused, with its identity taken
+/// away, so that even with the refusal gone nothing reaches a relay.
+#[test]
+fn a_node_with_no_identity_stops_before_it_dials() {
+    let mut n = node("bare", "personal", None);
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
+    let mut child = n.child.take().unwrap();
+    let told = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if told.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!(
+                "a node with no identity is still running:\n{}",
+                n.log_tail()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let log = std::fs::read_to_string(n.log()).unwrap();
+    assert!(log.contains("Node not initialised"), "{log}");
+    // Nothing of the network was begun: not its transport, and not the
+    // relays it would then have worked out.
+    assert!(
+        !log.contains("P2P transport") && !log.contains("relays configured"),
+        "{log}"
+    );
+}
+
+/// The harness refuses to give a node a relay that is not on this machine,
+/// when the node is made. Nothing is started, and nothing is asked of the
+/// network to find out. (The address is one kept for documentation, which
+/// no machine has.)
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_a_relay_that_is_not_on_this_machine() {
+    node_with_bootnode("far", "personal", Some("192.0.2.1:9474".into()));
+}
+
+/// And when a relay is added to a node that is already made, and when it
+/// is given by a name other than `localhost`.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn the_harness_refuses_to_add_a_relay_that_is_not_on_this_machine() {
+    let relay = node("relay", "relay", None);
+    relay.add_relay("relay.example:9474", None);
+}
+
+/// A node is not started if a relay it would dial is not on this machine,
+/// whatever wrote its configuration. Here a test has taken the stand-in
+/// relay out of a personal node's configuration, so that the node would
+/// dial the default relays: the harness reads the configuration as the
+/// node will, and stops before the node is started.
+///
+/// (In each of these tests the node's identity is taken away first. A
+/// node that finds none stops before it opens a socket, so that even with
+/// the check gone, and the node started, nothing would reach a relay.)
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_node_that_would_dial_a_public_relay_is_not_started() {
+    let mut n = node("bare", "personal", None);
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    let stand_in = format!("[[network.bootnodes]]\naddr = \"{NOWHERE}\"\n");
+    assert!(config.contains(&stand_in), "{config}");
+    std::fs::write(n.config(), config.replace(&stand_in, "")).unwrap();
+    assert_eq!(
+        n.will_dial(),
+        cordelia_core::protocol::FALLBACK_PEERS.to_vec(),
+        "a personal node that names no relay dials the default ones"
+    );
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
+}
+
+/// The same for a node whose configuration is not there at all: the node
+/// would run on its defaults, which name the public relays.
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_node_with_no_configuration_is_not_started() {
+    let mut n = node("unconfigured", "personal", None);
+    std::fs::remove_file(n.config()).unwrap();
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
+}
+
+/// And for a relay whose configuration has come to name a relay on
+/// another machine. (The address is one kept for documentation.)
+#[test]
+#[should_panic(expected = "not on this machine")]
+fn a_relay_that_would_dial_another_machine_is_not_started() {
+    let mut relay = node("relay", "relay", None);
+    let mut config = std::fs::read_to_string(relay.config()).unwrap();
+    config.push_str("\n[[network.bootnodes]]\naddr = \"192.0.2.1:9474\"\n");
+    std::fs::write(relay.config(), config).unwrap();
+    assert_eq!(relay.will_dial(), ["192.0.2.1:9474"]);
+    std::fs::remove_file(relay.data_dir().join("identity.key")).unwrap();
+    relay.start();
+}
+
+/// The harness makes personal nodes and relays: what those will dial can
+/// be known before they are started. A node of another role dials the
+/// addresses its peers hand it, which nothing read beforehand can show,
+/// so the harness makes none.
+#[test]
+#[should_panic(expected = "does not run one")]
+fn the_harness_makes_no_node_whose_dialling_it_cannot_check() {
+    node("boot", "bootnode", None);
+}
+
+/// And it starts none, where a configuration has come to name such a
+/// role.
+#[test]
+#[should_panic(expected = "does not run one")]
+fn a_node_whose_dialling_cannot_be_checked_is_not_started() {
+    let mut n = node("turned", "relay", None);
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    assert!(config.contains("role = \"relay\""), "{config}");
+    let turned = config.replace("role = \"relay\"", "role = \"bootnode\"");
+    std::fs::write(n.config(), turned).unwrap();
+    std::fs::remove_file(n.data_dir().join("identity.key")).unwrap();
+    n.start();
 }
 
 #[test]

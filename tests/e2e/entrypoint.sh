@@ -18,6 +18,31 @@ fi
 
 CONFIG="$CORDELIA_DATA_DIR/config.toml"
 
+# A node started with no configuration runs on the defaults, and the
+# defaults dial the public relays. A test node is not started so.
+if [ ! -f "$CONFIG" ]; then
+    echo "FATAL: no configuration at /config/config.toml or $CONFIG." >&2
+    echo "A test node is not started on the defaults: they dial the public relays." >&2
+    exit 1
+fi
+
+# Nor is a personal node whose configuration names no relay: it dials the
+# public ones as well. (Personal is also the role of a configuration that
+# states none.)
+# (The role is the one in the `[network]` table. A `role` in any other
+# table is not the node's.)
+ROLE=$(awk '
+    /^[[:space:]]*\[/ { network = ($0 ~ /^[[:space:]]*\[network\][[:space:]]*(#.*)?$/) }
+    network && /^[[:space:]]*role[[:space:]]*=[[:space:]]*"[^"]*"/ {
+        sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+    }' "$CONFIG")
+if [ "${ROLE:-personal}" = "personal" ] \
+    && ! grep -Eq '^[[:space:]]*\[\[network\.bootnodes\]\]' "$CONFIG"; then
+    echo "FATAL: $CONFIG is a personal node's and names no relay." >&2
+    echo "A test node is not started so: it would dial the public relays." >&2
+    exit 1
+fi
+
 # Pre-seeded identity: if /keys/lead.identity.key exists and this is a lead
 # (not a swarm child), copy it to the data dir BEFORE init so `cordelia init`
 # uses the pre-generated key instead of generating a new one.
