@@ -1063,13 +1063,27 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
     // Two versions beside: their lines in the order of their writers'
     // keys, a line that both have once. Each has a line for the file,
     // and both are taken: the record counts one.
-    let p = back_unlisted();
     let (first, second) = (
         "- [Notes, one](notes.md) on one device\n",
         "- [Notes, two](notes.md) on another\n",
     );
-    let one = stands_beside(&p, INDEX, &format!("{first}{EXTRA}"));
-    let two = stands_beside(&p, INDEX, &format!("{EXTRA}{second}"));
+    // (Made until this device holds the two in another order than that
+    // of their writers' keys: the order of the lines is then the rule's
+    // doing, and not the order in which they happen to be held.)
+    let (p, one, two) = loop {
+        let p = back_unlisted();
+        let one = stands_beside(&p, INDEX, &format!("{first}{EXTRA}"));
+        let two = stands_beside(&p, INDEX, &format!("{EXTRA}{second}"));
+        let held: Vec<[u8; 32]> = {
+            let db = p.st.db.lock().unwrap();
+            let entry = entries::current_of(&p.st, &db, &p.channel, INDEX).unwrap();
+            entry.unwrap().conflicts.iter().map(|v| v.author).collect()
+        };
+        assert_eq!(held.len(), 2);
+        if held[0] > held[1] {
+            break (p, one, two);
+        }
+    };
     assert_eq!(a_minute_from(&p, 25).published, 1);
     let (lower, higher) = match one.identity.public_key() < two.identity.public_key() {
         true => (format!("{first}{EXTRA}"), second.to_string()),
