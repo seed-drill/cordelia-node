@@ -321,7 +321,7 @@ file_max_count = 5                         # Rotated log files to retain
 
 ## 4. Environment Variable Overrides
 
-Environment variables override `config.toml` values. All use the `CORDELIA_` prefix.
+Environment variables override `config.toml` values. All use the `CORDELIA_` prefix but one: `RUST_LOG`, where it is set, is the node's log filter in place of `logging.level`.
 
 ### 4.1 Supported Overrides
 

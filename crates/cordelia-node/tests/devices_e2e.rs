@@ -14,6 +14,13 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
+/// What a node writes to its log on the way to running: its banner, its
+/// endpoint, and the relays it worked out. The test of a node that stops
+/// before all that looks for none of them, and a test of a node that
+/// starts looks for each: a line that is reworded is then missed there,
+/// where it shows, and not only here, where it would pass.
+const A_STARTED_NODE_LOGS: [&str; 3] = ["Cordelia v", "P2P endpoint", "relays configured"];
+
 #[test]
 fn add_device_accept_and_sync_through_a_relay() {
     let mut relay = node("relay", "relay", None);
@@ -853,13 +860,12 @@ fn a_personal_node_listens_on_nothing() {
     });
     let status = a.cli(&["status"]);
     assert!(status.contains("outbound only"), "{status}");
-    assert!(
-        std::fs::read_to_string(a.log())
-            .unwrap()
-            .contains("dials out only"),
-        "{}",
-        a.log_tail()
-    );
+    let log = std::fs::read_to_string(a.log()).unwrap();
+    assert!(log.contains("dials out only"), "{}", a.log_tail());
+    // And what a node with no identity is checked not to have reached.
+    for line in A_STARTED_NODE_LOGS {
+        assert!(log.contains(line), "{line}: {}", a.log_tail());
+    }
 
     a.stop();
     let config = std::fs::read_to_string(a.config()).unwrap();
@@ -970,10 +976,10 @@ fn the_harness_refuses_what_the_node_would_take_for_a_name() {
     assert_on_this_machine("odd", "[127.0.0.1]:9");
 }
 
-/// A node, and each command, is run with nothing of the caller's that the
-/// node reads a setting from: no `CORDELIA_` variable (the specs name one,
+/// A node, and each command that the harness runs, is run without three
+/// things of the caller's: any `CORDELIA_` variable (the specs name one,
 /// `CORDELIA_BOOTNODES`, that would move a node's relays past the look at
-/// its configuration once it is built), no `RUST_LOG`, and no proxy. It is
+/// its configuration once it is built), `RUST_LOG`, and any proxy. It is
 /// given its own data directory and home, and the rest is left.
 ///
 /// This is a test of the function that removes them, given the names: no
@@ -1045,7 +1051,7 @@ fn a_node_with_no_identity_stops_before_it_dials() {
     // identity, not to its endpoint, and not to the relays it would then
     // have worked out. (The harness's configuration logs at debug, and
     // the node is given no `RUST_LOG` to say otherwise.)
-    for later in ["Cordelia v", "P2P endpoint", "relays configured"] {
+    for later in A_STARTED_NODE_LOGS {
         assert!(!log.contains(later), "{later}: {log}");
     }
 }
@@ -1147,8 +1153,9 @@ fn a_node_whose_dialling_cannot_be_checked_is_not_started() {
 /// A command asks its own node directly, whatever proxy the environment
 /// names: a proxy is for the network, and a request to this machine
 /// carries the node's token. Here every proxy variable names something
-/// on this machine that counts who calls it and answers with a refusal:
-/// each command works, and nothing calls.
+/// on this machine that counts who calls it and answers with a refusal.
+/// A client that takes the proxy is counted and refused; each command
+/// works, and none of them calls it.
 #[test]
 fn a_command_asks_its_own_node_and_no_proxy() {
     use std::io::Write;
@@ -1169,20 +1176,46 @@ fn a_command_asks_its_own_node_and_no_proxy() {
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
         }
     });
-    // (The harness passes a command no proxy of the caller's, and nothing
-    // of theirs that excepts this machine from one: here it is given
-    // these.)
+    // What stands in for a proxy does count a caller, and does refuse
+    // one: a client told to use it, asking the node what a command asks,
+    // is counted, and gets nothing.
+    let through: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(Some(ureq::Proxy::new(&proxy).unwrap()))
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let asked = through
+        .get(&format!("http://127.0.0.1:{}/api/v1/status", n.http))
+        .header("Authorization", &format!("Bearer {}", n.token()))
+        .call();
+    assert!(asked.is_err(), "the stand-in passed a request on");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The harness passes a command no proxy of the caller's, and nothing
+    // of theirs that excepts this machine from one. Here it is given
+    // every name the client reads a proxy from, and an empty list of
+    // exceptions.
+    let named = [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ];
+    let mut given = named.map(|name| (name, proxy.as_str())).to_vec();
+    given.extend([("NO_PROXY", ""), ("no_proxy", "")]);
     let run = |args: &[&str]| {
-        let proxies = [
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-        ]
-        .map(|name| (name, proxy.as_str()));
-        n.command_given(&proxies, args)
+        let mut command = n.command_for(&given, args);
+        // The command has them: the test is not passing for want of them.
+        for name in named {
+            let set = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value);
+            assert_eq!(set, Some(std::ffi::OsStr::new(&proxy)), "{name}");
+        }
+        command.output().unwrap()
     };
     // One that reads, one that posts, and the one that does both.
     for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
@@ -1193,11 +1226,41 @@ fn a_command_asks_its_own_node_and_no_proxy() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "cordelia {args:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cordelia {args:?}");
     }
-    // The answers came from the node: its own key is in what it lists.
+    // The answers came from the node: its own key is in what it lists,
+    // and `status`, which succeeds whether or not it reached a node, says
+    // that it did.
     let listed = String::from_utf8_lossy(&run(&["devices"]).stdout).into_owned();
     assert!(listed.contains("this device"), "{listed}");
+    let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
+    assert!(status.contains("Running:   yes"), "{status}");
+}
+
+/// A command asks the node at an address of this machine and at no
+/// other: its request carries the node's token. With the API's address
+/// set to another machine's, a command that reads and one that posts
+/// each say why they will not ask, and ask nothing.
+#[test]
+fn a_command_asks_no_address_but_this_machines() {
+    let n = node("idle", "personal", None);
+    // (An address kept for documentation: nothing is there.)
+    let elsewhere = [("CORDELIA_BIND_ADDRESS", "192.0.2.1")];
+    for args in [&["peers", "--json"][..], &["devices"]] {
+        let asked = std::time::Instant::now();
+        let out = n.command_given(&elsewhere, args);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "cordelia {args:?}");
+        assert!(
+            said.contains("192.0.2.1") && said.contains("not this machine"),
+            "cordelia {args:?}: {said}"
+        );
+        // Refused, and not given up on after a wait for an answer.
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "cordelia {args:?}"
+        );
+    }
 }
 
 #[test]
@@ -1215,7 +1278,9 @@ fn cli_reports_when_the_node_is_not_running() {
     assert_eq!(json["state"], "stopped", "{json}");
 
     // On a machine without Cordelia (an empty home directory), the status
-    // line prints nothing.
+    // line prints nothing. (Built by hand: the harness would give it this
+    // node's configuration and home. It finds no identity, so it asks
+    // nothing of any node, whatever else the caller's environment says.)
     let empty_home = tempfile::tempdir().unwrap();
     let none = Command::new(BIN)
         .args(["status", "--line"])

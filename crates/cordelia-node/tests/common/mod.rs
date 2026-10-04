@@ -66,10 +66,11 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and nothing of whoever runs the tests that it reads a
-    /// setting from: no `CORDELIA_` variable of theirs, no `RUST_LOG`
-    /// (either would stand in place of the node's configuration), and no
-    /// proxy of theirs.
+    /// and home, and without three things of whoever runs the tests: any
+    /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
+    /// the node's configuration), and any proxy (the tests of what a
+    /// command does with one set their own). What else the binary reads
+    /// from the environment is left: `NO_COLOR`, which no test asks of.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -101,14 +102,17 @@ impl Node {
         self.binary().args(args).output().unwrap()
     }
 
-    /// As [`Self::command`], with `vars` set for it: the caller's own are
-    /// taken out first, as for any command.
+    /// A CLI command against this node, with `vars` set for it, not yet
+    /// run: the caller's own are taken out first, as for any command.
+    pub fn command_for(&self, vars: &[(&str, &str)], args: &[&str]) -> Command {
+        let mut command = self.binary();
+        command.envs(vars.iter().copied()).args(args);
+        command
+    }
+
+    /// [`Self::command_for`], run.
     pub fn command_given(&self, vars: &[(&str, &str)], args: &[&str]) -> std::process::Output {
-        self.binary()
-            .envs(vars.iter().copied())
-            .args(args)
-            .output()
-            .unwrap()
+        self.command_for(vars, args).output().unwrap()
     }
 
     /// As [`Self::command`], run in the directory `dir`: for what a
