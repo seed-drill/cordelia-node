@@ -162,6 +162,11 @@ enum Step {
     /// From now on the device behaves as devices did before. Only for a
     /// test of the check itself: a fault, put where the test wants it.
     AsBefore(usize),
+    /// The first device removes the second, as the node does: it
+    /// publishes again, under its own name, each entry that counts and
+    /// that the second wrote, and from then on the second's entries count
+    /// on no device, and its folder is no longer one of the person's.
+    Remove(usize, usize),
     /// The device moves the channel to a new key, as a device that
     /// removes another does, and writes under it from now on.
     NewKey(usize),
@@ -224,6 +229,8 @@ struct World {
     keys: u8,
     /// The device that changed it last.
     key_by: usize,
+    /// The devices that have been removed.
+    removed: BTreeSet<usize>,
     /// Each text a step wrote to a file, by the file it is a text of.
     wrote: BTreeSet<(String, String)>,
     /// Each line a step added to the index.
@@ -309,6 +316,7 @@ impl World {
             step: 0,
             keys: 0,
             key_by: 0,
+            removed: BTreeSet::new(),
             wrote: BTreeSet::new(),
             lines: BTreeSet::new(),
             let_go: BTreeSet::new(),
@@ -393,6 +401,23 @@ impl World {
                     .unwrap();
             }
             Step::AsBefore(d) => self.devices[*d].kind = Kind::Before,
+            Step::Remove(by, who) => {
+                let leaving = self.devices[*who].st.identity.public_key();
+                {
+                    // While the leaving device's entries still count
+                    // here, as the node does it.
+                    let st = &self.devices[*by].st;
+                    let db = st.db.lock().unwrap();
+                    entries::take_over(st, &db, &self.channel, &leaving).unwrap();
+                }
+                // The removal has reached every device.
+                for device in &self.devices {
+                    let db = device.st.db.lock().unwrap();
+                    channels::remove_member(&db, &self.channel, &leaving).unwrap();
+                }
+                self.removed.insert(*who);
+                self.settle_ties(*by);
+            }
             Step::NewKey(d) => {
                 self.keys += 1;
                 self.key_by = *d;
@@ -693,26 +718,33 @@ impl World {
         (files, held, records)
     }
 
-    /// Every device gets the newest key and everything the others hold,
-    /// and runs cycles, until nothing changes anywhere.
+    /// The devices that are still the person's.
+    fn remaining(&self) -> Vec<usize> {
+        (0..self.devices.len())
+            .filter(|d| !self.removed.contains(d))
+            .collect()
+    }
+
+    /// Every device that remains gets the newest key and everything the
+    /// others hold, and runs cycles, until nothing changes anywhere.
     fn rest(&mut self) {
-        let n = self.devices.len();
+        let devices = self.remaining();
         for _ in 0..20 {
-            let before: Vec<_> = (0..n).map(|d| self.whole(d)).collect();
-            for d in 0..n {
-                self.run(&Step::GetKey(d));
+            let before: Vec<_> = devices.iter().map(|d| self.whole(*d)).collect();
+            for d in &devices {
+                self.run(&Step::GetKey(*d));
             }
-            for from in 0..n {
-                for to in 0..n {
+            for from in &devices {
+                for to in &devices {
                     if from != to {
-                        self.run(&Step::Pass(from, to));
+                        self.run(&Step::Pass(*from, *to));
                     }
                 }
             }
-            for d in 0..n {
-                self.run(&Step::Cycle(d));
+            for d in &devices {
+                self.run(&Step::Cycle(*d));
             }
-            let after: Vec<_> = (0..n).map(|d| self.whole(d)).collect();
+            let after: Vec<_> = devices.iter().map(|d| self.whole(*d)).collect();
             if after == before {
                 return;
             }
@@ -721,10 +753,9 @@ impl World {
     }
 
     /// The texts and index lines that a step wrote and that are now in no
-    /// file on any device, though no step edited or deleted a file while
-    /// it held them.
+    /// file on any device that remains, though no step edited or deleted a
+    /// file while it held them. A removed device's folder is gone with it.
     fn lost(&self) -> Vec<String> {
-        let n = self.devices.len();
         let mut in_a_file: BTreeSet<(String, String)> = BTreeSet::new();
         let mut index_lines: BTreeSet<String> = BTreeSet::new();
         let mut note = |root: String, text: String| {
@@ -733,7 +764,7 @@ impl World {
             }
             in_a_file.insert((root, text));
         };
-        for d in 0..n {
+        for d in self.remaining() {
             let has = self.has(d);
             for (name, text) in has.files {
                 note(name, text);
@@ -1071,6 +1102,85 @@ fn each_device_that_held_an_overtaken_entry_keeps_it() {
             let text = world.read(d, copy).unwrap();
             assert!(text.starts_with("a.md, written on 1 at step"), "{text}");
         }
+    }
+}
+
+/// A text is kept through a removal. Device 0 writes a text and is then
+/// removed by device 1, which never had that text in its folder: it holds
+/// the entry, and publishes it again under its own name, saying nothing,
+/// as the node does. Device 2 holds the text. Device 3 edited the file
+/// without it, and its entry ties with the removed device's.
+///
+/// Where device 3's entry wins that tie on device 1, device 1's file takes
+/// device 3's text, and its next edit is written from a folder that never
+/// held device 0's text. Recorded as the writer of the entry it published
+/// again, device 1 was then taken to follow that text on device 2, where
+/// it was replaced with nothing kept, and it was in no file anywhere. The
+/// record of an entry that says nothing names nobody, and the text is
+/// kept. (Each tie goes as the seed says, so the sequence is run with
+/// seeds enough for the tie to go each way.)
+#[test]
+fn a_text_is_kept_through_a_removal() {
+    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
+    steps.extend(sync(4));
+    steps.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 2), Cycle(2)]);
+    steps.extend([Edit(3, "a.md"), Cycle(3)]);
+    // Device 1 holds device 0's entry and has run no cycle.
+    steps.extend([Pass(0, 1), Remove(1, 0), Pass(1, 2), Cycle(2)]);
+    steps.extend([Pass(3, 1), Cycle(1), Edit(1, "a.md"), Cycle(1)]);
+    steps.extend([Pass(1, 2), Cycle(2)]);
+    let mut kept = 0;
+    for seed in 0..8 {
+        let mut world = World::new(&[Built; 4], seed);
+        for step in &steps {
+            world.run(step);
+        }
+        world.rest();
+        let lost = world.lost();
+        assert!(lost.is_empty(), "seed {seed}: {lost:?}");
+        // Where the removed device's text was overtaken on device 2 by
+        // an entry that did not follow it, it is in a copy there.
+        let theirs = |text: &String| text.starts_with("a.md, written on 0 at step");
+        let copied = world.has(2).copies.iter().any(|(_, text)| theirs(text));
+        kept += usize::from(copied);
+    }
+    assert!(kept > 0, "no seed sent the tie the way this is for");
+}
+
+/// An edit that tied with an entry which was then published again at a
+/// removal is kept. Device 0 writes a text, device 1 takes it, and device
+/// 2 edits the file without it: a tie. Device 1 removes device 0,
+/// publishing its entry again, and edits the file. That edit says that
+/// everything at or below the entry it was written over is left to its
+/// revision, and device 2's own edit is at that revision. It said what it
+/// was written after, so it is not the entry that was written over, and
+/// its text is kept. It was replaced with nothing kept.
+#[test]
+fn an_edit_that_tied_with_an_entry_published_again_is_kept() {
+    let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
+    steps.extend(sync(3));
+    steps.extend([Edit(0, "a.md"), Cycle(0), Pass(0, 1), Cycle(1)]);
+    steps.extend([Edit(2, "a.md"), Cycle(2)]);
+    steps.extend([Remove(1, 0), Edit(1, "a.md"), Cycle(1)]);
+    steps.extend([Pass(1, 2), Cycle(2)]);
+    for seed in 0..4 {
+        let mut world = World::new(&[Built; 3], seed);
+        for step in &steps {
+            world.run(step);
+        }
+        // Device 2 has device 1's edit in the file, and its own beside it.
+        let has = world.has(2);
+        let file = &has.files["a.md"];
+        assert!(file.starts_with("a.md, written on 1 at step"), "{file}");
+        let own = |text: &String| text.starts_with("a.md, written on 2 at step");
+        let copies: Vec<&String> = has.copies.iter().map(|(_, text)| text).collect();
+        assert!(
+            copies.iter().any(|text| own(text)),
+            "seed {seed}: {copies:?}"
+        );
+        world.rest();
+        let lost = world.lost();
+        assert!(lost.is_empty(), "seed {seed}: {lost:?}");
     }
 }
 

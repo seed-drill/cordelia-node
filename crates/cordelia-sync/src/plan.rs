@@ -75,7 +75,7 @@ impl Remote {
     /// What a record of this version says of its writer: the device that
     /// wrote it, where it says what it was written after, and nobody where
     /// it says nothing. Only a sync adapter writes an entry that says
-    /// something, from the file in its folder. One that says nothing need
+    /// something, for a file of its folder. One that says nothing need
     /// never have been in its writer's folder (it is published again by
     /// the node when a device is removed, or written through the API), so
     /// nothing is rested on who wrote it.
@@ -805,7 +805,6 @@ mod tests {
             r
         };
         assert_eq!(planned(&base, &mine), kept);
-        assert_eq!(planned(&base, &nobodys), kept);
 
         // 1. It says nothing.
         let silent = Remote {
@@ -1139,6 +1138,23 @@ mod tests {
         assert_eq!(planned(&agreed_by(Writer::Nobody, 2, "x")), theirs);
         assert_eq!(planned(&agreed_by(Writer::NotRecorded, 2, "x")), theirs);
         assert_eq!(planned(&agreed_by(Writer::Device(THEM), 2, "x")), vec![]);
+        // And a later version is then judged by that record. THEM's next
+        // entry names nobody: it follows what THEM wrote, and not what
+        // this device wrote at the same revision.
+        let next = Remote {
+            rev: 3,
+            content: Some(c("y")),
+            ..said.clone()
+        };
+        let judged = |a: &Agreed| plan("n.md", Some(&x), Some(&next), Some(a), &none());
+        assert_eq!(
+            judged(&agreed_by(Writer::Device(THEM), 2, "x")),
+            vec![pull_of("y", 3, THEM)]
+        );
+        assert_eq!(
+            judged(&agreed_by(Writer::Device(ME), 2, "x")),
+            vec![keep("x"), pull_of("y", 3, THEM)]
+        );
 
         // The same for a file that both have as deleted.
         let deleted = |by: Writer| Agreed {

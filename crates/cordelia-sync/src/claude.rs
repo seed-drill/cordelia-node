@@ -1248,9 +1248,9 @@ struct Hooks<'a> {
     /// a text is flushed.
     flushed: &'a dyn Fn(&str),
     /// Publish and record as a version did before entries said what they
-    /// were written after: an entry says nothing, and a record names no
-    /// writer. With the plan of that version, a test has a device of that
-    /// version.
+    /// were written after: an entry says nothing, and a record says
+    /// nothing of the writer. With the plan of that version, a test has a
+    /// device of that version.
     says_nothing: bool,
 }
 
@@ -3482,6 +3482,10 @@ mod tests {
     /// later, naming itself and not the text's writer, is then not known
     /// to follow: the text is kept. Recorded as that device's, the later
     /// entry was taken with nothing kept.
+    ///
+    /// The entries here are made by hand, to show the rule alone: no two
+    /// devices come to them by syncing. The sequences with a removal
+    /// (`a_text_is_kept_through_a_removal`) have the case as it arises.
     #[test]
     fn a_text_is_kept_from_what_the_publisher_of_its_entry_writes_later() {
         let p = Pair::new();
@@ -3494,8 +3498,10 @@ mod tests {
         };
         p.file("notes.md", "mine\n");
         assert_eq!(p.cycle().published, 1);
-        // The other device publishes the same text again, a revision on,
-        // saying nothing: as a node does at a removal.
+        // The other device publishes the same text again, saying
+        // nothing, a revision on. (A node at a removal publishes at the
+        // entry's own revision, and a revision on only where it had lost
+        // a tie to it.)
         p.other_writes("notes.md", Some("mine\n"));
         let report = p.cycle();
         assert_eq!((report.pulled, report.published), (0, 0), "{report:?}");

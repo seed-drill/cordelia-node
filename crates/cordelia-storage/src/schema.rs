@@ -277,9 +277,9 @@ CREATE TABLE IF NOT EXISTS state_offers (
 );
 "#;
 
-/// Migration v9: the device that wrote the entry a folder agreed (decision
-/// 2026-09-30 §4.5), as its 32-byte key. NULL for a row from before, until
-/// the folder next records that file.
+/// Migration v9: who wrote the entry a folder agreed (decision 2026-09-30
+/// §4.5): a device's 32-byte key, or an empty value for nobody. NULL for a
+/// row from before, until the folder next records that file.
 const MIGRATION_V9: &str = r#"
 ALTER TABLE sync_files ADD COLUMN author BLOB;
 "#;

@@ -11,9 +11,9 @@ use cordelia_core::CordeliaError;
 /// it (decision 2026-09-30-agent-memory-sync §4.5).
 ///
 /// Stored in `sync_files.author`: `NULL` for [`Writer::NotRecorded`], an
-/// empty blob for [`Writer::Nobody`], and a device's 32 bytes. Anything
-/// else there is read as nobody: it shows nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// empty blob for [`Writer::Nobody`], and a device's 32 bytes. No version
+/// writes anything else there, and anything else is read as nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Writer {
     /// A row written before this was recorded says nothing of it.
     NotRecorded,
@@ -23,8 +23,7 @@ pub enum Writer {
     /// from an earlier version. Nothing is rested on who wrote it.
     Nobody,
     /// The device that wrote the agreed entry, which says what it was
-    /// written after: a sync adapter wrote it, from the file in its
-    /// folder.
+    /// written after: a sync adapter wrote it, for a file of its folder.
     Device([u8; 32]),
 }
 
@@ -46,7 +45,14 @@ pub fn load(
     let rows = stmt
         .query_map(params![folder, channel_id], |row| {
             let hash: Option<Vec<u8>> = row.get(1)?;
-            let author: Option<Vec<u8>> = row.get(3)?;
+            // Whatever is there that is no blob is read as an empty one:
+            // a value that a row should never hold does not end the
+            // folder's cycle.
+            let author: Option<Vec<u8>> = match row.get_ref(3)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+                _ => Some(Vec::new()),
+            };
             Ok((
                 row.get::<_, String>(0)?,
                 hash,
@@ -266,14 +272,15 @@ mod tests {
             assert_eq!(state["gone.md"], (None, 6, writer));
             assert_eq!(state["notes.md"], (Some([8; 32]), 3, b));
         }
-        // What is in the column and is no device's key shows nothing: it
-        // is read as nobody.
-        conn.execute(
-            "UPDATE sync_files SET author = x'0102' WHERE key = 'gone.md'",
-            [],
-        )
-        .unwrap();
-        let state = load(&conn, "/m", "grp_a").unwrap();
-        assert_eq!(state["gone.md"], (None, 6, Writer::Nobody));
+        // What is in the column and is no device's key is read as
+        // nobody, whatever it is: a blob of another length, a text, a
+        // number.
+        for odd in ["x'0102'", "'a text'", "17", "1.5"] {
+            let set = format!("UPDATE sync_files SET author = {odd} WHERE key = 'gone.md'");
+            conn.execute(&set, []).unwrap();
+            let state = load(&conn, "/m", "grp_a").unwrap();
+            assert_eq!(state["gone.md"], (None, 6, Writer::Nobody), "{odd}");
+            assert_eq!(state["notes.md"], (Some([8; 32]), 3, b), "{odd}");
+        }
     }
 }
