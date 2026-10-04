@@ -109,9 +109,16 @@ pub fn save(
 /// `keep`. A folder that stops syncing and later syncs again then starts
 /// afresh: its files merge with the channel's, and nothing it lost in
 /// between is taken as a delete. Returns the number of keys forgotten.
+///
+/// What a folder wrote down of the memories it deleted
+/// ([`crate::index_lines`]) is forgotten with what it agreed, here and in
+/// the two ways below: for a folder that has no agreed key too.
 pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usize, CordeliaError> {
     let mut stmt = conn
-        .prepare("SELECT DISTINCT folder, channel_id FROM sync_files")
+        .prepare(
+            "SELECT DISTINCT folder, channel_id FROM sync_files
+             UNION SELECT DISTINCT folder, channel_id FROM index_lines",
+        )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let pairs: Vec<(String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -129,6 +136,11 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
                 params![folder, channel_id],
             )
             .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM index_lines WHERE folder = ?1 AND channel_id = ?2",
+            params![folder, channel_id],
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     }
     Ok(forgotten)
 }
@@ -136,6 +148,8 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
 /// Forget what one folder agreed, with every channel. Returns the number
 /// of keys forgotten.
 pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM index_lines WHERE folder = ?1", params![folder])
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     conn.execute("DELETE FROM sync_files WHERE folder = ?1", params![folder])
         .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
@@ -144,7 +158,9 @@ pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaE
 /// in `keep`. Returns the number of keys forgotten.
 pub fn forget_folders_except(conn: &Connection, keep: &[String]) -> Result<usize, CordeliaError> {
     let mut stmt = conn
-        .prepare("SELECT DISTINCT folder FROM sync_files")
+        .prepare(
+            "SELECT DISTINCT folder FROM sync_files UNION SELECT DISTINCT folder FROM index_lines",
+        )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let folders: Vec<String> = stmt
         .query_map([], |row| row.get(0))

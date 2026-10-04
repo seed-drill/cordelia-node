@@ -102,6 +102,9 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `HISTORY_DAYS`, `HISTORY_MAX_BYTES` | 30, 256MB | parameter-rationale.md §10 |
 | `HISTORY_TURN_WAIT_SECS`, `HISTORY_SWEEP_INTERVAL_SECS` | 10s, 3600s | parameter-rationale.md §10 |
 | `HISTORY_SWEEP_SHARE` | 8 (swept at a cycle's end once an eighth of the size is kept) | parameter-rationale.md §10 |
+| `INDEX_LINE_PAIR_SECS`, `INDEX_LINE_KEPT_DAYS` | 3600s, 90 | parameter-rationale.md §11 |
+| `INDEX_LINE_MAX_RECORDS`, `INDEX_LINE_MAX_PUT_BACKS` | 1024, 3 | parameter-rationale.md §11 |
+| `INDEX_LINE_LOOK_SECS`, `INDEX_LINE_LOOK_GAP_SECS` | 60s, 30s | parameter-rationale.md §11 |
 | `MAX_REV`, `MAX_EPOCH` | 2^53 - 1 | parameter-rationale.md §4 |
 | `MAX_EPOCH_STEP` | 2^20 | parameter-rationale.md §4 |
 | `FALLBACK_PEERS` | relay1/relay2.cordelia.seeddrill.ai:9474 | decision 2026-09-30 §4.6 |

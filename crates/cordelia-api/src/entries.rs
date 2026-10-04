@@ -295,19 +295,52 @@ fn publish_at(
     })
 }
 
-/// Decrypt a stored item with the key version it claims and the associated
-/// data it must have been sealed with. Returns the plaintext JSON envelope.
-pub fn decrypt(state: &AppState, channel_key_version: i64, item: &StoredItem) -> Option<Value> {
-    let key = psk::read_psk_for_version(
+/// What came of opening a stored item.
+enum Opened {
+    /// What is inside, as JSON.
+    Content(Value),
+    /// No key this device holds opens it. It may be waiting for one: after
+    /// a removal, the device that removed writes under the new key at once.
+    NoKey,
+    /// It opens, and what is inside is not an entry's content.
+    NotContent,
+}
+
+/// Open a stored item with the key version it claims and the associated
+/// data it must have been sealed with.
+fn open(state: &AppState, channel_key_version: i64, item: &StoredItem) -> Opened {
+    let Ok(key) = psk::read_psk_for_version(
         &state.home_dir,
         &item.channel_id,
         item.key_version,
         channel_key_version,
-    )
-    .ok()?;
+    ) else {
+        return Opened::NoKey;
+    };
     let aad = item_aad(&item.channel_id, item.slot.as_deref(), item.rev);
-    let plaintext = cordelia_crypto::item_decrypt(&key, &item.encrypted_blob, &aad).ok()?;
-    serde_json::from_slice(&plaintext).ok()
+    let Ok(plaintext) = cordelia_crypto::item_decrypt(&key, &item.encrypted_blob, &aad) else {
+        return Opened::NoKey;
+    };
+    match serde_json::from_slice(&plaintext) {
+        Ok(envelope) => Opened::Content(envelope),
+        Err(_) => Opened::NotContent,
+    }
+}
+
+/// Decrypt a stored item with the key version it claims and the associated
+/// data it must have been sealed with. Returns the plaintext JSON envelope.
+pub fn decrypt(state: &AppState, channel_key_version: i64, item: &StoredItem) -> Option<Value> {
+    match open(state, channel_key_version, item) {
+        Opened::Content(envelope) => Some(envelope),
+        Opened::NoKey | Opened::NotContent => None,
+    }
+}
+
+/// An entry that this device holds and cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unread {
+    pub author: [u8; 32],
+    pub rev: u64,
 }
 
 /// What a reader needs to tell which stored items of a channel count.
@@ -362,6 +395,22 @@ impl<'a> Reading<'a> {
             content_hash: item.content_hash.clone(),
         };
         Some((slot.clone(), key.to_string(), version))
+    }
+
+    /// `item`, if it is an entry that this device cannot read: an active
+    /// member signed it, and no key this device holds opens it. One that
+    /// opens and is not an entry's content is not such an entry, and
+    /// neither is one that no member signed: each counts for nothing,
+    /// whenever it is looked at.
+    fn unread(&self, item: &StoredItem) -> Option<Unread> {
+        let rev = item.rev?;
+        item.slot.as_ref()?;
+        let author = <[u8; 32]>::try_from(item.author_id.as_slice()).ok()?;
+        if !self.members.contains(&author) || !verify_item_signature(item) {
+            return None;
+        }
+        matches!(open(self.state, self.key_version, item), Opened::NoKey)
+            .then_some(Unread { author, rev })
     }
 }
 
@@ -429,6 +478,24 @@ pub fn current_of(
         .map(|(_, _, version)| version)
         .collect();
     Ok((!versions.is_empty()).then(|| resolve(key.to_string(), versions)))
+}
+
+/// The entries stored for `key` in `channel_id` that this device cannot
+/// read (see [`Unread`]). [`current_of`] passes them over, so the value it
+/// gives can be older than one of these: a reader that is about to
+/// publish over that value, unasked, looks here first.
+pub fn unread_of(
+    state: &AppState,
+    db: &Connection,
+    channel_id: &str,
+    key: &str,
+) -> Result<Vec<Unread>, CordeliaError> {
+    let reading = Reading::of(state, db, channel_id)?;
+    let slot = slot_id(&reading.slot_key, key);
+    Ok(items::slot_items(db, channel_id, &slot)?
+        .iter()
+        .filter_map(|item| reading.unread(item))
+        .collect())
 }
 
 /// Publish again, under this device's name, every key in `channel_id` whose

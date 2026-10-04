@@ -170,6 +170,37 @@ pub struct Kept {
 /// What is kept, for each (memory folder, channel, file).
 type KeptByFile = std::collections::HashMap<(String, String, String), Kept>;
 
+/// What a look at the index found for one file with a record of its line
+/// (decision 2026-09-30 §4.5, the index line of a memory that comes back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineFound {
+    /// The file is back, the index has no line for it, and both are at
+    /// rest: the line is due.
+    Due,
+    /// The index has a line for it, and both are at rest.
+    Back,
+    /// Neither.
+    Neither,
+}
+
+/// What the last look found for one file, since when it has found that
+/// at every look, and when that look was. Times are seconds, in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Look {
+    pub found: LineFound,
+    pub since: i64,
+    pub at: i64,
+}
+
+/// The minute of looking, for each (memory folder, channel): what the
+/// last look found for each file with a record, and the entries that
+/// stood beside the index's then.
+#[derive(Default)]
+struct Looks {
+    files: std::collections::HashMap<(String, String, String), Look>,
+    beside: std::collections::HashMap<(String, String), Vec<String>>,
+}
+
 /// How the settings handlers and the sync adapter's loop keep in step.
 #[derive(Default)]
 pub struct SyncControl {
@@ -181,6 +212,13 @@ pub struct SyncControl {
     /// settings command: a record that outlived either could be of a
     /// conflict that is over (see [`Self::changed`]).
     kept: Mutex<KeptByFile>,
+    /// The minute of looking before an index line is put back, or its
+    /// record dropped. Held here as `kept` is, and for the same reasons: a
+    /// restart, and a settings command, each start the minute again.
+    looks: Mutex<Looks>,
+    /// The time the adapter reads for those records, where a test has set
+    /// one. Otherwise it is the system's clock.
+    clock: Mutex<Option<i64>>,
 }
 
 impl SyncControl {
@@ -207,7 +245,58 @@ impl SyncControl {
     pub fn changed(&self, _db: &rusqlite::Connection) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.kept().clear();
+        *self.looks() = Looks::default();
         self.wake.notify_one();
+    }
+
+    fn looks(&self) -> std::sync::MutexGuard<'_, Looks> {
+        self.looks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the last look found for `file` of `folder`, if there was one
+    /// since the node started and since it last took a settings command.
+    pub fn look(&self, folder: &str, channel: &str, file: &str) -> Option<Look> {
+        let key = (folder.to_string(), channel.to_string(), file.to_string());
+        self.looks().files.get(&key).copied()
+    }
+
+    /// Write down what a look found for `file`.
+    pub fn looked(&self, folder: &str, channel: &str, file: &str, look: Look) {
+        let key = (folder.to_string(), channel.to_string(), file.to_string());
+        self.looks().files.insert(key, look);
+    }
+
+    /// Forget what was found for `file`: its minute starts again. With no
+    /// file, for every file of the folder.
+    pub fn look_again(&self, folder: &str, channel: &str, file: Option<&str>) {
+        self.looks().files.retain(|(in_folder, in_channel, of), _| {
+            in_folder != folder || in_channel != channel || file.is_some_and(|file| file != of)
+        });
+    }
+
+    /// The entries that stood beside the index's at the last look, by ID.
+    pub fn stood_beside(&self, folder: &str, channel: &str) -> Option<Vec<String>> {
+        let key = (folder.to_string(), channel.to_string());
+        self.looks().beside.get(&key).cloned()
+    }
+
+    /// Write down which entries stand beside the index's at this look.
+    pub fn stands_beside(&self, folder: &str, channel: &str, entries: Vec<String>) {
+        let key = (folder.to_string(), channel.to_string());
+        self.looks().beside.insert(key, entries);
+    }
+
+    /// The time, in seconds, in UTC: the one place the adapter reads it
+    /// for the records of index lines, so that a test can set it.
+    pub fn now(&self) -> i64 {
+        let set = *self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        set.unwrap_or_else(|| chrono::Utc::now().timestamp())
+    }
+
+    /// Set the time that [`Self::now`] gives, or give it back to the
+    /// system's clock. For tests.
+    pub fn set_now(&self, now: Option<i64>) {
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = now;
     }
 
     fn kept(&self) -> std::sync::MutexGuard<'_, KeptByFile> {

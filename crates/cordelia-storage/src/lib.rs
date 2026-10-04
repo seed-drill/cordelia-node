@@ -6,6 +6,7 @@ pub mod atomic;
 pub mod channels;
 pub mod db;
 pub mod history;
+pub mod index_lines;
 pub mod invites;
 pub mod items;
 pub mod meta;
