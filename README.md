@@ -95,8 +95,8 @@ Each of your other devices applies the removal only when its node has received
 it. It is offered to them until each confirms it, and `cordelia devices`, on
 the device that sent it, marks any that has not after ten minutes. The absence
 of a mark does not show that every device has applied it. What a device does
-until it has applied a removal is in the known limits of the
-[decision record](docs/decisions/2026-09-30-agent-memory-sync.md), section 9.
+until it has applied a removal is in section 9 (Known limits) of the
+[decision record](docs/decisions/2026-09-30-agent-memory-sync.md).
 
 ### Status
 
