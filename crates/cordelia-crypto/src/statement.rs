@@ -116,6 +116,11 @@ pub enum StatementError {
 
     #[error("the two statements were not made apart")]
     NotApart,
+
+    #[error(
+        "the statement was made after the applied one, and lacks a key that the applied one removed"
+    )]
+    UndoesARemoval,
 }
 
 /// A device as a statement lists it.
@@ -191,8 +196,8 @@ pub enum Judgement {
     /// It is the applied one, or one on the applied one's chain. Nothing
     /// is done with it.
     Behind,
-    /// It was made apart from the applied one, or it lacks a removal that
-    /// the applied one has. The device stops until the two are settled.
+    /// It was made apart from the applied one: neither is on the other's
+    /// chain. The device stops until the two are settled.
     Fork,
     /// It was made after the applied one, undoes no removal, and lists
     /// this device's key as removed. The device is no longer one of the
@@ -607,7 +612,8 @@ impl SignedStatement {
 ///   apart is a fork, even where it removes everything the applied one
 ///   removed: what the applied one decided besides would be dropped.
 /// - Rule 5: every key that the applied one removed is removed in it. One
-///   that lacks a removal is a fork.
+///   that was made after the applied one and lacks a removal is an error,
+///   as below.
 /// - Rule 3: the device is among its devices, and it
 ///   [`Judgement::Applies`]. A device that is not is
 ///   [`Judgement::Removed`] or [`Judgement::NotListed`], and only by a
@@ -623,6 +629,13 @@ impl SignedStatement {
 ///   rule 5), and so is anything else that [`Statement::validate`]
 ///   refuses. It is no statement, whoever signed it, so a device is not
 ///   stopped by it as a fork stops one.
+/// - **A statement that has the applied one on its chain and lacks a
+///   removal that the applied one has is an error too**
+///   ([`StatementError::UndoesARemoval`]). A statement lists as removed
+///   every key that any statement on its chain removes, so this one is
+///   not well formed. And it is no fork: the two were not made apart, so
+///   nothing could settle them, and a device that stopped for it would
+///   stay stopped.
 pub fn judge(
     shown: &SignedStatement,
     applied: &Statement,
@@ -647,7 +660,7 @@ pub fn judge(
         return Ok(Judgement::Fork);
     }
     if !applied.removed.iter().all(|key| shown.removes(key)) {
-        return Ok(Judgement::Fork);
+        return Err(StatementError::UndoesARemoval);
     }
     Ok(if shown.lists(device) {
         Judgement::Applies
@@ -2361,10 +2374,11 @@ mod tests {
         assert_eq!(judged(&phrase, &renewed, &two, 1), Ok(Judgement::Applies));
     }
 
-    /// Rule 5. A statement that lacks a removal the applied one has is a
-    /// fork, though it was made after the applied one.
+    /// Rule 5. A statement that was made after the applied one and lacks a
+    /// removal that the applied one has is refused, as one that is not
+    /// well formed is. It is no fork: the two were not made apart.
     #[test]
-    fn a_statement_that_lacks_a_removal_is_a_fork() {
+    fn a_statement_made_after_the_applied_one_that_lacks_a_removal_is_refused() {
         let phrase = phrase();
         let Apart { a3, .. } = apart(&phrase);
         assert_eq!(a3.removed, vec![key(2)]);
@@ -2375,15 +2389,18 @@ mod tests {
         assert_eq!(judged(&phrase, &kept, &a3, 1), Ok(Judgement::Applies));
 
         // The same statement without the removal: as a maker with a fault
-        // would have made it.
+        // would have made it. It names the applied one on its chain, and
+        // is refused for every device: one it lists, the one whose
+        // removal it lacks, and a stranger.
         let mut undone = kept.clone();
         undone.removed.retain(|removed| *removed != key(2));
         assert_eq!(undone.removed, vec![key(9)]);
         assert!(undone.has_on_chain(&a3.link().unwrap()));
+        assert_eq!(undone.validate(), Ok(()));
         for device in [0, 1, 2, 7] {
             assert_eq!(
                 judged(&phrase, &undone, &a3, device),
-                Ok(Judgement::Fork),
+                Err(StatementError::UndoesARemoval),
                 "{device}"
             );
         }
@@ -2391,7 +2408,31 @@ mod tests {
         let mut back = undone.clone();
         back.devices.push(device(2));
         assert_eq!(back.validate(), Ok(()));
-        assert_eq!(judged(&phrase, &back, &a3, 2), Ok(Judgement::Fork));
+        for device in [1, 2] {
+            assert_eq!(
+                judged(&phrase, &back, &a3, device),
+                Err(StatementError::UndoesARemoval)
+            );
+        }
+        // It is no fork: the two were not made apart, and nothing settles
+        // them.
+        assert_eq!(
+            Statement::settle(&a3, &undone, key(0), &secret(5), devices(&[0, 1]), &[]),
+            Err(StatementError::NotApart)
+        );
+
+        // One made after it, with the removal again, is judged for what
+        // it is: it applies.
+        let again = undone
+            .next(key(0), &secret(5), devices(&[0, 1]), &[key(2)])
+            .unwrap();
+        assert!(again.has_on_chain(&a3.link().unwrap()));
+        assert_eq!(judged(&phrase, &again, &a3, 1), Ok(Judgement::Applies));
+        // To a device that had applied nothing later than the statement
+        // before the removal, the one that lacks it undoes nothing.
+        let Apart { two, .. } = apart(&phrase);
+        assert!(two.removed.is_empty());
+        assert_eq!(judged(&phrase, &undone, &two, 1), Ok(Judgement::Applies));
     }
 
     /// A removal undone by a later statement made apart: the other side

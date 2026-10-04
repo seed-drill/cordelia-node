@@ -2268,11 +2268,10 @@ mod tests {
         assert_eq!(everything(&conn), stopped);
     }
 
-    /// Two statements made apart: one at the applied one's number, one at
-    /// a higher number on another branch, and one made after the applied
-    /// one that lacks a removal it has.
-    fn made_apart(phrase: &Phrase) -> [Statement; 3] {
-        let [_, two, three, _] = statements(phrase);
+    /// Two statements made apart from statement 3 of [`statements`]: one
+    /// at its number, and one at a higher number on that other branch.
+    fn made_apart(phrase: &Phrase) -> [Statement; 2] {
+        let [_, two, ..] = statements(phrase);
         // Made from statement 2 on device 1, not knowing of statement 3.
         let same_number = two
             .next(key(1), &secret(13), listed(&[1, 0, 2]), &[])
@@ -2280,20 +2279,89 @@ mod tests {
         let higher = same_number
             .next(key(1), &secret(14), listed(&[1, 0, 2]), &[])
             .unwrap();
-        // Made after statement 3, and bringing back the key it removed.
+        [same_number, higher]
+    }
+
+    /// A statement made after statement 3 of [`statements`], which commits
+    /// to secret 15 and lacks the removal that statement 3 has.
+    fn lacking_a_removal(phrase: &Phrase) -> Statement {
+        let [_, _, three, _] = statements(phrase);
         let mut lacking = three
             .next(key(0), &secret(15), listed(&[0, 1]), &[])
             .unwrap();
         lacking.removed.clear();
         lacking.validate().unwrap();
-        [same_number, higher, lacking]
+        assert!(lacking.has_on_chain(&three.link().unwrap()));
+        lacking
+    }
+
+    /// A statement that has the applied one on its chain and lacks a
+    /// removal that the applied one has is refused, as one that is not
+    /// well formed is. It is no fork: the device does not stop, and
+    /// nothing changes.
+    #[test]
+    fn test_a_statement_that_lacks_a_removal_of_the_applied_one_is_refused() {
+        let conn = db::open_in_memory().unwrap();
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        follow(&conn, 0, &phrase, &three, secret(3));
+        hold_name(&conn, "team", NOW).unwrap();
+        put(&conn, &own(3, "team"), 0, 5, "a.md", text("a"), &[]);
+        let before = everything(&conn);
+
+        // Device 0 is listed in it, with the secret sealed to it.
+        let lacking = lacking_a_removal(&phrase);
+        let entry = change(&phrase, &lacking, secret(15));
+        let undoes = ChangeEntryError::Statement(StatementError::UndoesARemoval);
+        assert_eq!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Refused(Refused::NotAChangeEntry(undoes))
+        );
+        assert_eq!(state(&conn), State::Applied);
+        assert_eq!(kept(&conn, Kept::Apart), None);
+        assert_eq!(everything(&conn), before);
+        // Nor is it applied where it is given with its secret.
+        assert!(matches!(
+            apply(
+                &conn,
+                &device(0),
+                &sign(&lacking, &phrase),
+                &secret(15),
+                &entry,
+                NOW
+            ),
+            Err(PersonError::Statement(StatementError::UndoesARemoval))
+        ));
+        assert_eq!(everything(&conn), before);
+
+        // With the removed key among its devices again, it is the same.
+        let mut back = lacking.clone();
+        back.devices.push(listed(&[2]).remove(0));
+        back.validate().unwrap();
+        let entry = change(&phrase, &back, secret(15));
+        assert_eq!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Refused(Refused::NotAChangeEntry(ChangeEntryError::Statement(
+                StatementError::UndoesARemoval
+            )))
+        );
+        assert_eq!(everything(&conn), before);
+
+        // The device goes on: a statement made after the one applied, with
+        // every removal it has, is applied.
+        let [.., four] = statements(&phrase);
+        let entry = change(&phrase, &four, secret(4));
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
     }
 
     #[test]
     fn test_a_fork_stops_the_device_and_it_keeps_both_entries() {
         let phrase = phrase();
         let [_, _, three, _] = statements(&phrase);
-        let secrets_of = [13, 14, 15];
+        let secrets_of = [13, 14];
         for (place, apart) in made_apart(&phrase).iter().enumerate() {
             let conn = db::open_in_memory().unwrap();
             let keeps = follow(&conn, 0, &phrase, &three, secret(3));
@@ -2329,7 +2397,7 @@ mod tests {
         // device keeps the two it has.
         let conn = db::open_in_memory().unwrap();
         let keeps = follow(&conn, 0, &phrase, &three, secret(3));
-        let [same_number, higher, _] = made_apart(&phrase);
+        let [same_number, higher] = made_apart(&phrase);
         let first = change(&phrase, &same_number, secret(13));
         assert_eq!(shown(&conn, &device(0), &first, NOW).unwrap(), Shown::Fork);
         let stopped = everything(&conn);
@@ -3725,11 +3793,10 @@ mod tests {
             Err(PersonError::NotApplied(Judgement::Fork))
         ));
         // Rule 5: no removal is undone.
-        let [.., lacking] = made_apart(&phrase);
-        let (statement, entry) = given(&lacking, 15);
+        let (statement, entry) = given(&lacking_a_removal(&phrase), 15);
         assert!(matches!(
             apply(&conn, &me, &statement, &secret(15), &entry, NOW),
-            Err(PersonError::NotApplied(Judgement::Fork))
+            Err(PersonError::Statement(StatementError::UndoesARemoval))
         ));
         // Rule 3: it is in it.
         let without = three.next(key(0), &secret(4), listed(&[0]), &[]).unwrap();
