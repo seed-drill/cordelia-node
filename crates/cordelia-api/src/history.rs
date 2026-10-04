@@ -214,8 +214,10 @@ pub struct DropResponse {
     pub left: usize,
     /// How many records are left pending that could be neither marked nor
     /// read. Nothing shows whose they are, so a drop that names records
-    /// leaves them, and says that they are there: one may hold the text.
-    pub unreadable: usize,
+    /// leaves them, and says that they are there: one may hold a text that
+    /// was to go. (They are in no listing. A record that was marked and
+    /// cannot be read is another thing: the listing gives those.)
+    pub pending_unreadable: usize,
 }
 
 // ── Reading ────────────────────────────────────────────────────────
@@ -634,7 +636,7 @@ fn drop_with(
             dropped: Vec::new(),
             removed,
             left,
-            unreadable: 0,
+            pending_unreadable: 0,
         });
     }
     // A record left pending holds a text too: its change could not be
@@ -679,6 +681,7 @@ fn drop_with(
     // then (something else removed it) is neither dropped nor left.
     let (went, left) = store.remove(&ids);
     let mut removed = went.len();
+    let went: std::collections::HashSet<Id> = went.into_iter().collect();
     let mut dropped: Vec<Line> = gone
         .into_iter()
         .filter(|r| went.contains(&r.id))
@@ -708,7 +711,7 @@ fn drop_with(
         dropped,
         removed,
         left,
-        unreadable,
+        pending_unreadable: unreadable,
     })
 }
 
@@ -1482,6 +1485,9 @@ mod tests {
         };
         let dropped = drop_records(&n.state, &request, NO_WAIT).unwrap();
         assert_eq!((dropped.removed, dropped.left), (2, 0));
+        // The one that stays pending can be read: it is not among those
+        // that cannot.
+        assert_eq!(dropped.pending_unreadable, 0);
         let mut ids: Vec<String> = dropped.dropped.iter().map(|l| l.id.clone()).collect();
         ids.sort();
         let mut expected = vec![asked.clone(), copy.clone()];
@@ -1497,7 +1503,8 @@ mod tests {
 
     /// A record left pending that cannot be marked, and says nothing of
     /// itself that can be read, is not a named drop's: nothing shows whose
-    /// it is. It is not counted, and it stays. `--all` takes it.
+    /// it is. It is not removed, and not counted as left: the answer says
+    /// only that it is there. `--all` takes it.
     #[test]
     fn test_a_pending_record_that_cannot_be_read_goes_only_with_all() {
         let n = node();
@@ -1516,8 +1523,10 @@ mod tests {
         assert_eq!((dropped.removed, dropped.left), (0, 0));
         assert!(dropped.dropped.is_empty());
         assert!(pending.is_file());
-        // The answer says that it is there: it may hold the text.
-        assert_eq!(dropped.unreadable, 1);
+        // The answer says that it is there: it may hold the text. (Under
+        // the name that the command reads.)
+        let answer = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(answer["pending_unreadable"], 1);
         // Everything: the record goes. (What holds the name it would be
         // marked under is no file, and is counted as still there.)
         let request = DropRequest {
@@ -1526,7 +1535,7 @@ mod tests {
         };
         let all = drop_records(&n.state, &request, NO_WAIT).unwrap();
         assert_eq!((all.removed, all.left), (1, 1));
-        assert_eq!(all.unreadable, 0);
+        assert_eq!(all.pending_unreadable, 0);
         assert!(!pending.exists());
     }
 

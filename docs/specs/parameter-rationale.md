@@ -752,8 +752,8 @@ gives up nothing at twelve seconds: it only says that it is waiting.
 **Rationale:** How often records that are too old, or over the size, are
 dropped. Age is counted in days, so an hour is ample, and the sweep also
 runs when the node starts. The hour is counted while the machine is awake:
-a machine that sleeps sweeps once it has been awake for an hour since the
-last sweep.
+a machine that sleeps sweeps no later than an hour of being awake after
+the hourly sweep was last due.
 
 ### HISTORY_SWEEP_SHARE = 8
 

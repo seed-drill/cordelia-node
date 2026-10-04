@@ -576,7 +576,8 @@ impl Store {
     /// Remove records from this device, each by itself: one that cannot
     /// be removed is passed over, and the rest go. Returns the ids of
     /// those that went, and of those that are still there. One that was
-    /// not there to remove is in neither.
+    /// not there to remove is in neither (one that goes between the look
+    /// for it and its removal is given as still there).
     pub fn remove(&self, ids: &[Id]) -> (Vec<Id>, Vec<Id>) {
         self.remove_by(ids, &|path| std::fs::remove_file(path))
     }

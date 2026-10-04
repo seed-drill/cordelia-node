@@ -509,14 +509,15 @@ fn dropped(answer: &Value, all: bool) -> String {
     if all {
         return format!("Dropped {removed} records from this device.\n{left}{WHAT_STAYS}");
     }
-    // A record left unfinished that cannot be read is nobody's by what it
-    // says, and may hold the text all the same: a drop that names records
-    // leaves it, and says that it is there.
-    let unread = match answer["unreadable"].as_u64().unwrap_or(0) {
+    // A record left pending that could be neither marked nor read is
+    // nobody's by what it says, and may hold a text that was to go: a drop
+    // that names records leaves it, and says that it is there. It is in
+    // no listing.
+    let unread = match answer["pending_unreadable"].as_u64().unwrap_or(0) {
         0 => String::new(),
         unread => format!(
-            "{unread} unfinished records cannot be read, and may hold the same text: only \
-             `cordelia history drop --all` removes them.\n"
+            "{unread} unfinished records, which no listing shows, cannot be read and may hold a \
+             text that was to go: only `cordelia history drop --all` removes them.\n"
         ),
     };
     if removed == 0 && left.is_empty() {
@@ -920,22 +921,25 @@ mod tests {
             dropped(&none, false),
             "No such records. Nothing was dropped.\n"
         );
-        // An unfinished record that cannot be read is nobody's by what it
-        // says, and may hold the text: it is said to be there, whether or
-        // not anything else went.
-        let unread = json!({ "dropped": [], "removed": 0, "unreadable": 2 });
+        // A record left pending that could be neither marked nor read is
+        // nobody's by what it says, and may hold a text that was to go: it
+        // is said to be there, whether or not anything else went.
+        let unread = json!({ "dropped": [], "removed": 0, "pending_unreadable": 2 });
         let out = dropped(&unread, false);
         assert!(
             out.starts_with("No such records. Nothing was dropped.\n2 unfinished records"),
             "{out}"
         );
         assert!(out.contains("drop --all"), "{out}");
-        let both = json!({ "removed": 1, "unreadable": 1, "dropped": [
+        let both = json!({ "removed": 1, "pending_unreadable": 1, "dropped": [
             { "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
               "at": "2026-10-03T11:00:00Z" },
         ]});
         let out = dropped(&both, false);
-        assert!(out.contains("1 unfinished records cannot be read"), "{out}");
+        assert!(
+            out.contains("1 unfinished records, which no listing shows"),
+            "{out}"
+        );
         let some = json!({ "removed": 2, "dropped": [
             { "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
               "at": "2026-10-03T11:00:00Z" },

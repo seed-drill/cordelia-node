@@ -4236,7 +4236,10 @@ mod tests {
             7
         };
         let soon = std::time::Duration::from_millis(20);
+        let began = std::time::Instant::now();
         assert_eq!(saying_if_long(Some(soon), saying, slow), 7);
+        // Not before the wait that was given.
+        assert!(began.elapsed() >= soon);
         assert!(let_go(&gone));
         assert_eq!(said.load(Ordering::SeqCst), 1);
 
