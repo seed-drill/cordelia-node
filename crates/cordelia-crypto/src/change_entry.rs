@@ -44,9 +44,9 @@
 use std::fmt;
 
 use cordelia_core::protocol::{
-    CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_PHRASE_PART_BYTES,
-    ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES, LABEL_CHANGE_PHRASE, MAX_EARLIER_SECRETS,
-    SEALED_SECRET_BYTES,
+    CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
+    CHANGE_ENTRY_PHRASE_PART_BYTES, ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES,
+    LABEL_CHANGE_PHRASE, MAX_EARLIER_SECRETS, SEALED_SECRET_BYTES,
 };
 
 use crate::aes_gcm::{item_decrypt, item_encrypt};
@@ -284,6 +284,47 @@ pub fn build(
         &bound_to(LABEL_CHANGE_PHRASE, number, phrase_key),
     )?);
     Ok(content)
+}
+
+/// The change entry of `statement`, as the entry of the phrase's channel
+/// that carries it (decision 2026-10-04 §2.2, §4.6): its content is what
+/// [`build`] makes, its author is the phrase's key, and its revision is
+/// the statement's number. It is signed by the phrase's key and by the
+/// key of the phrase's channel, as every entry is by its author and its
+/// channel, so only what was given the phrase can make one.
+///
+/// The channel holds this one entry, in the slot of one name
+/// (`CHANGE_ENTRY_NAME`): each statement's entry takes the place of the
+/// one before it.
+///
+/// Refused: a statement under another phrase than `phrase`, and whatever
+/// [`build`] refuses.
+pub fn entry_of(
+    phrase: &crate::phrase::Phrase,
+    statement: &SignedStatement,
+    for_phrase: &ForPhrase,
+) -> Result<crate::entry::Entry, ChangeEntryError> {
+    let author = phrase.signing_key().map_err(crypto)?;
+    if statement.statement.phrase_key != author.public_key() {
+        return Err(ChangeEntryError::AnotherPhrase);
+    }
+    let content = build(
+        statement,
+        for_phrase,
+        &phrase.statement_key().map_err(crypto)?,
+        &phrase.seal_key().map_err(crypto)?,
+    )?;
+    let channel = phrase.channel_secret().map_err(crypto)?;
+    let channel_key = crate::derive::signing_key(&channel).map_err(crypto)?;
+    let slot_key = crate::derive::slot_key(&channel).map_err(crypto)?;
+    Ok(crate::entry::signed(
+        &channel_key,
+        &author,
+        crate::slots::slot_id(&slot_key, CHANGE_ENTRY_NAME),
+        statement.statement.number,
+        false,
+        content,
+    ))
 }
 
 /// Open the part of a change entry for the devices as far as its
@@ -1711,5 +1752,83 @@ mod tests {
         let printed = format!("{read:?}");
         assert!(printed.contains("secret: Opened(..)"), "{printed}");
         assert!(!printed.contains("156, 156, 156"), "{printed}");
+    }
+
+    // ── The entry that carries it ────────────────────────────────────
+
+    /// The change entry is an entry of the phrase's channel: its author is
+    /// the phrase's key, its revision the statement's number, and both of
+    /// its signatures hold, so that a relay stores it with no key.
+    #[test]
+    fn the_change_entry_is_an_entry_of_the_phrases_channel() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [one, two, ..] = statements(&phrase);
+        let channel = phrase.channel_secret().unwrap();
+
+        let made = entry_of(&phrase, &signed(&two, &phrase), &for_phrase_of(2)).unwrap();
+        assert_eq!(made.channel, derive::channel_id(&channel).unwrap());
+        assert_eq!(made.author, keys.phrase_key);
+        assert_eq!(made.rev, 2);
+        assert!(!made.delete);
+        assert_eq!(made.content.len(), CHANGE_ENTRY_BYTES);
+        // Its slot is the slot of its one name, under the channel's slot
+        // key.
+        assert_eq!(
+            made.slot,
+            crate::slots::slot_id(&derive::slot_key(&channel).unwrap(), "change")
+        );
+
+        // It passes the check that needs no key, and a device that the
+        // statement lists opens it.
+        let checked = made.clone().check().unwrap();
+        let opened = opened_by(&checked.content, checked.rev, &keys, 1);
+        assert_eq!(opened.statement, signed(&two, &phrase));
+        assert_eq!(opened.secret, DeviceSecret::Opened(secret(2)));
+        // The phrase opens its part.
+        let said = open_for_phrase(&checked.content, 2, &keys.phrase_key, &keys.seal_key).unwrap();
+        assert_eq!(said, for_phrase_of(2));
+
+        // Each statement's entry is in the one slot of the one channel, at
+        // its statement's number: it takes the place of the one before.
+        let before = entry_of(&phrase, &signed(&one, &phrase), &for_phrase_of(1)).unwrap();
+        assert_eq!((before.channel, before.slot), (made.channel, made.slot));
+        assert_eq!((before.author, before.rev), (made.author, 1));
+        assert!(before.check().is_ok());
+
+        // Another phrase's entry is in another channel, by another author.
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let theirs = entry_of(&other, &signed(&first(&other), &other), &for_phrase_of(1)).unwrap();
+        assert_ne!(theirs.channel, made.channel);
+        assert_ne!(theirs.author, made.author);
+        assert_ne!(theirs.slot, made.slot);
+    }
+
+    /// Only the phrase that signed a statement makes its entry: a
+    /// statement under another phrase is refused, and so is whatever no
+    /// content is made from.
+    #[test]
+    fn a_change_entry_is_not_made_for_another_phrases_statement() {
+        let phrase = phrase();
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let theirs = signed(&first(&other), &other);
+        assert_eq!(
+            entry_of(&phrase, &theirs, &for_phrase_of(1)),
+            Err(ChangeEntryError::AnotherPhrase)
+        );
+        // A secret that the statement does not commit to.
+        let ours = signed(&first(&phrase), &phrase);
+        assert_eq!(
+            entry_of(&phrase, &ours, &ForPhrase::first(secret(2))),
+            Err(ChangeEntryError::SecretNotCommitted)
+        );
+        // A statement that its phrase's key did not sign.
+        let mut forged = ours.clone();
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            entry_of(&phrase, &forged, &for_phrase_of(1)),
+            Err(ChangeEntryError::Statement(StatementError::Signature))
+        );
+        assert!(entry_of(&phrase, &ours, &for_phrase_of(1)).is_ok());
     }
 }

@@ -13,8 +13,10 @@
 //! `docs/reference/step4-test-vectors.json`. Beside them are an entry in
 //! the form such a channel has, with its seal, its two signatures and its
 //! chain ([`entry`]), and how a slot's current version is read
-//! ([`version`]).
+//! ([`version`]); and, for a device that is added, the record of its
+//! addition ([`addition`]) and what it is handed ([`hand_over`]).
 
+pub mod addition;
 pub mod aes_gcm;
 pub mod bech32;
 pub mod change_entry;
@@ -22,6 +24,7 @@ pub mod channel_state;
 pub mod derive;
 pub mod ecies;
 pub mod entry;
+pub mod hand_over;
 pub mod identity;
 pub mod phrase;
 pub mod psk_envelope;

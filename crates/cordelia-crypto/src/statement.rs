@@ -196,6 +196,18 @@ pub enum Judgement {
     NotListed,
 }
 
+/// A new person secret (decision 2026-10-04 §3): 32 bytes from the system's
+/// random numbers. It is never derived from the phrase: if it were, a
+/// device that was removed could work out the next one.
+pub fn new_secret() -> Result<[u8; 32], crate::CryptoError> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut secret = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut secret)
+        .map_err(|_| crate::CryptoError::KeyDerivationFailed("RNG failure".into()))?;
+    Ok(secret)
+}
+
 /// The commitment to `secret`: SHA-256 of the commitment's label and the
 /// secret. It says nothing of the channels that are derived from the
 /// secret, which a hash of them would.
@@ -1467,6 +1479,23 @@ mod tests {
         let mut nearly = secret(1);
         nearly[31] ^= 1;
         assert!(!one.commits_to(&nearly));
+    }
+
+    /// A new secret is 32 random bytes, another each time, and a statement
+    /// commits to it as to any secret.
+    #[test]
+    fn a_new_secret_is_made_from_random_numbers() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let secret = new_secret().unwrap();
+            assert!(seen.insert(secret), "the same secret twice");
+            assert_ne!(secret, [0u8; 32]);
+        }
+        let secret = new_secret().unwrap();
+        let phrase = phrase();
+        let one = Statement::first(device(0), &secret, phrase.public_key().unwrap()).unwrap();
+        assert!(one.commits_to(&secret));
+        assert!(!one.commits_to(&new_secret().unwrap()));
     }
 
     /// The phrase's key signs the statement's label and its form. The

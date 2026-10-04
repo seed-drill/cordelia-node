@@ -1058,8 +1058,84 @@ pub const LABEL_ENTRY_CHANNEL: &[u8] = b"cordelia v2 channel";
 /// (decision 2026-10-04 §2.3).
 pub const LABEL_ENTRY_CONTENT: &[u8] = b"cordelia v2 content";
 
+/// The label a record of an addition is signed under: the device that adds
+/// signs this label and the record's canonical form (decision 2026-10-04
+/// §6).
+pub const LABEL_ADDITION: &[u8] = b"cordelia v2 addition";
+
+/// The most a record of an addition takes in its canonical form, with its
+/// signature (decision 2026-10-04 §6).
+/// Derived from the widths of the form: the new device's key, its label
+/// behind its length, the time, the number and the hash of the statement
+/// it is made under, the key of the device that adds, and the signature.
+pub const MAX_ADDITION_BYTES: usize =
+    32 + 2 + MAX_DEVICE_LABEL_BYTES + 8 + 8 + STATEMENT_HASH_BYTES + 32 + 64;
+
+/// The name whose slot the change entry is in, in the phrase's channel
+/// (decision 2026-10-04 §2.2, §4.6). The channel holds that one entry. Its
+/// content is the two sealed parts of a change entry and holds no name:
+/// the name gives the slot, under the channel's slot key, and nothing
+/// else.
+pub const CHANGE_ENTRY_NAME: &str = "change";
+
+/// The name of the entry in a pair channel that hands a device what it
+/// needs when it is added (decision 2026-10-04 §2.2, §6). Nothing else in
+/// a pair channel is read.
+pub const HAND_OVER_NAME: &str = "hand-over";
+
+/// The most records of additions a hand-over carries (decision 2026-10-04
+/// §6): the record of the addition, and the record of the adder's own
+/// addition. A chain of additions is two long at most.
+pub const MAX_HAND_OVER_RECORDS: usize = 2;
+
+/// What a hand-over takes for the change entry it carries: the channel's
+/// ID, the slot, the two signatures, and the content at its one size. The
+/// entry's author and its revision are the statement's phrase key and
+/// number, and are not written twice.
+pub const HAND_OVER_CHANGE_ENTRY_BYTES: usize = 32 + 32 + 64 + 64 + CHANGE_ENTRY_BYTES;
+
+/// The most a hand-over takes (decision 2026-10-04 §6): the statement
+/// behind its length, the secret, the statement key, the change entry, a
+/// count of records, and each record behind its length.
+pub const MAX_HAND_OVER_BYTES: usize = 2
+    + MAX_STATEMENT_BYTES
+    + 32
+    + 32
+    + HAND_OVER_CHANGE_ENTRY_BYTES
+    + 1
+    + MAX_HAND_OVER_RECORDS * (2 + MAX_ADDITION_BYTES);
+
+// Checked at compile time: at every bound together a hand-over, with its
+// name, is within what one entry may hold. It is the value of one entry.
+const _: () = assert!(HAND_OVER_NAME.len() + MAX_HAND_OVER_BYTES <= MAX_ENTRY_NAME_AND_VALUE_BYTES);
+
+/// The most devices a reader counts in all (decision 2026-10-04 §6): those
+/// of the statement it has applied, and those added since in the order it
+/// saw their records. A record beyond that is kept as not counted, and a
+/// statement makes room.
+/// Derived: what a statement may list, so that the next statement can list
+/// every device that counts.
+pub const MAX_COUNTED_DEVICES: usize = MAX_STATEMENT_DEVICES;
+
+/// How long a device keeps the secret of a generation it left (decision
+/// 2026-10-04 §3): 90 days by its own clock, and then the secret is
+/// forgotten. It is for a carry that a person asks for.
+pub const LEFT_SECRET_KEPT_DAYS: u32 = 90;
+
+/// The first part of the name, in the personal channel, of a device's word
+/// that it has applied a statement (decision 2026-10-04 §8). The device's
+/// key follows it, as a device's key is written: each device has a slot of
+/// its own, and only its own entry there is its word.
+pub const PERSONAL_APPLIED_PREFIX: &str = "applied/";
+
+/// The first part of the name, in the personal channel, of a record of an
+/// addition (decision 2026-10-04 §6). Records are not carried to the next
+/// statement's personal channel: the next statement's own list is what
+/// stands (§7.3).
+pub const PERSONAL_ADDED_PREFIX: &str = "added/";
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 18] = [
+pub const LABELS: [&[u8]; 19] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1078,6 +1154,7 @@ pub const LABELS: [&[u8]; 18] = [
     LABEL_ENTRY_AUTHOR,
     LABEL_ENTRY_CHANNEL,
     LABEL_ENTRY_CONTENT,
+    LABEL_ADDITION,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -1612,5 +1689,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The record of an addition, and the hand-over that carries it: at
+    /// every bound together a hand-over is 54,267 bytes, and with its name
+    /// it is within the 61,440 that one entry may hold.
+    #[test]
+    fn test_adding_a_device_decision_2026_10_04_6() {
+        assert_eq!(LABEL_ADDITION, b"cordelia v2 addition");
+        // Two keys, a label of 64 bytes behind its length, a time, a
+        // statement's number and hash, and a signature.
+        assert_eq!(MAX_ADDITION_BYTES, 226);
+        assert_eq!(HAND_OVER_NAME, "hand-over");
+        assert_eq!(MAX_HAND_OVER_RECORDS, 2);
+        assert_eq!(HAND_OVER_CHANGE_ENTRY_BYTES, 192 + 32_768);
+        assert_eq!(MAX_HAND_OVER_BYTES, 54_267);
+        assert_eq!(
+            MAX_HAND_OVER_BYTES,
+            2 + MAX_STATEMENT_BYTES + 64 + 192 + CHANGE_ENTRY_BYTES + 1 + 2 * 228
+        );
+        assert_eq!(
+            MAX_ENTRY_NAME_AND_VALUE_BYTES - HAND_OVER_NAME.len() - MAX_HAND_OVER_BYTES,
+            7_164
+        );
+        // A reader counts as many devices as a statement may list.
+        assert_eq!(MAX_COUNTED_DEVICES, 64);
+        assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
+    }
+
+    #[test]
+    fn test_what_a_device_holds_of_its_person_decision_2026_10_04_3() {
+        assert_eq!(LEFT_SECRET_KEPT_DAYS, 90);
+        assert_eq!(CHANGE_ENTRY_NAME, "change");
+        // The two kinds of entry in the personal channel that are not
+        // carried: neither name begins the other.
+        assert_eq!(PERSONAL_APPLIED_PREFIX, "applied/");
+        assert_eq!(PERSONAL_ADDED_PREFIX, "added/");
+        assert!(!PERSONAL_APPLIED_PREFIX.starts_with(PERSONAL_ADDED_PREFIX));
+        assert!(!PERSONAL_ADDED_PREFIX.starts_with(PERSONAL_APPLIED_PREFIX));
     }
 }
