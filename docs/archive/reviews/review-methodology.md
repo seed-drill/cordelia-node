@@ -398,7 +398,7 @@ This document (`specs/review-methodology.md`) travels with the specs. Each proje
 
 ### New Passes: Compliance + Data Model (2026-03-12)
 
-**Passes added**: 13 (Compliance & Regulatory Alignment), 14 (Data Model Consistency). Contributed by OSA Claude (AdaVault context), refined with GDPR/UK DPA specificity, canonical data model fallback, and Internal API column for Pass 14.
+**Passes added**: 13 (Compliance & Regulatory Alignment), 14 (Data Model Consistency). Contributed from the review practice of another project, refined with GDPR/UK DPA specificity, canonical data model fallback, and Internal API column for Pass 14.
 
 **Specs reviewed**: All 7 (ecies-envelope-encryption.md, channels-api.md, channel-naming.md, sdk-api-reference.md, network-protocol.md, operations.md, memory-model.md)
 

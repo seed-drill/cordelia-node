@@ -21,7 +21,9 @@ never shared with another person. It is encrypted on the device
 that wrote it and travels through relays that store only ciphertext and hold no
 keys. Each device has its own key and is added or removed individually. A
 project's memory follows the project, matched by its git remote, not by where it
-sits on disk. Concurrent edits never silently lose work.
+sits on disk. When two devices edit the same memory, both versions are kept
+(the known exceptions are in section 9 of the decision record,
+`docs/decisions/2026-09-30-agent-memory-sync.md`).
 
 Version 1 does this for Claude Code's memory. This paper describes what v1 is,
 how it works, and what it promises; it makes no claim beyond what is built.
@@ -45,17 +47,17 @@ break that memory in practice:
    files but do not understand projects, concurrent edits, or who may read what.
 
 What is needed is small and specific: memory that belongs to the person, is
-matched by project, stays encrypted end to end, survives machines being off,
-and can be shared deliberately.
+matched by project, stays encrypted end to end, and survives machines being
+off.
 
 ## 2. What Cordelia does
 
 ```
-MacBook                               iMac
+Laptop                                Desktop
 $ cordelia init                       $ cordelia init
                                       $ cordelia id
                                         cordelia_pk1...    (copy this)
-$ cordelia add-device cordelia_pk1... --name imac
+$ cordelia add-device cordelia_pk1... --name desktop
     On the other device, run:
     cordelia accept cordelia_pk1...  (copy this back)
                                       $ cordelia accept cordelia_pk1...
@@ -75,7 +77,8 @@ After that:
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
-  (`MEMORY.md`) is merged line by line instead.
+  (`MEMORY.md`) is merged line by line instead. (Section 9 of the decision
+  record lists the cases where one of the two is not kept.)
 - `cordelia sync status` lists what was found on the machine and is not
   syncing, with the command that maps it, and what the person's other
   devices sync. `cordelia sync claude --all` syncs everything found instead.
@@ -104,8 +107,8 @@ A node applies an invitation only from a key it **trusts**:
   screens to the other, in each direction, so each device has been told by its
   owner which key is which.
 - **Through the personal channel**: every member of a person's personal channel
-  is one of their devices, so a third device added from the MacBook is trusted
-  by the iMac without another `accept`.
+  is one of their devices, so a third device added from any one of them is
+  trusted by the others without another `accept`.
 
 Anything else waits in `cordelia invites` until accepted (capped at 100,
 oldest dropped first; nothing a person's own devices sent is dropped to make
@@ -162,8 +165,10 @@ A memory file is edited, not appended to, so memory uses **replaceable items**:
 - **Slot**: `HMAC-SHA256(slot_key, "cordelia:slot:v1:" || key)`, where the key is
   the file's name within its folder. Relays can tell that two items are
   revisions of the same file without learning the file's name.
-- **Revision**: one more than the highest revision the writer has seen for the
-  slot. No wall clocks are involved, so clock skew between machines does no
+- **Revision**: one more than the highest revision the writer holds for the
+  slot among the items of the channel's members. (Items published again when
+  a device is removed are numbered as section 4.1 of the decision record
+  says.) No wall clocks are involved, so clock skew between machines does no
   harm.
 - **Binding**: the slot and revision are both signed and bound into the AES-GCM
   associated data (`channel_id || slot || rev`), so an item cannot be moved to
@@ -177,8 +182,11 @@ never evict a member's item.
 Readers resolve each slot from items that are signed, authored by an active
 member, decrypt under the key version they claim, and carry a key that maps back
 to their slot. The highest revision wins; ties go to the higher content hash, so
-every device picks the same winner. Other items at the winning revision are
-concurrent edits and are reported as conflicts rather than dropped.
+every device that counts the same items picks the same winner. Other items at
+the winning revision are concurrent edits and are reported as conflicts rather
+than dropped. An item at a lower revision is not reported, though it too may
+have been written without sight of the winner (section 9 of the decision
+record).
 
 **Deleting** a memory publishes a tombstone revision, which replicates like any
 other. When a key's newest revision is a tombstone older than 90 days, every node
@@ -237,7 +245,7 @@ Two mechanisms carry items between them:
    - The name is what devices share. A repository's name defaults to its
      normalised git remote (lower-cased host and path, without scheme,
      credentials, port, or `.git`); any other folder is given one; home memory
-     is `~` and has to be asked for by name.
+     syncs as `~` unless it is given another name, and has to be asked for.
    - Each name has its own channel, found in a map held in the personal
      channel. The first device to sync a name creates its channel, owned by it
      alone. Another of the person's devices joins only when it maps the name
@@ -262,7 +270,10 @@ Two mechanisms carry items between them:
    changed is taken. If both changed, the channel's version goes in the file and
    this device's version is kept as a conflict file. An edit beats a delete,
    whichever side made it. `MEMORY.md` is merged: the union of both versions'
-   lines, minus pointers to deleted files.
+   lines, minus pointers to deleted files. (Whether the channel's version
+   follows this device's is judged by its revision number alone; section 9 of
+   the decision record says where that takes one side without keeping the
+   other.)
 3. **Apply safely.** Files are written atomically (a temporary file, then a
    rename, which never writes through a symlink). Only plain file names are
    accepted from other devices: no separators, no `..`, no hidden files. Before
@@ -331,9 +342,11 @@ alpha pre-releases are published.
 **Next:**
 
 - **Channels shared between people,** carrying what is shared on purpose:
-  messages between agents first, then skills and secrets. They will not carry
-  memory. An agent reads its memory as its own notes, so memory stays with one
-  person and moves only between that person's devices (decision record §4.7).
+  messages between agents first, then secrets. They will not carry memory. An
+  agent reads its memory as its own notes, so memory stays with one person and
+  moves only between that person's devices (decision record §4.7). Skills that
+  people share travel in a repository, where a change is reviewed, and not in
+  a channel.
 - **More adapters**, starting with a second coding agent, so memory survives a
   change of agent as well as a change of machine.
 - **More relays, run by others.** Anyone can run one; the configuration lists
