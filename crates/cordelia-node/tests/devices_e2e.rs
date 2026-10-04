@@ -1769,3 +1769,95 @@ fn home_memory_syncs_under_any_name() {
     );
     assert_eq!(mapped_names(&state(&a)), ["team"]);
 }
+
+/// One edit on one machine against two on the other, made while the two
+/// cannot reach each other (#79). The second of the two is at a higher
+/// revision than the one, and its entry does not say that it was written
+/// after it. Both machines end with the later text in the file, as they
+/// always did, and with the one edit in a conflict file beside it, where
+/// it used to be in no file on either.
+#[test]
+fn an_edit_overtaken_while_apart_is_kept_on_both_machines() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut a = node("a", "personal", Some(relay.p2p));
+    let mut b = node("b", "personal", Some(relay.p2p));
+    a.start();
+    b.start();
+    for n in [&a, &b] {
+        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
+        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
+            has_hot_peer(n)
+        });
+    }
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
+    let a_mem = claude_folder(&a.home(), &a.home());
+    let b_mem = claude_folder(&b.home(), &b.home());
+
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    for n in [&a, &b] {
+        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        n.cli(&["sync", "map", &path(&n.home()), "--home"]);
+    }
+    std::fs::write(a_mem.join("notes.md"), "base\n").unwrap();
+    wait_for("b has the file", &[&relay, &a, &b], 120, || {
+        (read(&b_mem.join("notes.md")).as_deref() == Some("base\n")).then_some(())
+    });
+
+    // The machines are apart: the relay, which is how they meet, is down.
+    relay.stop();
+    // When home memory was last published from a machine: `Some(None)` if
+    // it never was, and `None` if this reading says nothing (a status
+    // that could not ask the node has no folders in it). Each edit is
+    // waited for, so that two edits are two revisions; and a reading that
+    // says nothing is not taken for a change, or the wait would end before
+    // the edit was published and two edits could be one revision.
+    let published = |n: &Node| -> Option<Option<String>> {
+        let state: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).ok()?;
+        let projects = state["sync"]["projects"].as_array()?.clone();
+        let home = projects.into_iter().find(|p| p["project"] == "~")?;
+        Some(home["last_published_at"].as_str().map(String::from))
+    };
+    let edit = |n: &Node, mem: &std::path::Path, text: &str| {
+        let before = wait_for("when it last published", &[&a, &b], 60, || published(n));
+        std::fs::write(mem.join("notes.md"), text).unwrap();
+        wait_for("the edit is published", &[&a, &b], 60, || {
+            published(n)
+                .filter(|now| now.is_some() && *now != before)
+                .map(|_| ())
+        });
+    };
+    edit(&b, &b_mem, "from b\n");
+    edit(&a, &a_mem, "from a, one\n");
+    edit(&a, &a_mem, "from a, two\n");
+
+    // They meet again.
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let copies = |mem: &std::path::Path| -> Vec<String> {
+        let mut texts: Vec<String> = std::fs::read_dir(mem)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("notes.conflict-"))
+            .filter_map(|name| read(&mem.join(name)))
+            .collect();
+        texts.sort();
+        texts
+    };
+    wait_for(
+        "both have the later text, and the edit it overtook beside it",
+        &[&relay, &a, &b],
+        180,
+        || {
+            [&a_mem, &b_mem]
+                .iter()
+                .all(|mem| {
+                    read(&mem.join("notes.md")).as_deref() == Some("from a, two\n")
+                        && copies(mem) == ["from b\n"]
+                })
+                .then_some(())
+        },
+    );
+}

@@ -63,6 +63,7 @@ impl Node {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             },
         )
         .unwrap()
@@ -353,6 +354,7 @@ fn t03_an_entry_over_the_size_limit_is_not_written() {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             },
         )
     };
@@ -390,6 +392,7 @@ fn delete(n: &Node, channel: &str, key: &str) -> u64 {
             metadata: None,
             item_type: "memory",
             deleted: true,
+            after: None,
         },
     )
     .unwrap()
@@ -421,6 +424,82 @@ fn join(owner: &Node, new: &Node, others: &[&Node]) {
         relay(owner, other, &naming::inbox_channel_id(&other.pk()));
         membership::process_inbox(&other.state).unwrap();
     }
+}
+
+/// What an entry says it was written after is a member of its sealed
+/// content, beside the text. It is there only when the writer puts it
+/// there, for a delete as for a text, and it is read back as written. An
+/// entry with it has the `key`, `content` and `metadata` members it would
+/// have without it, and those are the members that a version which knows
+/// nothing of it takes, by name. And an entry published again when a
+/// device is removed says nothing, whatever the one it takes the place of
+/// said.
+#[test]
+fn what_an_entry_was_written_after_is_carried_only_when_said() {
+    let (a, b, ch) = paired();
+    // The sealed content of the entry by `author` that `n` holds for `key`.
+    let sealed = |n: &Node, key: &str, author: &[u8; 32]| -> serde_json::Value {
+        let db = n.state.db.lock().unwrap();
+        let version = cordelia_storage::channels::get_by_id(&db, &ch)
+            .unwrap()
+            .key_version;
+        let slot = slot_id(&psk::read_slot_key(&n.state.home_dir, &ch).unwrap(), key);
+        let item = items::slot_items(&db, &ch, &slot)
+            .unwrap()
+            .into_iter()
+            .find(|it| it.author_id == author)
+            .unwrap();
+        entries::decrypt(&n.state, version, &item).unwrap()
+    };
+    let said = |n: &Node, key: &str| {
+        let db = n.state.db.lock().unwrap();
+        let entry = entries::current_of(&n.state, &db, &ch, key).unwrap();
+        entry.unwrap().current.after
+    };
+    let publish = |n: &Node, key: &str, after: Option<&serde_json::Value>, deleted: bool| {
+        let db = n.state.db.lock().unwrap();
+        let write = Write {
+            key,
+            content: &json!({ "text": "v" }),
+            metadata: None,
+            item_type: "memory",
+            deleted,
+            after,
+        };
+        entries::publish(&n.state, &db, &ch, &write).unwrap();
+    };
+
+    // Nothing said: no such member at all.
+    a.write(&ch, "plain.md", "v1");
+    assert!(sealed(&a, "plain.md", &a.pk()).get("after").is_none());
+    assert_eq!(said(&a, "plain.md"), None);
+    // `null` is nothing said.
+    publish(&a, "null.md", Some(&serde_json::Value::Null), false);
+    assert_eq!(said(&a, "null.md"), None);
+
+    // Said: it is carried as written, whatever it is, and the members a
+    // version from before reads are what they would be without it.
+    let after = json!({ "of": { "ab": 1 }, "more": [1, 2] });
+    publish(&b, "said.md", Some(&after), false);
+    relay(&b, &a, &ch);
+    assert_eq!(said(&a, "said.md"), Some(after.clone()));
+    let whole = sealed(&a, "said.md", &b.pk());
+    assert_eq!(
+        whole,
+        json!({ "key": "said.md", "content": { "text": "v" }, "metadata": null, "after": after })
+    );
+    // The same for a delete.
+    publish(&b, "said.md", Some(&after), true);
+    relay(&b, &a, &ch);
+    assert_eq!(said(&a, "said.md"), Some(after.clone()));
+    assert_eq!(holds(&a, &ch)[2], ("said.md".to_string(), None, 2, b.pk()));
+
+    // B is removed. What it wrote is published again as A's, and says
+    // nothing.
+    membership::remove_device(&a.state, &b.pk()).unwrap();
+    assert_eq!(holds(&a, &ch)[2], ("said.md".to_string(), None, 2, a.pk()));
+    assert_eq!(said(&a, "said.md"), None);
+    assert!(sealed(&a, "said.md", &a.pk()).get("after").is_none());
 }
 
 /// T16. The channel keeps what a removed device last wrote: the device
@@ -619,6 +698,7 @@ fn deleting_a_key_replicates_and_a_later_write_revives_it() {
                 metadata: None,
                 item_type: "memory",
                 deleted: true,
+                after: None,
             },
         )
         .unwrap()

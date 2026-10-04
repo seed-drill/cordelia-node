@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -277,6 +277,42 @@ CREATE TABLE IF NOT EXISTS state_offers (
 );
 "#;
 
+/// Migration v9: who wrote the entry a folder agreed (decision 2026-09-30
+/// §4.5): a device's 32-byte key, or an empty value for nobody. NULL for a
+/// row from before, until the folder next records that file.
+const MIGRATION_V9: &str = r#"
+ALTER TABLE sync_files ADD COLUMN author BLOB;
+"#;
+
+/// Run `sql` and set the schema version to `version` as one transaction:
+/// both happen, or neither. For a step that cannot be run twice (a column
+/// added), so that a start cut short between the two leaves it to be run
+/// again from the beginning.
+///
+/// The version is read again inside the transaction, and the step is not
+/// run if the database is already at `version`. The node and a command
+/// each open the database for themselves, and two that open it at one
+/// moment both read the version from before: the second would otherwise
+/// run the step a second time, and fail.
+fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), StorageError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = || -> rusqlite::Result<()> {
+        let now: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if now >= version {
+            return Ok(());
+        }
+        conn.execute_batch(sql)?;
+        conn.pragma_update(None, "user_version", version)
+    };
+    match step() {
+        Ok(()) => Ok(conn.execute_batch("COMMIT;")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e.into())
+        }
+    }
+}
+
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
@@ -340,6 +376,11 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         tracing::info!("applying migration v8 (channel states sent, until confirmed)");
         conn.execute_batch(MIGRATION_V8)?;
         conn.pragma_update(None, "user_version", 8)?;
+    }
+
+    if current < 9 {
+        tracing::info!("applying migration v9 (who wrote what a folder agreed)");
+        migrate_in_one(conn, MIGRATION_V9, 9)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -680,5 +721,76 @@ mod tests {
                 [],
             ).unwrap_or_else(|e| panic!("channel_type '{ct}' should be valid: {e}"));
         }
+    }
+
+    /// A database at version 8, as the version before this step leaves
+    /// it, with what a folder had agreed for two files.
+    fn at_v8() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        for sql in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        migrate_v4(&conn).unwrap();
+        for sql in [MIGRATION_V5, MIGRATION_V6, MIGRATION_V7, MIGRATION_V8] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sync_files (folder, channel_id, key, hash, rev)
+             VALUES ('/m', 'grp_a', 'notes.md', X'07', 2), ('/m', 'grp_a', 'gone.md', NULL, 5);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The step to version 9 adds a column, which cannot be done twice. The
+    /// column and the version change together or not at all, so a start
+    /// that fails between the two leaves a database that the next start
+    /// takes from the beginning. The rows are kept, and say nothing of
+    /// the writer.
+    #[test]
+    fn test_v9_adds_the_writer_and_its_version_as_one() {
+        let conn = at_v8();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has_writer = |conn: &Connection| conn.prepare("SELECT author FROM sync_files").is_ok();
+
+        // The column is added, and then something fails before the version
+        // is set.
+        let failing = format!("{MIGRATION_V9} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 9).is_err());
+        assert_eq!(version(&conn), 8);
+        assert!(!has_writer(&conn), "the column goes with the version");
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 9);
+        let rows: Vec<(String, i64, Option<Vec<u8>>)> = conn
+            .prepare("SELECT key, rev, author FROM sync_files ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("gone.md".to_string(), 5, None),
+                ("notes.md".to_string(), 2, None)
+            ]
+        );
+
+        // And a start after that changes nothing.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 9);
+        assert!(has_writer(&conn));
+
+        // Nor does the step itself, asked for again by a process that
+        // read the version before another had run it.
+        migrate_in_one(&conn, MIGRATION_V9, 9).unwrap();
+        assert_eq!(version(&conn), 9);
     }
 }

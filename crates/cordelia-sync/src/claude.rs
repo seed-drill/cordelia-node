@@ -38,9 +38,10 @@ use cordelia_api::state::{AppState, Kept};
 use cordelia_core::CordeliaError;
 use cordelia_storage::{channels, meta, sync_state};
 
+use crate::after::{After, Over};
 use crate::discover::{self, Project};
 use crate::names;
-use crate::plan::{self, Action, Agreed, Content, Remote};
+use crate::plan::{self, Action, Agreed, Content, Remote, Writer};
 
 /// Seconds between sync cycles.
 pub const CYCLE_SECS: u64 = 5;
@@ -843,6 +844,7 @@ fn exchange_names(
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: false,
+                after: None,
             },
         )?;
     }
@@ -901,6 +903,7 @@ fn project_channel(
             metadata: None,
             item_type: ITEM_TYPE,
             deleted: false,
+            after: None,
         },
     )?;
     tracing::info!(%remote, %channel, "mapped project to a new channel");
@@ -1222,29 +1225,44 @@ fn sync_folder(
     sync_folder_with(state, dir, channel, prefix, tag, generation, &Hooks::NONE)
 }
 
-/// The places where a test puts something of its own into a cycle. A
-/// cycle does nothing at any of them.
+/// How one file is planned: [`plan::plan`].
+type Planner =
+    fn(&str, Option<&Content>, Option<&Remote>, Option<&Agreed>, &HashSet<String>) -> Vec<Action>;
+
+/// The places where a test puts something of its own into a cycle.
 struct Hooks<'a> {
+    /// How each file is planned. A test can plan as an earlier version
+    /// did, to compare what the two come to.
+    plan: Planner,
     /// Run once the folder has been listed, and before the cycle looks at
-    /// whether it is still there. A test does what can happen to a folder
-    /// while it is being listed.
+    /// whether it is still there. A cycle does nothing there. A test does
+    /// what can happen to a folder while it is being listed.
     listed: &'a dyn Fn(),
     /// Run once the folder and the channel have been read and before
-    /// anything is done about them. A test does what another device may
-    /// do in that gap.
+    /// anything is done about them. A cycle does nothing there either. A
+    /// test does what another device may do in that gap.
     between: &'a dyn Fn(),
     /// Run each time a file's new text has been flushed, with the file's
     /// name, before the last look at what is there ([`write_atomic`]). A
-    /// test does what an agent may do while a text is flushed.
+    /// cycle does nothing there. A test does what an agent may do while
+    /// a text is flushed.
     flushed: &'a dyn Fn(&str),
+    /// Publish and record as a version did before entries said what they
+    /// were written after: an entry says nothing, and a record says
+    /// nothing of the writer. With the plan of that version, a test has a
+    /// device of that version.
+    says_nothing: bool,
 }
 
 impl Hooks<'_> {
-    /// What a cycle does: nothing at any of them.
+    /// What a cycle does: the plan, nothing at any of the three places,
+    /// and entries that say what they were written after.
     const NONE: Hooks<'static> = Hooks {
+        plan: plan::plan,
         listed: &|| {},
         between: &|| {},
         flushed: &|_| {},
+        says_nothing: false,
     };
 }
 
@@ -1313,12 +1331,14 @@ fn sync_folder_with(
                 Remote {
                     rev: e.current.rev,
                     content,
+                    author: e.current.author,
+                    after: After::read(e.current.after.as_ref(), e.current.rev),
                 },
             );
         }
         let agreed: HashMap<String, Agreed> = sync_state::load(&db, &folder, channel)?
             .into_iter()
-            .map(|(k, (hash, rev))| (k, Agreed { hash, rev }))
+            .map(|(k, (hash, rev, writer))| (k, Agreed { hash, rev, writer }))
             .collect();
         (remote, deleted, taken, agreed)
     };
@@ -1380,7 +1400,7 @@ fn sync_folder_with(
             continue;
         }
         let seen = local.get(key).map(|c| c.hash);
-        let actions = plan::plan(
+        let actions = (hooks.plan)(
             key,
             local.get(key),
             remote.get(key),
@@ -1399,6 +1419,7 @@ fn sync_folder_with(
             agreed: &agreed,
             flushed: hooks.flushed,
             relied: RefCell::new(None),
+            says_nothing: hooks.says_nothing,
         };
         // What was kept beside this file lasts from one cycle to the next
         // only while the file is still planned with a text to keep. Any
@@ -1481,6 +1502,8 @@ struct Ctx<'a> {
     /// found it kept. The file is replaced only while that copy still
     /// holds the text (see `apply`).
     relied: RefCell<Option<(String, [u8; 32])>>,
+    /// See [`Hooks::says_nothing`]: `false` except in a test.
+    says_nothing: bool,
 }
 
 /// Why an action could not be done.
@@ -1710,9 +1733,12 @@ fn record_agreed(
 }
 
 /// Publish `text` under `full_key`, or a delete if there is none, and
-/// return the entry. `None`, with nothing published, if the settings
-/// have changed since the cycle read them, or the channel's version of the
-/// file is not the entry the plan took it to be (`Ctx::planned`).
+/// return the entry, with what a record of it says of its writer: this
+/// device, or nobody where the entry fitted only with nothing said of what
+/// it was written after ([`Remote::writer`]). `None`, with nothing
+/// published, if the settings have changed since the cycle read them, or
+/// the channel's version of the file is not the entry the plan took it to
+/// be (`Ctx::planned`).
 ///
 /// Both are looked at on `db`, and the entry is published on it: the caller
 /// holds the database lock for the whole of this, so neither can change
@@ -1722,13 +1748,14 @@ fn publish_over(
     db: &rusqlite::Connection,
     full_key: &str,
     text: Option<&str>,
-) -> Result<Option<entries::Published>, CordeliaError> {
+) -> Result<Option<(entries::Published, Writer)>, CordeliaError> {
     let Ctx {
         state,
         channel,
         folder,
         generation,
         planned,
+        says_nothing,
         ..
     } = *ctx;
     // Called with the lock held, and `db` is the connection behind it.
@@ -1755,14 +1782,67 @@ fn publish_over(
         return Ok(None);
     }
     let content = text.map_or(Value::Null, |t| Value::String(t.to_string()));
-    let write = Write {
-        key: full_key,
-        content: &content,
-        metadata: None,
-        item_type: ITEM_TYPE,
-        deleted: text.is_none(),
+    let write = |after: Option<&Value>| -> Result<entries::Published, CordeliaError> {
+        let write = Write {
+            key: full_key,
+            content: &content,
+            metadata: None,
+            item_type: ITEM_TYPE,
+            deleted: text.is_none(),
+            after,
+        };
+        entries::publish(state, db, channel, &write)
     };
-    Ok(Some(entries::publish(state, db, channel, &write)?))
+    let said_nothing = |entry| Some((entry, Writer::Nobody));
+    if says_nothing {
+        return write(None).map(said_nothing);
+    }
+    // What the new entry is written after is what the plan read: the
+    // entry just found to be the one it took, or nothing. Not what the
+    // folder remembers, and not whatever other entries this device holds.
+    let over = now
+        .as_ref()
+        .filter(|entry| taken_as_a_version(entry).is_some())
+        .map(|entry| &entry.current);
+    let mut after = written_after(over);
+    loop {
+        match write(Some(&after.to_value())) {
+            // It does not fit with all that it says, so it says less: a
+            // name fewer each time, and then nothing that shows anything,
+            // which a reader takes as not known to follow.
+            Err(CordeliaError::TooLarge { .. }) if after.leave_one_out() => {}
+            Err(CordeliaError::TooLarge { .. }) if after != After::default() => {
+                after = After::default();
+            }
+            // It fits, if at all, only with no such member. A text that
+            // fitted before entries said anything still syncs, and is
+            // taken by its revision.
+            Err(CordeliaError::TooLarge { .. }) => return write(None).map(said_nothing),
+            published => {
+                let me = Writer::Device(state.identity.public_key());
+                return published.map(|entry| Some((entry, me)));
+            }
+        }
+    }
+}
+
+/// What an entry published over `over` (the channel's version of the file,
+/// as the plan read it; `None` for a new file) says it was written after.
+fn written_after(over: Option<&entries::Version>) -> After {
+    let Some(over) = over else {
+        return After::written_over(None);
+    };
+    let said = After::read(over.after.as_ref(), over.rev);
+    let text = match over.content.as_str() {
+        Some(text) if !over.deleted => Some(Content::new(text).hash),
+        _ => None,
+    };
+    After::written_over(Some(&Over {
+        author: over.author,
+        rev: over.rev,
+        text,
+        after: said.as_ref(),
+    }))
 }
 
 /// Apply one action. An error says whether it is this file's or the
@@ -1820,6 +1900,7 @@ fn apply(
         agreed: _,
         flushed: _,
         relied: _,
+        says_nothing,
     } = *ctx;
     let writes_file = matches!(
         action,
@@ -1886,15 +1967,23 @@ fn apply(
     // A publish that is refused for what the entry is (its name's
     // revisions are used up, say) is this file's failure. Any other is
     // the folder's.
-    let publish = |text: Option<&str>| -> Result<Option<entries::Published>, Failure> {
+    let publish = |text: Option<&str>| -> Result<Option<(entries::Published, Writer)>, Failure> {
         let db = lock(state)?;
         publish_over(ctx, &db, &full_key, text).map_err(|e| match e {
             CordeliaError::Validation(why) => Failure::File(why),
             e => Failure::Folder(e),
         })
     };
-    let record = |hash: Option<[u8; 32]>, rev: u64| -> Result<(), CordeliaError> {
-        record_agreed(state, generation, folder, channel, key, (hash, rev))
+    // What is agreed is one entry: its text, its revision, and what a
+    // record says of who wrote it (`Remote::writer`). A device that says
+    // nothing (a test's) records nothing of the writer, as before entries
+    // said anything.
+    let record = |hash: Option<[u8; 32]>, rev: u64, writer: Writer| -> Result<(), CordeliaError> {
+        let writer = match says_nothing {
+            true => Writer::NotRecorded,
+            false => writer,
+        };
+        record_agreed(state, generation, folder, channel, key, (hash, rev, writer))
     };
 
     // An entry holds the file's name beside its text, and the text is
@@ -1908,10 +1997,10 @@ fn apply(
 
     match action {
         Action::Publish(text) => match publish(Some(&text)) {
-            Ok(Some(entry)) => {
+            Ok(Some((entry, writer))) => {
                 report.published += 1;
                 note_published(ctx, key, &text, &entry.item_id);
-                record(Some(Content::new(text).hash), entry.rev)?;
+                record(Some(Content::new(text).hash), entry.rev, writer)?;
             }
             Ok(None) => return Ok(false),
             Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
@@ -1921,22 +2010,22 @@ fn apply(
             Err(e) => return Err(e),
         },
         Action::PublishDelete => {
-            let Some(entry) = publish(None)? else {
+            let Some((entry, writer)) = publish(None)? else {
                 return Ok(false);
             };
             report.published += 1;
-            record(None, entry.rev)?;
+            record(None, entry.rev, writer)?;
         }
-        Action::Pull { text, rev } => {
+        Action::Pull { text, rev, writer } => {
             if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                 deferred();
                 return Ok(false);
             }
             report.pulled += 1;
             forget_kept(ctx, key);
-            record(Some(Content::new(text).hash), rev)?;
+            record(Some(Content::new(text).hash), rev, writer)?;
         }
-        Action::RemoveFile { rev } => {
+        Action::RemoveFile { rev, writer } => {
             match std::fs::remove_file(dir.join(key)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1944,7 +2033,7 @@ fn apply(
             }
             report.pulled += 1;
             forget_kept(ctx, key);
-            record(None, rev)?;
+            record(None, rev, writer)?;
         }
         Action::SaveConflict(text) => {
             // Not kept twice: a conflict file that holds this text and is
@@ -1990,7 +2079,7 @@ fn apply(
             // Published before the file is written: if the merged text does
             // not fit, the file stays as it was.
             match publish(Some(&text)) {
-                Ok(Some(entry)) => {
+                Ok(Some((entry, writer))) => {
                     report.published += 1;
                     if !write_atomic(dir, key, &text, &flushed, &unchanged).map_err(io)? {
                         // Published, and the file was written to meanwhile:
@@ -1999,7 +2088,7 @@ fn apply(
                         return Ok(false);
                     }
                     forget_kept(ctx, key);
-                    record(Some(Content::new(text).hash), entry.rev)?;
+                    record(Some(Content::new(text).hash), entry.rev, writer)?;
                 }
                 Ok(None) => return Ok(false),
                 Err(Failure::Folder(CordeliaError::TooLarge { .. })) => {
@@ -2009,14 +2098,21 @@ fn apply(
                 Err(e) => return Err(e),
             }
         }
-        Action::Record(a) => record(a.hash, a.rev)?,
+        Action::Record(a) => record(a.hash, a.rev, a.writer)?,
     }
     Ok(true)
 }
 
 #[cfg(test)]
+mod sequences;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device that wrote a version of the channel's, where a test
+    /// makes an action by hand and does not look at whose it is.
+    const OTHER: [u8; 32] = [7; 32];
 
     fn state(dir: &Path) -> AppState {
         AppState {
@@ -2065,14 +2161,19 @@ mod tests {
             agreed: &HashMap::new(),
             flushed: &|_| {},
             relied: RefCell::new(None),
+            says_nothing: false,
         };
         let mut report = FolderReport::default();
         for action in [
             Action::Pull {
                 text: "incoming\n".into(),
                 rev: 2,
+                writer: Writer::Device(OTHER),
             },
-            Action::RemoveFile { rev: 2 },
+            Action::RemoveFile {
+                rev: 2,
+                writer: Writer::Device(OTHER),
+            },
             Action::Merge("merged\n".into()),
         ] {
             assert!(!apply(&ctx, "notes.md", seen, action, &mut report).unwrap());
@@ -2092,7 +2193,8 @@ mod tests {
                 now,
                 Action::Pull {
                     text: "incoming\n".into(),
-                    rev: 2
+                    rev: 2,
+                    writer: Writer::Device(OTHER),
                 },
                 &mut report
             )
@@ -2161,16 +2263,21 @@ mod tests {
             agreed: &HashMap::new(),
             flushed: &|_| {},
             relied: RefCell::new(None),
+            says_nothing: false,
         };
         let seen = Some(Content::new("here\n").hash);
         let mut report = FolderReport::default();
         let pull = || Action::Pull {
             text: "from another device\n".into(),
             rev: 2,
+            writer: Writer::Device(OTHER),
         };
         assert!(!apply(&ctx, "new.md", None, pull(), &mut report).unwrap());
         assert!(!apply(&ctx, "kept.md", seen, pull(), &mut report).unwrap());
-        let gone = Action::RemoveFile { rev: 2 };
+        let gone = Action::RemoveFile {
+            rev: 2,
+            writer: Writer::Device(OTHER),
+        };
         assert!(!apply(&ctx, "kept.md", seen, gone, &mut report).unwrap());
         let beside = Action::SaveConflict("this device's\n".into());
         assert!(!apply(&ctx, "kept.md", seen, beside, &mut report).unwrap());
@@ -2195,10 +2302,26 @@ mod tests {
             let all = sync_state::load(&db, elsewhere, &channel).unwrap();
             all.contains_key("late.md")
         };
-        record_agreed(&st, started, elsewhere, &channel, "late.md", (None, 9)).unwrap();
+        record_agreed(
+            &st,
+            started,
+            elsewhere,
+            &channel,
+            "late.md",
+            (None, 9, Writer::NotRecorded),
+        )
+        .unwrap();
         assert!(!agreed(&st));
         let now = st.sync_control.generation();
-        record_agreed(&st, now, elsewhere, &channel, "late.md", (None, 9)).unwrap();
+        record_agreed(
+            &st,
+            now,
+            elsewhere,
+            &channel,
+            "late.md",
+            (None, 9, Writer::NotRecorded),
+        )
+        .unwrap();
         assert!(agreed(&st));
 
         // The next cycle, under the settings as they are now, carries on.
@@ -2272,6 +2395,7 @@ mod tests {
             metadata: None,
             item_type: ITEM_TYPE,
             deleted: false,
+            after: None,
         };
         entries::publish(st, &st.db.lock().unwrap(), channel, &write)
             .unwrap()
@@ -2390,6 +2514,7 @@ mod tests {
                     agreed: &HashMap::new(),
                     flushed: &|_| {},
                     relied: RefCell::new(None),
+                    says_nothing: false,
                 };
                 let seen = current_hash(&mem, key);
                 apply(&ctx, key, seen, action, &mut FolderReport::default()).unwrap()
@@ -2418,6 +2543,7 @@ mod tests {
                     agreed: &HashMap::new(),
                     flushed: &|_| {},
                     relied: RefCell::new(None),
+                    says_nothing: false,
                 };
                 let mut report = FolderReport::default();
                 let done = apply(&ctx, key, None, action.clone(), &mut report).unwrap();
@@ -2677,6 +2803,16 @@ mod tests {
         /// The other device writes `text` under `name` (or deletes it),
         /// having received what `st` holds, and `st` receives it.
         fn other_writes(&self, name: &str, text: Option<&str>) {
+            self.other_puts(name, text, None);
+        }
+
+        /// The same, with a text and with what the entry says it was
+        /// written after.
+        fn other_says(&self, name: &str, text: &str, after: Option<&Value>) {
+            self.other_puts(name, Some(text), after);
+        }
+
+        fn other_puts(&self, name: &str, text: Option<&str>, after: Option<&Value>) {
             deliver(&self.st, &self.other, &self.channel);
             let content = text.map_or(Value::Null, |t| Value::String(t.into()));
             let write = Write {
@@ -2685,6 +2821,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: text.is_none(),
+                after,
             };
             let db = self.other.db.lock().unwrap();
             entries::publish(&self.other, &db, &self.channel, &write).unwrap();
@@ -2796,10 +2933,11 @@ mod tests {
     /// what it held is kept beside it. The other four are published above
     /// the unread entry (a merged index, a file over a delete, an edit, a
     /// delete), and when the key arrives the entry does not count on this
-    /// device. Its author would take what was published, by revision: that
-    /// side is not run here, and the new key is put in place by hand, not
-    /// by a removal. This is behaviour the released version has; the test
-    /// states it, so that it changes on purpose.
+    /// device. Its author takes what was published, by revision, and
+    /// keeps its own text as a conflict file first: that side is run in
+    /// `sequences`. The new key is put in place by hand here, not by a
+    /// removal. What the waiting device does is behaviour the released
+    /// version has; the test states it, so that it changes on purpose.
     #[test]
     fn a_device_that_waits_for_a_key_plans_from_what_it_can_read() {
         use cordelia_storage::psk;
@@ -2934,6 +3072,534 @@ mod tests {
         assert_eq!(p.read(index), Some(merged));
         // No file comes back and no second conflict file is made.
         assert_eq!(files(&p), there);
+    }
+
+    /// What the channel's version of `name` says it was written after, as
+    /// `st` holds it: `None` if it says nothing.
+    fn said(st: &AppState, channel: &str, name: &str) -> Option<Value> {
+        let db = st.db.lock().unwrap();
+        let entry = entries::current_of(st, &db, channel, name).unwrap();
+        entry.expect("an entry").current.after
+    }
+
+    /// `after`, as an entry carries it: the devices named, the text
+    /// published over, and the revision under which nothing is known.
+    fn after(of: &[(&[u8; 32], u64)], over: Option<&str>, below: Option<u64>) -> Value {
+        let mut said = serde_json::Map::new();
+        if !of.is_empty() {
+            let of = of
+                .iter()
+                .map(|(device, rev)| (hex::encode(device), Value::from(*rev)))
+                .collect();
+            said.insert("of".into(), Value::Object(of));
+        }
+        if let Some(text) = over {
+            said.insert("over".into(), hex::encode(Content::new(text).hash).into());
+        }
+        if let Some(below) = below {
+            said.insert("below".into(), below.into());
+        }
+        Value::Object(said)
+    }
+
+    /// What each entry the adapter publishes says it was written after:
+    /// the entry the plan read, and through that entry the ones before it.
+    #[test]
+    fn an_entry_says_what_it_was_written_over() {
+        let p = Pair::new();
+        let me = p.st.identity.public_key();
+        let them = p.other.identity.public_key();
+        let said = |name: &str| said(&p.st, &p.channel, name);
+
+        // A new file: over nothing. It says so, which is not the same as
+        // saying nothing.
+        p.file("mine.md", "one\n");
+        p.cycle();
+        assert_eq!(said("mine.md"), Some(after(&[], None, None)));
+        // An edit of it, over this device's own entry.
+        p.file("mine.md", "two\n");
+        p.cycle();
+        assert_eq!(
+            said("mine.md"),
+            Some(after(&[(&me, 1)], Some("one\n"), None))
+        );
+        // And again: the device is named at its later entry.
+        p.file("mine.md", "three\n");
+        p.cycle();
+        assert_eq!(
+            said("mine.md"),
+            Some(after(&[(&me, 2)], Some("two\n"), None))
+        );
+        // A delete says the same things an edit does.
+        std::fs::remove_file(p.mem.join("mine.md")).unwrap();
+        p.cycle();
+        assert_eq!(
+            said("mine.md"),
+            Some(after(&[(&me, 3)], Some("three\n"), None))
+        );
+        // The file written again, over the delete: there is no text to
+        // name.
+        p.file("mine.md", "back\n");
+        p.cycle();
+        assert_eq!(said("mine.md"), Some(after(&[(&me, 4)], None, None)));
+
+        // Over an entry that says nothing (one from before entries said
+        // anything): it is named, and it and everything below it are left
+        // to their revisions.
+        p.other_writes("theirs.md", Some("one\n"));
+        p.cycle();
+        p.file("theirs.md", "two\n");
+        p.cycle();
+        let over_theirs = after(&[(&them, 1)], Some("one\n"), Some(1));
+        assert_eq!(said("theirs.md"), Some(over_theirs));
+        // Over that one, both are named, and what is left to its revision
+        // is carried on.
+        p.file("theirs.md", "three\n");
+        p.cycle();
+        let then = after(&[(&them, 1), (&me, 2)], Some("two\n"), Some(1));
+        assert_eq!(said("theirs.md"), Some(then));
+
+        // Over an entry that says something that cannot be read: nothing
+        // of what it said is carried on, and nothing is left to its
+        // revision, since it did say something.
+        let odd = serde_json::json!({ "of": "x", "over": 7, "below": "1", "more": true });
+        p.other_says("odd.md", "one\n", Some(&odd));
+        p.cycle();
+        p.file("odd.md", "two\n");
+        p.cycle();
+        assert_eq!(
+            said("odd.md"),
+            Some(after(&[(&them, 1)], Some("one\n"), None))
+        );
+
+        // Over something that is no version of a memory file (not a text,
+        // written through the API under the file's name): over nothing.
+        // The plan read no version there, so the entry names none.
+        deliver(&p.st, &p.other, &p.channel);
+        write(
+            &p.other,
+            &p.channel,
+            "api.md",
+            serde_json::json!({ "not": "a text" }),
+        );
+        deliver(&p.other, &p.st, &p.channel);
+        p.file("api.md", "a text\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(said("api.md"), Some(after(&[], None, None)));
+
+        // A conflict file is a new file: over nothing. And an index merged
+        // with the channel's is over the channel's.
+        let index = crate::memory_md::INDEX_FILE;
+        p.file(index, "- a\n");
+        p.file("both.md", "base\n");
+        assert_eq!(p.cycle().published, 2);
+        p.file("both.md", "mine\n");
+        p.file(index, "- a\n- mine\n");
+        p.other_writes("both.md", Some("theirs\n"));
+        p.other_writes(index, Some("- a\n- theirs\n"));
+        let report = p.cycle();
+        assert_eq!((report.conflicts, report.published), (1, 1), "{report:?}");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(said("both.conflict-abcd.md"), Some(after(&[], None, None)));
+        let merged = after(&[(&them, 2)], Some("- a\n- theirs\n"), Some(2));
+        assert_eq!(said(index), Some(merged));
+    }
+
+    /// What an entry says comes from the entry the plan read, and from
+    /// nothing else this device holds. Here a third device's entry for the
+    /// file is held beside the channel's version, at a lower revision: it
+    /// was never the version this device took, and it is not named.
+    #[test]
+    fn an_entry_names_only_what_it_was_written_over() {
+        let p = Pair::new();
+        let them = p.other.identity.public_key();
+        let third = another_device(&p.st, &p.mem.with_file_name("third"), &p.channel);
+        // The third device writes the file having seen nothing, and so
+        // does the other; then the other writes it again.
+        write(&third, &p.channel, "z.md", Value::String("third\n".into()));
+        p.other_writes("z.md", Some("one\n"));
+        p.other_writes("z.md", Some("two\n"));
+        deliver(&third, &p.st, &p.channel);
+        // This device takes the other's second, and edits it.
+        assert_eq!(p.cycle().pulled, 1);
+        assert_eq!(p.read("z.md").as_deref(), Some("two\n"));
+        p.file("z.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(
+            said(&p.st, &p.channel, "z.md"),
+            Some(after(&[(&them, 2)], Some("two\n"), Some(2)))
+        );
+
+        // The same where the entry held beside the channel's version is
+        // at its own revision. The other device and the third write the
+        // file again, neither with the other's, and this device takes the
+        // one that counts. The one that lost the tie is not named: this
+        // device's entry was not written over it.
+        p.other_writes("z.md", Some("theirs\n"));
+        write_at(&third, &p.channel, "z.md", "the third's\n", 4);
+        deliver(&third, &p.st, &p.channel);
+        let (_, rev, counts) = version(&p.st, &p.channel, "z.md").unwrap();
+        assert_eq!(rev, 4);
+        let winner = match counts.as_str() {
+            "theirs\n" => them,
+            _ => third.identity.public_key(),
+        };
+        assert_eq!(p.cycle().pulled, 1);
+        p.file("z.md", "mine again\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(
+            said(&p.st, &p.channel, "z.md"),
+            Some(after(&[(&winner, 4)], Some(&counts), Some(4)))
+        );
+    }
+
+    /// An entry cannot have been written after an entry at its own
+    /// revision or a higher one, whatever it says, and the adapter reads
+    /// what an entry says against that entry's revision. Here another
+    /// device's entry names this device at the entry's own revision. If
+    /// that were believed it would be known to follow this device's. It
+    /// is not believed, and the name is not carried into what this device
+    /// then writes over that entry.
+    #[test]
+    fn what_an_entry_says_is_read_against_its_own_revision() {
+        let p = Pair::new();
+        let me = p.st.identity.public_key();
+        let them = p.other.identity.public_key();
+        // Named at the revision this device wrote: known to follow, and
+        // nothing is kept.
+        p.file("y.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_says("y.md", "theirs\n", Some(&after(&[(&me, 1)], None, None)));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+
+        // Named at the entry's own revision, 2: this device's text is
+        // kept.
+        p.file("z.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_says("z.md", "theirs\n", Some(&after(&[(&me, 2)], None, None)));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.cycle().published, 1);
+
+        p.file("z.md", "mine again\n");
+        assert_eq!(p.cycle().published, 1);
+        assert_eq!(
+            said(&p.st, &p.channel, "z.md"),
+            Some(after(&[(&them, 2)], Some("theirs\n"), None))
+        );
+    }
+
+    /// A delete is no text to have been written over, whatever it
+    /// carries.
+    #[test]
+    fn a_delete_is_no_text_to_be_written_over() {
+        let p = Pair::new();
+        p.other_writes("z.md", Some("theirs\n"));
+        let db = p.st.db.lock().unwrap();
+        let mut version = entries::current_of(&p.st, &db, &p.channel, "z.md")
+            .unwrap()
+            .unwrap()
+            .current;
+        assert_eq!(
+            written_after(Some(&version)).over,
+            Some(Content::new("theirs\n").hash)
+        );
+        version.deleted = true;
+        assert_eq!(written_after(Some(&version)).over, None);
+    }
+
+    /// An entry that would not fit with all that it says, says less: the
+    /// names with the lowest revisions go first (of two at one revision,
+    /// the higher key), then everything, and last the member itself. A
+    /// text that fitted before entries said anything still syncs.
+    #[test]
+    fn an_entry_that_does_not_fit_says_less() {
+        use cordelia_core::protocol::{ITEM_SEAL_OVERHEAD_BYTES, MAX_ITEM_BYTES};
+        // Three devices that the entry published over names, and what it
+        // was itself published over.
+        let (low, high, late) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        let earlier = after(
+            &[(&low, 1), (&high, 1), (&late, 2)],
+            Some("before\n"),
+            Some(1),
+        );
+        // The text that makes an entry for `name` exactly as large as an
+        // entry may be when it says `saying`.
+        let filling = |name: &str, saying: Option<&Value>| -> String {
+            let mut entry = serde_json::json!({ "key": name, "content": "", "metadata": null });
+            if let Some(saying) = saying {
+                entry["after"] = saying.clone();
+            }
+            let room = MAX_ITEM_BYTES - ITEM_SEAL_OVERHEAD_BYTES;
+            "x".repeat(room - serde_json::to_vec(&entry).unwrap().len())
+        };
+        // This device publishes a text over the other's entry, with just
+        // room to say `fits`, and says exactly that.
+        type Saying<'a> = &'a dyn Fn(&[u8; 32]) -> Value;
+        let published_saying = |fits: Option<Saying>| {
+            let p = Pair::new();
+            let them = p.other.identity.public_key();
+            p.other_writes("f.md", Some("one\n"));
+            p.other_writes("f.md", Some("two\n"));
+            p.other_says("f.md", "three\n", Some(&earlier));
+            assert_eq!(p.cycle().pulled, 1);
+            let fits = fits.map(|fits| fits(&them));
+            let text = filling("f.md", fits.as_ref());
+            p.file("f.md", &text);
+            let report = p.cycle();
+            assert_eq!(report.published, 1, "{:?}", report.too_large);
+            assert_eq!(p.held("f.md").as_deref(), Some(text.as_str()));
+            assert_eq!(said(&p.st, &p.channel, "f.md"), fits);
+            // The record names this device where the entry says anything,
+            // and nobody where it fitted only with nothing said.
+            let folder = p.mem.display().to_string();
+            let db = p.st.db.lock().unwrap();
+            let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
+            let writer = match fits {
+                Some(_) => Writer::Device(p.st.identity.public_key()),
+                None => Writer::Nobody,
+            };
+            assert_eq!(rows["f.md"].2, writer);
+        };
+        // Everything: its history, with the entry itself joined in.
+        published_saying(Some(&|them| {
+            let all = [(&low, 1), (&high, 1), (&late, 2), (them, 3)];
+            after(&all, Some("three\n"), Some(1))
+        }));
+        // One name fewer: of the two at the lowest revision, the higher key.
+        published_saying(Some(&|them| {
+            after(
+                &[(&low, 1), (&late, 2), (them, 3)],
+                Some("three\n"),
+                Some(1),
+            )
+        }));
+        // Two fewer, three fewer.
+        published_saying(Some(&|them| {
+            after(&[(&late, 2), (them, 3)], Some("three\n"), Some(1))
+        }));
+        published_saying(Some(&|them| after(&[(them, 3)], Some("three\n"), Some(1))));
+        // No names.
+        published_saying(Some(&|_| after(&[], Some("three\n"), Some(1))));
+        // Nothing that shows anything. A reader takes that as not known
+        // to follow, which keeps what it holds.
+        published_saying(Some(&|_| after(&[], None, None)));
+        // Not even that: the entry says nothing at all.
+        published_saying(None);
+    }
+
+    /// What a folder records of a file is one entry: its text, its
+    /// revision, and who wrote it. That is the device that wrote the
+    /// entry, where the entry says what it was written after, and nobody
+    /// where it says nothing. A row from before the writer was kept is
+    /// decided by revision, until a cycle that finds it in step with the
+    /// channel gives it what the channel's version says.
+    #[test]
+    fn a_record_says_who_wrote_the_entry_it_agrees_with() {
+        let p = Pair::new();
+        let me = Writer::Device(p.st.identity.public_key());
+        let them = Writer::Device(p.other.identity.public_key());
+        let mine = p.st.identity.public_key();
+        let folder = p.mem.display().to_string();
+        let writer = |name: &str| -> Writer {
+            let db = p.st.db.lock().unwrap();
+            let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
+            rows[name].2
+        };
+        let no_writers = || {
+            let db = p.st.db.lock().unwrap();
+            db.execute("UPDATE sync_files SET author = NULL", [])
+                .unwrap();
+        };
+        // What an entry published over this device's first entry of a
+        // file says, so that it is known to follow it.
+        let follows = |text: &str| after(&[(&mine, 1)], Some(text), None);
+
+        // Published here: this device.
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            p.file(name, "one\n");
+        }
+        p.cycle();
+        assert_eq!((writer("a.md"), writer("b.md")), (me, me));
+        // Pulled, or removed for a delete: the device that wrote the
+        // channel's version, where that version says something.
+        p.other_says("a.md", "two\n", Some(&follows("one\n")));
+        p.other_puts("b.md", None, Some(&follows("one\n")));
+        // And nobody, where it says nothing.
+        p.other_writes("c.md", Some("two\n"));
+        p.other_writes("d.md", None);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (4, 0), "{report:?}");
+        assert_eq!((writer("a.md"), writer("b.md")), (them, them));
+        assert_eq!(
+            (writer("c.md"), writer("d.md")),
+            (Writer::Nobody, Writer::Nobody)
+        );
+        std::fs::remove_file(p.mem.join("a.md")).unwrap();
+        p.cycle();
+        assert_eq!(writer("a.md"), me);
+        // A merged index is an entry that this device writes: this device.
+        p.file("MEMORY.md", "- mine\n");
+        p.cycle();
+        p.other_writes("MEMORY.md", Some("- theirs\n"));
+        p.file("MEMORY.md", "- mine\n- more\n");
+        let report = p.cycle();
+        assert_eq!((report.published, report.conflicts), (1, 0), "{report:?}");
+        assert_eq!(writer("MEMORY.md"), me);
+
+        // A row with no writer, and a version of the channel's that says
+        // something and shows nothing: taken by its revision, as before,
+        // and nothing is kept.
+        let nothing = after(&[], None, None);
+        p.file("old.md", "one\n");
+        p.file("new.md", "one\n");
+        p.cycle();
+        no_writers();
+        assert_eq!(writer("old.md"), Writer::NotRecorded);
+        p.other_says("old.md", "two\n", Some(&nothing));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+        assert_eq!(writer("old.md"), them);
+
+        // A cycle that has nothing to do for a file gives its row what
+        // the channel's version says of its writer. From then on a
+        // version that is not known to follow it has what the file held
+        // kept first.
+        no_writers();
+        assert_eq!(p.cycle().pulled, 0);
+        assert_eq!(writer("new.md"), me);
+        p.other_says("new.md", "two\n", Some(&nothing));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read("new.conflict-abcd.md").as_deref(), Some("one\n"));
+        assert_eq!(p.read("new.md").as_deref(), Some("two\n"));
+    }
+
+    /// An entry published again when its writer is removed says nothing,
+    /// and carries the key of the device that published it. A folder that
+    /// holds its text records nobody for it. What that device writes
+    /// later, naming itself and not the text's writer, is then not known
+    /// to follow: the text is kept. Recorded as that device's, the later
+    /// entry was taken with nothing kept.
+    ///
+    /// The entries here are made by hand, to show the rule alone: no two
+    /// devices come to them by syncing. The sequences with a removal
+    /// (`a_text_is_kept_through_a_removal`) have the case as it arises.
+    #[test]
+    fn a_text_is_kept_from_what_the_publisher_of_its_entry_writes_later() {
+        let p = Pair::new();
+        let them = p.other.identity.public_key();
+        let folder = p.mem.display().to_string();
+        let writer = |name: &str| -> Writer {
+            let db = p.st.db.lock().unwrap();
+            let rows = sync_state::load(&db, &folder, &p.channel).unwrap();
+            rows[name].2
+        };
+        p.file("notes.md", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        // The other device publishes the same text again, saying
+        // nothing, a revision on. (A node at a removal publishes at the
+        // entry's own revision, and a revision on only where it had lost
+        // a tie to it.)
+        p.other_writes("notes.md", Some("mine\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.published), (0, 0), "{report:?}");
+        assert_eq!(writer("notes.md"), Writer::Nobody);
+        // Its next entry names itself at that revision, over another
+        // text: written from a folder that held something else.
+        let later = after(&[(&them, 2)], Some("something else\n"), None);
+        p.other_says("notes.md", "theirs\n", Some(&later));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("theirs\n"));
+        let kept = p.read("notes.conflict-abcd.md");
+        assert_eq!(kept.as_deref(), Some("mine\n"));
+    }
+
+    /// Where what a file holds was to be kept before a version at a higher
+    /// revision is taken, and cannot be kept, the file is left as it is:
+    /// not written over, and not removed. The text is kept first, and only
+    /// then is the version taken.
+    #[test]
+    fn a_file_that_is_overtaken_is_left_where_its_text_cannot_be_kept() {
+        let p = Pair::new();
+        let unseen = after(&[], None, None);
+        p.file("text.md", "mine\n");
+        p.file("gone.md", "mine too\n");
+        assert_eq!(p.cycle().published, 2);
+        // The other device writes one and deletes the other, and neither
+        // entry shows that this device's text was in front of it.
+        p.other_says("text.md", "theirs\n", Some(&unseen));
+        p.other_puts("gone.md", None, Some(&unseen));
+        // Something is in the way of each copy.
+        let in_the_way: Vec<PathBuf> = ["text.md", "gone.md"]
+            .iter()
+            .map(|name| temporary_name(&names::conflict_name(name, "abcd")))
+            .map(|temporary| p.mem.join(temporary))
+            .collect();
+        for path in &in_the_way {
+            std::fs::create_dir(path).unwrap();
+        }
+        let report = p.cycle();
+        assert_eq!(
+            (report.pulled, report.conflicts, report.failed.len()),
+            (0, 0, 2),
+            "{report:?}"
+        );
+        assert_eq!(p.read("text.md").as_deref(), Some("mine\n"));
+        assert_eq!(p.read("gone.md").as_deref(), Some("mine too\n"));
+
+        // With nothing in the way each text is kept. One file takes the
+        // channel's version, and the other goes.
+        for path in &in_the_way {
+            std::fs::remove_dir(path).unwrap();
+        }
+        let report = p.cycle();
+        assert_eq!(
+            (report.pulled, report.conflicts, report.failed.len()),
+            (2, 2, 0),
+            "{report:?}"
+        );
+        assert_eq!(p.read("text.md").as_deref(), Some("theirs\n"));
+        assert_eq!(p.read("gone.md"), None);
+        assert_eq!(p.read("text.conflict-abcd.md").as_deref(), Some("mine\n"));
+        let kept = p.read("gone.conflict-abcd.md");
+        assert_eq!(kept.as_deref(), Some("mine too\n"));
+    }
+
+    /// A text that is overtaken twice is kept twice. The first copy has
+    /// been to the other device, which deleted it as a conflict that was
+    /// done with, not knowing that the text was back in the file here and
+    /// about to be overtaken again.
+    #[test]
+    fn a_text_overtaken_twice_is_kept_twice() {
+        let p = Pair::new();
+        let (first, second) = ("notes.conflict-abcd", "notes.conflict-abcd-2");
+        let unseen = after(&[], None, None);
+        p.file("notes", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        // The other device writes the file without having had this
+        // device's text in front of it. The text here is kept, and the
+        // copy is published.
+        p.other_says("notes", "theirs\n", Some(&unseen));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read(first).as_deref(), Some("mine\n"));
+        assert_eq!(p.cycle().published, 1);
+
+        // The person puts the text back in the file here. On the other
+        // device, meanwhile, the copy is deleted and the file is written
+        // again, without sight of that.
+        p.file("notes", "mine\n");
+        assert_eq!(p.cycle().published, 1);
+        p.other_says("notes", "theirs again\n", Some(&unseen));
+        p.other_writes(first, None);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (2, 1), "{report:?}");
+        assert_eq!(p.read("notes").as_deref(), Some("theirs again\n"));
+        assert_eq!(p.read(first), None);
+        assert_eq!(p.read(second).as_deref(), Some("mine\n"));
     }
 
     /// One file that fails does not stop the files after it. It is named
@@ -3177,6 +3843,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: true,
+                after: None,
             };
             deliver(&p.st, &p.other, &p.channel);
             entries::publish(&p.other, &p.other.db.lock().unwrap(), &p.channel, &delete).unwrap();
@@ -3222,6 +3889,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: true,
+                after: None,
             };
             deliver(&p.st, &p.other, &p.channel);
             entries::publish(&p.other, &p.other.db.lock().unwrap(), &p.channel, &delete).unwrap();
@@ -3269,6 +3937,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: true,
+                after: None,
             };
             deliver(&p.st, &p.other, &p.channel);
             entries::publish(&p.other, &p.other.db.lock().unwrap(), &p.channel, &delete).unwrap();
@@ -3373,6 +4042,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: true,
+                after: None,
             };
             deliver(&p.st, &p.other, &p.channel);
             entries::publish(&p.other, &p.other.db.lock().unwrap(), &p.channel, &delete).unwrap();
@@ -3415,6 +4085,7 @@ mod tests {
                 metadata: None,
                 item_type: ITEM_TYPE,
                 deleted: true,
+                after: None,
             };
             deliver(&p.st, &p.other, &p.channel);
             entries::publish(&p.other, &p.other.db.lock().unwrap(), &p.channel, &delete).unwrap();
@@ -4146,6 +4817,7 @@ mod tests {
             agreed: &none,
             flushed: &|_| {},
             relied: RefCell::new(None),
+            says_nothing: false,
         };
         let is = |planned, name: &str, text: &str| {
             is_the_copy(&with(planned), "notes.md", name, text).unwrap()
@@ -4218,6 +4890,7 @@ mod tests {
             Agreed {
                 hash: Some(Content::new("mine\n").hash),
                 rev: 1,
+                writer: Writer::NotRecorded,
             },
         )]
         .into();
@@ -4244,7 +4917,7 @@ mod tests {
             &folder,
             &p.channel,
             "notes.md",
-            (None, 1),
+            (None, 1, Writer::NotRecorded),
         )
         .unwrap();
         assert!(!is(version, copy, "mine\n"));
@@ -4285,9 +4958,16 @@ mod tests {
                 Action::Pull {
                     text: "theirs\n".into(),
                     rev: 1,
+                    writer: Writer::Device([9; 32]),
                 },
             ),
-            ("notes.md", Action::RemoveFile { rev: 1 }),
+            (
+                "notes.md",
+                Action::RemoveFile {
+                    rev: 1,
+                    writer: Writer::Device([9; 32]),
+                },
+            ),
             (index, Action::Merge("- [A](a.md) a\n".into())),
         ];
         for (file, action) in replaced {
@@ -4309,6 +4989,7 @@ mod tests {
                 agreed: &none,
                 flushed: &|_| {},
                 relied: RefCell::new(None),
+                says_nothing: false,
             };
             let copy = names::conflict_name(file, "abcd");
             assert_eq!(claim(&ctx, file, &copy, "mine\n").unwrap(), Claim::Taken);
@@ -4935,7 +5616,7 @@ mod tests {
             "/a/memory",
             "grp_x",
             "notes.md",
-            (None, 1),
+            (None, 1, Writer::NotRecorded),
         )
         .unwrap();
         let mine: BTreeSet<String> = ["one".to_string()].into();

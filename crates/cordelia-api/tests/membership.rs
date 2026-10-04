@@ -1552,6 +1552,7 @@ fn t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting() {
                 metadata: None,
                 item_type: "memory",
                 deleted: false,
+                after: None,
             };
             entries::publish(&a.state, &db, &personal, &mine).unwrap();
             channels::add_member(&db, &personal, &nobody, "owner").unwrap();
