@@ -578,6 +578,14 @@ impl From<&relay::Taken> for PushAnswer {
     }
 }
 
+impl From<&relay::Proof> for ChannelProved {
+    fn from(proof: &relay::Proof) -> Self {
+        Self {
+            proved: proof.answer(),
+        }
+    }
+}
+
 impl From<&relay::Page> for EntryPulled {
     fn from(page: &relay::Page) -> Self {
         Self {
@@ -1438,7 +1446,28 @@ mod tests {
     /// not hold, nor a full channel from a full relay.
     #[test]
     fn what_a_relay_did_is_said_as_one_of_the_answers() {
-        use cordelia_storage::relay::{Page, Refused, Shown, Taken};
+        use cordelia_storage::relay::{Page, Proof, Refused, Shown, Taken};
+
+        // A proof: yes only where it holds and the channel is held. A
+        // proof that fails and a channel that is not held are one no.
+        for (found, proved) in [
+            (Proof::Holds { channel_held: true }, true),
+            (
+                Proof::Holds {
+                    channel_held: false,
+                },
+                false,
+            ),
+            (Proof::Fails, false),
+        ] {
+            assert_eq!(ChannelProved::from(&found), ChannelProved { proved });
+        }
+        assert_eq!(
+            encode(&ChannelProved::from(&Proof::Fails)),
+            encode(&ChannelProved::from(&Proof::Holds {
+                channel_held: false
+            }))
+        );
 
         let refusals = [
             (

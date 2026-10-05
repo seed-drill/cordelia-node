@@ -67,7 +67,8 @@
 //!   in that slot, at that revision or a later one.
 //! - **A proof** ([`prove`], §2.4 items 3 and 4): yes or no. The signature
 //!   is checked before the channel is looked up, and a proof that fails
-//!   and a channel that is not held are answered alike.
+//!   and a channel that is not held are answered alike. The caller is
+//!   given the two apart, and may remember a proof that held.
 //! - **A pull** ([`pull`]): a page of a channel's entries, only where the
 //!   caller says the channel was proved on this connection. Without that
 //!   it is answered as for a channel that is not held.
@@ -265,6 +266,36 @@ pub struct Page {
     /// What the entries are counted at together. It counts against the
     /// asker's limits.
     pub cost: u64,
+}
+
+/// What a relay found of a proof that a connection holds a channel's key
+/// ([`prove`]): whether the proof holds, and whether the relay holds the
+/// channel, as two things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proof {
+    /// The proof does not hold. The channel was not looked up.
+    Fails,
+    /// The proof holds: the other end of the connection holds the
+    /// channel's key.
+    Holds {
+        /// Whether the relay holds the channel now.
+        channel_held: bool,
+    },
+}
+
+impl Proof {
+    /// Whether the proof holds: what the caller may remember with the
+    /// connection, whether or not the channel is held.
+    pub fn holds(self) -> bool {
+        matches!(self, Self::Holds { .. })
+    }
+
+    /// What the other end is told: yes only where the proof holds and the
+    /// relay holds the channel. A no says neither which of the two it
+    /// was.
+    pub fn answer(self) -> bool {
+        self == Self::Holds { channel_held: true }
+    }
 }
 
 /// A channel that a relay holds.
@@ -620,21 +651,34 @@ fn shown(
     }
 }
 
-/// Whether the other end of the connection whose TLS session exports
-/// `session` has proved, with `proof`, that it holds the key of a channel
-/// this relay holds (decision 2026-10-04 §2.4 items 3 and 4). `prover` is
-/// the node key of the peer at the other end, as the connection says it:
-/// a proof says which end made it, and one that this end made is no proof
-/// when the other end sends it back. `now` is the relay's time, in
-/// seconds.
+/// Check the proof that the other end of the connection whose TLS session
+/// exports `session` sent, that it holds the key of `channel` (decision
+/// 2026-10-04 §2.4 items 3 and 4). `prover` is the node key of the peer at
+/// the other end, as the connection says it: a proof says which end made
+/// it, and one that this end made is no proof when the other end sends it
+/// back. `now` is the relay's time, in seconds.
 ///
 /// The signature is checked first, and the channel is looked up only
-/// where it holds. No, for a proof that fails; and no, for a channel that
-/// the relay does not hold: the two are answered alike, so that nobody
+/// where it holds. The caller is given the two apart ([`Proof`]): whether
+/// the proof holds, and, where it does, whether the relay holds the
+/// channel. A proof that holds for a channel the relay holds is use of
+/// the channel.
+///
+/// **What the other end is told** is one thing, [`Proof::answer`]: yes
+/// only where the proof holds and the channel is held. A proof that fails
+/// and a channel that is not held are answered alike, so that nobody
 /// without a channel's key learns whether the relay holds it.
 ///
-/// A yes is for this connection alone: the caller keeps it with the
-/// connection, and says so where it asks for the channel ([`pull`]).
+/// **What the caller may remember** is that the proof held
+/// ([`Proof::holds`]), for this channel, with this connection and for as
+/// long as it lasts, whether or not the relay holds the channel now. A
+/// channel that arrives later is then handed to the connection with no
+/// proof more: the caller says so where the channel is asked for
+/// ([`pull`]). It remembers nothing of a proof that failed, and nothing
+/// beyond the connection: a proof is for the one session it was made
+/// over. Whoever holds a secret can prove its channel, held or not, and
+/// secrets cost nothing to make, so the caller bounds how many channels
+/// it remembers for one connection.
 pub fn prove(
     conn: &Connection,
     channel: &[u8; 32],
@@ -642,11 +686,12 @@ pub fn prove(
     prover: &[u8; 32],
     proof: &[u8; 64],
     now: i64,
-) -> Result<bool, CordeliaError> {
+) -> Result<Proof, CordeliaError> {
     if !proof::check(channel, session, prover, proof) {
-        return Ok(false);
+        return Ok(Proof::Fails);
     }
-    used(conn, channel, now)
+    let channel_held = used(conn, channel, now)?;
+    Ok(Proof::Holds { channel_held })
 }
 
 /// One page of the entries of `channel` that this relay stored after the
@@ -661,9 +706,10 @@ pub fn prove(
 /// counts from the start: a place from before means nothing in it.
 ///
 /// `proved` is whether the channel's key was proved on the connection
-/// that asks ([`prove`]). Where it was not, the answer is the one for a
-/// channel that is not held: no entries, and the place that was asked
-/// after. The store is not looked at.
+/// that asks: a proof that held there ([`Proof::holds`]), also one from
+/// before the relay held the channel. Where it was not, the answer is the
+/// one for a channel that is not held: no entries, and the place that was
+/// asked after. The store is not looked at.
 ///
 /// A page holds at most ENTRY_PAGE_MAX_ENTRIES entries, and at most
 /// ENTRY_PAGE_MAX_BYTES of them as they travel, so that it fits one
@@ -1239,7 +1285,8 @@ mod tests {
             &proof::make(&secret(2), &SESSION, &peer()).unwrap(),
             NOW,
         )
-        .unwrap();
+        .unwrap()
+        .answer();
         assert!(!not_held);
         // The stranger is the peer on its connection, and says so in what
         // it signs.
@@ -1255,7 +1302,9 @@ mod tests {
             [0; 64],
         ] {
             assert_eq!(
-                prove(&conn, &channel(1), &SESSION, &itself, &forged, NOW + 60).unwrap(),
+                prove(&conn, &channel(1), &SESSION, &itself, &forged, NOW + 60)
+                    .unwrap()
+                    .answer(),
                 not_held
             );
         }
@@ -1268,7 +1317,9 @@ mod tests {
             proof::make(&secret(1), &SESSION, &peer()).unwrap(),
         ] {
             assert_eq!(
-                prove(&conn, &channel(1), &SESSION, &itself, &seen, NOW + 60).unwrap(),
+                prove(&conn, &channel(1), &SESSION, &itself, &seen, NOW + 60)
+                    .unwrap()
+                    .answer(),
                 not_held
             );
         }
@@ -1297,7 +1348,11 @@ mod tests {
         assert_eq!(used_at(&conn, 1), Some(NOW));
         // The control: whoever holds the key is handed it.
         let proved = proof::make(&secret(1), &SESSION, &peer()).unwrap();
-        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &proved, NOW + 60).unwrap());
+        assert!(
+            prove(&conn, &channel(1), &SESSION, &peer(), &proved, NOW + 60)
+                .unwrap()
+                .answer()
+        );
         assert_eq!(
             pull(&conn, &channel(1), true, 0, 100).unwrap().entries,
             [held_entry.into_entry()]
@@ -2369,7 +2424,11 @@ mod tests {
         let good = proof::make(&secret(1), &SESSION, &peer()).unwrap();
 
         // The channel's key, on this connection, for a channel it holds.
-        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW + 60).unwrap());
+        assert!(
+            prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW + 60)
+                .unwrap()
+                .answer()
+        );
 
         // A proof for another channel: the holder of channel 2 proves
         // that one, and shows the proof for channel 1.
@@ -2384,6 +2443,7 @@ mod tests {
                 NOW + 60
             )
             .unwrap()
+            .answer()
         );
         assert!(
             !prove(
@@ -2395,14 +2455,23 @@ mod tests {
                 NOW + 120
             )
             .unwrap()
+            .answer()
         );
         // And the proof of channel 1 is none for channel 2.
-        assert!(!prove(&conn, &channel(2), &SESSION, &peer(), &good, NOW + 120).unwrap());
+        assert!(
+            !prove(&conn, &channel(2), &SESSION, &peer(), &good, NOW + 120)
+                .unwrap()
+                .answer()
+        );
 
         // A proof made over another session's value: replayed here from
         // another connection, and from here on another.
         let elsewhere = proof::make(&secret(1), &other_session, &peer()).unwrap();
-        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &elsewhere, NOW + 120).unwrap());
+        assert!(
+            !prove(&conn, &channel(1), &SESSION, &peer(), &elsewhere, NOW + 120)
+                .unwrap()
+                .answer()
+        );
         assert!(
             !prove(
                 &conn,
@@ -2413,6 +2482,7 @@ mod tests {
                 NOW + 120
             )
             .unwrap()
+            .answer()
         );
 
         // A proof says which end made it. One that this end made, over
@@ -2436,15 +2506,55 @@ mod tests {
                 NOW + 120
             )
             .unwrap()
+            .answer()
         );
         let another = device(9).public_key();
-        assert!(!prove(&conn, &channel(1), &SESSION, &another, &good, NOW + 120).unwrap());
+        assert!(
+            !prove(&conn, &channel(1), &SESSION, &another, &good, NOW + 120)
+                .unwrap()
+                .answer()
+        );
+
+        // What the caller is given is two things: whether the proof
+        // holds, and whether the channel is held. What the other end is
+        // told is one: yes only where both are so.
+        let found = |c: u16, proof: &[u8; 64]| {
+            prove(&conn, &channel(c), &SESSION, &peer(), proof, NOW + 60).unwrap()
+        };
+        assert_eq!(found(1, &good), Proof::Holds { channel_held: true });
+        assert_eq!(found(1, &for_another), Proof::Fails);
+        assert_eq!(found(1, &sent_by_this_end), Proof::Fails);
+        assert_eq!(found(1, &[0; 64]), Proof::Fails);
+        let for_none = proof::make(&secret(3), &SESSION, &peer()).unwrap();
+        assert_eq!(
+            found(3, &for_none),
+            Proof::Holds {
+                channel_held: false
+            }
+        );
+        for (proof, holds, told) in [
+            (Proof::Holds { channel_held: true }, true, true),
+            (
+                Proof::Holds {
+                    channel_held: false,
+                },
+                true,
+                false,
+            ),
+            (Proof::Fails, false, false),
+        ] {
+            assert_eq!((proof.holds(), proof.answer()), (holds, told), "{proof:?}");
+        }
 
         // A channel that the relay does not hold, proved as it should be:
         // the same no.
         let not_held = proof::make(&secret(3), &SESSION, &peer()).unwrap();
         assert!(proof::check(&channel(3), &SESSION, &peer(), &not_held));
-        assert!(!prove(&conn, &channel(3), &SESSION, &peer(), &not_held, NOW + 120).unwrap());
+        assert!(
+            !prove(&conn, &channel(3), &SESSION, &peer(), &not_held, NOW + 120)
+                .unwrap()
+                .answer()
+        );
         // And nothing is kept of having been asked.
         assert_eq!(held_channel(&conn, &channel(3)).unwrap(), None);
 
@@ -2456,9 +2566,83 @@ mod tests {
         // nothing to look channels up in, a proof that fails is still
         // answered, and one that holds is not.
         conn.execute_batch("DROP TABLE relay_channels").unwrap();
-        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &for_another, NOW).unwrap());
-        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &[0; 64], NOW).unwrap());
+        assert!(
+            !prove(&conn, &channel(1), &SESSION, &peer(), &for_another, NOW)
+                .unwrap()
+                .answer()
+        );
+        assert!(
+            !prove(&conn, &channel(1), &SESSION, &peer(), &[0; 64], NOW)
+                .unwrap()
+                .answer()
+        );
         assert!(prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW).is_err());
+    }
+
+    /// A proof that held is the caller's to remember, with the connection,
+    /// also for a channel that the relay does not hold: when the channel
+    /// arrives a minute later, the connection is handed it with no proof
+    /// more. A proof that failed is nothing to remember.
+    #[test]
+    fn test_a_proof_that_held_is_remembered_for_a_channel_that_arrives_later() {
+        let (conn, mut room) = relay();
+        let nothing = Page {
+            entries: Vec::new(),
+            next: 0,
+            cost: 0,
+        };
+        let proof = proof::make(&secret(3), &SESSION, &peer()).unwrap();
+
+        // The relay does not hold the channel. The proof holds all the
+        // same, and the caller is given that. The other end is told no.
+        let found = prove(&conn, &channel(3), &SESSION, &peer(), &proof, NOW).unwrap();
+        assert_eq!(
+            found,
+            Proof::Holds {
+                channel_held: false
+            }
+        );
+        assert!(found.holds());
+        assert!(!found.answer());
+        // Nothing is kept in the store of having been asked.
+        assert_eq!(held_channel(&conn, &channel(3)).unwrap(), None);
+        assert_eq!(counted(&conn), 0);
+
+        // The caller remembers that the proof held. Asked for now, the
+        // channel is handed as one that is not held.
+        let proved = found.holds();
+        assert_eq!(pull(&conn, &channel(3), proved, 0, 100).unwrap(), nothing);
+
+        // A minute later the channel arrives, from elsewhere.
+        let entry = small(3, 1, 5);
+        take(&conn, &mut room, &entry, &from(2), NOW + 60).unwrap();
+        // The connection is handed it, on what it proved a minute ago.
+        assert_eq!(
+            pull(&conn, &channel(3), proved, 0, 100).unwrap().entries,
+            [(*entry).clone()]
+        );
+        // The proof was no use of a channel that was not held: the
+        // channel was used when it was taken.
+        assert_eq!(used_at(&conn, 3), Some(NOW + 60));
+
+        // A proof that fails is nothing to remember, also where the
+        // channel is held: this one was made over another session's
+        // value. A connection that has only that is handed nothing.
+        let fails = prove(&conn, &channel(3), &[0x52; 32], &peer(), &proof, NOW + 120).unwrap();
+        assert_eq!(fails, Proof::Fails);
+        assert!(!fails.holds() && !fails.answer());
+        assert_eq!(
+            pull(&conn, &channel(3), fails.holds(), 0, 100).unwrap(),
+            nothing
+        );
+        assert_eq!(used_at(&conn, 3), Some(NOW + 60));
+
+        // Proved again now that it is held: yes, to the caller and to the
+        // other end, and the channel was used.
+        let again = prove(&conn, &channel(3), &SESSION, &peer(), &proof, NOW + 180).unwrap();
+        assert_eq!(again, Proof::Holds { channel_held: true });
+        assert!(again.holds() && again.answer());
+        assert_eq!(used_at(&conn, 3), Some(NOW + 180));
     }
 
     /// A channel is handed in pages, in the order the relay stored its
@@ -2723,7 +2907,11 @@ mod tests {
         );
         // The third: its key is proved.
         let proved = proof::make(&secret(3), &SESSION, &peer()).unwrap();
-        assert!(prove(&conn, &channel(3), &SESSION, &peer(), &proved, yesterday).unwrap());
+        assert!(
+            prove(&conn, &channel(3), &SESSION, &peer(), &proved, yesterday)
+                .unwrap()
+                .answer()
+        );
         // The fourth: an entry is shown that the relay did not hold, and
         // took. It holds it now.
         assert_eq!(
@@ -2736,7 +2924,11 @@ mod tests {
             show(&conn, &mut room, &small(5, 1, 4), &from(1), yesterday).unwrap(),
             Shown::Another { .. }
         ));
-        assert!(!prove(&conn, &channel(5), &SESSION, &peer(), &proved, yesterday).unwrap());
+        assert!(
+            !prove(&conn, &channel(5), &SESSION, &peer(), &proved, yesterday)
+                .unwrap()
+                .answer()
+        );
         // The sixth: an entry is pushed, and stored. Whoever holds an
         // entry can push it: it proves no key, and is no use either.
         assert_eq!(
