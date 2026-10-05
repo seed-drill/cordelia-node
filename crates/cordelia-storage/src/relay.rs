@@ -2485,6 +2485,27 @@ mod tests {
         room.written();
         assert_eq!(made(&room), 7);
         assert_eq!(held(&conn), [0, 1, 2, 3, 4, 5, 8]);
+
+        // A write that counted a channel and then failed, where it could
+        // not be written for good: the channel is counted no more,
+        // whether the write was its own or part of the caller's. What
+        // the writes before it counted stays.
+        room.added_channel(address, NOW + 5);
+        assert_eq!((made(&room), room.not_yet.len()), (8, 1));
+        room.ended(true, 0, false);
+        assert_eq!((made(&room), room.not_yet.len()), (7, 0));
+        room.added_channel(address, NOW + 6);
+        room.added_channel(address, NOW + 7);
+        room.ended(false, 1, false);
+        assert_eq!((made(&room), room.not_yet.len()), (8, 1));
+        assert_eq!(room.new_channels[&address].last(), Some(&(NOW + 6)));
+        // Done, in a write of the caller's: counted, and still under way.
+        room.added_channel(address, NOW + 8);
+        room.ended(false, 1, true);
+        assert_eq!((made(&room), room.not_yet.len()), (9, 2));
+        // Done, in a write of its own: written.
+        room.ended(true, 2, true);
+        assert_eq!((made(&room), room.not_yet.len()), (9, 0));
     }
 
     /// The 257th channel that one address makes a relay take in an hour
