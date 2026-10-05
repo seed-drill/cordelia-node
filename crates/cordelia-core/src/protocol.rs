@@ -1187,6 +1187,26 @@ pub const LABEL_CHANNEL_PROOF: &[u8] = b"cordelia v2 proof";
 /// channel's ID begins is never in doubt.
 pub const SESSION_VALUE_BYTES: usize = 32;
 
+/// The protocol byte of a stream on which a connection shows an entry, and
+/// is answered with what the receiver holds (decision 2026-10-04 §2.4,
+/// item 5). The four streams of entries begin at 0x10, apart from the
+/// eight of the older kind: a peer that does not know them refuses the
+/// stream, and reads none of them as one of its own.
+pub const PROTOCOL_ENTRY_SHOW: u8 = 0x10;
+
+/// The protocol byte of a stream on which a connection proves that it
+/// holds a channel's key (decision 2026-10-04 §2.4, items 3 and 4).
+pub const PROTOCOL_CHANNEL_PROVE: u8 = 0x11;
+
+/// The protocol byte of a stream on which a connection asks for a page of
+/// the entries of a channel it has proved (decision 2026-10-04 §2.4,
+/// item 3).
+pub const PROTOCOL_ENTRY_PULL: u8 = 0x12;
+
+/// The protocol byte of a stream on which a connection sends entries to be
+/// stored (decision 2026-10-04 §2.4, items 1 and 2).
+pub const PROTOCOL_ENTRY_PUSH: u8 = 0x13;
+
 /// The most entries in one page of a channel, as a relay hands it to a
 /// connection that has proved the channel's key (decision 2026-10-04
 /// §2.4, item 3).
@@ -1862,6 +1882,24 @@ mod tests {
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
         assert_eq!(LABELS.len(), 21);
+    }
+
+    /// The four streams of entries have bytes of their own, each another,
+    /// and none of them one of the eight that the older kind has.
+    #[test]
+    fn test_the_streams_of_entries_decision_2026_10_04_2_4() {
+        assert_eq!(PROTOCOL_ENTRY_SHOW, 0x10);
+        assert_eq!(PROTOCOL_CHANNEL_PROVE, 0x11);
+        assert_eq!(PROTOCOL_ENTRY_PULL, 0x12);
+        assert_eq!(PROTOCOL_ENTRY_PUSH, 0x13);
+        for byte in [
+            PROTOCOL_ENTRY_SHOW,
+            PROTOCOL_CHANNEL_PROVE,
+            PROTOCOL_ENTRY_PULL,
+            PROTOCOL_ENTRY_PUSH,
+        ] {
+            assert!(!(0x01..=0x08).contains(&byte), "{byte:#04x}");
+        }
     }
 
     /// A page of a channel's entries: at most 100 of them, and at most
