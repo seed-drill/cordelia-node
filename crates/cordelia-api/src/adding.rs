@@ -389,8 +389,10 @@ fn hand_over_in(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Result<HandOver, NotAccepted>, PersonError> {
-    // A pair channel is read only with a key typed in the last hour.
-    if now < typed_at || now - typed_at >= PAIR_KEY_TYPED_SECS {
+    // A pair channel is read only with a key typed in the last hour. Two
+    // times that are too far apart to subtract are not within an hour.
+    let typed_ago = now.checked_sub(typed_at);
+    if !typed_ago.is_some_and(|ago| (0..PAIR_KEY_TYPED_SECS).contains(&ago)) {
         return Ok(Err(NotAccepted::NotTypedInTheLastHour));
     }
     let pair = match derive::pair_secret(identity, typed) {
@@ -1033,15 +1035,38 @@ mod tests {
         let made = now as u64;
 
         // Typed an hour ago, longer ago, and at a time that is yet to
-        // come.
-        for typed_at in [now - HOUR, now - HOUR - 1, now - 9 * HOUR, now + 1] {
+        // come. And at a time so far from now that the two cannot be
+        // subtracted.
+        for typed_at in [
+            now - HOUR,
+            now - HOUR - 1,
+            now - 9 * HOUR,
+            now + 1,
+            i64::MAX,
+            i64::MIN,
+        ] {
             assert_eq!(
                 refused(&adder_key, typed_at, &added.hand_over),
                 NotAccepted::NotTypedInTheLastHour,
-                "{}",
-                now - typed_at
+                "{typed_at}"
             );
         }
+        // A clock so far back that the time the hand-over was made cannot
+        // be set beside the time the key was typed.
+        let long_ago = accept(
+            &new.conn,
+            &new.identity,
+            &adder_key,
+            i64::MIN + 5,
+            false,
+            &added.hand_over,
+            i64::MIN + 10,
+        );
+        assert_eq!(
+            long_ago.unwrap(),
+            Accepted::Refused(NotAccepted::NotMadeWithinTheHour)
+        );
+        assert_eq!(new.everything(), empty);
         // Another key was typed than the one that signed: the entry is of
         // another pair channel than that key's. And this device's own
         // key, or one that is no key, has none.
