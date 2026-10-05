@@ -26,8 +26,9 @@
 //! entry, and only over what the caller planned against:
 //!
 //! - It is made only where the slot's current version is still the one
-//!   the caller read: the same value at the same revision
-//!   ([`PlannedAgainst`]). Otherwise nothing is written, and it says so.
+//!   the caller read: the same kind of value, with the same bytes, at the
+//!   same revision ([`PlannedAgainst`]). Otherwise nothing is written,
+//!   and it says so.
 //! - Its chain is that of an entry written over one entry of that version
 //!   ([`chain::written_over`]): this device's own where it holds one, and
 //!   otherwise the one whose signer has the lowest key. A merged index is
@@ -59,10 +60,39 @@ use crate::person::{Counting, Held, PersonError, applied_secret, held, in_one};
 pub enum PlannedAgainst {
     /// The slot held no version.
     NoVersion,
-    /// The slot's current version was this one: a value, named by its
-    /// hash ([`value_hash`]), at a revision. Two entries that are one
-    /// version are one here, whichever of them the caller read.
-    Version { rev: u64, hash: [u8; 32] },
+    /// The slot's current version was this one: a value at a revision.
+    /// The value is said by which of the three it is, and by its hash
+    /// ([`value_hash`]). Two entries that are one version are one here,
+    /// whichever of them the caller read.
+    Version {
+        rev: u64,
+        kind: Kind,
+        hash: [u8; 32],
+    },
+}
+
+/// Which of the three a value is. A text and bytes that are no text are
+/// two values though their bytes are the same, and two versions at one
+/// revision: where they tie, the text wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A text: what a file holds.
+    Text,
+    /// Nothing: the name was deleted.
+    Delete,
+    /// Bytes that are not a text.
+    Other,
+}
+
+impl Kind {
+    /// Which of the three `value` is.
+    pub fn of(value: &Value) -> Self {
+        match value {
+            Value::Text(_) => Self::Text,
+            Value::Delete => Self::Delete,
+            Value::Other(_) => Self::Other,
+        }
+    }
 }
 
 impl PlannedAgainst {
@@ -72,17 +102,21 @@ impl PlannedAgainst {
             None => Self::NoVersion,
             Some(version) => Self::Version {
                 rev: version.rev,
+                kind: Kind::of(&version.value),
                 hash: value_hash(&version.value),
             },
         }
     }
 
-    /// Whether `current` is still what was planned against.
+    /// Whether `current` is still what was planned against: the same
+    /// kind of value, with the same bytes, at the same revision.
     fn is_still(&self, current: Option<&Version>) -> bool {
         match (self, current) {
             (Self::NoVersion, None) => true,
-            (Self::Version { rev, hash }, Some(version)) => {
-                version.rev == *rev && value_hash(&version.value) == *hash
+            (Self::Version { rev, kind, hash }, Some(version)) => {
+                version.rev == *rev
+                    && Kind::of(&version.value) == *kind
+                    && value_hash(&version.value) == *hash
             }
             _ => false,
         }
@@ -560,6 +594,7 @@ mod tests {
             on(&s),
             PlannedAgainst::Version {
                 rev: 1,
+                kind: Kind::Text,
                 hash: hash("one")
             }
         );
@@ -568,7 +603,17 @@ mod tests {
             on(&s),
             PlannedAgainst::Version {
                 rev: 2,
+                kind: Kind::Delete,
                 hash: [0u8; 32]
+            }
+        );
+        published(&mut s, 0, "a.md", Value::Other(b"one".to_vec()));
+        assert_eq!(
+            on(&s),
+            PlannedAgainst::Version {
+                rev: 3,
+                kind: Kind::Other,
+                hash: hash("one")
             }
         );
     }
@@ -597,6 +642,7 @@ mod tests {
         };
         let version = |rev: u64, said: &str| PlannedAgainst::Version {
             rev,
+            kind: Kind::Text,
             hash: hash(said),
         };
 
@@ -620,7 +666,20 @@ mod tests {
             version(2, "one"),
             PlannedAgainst::Version {
                 rev: 2,
+                kind: Kind::Delete,
                 hash: [0u8; 32],
+            },
+            // That text's bytes at that revision, as bytes that are no
+            // text, and as a delete.
+            PlannedAgainst::Version {
+                rev: 2,
+                kind: Kind::Other,
+                hash: hash("two"),
+            },
+            PlannedAgainst::Version {
+                rev: 2,
+                kind: Kind::Delete,
+                hash: hash("two"),
             },
         ] {
             assert_eq!(
@@ -711,6 +770,53 @@ mod tests {
             publish(&on.conn, &on.identity, &write, now).unwrap(),
             Published::Changed
         );
+    }
+
+    /// A text and bytes that are no text are two versions though their
+    /// bytes are the same. A caller read the bytes, and a text of those
+    /// very bytes then wins the tie at that revision: what was planned
+    /// against is no longer current, and nothing is written.
+    #[test]
+    fn test_a_text_and_other_bytes_with_the_same_bytes_are_two_versions() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let channel = s[0].own("notes");
+        let bytes = Value::Other(b"the same bytes".to_vec());
+        made(published(&mut s, 0, "a.md", bytes.clone()));
+        let planned = PlannedAgainst::what_is_in(&s[0].slot("notes", "a.md"));
+        let a_text = entry_by(
+            &s[1].identity,
+            &channel,
+            1,
+            "a.md",
+            text("the same bytes"),
+            &[],
+        );
+        holds(&s, 0, &a_text);
+        let slot = s[0].slot("notes", "a.md");
+        assert_eq!(slot.current.unwrap().value, text("the same bytes"));
+        assert_eq!(slot.lost[0].value, bytes);
+
+        let on = &s[0];
+        let write = |planned: PlannedAgainst| Write {
+            name: "notes",
+            file: "a.md",
+            value: text("over what was read"),
+            planned,
+            merge: None,
+        };
+        let before = on.everything();
+        assert_eq!(
+            publish(&on.conn, &on.identity, &write(planned), s.now).unwrap(),
+            Published::Changed
+        );
+        assert_eq!(on.everything(), before);
+        // The control: planned against the text, which is current.
+        let planned = PlannedAgainst::what_is_in(&on.slot("notes", "a.md"));
+        assert!(matches!(
+            publish(&on.conn, &on.identity, &write(planned), s.now).unwrap(),
+            Published::Made(_)
+        ));
     }
 
     /// A device writes over a version from one of its entries: its own

@@ -528,6 +528,7 @@ mod tests {
 
     use crate::change::make_settlement;
     use crate::person::PersonError;
+    use crate::publish::Kind;
     use crate::take::NotTaken;
 
     /// An ordinary entry that the store took.
@@ -655,6 +656,7 @@ mod tests {
             planned,
             PlannedAgainst::Version {
                 rev: 1,
+                kind: Kind::Text,
                 hash: hash("one")
             }
         );
