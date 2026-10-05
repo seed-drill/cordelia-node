@@ -1088,6 +1088,123 @@ mod tests {
         }
     }
 
+    /// What a device that is being added wrote reaches device 1 before the
+    /// record of its addition: its word that it has applied, a file, and
+    /// a record that it signed in its turn. Each is refused, and nothing
+    /// is kept. The record arrives, and the key comes to count: given the
+    /// same entries again, device 1 takes them. It ends with the same
+    /// entries and the same answers as device 2, which was given the
+    /// records first.
+    #[test]
+    fn test_what_arrives_before_the_record_is_taken_when_it_is_given_again() {
+        use crate::person::AdditionSeen;
+        use crate::take::Record;
+        use std::collections::BTreeSet;
+
+        let mut s = Several::new(5);
+        s.make_phrase(0);
+        for new in [1, 2] {
+            assert!(matches!(s.add(0, new), Accepted::Joined(_)));
+        }
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        // Device 0 adds device 3, and device 3 adds device 4. Each writes
+        // that it has applied, and a file.
+        assert!(matches!(s.add(0, 3), Accepted::Joined(_)));
+        s.hold(&[3], "notes");
+        s.write(3, "notes", "a.md", "by device 3");
+        assert!(matches!(s.add(3, 4), Accepted::Joined(_)));
+        s.hold(&[4], "notes");
+        s.write(4, "notes", "b.md", "by device 4");
+
+        const REFUSED: Taken = Taken::Refused(NotTaken::SignerDoesNotCount);
+        let a_record = |came_to_count: usize| Taken::Own {
+            stored: Outcome::Stored,
+            record: Some(Record::Seen(AdditionSeen::Counted)),
+            came_to_count,
+        };
+        let before = s[1].stored();
+
+        // Device 1 is given what device 4 holds: its word, and its file.
+        let taken = s.pass(4, 1);
+        assert_eq!(taken[0], Taken::Shown(Shown::Held));
+        assert_eq!(taken[1..], [REFUSED, REFUSED]);
+        // And what device 3 holds: its word, its file, its record that it
+        // added device 4, and the hand-over, which is of a pair channel.
+        let taken = s.pass(3, 1);
+        assert_eq!(
+            taken[1..],
+            [
+                REFUSED,
+                REFUSED,
+                REFUSED,
+                Taken::Refused(NotTaken::AnotherChannel)
+            ]
+        );
+        // Nothing of it is kept, and neither key counts.
+        assert_eq!(s[1].stored(), before);
+        assert!(!s[1].counts(&s.key(3)) && !s[1].counts(&s.key(4)));
+
+        // The record that device 0 added device 3 arrives: a key came to
+        // count, and the caller gives again what it gave before.
+        let taken = s.pass(0, 1);
+        assert_eq!(taken.iter().filter(|one| **one == a_record(1)).count(), 1);
+        assert!(s[1].counts(&s.key(3)) && !s[1].counts(&s.key(4)));
+        // What device 3 holds, again: its word and its file are stored,
+        // and its record is read. A further key came to count by it.
+        let taken = s.pass(3, 1);
+        assert_eq!(
+            taken[1..],
+            [
+                STORED,
+                STORED,
+                a_record(1),
+                Taken::Refused(NotTaken::AnotherChannel)
+            ]
+        );
+        assert!(s[1].counts(&s.key(4)));
+        // And what device 4 holds, again.
+        let taken = s.pass(4, 1);
+        assert_eq!(taken[1..], [STORED, STORED]);
+
+        // Device 2 is given the records first, and nothing twice.
+        for from in [0, 3, 4] {
+            let taken = s.pass(from, 2);
+            assert!(!taken.contains(&REFUSED), "{from}");
+        }
+
+        // The two hold the same entries, and give the same answers.
+        let entries = |n: usize| -> BTreeSet<[u8; 32]> {
+            s[n].stored().iter().map(|entry| entry.id()).collect()
+        };
+        assert_eq!(entries(1), entries(2));
+        assert_eq!(entries(1).len(), before.len() + 6);
+        let answers = |n: usize| {
+            let on = &s[n];
+            let counting = who_counts(&on.conn).unwrap();
+            let keys: Vec<[u8; 32]> = (0..5).map(|m| s.key(m)).collect();
+            (
+                keys.iter()
+                    .map(|key| counting.counts(key))
+                    .collect::<Vec<_>>(),
+                keys.iter()
+                    .map(|key| counting.may_add(key))
+                    .collect::<Vec<_>>(),
+                keys.iter().map(|key| on.word_of(key)).collect::<Vec<_>>(),
+                on.slot("notes", "a.md"),
+                on.slot("notes", "b.md"),
+            )
+        };
+        assert_eq!(answers(1), answers(2));
+        let (counts, may_add, words, a, b) = answers(1);
+        assert_eq!(counts, [true; 5]);
+        // Device 4 was added by a device added since: it may not add.
+        assert_eq!(may_add, [true, true, true, true, false]);
+        assert_eq!(words, vec![Some(text("1")); 5]);
+        assert_eq!(a.current.unwrap().value, text("by device 3"));
+        assert_eq!(b.current.unwrap().value, text("by device 4"));
+    }
+
     /// Two changes are made apart: one on device 0, one on device 1.
     /// Every device that sees both is in a fork, and neither publishes in
     /// its own channels nor takes from them. The settlement, made on a

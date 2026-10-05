@@ -23,6 +23,23 @@
 //! Each outcome says what it was ([`Taken`]), so that a caller can count
 //! and report. An error is this device's, and not the entry's: its
 //! database could not be read or written, and nothing was changed.
+//!
+//! ## What a caller owes it
+//!
+//! An entry whose signer does not count is refused, and nothing of it is
+//! kept. So what a device that is being added wrote is refused where it
+//! arrives before the record of that device's addition, and so is a
+//! record whose own signer does not count yet. Nothing here remembers
+//! them.
+//!
+//! **Where [`take`] says that a key came to count** (`came_to_count`
+//! above 0 in [`Taken::Own`]), **the caller gives it again every entry of
+//! this device's own channels that it gave before.** What the key that
+//! now counts had signed is then taken, and a record among it may let a
+//! further key count, which is said in its turn. A device that does so
+//! ends with the same entries, and the same answers, as one that was
+//! given the record first. A node does it by listing its channels to its
+//! relays again from the start (§16).
 
 use rusqlite::Connection;
 
@@ -54,6 +71,11 @@ pub enum Taken {
         /// How many keys came to count by it: none for any entry but a
         /// record, and more than one where a record that was kept as not
         /// counted came to count with it.
+        ///
+        /// Above 0, the caller gives [`take`] again every entry of this
+        /// device's own channels that it gave before: what a key that
+        /// now counts had signed was refused when it arrived, and was
+        /// not kept.
         came_to_count: usize,
     },
     /// It is of the phrase's channel: it was shown to the device, which
@@ -114,6 +136,13 @@ pub enum NotRead {
 
 /// Take an entry from outside (see the module's documentation). `entry`
 /// has passed the check that needs no key.
+///
+/// **What the caller owes:** where this returns [`Taken::Own`] with
+/// `came_to_count` above 0, it gives again every entry of this device's
+/// own channels that it gave before. An entry that a key signed before
+/// that key counted was refused here and not kept, whichever arrived
+/// first: the entries of a device that is being added, and a record that
+/// such a device signed.
 pub fn take(
     conn: &Connection,
     identity: &NodeIdentity,
