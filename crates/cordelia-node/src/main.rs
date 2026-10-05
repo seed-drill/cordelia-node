@@ -2212,9 +2212,9 @@ fn api_post_within(
             .as_str()
             .map(|m| m.strip_prefix("bad request: ").unwrap_or(m).to_string())
             .unwrap_or_else(|| format!("HTTP {status}"));
-        // An install leaves the old node running until it is restarted.
-        // A refusal may then mean only that the node is another version
-        // than this command.
+        // A node goes on running the version it was started as until it
+        // is restarted. A refusal may then mean only that the node is
+        // another version than this command.
         let timeout = std::time::Duration::from_secs(3);
         if !VERSION_NOTED.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(node) = local_api(&config, false, "/api/v1/status", timeout)
@@ -2243,10 +2243,11 @@ fn node_version_note(config_path: &str) -> Option<String> {
 
 /// The command that restarts a node which runs as the service that the
 /// install script sets up, on the system named (`std::env::consts::OS`).
+/// The script prints the same one.
 fn restart_command(os: &str) -> &'static str {
     match os {
         "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
-        _ => "systemctl --user restart cordelia",
+        _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
     }
 }
 
@@ -2257,8 +2258,8 @@ fn version_note(node: Option<&str>, own: &str) -> Option<String> {
     // not compared, only found to differ.
     let after = format!(
         "They should be the same: a node goes on running the version it was started as \
-         until it is restarted. Restart it with `{}`, or stop it and start it again \
-         where it does not run as a service.",
+         until it is restarted. Where it runs as the service that the install script \
+         set up, restart it with `{}`; otherwise stop it and start it again.",
         restart_command(std::env::consts::OS)
     );
     match node {
@@ -2438,9 +2439,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
 
-    // An install leaves the old node running until it is restarted. Said
-    // first, and whether or not the command then works: a node of another
-    // version may take a request and mean something else by it.
+    // A node goes on running the version it was started as until it is
+    // restarted. Said first, and whether or not the command then works: a
+    // node of another version may take a request and mean something else
+    // by it.
     if let Some(note) = node_version_note(config_path) {
         eprintln!("{note}\n");
         VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3606,8 +3608,8 @@ mod tests {
         }
     }
 
-    /// An install leaves the old node running. A command says so, beside
-    /// what the node answered, when the node is not the version it is.
+    /// A node can be another version than the command. A command says so,
+    /// beside what the node answered, and says how to restart the node.
     #[test]
     fn test_a_node_of_another_version_is_named() {
         assert_eq!(version_note(Some("0.2.0-alpha.6"), "0.2.0-alpha.6"), None);
@@ -3617,7 +3619,7 @@ mod tests {
         assert!(
             other.contains("node is version 0.2.0-alpha.5")
                 && other.contains("command is version 0.2.0-alpha.6")
-                && other.contains(&format!("Restart it with `{restart}`")),
+                && other.contains(&format!("restart it with `{restart}`")),
             "{other}"
         );
         // A node from before it said its version.
@@ -3625,7 +3627,7 @@ mod tests {
         assert!(
             older.contains("from before nodes said their version")
                 && older.contains("command is version 0.2.0-alpha.6")
-                && older.contains(&format!("Restart it with `{restart}`")),
+                && older.contains(&format!("restart it with `{restart}`")),
             "{older}"
         );
     }
@@ -3636,7 +3638,7 @@ mod tests {
     fn test_the_restart_command_is_the_systems_own() {
         assert_eq!(
             restart_command("linux"),
-            "systemctl --user restart cordelia"
+            "systemctl --user daemon-reload && systemctl --user restart cordelia"
         );
         assert_eq!(
             restart_command("macos"),
