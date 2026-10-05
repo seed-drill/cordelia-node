@@ -2,6 +2,7 @@
 //!
 //! Spec: seed-drill/specs/data-formats.md, seed-drill/specs/channels-api.md
 
+pub mod acts;
 pub mod at_relays;
 pub mod atomic;
 pub mod channels;

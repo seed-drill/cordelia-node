@@ -238,6 +238,22 @@ pub fn set_state(conn: &Connection, state: State) -> Result<(), CordeliaError> {
     Ok(())
 }
 
+/// The device follows no phrase from now on (decision 2026-10-04 §5.2):
+/// the one row goes, and so the phrase it followed and the statement it
+/// had applied. Returns whether it followed one.
+///
+/// What else a device holds of its person is forgotten by the functions
+/// of its own tables: its secrets ([`forget_secrets`]), the change
+/// entries it keeps ([`drop_change_entry`]), its records of additions
+/// ([`clear_additions`]) and what it keeps of its hand-overs
+/// ([`forget_hand_overs`]). The names it holds stay: they are its
+/// folders' names.
+pub fn forget_person(conn: &Connection) -> Result<bool, CordeliaError> {
+    conn.execute("DELETE FROM person", [])
+        .map(|rows| rows > 0)
+        .map_err(storage)
+}
+
 // ── Its secrets ──────────────────────────────────────────────────────
 
 /// Every secret the device holds: the one it has applied first, and then
@@ -774,6 +790,23 @@ mod tests {
         // It has no state to change.
         assert!(set_state(&conn, State::Fork).is_err());
         assert_eq!(person(&conn).unwrap(), None);
+    }
+
+    /// A device that forgets what it follows has no row, and so follows
+    /// no phrase. Its names stay, and so does whatever its other tables
+    /// hold: each is forgotten by a function of its own.
+    #[test]
+    fn test_a_device_that_forgets_what_it_follows_has_no_row_and_keeps_its_names() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(!forget_person(&conn).unwrap());
+        put_person(&conn, &sample(State::Removed)).unwrap();
+        apply_secret(&conn, 1, &[7; 32], 100).unwrap();
+        hold_name(&conn, "notes", &[8; 32], 100).unwrap();
+        assert!(forget_person(&conn).unwrap());
+        assert_eq!(person(&conn).unwrap(), None);
+        assert!(!forget_person(&conn).unwrap());
+        assert_eq!(names(&conn).unwrap().len(), 1);
+        assert_eq!(secrets(&conn).unwrap().len(), 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -534,6 +534,47 @@ CREATE TABLE person_carried (
 );
 "#;
 
+/// Migration v15: what a person did on a device at a terminal, and what
+/// the device still has to tell them (decision 2026-10-04 §5.1, §6, §8).
+///
+/// Three tables, each one of what a device holds of its person:
+///
+/// - `person_typed_keys`: a key that a person typed at `cordelia accept`,
+///   with when. A pair channel is read only with such a key, and only for
+///   an hour after it was typed (§2.2). `taken_at` is when a hand-over was
+///   taken with it: the key is then spent, and reads nothing more. `said`
+///   is what became of the last hand-over that was read with it, in words
+///   for a person.
+/// - `person_left_out`: a key that this device counted as a device before
+///   a statement, and that is in neither of that statement's lists (§8),
+///   with the label it was known by and the statement's number. It is
+///   shown until a person clears it, or a later statement lists it.
+/// - `person_cleared`: a notice that a person has cleared here, by what
+///   the notice is named by: 32 bytes. A notice that is cleared is shown
+///   no more on this device.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V15: &str = r#"
+CREATE TABLE person_typed_keys (
+    key       BLOB PRIMARY KEY CHECK(length(key) = 32),
+    typed_at  INTEGER NOT NULL,
+    taken_at  INTEGER,
+    said      TEXT
+);
+
+CREATE TABLE person_left_out (
+    key       BLOB PRIMARY KEY CHECK(length(key) = 32),
+    label     TEXT NOT NULL,
+    number    INTEGER NOT NULL CHECK(number >= 1),
+    noted_at  INTEGER NOT NULL
+);
+
+CREATE TABLE person_cleared (
+    notice      BLOB PRIMARY KEY CHECK(length(notice) = 32),
+    cleared_at  INTEGER NOT NULL
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -666,6 +707,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 14 {
         tracing::info!("applying migration v14 (what a device keeps of each relay)");
         migrate_in_one(conn, MIGRATION_V14, 14)?;
+    }
+
+    if current < 15 {
+        tracing::info!("applying migration v15 (what a person typed, cleared and is to be told)");
+        migrate_in_one(conn, MIGRATION_V15, 15)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1375,6 +1421,9 @@ mod tests {
             "SELECT name FROM sqlite_master
              WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
                AND name NOT LIKE '%person_carried%'
+               AND name NOT LIKE '%person_typed_keys%'
+               AND name NOT LIKE '%person_left_out%'
+               AND name NOT LIKE '%person_cleared%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1578,6 +1627,9 @@ mod tests {
             "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
                  WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
                    AND name NOT LIKE '%person_carried%'
+                   AND name NOT LIKE '%person_typed_keys%'
+                   AND name NOT LIKE '%person_left_out%'
+                   AND name NOT LIKE '%person_cleared%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -1842,7 +1894,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 14);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v14(&conn), NEW_IN_V14);
 
@@ -1909,6 +1960,160 @@ mod tests {
         assert!(definition_of(&conn, "idx_at_relays_channel").contains("at_relays(channel)"));
     }
 
+    // ── v15: what a person typed, cleared and is to be told ──────────
+
+    /// A database at version 14, as the version before the commands a
+    /// person types leaves it: what [`at_v13`] holds, and what a device
+    /// keeps of a relay.
+    fn at_v14() -> Connection {
+        let conn = at_v13();
+        migrate_in_one(&conn, MIGRATION_V14, 14).unwrap();
+        conn.execute_batch(
+            "INSERT INTO at_relays (relay, channel, mark, place, sent_to, carried_to)
+             VALUES (zeroblob(32), zeroblob(32), X'0102030405060708', 7, 9, 3);
+             INSERT INTO person_carried (one, up_to) VALUES (1, 9);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The tables that the step to version 15 adds.
+    const NEW_IN_V15: [&str; 3] = ["person_cleared", "person_left_out", "person_typed_keys"];
+
+    /// What a database holds of the step to version 15, by name.
+    fn new_in_v15(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name IN ('person_cleared', 'person_left_out', 'person_typed_keys')
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database at version 14 holds: what one at version 13
+    /// holds, each definition of the step to version 14, and each row of
+    /// its two tables.
+    fn held_before_v15(conn: &Connection) -> Vec<String> {
+        let mut held = held_before_v14(conn);
+        for rows in [
+            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name LIKE '%at_relays%' OR name = 'person_carried'
+                 ORDER BY name",
+            "SELECT hex(relay) || hex(channel) || hex(mark) || place || sent_to || carried_to
+                 FROM at_relays",
+            "SELECT one || ' ' || up_to FROM person_carried",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// The three tables of what a person typed, cleared and is to be told
+    /// are made in one step with their version: a failure between them
+    /// leaves none, and the step asked for twice is run once.
+    #[test]
+    fn test_v15_adds_what_a_person_typed_and_is_told_and_its_version_as_one() {
+        let conn = at_v14();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 14);
+        assert!(new_in_v15(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V15} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 15).is_err());
+        assert_eq!(version(&conn), 14);
+        assert!(
+            new_in_v15(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 15);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v15(&conn), NEW_IN_V15);
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        conn.execute_batch(
+            "INSERT INTO person_typed_keys (key, typed_at) VALUES (zeroblob(32), 7);
+             INSERT INTO person_left_out (key, label, number, noted_at)
+             VALUES (zeroblob(32), 'laptop', 2, 8);
+             INSERT INTO person_cleared (notice, cleared_at) VALUES (zeroblob(32), 9);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V15, 15).unwrap();
+        let kept: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT typed_at FROM person_typed_keys),
+                        (SELECT number FROM person_left_out),
+                        (SELECT cleared_at FROM person_cleared)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((version(&conn), kept), (SCHEMA_VERSION, (7, 2, 9)));
+    }
+
+    /// A database at version 14 that an older binary wrote is taken to
+    /// version 15 with everything it held as it was: the step adds three
+    /// tables, with nothing in them, and touches nothing else.
+    #[test]
+    fn test_a_database_at_v14_that_an_older_binary_wrote_is_taken_to_v15() {
+        let conn = at_v14();
+        let before = held_before_v15(&conn);
+        assert!(before.iter().any(|row| row.starts_with("at_relays: ")));
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 14);
+
+        migrate_in_one(&conn, MIGRATION_V15, 15).unwrap();
+        assert_eq!(version(&conn), 15);
+        assert_eq!(held_before_v15(&conn), before);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(held_before_v15(&conn), before);
+
+        assert_eq!(new_in_v15(&conn), NEW_IN_V15);
+        for table in NEW_IN_V15 {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        // A row that is not what a device keeps is refused: a key or a
+        // notice of another length, and a statement numbered 0.
+        for refused in [
+            "INSERT INTO person_typed_keys (key, typed_at) VALUES (zeroblob(31), 1)",
+            "INSERT INTO person_left_out (key, label, number, noted_at)
+                 VALUES (zeroblob(33), 'laptop', 1, 1)",
+            "INSERT INTO person_left_out (key, label, number, noted_at)
+                 VALUES (zeroblob(32), 'laptop', 0, 1)",
+            "INSERT INTO person_cleared (notice, cleared_at) VALUES (zeroblob(16), 1)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -1929,13 +2134,14 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 6] = [
+        let from: [(u32, Connection); 7] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
             (11, at_v11()),
             (12, at_v12()),
             (13, at_v13()),
+            (14, at_v14()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -1953,6 +2159,7 @@ mod tests {
             assert_eq!(new_in_v12(&conn), NEW_IN_V12, "from version {at}");
             assert_eq!(new_in_v13(&conn), NEW_IN_V13, "from version {at}");
             assert_eq!(new_in_v14(&conn), NEW_IN_V14, "from version {at}");
+            assert_eq!(new_in_v15(&conn), NEW_IN_V15, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }
