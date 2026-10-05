@@ -79,7 +79,7 @@ use cordelia_network::rate_limit::ByteCounter;
 use cordelia_storage::person::State;
 use rusqlite::Connection;
 
-pub use leave::{Clock, Leave, Link, LinkId, NoLeave, Refused};
+pub use leave::{Asked, Clock, Leave, Link, LinkId, NoLeave, Refused};
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -132,6 +132,13 @@ pub struct Counts {
     pub pushes: u64,
     /// Entries of those pushes.
     pub pushed: u64,
+}
+
+/// Where a pass asks: a connection to a relay, and what the change entry
+/// was named by that the device kept when the pass read its channels.
+struct At<'a> {
+    link: &'a Link,
+    under: [u8; 32],
 }
 
 /// What became of one step of a relay's pass.
@@ -567,33 +574,42 @@ impl DeviceEntries {
 
     /// The pass at one relay: each channel of the device's own, in the
     /// order that [`at_relays::channels`] gives.
+    ///
+    /// The channels are those of the statement whose change entry the
+    /// device keeps when the pass begins, and each request of the pass is
+    /// built under that entry ([`Leave::open`]). Where the device comes
+    /// to keep another, by a show on this connection or on any other,
+    /// the pass ends there: the next reads the device's channels afresh.
     async fn relay_pass(&self, link: &Link, kind: Pass) {
-        let own = {
+        let read = {
             let db = lock(&self.state.db);
-            at_relays::channels(&db, &self.state.identity)
+            let own = at_relays::channels(&db, &self.state.identity);
+            own.and_then(|own| Ok((own, at_relays::kept_id(&db)?)))
         };
-        let own = match own {
-            Ok(own) => own,
+        let (own, under) = match read {
+            Ok((own, Some(under))) => (own, under),
+            Ok((_, None)) => return,
             Err(e) => {
                 tracing::debug!(error = %e, "could not read this device's channels");
                 return;
             }
         };
+        let at = At { link, under };
         let whole = kind == Pass::Whole;
         for channel in &own {
             let mut read_to_its_end = false;
             if whole && channel.is_pulled() {
-                match self.prove(link, channel, true).await {
+                match self.prove(&at, channel, true).await {
                     Step::Done(true) => {}
                     Step::Done(false) => continue,
                     Step::Stop => return,
                 }
-                match self.pull(link, channel).await {
+                match self.pull(&at, channel).await {
                     Step::Done(caught_up) => read_to_its_end = caught_up,
                     Step::Stop => return,
                 }
             }
-            let sent = match self.push(link, channel, Which::Since).await {
+            let sent = match self.push(&at, channel, Which::Since).await {
                 Step::Done(sent) => sent,
                 Step::Stop => return,
             };
@@ -602,31 +618,45 @@ impl DeviceEntries {
             if read_to_its_end
                 && sent
                 && matches!(channel.kind, Kind::Name(_))
-                && matches!(self.push(link, channel, Which::Carried).await, Step::Stop)
+                && matches!(self.push(&at, channel, Which::Carried).await, Step::Stop)
             {
                 return;
             }
         }
         if whole {
-            self.prove_listed(link, own.len()).await;
+            self.prove_listed(&at, own.len()).await;
         }
     }
 
-    /// Ask `request` on a stream for a channel of the device's own, on
-    /// `link`. Where there is no leave that a show gives, the device shows
-    /// again, and asks once more.
+    /// Ask `request` on a stream for a channel of the device's own, at
+    /// `at`. Where there is no leave that a show gives, the device shows
+    /// again, and asks once more. Where that show had it apply a change,
+    /// it keeps another entry than the one the request was built under:
+    /// the one way in refuses the request then, as it refuses any that
+    /// was built under an entry the device keeps no more, and the pass
+    /// at this relay ends (decision 2026-10-04 §16).
+    ///
+    /// `opened` is called under the database's lock once a stream is
+    /// about to be opened, and not for one that is refused.
     async fn through<R, T>(
         &self,
-        link: &Link,
+        at: &At<'_>,
         request: &WireMessage,
+        opened: impl Fn(&Connection),
         read: impl Fn(WireMessage) -> R,
         take: impl Fn(&Connection, R) -> T,
     ) -> Result<T, Refused> {
         let db = &self.state.db;
-        match self.leave.open(db, link, request, &read, &take).await {
+        let asked = Asked {
+            under: &at.under,
+            request,
+        };
+        let link = at.link;
+        let open = || self.leave.open(db, link, asked, &opened, &read, &take);
+        match open().await {
             Err(Refused::NoLeave(NoLeave::NotGiven)) => {
                 self.show_at(link).await;
-                self.leave.open(db, link, request, &read, &take).await
+                open().await
             }
             done => done,
         }
@@ -640,7 +670,8 @@ impl DeviceEntries {
     /// What is remembered is that the proof was made and answered, and
     /// not what was answered: a relay remembers a proof that held for a
     /// channel it does not hold yet.
-    async fn prove(&self, link: &Link, channel: &Own, held: bool) -> Step {
+    async fn prove(&self, at: &At<'_>, channel: &Own, held: bool) -> Step {
+        let link = at.link;
         let now = self.clock.now();
         {
             let kept = lock(&self.kept);
@@ -675,8 +706,9 @@ impl DeviceEntries {
         let relay = link.relay().0;
         let answered = self
             .through(
-                link,
+                at,
                 &request,
+                |_| (),
                 |answer| match answer {
                     WireMessage::ChannelProved(proved) => Some(proved.proved),
                     _ => None,
@@ -712,7 +744,8 @@ impl DeviceEntries {
     /// not dropped while any device of the person's is on. `own` is how
     /// many channels the device holds: with those, at most as many as a
     /// relay remembers for a connection.
-    async fn prove_listed(&self, link: &Link, own: usize) {
+    async fn prove_listed(&self, at: &At<'_>, own: usize) {
+        let link = at.link;
         let now = self.clock.now();
         let due = lock(&self.kept)
             .links
@@ -726,7 +759,7 @@ impl DeviceEntries {
         let listed = at_relays::listed(&lock(&self.state.db), most);
         let Ok(listed) = listed else { return };
         for channel in &listed {
-            if !matches!(self.prove(link, channel, false).await, Step::Done(true)) {
+            if !matches!(self.prove(at, channel, false).await, Step::Done(true)) {
                 return;
             }
         }
@@ -741,7 +774,8 @@ impl DeviceEntries {
     /// device keeps there: so many pages in one pass, each through the
     /// one door, with its place (decision 2026-10-04 §2.4 item 3, §16).
     /// Says whether the channel was read to its end.
-    async fn pull(&self, link: &Link, channel: &Own) -> Step {
+    async fn pull(&self, at: &At<'_>, channel: &Own) -> Step {
+        let link = at.link;
         let relay = link.relay().0;
         for _ in 0..RELAY_ENTRY_PULL_PAGES {
             let place = at_relays::place(&lock(&self.state.db), &relay, &channel.id);
@@ -757,8 +791,9 @@ impl DeviceEntries {
             let now = self.clock.unix();
             let taken = self
                 .through(
-                    link,
+                    at,
                     &request,
+                    |_| (),
                     |answer| {
                         let WireMessage::EntryPulled(page) = answer else {
                             return None;
@@ -825,7 +860,8 @@ impl DeviceEntries {
     /// Push to the relay at `link` what it has not been sent of
     /// `channel`, and act on each answer (decision 2026-10-04 §2.4 items
     /// 1 and 2, §7.3). Says whether everything was sent.
-    async fn push(&self, link: &Link, channel: &Own, which: Which) -> Step {
+    async fn push(&self, at: &At<'_>, channel: &Own, which: Which) -> Step {
+        let link = at.link;
         let relay = link.relay().0;
         loop {
             if self.is_left(&relay, &channel.id) {
@@ -858,7 +894,7 @@ impl DeviceEntries {
                 }
                 continue;
             }
-            let done = match self.push_batch(link, channel, &batch).await {
+            let done = match self.push_batch(at, channel, &batch).await {
                 Ok(Some(done)) => done,
                 Ok(None) => return Step::Done(false),
                 Err(_) => return Step::Stop,
@@ -898,10 +934,11 @@ impl DeviceEntries {
     /// `None` where what came back was no answer to it.
     async fn push_batch(
         &self,
-        link: &Link,
+        at: &At<'_>,
         channel: &Own,
         batch: &Batch,
     ) -> Result<Option<Sent>, Refused> {
+        let link = at.link;
         let relay = link.relay().0;
         let request = WireMessage::EntryPush(EntryPush {
             entries: batch
@@ -922,8 +959,16 @@ impl DeviceEntries {
         let sent = batch.entries.len();
         let done = self
             .through(
-                link,
+                at,
                 &request,
+                // That the relay is sent something of a pair channel is
+                // kept from before it is sent, whatever comes back: and
+                // only once there is leave to send it.
+                |db| {
+                    if let Err(e) = at_relays::opened_for(db, &relay, channel, batch) {
+                        tracing::debug!(error = %e, "could not keep that a relay is sent a channel");
+                    }
+                },
                 |answer| {
                     let WireMessage::EntryPushed(pushed) = answer else {
                         return None;

@@ -587,10 +587,8 @@ const READ: u32 = 64;
 /// as one push may hold (see the module's documentation). [`sent`] is
 /// told what the relay answered.
 ///
-/// Nothing is written but this: that the relay is about to be sent
-/// something of a pair channel, which is kept whatever comes back. A
-/// hand-over that reached a relay whose answer was lost is still written
-/// over there.
+/// Nothing is written. Whoever goes on to send the batch says so once
+/// the stream for it is opened ([`opened_for`]).
 pub fn to_send(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -599,14 +597,30 @@ pub fn to_send(
     which: Which,
     most: Most,
 ) -> Result<Batch, PersonError> {
-    let batch = batch_of(conn, identity, relay, channel, which, most)?;
+    batch_of(conn, identity, relay, channel, which, most)
+}
+
+/// A stream is about to be opened to send `relay` the batch `batch` of
+/// `channel`: there is leave to send it, and it goes out now.
+///
+/// What is written is this: that the relay is sent something of a pair
+/// channel, which is kept whatever comes back. A hand-over that reached a
+/// relay whose answer was lost is still written over there. It is kept
+/// only for a push that was opened: a relay that was never sent a
+/// hand-over is never sent the delete over it, as a channel of its own.
+pub fn opened_for(
+    conn: &Connection,
+    relay: &[u8; 32],
+    channel: &Own,
+    batch: &Batch,
+) -> Result<(), PersonError> {
     if channel.kind == Kind::Pair && !batch.entries.is_empty() {
         kept_rows::sending(conn, relay, &channel.id)?;
     }
-    Ok(batch)
+    Ok(())
 }
 
-/// [`to_send`], with nothing written.
+/// [`to_send`].
 fn batch_of(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1973,9 +1987,10 @@ mod tests {
 
     /// In a pair channel a device sends what it wrote itself. The
     /// hand-over goes to every relay, and that a relay was sent it is
-    /// kept from before it is sent. The delete that is written over a
-    /// hand-over which has gone goes only to a relay that was sent
-    /// something of the channel.
+    /// kept from when the push is opened, whatever comes back, and not
+    /// before: a push that found no leave was not sent. The delete that
+    /// is written over a hand-over which has gone goes only to a relay
+    /// that was sent something of the channel.
     #[test]
     fn test_a_hand_over_goes_to_every_relay_and_its_delete_only_where_it_went() {
         let mut s = Several::new(2);
@@ -1986,11 +2001,30 @@ mod tests {
         let pair = channel_of(on, Kind::Pair);
         assert_eq!(pair.id, handed.channel);
 
-        // It is sent to the first relay, whose answer is lost: that the
-        // relay was sent it is kept all the same.
+        // What is to be sent is read, for each relay. Nothing is kept of
+        // that: there may be no leave to send it.
         let batch = sends(on, &RELAY, &pair, Which::Since);
         assert_eq!(ids(&batch.entries), [handed.id()]);
+        let not_sent = sends(on, &OTHER_RELAY, &pair, Which::Since);
+        assert_eq!(ids(&not_sent.entries), [handed.id()]);
+        for relay in [&RELAY, &OTHER_RELAY] {
+            assert!(!kept_rows::keeps_any(&on.conn, relay, &pair.id).unwrap());
+        }
+        // The push to the first relay is opened, and its answer is lost:
+        // that the relay was sent it is kept all the same. The push to
+        // the other was never opened.
+        opened_for(&on.conn, &RELAY, &pair, &batch).unwrap();
         assert!(kept_rows::keeps_any(&on.conn, &RELAY, &pair.id).unwrap());
+        assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &pair.id).unwrap());
+        // A push of nothing, and one of a channel of the device's own,
+        // keep nothing.
+        let personal = channel_of(on, Kind::Personal);
+        let own = sends(on, &OTHER_RELAY, &personal, Which::Since);
+        assert!(!own.entries.is_empty());
+        opened_for(&on.conn, &OTHER_RELAY, &personal, &own).unwrap();
+        assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &personal.id).unwrap());
+        let nothing = sends(on, &OTHER_RELAY, &pair, Which::Carried);
+        opened_for(&on.conn, &OTHER_RELAY, &pair, &nothing).unwrap();
         assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &pair.id).unwrap());
         // It is sent again, and the relay holds it.
         assert_eq!(sends_all(on, &RELAY, &pair, Which::Since), [handed.id()]);
@@ -2018,8 +2052,9 @@ mod tests {
         // The delete goes to the relay that was sent the hand-over.
         let pair = channel_of(on, Kind::Pair);
         assert_eq!(sends_all(on, &RELAY, &pair, Which::Since), [over[0].id()]);
-        // The other relay was sent nothing of the channel: it is not
-        // sent the delete, and nothing is kept of that.
+        // The other relay was sent nothing of the channel, though what
+        // would have gone to it was read: it is not sent the delete, and
+        // nothing is kept of that.
         assert!(sends(on, &OTHER_RELAY, &pair, Which::Since).is_empty());
         assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &pair.id).unwrap());
     }

@@ -41,7 +41,7 @@ use cordelia_network::messages::{
 };
 use cordelia_network::{codec, connection, transport};
 use cordelia_node::device_entries::{
-    Clock, Counts, DeviceEntries, Link, NoLeave, Pass, Refused, Relay,
+    Asked, Clock, Counts, DeviceEntries, Link, NoLeave, Pass, Refused, Relay,
 };
 use cordelia_storage::person::State;
 use cordelia_storage::{entries, person as held_rows};
@@ -225,6 +225,27 @@ impl Device {
     /// Whether there is leave to use its connection to `name`.
     fn has_leave(&self, name: &str) -> Result<(), NoLeave> {
         self.engine.leave().has(&self.db(), &self.link(name))
+    }
+
+    /// Open a stream for a channel of the device's own on `link`, through
+    /// the one way in: `request` is built under the change entry that the
+    /// device keeps now, and nothing is kept of its being opened.
+    async fn opens<R, T>(
+        &self,
+        link: &Link,
+        request: &WireMessage,
+        read: impl FnOnce(WireMessage) -> R,
+        take: impl FnOnce(&rusqlite::Connection, R) -> T,
+    ) -> Result<T, Refused> {
+        let under = self.latest().id();
+        let asked = Asked {
+            under: &under,
+            request,
+        };
+        self.engine
+            .leave()
+            .open(&self.state.db, link, asked, |_| (), read, take)
+            .await
     }
 
     // ── What it holds of its person ──────────────────────────────────
@@ -437,6 +458,11 @@ enum Say {
     Nothing,
 }
 
+/// What a test has a stand-in do as each request arrives, before it is
+/// answered: for a show, `Some` is what this one is answered with, in the
+/// place of what the script says.
+type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
+
 struct Script {
     /// What a show in short is answered with.
     short: Say,
@@ -444,6 +470,8 @@ struct Script {
     whole: Say,
     /// Every request that arrived, with the stream it came on.
     seen: Vec<(Protocol, WireMessage)>,
+    /// What the test does as each request arrives.
+    hook: Option<Hook>,
 }
 
 impl Default for Script {
@@ -452,6 +480,7 @@ impl Default for Script {
             short: Say::Answer(ShowAnswer::Held),
             whole: Say::Answer(ShowAnswer::Held),
             seen: Vec::new(),
+            hook: None,
         }
     }
 }
@@ -517,11 +546,12 @@ impl StandIn {
         // answered and the stream is kept open.
         let does = {
             let mut script = script.lock().unwrap();
+            let hooked = script.hook.as_mut().and_then(|hook| hook(&request));
             let does = match &request {
                 WireMessage::EntryShow(_) | WireMessage::EntryShowShort(_) => {
                     let whole = matches!(request, WireMessage::EntryShow(_));
                     let say = if whole { &script.whole } else { &script.short };
-                    match say.clone() {
+                    match hooked.unwrap_or_else(|| say.clone()) {
                         Say::Answer(answer) => {
                             Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
                         }
@@ -564,6 +594,19 @@ impl StandIn {
     fn says(&self, short: Say, whole: Say) {
         let mut script = self.script.lock().unwrap();
         (script.short, script.whole) = (short, whole);
+    }
+
+    /// From now on `hook` is called as each request arrives, before it is
+    /// answered.
+    fn hook(&self, hook: impl FnMut(&WireMessage) -> Option<Say> + Send + 'static) {
+        self.script.lock().unwrap().hook = Some(Box::new(hook));
+    }
+
+    /// Every request that arrived since this, or [`Self::seen`], was last
+    /// asked, as it arrived.
+    fn requests(&self) -> Vec<WireMessage> {
+        let seen = std::mem::take(&mut self.script.lock().unwrap().seen);
+        seen.into_iter().map(|(_, request)| request).collect()
     }
 
     /// Every request that arrived since this was last asked: each as the
@@ -698,17 +741,10 @@ async fn leave_lasts_ten_seconds_from_an_answer_and_is_asked_again_before_anythi
     // The device has leave, and a stream is opened: here, a proof.
     let link = writer.link("relay");
     let proof = proof_on(&writer, "relay", "notes");
-    let proves = |device: &Device, link: &Link, proof: &WireMessage| {
-        let (leave, db) = (device.engine.clone(), device.state.clone());
-        let (link, proof) = (link.clone(), proof.clone());
-        async move {
-            let read = |answer| matches!(answer, WireMessage::ChannelProved(_));
-            leave
-                .leave()
-                .open(&db.db, &link, &proof, read, |_, proved| proved)
-                .await
-        }
-    };
+    async fn proves(device: &Device, link: &Link, proof: &WireMessage) -> Result<bool, Refused> {
+        let read = |answer| matches!(answer, WireMessage::ChannelProved(_));
+        device.opens(link, proof, read, |_, proved| proved).await
+    }
     assert_eq!(writer.has_leave("relay"), Ok(()));
     assert_eq!(proves(&writer, &link, &proof).await, Ok(true));
     // Some seconds short of ten, it still has. (The test's own steps take
@@ -729,11 +765,7 @@ async fn leave_lasts_ten_seconds_from_an_answer_and_is_asked_again_before_anythi
     assert_eq!(proves(&writer, &link, &proof).await, Ok(true));
     // Only a proof, a pull or a push is asked on a stream of a channel.
     let stray = WireMessage::ChannelProved(ChannelProved { proved: true });
-    let asked = writer
-        .engine
-        .leave()
-        .open(&writer.state.db, &link, &stray, |_| (), |_, _| ())
-        .await;
+    let asked = writer.opens(&link, &stray, |_| (), |_, _| ()).await;
     assert_eq!(asked, Err(Refused::NotARequest));
 
     // The writer writes a file, and the relay holds it.
@@ -772,10 +804,7 @@ async fn leave_lasts_ten_seconds_from_an_answer_and_is_asked_again_before_anythi
     assert_eq!(reader.has_leave("relay"), Ok(()));
     let taken = AtomicBool::new(false);
     let late = reader
-        .engine
-        .leave()
-        .open(
-            &reader.state.db,
+        .opens(
             &link,
             &pull,
             |answer| {
@@ -936,15 +965,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     // sees none, whoever asks for one.
     let proof = proof_on(&device, "relay", "notes");
     let opened = device
-        .engine
-        .leave()
-        .open(
-            &device.state.db,
-            &device.link("relay"),
-            &proof,
-            |_| (),
-            |_, _| (),
-        )
+        .opens(&device.link("relay"), &proof, |_| (), |_, _| ())
         .await;
     assert_eq!(opened, Err(Refused::NoLeave(NoLeave::NotGiven)));
     assert_eq!(relay.seen(), []);
@@ -1058,16 +1079,21 @@ async fn a_device_asks_only_so_much_of_a_relay_in_a_minute() {
     let link = device.link("relay");
     let proof = proof_on(&device, "relay", "notes");
     let entry = device.latest();
+    let under = entry.id();
     let mut refused = None;
     for n in 0..most {
         if n % 200 == 0 {
             let shown = device.engine.leave().show(&link, &entry, true).await;
             shown.unwrap();
         }
+        let asked = Asked {
+            under: &under,
+            request: &proof,
+        };
         let asked = device
             .engine
             .leave()
-            .open(&device.state.db, &link, &proof, |_| (), |_, _| ())
+            .open(&device.state.db, &link, asked, |_| (), |_| (), |_, _| ())
             .await;
         if let Err(why) = asked {
             refused = Some(why);
@@ -1488,6 +1514,284 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     assert_eq!(other.stands(), Stands::Stopped(State::Fork));
 }
 
+/// The channels that `request` names: the one that is proved or pulled,
+/// and the channel of each entry that is pushed. None for a show.
+fn channels_named(request: &WireMessage) -> Vec<[u8; 32]> {
+    match request {
+        WireMessage::ChannelProve(prove) => vec![prove.channel],
+        WireMessage::EntryPull(pull) => vec![pull.channel],
+        WireMessage::EntryPush(push) => push
+            .entries
+            .iter()
+            .map(|entry| Entry::from_wire(entry).unwrap().channel)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A request that was built before a show applied a change is not sent
+/// after it. A pass has a push in hand when its leave runs out: it shows
+/// again, is answered with a later change, applies it, and has leave
+/// again under the entry it then keeps. The push in hand is of a channel
+/// that the device has left: it is not sent again, the pass ends there,
+/// and the next reads the device's channels afresh. Nothing that names a
+/// channel of the generation left is sent after the apply, on that
+/// connection or on any other, and nothing is kept of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_applied_at_a_show_inside_a_pass_ends_the_pass_and_nothing_goes_to_a_channel_left()
+{
+    let (relay, other) = (StandIn::started().await, StandIn::started().await);
+    let (maker, mut device) = (Device::new("desktop"), Device::new("laptop"));
+    maker.makes_the_phrase(&phrase());
+    maker.adds(&device);
+    device.holds("notes");
+    device.writes("notes", "a.md", "written before the change");
+    let first = device.latest();
+    let old = [device.personal(), device.channel("notes")];
+    // A change that the device has not heard of.
+    let change = maker.changes(&phrase(), &[&maker, &device], &[]);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.connects_to("other", other.port, other.key).await;
+
+    // The relay answers as one that holds nothing later, until the first
+    // push arrives. As that push is in hand, ten seconds go by: the
+    // device's leave runs out. From then on the relay holds the change:
+    // shown the first entry in short it tells of the change, shown it
+    // whole it answers with the change, and shown the change it holds
+    // it.
+    let clock = device.clock.clone();
+    let (first_id, change_id, change_rev) = (first.id(), change.id(), change.rev);
+    let change_wire = change.to_wire();
+    let mut pushed = false;
+    relay.hook(move |request| match request {
+        WireMessage::EntryPush(_) if !pushed => {
+            pushed = true;
+            clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+            None
+        }
+        WireMessage::EntryShowShort(show) if pushed && show.id == first_id => {
+            Some(Say::Answer(ShowAnswer::Other {
+                rev: change_rev,
+                id: change_id,
+            }))
+        }
+        WireMessage::EntryShow(show) if pushed => {
+            let shown = Entry::from_wire(&show.entry).unwrap();
+            Some(Say::Answer(match shown.id() == first_id {
+                true => ShowAnswer::Another(change_wire.clone()),
+                false => ShowAnswer::Held,
+            }))
+        }
+        _ => None,
+    });
+
+    device.passes().await;
+    // It applied the change, at the show inside the pass.
+    assert_eq!(device.latest().id(), change.id());
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    let seen = relay.requests();
+    let applied_at = seen
+        .iter()
+        .position(|request| {
+            matches!(request, WireMessage::EntryShow(show)
+                if Entry::from_wire(&show.entry).unwrap().id() == first_id)
+                && seen
+                    .iter()
+                    .any(|one| matches!(one, WireMessage::EntryPush(_)))
+        })
+        .and_then(|_| {
+            seen.iter().rposition(|request| {
+                matches!(request, WireMessage::EntryShow(show)
+                    if Entry::from_wire(&show.entry).unwrap().id() == first_id)
+            })
+        })
+        .expect("the first entry was shown whole again, inside the pass");
+    // The push that was in hand went out once, before the change was
+    // applied: it named a channel that the device was in then.
+    let before: Vec<&WireMessage> = seen[..applied_at]
+        .iter()
+        .filter(|request| matches!(request, WireMessage::EntryPush(_)))
+        .collect();
+    assert_eq!(before.len(), 1, "{seen:?}");
+    // After it, nothing names a channel of the generation left: the push
+    // is not sent again, and the pass does not walk on.
+    let after = &seen[applied_at + 1..];
+    for request in after {
+        for channel in channels_named(request) {
+            assert!(!old.contains(&channel), "sent in a channel that was left");
+        }
+    }
+    assert!(
+        after
+            .iter()
+            .all(|request| channels_named(request).is_empty()),
+        "the pass went on after the change: {after:?}"
+    );
+    // And nothing is kept of a channel that was left, at any relay.
+    let kept: i64 = device
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM at_relays WHERE channel IN (?1, ?2)",
+            rusqlite::params![old[0].as_slice(), old[1].as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 0);
+
+    // On the other connection: a request that was built under the entry
+    // before is refused, though there is leave there for the entry that
+    // the device keeps now. The relay sees nothing of it.
+    let link = device.link("other");
+    device
+        .engine
+        .leave()
+        .show(&link, &device.latest(), false)
+        .await
+        .unwrap();
+    assert_eq!(device.has_leave("other"), Ok(()));
+    other.requests();
+    let stale = WireMessage::EntryPull(EntryPull {
+        channel: old[0],
+        mark: [0; 8],
+        after: 0,
+        limit: ENTRY_PAGE_MAX_ENTRIES,
+    });
+    let marked = AtomicBool::new(false);
+    let refused = device
+        .engine
+        .leave()
+        .open(
+            &device.state.db,
+            &link,
+            Asked {
+                under: &first_id,
+                request: &stale,
+            },
+            |_| marked.store(true, Ordering::SeqCst),
+            |_| (),
+            |_, _| (),
+        )
+        .await;
+    assert_eq!(refused, Err(Refused::KeptAnother));
+    assert!(!marked.load(Ordering::SeqCst));
+    assert_eq!(other.requests().len(), 0);
+    // Built under the entry it keeps, the same stream is opened.
+    assert_eq!(device.opens(&link, &stale, |_| (), |_, _| ()).await, Ok(()));
+
+    // The next pass reads the device's channels afresh: what it sends
+    // names the channels of the generation it has come to, and no other.
+    relay.requests();
+    device.passes().await;
+    let fresh = [device.personal(), device.channel("notes")];
+    let named: Vec<[u8; 32]> = relay.requests().iter().flat_map(channels_named).collect();
+    assert!(!named.is_empty());
+    for channel in named {
+        assert!(fresh.contains(&channel), "another channel than its own now");
+    }
+}
+
+/// A relay that was never sent a hand-over is never sent the delete over
+/// it. A push that finds no leave is not sent, and nothing is kept of it:
+/// so when the hand-over goes from the store, two hours on, there is no
+/// relay to write over it at, and the pair channel reaches no relay as a
+/// channel of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_was_never_sent_a_hand_over_is_not_sent_a_delete_over_it() {
+    let relay = StandIn::started().await;
+    let (mut adder, new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    adder.connects_to("relay", relay.port, relay.key).await;
+    // The relay gives no leave: it asks for the whole entry, each time.
+    let whole = Say::Answer(ShowAnswer::Whole);
+    relay.says(whole.clone(), whole);
+    let now = adder.now();
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        now,
+    );
+    let pair = added.unwrap().hand_over.channel;
+    adder.passes().await;
+    adder.sends().await;
+    // The hand-over waits, and nothing was sent: nothing is kept of the
+    // push that found no leave.
+    assert!(
+        relay
+            .requests()
+            .iter()
+            .all(|one| channels_named(one).is_empty())
+    );
+    let sent_anywhere = |device: &Device| {
+        cordelia_storage::at_relays::keeps_any_anywhere(&device.db(), &pair).unwrap()
+    };
+    assert!(!sent_anywhere(&adder));
+
+    // Two hours on, the hand-over goes from the store, and the relay
+    // gives leave. No delete is written over what no relay was sent, and
+    // nothing of the pair channel goes to the relay.
+    adder
+        .clock
+        .run_ahead(Duration::from_secs(HAND_OVER_KEPT_SECS as u64));
+    let held = Say::Answer(ShowAnswer::Held);
+    relay.says(held.clone(), held);
+    adder.passes().await;
+    adder.passes().await;
+    adder.sends().await;
+    let named: Vec<[u8; 32]> = relay.requests().iter().flat_map(channels_named).collect();
+    assert!(
+        named.contains(&adder.personal()),
+        "it went on in its own channels"
+    );
+    assert!(!named.contains(&pair));
+    assert!(adder.holds_of(&pair).is_empty());
+    assert!(!sent_anywhere(&adder));
+}
+
+/// What came back on a stream is not taken where the device applied a
+/// change while it was on its way: the request was built under the entry
+/// before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_comes_back_after_a_change_was_applied_is_not_taken() {
+    let relay = StandIn::started().await;
+    let (maker, mut device) = (Device::new("desktop"), Device::new("laptop"));
+    maker.makes_the_phrase(&phrase());
+    maker.adds(&device);
+    device.holds("notes");
+    let change = maker.changes(&phrase(), &[&maker, &device], &[]);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    let link = device.link("relay");
+    let pull = WireMessage::EntryPull(EntryPull {
+        channel: device.channel("notes"),
+        mark: [0; 8],
+        after: 0,
+        limit: ENTRY_PAGE_MAX_ENTRIES,
+    });
+    let taken = AtomicBool::new(false);
+    let late = device
+        .opens(
+            &link,
+            &pull,
+            |_| {
+                // The page is on its way back, and a change is applied
+                // meanwhile: shown on another connection, say.
+                let applied = shown(&device.db(), &device.state.identity, &change, device.now());
+                assert!(matches!(applied.unwrap(), Shown::Applied(_)));
+            },
+            |_, _| taken.store(true, Ordering::SeqCst),
+        )
+        .await;
+    assert!(late.is_err(), "{late:?}");
+    assert!(
+        !taken.load(Ordering::SeqCst),
+        "a page was taken under an entry left"
+    );
+    assert_eq!(device.latest().id(), change.id());
+}
+
 // ── A device that wakes ──────────────────────────────────────────────
 
 /// A device that wakes asks every relay first. With two relays, of which
@@ -1813,10 +2117,7 @@ async fn pushed_by_hand(through: &Device, relay: &str, pushed: &[&Entry]) -> Vec
         entries: pushed.iter().map(|entry| entry.to_wire().into()).collect(),
     });
     let answered = through
-        .engine
-        .leave()
-        .open(
-            &through.state.db,
+        .opens(
             &link,
             &request,
             |answer| match answer {

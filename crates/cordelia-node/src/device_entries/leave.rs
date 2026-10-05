@@ -36,6 +36,15 @@
 //! lock of the database that the leave was asked under, to whoever takes
 //! it, and to nobody else.
 //!
+//! **A request is sent only under the change entry that it was built
+//! under** (§16). Whoever asks says which entry the device kept when the
+//! request was made: its channels are those of that entry's statement.
+//! Where the device keeps another by the time the stream is to be
+//! opened, or by the time its answer is to be taken, a change was
+//! applied in between, on this connection or on any other: nothing is
+//! sent, and nothing is taken. So nothing is sent in a channel that the
+//! device has left, and nothing is written down of one.
+//!
 //! A connection is a [`Link`], which keeps the connection to itself:
 //! outside this file there is no way to open a stream on one but
 //! [`Leave::show`] and [`Leave::open`].
@@ -216,6 +225,23 @@ pub enum Refused {
     /// The device has asked as much of this relay as it asks in a minute.
     /// Nothing was sent: it is asked again later.
     AskedEnough,
+    /// The device keeps another change entry than the one the request
+    /// was built under: it applied a change since. Nothing was sent, or
+    /// nothing of what came back was taken. The channels are read afresh.
+    KeptAnother,
+}
+
+/// What is asked on a stream for a channel of the device's own: the
+/// request, and what the change entry was named by that the device kept
+/// when the request was built.
+#[derive(Debug, Clone, Copy)]
+pub struct Asked<'a> {
+    /// What the change entry is named by that the request was built
+    /// under: its channels are those of that entry's statement.
+    pub under: &'a [u8; 32],
+    /// A proof of a channel's key, a pull of a page, or a push of
+    /// entries.
+    pub request: &'a WireMessage,
 }
 
 /// What a show was answered, and what it cost to send.
@@ -457,43 +483,69 @@ impl Leave {
     }
 
     /// Open a stream for a channel of the device's own on `link`, ask
-    /// `request` on it, and hand what came back to `read` and then to
-    /// `take`: a proof of a channel's key, a pull of a page, or a push of
-    /// entries, each on the stream of its own.
+    /// what is `asked` on it, and hand what came back to `read` and then
+    /// to `take`: a proof of a channel's key, a pull of a page, or a push
+    /// of entries, each on the stream of its own.
     ///
-    /// It is refused where there is no leave ([`Leave::has`]), and where
-    /// the device has asked as much on this connection as it asks of a
-    /// relay in a minute. `read` is
-    /// given the answer with no database: it checks what came back.
-    /// Leave is then asked again, and `take` is called with what `read`
-    /// made, under the lock of the database that the leave was asked
-    /// under: so nothing that came back is taken without leave, and what
-    /// arrives after the leave has run out is dropped.
+    /// The stream is refused where there is no leave ([`Leave::has`]),
+    /// where the device keeps another change entry now than the one the
+    /// request was built under ([`Asked::under`]), and where it has asked
+    /// as much on this connection as it asks of a relay in a minute.
+    ///
+    /// `opened` is called once the stream is about to be opened, under
+    /// the lock of the database that the leave was asked under: for what
+    /// is kept of a request whatever comes back. It is not called for a
+    /// stream that is refused.
+    ///
+    /// `read` is given the answer with no database: it checks what came
+    /// back. Leave is then asked again, and whether the device still
+    /// keeps that entry, and `take` is called with what `read` made,
+    /// under the lock of the database that both were asked under: so
+    /// nothing that came back is taken without leave, what arrives after
+    /// the leave has run out is dropped, and so is what arrives after a
+    /// change was applied.
     pub async fn open<R, T>(
         &self,
         db: &Mutex<Connection>,
         link: &Link,
-        request: &WireMessage,
+        asked: Asked<'_>,
+        opened: impl FnOnce(&Connection),
         read: impl FnOnce(WireMessage) -> R,
         take: impl FnOnce(&Connection, R) -> T,
     ) -> Result<T, Refused> {
+        let Asked { under, request } = asked;
         let protocol = match request {
             WireMessage::ChannelProve(_) => Protocol::ChannelProve,
             WireMessage::EntryPull(_) => Protocol::EntryPull,
             WireMessage::EntryPush(_) => Protocol::EntryPush,
             _ => return Err(Refused::NotARequest),
         };
-        self.has(&lock(db), link).map_err(Refused::NoLeave)?;
-        if !lock(&self.inner).may_ask(link.id()) {
-            return Err(Refused::AskedEnough);
+        {
+            let conn = lock(db);
+            self.may_use(&conn, link, under)?;
+            if !lock(&self.inner).may_ask(link.id()) {
+                return Err(Refused::AskedEnough);
+            }
+            opened(&conn);
         }
         let answer = ask(&link.conn, protocol, request)
             .await
             .map_err(Refused::NotAnswered)?;
         let answer = read(answer);
         let conn = lock(db);
-        self.has(&conn, link).map_err(Refused::NoLeave)?;
+        self.may_use(&conn, link, under)?;
         Ok(take(&conn, answer))
+    }
+
+    /// Whether a request that was built under the change entry named
+    /// `under` may use `link` now: there is leave, and the device keeps
+    /// that entry still.
+    fn may_use(&self, conn: &Connection, link: &Link, under: &[u8; 32]) -> Result<(), Refused> {
+        self.has(conn, link).map_err(Refused::NoLeave)?;
+        match at_relays::kept_id(conn) {
+            Ok(Some(kept)) if kept == *under => Ok(()),
+            _ => Err(Refused::KeptAnother),
+        }
     }
 }
 
