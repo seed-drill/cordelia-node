@@ -1099,19 +1099,23 @@ mod tests {
     /// same entries again, device 1 takes them. It ends with the same
     /// entries and the same answers as device 2, which was given the
     /// records first.
+    ///
+    /// So does device 5, which is given them again in the very order that
+    /// failed the first time: its caller gives everything again for as
+    /// long as a key came to count.
     #[test]
     fn test_what_arrives_before_the_record_is_taken_when_it_is_given_again() {
         use crate::person::AdditionSeen;
         use crate::take::Record;
         use std::collections::BTreeSet;
 
-        let mut s = Several::new(5);
+        let mut s = Several::new(6);
         s.make_phrase(0);
-        for new in [1, 2] {
+        for new in [1, 2, 5] {
             assert!(matches!(s.add(0, new), Accepted::Joined(_)));
         }
-        s.hold(&[0, 1, 2], "notes");
-        s.meet(&[0, 1, 2]);
+        s.hold(&[0, 1, 2, 5], "notes");
+        s.meet(&[0, 1, 2, 5]);
         // Device 0 adds device 3, and device 3 adds device 4. Each writes
         // that it has applied, and a file.
         assert!(matches!(s.add(0, 3), Accepted::Joined(_)));
@@ -1122,38 +1126,64 @@ mod tests {
         s.write(4, "notes", "b.md", "by device 4");
 
         const REFUSED: Taken = Taken::Refused(NotTaken::SignerDoesNotCount);
+        const HELD: Taken = Taken::Own {
+            stored: Outcome::AlreadyHeld,
+            record: None,
+            came_to_count: 0,
+        };
+        const OF_A_PAIR: Taken = Taken::Refused(NotTaken::AnotherChannel);
         let a_record = |came_to_count: usize| Taken::Own {
             stored: Outcome::Stored,
             record: Some(Record::Seen(AdditionSeen::Counted)),
             came_to_count,
         };
         let before = s[1].stored();
+        let before_on_5 = s[5].stored();
 
-        // Device 1 is given what device 4 holds: its word, and its file.
-        let taken = s.pass(4, 1);
-        assert_eq!(taken[0], Taken::Shown(Shown::Held));
-        assert_eq!(taken[1..], [REFUSED, REFUSED]);
-        // And what device 3 holds: its word, its file, its record that it
-        // added device 4, and the hand-over, which is of a pair channel.
-        let taken = s.pass(3, 1);
-        assert_eq!(
-            taken[1..],
-            [
-                REFUSED,
-                REFUSED,
-                REFUSED,
-                Taken::Refused(NotTaken::AnotherChannel)
-            ]
-        );
+        for to in [1, 5] {
+            // The device is given what device 4 holds: its word, and its
+            // file.
+            let taken = s.pass(4, to);
+            assert_eq!(taken[0], Taken::Shown(Shown::Held));
+            assert_eq!(taken[1..], [REFUSED, REFUSED]);
+            // And what device 3 holds: its word, its file, its record
+            // that it added device 4, and the hand-over, which is of a
+            // pair channel.
+            let taken = s.pass(3, to);
+            assert_eq!(taken[1..], [REFUSED, REFUSED, REFUSED, OF_A_PAIR]);
+        }
         // Nothing of it is kept, and neither key counts.
         assert_eq!(s[1].stored(), before);
-        assert!(!s[1].counts(&s.key(3)) && !s[1].counts(&s.key(4)));
+        assert_eq!(s[5].stored(), before_on_5);
+        for to in [1, 5] {
+            assert!(!s[to].counts(&s.key(3)) && !s[to].counts(&s.key(4)));
+        }
 
         // The record that device 0 added device 3 arrives: a key came to
         // count, and the caller gives again what it gave before.
-        let taken = s.pass(0, 1);
-        assert_eq!(taken.iter().filter(|one| **one == a_record(1)).count(), 1);
-        assert!(s[1].counts(&s.key(3)) && !s[1].counts(&s.key(4)));
+        for to in [1, 5] {
+            let taken = s.pass(0, to);
+            assert_eq!(taken.iter().filter(|one| **one == a_record(1)).count(), 1);
+            assert!(s[to].counts(&s.key(3)) && !s[to].counts(&s.key(4)));
+        }
+
+        // Device 5 is given it in the order that failed the first time:
+        // what device 4 holds, and then what device 3 holds. What device
+        // 4 signed is refused again. The record that device 3 signed is
+        // read, and a further key came to count by it: the caller gives
+        // everything again.
+        let taken = s.pass(4, 5);
+        assert_eq!(taken[1..], [REFUSED, REFUSED]);
+        let taken = s.pass(3, 5);
+        assert_eq!(taken[1..], [STORED, STORED, a_record(1), OF_A_PAIR]);
+        assert!(s[5].counts(&s.key(4)));
+        // In that order again: what device 4 signed is taken, and the
+        // store holds the rest. No key came to count, and it is done.
+        let taken = s.pass(4, 5);
+        assert_eq!(taken[1..], [STORED, STORED]);
+        let taken = s.pass(3, 5);
+        assert_eq!(taken[1..], [HELD, HELD, HELD, OF_A_PAIR]);
+
         // What device 3 holds, again: its word and its file are stored,
         // and its record is read. A further key came to count by it.
         let taken = s.pass(3, 1);
@@ -1177,11 +1207,12 @@ mod tests {
             assert!(!taken.contains(&REFUSED), "{from}");
         }
 
-        // The two hold the same entries, and give the same answers.
+        // The three hold the same entries, and give the same answers.
         let entries = |n: usize| -> BTreeSet<[u8; 32]> {
             s[n].stored().iter().map(|entry| entry.id()).collect()
         };
         assert_eq!(entries(1), entries(2));
+        assert_eq!(entries(5), entries(2));
         assert_eq!(entries(1).len(), before.len() + 6);
         let answers = |n: usize| {
             let on = &s[n];
@@ -1200,6 +1231,7 @@ mod tests {
             )
         };
         assert_eq!(answers(1), answers(2));
+        assert_eq!(answers(5), answers(2));
         let (counts, may_add, words, a, b) = answers(1);
         assert_eq!(counts, [true; 5]);
         // Device 4 was added by a device added since: it may not add.

@@ -73,7 +73,7 @@ use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Following, State};
 
 use crate::person::{
-    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Refused, Shown, added_name,
+    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Shown, added_name,
     applied_secret, apply_added, apply_judged, drop_hand_overs, held, in_one, its_own_entry,
     latest_entry, see_addition, shown,
 };
@@ -386,10 +386,6 @@ pub enum NotAccepted {
     /// The hand-over's statement is none that this device takes beside
     /// the one it has applied.
     Statement(StatementError),
-    /// The hand-over's statement was made apart from the one this device
-    /// has applied, and its change entry was refused where it was shown to
-    /// the device as one: this is why.
-    NotShown(Refused),
     /// This device has stopped, and the hand-over's statement was made
     /// apart from the one it has applied, or is behind the change that
     /// stopped it.
@@ -659,11 +655,12 @@ impl<'a> Brought<'a> {
             Judgement::Behind => Ok(Accepted::Refused(NotAccepted::BringsNoChange)),
             Judgement::Removed => Ok(Accepted::Refused(NotAccepted::NotForThisDevice)),
             Judgement::Fork if held.state == State::Applied => {
+                // The entry was opened as this statement's own, and the
+                // statement judged, just above: shown to a device that
+                // has not stopped, it is a fork, and can be nothing
+                // else.
                 match shown(conn, identity, &self.entry, now)? {
                     Shown::Fork => Ok(Accepted::Fork),
-                    // The entry was refused where it was shown: that is
-                    // the hand-over's, and nothing changed.
-                    Shown::Refused(why) => Ok(Accepted::Refused(NotAccepted::NotShown(why))),
                     other => Err(PersonError::Held(format!(
                         "a statement made apart was shown, and was {other:?}"
                     ))),
@@ -1823,7 +1820,9 @@ mod tests {
     /// that phrase for another, and adds the key again: the later
     /// hand-over takes the place of the earlier, in its store and in any
     /// store, and the device that accepts joins the phrase the adder
-    /// follows now. The old one, shown again, is not taken.
+    /// follows now. The old one, shown again, is not taken: by its age
+    /// alone on a device that follows no phrase, and whatever its age on
+    /// one that follows another.
     #[test]
     fn test_a_hand_over_under_a_new_phrase_takes_the_place_of_one_under_the_old() {
         let mut s = Several::new(3);
@@ -1834,6 +1833,7 @@ mod tests {
         s.change(0, &[0], &[]);
         assert_eq!(s[0].number(), 3);
         let old = s.hand(0, 1);
+        let (old_made, old_secret) = (s.now, s[0].secret());
         let pair = derive::pair_secret(&s[0].identity, &s.key(1)).unwrap();
         assert_eq!(s[0].stored_in(&pair), std::slice::from_ref(&old.hand_over));
 
@@ -1845,6 +1845,42 @@ mod tests {
         first_statement(&on.conn, &on.identity, &other, &on.label, s.now).unwrap();
         let handed = s.hand(2, 0);
         assert_eq!(s.accept(0, 2, &handed.hand_over), Accepted::Moved(first()));
+
+        // The old one is shown to device 1, which follows no phrase, with
+        // the key of device 0 typed an hour after it was made: nothing
+        // but its age refuses it.
+        let on = &s[1];
+        let shown_old = |to: &Machine, typed_at: i64| {
+            let (typed, entry) = (s.key(0), &old.hand_over);
+            accept(
+                &to.conn,
+                &to.identity,
+                &typed,
+                typed_at,
+                false,
+                entry,
+                typed_at,
+            )
+            .unwrap()
+        };
+        let before = on.everything();
+        assert_eq!(
+            shown_old(on, old_made + HOUR),
+            Accepted::Refused(NotAccepted::NotMadeWithinTheHour)
+        );
+        assert_eq!(on.everything(), before);
+        // A device with that key and nothing else, where the key is typed
+        // one second sooner, takes it: statement 3 of the old phrase.
+        let twin = Machine::new(1);
+        let joined = Applied {
+            number: 3,
+            ..first()
+        };
+        assert_eq!(
+            shown_old(&twin, old_made + HOUR - 1),
+            Accepted::Joined(joined)
+        );
+        assert_eq!(twin.secret(), old_secret);
 
         // It adds device 1 again, under statement 1 of the phrase it
         // follows now.
