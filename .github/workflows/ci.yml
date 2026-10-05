@@ -39,6 +39,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install script
+        run: sh scripts/test-install.sh
+
   coverage:
     runs-on: ubuntu-latest
     steps:
