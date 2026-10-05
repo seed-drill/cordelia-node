@@ -122,6 +122,15 @@ pub struct Added {
 /// Before anything else, and whatever then comes of the adding, the
 /// hand-overs this device made that are not within two hours of `now` go
 /// from its store ([`drop_old_hand_overs`]).
+///
+/// **What the caller owes:** the record is taken here as any record is
+/// ([`see_addition`]), and a key may come to count by it: the key that is
+/// added, and any key that a record it had signed adds in its turn. What
+/// such a key signed was refused when it arrived, and was not kept. So
+/// wherever a record was made ([`Added::record`] is `Some`), the caller
+/// gives [`crate::take::take`] again every entry of this device's own
+/// channels that it gave before, as it does where `take` says that a key
+/// came to count.
 pub fn add_device(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -408,6 +417,17 @@ pub enum NotAccepted {
 /// Before anything else, and whatever then comes of it, the hand-overs
 /// this device itself made that are not within two hours of `now` go from
 /// its store ([`drop_old_hand_overs`]).
+///
+/// **What the caller owes:** nothing here remembers what was taken. A
+/// hand-over is taken by the state the device is in when it is given,
+/// each time it is given with a key typed within the hour. One that was
+/// taken, given again with the same key and the same time of typing, is
+/// judged afresh: a device that joined by it, and then within the hour
+/// made a phrase of its own, with sync off, is moved back. So once this
+/// has succeeded ([`Accepted::Joined`], [`Accepted::Moved`] or
+/// [`Accepted::Applied`]) the caller spends the typed key: it gives that
+/// key, as typed then, to no later call. A person who means it types the
+/// key again.
 pub fn accept(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -744,7 +764,7 @@ mod tests {
         Machine, OTHER_WORDS, Several, change_that_does_not_open_for, entry_by, listed_as,
         signed_in, text,
     };
-    use crate::take::Taken;
+    use crate::take::{NotTaken, Taken, take};
     use cordelia_crypto::change_entry::ForPhrase;
     use cordelia_crypto::phrase::Phrase;
 
@@ -1505,6 +1525,102 @@ mod tests {
         assert_eq!(last.rev, now as u64 + 3_699);
         assert!(last.rev - (now as u64 + 60) > HOUR as u64);
         assert_eq!(typed(2, &last, now + 61), Accepted::Joined(first()));
+    }
+
+    /// What a key signed before it was added was refused, and not kept.
+    /// The device that adds it takes the record as any record is taken:
+    /// the key counts from then, and what it signed is taken when the
+    /// caller gives it again, which is what the caller owes.
+    #[test]
+    fn test_what_a_key_signed_before_it_was_added_is_taken_once_it_is_given_again() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        s.hold(&[0], "notes");
+        let notes = s[0].own("notes");
+        let theirs = entry_by(&s[1].identity, &notes, 1, "a.md", text("early"), &[]);
+        let given = |s: &Several| take(&s[0].conn, &s[0].identity, &theirs, s.now).unwrap();
+        assert_eq!(given(&s), Taken::Refused(NotTaken::SignerDoesNotCount));
+
+        let added = s.hand(0, 1);
+        assert!(added.record.is_some());
+        assert_eq!(added.seen, Some(AdditionSeen::Counted));
+        // Nothing of it was kept, and nothing here gives it again.
+        assert!(s[0].stored_in(&notes).is_empty());
+        assert_eq!(
+            given(&s),
+            Taken::Own {
+                stored: entries::Outcome::Stored,
+                record: None,
+                came_to_count: 0,
+            }
+        );
+    }
+
+    /// Nothing remembers what a device has accepted: a hand-over is taken
+    /// by the state the device is in each time it is given, with a key
+    /// typed within the hour. A device that joined, and then within the
+    /// hour made a phrase of its own, with sync off, is moved back where
+    /// the same hand-over is given again with the same typing. So the
+    /// caller spends the typed key once a hand-over has been taken.
+    #[test]
+    fn test_a_hand_over_given_again_with_the_same_typing_is_judged_afresh() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        let typed_at = s.tick();
+        let (adder, new) = (&s[0], &s[1]);
+        let given = |sync_on: bool, now: i64| {
+            let typed = adder.key();
+            let entry = &added.hand_over;
+            accept(
+                &new.conn,
+                &new.identity,
+                &typed,
+                typed_at,
+                sync_on,
+                entry,
+                now,
+            )
+            .unwrap()
+        };
+        assert_eq!(given(false, typed_at + 1), Accepted::Joined(first()));
+        // Given again as it stands, it brings nothing.
+        assert_eq!(
+            given(false, typed_at + 2),
+            Accepted::Refused(NotAccepted::BringsNoChange)
+        );
+
+        // Within the hour the device makes a phrase of its own. By an act
+        // that is not built here it follows none, and then it makes its
+        // first statement.
+        new.conn
+            .execute_batch(
+                "DELETE FROM person; DELETE FROM person_secrets;
+                 DELETE FROM person_change_entries; DELETE FROM person_additions;
+                 DELETE FROM person_names; DELETE FROM entries;",
+            )
+            .unwrap();
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        first_statement(&new.conn, &new.identity, &other, &new.label, typed_at + 60).unwrap();
+        let follows = || new.held().following.phrase_key;
+        assert_eq!(follows(), other.public_key().unwrap());
+
+        // The same hand-over, with the same typing. With sync on it moves
+        // nothing. With sync off the device is moved back.
+        assert_eq!(
+            given(true, typed_at + 120),
+            Accepted::Refused(NotAccepted::SyncIsOn)
+        );
+        assert_eq!(follows(), other.public_key().unwrap());
+        assert_eq!(given(false, typed_at + 120), Accepted::Moved(first()));
+        assert_eq!(follows(), s.phrase.public_key().unwrap());
+        assert_eq!(new.secret(), adder.secret());
+
+        // The typing is spent by the hour, and by nothing else here.
+        assert_eq!(
+            given(false, typed_at + HOUR),
+            Accepted::Refused(NotAccepted::NotTypedInTheLastHour)
+        );
     }
 
     /// A hand-over holds the person secret, and does not stay in the store
