@@ -210,6 +210,7 @@ impl Machine {
             "person_change_entries",
             "person_additions",
             "person_names",
+            "person_hand_overs",
         ] {
             let mut stmt = self
                 .conn

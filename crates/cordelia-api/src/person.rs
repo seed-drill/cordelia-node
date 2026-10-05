@@ -997,9 +997,37 @@ fn come_to(
         let channel = derive::channel_id(&derive::own_secret(&to.secret, &name.name)?)?;
         held_rows::move_name(conn, &name.name, &channel)?;
     }
+    // What it handed a key under the statement it leaves holds that
+    // statement's secret: the store keeps none of it.
+    drop_hand_overs(conn, |_| false)?;
 
     write_applied(conn, identity, statement, &to.secret, now)?;
     Ok(applied)
+}
+
+/// Drop from the store the hand-overs that this device made (decision
+/// 2026-10-04 §3, §6). A hand-over holds the person secret of the
+/// statement it hands over, and the store is not where a device keeps a
+/// secret: it stays there for as long as a device could take it, and no
+/// longer.
+///
+/// `stays` says, of the time a hand-over says it was made, whether it
+/// stays. What the device keeps of one that goes is its revision, so that
+/// the next it makes for that key is above it. Returns how many went.
+pub(crate) fn drop_hand_overs(
+    conn: &Connection,
+    stays: impl Fn(i64) -> bool,
+) -> Result<usize, PersonError> {
+    let mut dropped = 0;
+    for last in held_rows::hand_overs_held(conn)? {
+        if stays(last.made_at) {
+            continue;
+        }
+        entries::remove_channel(conn, &last.channel)?;
+        held_rows::hand_over_gone(conn, &last.key)?;
+        dropped += 1;
+    }
+    Ok(dropped)
 }
 
 /// A generation: a person secret, and the number of its statement.
@@ -1596,6 +1624,7 @@ mod tests {
             "person_change_entries",
             "person_additions",
             "person_names",
+            "person_hand_overs",
         ] {
             let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
             let columns = stmt.column_count();

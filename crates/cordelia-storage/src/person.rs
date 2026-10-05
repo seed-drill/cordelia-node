@@ -1,6 +1,6 @@
 //! What a device holds of its person (decision 2026-10-04 §3 to §6).
 //!
-//! Five tables, in the node's database, so that everything here changes in
+//! Six tables, in the node's database, so that everything here changes in
 //! one transaction with a statement (§3):
 //!
 //! - **What it follows, and where it stands** (`person`, one row). The
@@ -20,6 +20,10 @@
 //!   (§6).
 //! - **The names it holds** in the current generation (`person_names`),
 //!   each with its channel's ID, so that either is found from the other.
+//! - **The last hand-over it made for each key** (`person_hand_overs`):
+//!   its revision, so that the next is above it, when it says it was
+//!   made, and whether the store still holds it. Never the hand-over,
+//!   which holds the secret (§6).
 //!
 //! Nothing here decides anything: what a statement is to a device, who
 //! counts and what is carried are decided where these are read. A function
@@ -565,6 +569,100 @@ pub fn name_of_channel(
         |row| row.get(0),
     )
     .optional()
+    .map_err(storage)
+}
+
+// ── The last hand-over it made for each key ──────────────────────────
+
+/// What a device keeps of the last hand-over it made for a key (decision
+/// 2026-10-04 §6): where it is, and how it is ordered. Never what it
+/// holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandedOver {
+    /// The key it was made for.
+    pub key: [u8; 32],
+    /// The ID of the pair channel of this device and that key.
+    pub channel: [u8; 32],
+    /// The revision of its entry there: the next is above it.
+    pub rev: u64,
+    /// When it says it was made, in seconds.
+    pub made_at: i64,
+    /// Whether the store still holds its entry.
+    pub held: bool,
+}
+
+fn handed_over_from_row(row: &rusqlite::Row) -> rusqlite::Result<HandedOver> {
+    Ok(HandedOver {
+        key: row.get(0)?,
+        channel: row.get(1)?,
+        rev: row.get::<_, i64>(2)?.max(0) as u64,
+        made_at: row.get(3)?,
+        held: row.get(4)?,
+    })
+}
+
+/// What the device keeps of the last hand-over it made for `key`. `None`
+/// where it has made none for it.
+pub fn handed_over(conn: &Connection, key: &[u8; 32]) -> Result<Option<HandedOver>, CordeliaError> {
+    conn.query_row(
+        "SELECT key, channel, rev, made_at, held FROM person_hand_overs WHERE key = ?1",
+        params![key.as_slice()],
+        handed_over_from_row,
+    )
+    .optional()
+    .map_err(storage)
+}
+
+/// The last hand-over for each key whose entry the store still holds, in
+/// order of the time each says it was made.
+pub fn hand_overs_held(conn: &Connection) -> Result<Vec<HandedOver>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, channel, rev, made_at, held FROM person_hand_overs
+             WHERE held = 1 ORDER BY made_at ASC, key ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt.query_map([], handed_over_from_row).map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// The device has made a hand-over for `key`, and its store holds it: in
+/// the pair channel whose ID is `channel`, at revision `rev`, saying it
+/// was made at `made_at`. It takes the place of what was kept of the one
+/// before for that key.
+pub fn note_hand_over(
+    conn: &Connection,
+    key: &[u8; 32],
+    channel: &[u8; 32],
+    rev: u64,
+    made_at: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_hand_overs (key, channel, rev, made_at, held)
+         VALUES (?1, ?2, ?3, ?4, 1)
+         ON CONFLICT(key) DO UPDATE SET
+             channel = excluded.channel, rev = excluded.rev,
+             made_at = excluded.made_at, held = 1",
+        params![
+            key.as_slice(),
+            channel.as_slice(),
+            i64::try_from(rev).unwrap_or(i64::MAX),
+            made_at,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The store holds the last hand-over for `key` no longer. Its revision
+/// is kept, so that the next one made for that key is above it. Returns
+/// whether the store was said to hold it.
+pub fn hand_over_gone(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "UPDATE person_hand_overs SET held = 0 WHERE key = ?1 AND held = 1",
+        params![key.as_slice()],
+    )
+    .map(|rows| rows > 0)
     .map_err(storage)
 }
 
@@ -1230,6 +1328,68 @@ mod tests {
         assert!(!drop_name(&conn, "team").unwrap());
         assert_eq!(channel_of_name(&conn, "team").unwrap(), None);
         assert_eq!(names(&conn).unwrap().len(), 1);
+    }
+
+    // ── The last hand-over it made for each key ──────────────────────
+
+    /// A device keeps, of the last hand-over it made for each key, where
+    /// it is and how it is ordered. Once the store holds it no longer,
+    /// its revision stays.
+    #[test]
+    fn test_the_last_hand_over_for_a_key_is_kept_by_its_revision_and_no_more() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(handed_over(&conn, &[1; 32]).unwrap(), None);
+        assert!(hand_overs_held(&conn).unwrap().is_empty());
+        assert!(!hand_over_gone(&conn, &[1; 32]).unwrap());
+
+        note_hand_over(&conn, &[1; 32], &[0x71; 32], 500, NOW + 9).unwrap();
+        note_hand_over(&conn, &[2; 32], &[0x72; 32], 7, NOW).unwrap();
+        let first = HandedOver {
+            key: [1; 32],
+            channel: [0x71; 32],
+            rev: 500,
+            made_at: NOW + 9,
+            held: true,
+        };
+        assert_eq!(handed_over(&conn, &[1; 32]).unwrap(), Some(first.clone()));
+        // Those the store holds, in order of when they were made.
+        let held = hand_overs_held(&conn).unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!((held[0].key, held[1].clone()), ([2; 32], first.clone()));
+
+        // The store holds one no longer: its revision stays.
+        assert!(hand_over_gone(&conn, &[1; 32]).unwrap());
+        assert!(!hand_over_gone(&conn, &[1; 32]).unwrap());
+        let gone = HandedOver {
+            held: false,
+            ..first
+        };
+        assert_eq!(handed_over(&conn, &[1; 32]).unwrap(), Some(gone));
+        assert_eq!(hand_overs_held(&conn).unwrap().len(), 1);
+        assert_eq!(handed_over(&conn, &[2; 32]).unwrap().unwrap().rev, 7);
+
+        // The next one for that key takes the place of what was kept.
+        note_hand_over(&conn, &[1; 32], &[0x71; 32], 501, NOW + 60).unwrap();
+        let next = handed_over(&conn, &[1; 32]).unwrap().unwrap();
+        assert_eq!((next.rev, next.made_at, next.held), (501, NOW + 60, true));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM person_hand_overs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        // A key and a channel's ID are 32 bytes, a revision is at least
+        // 1, and whether the store holds it is yes or no.
+        assert!(note_hand_over(&conn, &[3; 32], &[0x73; 32], 0, NOW).is_err());
+        for change in ["key = X'0102'", "channel = X'0102'", "rev = 0", "held = 2"] {
+            assert!(
+                conn.execute(&format!("UPDATE person_hand_overs SET {change}"), [])
+                    .is_err(),
+                "{change}"
+            );
+        }
+        assert_eq!(handed_over(&conn, &[3; 32]).unwrap(), None);
     }
 
     #[test]

@@ -15,13 +15,19 @@
 //! lists is handed the change again, with no record.
 //!
 //! Both wait in the device's store to be sent, and the hand-over goes
-//! ahead of everything else (§6). A pair channel is one channel for as
-//! long as both keys exist, whatever phrase either device follows, and a
-//! statement's number starts again under each phrase. So the hand-over's
-//! revision is the time it was made, by the clock of the device that
-//! adds, or one above the one it made before for that key: what is
-//! handed later takes the place of what was handed before. The revision
-//! only orders them. When a hand-over was made, it says itself.
+//! ahead of everything else (§6). The hand-over holds the person secret,
+//! and does not stay there: it goes two hours after the time it says it
+//! was made ([`drop_old_hand_overs`]), when the device applies a
+//! statement, and when it leaves its phrase. What the device keeps of it
+//! is its revision.
+//!
+//! A pair channel is one channel for as long as both keys exist, whatever
+//! phrase either device follows, and a statement's number starts again
+//! under each phrase. So the hand-over's revision is the time it was
+//! made, by the clock of the device that adds, or one above the one it
+//! made before for that key: what is handed later takes the place of what
+//! was handed before. The revision only orders them. When a hand-over was
+//! made, it says itself.
 //!
 //! ## The device that accepts
 //!
@@ -51,7 +57,9 @@
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{HAND_OVER_NAME, MAX_COUNTED_DEVICES, PAIR_KEY_TYPED_SECS};
+use cordelia_core::protocol::{
+    HAND_OVER_KEPT_SECS, HAND_OVER_NAME, MAX_COUNTED_DEVICES, PAIR_KEY_TYPED_SECS,
+};
 use cordelia_core::revision::next_under;
 use cordelia_crypto::addition::{Addition, SignedAddition};
 use cordelia_crypto::change_entry;
@@ -66,8 +74,8 @@ use cordelia_storage::person::{self as held_rows, Following, State};
 
 use crate::person::{
     AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Refused, Shown, added_name,
-    applied_secret, apply_added, apply_judged, held, in_one, its_own_entry, latest_entry,
-    see_addition, shown,
+    applied_secret, apply_added, apply_judged, drop_hand_overs, held, in_one, its_own_entry,
+    latest_entry, see_addition, shown,
 };
 use crate::publish::Standing;
 
@@ -83,9 +91,9 @@ pub struct Added {
     /// What the record was to this device itself, where one was made.
     pub seen: Option<AdditionSeen>,
     /// The hand-over: this device's entry under the name `hand-over` in
-    /// the pair channel of the two keys, at the time it was made. It is
-    /// in this device's store, in the place of the one it made before for
-    /// that key.
+    /// the pair channel of the two keys, above the one it made before for
+    /// that key. It is in this device's store for two hours, or until the
+    /// device applies a statement or leaves its phrase.
     pub hand_over: CheckedEntry,
 }
 
@@ -110,6 +118,10 @@ pub struct Added {
 /// stands. A key that already counts by a record this device keeps is
 /// handed the change again too, with a record of this device's own: it
 /// takes no room, and the bound of 64 is not asked for it.
+///
+/// Before anything else, and whatever then comes of the adding, the
+/// hand-overs this device made that are not within two hours of `now` go
+/// from its store ([`drop_old_hand_overs`]).
 pub fn add_device(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -117,6 +129,7 @@ pub fn add_device(
     label: &str,
     now: i64,
 ) -> Result<Added, PersonError> {
+    drop_old_hand_overs(conn, now)?;
     in_one(conn, || {
         let standing = Standing::to_write(conn)?;
         let own = identity.public_key();
@@ -153,7 +166,7 @@ pub fn add_device(
             hand_over.addition = Some(record);
         }
 
-        let hand_over = hand_over_written(conn, identity, &pair, &hand_over, now)?;
+        let hand_over = hand_over_written(conn, identity, new, &pair, &hand_over, now)?;
         Ok(Added {
             record: added.0,
             seen: added.1,
@@ -229,8 +242,9 @@ fn own_addition(
 }
 
 /// Write the hand-over as this device's entry under the name `hand-over`
-/// in the pair channel whose secret is `pair`. A hand-over that the device
-/// it is for would refuse is not written.
+/// in the pair channel whose secret is `pair`, which is its channel with
+/// the key `new`. A hand-over that the device it is for would refuse is
+/// not written.
 ///
 /// A pair channel is of no generation, and a revision in it is a plain
 /// number (decision 2026-10-04 §2.3). It is one channel for as long as
@@ -238,9 +252,11 @@ fn own_addition(
 /// that starts again under a phrase can number its entries. The entry's
 /// revision is the time it is made, by this device's clock, in seconds:
 /// what is handed later takes the place of what was handed before, in
-/// this device's store and at a relay. Where this device's own entry
-/// there is already at that time or above it (two made in one second, or
-/// a clock that was set back), it is one above that entry.
+/// this device's store and at a relay. Where the last hand-over this
+/// device made for that key is already at that time or above it (two made
+/// in one second, or a clock that was set back), it is one above that
+/// one. The device keeps the revision of the last for each key, whether
+/// or not its store still holds the hand-over.
 ///
 /// The revision orders the hand-overs, and says nothing else: it can run
 /// ahead of the clock for good. When the hand-over was made is in the
@@ -248,14 +264,12 @@ fn own_addition(
 fn hand_over_written(
     conn: &Connection,
     identity: &NodeIdentity,
+    new: &[u8; 32],
     pair: &[u8; 32],
     hand_over: &HandOver,
     now: i64,
 ) -> Result<CheckedEntry, PersonError> {
-    let channel = derive::channel_id(pair)?;
-    let slot = slot_id(&derive::slot_key(pair)?, HAND_OVER_NAME);
-    let before = entries::author_entry(conn, &channel, &slot, &identity.public_key())?
-        .map(|held| held.entry.rev);
+    let before = held_rows::handed_over(conn, new)?.map(|last| last.rev);
     let made_at = at(now);
     let rev = match before {
         Some(before) if before >= made_at => before + 1,
@@ -268,7 +282,34 @@ fn hand_over_written(
     };
     let entry = Entry::seal(pair, identity, rev, &inside)?.check()?;
     entries::store(conn, &entry, now)?;
+    let said = i64::try_from(hand_over.made_at).unwrap_or(i64::MAX);
+    held_rows::note_hand_over(conn, new, &entry.channel, rev, said)?;
     Ok(entry)
+}
+
+/// Drop from this device's store each hand-over it made that is not
+/// within two hours of now, by the time the hand-over says it was made
+/// (decision 2026-10-04 §3, §6). `now` is this device's clock, in
+/// seconds. Returns how many went.
+///
+/// A hand-over holds the person secret. No device takes one two hours
+/// after it was made: a key opens the pair channel for an hour, and only
+/// for a hand-over made within the hour of its typing. One that says a
+/// time two hours or more ahead of the clock was made by a clock that has
+/// since been set back, and no key typed by now takes it: it goes too,
+/// and does not wait for a time that may be years away.
+///
+/// The node calls this as it goes. A device also does it first wherever
+/// it adds or accepts, whatever then comes of that, and every hand-over
+/// goes where the device applies a statement or leaves its phrase.
+pub fn drop_old_hand_overs(conn: &Connection, now: i64) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        drop_hand_overs(conn, |made_at| {
+            now.checked_sub(made_at)
+                .and_then(i64::checked_abs)
+                .is_some_and(|apart| apart < HAND_OVER_KEPT_SECS)
+        })
+    })
 }
 
 // ── The device that accepts ──────────────────────────────────────────
@@ -364,6 +405,9 @@ pub enum NotAccepted {
 /// documentation, and [`Accepted`]).
 ///
 /// An error is this device's, and not the hand-over's: nothing changed.
+/// Before anything else, and whatever then comes of it, the hand-overs
+/// this device itself made that are not within two hours of `now` go from
+/// its store ([`drop_old_hand_overs`]).
 pub fn accept(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -373,6 +417,7 @@ pub fn accept(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Accepted, PersonError> {
+    drop_old_hand_overs(conn, now)?;
     let accepted = in_one(conn, || {
         let hand_over = match hand_over_in(identity, typed, typed_at, entry, now)? {
             Ok(hand_over) => hand_over,
@@ -671,12 +716,13 @@ fn is_alone(conn: &Connection, held: &Held, own: &[u8; 32]) -> Result<bool, Pers
 /// What it follows, its statement and the change entry it keeps are
 /// replaced where it applies the statement it is handed. It keeps no
 /// record of an addition, and no entry of a statement made apart: it is
-/// alone, and in no fork. What it wrote in a pair channel stays, since
-/// that channel is of no generation, and what it hands the same key next
-/// is written above it.
+/// alone, and in no fork. The hand-overs it made go too: each holds a
+/// secret of the phrase it leaves. The revision of each stays, and what
+/// it hands the same key next is written above it.
 fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     // What is held holds together: the secret applied is the statement's.
     applied_secret(conn, &held.statement.statement)?;
+    drop_hand_overs(conn, |_| false)?;
     let names = held_rows::names(conn)?;
     for generation in held_rows::secrets(conn)? {
         let personal = derive::personal_secret(&generation.secret)?;
@@ -875,7 +921,10 @@ mod tests {
             std::slice::from_ref(&set_back.hand_over)
         );
         // A clock that says a time before 1970 gives no revision: nothing
-        // is written.
+        // is written. What the device handed before says a time far ahead
+        // of such a clock, and goes first.
+        assert_eq!(drop_old_hand_overs(&adder.conn, -5).unwrap(), 1);
+        assert!(adder.stored_in(&pair).is_empty());
         let before = adder.everything();
         let fresh = Machine::new(8);
         assert!(matches!(
@@ -950,9 +999,9 @@ mod tests {
         let added = add_device(&adder.conn, &adder.identity, &listed.key(), "", now).unwrap();
         assert_eq!((added.record, added.seen), (None, None));
         assert!(held_rows::additions(&adder.conn).unwrap().is_empty());
-        // Nothing is written but the hand-over, which takes the place of
-        // the one that added the device.
-        assert_eq!(adder.stored().len(), before);
+        // Nothing is written but the hand-over. The one that added the
+        // device went from the store when the change was applied.
+        assert_eq!(adder.stored().len(), before + 1);
         assert!(adder.stored().contains(&added.hand_over));
         assert_eq!(added.hand_over.rev, now as u64);
 
@@ -1443,20 +1492,214 @@ mod tests {
         // above the one before: the last is at a revision more than an
         // hour ahead of the clock, and is taken all the same.
         let first_of_them = add(2, now);
-        let pair = derive::pair_secret(&adder.identity, &s.key(2)).unwrap();
-        let the_3699th = entry_by(
-            &adder.identity,
-            &pair,
+        // What the device keeps of the 3,699th: its revision.
+        held_rows::note_hand_over(
+            &adder.conn,
+            &s.key(2),
+            &first_of_them.channel,
             first_of_them.rev + 3_698,
-            HAND_OVER_NAME,
-            text("as the 3,699th left it"),
-            &[],
-        );
-        entries::store(&adder.conn, &the_3699th, now).unwrap();
+            now + 59,
+        )
+        .unwrap();
         let last = add(2, now + 60);
         assert_eq!(last.rev, now as u64 + 3_699);
         assert!(last.rev - (now as u64 + 60) > HOUR as u64);
         assert_eq!(typed(2, &last, now + 61), Accepted::Joined(first()));
+    }
+
+    /// A hand-over holds the person secret, and does not stay in the store
+    /// of the device that made it: it goes two hours after the time it
+    /// says it was made. What the device keeps of it is its revision, and
+    /// the next it makes for that key is above it.
+    #[test]
+    fn test_a_hand_over_leaves_the_store_two_hours_after_the_time_it_says() {
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        let now = s.now;
+        let adder = &s[0];
+        let pair = |new: usize| derive::pair_secret(&adder.identity, &s.key(new)).unwrap();
+        let add = |new: usize, at: i64| {
+            add_device(&adder.conn, &adder.identity, &s.key(new), "new", at)
+                .unwrap()
+                .hand_over
+        };
+        let drop_at = |at: i64| drop_old_hand_overs(&adder.conn, at).unwrap();
+        let kept = |new: usize| {
+            let last = held_rows::handed_over(&adder.conn, &s.key(new)).unwrap();
+            let last = last.unwrap();
+            (last.rev, last.made_at, last.held)
+        };
+
+        // One second short of two hours after it was made, it stays.
+        let made = add(1, now);
+        assert_eq!(drop_at(now + 2 * HOUR - 1), 0);
+        assert_eq!(adder.stored_in(&pair(1)), std::slice::from_ref(&made));
+        assert_eq!(kept(1), (made.rev, now, true));
+        // At two hours it goes, and what is kept is its revision.
+        let others = adder.stored().len() - 1;
+        assert_eq!(drop_at(now + 2 * HOUR), 1);
+        assert!(adder.stored_in(&pair(1)).is_empty());
+        assert_eq!(adder.stored().len(), others);
+        assert_eq!(kept(1), (made.rev, now, false));
+        assert_eq!(drop_at(now + 3 * HOUR), 0);
+
+        // The next for that key is above it, though the store holds none
+        // and the clock was set back.
+        let next = add(1, now - 100);
+        assert_eq!(next.rev, made.rev + 1);
+        assert_eq!(adder.stored_in(&pair(1)), std::slice::from_ref(&next));
+        assert_eq!(kept(1), (made.rev + 1, now - 100, true));
+
+        // A device that adds drops them first: two hours after the time
+        // that one says, it is gone.
+        let later = add(2, now - 100 + 2 * HOUR);
+        assert!(adder.stored_in(&pair(1)).is_empty());
+        assert_eq!(adder.stored_in(&pair(2)), std::slice::from_ref(&later));
+        // A device that accepts drops them first, whatever comes of what
+        // it is given.
+        let at = now - 100 + 4 * HOUR;
+        let given = accept(
+            &adder.conn,
+            &adder.identity,
+            &s.key(3),
+            at,
+            false,
+            &later,
+            at,
+        );
+        assert_eq!(
+            given.unwrap(),
+            Accepted::Refused(NotAccepted::NotThePairChannel)
+        );
+        assert!(adder.stored_in(&pair(2)).is_empty());
+        assert_eq!(kept(2), (later.rev, now - 100 + 2 * HOUR, false));
+        // So does one that fails: this device does not add itself.
+        let again = add(2, at);
+        assert!(
+            add_device(
+                &adder.conn,
+                &adder.identity,
+                &adder.key(),
+                "",
+                at + 2 * HOUR
+            )
+            .is_err()
+        );
+        assert!(adder.stored_in(&pair(2)).is_empty());
+        assert_eq!(kept(2), (again.rev, at, false));
+
+        // One that says a time two hours or more ahead of the clock was
+        // made by a clock since set back. It goes too, and does not wait
+        // for that time.
+        let ahead = add(3, now + 10 * HOUR);
+        assert_eq!(drop_at(now + 8 * HOUR + 1), 0);
+        assert_eq!(adder.stored_in(&pair(3)), std::slice::from_ref(&ahead));
+        assert_eq!(drop_at(now + 8 * HOUR), 1);
+        assert!(adder.stored_in(&pair(3)).is_empty());
+        // The next is above it, hours ahead of the clock.
+        assert_eq!(add(3, now + 8 * HOUR).rev, ahead.rev + 1);
+    }
+
+    /// Every hand-over a device made goes from its store when it applies
+    /// a statement: each holds the secret of the statement it leaves. The
+    /// next it makes for a key is above the last all the same.
+    #[test]
+    fn test_a_hand_over_leaves_the_store_when_a_statement_is_applied() {
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        assert!(matches!(s.add(0, 1), Accepted::Joined(_)));
+        let pair = |s: &Several, of: usize, new: usize| {
+            derive::pair_secret(&s[of].identity, &s.key(new)).unwrap()
+        };
+        let kept = |s: &Several, of: usize, new: usize| {
+            let last = held_rows::handed_over(&s[of].conn, &s.key(new)).unwrap();
+            let last = last.unwrap();
+            (last.rev, last.held)
+        };
+
+        // Each of the two has handed a key the change, and each holds
+        // what it handed.
+        let by_0 = s.hand(0, 2).hand_over;
+        let by_1 = s.hand(1, 3).hand_over;
+        assert_eq!(s[0].stored_in(&pair(&s, 0, 2)), std::slice::from_ref(&by_0));
+        assert_eq!(s[1].stored_in(&pair(&s, 1, 3)), std::slice::from_ref(&by_1));
+        // The one that added device 1 is there still, too.
+        assert_eq!(s[0].stored_in(&pair(&s, 0, 1)).len(), 1);
+
+        // Device 0 makes a change, and applies it as it is shown it:
+        // everything it handed is gone.
+        let now = s.now;
+        let change = s.change(0, &[0, 1], &[]);
+        assert!(s[0].stored_in(&pair(&s, 0, 2)).is_empty());
+        assert!(s[0].stored_in(&pair(&s, 0, 1)).is_empty());
+        assert_eq!(kept(&s, 0, 2), (by_0.rev, false));
+        // Device 1 is handed the change, and applies it as it accepts:
+        // what it handed is gone.
+        let handed = s.hand(0, 1).hand_over;
+        assert!(matches!(s.accept(1, 0, &handed), Accepted::Applied(_)));
+        assert_eq!(s[1].latest(), change);
+        assert!(s[1].stored_in(&pair(&s, 1, 3)).is_empty());
+        assert_eq!(kept(&s, 1, 3), (by_1.rev, false));
+
+        // The next that device 0 makes for the key is above the last,
+        // though it is made at a time before it and the store held none.
+        let adder = &s[0];
+        let next = add_device(
+            &adder.conn,
+            &adder.identity,
+            &s.key(2),
+            "device 2",
+            now - 50,
+        );
+        let next = next.unwrap().hand_over;
+        assert_eq!(next.rev, by_0.rev + 1);
+        assert_eq!(adder.stored_in(&pair(&s, 0, 2)), [next]);
+    }
+
+    /// Every hand-over a device made goes from its store when it leaves
+    /// its phrase for another: each holds a secret of the phrase it
+    /// leaves. The next it makes for a key is above the last all the
+    /// same.
+    ///
+    /// A device that has added a key is not alone, and one that applies a
+    /// statement drops what it handed: nothing here leaves a device alone
+    /// with a hand-over in its store. This one is put there by hand, as
+    /// a device would be that had lost the record it made. Leaving does
+    /// not lean on the other two.
+    #[test]
+    fn test_a_hand_over_leaves_the_store_when_the_device_leaves_its_phrase() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        let old = s.hand(0, 1).hand_over;
+        let made = s.now;
+        held_rows::clear_additions(&s[0].conn).unwrap();
+        let pair = derive::pair_secret(&s[0].identity, &s.key(1)).unwrap();
+        assert_eq!(s[0].stored_in(&pair), std::slice::from_ref(&old));
+        let old_secret = s[0].secret();
+        assert_eq!(hand_over_of(&s, 0, &s.key(1), &old).secret, old_secret);
+
+        // It leaves its phrase for the one that device 2 made.
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let on = &s[2];
+        first_statement(&on.conn, &on.identity, &other, &on.label, s.now).unwrap();
+        let handed = s.hand(2, 0);
+        assert_eq!(s.accept(0, 2, &handed.hand_over), Accepted::Moved(first()));
+        assert_ne!(s[0].secret(), old_secret);
+        // What it handed under the phrase it left is gone, and its
+        // revision is kept.
+        assert!(s[0].stored_in(&pair).is_empty());
+        let adder = &s[0];
+        let last = held_rows::handed_over(&adder.conn, &s.key(1)).unwrap();
+        let last = last.unwrap();
+        assert_eq!((last.rev, last.held), (old.rev, false));
+
+        // It adds device 1 again under the phrase it follows now, in the
+        // second in which it made the old one: the new one is above it.
+        let new = add_device(&adder.conn, &adder.identity, &s.key(1), "device 1", made);
+        let new = new.unwrap().hand_over;
+        assert_eq!(new.rev, old.rev + 1);
+        assert_eq!(adder.stored_in(&pair), std::slice::from_ref(&new));
+        assert_eq!(hand_over_of(&s, 0, &s.key(1), &new).secret, adder.secret());
     }
 
     /// A pair channel is one channel whatever phrase either device

@@ -1113,6 +1113,14 @@ pub const HAND_OVER_NAME: &str = "hand-over";
 /// was handed long ago is not taken for what a person means now.
 pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
 
+/// How long the device that adds keeps a hand-over in its store, from the
+/// time the hand-over says it was made: two hours (decision 2026-10-04 §3,
+/// §6). A hand-over holds the person secret. No device takes one that was
+/// made an hour or more before a key was typed, and a typed key opens the
+/// pair channel for an hour: after two hours nobody can take it.
+/// Derived: twice PAIR_KEY_TYPED_SECS.
+pub const HAND_OVER_KEPT_SECS: i64 = 2 * PAIR_KEY_TYPED_SECS;
+
 /// The most records of additions a hand-over carries (decision 2026-10-04
 /// §6): the record of the addition, and the record of the adder's own
 /// addition. A chain of additions is two long at most.
@@ -1850,6 +1858,8 @@ mod tests {
         assert_eq!(HAND_OVER_NAME, "hand-over");
         // A typed key opens its pair channel for an hour.
         assert_eq!(PAIR_KEY_TYPED_SECS, 3_600);
+        // The device that adds keeps a hand-over for two hours.
+        assert_eq!(HAND_OVER_KEPT_SECS, 7_200);
         assert_eq!(MAX_HAND_OVER_RECORDS, 2);
         assert_eq!(HAND_OVER_CHANGE_ENTRY_BYTES, 192 + 32_768);
         assert_eq!(MAX_HAND_OVER_BYTES, 54_275);

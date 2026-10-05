@@ -352,6 +352,10 @@ INSERT OR IGNORE INTO counters (name, value) VALUES ('entry_seq', 0);
 ///   applied statement, in the order it saw them, each counted or not.
 /// - `person_names`: the names it holds in the current generation, each
 ///   with its channel's ID, so that either is found from the other.
+/// - `person_hand_overs`: for each key it has handed the change to, the
+///   pair channel of the two, the revision of the last hand-over it made
+///   there, when that one says it was made, and whether the store still
+///   holds it. Never the hand-over itself, which holds the secret (§6).
 const MIGRATION_V12: &str = r#"
 CREATE TABLE person (
     one             INTEGER PRIMARY KEY CHECK(one = 1),
@@ -397,6 +401,14 @@ CREATE TABLE person_names (
     name     TEXT PRIMARY KEY CHECK(length(name) >= 1),
     channel  BLOB NOT NULL UNIQUE CHECK(length(channel) = 32),
     held_at  INTEGER NOT NULL
+);
+
+CREATE TABLE person_hand_overs (
+    key      BLOB PRIMARY KEY CHECK(length(key) = 32),
+    channel  BLOB NOT NULL CHECK(length(channel) = 32),
+    rev      INTEGER NOT NULL CHECK(rev >= 1),
+    made_at  INTEGER NOT NULL,
+    held     INTEGER NOT NULL CHECK(held IN (0, 1))
 );
 "#;
 
@@ -1211,11 +1223,12 @@ mod tests {
     }
 
     /// The tables and the index that the step to version 12 adds.
-    const NEW_IN_V12: [&str; 6] = [
+    const NEW_IN_V12: [&str; 7] = [
         "idx_person_secrets_applied",
         "person",
         "person_additions",
         "person_change_entries",
+        "person_hand_overs",
         "person_names",
         "person_secrets",
     ];
@@ -1314,7 +1327,7 @@ mod tests {
     }
 
     /// A database at version 11 that an older binary wrote is taken to
-    /// version 12 with everything it held as it was: the step adds five
+    /// version 12 with everything it held as it was: the step adds six
     /// tables and an index, with nothing in them, and touches nothing
     /// else. A device that takes this version follows no phrase.
     #[test]
