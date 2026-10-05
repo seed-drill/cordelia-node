@@ -35,16 +35,21 @@
 //! pages, so an entry that replaces one of its size changes nothing (§16).
 //!
 //! - One channel may hold only so much ([`Room::max_channel_bytes`]).
-//! - At its cap ([`Room::max_bytes`]) a relay takes no channel that it
-//!   does not hold.
+//! - A write that would take the relay past its cap ([`Room::max_bytes`])
+//!   is refused before anything is stored: the first entry of a channel
+//!   that it does not hold, and an entry that makes a channel it holds
+//!   hold more. So at its cap a relay takes no new channel, and no write
+//!   makes it drop anything that it holds.
 //! - A newer revision of an entry it holds, that is no larger, is never
 //!   refused for room.
-//! - A write that takes it over its cap makes it drop the channels it has
-//!   held for the shortest time, until it is under ([`make_room`]). If the
-//!   channel written to is among them, the write did not stay, and is
-//!   refused.
-//! - One address may make it take only so many new channels in an hour.
-//!   A relay that the operator lists is not counted.
+//! - A relay that holds more than its cap drops the channels it has held
+//!   for the shortest time, until it is under ([`make_room`]). That is for
+//!   a relay whose cap came down, and for its operator: whoever runs the
+//!   relay calls it.
+//! - One address may make it take only so many new channels in an hour:
+//!   it is counted for each channel that the relay takes from it, and for
+//!   none that was refused. A relay that the operator lists is not
+//!   counted.
 //!
 //! ## How long it has held a channel
 //!
@@ -199,9 +204,9 @@ pub enum Refused {
     /// It is not signed as it must be: a signature does not hold, or a
     /// key is one that anyone can sign for.
     NotSigned(EntryError),
-    /// The relay is at its cap and does not hold the entry's channel, or
-    /// the write took it over its cap and its channel was among those it
-    /// dropped.
+    /// With the entry the relay would hold more than its cap: the first
+    /// entry of a channel that it does not hold, or one that makes a
+    /// channel it holds hold more. Nothing was stored.
     NoRoom,
     /// The entry's channel holds as much as one channel may.
     ChannelFull,
@@ -340,26 +345,31 @@ fn taken(
         None => 0,
     };
 
+    // What the channel would hold with this entry, less what it replaces,
+    // and how much more that is than it holds. A write that makes it hold
+    // no more is always taken: a newer revision, of an entry the relay
+    // holds, that is no larger.
     let held = held_channel(conn, &entry.channel)?;
-    if held.is_none() {
-        // A channel the relay does not hold: only if it is under its cap,
-        // and the address has not made it take too many lately.
-        if used_bytes(conn)? >= room.max_bytes {
-            return Ok(Taken::Refused(Refused::NoRoom));
-        }
-        if let Asker::Address(address) = asker
-            && !room.may_add_channel(*address, now)
-        {
-            return Ok(Taken::Refused(Refused::OverAllowance));
-        }
-    }
-
-    // What the channel would hold with this entry, less what it replaces.
-    // A write that does not make the channel hold more is always taken: a
-    // newer revision, of an entry the relay holds, that is no larger.
     let holds = held.map_or(0, |held| held.bytes);
     let after = holds.saturating_sub(replaced) + entry_cost(entry.content.len());
-    if after > room.max_channel_bytes && after > holds {
+    let more = after.saturating_sub(holds);
+
+    // A write that would take the relay past its cap is refused here,
+    // before anything is stored: no entry, no row, and nothing counted
+    // against the address. The first entry of a channel it does not hold
+    // is all of it more.
+    if more > 0 && used_bytes(conn)?.saturating_add(more) > room.max_bytes {
+        return Ok(Taken::Refused(Refused::NoRoom));
+    }
+    // A channel the relay does not hold: only if the address has not made
+    // it take too many lately.
+    if held.is_none()
+        && let Asker::Address(address) = asker
+        && !room.may_add_channel(*address, now)
+    {
+        return Ok(Taken::Refused(Refused::OverAllowance));
+    }
+    if more > 0 && after > room.max_channel_bytes {
         return Ok(Taken::Refused(Refused::ChannelFull));
     }
 
@@ -392,16 +402,12 @@ fn taken(
                 params![entry.channel.as_slice(), since, now, to_sql(bytes)],
             )
             .map_err(storage)?;
+            // The address is counted for a channel that the relay took,
+            // and that stays: nothing drops it for room.
             if let Asker::Address(address) = asker {
                 room.added_channel(*address, now);
             }
         }
-    }
-
-    // Only a write that makes the relay hold more can take it over its
-    // cap: one that does not is never refused for room.
-    if after > holds && dropped_for_room(conn, room.max_bytes)?.contains(&entry.channel) {
-        return Ok(Taken::Refused(Refused::NoRoom));
     }
     Ok(Taken::Stored)
 }
@@ -426,6 +432,10 @@ pub fn used_bytes(conn: &Connection) -> Result<u64, CordeliaError> {
 ///
 /// So what was there first is never pushed out by what came later
 /// (decision 2026-10-04 §2.5).
+///
+/// No write makes a relay hold more than its cap, so this is for a relay
+/// whose cap came down, and for its operator. Whoever runs the relay
+/// calls it with the relay's cap: nothing here calls it for a write.
 ///
 /// Refused, with nothing dropped, on a database in which a device follows
 /// a phrase.
@@ -1609,10 +1619,172 @@ mod tests {
         assert_eq!(counted(&conn), 2 * SMALL);
     }
 
-    /// A write that takes a relay over its cap makes it drop the channels
-    /// it has held for the shortest time. What was there first is never
-    /// pushed out by what came later, and a write to the newest channel
-    /// does not stay.
+    /// One byte under its cap a relay has no room for the first entry of
+    /// a channel it does not hold. It is refused before anything is
+    /// stored: no entry, no row, and nothing counted against the address.
+    /// So refusals for room do not use up an address's allowance.
+    #[test]
+    fn test_a_byte_under_its_cap_a_new_channels_first_entry_is_refused_and_nothing_is_stored() {
+        let address = IpAddr::from([192, 0, 2, 2]);
+        let (conn, mut room) = relay_of(SMALL + 1);
+        assert_eq!(
+            take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(counted(&conn) + 1, room.max_bytes);
+        // What the store has written, in all: one entry, at one place.
+        let written = |conn: &Connection| -> (i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM entries),
+                        (SELECT value FROM counters WHERE name = 'entry_seq'),
+                        (SELECT COUNT(*) FROM relay_channels)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(written(&conn), (1, 1, 1));
+
+        // The first entry of a channel it does not hold, pushed and
+        // shown, from an address and from a relay that the operator
+        // lists: with it the relay would pass its cap, by all but a byte
+        // of the entry.
+        for asker in [from(2), LISTED, listed_since(NOW - DAY)] {
+            assert_eq!(
+                take(&conn, &mut room, &small(2, 1, 5), &asker, NOW + 10).unwrap(),
+                Taken::Refused(Refused::NoRoom)
+            );
+            assert_eq!(
+                show(&conn, &mut room, &small(2, 1, 5), &asker, NOW + 10).unwrap(),
+                Shown::Refused(Refused::NoRoom)
+            );
+        }
+        // Nothing was stored for it, also not for a moment: the store has
+        // given out no place. No row was made, and nothing was dropped.
+        assert_eq!(written(&conn), (1, 1, 1));
+        assert_eq!(held(&conn), [1]);
+        assert_eq!(counted(&conn), SMALL);
+        // And the address was not counted.
+        assert!(!room.new_channels.contains_key(&address));
+
+        // 256 such refusals, each of another channel, do not use up the
+        // address's allowance.
+        let firsts: Vec<CheckedEntry> = (2..258).map(|c| small(c, 1, 5)).collect();
+        assert_eq!(firsts.len(), NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR);
+        for entry in &firsts {
+            assert_eq!(
+                take(&conn, &mut room, entry, &from(2), NOW + 20).unwrap(),
+                Taken::Refused(Refused::NoRoom)
+            );
+        }
+        assert_eq!(written(&conn), (1, 1, 1));
+        assert!(!room.new_channels.contains_key(&address));
+        assert!(room.may_add_channel(address, NOW + 20));
+
+        // With room, in that same hour, the address makes the relay take
+        // every one of them: it has all of its allowance. The one after
+        // is over it.
+        room.max_bytes = u64::MAX;
+        for entry in &firsts {
+            assert_eq!(
+                take(&conn, &mut room, entry, &from(2), NOW + 30).unwrap(),
+                Taken::Stored
+            );
+        }
+        assert_eq!(room.new_channels[&address].len(), 256);
+        assert_eq!(
+            take(&conn, &mut room, &small(258, 1, 5), &from(2), NOW + 30).unwrap(),
+            Taken::Refused(Refused::OverAllowance)
+        );
+
+        // To the byte: with room for the entry and no more, it is taken.
+        let (conn, mut room) = relay_of(2 * SMALL);
+        take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
+        assert_eq!(
+            take(&conn, &mut room, &small(2, 1, 5), &from(2), NOW).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(counted(&conn), room.max_bytes);
+    }
+
+    /// A write that would make the relay's newest channel hold more, past
+    /// the relay's cap, is refused, and the channel keeps what it held:
+    /// its hundred entries are still there.
+    #[test]
+    fn test_a_growing_write_to_the_newest_channel_is_refused_and_what_it_held_stays() {
+        let (conn, mut room) = relay();
+        take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
+        // The newest channel: a hundred entries, of a hundred authors.
+        for d in 1..=100 {
+            take(&conn, &mut room, &small(2, d, 5), &from(1), NOW + 10).unwrap();
+        }
+        let before = (ids(&conn, 1), ids(&conn, 2));
+        assert_eq!(before.1.len(), 100);
+        let row = held_channel(&conn, &channel(2)).unwrap();
+        // The relay is at its cap.
+        room.max_bytes = counted(&conn);
+        assert_eq!(room.max_bytes, 101 * SMALL);
+
+        // One entry more in the newest channel, and a larger revision of
+        // one that it holds there: pushed and shown, each is refused.
+        let larger = made(2, 1, 6, "notes.md", &"x".repeat(300));
+        assert_eq!(larger.content.len(), 512);
+        for entry in [small(2, 101, 5), larger] {
+            assert_eq!(
+                take(&conn, &mut room, &entry, &from(1), NOW + 20).unwrap(),
+                Taken::Refused(Refused::NoRoom)
+            );
+            assert_eq!(
+                show(&conn, &mut room, &entry, &from(1), NOW + 20).unwrap(),
+                Shown::Refused(Refused::NoRoom)
+            );
+        }
+        // Its hundred entries are still there, and its row is as it was.
+        assert_eq!((ids(&conn, 1), ids(&conn, 2)), before);
+        assert_eq!(held_channel(&conn, &channel(2)).unwrap(), row);
+        assert_eq!(held(&conn), [1, 2]);
+        assert_eq!(counted(&conn), 101 * SMALL);
+
+        // An older channel that would hold more is refused the same: no
+        // write makes a relay drop what it holds, the newest channel no
+        // more than any other.
+        assert_eq!(
+            take(&conn, &mut room, &small(1, 2, 5), &from(1), NOW + 30).unwrap(),
+            Taken::Refused(Refused::NoRoom)
+        );
+        assert_eq!((ids(&conn, 1), ids(&conn, 2)), before);
+        assert_eq!(held(&conn), [1, 2]);
+
+        // What makes neither hold more is taken, in each.
+        for c in [1, 2] {
+            assert_eq!(
+                take(&conn, &mut room, &small(c, 1, 6), &from(1), NOW + 40).unwrap(),
+                Taken::Stored
+            );
+        }
+        assert_eq!(ids(&conn, 2).len(), 100);
+        assert_eq!(counted(&conn), 101 * SMALL);
+
+        // To the byte: one byte short of room for an entry more, it is
+        // refused, and with room for it and no more, it is taken.
+        room.max_bytes = 102 * SMALL - 1;
+        assert_eq!(
+            take(&conn, &mut room, &small(2, 101, 5), &from(1), NOW + 50).unwrap(),
+            Taken::Refused(Refused::NoRoom)
+        );
+        room.max_bytes = 102 * SMALL;
+        assert_eq!(
+            take(&conn, &mut room, &small(2, 101, 5), &from(1), NOW + 50).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(ids(&conn, 2).len(), 101);
+        assert_eq!(counted(&conn), room.max_bytes);
+    }
+
+    /// A relay that holds more than its cap, since its cap came down,
+    /// drops the channels it has held for the shortest time when room is
+    /// made. What was there first is never pushed out by what came later.
+    /// No write makes it drop anything.
     #[test]
     fn test_a_relay_over_its_cap_drops_the_newest_channel() {
         let (conn, mut room) = relay_of(3 * SMALL);
@@ -1624,56 +1796,49 @@ mod tests {
         }
         assert_eq!(counted(&conn), room.max_bytes);
 
-        // The oldest channel comes to hold more: the newest goes, with
-        // its entries, and the write stays.
-        let more = small(1, 2, 5);
-        assert_eq!(
-            take(&conn, &mut room, &more, &from(1), NOW + 30).unwrap(),
-            Taken::Stored
-        );
-        assert_eq!(held(&conn), [1, 2]);
-        assert!(ids(&conn, 3).is_empty());
-        assert_eq!(ids(&conn, 1).len(), 2);
+        // Its cap comes down, to what two of the three take. It holds
+        // more than its cap now.
+        room.max_bytes = 2 * SMALL;
+        // No write brings it under: what would make it hold more is
+        // refused, in the oldest channel and in the newest, and what
+        // makes it hold no more is taken. All three channels stay.
+        for c in [1, 3] {
+            assert_eq!(
+                take(&conn, &mut room, &small(c, 2, 5), &from(1), NOW + 30).unwrap(),
+                Taken::Refused(Refused::NoRoom)
+            );
+            assert_eq!(
+                take(&conn, &mut room, &small(c, 1, 6), &from(1), NOW + 30).unwrap(),
+                Taken::Stored
+            );
+        }
+        assert_eq!(held(&conn), [1, 2, 3]);
         assert_eq!(counted(&conn), 3 * SMALL);
 
-        // The newest channel comes to hold more: it is the one that goes,
-        // and the write did not stay.
-        assert_eq!(
-            take(&conn, &mut room, &small(2, 2, 5), &from(1), NOW + 40).unwrap(),
-            Taken::Refused(Refused::NoRoom)
-        );
-        assert_eq!(held(&conn), [1]);
-        assert!(ids(&conn, 2).is_empty());
+        // Room is made, with the relay's cap: the newest channel goes,
+        // with its entries, and the two that were there before it stay.
+        assert_eq!(make_room(&conn, room.max_bytes).unwrap(), [channel(3)]);
+        assert_eq!(held(&conn), [1, 2]);
+        assert!(ids(&conn, 3).is_empty());
+        assert_eq!((ids(&conn, 1).len(), ids(&conn, 2).len()), (1, 1));
         assert_eq!(counted(&conn), 2 * SMALL);
+        // It is under its cap: made again, nothing more goes.
+        assert!(make_room(&conn, room.max_bytes).unwrap().is_empty());
 
-        // A new channel that fits is taken, and one write more than fits
-        // drops it again and nothing else. Shown, it is the same.
-        assert_eq!(
-            take(&conn, &mut room, &small(4, 1, 5), &from(1), NOW + 50).unwrap(),
-            Taken::Stored
-        );
-        assert_eq!(
-            show(&conn, &mut room, &small(4, 2, 5), &from(1), NOW + 60).unwrap(),
-            Shown::Refused(Refused::NoRoom)
-        );
-        assert_eq!(held(&conn), [1]);
-
-        // Enough is dropped to be under: one large write to the oldest
-        // drops as many of the newest as it takes.
+        // Enough is dropped to be under: as many of the newest as it
+        // takes, and no more.
         room.max_bytes = 5 * SMALL;
         for (c, at) in [(5, NOW + 70), (6, NOW + 80), (7, NOW + 90)] {
             take(&conn, &mut room, &small(c, 1, 5), &from(1), at).unwrap();
         }
-        assert_eq!(held(&conn), [1, 5, 6, 7]);
-        assert_eq!(counted(&conn), 5 * SMALL);
-        let large = made(1, 3, 5, "notes.md", &"x".repeat(700));
-        assert_eq!(entry_cost(large.content.len()), 2 * SMALL - 512);
+        assert_eq!(held(&conn), [1, 2, 5, 6, 7]);
+        room.max_bytes = 3 * SMALL + 1;
         assert_eq!(
-            take(&conn, &mut room, &large, &from(1), NOW + 100).unwrap(),
-            Taken::Stored
+            make_room(&conn, room.max_bytes).unwrap(),
+            [channel(7), channel(6)]
         );
-        assert_eq!(held(&conn), [1, 5]);
-        assert_eq!(counted(&conn), 5 * SMALL - 512);
+        assert_eq!(held(&conn), [1, 2, 5]);
+        assert_eq!(counted(&conn), 3 * SMALL);
     }
 
     /// Making room, by itself: the newest first, and of two channels held
@@ -1730,13 +1895,10 @@ mod tests {
         assert!(sweep_unused(&conn, NOW + 30).unwrap().is_empty());
         assert_eq!(counted(&conn), room.max_bytes);
 
-        // The oldest by this relay's own time comes to hold more: the
-        // channel that goes is the second, though the third was taken
-        // after it.
-        assert_eq!(
-            take(&conn, &mut room, &small(1, 2, 5), &from(1), NOW + 30).unwrap(),
-            Taken::Stored
-        );
+        // The relay's cap comes down by one channel's worth, and room is
+        // made: the channel that goes is the second, though the third
+        // was taken after it.
+        assert_eq!(make_room(&conn, 2 * SMALL).unwrap(), [channel(2)]);
         assert_eq!(held(&conn), [1, 3]);
         // And then the first, which this relay has held longest itself:
         // the one that the listed relay has held longer is what stays.
@@ -1749,7 +1911,7 @@ mod tests {
         take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 10).unwrap();
         take(&conn, &mut room, &small(3, 1, 5), &LISTED, NOW + 20).unwrap();
-        take(&conn, &mut room, &small(1, 2, 5), &from(1), NOW + 30).unwrap();
+        assert_eq!(make_room(&conn, 2 * SMALL).unwrap(), [channel(3)]);
         assert_eq!(held(&conn), [1, 2]);
     }
 
@@ -2158,10 +2320,12 @@ mod tests {
             show(&conn, &mut room, &small(1, 1, 4), &from(1), NOW).unwrap(),
             Shown::Another { .. }
         ));
-        // A later one that is no larger is taken, and one that is larger
-        // takes the relay over its cap in its newest channel: refused.
+        // A later one that is no larger is taken. One that is larger
+        // would take the relay past its cap: it is refused, and the one
+        // that is held stays.
+        let later = small(1, 1, 6);
         assert_eq!(
-            show(&conn, &mut room, &small(1, 1, 6), &from(1), NOW).unwrap(),
+            show(&conn, &mut room, &later, &from(1), NOW).unwrap(),
             Shown::Taken
         );
         let larger = made(1, 1, 7, "notes.md", &"x".repeat(300));
@@ -2169,7 +2333,9 @@ mod tests {
             show(&conn, &mut room, &larger, &from(1), NOW).unwrap(),
             Shown::Refused(Refused::NoRoom)
         );
-        assert!(held(&conn).is_empty());
+        assert_eq!(held(&conn), [1]);
+        assert_eq!(ids(&conn, 1), [later.id()]);
+        assert_eq!(counted(&conn), SMALL);
     }
 
     /// A stored entry that was changed where it lay is not handed out as
@@ -2605,12 +2771,10 @@ mod tests {
         );
         assert_eq!(older(&conn), before);
 
-        // Over this kind's cap, what is dropped is of this kind, down to
-        // nothing: the older kind's channels are never among them.
-        assert_eq!(
-            take(&conn, &mut room, &small(1, 2, 5), &from(1), NOW + 10).unwrap(),
-            Taken::Stored
-        );
+        // Over this kind's cap, since its cap came down, what is dropped
+        // to make room is of this kind, down to nothing: the older kind's
+        // channels are never among them.
+        assert_eq!(make_room(&conn, SMALL).unwrap(), [channel(2)]);
         assert_eq!(held(&conn), [1]);
         assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
         assert!(make_room(&conn, 0).unwrap().is_empty());

@@ -381,9 +381,8 @@ pub enum EntryRefused {
     /// It is not signed as it must be: the bytes are not an entry's, or a
     /// signature does not hold.
     NotSigned,
-    /// The receiver has no room for it: it is at its cap and does not
-    /// hold the entry's channel, or the channel holds as much as one may,
-    /// or the write did not stay.
+    /// The receiver has no room for it: with it the receiver would hold
+    /// more than its cap, or the entry's channel more than one may.
     NoRoom,
     /// The sender is over a limit: its address has made the receiver take
     /// as many new channels as one address may for now.
