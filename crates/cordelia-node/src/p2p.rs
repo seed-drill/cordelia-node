@@ -2058,6 +2058,7 @@ pub async fn p2p_loop(
     allow_private_addresses: bool,
     node_role: String,
     gov_config: cordelia_core::config::GovernorConfig,
+    relays_set_up: Vec<cordelia_network::bootstrap::Relay>,
     relay_addrs: RelayAddrs,
     trusted_peer_ids: Vec<NodeId>,
     max_storage_bytes: u64,
@@ -2169,6 +2170,9 @@ pub async fn p2p_loop(
     if let Some(entries) = &relay_entries {
         entries.make_room(&state.db);
     }
+    // How many relays the node is set up with is said here, from the list
+    // that every pass is made of: the two cannot come to differ.
+    state.own_channels.set_up_with(relays_set_up.len());
     // A device's side of its relays, for the channels of its own
     // (decision 2026-10-04 §4.6): the show, the leave it gives, and the
     // passes that prove, pull and push. Only a personal node has one, and
@@ -2773,13 +2777,13 @@ pub async fn p2p_loop(
                 }
                 // What waits in a channel of the device's own is sent on
                 // the same timer, through the leave that a show gives.
-                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
             }
 
             // Something was written in a channel of the device's own: it
             // is sent without waiting for the timer, through that leave.
             _ = state.own_channels.wait_written(), if device_entries.is_some() => {
-                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
             }
 
             // A command asked for a whole pass: the show to each relay,
@@ -2787,7 +2791,7 @@ pub async fn p2p_loop(
             // of a new phrase; the asking for what a typed key's device
             // hands over (decision 2026-10-04 §5.1, §5.2, §7.1).
             _ = state.own_channels.wait_asked(), if device_entries.is_some() => {
-                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
             }
 
             // ── Entries of channels from their secrets, on a relay ────
@@ -3037,7 +3041,7 @@ pub async fn p2p_loop(
                 // A device's own channels, at each relay it is set up
                 // with: it shows its change entry, and then proves, pulls
                 // and pushes where the answer gives it leave.
-                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
 
                 // Apply channel states that arrived in our inbox since the last
                 // cycle (decision 2026-09-30 §4.1). Off the select loop: it does
@@ -3556,25 +3560,43 @@ fn relay_connected(
 
 /// The relays this node is set up with, each with its connection where
 /// there is one: by its key if one is configured, otherwise by the address
-/// it was dialled at.
+/// that its name resolves to.
+///
+/// **Every relay of the configuration is here, by its name, whether or not
+/// the name resolves** (decision 2026-10-04 §4.6): `set_up` is what the
+/// node was configured with, and `relay_addrs` the addresses that those
+/// names resolve to now. A relay whose name has not resolved has no
+/// connection, like one that is down, and is a relay that the device is
+/// set up with all the same. It is waited for when the device wakes, it is
+/// named as not heard from, and it is one of the relays that a command
+/// says does not hold a change.
 fn relays_with_links(
+    set_up: &[cordelia_network::bootstrap::Relay],
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
 ) -> Vec<cordelia_node::device_entries::Relay> {
     use cordelia_node::device_entries::{Link, Relay};
-    let Ok(relays) = relay_addrs.read() else {
-        return Vec::new();
-    };
-    relays
+    // Where the addresses cannot be read, a relay is still known by its
+    // key, and by its name.
+    let resolved = relay_addrs
+        .read()
+        .map(|resolved| resolved.clone())
+        .unwrap_or_default();
+    set_up
         .iter()
         .map(|relay| {
             let peer = match relay.key {
                 Some(key) => Some(NodeId(key)),
-                None => conn_mgr.connected_peers().into_iter().find(|peer| {
-                    conn_mgr
-                        .get_connection(peer)
-                        .is_some_and(|conn| conn.remote_address() == relay.addr)
-                }),
+                None => resolved
+                    .iter()
+                    .find(|resolved| resolved.host == relay.host)
+                    .and_then(|resolved| {
+                        conn_mgr.connected_peers().into_iter().find(|peer| {
+                            conn_mgr
+                                .get_connection(peer)
+                                .is_some_and(|conn| conn.remote_address() == resolved.addr)
+                        })
+                    }),
             };
             let link = peer.and_then(|peer| {
                 let conn = conn_mgr.get_connection(&peer)?.clone();
@@ -3593,6 +3615,7 @@ fn relays_with_links(
 /// finds another running does nothing.
 fn device_pass(
     device: &Option<std::sync::Arc<cordelia_node::device_entries::DeviceEntries>>,
+    set_up: &[cordelia_network::bootstrap::Relay],
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
     kind: cordelia_node::device_entries::Pass,
@@ -3600,7 +3623,7 @@ fn device_pass(
     let Some(device) = device.clone() else {
         return;
     };
-    let relays = relays_with_links(relay_addrs, conn_mgr);
+    let relays = relays_with_links(set_up, relay_addrs, conn_mgr);
     tokio::spawn(async move { device.pass(&relays, kind).await });
 }
 
@@ -4595,6 +4618,103 @@ mod tests {
         assert_eq!(secs(40, false), BACKOFF_BASE_SECS);
         // Never zero, whatever the tick.
         assert_eq!(relay_backoff(1, 0, true).as_secs(), 1);
+    }
+
+    /// Every relay that a node is configured with is one of the relays a
+    /// pass is given, by its name, whether or not the name resolves
+    /// (decision 2026-10-04 §4.6). One whose name has not resolved has no
+    /// connection, as one that is down has none: it is still waited for
+    /// when the device wakes, and named as not heard from. A relay with a
+    /// key is found by its key, and one with none by the address that its
+    /// name resolves to.
+    #[tokio::test]
+    async fn a_relay_whose_name_does_not_resolve_is_still_one_the_node_is_set_up_with() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        use cordelia_network::{connection, transport};
+        let identity = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (device, relay) = (identity(1), identity(2));
+        let relay_end = transport::create_endpoint(&relay, here).unwrap();
+        let relay_addr = relay_end.local_addr().unwrap();
+        let relay_mgr =
+            connection::ConnectionManager::new(relay.clone(), relay_end, vec![], vec![], 9474);
+        let (accepts, as_relay) = (relay_mgr.endpoint(), relay_mgr.connect_context());
+        let accepted = tokio::spawn(async move {
+            let incoming = accepts.accept().await.unwrap();
+            connection::inbound_accept(&as_relay, incoming)
+                .await
+                .unwrap()
+        });
+        let device_end = transport::create_endpoint(&device, here).unwrap();
+        let mut conn_mgr =
+            connection::ConnectionManager::new(device.clone(), device_end, vec![], vec![], 9474);
+        conn_mgr.connect_to(relay_addr).await.unwrap();
+        let _accepted = accepted.await.unwrap();
+
+        // Four relays in the configuration. Only the first two have names
+        // that resolve: the one that is connected, and one that is down.
+        let named = |host: &str, key: Option<[u8; 32]>| Relay {
+            host: host.into(),
+            key,
+        };
+        let down: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let set_up = [
+            named("reached.test:9474", None),
+            named("down.test:9474", None),
+            named("no-such-name.test:9474", None),
+            named("no-such-name-with-a-key.test:9474", Some([7; 32])),
+        ];
+        let resolved = |host: &str, addr| RelayAddr {
+            host: host.into(),
+            addr,
+            key: None,
+        };
+        let addrs: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(vec![
+            resolved("reached.test:9474", relay_addr),
+            resolved("down.test:9474", down),
+        ]));
+
+        let relays = relays_with_links(&set_up, &addrs, &conn_mgr);
+        let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "reached.test:9474",
+                "down.test:9474",
+                "no-such-name.test:9474",
+                "no-such-name-with-a-key.test:9474"
+            ]
+        );
+        let linked: Vec<bool> = relays.iter().map(|relay| relay.link.is_some()).collect();
+        assert_eq!(linked, [true, false, false, false]);
+        let link = relays[0].link.as_ref().unwrap();
+        assert_eq!(
+            (link.name(), link.relay().0),
+            ("reached.test:9474", relay.public_key())
+        );
+
+        // With no name resolved at all, every relay is still listed, and
+        // none has a connection: a relay with no key is known only by
+        // the address its name resolves to.
+        let none: RelayAddrs = Default::default();
+        let relays = relays_with_links(&set_up, &none, &conn_mgr);
+        assert_eq!(relays.len(), set_up.len());
+        assert!(relays.iter().all(|relay| relay.link.is_none()));
+
+        // A relay with a key is found by its key, whatever its name
+        // resolves to, and whether or not it resolves.
+        let keyed = [named(
+            "no-such-name-with-a-key.test:9474",
+            Some(relay.public_key()),
+        )];
+        let relays = relays_with_links(&keyed, &none, &conn_mgr);
+        assert_eq!(relays.len(), 1);
+        assert!(relays[0].link.is_some());
+        conn_mgr.shutdown();
     }
 
     fn ids(names: &[&str]) -> Vec<String> {

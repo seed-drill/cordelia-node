@@ -94,10 +94,11 @@ pub struct AppState {
 /// began after it asked ([`OwnChannels::whole_passes`]).
 ///
 /// And it carries how many relays the node is configured with
-/// ([`OwnChannels::set_up_with`]). A pass is given the relays whose names
-/// resolved, which may be fewer: what a device keeps of a relay is
-/// forgotten as of one that it is set up with no longer only while every
-/// relay it is configured with is connected.
+/// ([`OwnChannels::set_up_with`]). The node says it from the list that
+/// each pass is given, which is every relay of its configuration, whether
+/// or not its name resolves. What a device keeps of a relay is forgotten
+/// as of one that it is set up with no longer only while every relay it
+/// is configured with is connected.
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,

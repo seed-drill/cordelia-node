@@ -556,9 +556,10 @@ impl DeviceEntries {
     ///
     /// Which relays the device is set up with is known by their keys
     /// while every one of them is connected, and not otherwise: nothing
-    /// is forgotten of any relay then. `relays` may be fewer than the
-    /// node is configured with, since a relay whose name does not
-    /// resolve is not among them: every one is connected where each of
+    /// is forgotten of any relay then. `relays` is every relay that the
+    /// node is configured with, a relay whose name does not resolve
+    /// among them, with no connection. Whoever gives a pass fewer than
+    /// that is not believed: every one is connected only where each of
     /// `relays` is, and they are as many as the node said it is
     /// configured with.
     fn forget_done(&self, relays: &[Relay]) {

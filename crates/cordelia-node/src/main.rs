@@ -1082,13 +1082,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // Relays are configured by name, so the names are resolved again
         // while the node runs, not only at startup.
         let relay_addrs = p2p::RelayAddrs::default();
-        state.own_channels.set_up_with(relays.len());
+        // The relays as the configuration names them, whether or not a
+        // name resolves: what the node is set up with.
+        let relays_set_up = relays.clone();
         if !relays.is_empty() {
             tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone()));
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400))).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400))).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
