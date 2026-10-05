@@ -7,11 +7,14 @@
 //! the node's database: what it holds of its person, who counts and how a
 //! statement is applied ([`person`]); publishing in a name it holds, and
 //! reading one ([`publish`]); the one door for an entry from outside
-//! ([`take`]); adding a device, in its two halves ([`adding`]); and the
-//! part of a change that needs the phrase ([`change`]). No handler, command
-//! or adapter calls them yet.
+//! ([`take`]); adding a device, in its two halves ([`adding`]); the part
+//! of a change that needs the phrase ([`change`]); and what a device does
+//! at a relay for the channels of its own ([`at_relays`]), which the node
+//! asks when it has leave to use a connection. No handler, command or
+//! adapter calls them yet.
 
 pub mod adding;
+pub mod at_relays;
 pub mod auth;
 pub mod change;
 pub mod devices;

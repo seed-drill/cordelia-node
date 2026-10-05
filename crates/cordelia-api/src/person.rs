@@ -44,6 +44,12 @@
 //! store holds of the generation it left is then dropped, and the device
 //! writes, in the new personal channel, that it has applied the statement
 //! (§8). Where any of it fails, nothing is changed.
+//!
+//! How far the store's own order had got when the carry was written is
+//! kept (`cordelia_storage::at_relays`): what the device holds of its own
+//! in the channel of a name, up to there, is what it carried, and is sent
+//! to a relay by a rule of its own (§7.3). What it kept of each relay for
+//! a channel that it left goes with the channel.
 
 use rusqlite::Connection;
 
@@ -67,6 +73,7 @@ use cordelia_crypto::statement::{
     self, Device, Judgement, SignedStatement, Statement, StatementError, judge,
 };
 use cordelia_crypto::version::{self, Version};
+use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
 
@@ -256,6 +263,11 @@ impl Counting {
     /// since.
     pub fn devices(&self) -> usize {
         self.listed.len() + self.added.len()
+    }
+
+    /// How many keys may add a device ([`Counting::may_add`]).
+    pub fn adders(&self) -> usize {
+        self.keys().iter().filter(|key| self.may_add(key)).count()
     }
 
     /// What a record that adds `key`, signed by `adder`, is to this
@@ -1020,6 +1032,10 @@ fn come_to(
             }
         }
     }
+    // What the store has taken up to here, of this device's own in the
+    // channel of a name, is what it carried: what it writes from now on
+    // is not (§7.3).
+    kept_rows::carried_to_here(conn)?;
 
     // The statement and the secret, and the generation it was in is left.
     held_rows::put_person(
@@ -1154,6 +1170,8 @@ impl Carry<'_> {
         }
         // What the store holds of the channel that was left is dropped.
         entries::remove_channel(conn, &channel)?;
+        // And with it what the device kept of each relay for it.
+        kept_rows::forget_channel(conn, &channel)?;
         Ok((carried, no_version))
     }
 }

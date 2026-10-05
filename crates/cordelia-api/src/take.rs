@@ -32,14 +32,17 @@
 //! record whose own signer does not count yet. Nothing here remembers
 //! them.
 //!
-//! **Where [`take`] says that a key came to count** (`came_to_count`
-//! above 0 in [`Taken::Own`]), **the caller gives it again every entry of
-//! this device's own channels that it gave before.** What the key that
-//! now counts had signed is then taken, and a record among it may let a
-//! further key count, which is said in its turn. A device that does so
-//! ends with the same entries, and the same answers, as one that was
-//! given the record first. A node does it by listing its channels to its
-//! relays again from the start (§16).
+//! **Where [`take`] says that a key came to count, or came to may add**
+//! (`came_to_count` or `came_to_add` above 0 in [`Taken::Own`]), **the
+//! caller gives it again every entry of this device's own channels that
+//! it gave before.** What the key that now counts had signed is then
+//! taken, and a record among it may let a further key count, which is
+//! said in its turn. A record that a key signed before it might add was
+//! not counted, and where the device kept nothing of it, it is judged
+//! when its entry is given again. A device that does so ends with the
+//! same entries, and the same answers, as one that was given the records
+//! first. A node does it by reading its channels at its relays again from
+//! the start (§16), and does not stop at an entry that it holds already.
 //!
 //! A record that is not counted may go where the device keeps 256 of
 //! them ([`crate::person::see_addition`]). It is then as one never seen,
@@ -86,6 +89,14 @@ pub enum Taken {
         /// now counts had signed was refused when it arrived, and was
         /// not kept.
         came_to_count: usize,
+        /// How many keys came to may add by it: keys that count, and that
+        /// a device of the statement has now added (decision 2026-10-04
+        /// §6). None for any entry but a record.
+        ///
+        /// Above 0, the caller gives everything again as well: a record
+        /// that such a key signed before was not counted, and the device
+        /// may keep nothing of it.
+        came_to_add: usize,
     },
     /// It is of the phrase's channel: it was shown to the device, which
     /// did what a change entry has it do.
@@ -147,8 +158,8 @@ pub enum NotRead {
 /// has passed the check that needs no key.
 ///
 /// **What the caller owes:** where this returns [`Taken::Own`] with
-/// `came_to_count` above 0, it gives again every entry of this device's
-/// own channels that it gave before. An entry that a key signed before
+/// `came_to_count` or `came_to_add` above 0, it gives again every entry
+/// of this device's own channels that it gave before. An entry that a key signed before
 /// that key counted was refused here and not kept, whichever arrived
 /// first: the entries of a device that is being added, and a record that
 /// such a device signed.
@@ -207,10 +218,22 @@ fn taken_as_its_own(
         let again = stored == Outcome::AlreadyHeld;
         taken = record_in(conn, entry, &personal, again, now)?;
     }
+    // A record that was taken can let a key add: the one it adds, where
+    // a device of the statement signed it. (A record that is not counted
+    // can go where the device keeps too many, and with it what let a key
+    // add: none came to, then.)
+    let came_to_add = match taken.0 {
+        Some(Record::Seen(_)) => {
+            let may_add = who_counts(conn)?.adders();
+            may_add.saturating_sub(counting.adders())
+        }
+        _ => 0,
+    };
     Ok(Some(Taken::Own {
         stored,
         record: taken.0,
         came_to_count: taken.1,
+        came_to_add,
     }))
 }
 
@@ -345,6 +368,7 @@ mod tests {
         stored: Outcome::Stored,
         record: None,
         came_to_count: 0,
+        came_to_add: 0,
     };
 
     /// An entry that the store held already, and that says no more.
@@ -352,6 +376,7 @@ mod tests {
         stored: Outcome::AlreadyHeld,
         record: None,
         came_to_count: 0,
+        came_to_add: 0,
     };
 
     /// The revision at `count` in `band`.
@@ -424,6 +449,7 @@ mod tests {
             stored,
             record: None,
             came_to_count: 0,
+            came_to_add: 0,
         };
         assert_eq!(given(&s, 0, &first), held(Outcome::AlreadyHeld));
         let older = by(&s[1].identity, 4, "a.md", "older");
@@ -469,6 +495,7 @@ mod tests {
                 stored: Outcome::Stored,
                 record: Some(Record::Seen(AdditionSeen::Counted)),
                 came_to_count: 1,
+                came_to_add: 1,
             }
         );
         assert!(s[1].counts(&new.key()));
@@ -480,6 +507,7 @@ mod tests {
                 stored: Outcome::AlreadyHeld,
                 record: None,
                 came_to_count: 0,
+                came_to_add: 0,
             }
         );
 
@@ -523,23 +551,30 @@ mod tests {
             let record = record(&s, 1, adder, new);
             given(&s, 1, &record_entry(&s, 1, adder, &record))
         };
-        let taken = |seen: AdditionSeen, came_to_count: usize| Taken::Own {
+        let taken = |seen: AdditionSeen, came_to_count: usize, came_to_add: usize| Taken::Own {
             stored: Outcome::Stored,
             record: Some(Record::Seen(seen)),
             came_to_count,
+            came_to_add,
         };
 
-        assert_eq!(seen(&listed, &a), taken(AdditionSeen::Counted, 1));
-        assert_eq!(seen(&a, &b), taken(AdditionSeen::Counted, 1));
+        // A device of the statement adds a: it counts, and may add.
+        assert_eq!(seen(&listed, &a), taken(AdditionSeen::Counted, 1, 1));
+        // Device a adds b: it counts, and may not add.
+        assert_eq!(seen(&a, &b), taken(AdditionSeen::Counted, 1, 0));
         // Device b was added by a device added since: it may not add.
         let may_not = AdditionSeen::NotCounted(NotCounted::MayNotAdd);
-        assert_eq!(seen(&b, &c), taken(may_not, 0));
+        assert_eq!(seen(&b, &c), taken(may_not, 0, 0));
         assert!(!s[1].counts(&c.key()));
-        // A device of the statement adds b too: b counts already, and the
-        // record that b signed comes to count with this one.
+        // A device of the statement adds b too: b counts already, and
+        // comes to may add. The record that b signed comes to count with
+        // this one, and the key it adds may not add.
         let already = AdditionSeen::NotCounted(NotCounted::CountsAlready);
-        assert_eq!(seen(&listed, &b), taken(already, 1));
+        assert_eq!(seen(&listed, &b), taken(already, 1, 1));
         assert!(s[1].counts(&c.key()));
+        // The same record from another device of the statement's word
+        // changes nothing more: no key comes to count, or to may add.
+        assert_eq!(who_counts(&s[1].conn).unwrap().adders(), 4);
     }
 
     /// A record is the word of the device that adds: it is read only from
@@ -558,6 +593,7 @@ mod tests {
                 stored: Outcome::Stored,
                 record: Some(Record::NotRead(why)),
                 came_to_count: 0,
+                came_to_add: 0,
             } => why,
             other => panic!("{other:?}"),
         };
@@ -607,6 +643,7 @@ mod tests {
                 stored: Outcome::Stored,
                 record: Some(Record::Seen(AdditionSeen::Counted)),
                 came_to_count: 1,
+                came_to_add: 1,
             }
         );
         assert!(s[1].counts(&new.key()));
@@ -635,6 +672,7 @@ mod tests {
                 stored: Outcome::Stored,
                 record: Some(Record::NotRead(NotRead::NoBytes)),
                 came_to_count: 0,
+                came_to_add: 0,
             }
         );
         // Given again, it is what it was when the store took it, and
@@ -655,6 +693,7 @@ mod tests {
                 stored: Outcome::Stored,
                 record: Some(Record::Seen(AdditionSeen::Counted)),
                 came_to_count: 1,
+                came_to_add: 1,
             }
         );
         // An entry below the one that the store holds is not read at all.
@@ -664,6 +703,7 @@ mod tests {
                 stored: Outcome::OlderThanHeld,
                 record: None,
                 came_to_count: 0,
+                came_to_add: 0,
             }
         );
     }
@@ -699,21 +739,27 @@ mod tests {
             entry_by(&by, &personal, 1, &name, value, &[])
         };
         // What the store did with an entry that device 1 is given, what
-        // the record in it was, and how many keys came to count by it.
+        // the record in it was, and how many keys came to count by it,
+        // and to may add.
         let taken = |entry: &CheckedEntry| match given(&s, 1, entry) {
             Taken::Own {
                 stored,
                 record,
                 came_to_count,
-            } => (stored, record, came_to_count),
+                came_to_add,
+            } => (stored, record, (came_to_count, came_to_add)),
             other => panic!("{other:?}"),
         };
-        let stored =
-            |seen: AdditionSeen, came: usize| (Outcome::Stored, Some(Record::Seen(seen)), came);
-        let again = |seen: AdditionSeen, came: usize| {
-            (Outcome::AlreadyHeld, Some(Record::Seen(seen)), came)
+        // `came` keys came to count, and none to may add.
+        let stored = |seen: AdditionSeen, came: usize| {
+            (Outcome::Stored, Some(Record::Seen(seen)), (came, 0))
         };
-        let says_no_more = (Outcome::AlreadyHeld, None, 0);
+        // No key came to count, and one to may add.
+        let lets_add = (Outcome::Stored, Some(Record::Seen(ALREADY)), (0, 1));
+        let again = |seen: AdditionSeen, came: usize| {
+            (Outcome::AlreadyHeld, Some(Record::Seen(seen)), (came, 0))
+        };
+        let says_no_more = (Outcome::AlreadyHeld, None, (0, 0));
         let keeps = |entry: &CheckedEntry| {
             let Value::Other(record) = entry.open(&personal).unwrap().value else {
                 panic!("a record is bytes");
@@ -735,7 +781,7 @@ mod tests {
         assert_eq!(taken(&adds(1, 8)), stored(COUNTED, 1));
         assert!(!may_add(8));
         let lets_8_add = adds(0, 8);
-        assert_eq!(taken(&lets_8_add), stored(ALREADY, 0));
+        assert_eq!(taken(&lets_8_add), lets_add);
         assert!(may_add(8));
         // Device 8 adds devices 9 and 10, which count and may not add:
         // what they sign is kept as not counted.
@@ -761,10 +807,11 @@ mod tests {
         assert_eq!(taken(&adds(8, 12)), stored(COUNTED, 1));
 
         // Device 0 adds device 9 too: it may add from now on. The device
-        // keeps nothing that device 9 signed, so no key comes to count.
-        // This record stays as the other does, and the oldest of the
-        // others goes.
-        assert_eq!(taken(&adds(0, 9)), stored(ALREADY, 0));
+        // keeps nothing that device 9 signed, so no key comes to count:
+        // that a key came to may add is all that says the caller is to
+        // give everything again. This record stays as the other does, and
+        // the oldest of the others goes.
+        assert_eq!(taken(&adds(0, 9)), lets_add);
         assert!(may_add(9) && !keeps(&by_10[0]));
         assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
 

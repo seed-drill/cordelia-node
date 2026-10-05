@@ -537,6 +537,7 @@ mod tests {
         stored: Outcome::Stored,
         record: None,
         came_to_count: 0,
+        came_to_add: 0,
     };
 
     fn hash(said: &str) -> [u8; 32] {
@@ -1084,6 +1085,7 @@ mod tests {
                         )
                     )),
                     came_to_count: 0,
+                    came_to_add: 0,
                 },
                 "{n}"
             );
@@ -1130,12 +1132,15 @@ mod tests {
             stored: Outcome::AlreadyHeld,
             record: None,
             came_to_count: 0,
+            came_to_add: 0,
         };
         const OF_A_PAIR: Taken = Taken::Refused(NotTaken::AnotherChannel);
-        let a_record = |came_to_count: usize| Taken::Own {
+        // A record by which a key came to count, and may add or not.
+        let a_record = |came_to_add: usize| Taken::Own {
             stored: Outcome::Stored,
             record: Some(Record::Seen(AdditionSeen::Counted)),
-            came_to_count,
+            came_to_count: 1,
+            came_to_add,
         };
         let before = s[1].stored();
         let before_on_5 = s[5].stored();
@@ -1160,7 +1165,8 @@ mod tests {
         }
 
         // The record that device 0 added device 3 arrives: a key came to
-        // count, and the caller gives again what it gave before.
+        // count, and may add, since a device of the statement added it.
+        // The caller gives again what it gave before.
         for to in [1, 5] {
             let taken = s.pass(0, to);
             assert_eq!(taken.iter().filter(|one| **one == a_record(1)).count(), 1);
@@ -1175,7 +1181,9 @@ mod tests {
         let taken = s.pass(4, 5);
         assert_eq!(taken[1..], [REFUSED, REFUSED]);
         let taken = s.pass(3, 5);
-        assert_eq!(taken[1..], [STORED, STORED, a_record(1), OF_A_PAIR]);
+        // The key it adds counts, and may not add: device 3 was added
+        // since the statement.
+        assert_eq!(taken[1..], [STORED, STORED, a_record(0), OF_A_PAIR]);
         assert!(s[5].counts(&s.key(4)));
         // In that order again: what device 4 signed is taken, and the
         // store holds the rest. No key came to count, and it is done.
@@ -1192,7 +1200,7 @@ mod tests {
             [
                 STORED,
                 STORED,
-                a_record(1),
+                a_record(0),
                 Taken::Refused(NotTaken::AnotherChannel)
             ]
         );

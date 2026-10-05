@@ -21,6 +21,14 @@
 //! statement, and when it leaves its phrase. What the device keeps of it
 //! is its revision.
 //!
+//! A relay that was sent the hand-over still holds it then. So the
+//! device that adds writes a delete over it in the pair channel, one
+//! revision above it, which waits in its store to be sent to each relay
+//! that was sent the hand-over ([`write_over_dropped`]): the relay's copy
+//! is written over. The node does that as it goes, after it has dropped
+//! what is old. A device that leaves its phrase does it as it leaves, and
+//! then keeps nothing of any hand-over it made.
+//!
 //! A pair channel is one channel for as long as both keys exist, whatever
 //! phrase either device follows, and a statement's number starts again
 //! under each phrase. So the hand-over's revision is the time it was
@@ -69,6 +77,7 @@ use cordelia_crypto::hand_over::{HandOver, HandOverError};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::{Device, Judgement, Statement, StatementError, judge};
+use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Following, State};
 
@@ -279,6 +288,13 @@ fn hand_over_written(
     now: i64,
 ) -> Result<CheckedEntry, PersonError> {
     let before = held_rows::handed_over(conn, new)?.map(|last| last.rev);
+    // The delete that this device wrote over the last one is above it,
+    // and is all there is where the device keeps nothing of the last: it
+    // left the phrase that it handed that one under.
+    let slot = slot_id(&derive::slot_key(pair)?, HAND_OVER_NAME);
+    let channel = derive::channel_id(pair)?;
+    let in_store = entries::author_entry(conn, &channel, &slot, &identity.public_key())?;
+    let before = before.max(in_store.map(|held| held.entry.rev));
     let made_at = at(now);
     let rev = match before {
         Some(before) if before >= made_at => before + 1,
@@ -318,6 +334,62 @@ pub fn drop_old_hand_overs(conn: &Connection, now: i64) -> Result<usize, PersonE
                 .and_then(i64::checked_abs)
                 .is_some_and(|apart| apart < HAND_OVER_KEPT_SECS)
         })
+    })
+}
+
+/// Write a delete over each hand-over that this device made and that has
+/// gone from its store (decision 2026-10-04 §6): its own entry under the
+/// name `hand-over` in the pair channel, one revision above the
+/// hand-over. It waits in the store to be sent, and a relay that takes it
+/// holds the hand-over no longer. `now` is this device's clock, in
+/// seconds. Returns how many were written.
+///
+/// A hand-over holds the person secret, and goes from the store of the
+/// device that made it two hours after it was made, when that device
+/// applies a statement, and when it leaves its phrase. A relay that was
+/// sent it would hold it for as long as it holds the pair channel.
+///
+/// None is written:
+///
+/// - over a hand-over that the store still holds;
+/// - where no relay was sent anything of the pair channel: there is
+///   nothing to write over;
+/// - where the store holds an entry of this device's in the pair channel:
+///   that is the delete, written before.
+///
+/// The node calls this as it goes, after [`drop_old_hand_overs`].
+pub fn write_over_dropped(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let own = identity.public_key();
+        let mut written = 0;
+        for gone in held_rows::hand_overs_gone(conn)? {
+            if !kept_rows::keeps_any_anywhere(conn, &gone.channel)?
+                || kept_rows::holds_by(conn, &gone.channel, &own)?
+            {
+                continue;
+            }
+            // The pair channel of this device and that key: a row that
+            // names another channel is not this device's, and is left.
+            let Ok(pair) = derive::pair_secret(identity, &gone.key) else {
+                continue;
+            };
+            if derive::channel_id(&pair)? != gone.channel {
+                continue;
+            }
+            let inside = Inside {
+                name: HAND_OVER_NAME.into(),
+                value: Value::Delete,
+                chain: Some(Vec::new()),
+            };
+            let entry = Entry::seal(&pair, identity, gone.rev.saturating_add(1), &inside)?;
+            entries::store(conn, &entry.check()?, now)?;
+            written += 1;
+        }
+        Ok(written)
     })
 }
 
@@ -455,6 +527,11 @@ pub fn accept(
                     return Ok(Accepted::Refused(NotAccepted::SyncIsOn));
                 }
                 leave(conn, &held)?;
+                // What it handed a key under the phrase it leaves is
+                // written over at each relay that was sent it, and it
+                // keeps nothing more of any hand-over it made (§6).
+                write_over_dropped(conn, identity, now)?;
+                held_rows::forget_hand_overs(conn)?;
                 brought
                     .applied_on(conn, identity, None, &brought.following, now)
                     .map(Accepted::Moved)
@@ -734,8 +811,14 @@ fn is_alone(conn: &Connection, held: &Held, own: &[u8; 32]) -> Result<bool, Pers
 /// replaced where it applies the statement it is handed. It keeps no
 /// record of an addition, and no entry of a statement made apart: it is
 /// alone, and in no fork. The hand-overs it made go too: each holds a
-/// secret of the phrase it leaves. The revision of each stays, and what
-/// it hands the same key next is written above it.
+/// secret of the phrase it leaves. What it kept of each relay for a
+/// channel that it leaves goes with the channel.
+///
+/// Whoever calls this then writes a delete over each hand-over that
+/// went ([`write_over_dropped`]) and empties the table of hand-overs
+/// (decision 2026-10-04 §6): a device that has left keeps nothing of the
+/// keys it added under the phrase it left. What it hands one of them
+/// next is above the delete, where one was written.
 fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     // What is held holds together: the secret applied is the statement's.
     applied_secret(conn, &held.statement.statement)?;
@@ -744,9 +827,11 @@ fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     for generation in held_rows::secrets(conn)? {
         let personal = derive::personal_secret(&generation.secret)?;
         entries::remove_channel(conn, &derive::channel_id(&personal)?)?;
+        kept_rows::forget_channel(conn, &derive::channel_id(&personal)?)?;
         for name in &names {
             let own = derive::own_secret(&generation.secret, &name.name)?;
             entries::remove_channel(conn, &derive::channel_id(&own)?)?;
+            kept_rows::forget_channel(conn, &derive::channel_id(&own)?)?;
         }
     }
     held_rows::forget_secrets(conn)?;
@@ -979,6 +1064,7 @@ mod tests {
                 stored: entries::Outcome::Stored,
                 record: Some(Record::NotRead(NotRead::NoBytes)),
                 came_to_count: 0,
+                came_to_add: 0,
             }
         );
 
@@ -992,13 +1078,15 @@ mod tests {
         let inside = record.open(&adder.personal()).unwrap();
         assert_eq!((inside.name, inside.chain), (name, Some(Vec::new())));
         assert!(adder.counts(&new.key()));
-        // A device that is given it reads the record from it.
+        // A device that is given it reads the record from it: the key
+        // counts, and may add, since a device of the statement added it.
         assert_eq!(
             take(&other.conn, &other.identity, &record, now).unwrap(),
             Taken::Own {
                 stored: entries::Outcome::Stored,
                 record: Some(Record::Seen(AdditionSeen::Counted)),
                 came_to_count: 1,
+                came_to_add: 1,
             }
         );
     }
@@ -1549,6 +1637,7 @@ mod tests {
                 stored: entries::Outcome::Stored,
                 record: None,
                 came_to_count: 0,
+                came_to_add: 0,
             }
         );
     }
@@ -1824,21 +1913,203 @@ mod tests {
         let handed = s.hand(2, 0);
         assert_eq!(s.accept(0, 2, &handed.hand_over), Accepted::Moved(first()));
         assert_ne!(s[0].secret(), old_secret);
-        // What it handed under the phrase it left is gone, and its
-        // revision is kept.
+        // What it handed under the phrase it left is gone, and it keeps
+        // nothing of any hand-over it made: not the key, and not the
+        // revision.
         assert!(s[0].stored_in(&pair).is_empty());
         let adder = &s[0];
-        let last = held_rows::handed_over(&adder.conn, &s.key(1)).unwrap();
-        let last = last.unwrap();
-        assert_eq!((last.rev, last.held), (old.rev, false));
+        assert_eq!(
+            held_rows::handed_over(&adder.conn, &s.key(1)).unwrap(),
+            None
+        );
+        assert!(held_rows::hand_overs_gone(&adder.conn).unwrap().is_empty());
 
         // It adds device 1 again under the phrase it follows now, in the
-        // second in which it made the old one: the new one is above it.
+        // second in which it made the old one. No relay was sent the old
+        // one: there is nothing for the new one to be above.
         let new = add_device(&adder.conn, &adder.identity, &s.key(1), "device 1", made);
         let new = new.unwrap().hand_over;
-        assert_eq!(new.rev, old.rev + 1);
+        assert_eq!(new.rev, old.rev);
         assert_eq!(adder.stored_in(&pair), std::slice::from_ref(&new));
         assert_eq!(hand_over_of(&s, 0, &s.key(1), &new).secret, adder.secret());
+    }
+
+    /// A relay that was sent a hand-over holds it still when the device
+    /// that made it has dropped it. So that device writes a delete over
+    /// it, one revision above, which waits in its store to be sent. None
+    /// is written over a hand-over that the store still holds, where no
+    /// relay was sent anything of the pair channel, or a second time.
+    #[test]
+    fn test_a_delete_is_written_over_a_hand_over_that_has_gone_where_a_relay_was_sent_it() {
+        const RELAY: [u8; 32] = [0xa1; 32];
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        let now = s.now;
+        let adder = &s[0];
+        let pair = |new: usize| derive::pair_secret(&adder.identity, &s.key(new)).unwrap();
+        let add = |new: usize, at: i64| {
+            add_device(&adder.conn, &adder.identity, &s.key(new), "new", at)
+                .unwrap()
+                .hand_over
+        };
+        let write_over = |at: i64| write_over_dropped(&adder.conn, &adder.identity, at).unwrap();
+        let (to_1, _to_2) = (add(1, now), add(2, now));
+        // A relay was sent the first, and none was sent the second.
+        kept_rows::sending(&adder.conn, &RELAY, &to_1.channel).unwrap();
+
+        // While the store holds them, nothing is written over either.
+        assert_eq!(write_over(now + 60), 0);
+        assert_eq!(adder.stored_in(&pair(1)), std::slice::from_ref(&to_1));
+        // Two hours on both go, and a delete is written over the first:
+        // this device's own entry under the hand-over's name, one
+        // revision above it.
+        let later = now + 2 * HOUR;
+        assert_eq!(drop_old_hand_overs(&adder.conn, later).unwrap(), 2);
+        assert!(adder.stored_in(&pair(1)).is_empty());
+        assert_eq!(write_over(later), 1);
+        let over = adder.stored_in(&pair(1));
+        assert_eq!(over.len(), 1);
+        assert_eq!(
+            (over[0].author, over[0].rev, over[0].delete),
+            (adder.key(), to_1.rev + 1, true)
+        );
+        assert_eq!(over[0].slot, to_1.slot);
+        let inside = over[0].open(&pair(1)).unwrap();
+        assert_eq!(
+            (inside.name.as_str(), inside.value),
+            (HAND_OVER_NAME, Value::Delete)
+        );
+        // Over the second, which no relay was sent, nothing is written.
+        assert!(adder.stored_in(&pair(2)).is_empty());
+        // And nothing a second time.
+        assert_eq!(write_over(later + 60), 0);
+        assert_eq!(adder.stored_in(&pair(1)), over);
+        // What the device keeps of the hand-over is as it was.
+        let last = held_rows::handed_over(&adder.conn, &s.key(1)).unwrap();
+        let last = last.unwrap();
+        assert_eq!((last.rev, last.held), (to_1.rev, false));
+
+        // The next that it makes for that key is above the delete, though
+        // the clock was set back: it takes the delete's place.
+        let next = add(1, now - 100);
+        assert_eq!(next.rev, to_1.rev + 2);
+        assert_eq!(adder.stored_in(&pair(1)), std::slice::from_ref(&next));
+        // And once that one has gone, the delete over it is above it.
+        assert_eq!(drop_old_hand_overs(&adder.conn, later).unwrap(), 1);
+        assert_eq!(write_over(later), 1);
+        let over = adder.stored_in(&pair(1));
+        assert_eq!((over[0].rev, over[0].delete), (to_1.rev + 3, true));
+
+        // A device that made none writes none.
+        let other = &s[1];
+        assert_eq!(
+            write_over_dropped(&other.conn, &other.identity, later).unwrap(),
+            0
+        );
+    }
+
+    /// A device that leaves its phrase writes a delete over what it had
+    /// handed over and a relay was sent, in the step in which it leaves,
+    /// and then keeps nothing of any hand-over it made. The next that it
+    /// makes for that key is above the delete. What it kept of a relay
+    /// for a channel that it leaves goes with the channel.
+    #[test]
+    fn test_a_device_that_leaves_writes_over_what_it_handed_and_keeps_nothing_of_it() {
+        const RELAY: [u8; 32] = [0xa1; 32];
+        const MARK: [u8; 8] = [0x4d, 1, 2, 3, 4, 5, 6, 7];
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        s.hold(&[0], "notes");
+        let sent = s.hand(0, 1).hand_over;
+        s.hand(0, 3);
+        let made = s.now;
+        held_rows::clear_additions(&s[0].conn).unwrap();
+        let on = &s[0];
+        kept_rows::sending(&on.conn, &RELAY, &sent.channel).unwrap();
+        // It has a place at the relay in each channel of its own.
+        let left = [
+            derive::channel_id(&on.personal()).unwrap(),
+            derive::channel_id(&on.own("notes")).unwrap(),
+        ];
+        for channel in &left {
+            kept_rows::keep_place(&on.conn, &RELAY, channel, &MARK, 3).unwrap();
+            kept_rows::sent(&on.conn, &RELAY, channel, 2).unwrap();
+        }
+
+        // It leaves its phrase for the one that device 2 made.
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let by = &s[2];
+        first_statement(&by.conn, &by.identity, &other, &by.label, s.now).unwrap();
+        let handed = s.hand(2, 0);
+        assert_eq!(s.accept(0, 2, &handed.hand_over), Accepted::Moved(first()));
+
+        let on = &s[0];
+        let pair = derive::pair_secret(&on.identity, &s.key(1)).unwrap();
+        let over = on.stored_in(&pair);
+        assert_eq!(over.len(), 1);
+        assert_eq!((over[0].rev, over[0].delete), (sent.rev + 1, true));
+        // Nothing is written over the one that no relay was sent.
+        let other_pair = derive::pair_secret(&on.identity, &s.key(3)).unwrap();
+        assert!(on.stored_in(&other_pair).is_empty());
+        // The table of hand-overs is empty.
+        for key in [s.key(1), s.key(3)] {
+            assert_eq!(held_rows::handed_over(&on.conn, &key).unwrap(), None);
+        }
+        assert!(held_rows::hand_overs_held(&on.conn).unwrap().is_empty());
+        assert!(held_rows::hand_overs_gone(&on.conn).unwrap().is_empty());
+        // That the relay was sent the hand-over is kept: the delete is
+        // for it. Nothing is kept of the channels that were left.
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &sent.channel).unwrap());
+        for channel in &left {
+            assert!(!kept_rows::keeps_any_anywhere(&on.conn, channel).unwrap());
+        }
+
+        // The next that it makes for the key, in the second in which it
+        // made the one before, is above the delete.
+        let new = add_device(&on.conn, &on.identity, &s.key(1), "device 1", made);
+        assert_eq!(new.unwrap().hand_over.rev, sent.rev + 2);
+    }
+
+    /// What a device kept of a relay for a channel of the generation it
+    /// leaves goes with the channel when it applies a statement, and what
+    /// its store had taken by then is what it carried.
+    #[test]
+    fn test_applying_a_statement_forgets_the_places_in_the_channels_it_leaves() {
+        const RELAY: [u8; 32] = [0xa1; 32];
+        const MARK: [u8; 8] = [0x4d, 1, 2, 3, 4, 5, 6, 7];
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(0, "notes", "a.md", "a text");
+        let on = &s[0];
+        let left = [
+            derive::channel_id(&on.personal()).unwrap(),
+            derive::channel_id(&on.own("notes")).unwrap(),
+        ];
+        let pair = derive::pair_secret(&on.identity, &s.key(1)).unwrap();
+        let pair = derive::channel_id(&pair).unwrap();
+        for channel in left.iter().chain([&pair]) {
+            kept_rows::keep_place(&on.conn, &RELAY, channel, &MARK, 3).unwrap();
+        }
+        let carried_before = kept_rows::carried_up_to(&on.conn).unwrap();
+
+        s.change(0, &[0, 1], &[]);
+        let on = &s[0];
+        for channel in &left {
+            assert!(!kept_rows::keeps_any_anywhere(&on.conn, channel).unwrap());
+        }
+        // A pair channel is of no generation: what is kept of it stays.
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &pair).unwrap());
+        // What it carried is everything its store had taken before it
+        // wrote that it has applied: that word is the one entry since.
+        let carried = kept_rows::carried_up_to(&on.conn).unwrap();
+        assert!(carried > carried_before);
+        let personal = derive::channel_id(&on.personal()).unwrap();
+        assert_eq!(
+            kept_rows::last_taken(&on.conn, &personal).unwrap(),
+            carried + 1
+        );
+        let notes = derive::channel_id(&on.own("notes")).unwrap();
+        assert_eq!(kept_rows::last_taken(&on.conn, &notes).unwrap(), carried);
     }
 
     /// A pair channel is one channel whatever phrase either device
