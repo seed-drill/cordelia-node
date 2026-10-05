@@ -81,6 +81,16 @@ impl Node {
     /// [`Self::binary`], given the names of the variables it would
     /// inherit: the environment's, except in the test of this.
     pub fn binary_given(&self, inherited: impl Iterator<Item = std::ffi::OsString>) -> Command {
+        self.binary_at(&self.config(), inherited)
+    }
+
+    /// [`Self::binary_given`], told to use the configuration at `config`
+    /// in the place of this node's own.
+    fn binary_at(
+        &self,
+        config: &std::path::Path,
+        inherited: impl Iterator<Item = std::ffi::OsString>,
+    ) -> Command {
         let mut command = Command::new(BIN);
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
@@ -95,7 +105,7 @@ impl Node {
         }
         command
             .arg("--config")
-            .arg(self.config())
+            .arg(config)
             .env("CORDELIA_DATA_DIR", self.data_dir())
             .env("HOME", self.home());
         command
@@ -148,6 +158,36 @@ impl Node {
             String::from_utf8_lossy(&out.stdout)
         );
         String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Run a CLI command against this node at a terminal of its own, as
+    /// a person runs it: what it says is read, and what a person types
+    /// is typed, through [`AtTerminal`].
+    ///
+    /// A command that asks a yes, or the recovery phrase, asks at a
+    /// terminal, and refuses where its input is not one (decision
+    /// 2026-10-04 §5). A program that has a shell can give a command a
+    /// terminal, and this does.
+    pub fn at_terminal(&self, args: &[&str]) -> AtTerminal {
+        AtTerminal::running(self.name, self.binary(), args)
+    }
+
+    /// [`Self::at_terminal`], for a command that reaches this node's API
+    /// at `port` on this machine, and not at the node's own port: where
+    /// a test listens there, and passes on what it is sent. The command
+    /// is given a copy of the node's configuration that differs in that
+    /// port, and in nothing else.
+    pub fn at_terminal_through(&self, port: u16, args: &[&str]) -> AtTerminal {
+        let own = std::fs::read_to_string(self.config()).unwrap();
+        let through = own.replace(
+            &format!("http_port = {}", self.http),
+            &format!("http_port = {port}"),
+        );
+        assert_ne!(own, through);
+        let config = self.dir.path().join("config-through.toml");
+        std::fs::write(&config, through).unwrap();
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
     }
 
     /// This node's stand-in home directory (for the sync adapter): a real
@@ -524,6 +564,167 @@ level = "debug"
     };
     n.cli(&["init", "--non-interactive", "--name", name]);
     n
+}
+
+/// A command that runs at a terminal of its own: a pseudo-terminal,
+/// whose other end the test holds. What the command says is read from
+/// that end, and what a person would type is written to it.
+pub struct AtTerminal {
+    name: &'static str,
+    args: String,
+    child: Child,
+    /// The test's end of the terminal, to type at.
+    types: std::fs::File,
+    /// What the command says, as it arrives.
+    reads: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Everything it has said so far, and what was typed where the
+    /// terminal showed it.
+    pub said: String,
+    /// How far into `said` what was waited for has been found.
+    found_to: usize,
+}
+
+impl AtTerminal {
+    fn running(name: &'static str, mut command: Command, args: &[&str]) -> Self {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
+        grantpt(&ours).unwrap();
+        unlockpt(&ours).unwrap();
+        let theirs = ptsname(&ours, Vec::new()).unwrap();
+        let theirs = std::path::PathBuf::from(theirs.to_str().unwrap());
+        let end = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&theirs)
+                .unwrap()
+        };
+        let child = command
+            .args(args)
+            .stdin(end())
+            .stdout(end())
+            .stderr(end())
+            .spawn()
+            .unwrap();
+        // The command holds its end, and the test none of it: when the
+        // command ends, there is nothing more to read.
+        drop(command);
+        let ours = std::fs::File::from(ours);
+        let mut reads_from = ours.try_clone().unwrap();
+        let (tx, reads) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reads_from.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            name,
+            args: args.join(" "),
+            child,
+            types: ours,
+            reads,
+            said: String::new(),
+            found_to: 0,
+        }
+    }
+
+    /// Take in what the command has said since, waiting up to `wait` for
+    /// more. Says whether anything came.
+    fn hears(&mut self, wait: Duration) -> bool {
+        match self.reads.recv_timeout(wait) {
+            Ok(bytes) => {
+                self.said.push_str(&String::from_utf8_lossy(&bytes));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Wait until the command has said `what`, after whatever was waited
+    /// for before. Fails, with everything it said, where it ends or two
+    /// minutes go by first.
+    pub fn says(&mut self, what: &str) -> &mut Self {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if let Some(at) = self.said[self.found_to..].find(what) {
+                self.found_to += at + what.len();
+                return self;
+            }
+            let ended = self.child.try_wait().unwrap().is_some();
+            let heard = self.hears(Duration::from_millis(200));
+            if (ended && !heard) || Instant::now() > deadline {
+                panic!(
+                    "{}: cordelia {} did not say {what:?}. It said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+        }
+    }
+
+    /// Type `line` and press Enter, as a person does.
+    pub fn types(&mut self, line: &str) -> &mut Self {
+        use std::io::Write;
+        // A moment, as a person takes: the command has set the terminal
+        // as it wants it for this answer by then.
+        std::thread::sleep(Duration::from_millis(150));
+        self.types
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        self.types.flush().unwrap();
+        self
+    }
+
+    /// Wait for the command to end: whether it succeeded, and everything
+    /// that its terminal showed. Fails where it does not end in five
+    /// minutes.
+    pub fn ends(mut self) -> (bool, String) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let status = loop {
+            self.hears(Duration::from_millis(100));
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!(
+                    "{}: cordelia {} did not end. It said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+        };
+        while self.hears(Duration::from_millis(200)) {}
+        (status.success(), std::mem::take(&mut self.said))
+    }
+
+    /// [`Self::ends`], for a command that must succeed: what it said.
+    pub fn done(self) -> String {
+        let (name, args) = (self.name, self.args.clone());
+        let (success, said) = self.ends();
+        assert!(success, "{name}: cordelia {args} failed:\n{said}");
+        said
+    }
+
+    /// [`Self::ends`], for a command that must be refused: what it said.
+    pub fn refused(self) -> String {
+        let (name, args) = (self.name, self.args.clone());
+        let (success, said) = self.ends();
+        assert!(
+            !success,
+            "{name}: cordelia {args} should have been refused:\n{said}"
+        );
+        said
+    }
+}
+
+impl Drop for AtTerminal {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Poll `check` until it returns Some, or fail with every node's log tail.
