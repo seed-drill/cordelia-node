@@ -809,34 +809,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let db_path = data_dir.join("cordelia.db");
     let conn = cordelia_storage::db::open(&db_path)?;
 
-    // Auto-create persistent swarm channel for lead nodes (§8.2.2).
-    // Only personal nodes can be swarm leads (not bootnodes or relays).
-    if config.swarm.swarm_index.is_none() && config.network.role == "personal" {
-        let entity_id = &config.identity.entity_id;
-        if !entity_id.is_empty() {
-            let swarm_ch_id = cordelia_storage::naming::swarm_channel_id(entity_id);
-            let now = chrono::Utc::now().to_rfc3339();
-            let pk = identity.public_key();
-            // Generate PSK and store it alongside the channel
-            let swarm_psk = cordelia_crypto::generate_psk()?;
-            let swarm_psk_hash = cordelia_crypto::sha256(&swarm_psk);
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
-                 VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
-                rusqlite::params![swarm_ch_id, pk.as_slice(), swarm_psk_hash.as_slice(), now, now],
-            );
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
-                 VALUES (?1, ?2, 'owner', ?3)",
-                rusqlite::params![swarm_ch_id, pk.as_slice(), now],
-            );
-            // Save PSK using standard psk module (handles path encoding + 0600 permissions)
-            if !cordelia_storage::psk::has_psk(&data_dir, &swarm_ch_id) {
-                let _ = cordelia_storage::psk::write_psk(&data_dir, &swarm_ch_id, &swarm_psk);
-            }
-        }
-    }
-
     // The API listens only on this machine.
     let bind_addr = &config.api.bind_address;
     let Some(host) = api_host(bind_addr) else {
@@ -880,6 +852,29 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         warm_max,
         "node starting"
     );
+
+    // A node makes no channel that it does not use. Up to 0.2.0-alpha.7 a
+    // personal node made a swarm channel for itself each time it started,
+    // and v1 uses none. Any that this node holds is removed, with its key
+    // and whatever it holds. Its ID holds a name, so the log says how many
+    // went and does not say which.
+    let removed = cordelia_storage::channels::remove_swarm_channels(&conn, &data_dir)?;
+    if removed.any() {
+        tracing::info!(
+            channels = removed.channels,
+            items = removed.items,
+            key_files = removed.key_files,
+            "removed swarm channels, which this version does not use"
+        );
+    }
+    // A key file that could not be removed is no reason not to start. The
+    // node says how many, and tries again the next time it starts.
+    if removed.key_files_left > 0 {
+        tracing::warn!(
+            key_files = removed.key_files_left,
+            "could not remove every key file of a swarm channel; they are left, and the node starts"
+        );
+    }
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);

@@ -133,7 +133,7 @@ fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
 /// Text from a record as it is safe to print: control characters shown as
 /// escapes, so that a file name cannot move the cursor or hide a line, and
 /// so are the marks that change the direction text is laid out in.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     escaped(text, |_| false)
 }
 

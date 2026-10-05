@@ -588,6 +588,112 @@ pub fn drop_stored(conn: &Connection, channel_id: &str) -> Result<usize, Cordeli
     Ok(items)
 }
 
+/// The tables that refer to a channel by ID, other than `channels` itself
+/// and the two that [`drop_stored`] empties (`items` and `search_content`).
+/// A table that comes to refer to a channel by ID belongs here too: the
+/// test of [`remove_swarm_channels`] reads the schema, and fails until it
+/// is added.
+const TABLES_OF_A_CHANNEL: [&str; 7] = [
+    "channel_members",
+    "channel_keys",
+    "dm_peers",
+    "invites",
+    "state_offers",
+    "sync_files",
+    "index_lines",
+];
+
+/// Remove a channel from the database with everything held for it there:
+/// its members, the rows of every table that refers to it by ID, its
+/// items, and its own row. Returns how many items went. The caller makes
+/// it one transaction.
+fn remove(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
+    for table in TABLES_OF_A_CHANNEL {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE channel_id = ?1"),
+            params![channel_id],
+        )
+        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
+    // With no member left, this takes the channel's row with its items.
+    drop_stored(conn, channel_id)
+}
+
+/// What [`remove_swarm_channels`] removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemovedSwarmChannels {
+    pub channels: usize,
+    /// The items those channels held.
+    pub items: usize,
+    /// The key files kept for them.
+    pub key_files: usize,
+    /// The key files kept for them that could not be removed, and are
+    /// still there.
+    pub key_files_left: usize,
+}
+
+impl RemovedSwarmChannels {
+    /// Whether anything was removed.
+    pub fn any(&self) -> bool {
+        self.channels > 0 || self.items > 0 || self.key_files > 0
+    }
+}
+
+/// Remove every swarm channel this node holds (an ID that begins
+/// [`naming::SWARM_CHANNEL_PREFIX`]), with its members, its items, every
+/// row that refers to it, and its key files.
+///
+/// A node makes no channel that it does not use. Up to 0.2.0-alpha.7 a
+/// personal node made a swarm channel for itself each time it started, and
+/// v1 publishes nothing in one and reads nothing from one. Its ID holds the
+/// node's entity ID, which holds a name, so it is not one a node should
+/// keep: a node removes any it finds when it starts. What such a channel
+/// holds goes with it, since nothing reads it.
+///
+/// The rows go in one transaction, and the key files after it. The files
+/// are found by name, so a start that is cut short between the two leaves
+/// nothing for good: the next start takes the files.
+///
+/// It fails only where the database does. A key file that cannot be
+/// removed is counted and left, and tried again at the next start: it is
+/// for the node to say so, and no reason for it not to start.
+pub fn remove_swarm_channels(
+    conn: &Connection,
+    home_dir: &std::path::Path,
+) -> Result<RemovedSwarmChannels, CordeliaError> {
+    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
+    let batch =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+    let ids: Vec<String> = {
+        let mut stmt = batch
+            .prepare("SELECT channel_id FROM channels WHERE substr(channel_id, 1, ?1) = ?2")
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    naming::SWARM_CHANNEL_PREFIX.len() as i64,
+                    naming::SWARM_CHANNEL_PREFIX
+                ],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        rows.collect::<Result<_, _>>().map_err(storage)?
+    };
+    let mut items = 0;
+    for id in &ids {
+        items += remove(&batch, id)?;
+    }
+    batch.commit().map_err(storage)?;
+    let (key_files, key_files_left) = crate::psk::delete_swarm_keys(home_dir);
+    Ok(RemovedSwarmChannels {
+        channels: ids.len(),
+        items,
+        key_files,
+        key_files_left,
+    })
+}
+
 /// Create a local-scope channel (ephemeral, never forwarded to relay mesh).
 ///
 /// Uses a protocol-prefixed channel ID. The `channel_id` must be provided
@@ -994,6 +1100,304 @@ mod tests {
             .unwrap();
             assert_eq!(epoch(&conn, ch).unwrap().0, 0, "{stored}");
         }
+    }
+
+    /// The channel that a personal node made for itself each time it
+    /// started, up to 0.2.0-alpha.7, made as that version made it: its
+    /// row, the node as its owner, and its key file.
+    fn swarm_channel_as_it_was_made(
+        conn: &Connection,
+        home: &std::path::Path,
+        entity_id: &str,
+        pk: &[u8; 32],
+    ) -> String {
+        let id = naming::swarm_channel_id(entity_id);
+        let now = Utc::now().to_rfc3339();
+        let psk = [0x5Cu8; 32];
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
+             VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
+            params![id, pk.as_slice(), Sha256::digest(psk).as_slice(), now, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', ?3)",
+            params![id, pk.as_slice(), now],
+        )
+        .unwrap();
+        crate::psk::write_psk(home, &id, &psk).unwrap();
+        id
+    }
+
+    /// A row for `channel_id` in every table that refers to a channel by
+    /// ID, beyond the channel's own row and its first member: an item with
+    /// what search keeps of it, and one row in each other table. `n` keeps
+    /// one channel's rows apart from another's.
+    fn a_row_in_every_table(conn: &Connection, channel_id: &str, n: u8) {
+        let item_id = format!("ci_{n}");
+        assert!(
+            crate::items::insert_item(
+                conn,
+                &crate::items::NewItem::plain(
+                    &item_id,
+                    channel_id,
+                    &test_creator(),
+                    "message",
+                    "2026-01-01T00:00:00Z",
+                    1,
+                    &[n; 32],
+                    &[0x02; 64],
+                    &[0x03; 100],
+                ),
+            )
+            .unwrap()
+        );
+        conn.execute(
+            "INSERT INTO search_content (item_id, channel_id, item_type, published_at, content_text)
+             VALUES (?1, ?2, 'message', '2026-01-01T00:00:00Z', 'kept for search')",
+            params![item_id, channel_id],
+        )
+        .unwrap();
+        add_member(conn, channel_id, &[0x99; 32], "member").unwrap();
+        for sql in [
+            "INSERT INTO channel_keys (channel_id, encrypted_psk) VALUES (?1, X'01')",
+            "INSERT INTO dm_peers (channel_id, peer_key) VALUES (?1, X'02')",
+            "INSERT INTO invites (item_id, inviter, channel_id, status, received_at)
+             VALUES ('ci_invite_' || ?1, X'03', ?1, 'pending', '2026-01-01')",
+            "INSERT INTO state_offers (channel_id, member, epoch, item_id, sent_at, last_offered_at)
+             VALUES (?1, X'04', 1, 'ci_state', 0, 0)",
+            "INSERT INTO sync_files (folder, channel_id, key, rev) VALUES ('/m', ?1, 'notes.md', 1)",
+            "INSERT INTO index_lines (folder, channel_id, file) VALUES ('/m', ?1, 'notes.md')",
+        ] {
+            conn.execute(sql, params![channel_id]).unwrap();
+        }
+    }
+
+    /// The tables that have a `channel_id` column, as the schema has them,
+    /// and how many rows each holds for `channel_id`.
+    fn rows_by_table(conn: &Connection, channel_id: &str) -> Vec<(String, i64)> {
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT m.name FROM sqlite_master m, pragma_table_info(m.name) c
+                 WHERE m.type = 'table' AND c.name = 'channel_id' ORDER BY m.name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let rows = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE channel_id = ?1"),
+                        params![channel_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    /// A node makes no channel that it does not use, and removes the one
+    /// an earlier version made when it starts: its row, its members, its
+    /// items, every row that refers to it, and its key files. Every other
+    /// channel is left as it was, with its keys. A second start finds
+    /// nothing to remove.
+    #[test]
+    fn a_swarm_channel_is_removed_with_everything_held_for_it() {
+        let conn = db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let me = test_creator();
+        let key_files = |home: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(home.join("channel-keys"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // The node's own, as an earlier version made it, which has come to
+        // hold an item and a row in every table; and one with a ring and a
+        // slot key besides its key, as a channel whose key changed has.
+        let own = swarm_channel_as_it_was_made(&conn, home, "lead_a1b2", &me);
+        a_row_in_every_table(&conn, &own, 1);
+        let other = swarm_channel_as_it_was_made(&conn, home, "other_c3d4", &me);
+        crate::psk::rotate_psk(home, &other, &[0x5D; 32], "2026-01-01T00:00:00Z").unwrap();
+        crate::psk::write_slot_key(home, &other, &[0x5E; 32]).unwrap();
+
+        // What the node does use: a group, its inbox, and a local channel,
+        // whose ID begins as a swarm channel's does up to the second word.
+        let group = create_group(&conn, &me, "realtime", None, Some(&test_psk())).unwrap();
+        let group = group.channel_id;
+        a_row_in_every_table(&conn, &group, 2);
+        let inbox = naming::inbox_channel_id(&me);
+        ensure_inbox(&conn, &inbox, &me, true).unwrap();
+        let local = "cordelia:local:550e8400";
+        create_local(&conn, local, &me, Some(&test_psk())).unwrap();
+        for kept in [group.as_str(), local] {
+            crate::psk::write_psk(home, kept, &test_psk()).unwrap();
+        }
+        crate::psk::write_slot_key(home, &group, &[0x5F; 32]).unwrap();
+        let kept_keys = vec![
+            format!("{local}.key"),
+            format!("{group}.key"),
+            format!("{group}.slot"),
+        ];
+
+        // Every table that refers to a channel by ID is one the removal
+        // knows of, and each holds something for the node's own.
+        let before = rows_by_table(&conn, &own);
+        let mut known: Vec<&str> = TABLES_OF_A_CHANNEL.to_vec();
+        known.extend(["channels", "items", "search_content"]);
+        known.sort();
+        assert_eq!(
+            before.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            known,
+            "a table refers to a channel by ID and is not removed from"
+        );
+        assert!(before.iter().all(|(_, rows)| *rows > 0), "{before:?}");
+        let of_group = rows_by_table(&conn, &group);
+        assert_eq!(key_files(home).len(), kept_keys.len() + 4);
+
+        let removed = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!(
+            removed,
+            RemovedSwarmChannels {
+                channels: 2,
+                items: 1,
+                key_files: 4,
+                key_files_left: 0,
+            }
+        );
+        assert!(removed.any());
+        for gone in [&own, &other] {
+            let rows = rows_by_table(&conn, gone);
+            assert!(rows.iter().all(|(_, rows)| *rows == 0), "{gone}: {rows:?}");
+            assert!(!exists(&conn, gone).unwrap());
+        }
+        assert_eq!(key_files(home), kept_keys);
+        // Nothing of the item is left for search to find.
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH 'kept'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the group's item, and not the swarm channel's");
+
+        // The channels the node uses are as they were.
+        assert_eq!(rows_by_table(&conn, &group), of_group);
+        let mut left: Vec<String> = list_for_entity(&conn, &me)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.channel_id)
+            .collect();
+        left.sort();
+        let mut expected = vec![group.clone(), inbox, local.to_string()];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(crate::psk::read_psk(home, &group).unwrap(), test_psk());
+
+        // A second start has nothing to remove, and says nothing.
+        let again = remove_swarm_channels(&conn, home).unwrap();
+        assert!(!again.any(), "{again:?}");
+        assert_eq!(key_files(home), kept_keys);
+    }
+
+    /// The rows of a swarm channel go together or not at all, and its key
+    /// files only once they have gone. A removal that fails part of the
+    /// way leaves the channel whole, and the next one takes all of it. A
+    /// key file whose channel has no row is taken too.
+    #[test]
+    fn a_swarm_channel_is_removed_whole_or_not_at_all() {
+        let conn = db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let own = swarm_channel_as_it_was_made(&conn, home, "lead_a1b2", &test_creator());
+        a_row_in_every_table(&conn, &own, 1);
+        let before = rows_by_table(&conn, &own);
+
+        // The last statement of the removal fails: the channel's own row
+        // cannot be deleted.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse BEFORE DELETE ON channels
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+        assert!(remove_swarm_channels(&conn, home).is_err());
+        assert_eq!(rows_by_table(&conn, &own), before);
+        assert!(crate::psk::has_psk(home, &own));
+
+        conn.execute_batch("DROP TRIGGER refuse;").unwrap();
+        let removed = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!(
+            (removed.channels, removed.items, removed.key_files),
+            (1, 1, 1)
+        );
+        assert!(!crate::psk::has_psk(home, &own));
+
+        // A key file left behind by a removal that was cut short after its
+        // rows had gone.
+        crate::psk::write_psk(home, &own, &[0x5C; 32]).unwrap();
+        let removed = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!(
+            (removed.channels, removed.items, removed.key_files),
+            (0, 0, 1)
+        );
+        assert!(!crate::psk::has_psk(home, &own));
+
+        // A node with no key directory at all has nothing to remove.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!remove_swarm_channels(&conn, empty.path()).unwrap().any());
+    }
+
+    /// A key file that cannot be removed does not fail the removal. It is
+    /// counted, and all that can go goes: the channel's rows, and its
+    /// other key files. The next removal tries it again, and takes it once
+    /// it can be removed. (Here it is a directory where a slot key would
+    /// be, which cannot be removed as a file is.)
+    #[test]
+    fn a_key_file_that_cannot_be_removed_is_counted_and_fails_nothing() {
+        let conn = db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let own = swarm_channel_as_it_was_made(&conn, home, "lead_a1b2", &test_creator());
+        let stuck = crate::psk::slot_key_path(home, &own);
+        std::fs::create_dir(&stuck).unwrap();
+
+        let removed = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!(
+            removed,
+            RemovedSwarmChannels {
+                channels: 1,
+                items: 0,
+                key_files: 1,
+                key_files_left: 1,
+            }
+        );
+        assert!(!exists(&conn, &own).unwrap());
+        assert!(!crate::psk::has_psk(home, &own));
+        assert!(stuck.exists());
+
+        // Nothing more to remove, and the one that is left is counted
+        // again: there was nothing to say was removed.
+        let again = remove_swarm_channels(&conn, home).unwrap();
+        assert!(!again.any(), "{again:?}");
+        assert_eq!(again.key_files_left, 1);
+
+        // Once it can be removed, it is.
+        std::fs::remove_dir(&stuck).unwrap();
+        crate::psk::write_slot_key(home, &own, &[0x5E; 32]).unwrap();
+        let last = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!((last.key_files, last.key_files_left), (1, 0));
+        assert!(!stuck.exists());
     }
 
     #[test]

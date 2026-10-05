@@ -398,13 +398,27 @@ pub fn query_sync_after(
     Ok(items)
 }
 
+/// Which rows of `items` are in the outbox of the author `?1`: written by
+/// it, not yet acknowledged by a relay, and in a channel whose items go to
+/// relays. That is a network-scope channel whose ID may be told to a peer
+/// ([`crate::naming::may_be_told_to_a_peer`]): an item carries its
+/// channel's ID, so one in any other channel is never sent. It is left out
+/// here, in the query, so that it neither counts as waiting nor takes a
+/// place in a batch from one that can be sent.
+fn in_outbox() -> String {
+    format!(
+        "author_id = ?1 AND relayed_at IS NULL
+           AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')
+           AND {}",
+        crate::naming::told_to_a_peer_sql("channel_id")
+    )
+}
+
 /// How many items are in this node's [`outbox`]: written by `author`, not
 /// yet acknowledged by a relay.
 pub fn outbox_len(conn: &Connection, author: &[u8; 32]) -> Result<u64, CordeliaError> {
     conn.query_row(
-        "SELECT COUNT(*) FROM items
-         WHERE author_id = ?1 AND relayed_at IS NULL
-           AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')",
+        &format!("SELECT COUNT(*) FROM items WHERE {}", in_outbox()),
         params![author.as_slice()],
         |row| row.get::<_, i64>(0),
     )
@@ -418,7 +432,8 @@ pub fn outbox_len(conn: &Connection, author: &[u8; 32]) -> Result<u64, CordeliaE
 /// relay counts them the same way), but always at least one item if any
 /// are pending. Items whose ID is in `skip` are left out (those a relay
 /// refused, which wait before they are offered again), and do not count
-/// towards the bounds.
+/// towards the bounds. Nor do the items of a channel whose ID may not be
+/// told to a peer, which are never in it.
 pub fn outbox(
     conn: &Connection,
     author: &[u8; 32],
@@ -429,10 +444,10 @@ pub fn outbox(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {ITEM_COLUMNS} FROM items
-             WHERE author_id = ?1 AND relayed_at IS NULL
-               AND channel_id IN (SELECT channel_id FROM channels WHERE scope = 'network')
+             WHERE {}
              ORDER BY seq ASC
-             LIMIT ?2"
+             LIMIT ?2",
+            in_outbox()
         ))
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
     let rows = stmt
@@ -1403,6 +1418,51 @@ mod tests {
         assert_eq!(
             ids(outbox(&conn, &me, 10, 1 << 20, &none).unwrap()),
             vec!["ci_m2"]
+        );
+        assert_eq!(outbox_len(&conn, &me).unwrap(), 1);
+    }
+
+    /// An item carries its channel's ID, so the items of a channel whose
+    /// ID may not be told to a peer are never in the outbox: they are not
+    /// sent, they are not counted as waiting, and they take no place in a
+    /// batch from an item that can be sent.
+    #[test]
+    fn the_outbox_holds_no_item_of_a_channel_whose_id_is_not_told() {
+        let conn = setup();
+        let me = [0x42u8; 32];
+        let swarm = crate::naming::swarm_channel_id("lead_a1b2");
+        assert!(!crate::naming::may_be_told_to_a_peer(&swarm));
+        // Made as a version up to 0.2.0-alpha.7 made it: of network scope.
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, scope, creator_id, created_at, updated_at)
+             VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, '2026-01-01', '2026-01-01')",
+            params![swarm, me.as_slice()],
+        )
+        .unwrap();
+
+        // Two of this node's items there, written before one in a channel
+        // whose ID may be told.
+        for (n, id) in ["ci_s1", "ci_s2"].into_iter().enumerate() {
+            let mut held = test_item(id, "2026-01-01T00:01:00Z");
+            held.channel_id = Box::leak(swarm.clone().into_boxed_str());
+            held.content_hash = Box::leak(Box::new([0x90 + n as u8; 32]));
+            assert!(insert_item(&conn, &held).unwrap());
+        }
+        let mut sent = test_item("ci_m1", "2026-01-01T00:02:00Z");
+        sent.content_hash = &[0x81; 32];
+        assert!(insert_item(&conn, &sent).unwrap());
+
+        let ids = |v: Vec<StoredItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            ids(outbox(&conn, &me, 10, 1 << 20, &none).unwrap()),
+            vec!["ci_m1"]
+        );
+        // A batch of one is the item that can be sent, though the two that
+        // cannot were written first.
+        assert_eq!(
+            ids(outbox(&conn, &me, 1, 1 << 20, &none).unwrap()),
+            vec!["ci_m1"]
         );
         assert_eq!(outbox_len(&conn, &me).unwrap(), 1);
     }
