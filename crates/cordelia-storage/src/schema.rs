@@ -352,10 +352,6 @@ INSERT OR IGNORE INTO counters (name, value) VALUES ('entry_seq', 0);
 ///   applied statement, in the order it saw them, each counted or not.
 /// - `person_names`: the names it holds in the current generation, each
 ///   with its channel's ID, so that either is found from the other.
-/// - `person_hand_overs`: for each key it has handed the change to, the
-///   pair channel of the two, the revision of the last hand-over it made
-///   there, when that one says it was made, and whether the store still
-///   holds it. Never the hand-over itself, which holds the secret (§6).
 const MIGRATION_V12: &str = r#"
 CREATE TABLE person (
     one             INTEGER PRIMARY KEY CHECK(one = 1),
@@ -402,14 +398,6 @@ CREATE TABLE person_names (
     channel  BLOB NOT NULL UNIQUE CHECK(length(channel) = 32),
     held_at  INTEGER NOT NULL
 );
-
-CREATE TABLE person_hand_overs (
-    key      BLOB PRIMARY KEY CHECK(length(key) = 32),
-    channel  BLOB NOT NULL CHECK(length(channel) = 32),
-    rev      INTEGER NOT NULL CHECK(rev >= 1),
-    made_at  INTEGER NOT NULL,
-    held     INTEGER NOT NULL CHECK(held IN (0, 1))
-);
 "#;
 
 /// Migration v13: the channels from their secrets that a relay holds
@@ -434,6 +422,13 @@ CREATE TABLE person_hand_overs (
 /// that says nothing of any other channel. A channel is handed to a
 /// holder of its key in pages by that count. The entries that are there
 /// are counted in the order in which this node stored them.
+///
+/// And what a device keeps of the last hand-over it made for each key
+/// (`person_hand_overs`, decision 2026-10-04 §6): the pair channel of
+/// the two, the revision of that hand-over there, when it says it was
+/// made, and whether the store still holds it. Never the hand-over
+/// itself, which holds the secret. It is one of the tables of what a
+/// device holds of its person, and is made by this step.
 const MIGRATION_V13: &str = r#"
 CREATE TABLE relay_channels (
     channel_id  BLOB PRIMARY KEY CHECK(length(channel_id) = 32),
@@ -453,6 +448,14 @@ UPDATE entries SET channel_place = (
 );
 
 CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_place);
+
+CREATE TABLE person_hand_overs (
+    key      BLOB PRIMARY KEY CHECK(length(key) = 32),
+    channel  BLOB NOT NULL CHECK(length(channel) = 32),
+    rev      INTEGER NOT NULL CHECK(rev >= 1),
+    made_at  INTEGER NOT NULL,
+    held     INTEGER NOT NULL CHECK(held IN (0, 1))
+);
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -1223,12 +1226,11 @@ mod tests {
     }
 
     /// The tables and the index that the step to version 12 adds.
-    const NEW_IN_V12: [&str; 7] = [
+    const NEW_IN_V12: [&str; 6] = [
         "idx_person_secrets_applied",
         "person",
         "person_additions",
         "person_change_entries",
-        "person_hand_overs",
         "person_names",
         "person_secrets",
     ];
@@ -1272,11 +1274,14 @@ mod tests {
         .unwrap()
     }
 
-    /// What a database holds of the step to version 12, by name.
+    /// What a database holds of the step to version 12, by name. One
+    /// table of what a device holds of its person is of a later step.
     fn new_in_v12(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
-             WHERE name LIKE '%person%' AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+             WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
+               AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
         )
         .unwrap()
         .query_map([], |row| row.get(0))
@@ -1327,7 +1332,7 @@ mod tests {
     }
 
     /// A database at version 11 that an older binary wrote is taken to
-    /// version 12 with everything it held as it was: the step adds six
+    /// version 12 with everything it held as it was: the step adds five
     /// tables and an index, with nothing in them, and touches nothing
     /// else. A device that takes this version follows no phrase.
     #[test]
@@ -1415,11 +1420,12 @@ mod tests {
         conn
     }
 
-    /// The table and the indexes that the step to version 13 adds.
-    const NEW_IN_V13: [&str; 4] = [
+    /// The tables and the indexes that the step to version 13 adds.
+    const NEW_IN_V13: [&str; 5] = [
         "idx_entries_channel_place",
         "idx_relay_channels_held",
         "idx_relay_channels_used",
+        "person_hand_overs",
         "relay_channels",
     ];
 
@@ -1445,7 +1451,8 @@ mod tests {
         let mut held = held_before_v12(conn);
         for rows in [
             "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
-                 WHERE name LIKE '%person%' ORDER BY name",
+                 WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
+                 ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
             "SELECT number || hex(secret) || COALESCE(left_at, '') FROM person_secrets",
@@ -1468,7 +1475,8 @@ mod tests {
     fn new_in_v13(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
-             WHERE (name LIKE '%relay_channels%' OR name = 'idx_entries_channel_place')
+             WHERE (name LIKE '%relay_channels%' OR name = 'idx_entries_channel_place'
+                    OR name = 'person_hand_overs')
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1479,10 +1487,11 @@ mod tests {
         .unwrap()
     }
 
-    /// The table of the channels a relay holds, and each entry's place in
-    /// its channel's own order, are made in one step with their version,
-    /// as the steps before it are: a failure between them leaves none,
-    /// and the step asked for twice is run once.
+    /// The table of the channels a relay holds, each entry's place in its
+    /// channel's own order, and the table of the hand-overs a device
+    /// made, are made in one step with their version, as the steps before
+    /// it are: a failure between them leaves none, and the step asked for
+    /// twice is run once.
     #[test]
     fn test_v13_adds_the_channels_a_relay_holds_and_its_version_as_one() {
         let conn = at_v12();
@@ -1529,11 +1538,12 @@ mod tests {
     }
 
     /// A database at version 12 that an older binary wrote is taken to
-    /// version 13 with everything it held as it was: the step adds one
-    /// table and two indexes, with nothing in them, and to each entry its
-    /// place in its channel's own order, with an index. It touches
+    /// version 13 with everything it held as it was: the step adds two
+    /// tables and two indexes, with nothing in them, and to each entry
+    /// its place in its channel's own order, with an index. It touches
     /// nothing else. The entries it held are in no channel that a relay
-    /// holds.
+    /// holds, and the device has made no hand-over that it keeps
+    /// anything of.
     #[test]
     fn test_a_database_at_v12_that_an_older_binary_wrote_is_taken_to_v13() {
         let conn = at_v12();
@@ -1567,12 +1577,16 @@ mod tests {
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(held_before_v13(&conn), before);
 
-        // What is new: the table, with nothing in it, and its indexes.
+        // What is new: the tables, with nothing in them, and the indexes.
         assert_eq!(new_in_v13(&conn), NEW_IN_V13);
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM relay_channels", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
+        for table in ["relay_channels", "person_hand_overs"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
 
         // And each entry's place in its channel's own order: the entries
         // of each channel are counted from 1, in the order in which this
