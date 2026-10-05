@@ -1017,6 +1017,15 @@ mod tests {
             change.content.clone(),
         );
         assert_eq!(answer(&elsewhere), Answered::NotOfTheSlot);
+        // And the phrase's own entry, in that slot, of another channel.
+        let of_another = signed_in(
+            &[9; 32],
+            &phrase_key,
+            change.slot,
+            change.rev,
+            change.content.clone(),
+        );
+        assert_eq!(answer(&of_another), Answered::NotOfTheSlot);
         assert_eq!(on.everything(), before);
 
         // The entry that it shows: it keeps it.
@@ -1124,6 +1133,17 @@ mod tests {
             says(&identity_of(9), 1, "name/strangers", text("")),
             Taken::Refused(NotTaken::SignerDoesNotCount)
         );
+        // And the word of a key that does not count, where the store
+        // holds it all the same: it lists nothing.
+        let unlisted = entry_by(
+            &identity_of(9),
+            &personal,
+            1,
+            "name/unlisted",
+            text(""),
+            &[],
+        );
+        entries::store(&on.conn, &unlisted, now).unwrap();
 
         let names = |most: usize| -> Vec<Kind> {
             listed(&on.conn, most)
@@ -1698,6 +1718,19 @@ mod tests {
             s.write(0, "notes", file, &format!("what {file} holds"));
         }
         s.meet(&[0, 1]);
+        // Device 0 has a word of its own in the personal channel.
+        let word = entry_by(
+            &s[0].identity,
+            &s[0].personal(),
+            1,
+            "name/notes",
+            text(""),
+            &[],
+        );
+        assert_eq!(
+            take(&s[0].conn, &s[0].identity, &word, s.now).unwrap(),
+            STORED
+        );
         // A change, made on device 0: it carries what it holds.
         let change = s.change(0, &[0, 1], &[]);
         let now = s.tick();
@@ -1710,10 +1743,12 @@ mod tests {
         // What it carried is not what came since: in the name's channel
         // nothing did.
         assert!(sends(on, &RELAY, &notes, Which::Since).is_empty());
-        // In the personal channel its word that it applied is sent with
-        // everything, and nothing there is sent apart.
+        // In the personal channel the word that it carried, and its word
+        // that it applied, are sent with everything, and nothing there
+        // is sent apart.
         let personal = channel_of(on, Kind::Personal);
-        assert_eq!(sends(on, &RELAY, &personal, Which::Since).entries.len(), 1);
+        assert_eq!(on.stored_in(&on.personal()).len(), 2);
+        assert_eq!(sends(on, &RELAY, &personal, Which::Since).entries.len(), 2);
         assert!(sends(on, &RELAY, &personal, Which::Carried).is_empty());
         // The relay holds nothing of the name: all three are sent.
         let all = sends(on, &RELAY, &notes, Which::Carried);

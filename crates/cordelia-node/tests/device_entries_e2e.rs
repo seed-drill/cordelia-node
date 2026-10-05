@@ -876,13 +876,22 @@ async fn leave_ends_at_once_at_every_relay_when_the_entry_kept_changes() {
     // then sends: each relay holds the change, and what was carried is
     // not sent by the pass that sends.
     device.sends().await;
+    let new_notes = device.channel("notes");
     for relay in [&first, &second] {
         assert!(holds_at(relay, &change.channel, &change.id()));
         assert!(!holds_at(relay, &old_notes, &waiting.id()));
+        assert!(held_at(relay, &new_notes).is_empty());
     }
     for relay in ["first", "second"] {
         assert_eq!(device.has_leave(relay), Ok(()));
         assert_eq!(device.counts(relay).whole_shows, 2);
+    }
+    // The whole pass fetches the name's new channel from each relay, and
+    // then sends what it carried.
+    device.passes().await;
+    for relay in [&first, &second] {
+        assert_eq!(held_at(relay, &new_notes).len(), 1);
+        assert!(!holds_at(relay, &old_notes, &waiting.id()));
     }
 }
 
@@ -923,6 +932,22 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     assert_eq!(relay.seen(), [Seen::Short, Seen::Whole]);
+    // With no leave, no stream for a channel is opened at all: the relay
+    // sees none, whoever asks for one.
+    let proof = proof_on(&device, "relay", "notes");
+    let opened = device
+        .engine
+        .leave()
+        .open(
+            &device.state.db,
+            &device.link("relay"),
+            &proof,
+            |_| (),
+            |_, _| (),
+        )
+        .await;
+    assert_eq!(opened, Err(Refused::NoLeave(NoLeave::NotGiven)));
+    assert_eq!(relay.seen(), []);
 
     // Word of another, which the device does not keep: it shows its own
     // whole, and is answered with what is no entry. No leave, and nothing
@@ -1461,7 +1486,15 @@ async fn with_a_relay_out_of_reach_a_device_waits_half_a_minute_and_then_goes_on
     device.passes().await;
     assert!(device.status().relays.iter().all(|at| !at.heard_since_woke));
 
+    // It reaches one. Whichever pass comes first asks it: here, the pass
+    // that sends. And it is asked once: it has answered.
     device.connects("reached", &relay).await;
+    device.sends().await;
+    assert!(device.at("reached").heard_since_woke);
+    let asked = device.counts("reached");
+    assert_eq!((asked.whole_shows, asked.short_shows), (1, 0));
+    device.sends().await;
+    assert_eq!(device.counts("reached"), asked);
     device.passes().await;
     device.sends().await;
     // The one it reaches has answered. The other has not, and the device
