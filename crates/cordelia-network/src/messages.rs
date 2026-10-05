@@ -334,7 +334,9 @@ pub struct Refusal {
     pub why: String,
 }
 
-/// The item is not valid: its hash, its signature or its shape.
+/// The item is not valid: its hash, its signature or its shape. Or the
+/// receiver is a relay, and the item's channel is one whose ID may not be
+/// told to a peer: a relay stores nothing of such a channel.
 pub const REFUSED_INVALID: &str = "invalid";
 /// The receiver could not store it (its disk, or its database).
 pub const REFUSED_STORAGE: &str = "storage";

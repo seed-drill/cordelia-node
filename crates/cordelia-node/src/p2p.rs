@@ -874,6 +874,9 @@ fn next_ask(
 /// about, and keep a place in, any number of channels with names of any
 /// length. A peer with more channels than `most` is asked about a
 /// different part of them each time, since a set has no order.
+///
+/// To ask about a channel is to send its ID, so a channel whose ID may not
+/// be told to a peer is not asked about, whoever listed it.
 fn channels_to_ask(own: Vec<String>, listed: Vec<String>, most: usize) -> Vec<String> {
     let mut channels: std::collections::HashSet<String> = own.into_iter().collect();
     let listed: std::collections::HashSet<String> = listed
@@ -882,10 +885,87 @@ fn channels_to_ask(own: Vec<String>, listed: Vec<String>, most: usize) -> Vec<St
             !id.is_empty()
                 && id.len() <= cordelia_core::protocol::MAX_CHANNEL_ID_LEN
                 && id.bytes().all(|b| b.is_ascii_graphic())
+                && cordelia_storage::naming::may_be_told_to_a_peer(id)
         })
         .collect();
     channels.extend(listed.into_iter().take(most));
     channels.into_iter().collect()
+}
+
+/// The channels a node fetches from its peers, whatever they list: a
+/// relay's are those it holds items for, and a device's those it is a
+/// member of. A device's local channels are among them: who is served a
+/// local channel is decided where it is served (§8.2.2).
+///
+/// To fetch a channel is to ask for it by its ID, so a channel whose ID
+/// may not be told to a peer is not among them.
+///
+/// The inbox comes first. A device that removes another publishes again
+/// what that device last wrote, and then sends the removal. Fetching the
+/// removal before the channels means that whenever it is seen, those
+/// entries are fetched in the same pass, before it is applied.
+fn channels_to_fetch(db: &rusqlite::Connection, node_role: &str, own: &[u8; 32]) -> Vec<String> {
+    use cordelia_storage::naming::{ChannelType, may_be_told_to_a_peer};
+    let mut channels: Vec<String> = if node_role == "relay" {
+        cordelia_storage::channels::list_stored_channel_ids(db).unwrap_or_default()
+    } else {
+        cordelia_storage::channels::list_for_entity(db, own)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.channel_id)
+            .collect()
+    };
+    channels.retain(|id| may_be_told_to_a_peer(id));
+    channels.sort_by_key(|id| ChannelType::from_id(id) != ChannelType::Inbox);
+    channels
+}
+
+/// The channels this node announces to a peer: its network-scope channels
+/// (§8.2.2: local channels never leave the PAN) whose IDs may be told to
+/// one.
+fn channels_to_announce(db: &rusqlite::Connection, own: &[u8; 32]) -> Vec<String> {
+    cordelia_storage::channels::list_network_channels(db, own)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.channel_id)
+        .filter(|id| cordelia_storage::naming::may_be_told_to_a_peer(id))
+        .collect()
+}
+
+/// The channels a node answers with when one of its own relays asks which
+/// it holds (§4.5): those it has items for whose IDs may be told to a
+/// peer. Local-scope channels are told to a swarm peer and to no other
+/// (§8.2.2).
+fn channels_it_lists(db: &rusqlite::Connection, to_a_swarm_peer: bool) -> Vec<String> {
+    let mut ids = cordelia_storage::channels::list_stored_channel_ids(db).unwrap_or_default();
+    ids.retain(|id| {
+        cordelia_storage::naming::may_be_told_to_a_peer(id)
+            && (to_a_swarm_peer
+                || !cordelia_storage::channels::is_local_scope(db, id).unwrap_or(false))
+    });
+    ids
+}
+
+/// Whether a node answers a peer that asks for a channel's items: not for
+/// a local-scope channel unless a swarm peer asks (§8.2.2), and not for a
+/// channel whose ID may not be told to a peer, since each item it would
+/// list carries that ID.
+fn answers_for(db: &rusqlite::Connection, channel_id: &str, to_a_swarm_peer: bool) -> bool {
+    cordelia_storage::naming::may_be_told_to_a_peer(channel_id)
+        && (to_a_swarm_peer
+            || !cordelia_storage::channels::is_local_scope(db, channel_id).unwrap_or(false))
+}
+
+/// Whether a relay passes an item of `channel_id` on to the relays it
+/// lists: not an item of a local-scope channel (§8.2.2: it never leaves
+/// the PAN), and not one of a channel whose ID may not be told to a peer,
+/// since an item carries its channel's ID. Without the database, which
+/// says what a channel's scope is, only the second is known.
+fn passed_on(db: Option<&rusqlite::Connection>, channel_id: &str) -> bool {
+    cordelia_storage::naming::may_be_told_to_a_peer(channel_id)
+        && !db.is_some_and(|db| {
+            cordelia_storage::channels::is_local_scope(db, channel_id).unwrap_or(false)
+        })
 }
 
 /// A fetch running from one peer. While it lives, no other is started
@@ -1269,7 +1349,9 @@ async fn fetch_from(from: FetchFrom) -> (Fetched, u64) {
                         }
                     }
                     if stored_count > 0 {
-                        tracing::info!(channel = %ch_id, fetched = fetch_ids.len(), stored = stored_count, "pull-sync page complete");
+                        // Which channel is said for debugging only.
+                        tracing::info!(peer = %target, fetched = fetch_ids.len(), stored = stored_count, "pull-sync page complete");
+                        tracing::debug!(peer = %target, channel = %ch_id, stored = stored_count, "pull-sync page stored");
                         total_stored += stored_count as u64;
                     }
                 }
@@ -1390,6 +1472,11 @@ pub fn check_item(item: &cordelia_network::messages::Item) -> Result<Checked, &'
 
 /// Store an item that [`check_item`] has passed. A relay passes its
 /// [`RelayRoom`]; a device passes none.
+///
+/// A relay stores nothing of a channel whose ID may not be told to a peer.
+/// It would hold, under an ID that holds a name, what it never lists,
+/// serves or passes on. Such an item is refused as one that is not valid,
+/// before anything is made for its channel.
 pub fn store_checked(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
@@ -1401,6 +1488,11 @@ pub fn store_checked(
     use cordelia_network::messages::{
         REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
     };
+
+    if node_role == "relay" && !cordelia_storage::naming::may_be_told_to_a_peer(&item.channel_id) {
+        tracing::debug!(item = %item.item_id, channel = %item.channel_id, "an item of a channel whose ID is not told to a peer; a relay does not store it");
+        return Err(REFUSED_INVALID);
+    }
 
     let will_hold = match room.as_deref_mut() {
         Some(room) => Some(room.admit(db, item, checked)?),
@@ -2831,14 +2923,13 @@ pub async fn p2p_loop(
                 }
                 if pending.is_empty() { continue; }
 
-                // Filter out local-scope items (§8.2.2: never leave the PAN)
+                // Filter out what a relay does not pass on: local-scope items
+                // (§8.2.2: never leave the PAN), and the items of a channel
+                // whose ID may not be told to a peer.
                 {
                     let db = state.db.lock();
-                    if let Ok(db) = db {
-                        pending.retain(|_, (item, _)| {
-                            !cordelia_storage::channels::is_local_scope(&db, &item.channel_id).unwrap_or(false)
-                        });
-                    }
+                    let db = db.as_deref().ok();
+                    pending.retain(|_, (item, _)| passed_on(db, &item.channel_id));
                 }
                 if pending.is_empty() { continue; }
 
@@ -2998,35 +3089,16 @@ pub async fn p2p_loop(
                 // Scope filtering happens on the serving side (§8.2.2):
                 // handle_inbound_sync rejects local-scope requests from non-swarm peers.
                 // Swarm nodes need to sync local channels from their lead.
+                // The inbox comes first (see `channels_to_fetch`).
                 let local_channels: Vec<String> = {
                     let db = match state.db.lock() {
                         Ok(db) => db,
                         Err(_) => continue,
                     };
-                    if node_role == "relay" {
-                        cordelia_storage::channels::list_stored_channel_ids(&db)
-                            .unwrap_or_default()
-                    } else {
-                        let pk = state.identity.public_key();
-                        cordelia_storage::channels::list_for_entity(&db, &pk)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|c| c.channel_id)
-                            .collect()
-                    }
+                    channels_to_fetch(&db, &node_role, &state.identity.public_key())
                 };
                 // Personal nodes with no subscribed channels: nothing to sync
                 if local_channels.is_empty() && node_role != "relay" { continue; }
-                // The inbox first. A device that removes another publishes
-                // again what that device last wrote, and then sends the
-                // removal. Fetching the removal before the channels means
-                // that whenever it is seen, those entries are fetched in the
-                // same pass, before it is applied.
-                let mut local_channels = local_channels;
-                local_channels.sort_by_key(|id| {
-                    cordelia_storage::naming::ChannelType::from_id(id)
-                        != cordelia_storage::naming::ChannelType::Inbox
-                });
 
                 let is_relay = node_role == "relay";
                 let hot = governor.hot_peers();
@@ -4144,15 +4216,10 @@ async fn handle_inbound_sync(
                     Ok(db) => db,
                     Err(_) => return,
                 };
-                let mut ids =
-                    cordelia_storage::channels::list_stored_channel_ids(&db).unwrap_or_default();
-                // Hide local-scope channels from non-swarm peers (§8.2.2)
-                if !is_swarm_peer {
-                    ids.retain(|ch_id| {
-                        !cordelia_storage::channels::is_local_scope(&db, ch_id).unwrap_or(false)
-                    });
-                }
-                ids
+                // Local-scope channels are hidden from non-swarm peers
+                // (§8.2.2), and a channel whose ID may not be told to a
+                // peer from every peer.
+                channels_it_lists(&db, is_swarm_peer)
             };
             tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
             let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
@@ -4177,35 +4244,34 @@ async fn handle_inbound_sync(
     // old clients close after one channel, server reads EOF, loop breaks.
     let mut channels_served: u32 = 0;
     loop {
-        // Scope check: don't serve local-scope channel items to non-swarm peers (§8.2.2)
-        if !is_swarm_peer {
-            let is_local = {
-                let db = match state.db.lock() {
-                    Ok(db) => db,
-                    Err(_) => break,
-                };
-                cordelia_storage::channels::is_local_scope(&db, &current_req.channel_id)
-                    .unwrap_or(false)
+        // Don't serve local-scope channel items to non-swarm peers (§8.2.2),
+        // nor to any peer the items of a channel whose ID may not be told
+        // to one: the answer is that the channel holds nothing.
+        let answers = {
+            let db = match state.db.lock() {
+                Ok(db) => db,
+                Err(_) => break,
             };
-            if is_local {
-                tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "rejecting sync for local-scope channel from non-swarm peer");
-                let resp = cordelia_network::messages::WireMessage::SyncResponse(
-                    cordelia_network::messages::SyncResponse {
-                        items: vec![],
-                        has_more: false,
-                        last_seq: None,
-                    },
-                );
-                let _ = cordelia_network::codec::write_frame(send, &resp).await;
-                // Don't abort stream -- read next frame to continue batch
-                match cordelia_network::codec::read_frame(recv).await {
-                    Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
-                        current_req = r;
-                        channels_served += 1;
-                        continue;
-                    }
-                    _ => break,
+            answers_for(&db, &current_req.channel_id, is_swarm_peer)
+        };
+        if !answers {
+            tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "rejecting sync for a channel that is not served to this peer");
+            let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                cordelia_network::messages::SyncResponse {
+                    items: vec![],
+                    has_more: false,
+                    last_seq: None,
+                },
+            );
+            let _ = cordelia_network::codec::write_frame(send, &resp).await;
+            // Don't abort stream -- read next frame to continue batch
+            match cordelia_network::codec::read_frame(recv).await {
+                Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
+                    current_req = r;
+                    channels_served += 1;
+                    continue;
                 }
+                _ => break,
             }
         }
 
@@ -4395,13 +4461,27 @@ async fn handle_inbound_peer_share(
     }
 }
 
+/// Text that a peer chose, as it is safe to put in a warning: its first 64
+/// characters, with control characters and the marks that change the
+/// direction of text shown as escapes. A peer chooses what the text holds
+/// and how long it is.
+fn as_a_peer_sent_it(text: &str) -> String {
+    const MOST: usize = 64;
+    let start: String = text.chars().take(MOST).collect();
+    crate::history_cmd::printable(&start)
+}
+
 /// Handle inbound ChannelAnnounce (0x04) stream.
 /// Reads frames until EOF/error, dispatches ChannelJoined/ChannelLeft to governor.
+///
+/// A channel's ID is logged for debugging only. What a node logs as a
+/// matter of course is how many channels a peer announced, not which.
 async fn handle_inbound_channel_announce(
     recv: &mut quinn::RecvStream,
     peer_id: &NodeId,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
 ) {
+    let (mut announced, mut withdrawn) = (0u64, 0u64);
     loop {
         let msg = match cordelia_network::codec::read_frame(recv).await {
             Ok(m) => m,
@@ -4412,30 +4492,33 @@ async fn handle_inbound_channel_announce(
                 if let Err(e) =
                     cordelia_network::channel_announce::validate_descriptor(&joined.descriptor)
                 {
+                    // Both are what the peer sent, or hold it.
                     tracing::warn!(
                         peer = %peer_id,
-                        channel = %joined.channel_id,
-                        error = %e,
+                        channel = %as_a_peer_sent_it(&joined.channel_id),
+                        error = %as_a_peer_sent_it(&e.to_string()),
                         "channel-announce: invalid descriptor"
                     );
                     continue;
                 }
-                tracing::info!(
+                tracing::debug!(
                     peer = %peer_id,
                     channel = %joined.channel_id,
                     "peer announced channel"
                 );
+                announced += 1;
                 let _ = gov_tx.send(GovEvent::ChannelAnnounced(
                     peer_id.clone(),
                     joined.channel_id,
                 ));
             }
             cordelia_network::messages::WireMessage::ChannelLeft(left) => {
-                tracing::info!(
+                tracing::debug!(
                     peer = %peer_id,
                     channel = %left.channel_id,
                     "peer withdrew channel"
                 );
+                withdrawn += 1;
                 let _ = gov_tx.send(GovEvent::ChannelWithdrawn(peer_id.clone(), left.channel_id));
             }
             _ => {
@@ -4443,6 +4526,9 @@ async fn handle_inbound_channel_announce(
                 break;
             }
         }
+    }
+    if announced + withdrawn > 0 {
+        tracing::info!(peer = %peer_id, announced, withdrawn, "peer announced channels");
     }
 }
 
@@ -4454,9 +4540,9 @@ async fn send_channel_announcements(
 ) -> Result<(), String> {
     let channels = {
         let db = state.db.lock().map_err(|e| format!("db lock: {e}"))?;
-        let pk = state.identity.public_key();
-        // Only announce network-scope channels (§8.2.2: local channels never leave PAN)
-        cordelia_storage::channels::list_network_channels(&db, &pk).unwrap_or_default()
+        // Only network-scope channels (§8.2.2: local channels never leave
+        // PAN), and only those whose IDs may be told to a peer.
+        channels_to_announce(&db, &state.identity.public_key())
     };
     if channels.is_empty() {
         return Ok(());
@@ -4469,18 +4555,18 @@ async fn send_channel_announcements(
         .await
         .map_err(|e| format!("write protocol byte: {e}"))?;
 
-    for ch in &channels {
+    for channel_id in &channels {
         // The ID and nothing else: a relay is not told a channel's name.
         let descriptor =
-            cordelia_network::channel_announce::announcement(&state.identity, &ch.channel_id);
+            cordelia_network::channel_announce::announcement(&state.identity, channel_id);
         if let Err(e) = cordelia_network::channel_announce::send_channel_joined(
             &mut send,
-            &ch.channel_id,
+            channel_id,
             &descriptor,
         )
         .await
         {
-            tracing::debug!(channel = %ch.channel_id, error = %e, "channel announce send failed");
+            tracing::debug!(channel = %channel_id, error = %e, "channel announce send failed");
             break;
         }
     }
@@ -5365,6 +5451,240 @@ mod tests {
         // This node's own channels are asked about whatever the peer lists.
         let asked = channels_to_ask(vec![good(9_999_999)], many, 0);
         assert_eq!(asked, vec![good(9_999_999)]);
+    }
+
+    /// A node's database with a channel of each kind, the node the owner
+    /// of each and one item in each: its inbox, a group, a local channel,
+    /// and a swarm channel, made as a version up to 0.2.0-alpha.7 made one
+    /// for itself each time it started. Returns their IDs in that order.
+    fn a_node_that_holds_a_swarm_channel(
+        own: &cordelia_crypto::identity::NodeIdentity,
+    ) -> (rusqlite::Connection, [String; 4]) {
+        use cordelia_storage::{channels, naming};
+        let db = cordelia_storage::db::open_in_memory().unwrap();
+        let pk = own.public_key();
+
+        let inbox = naming::inbox_channel_id(&pk);
+        channels::ensure_inbox(&db, &inbox, &pk, true).unwrap();
+        channels::ensure_group(&db, A_CHANNEL, None, "realtime", &pk).unwrap();
+        channels::add_member(&db, A_CHANNEL, &pk, "owner").unwrap();
+        let local = "cordelia:local:550e8400".to_string();
+        channels::create_local(&db, &local, &pk, None).unwrap();
+        let swarm = naming::swarm_channel_id("lead_a1b2");
+        db.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, scope, creator_id, created_at, updated_at)
+             VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, '2026-10-02', '2026-10-02')",
+            rusqlite::params![swarm, pk.as_slice()],
+        )
+        .unwrap();
+        channels::add_member(&db, &swarm, &pk, "owner").unwrap();
+
+        let ids = [inbox, A_CHANNEL.to_string(), local, swarm];
+        for (n, channel) in ids.iter().enumerate() {
+            let item = arriving_in(own, channel, vec![n as u8; 40]);
+            assert_eq!(
+                store_item(&db, &item, "personal", &pk),
+                Ok(true),
+                "{channel}"
+            );
+        }
+        (db, ids)
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    /// A channel ID that holds a name is never told to a peer. A node that
+    /// holds a swarm channel announces its other network-scope channels,
+    /// and not that one.
+    #[test]
+    fn a_node_announces_no_channel_whose_id_holds_a_name() {
+        use cordelia_storage::{channels, naming};
+        let own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let (db, [inbox, group, _local, swarm]) = a_node_that_holds_a_swarm_channel(&own);
+        // It is one of the node's network-scope channels, like the others.
+        assert!(
+            channels::list_network_channels(&db, &own.public_key())
+                .unwrap()
+                .iter()
+                .any(|c| c.channel_id == swarm)
+        );
+
+        let announced = channels_to_announce(&db, &own.public_key());
+        assert_eq!(sorted(announced.clone()), sorted(vec![inbox, group]));
+        // So no announcement the node builds names it.
+        for channel_id in &announced {
+            let d = cordelia_network::channel_announce::announcement(&own, channel_id);
+            assert!(naming::may_be_told_to_a_peer(&d.channel_id), "{channel_id}");
+        }
+    }
+
+    /// When one of its own relays asks a node which channels it holds, the
+    /// node lists those whose IDs may be told to a peer. A swarm channel
+    /// it holds is not among them, whoever asks.
+    #[test]
+    fn a_node_lists_no_channel_whose_id_holds_a_name() {
+        let own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let (db, [inbox, group, local, swarm]) = a_node_that_holds_a_swarm_channel(&own);
+        // It holds items for it, as for the others.
+        assert!(
+            cordelia_storage::channels::list_stored_channel_ids(&db)
+                .unwrap()
+                .contains(&swarm)
+        );
+
+        assert_eq!(
+            sorted(channels_it_lists(&db, false)),
+            sorted(vec![inbox.clone(), group.clone()])
+        );
+        // A swarm peer is told of local channels too, and still not of it.
+        assert_eq!(
+            sorted(channels_it_lists(&db, true)),
+            sorted(vec![inbox, group, local])
+        );
+    }
+
+    /// To fetch a channel from a peer is to ask for it by its ID. A node
+    /// that holds a swarm channel fetches its other channels, the inbox
+    /// first, and does not ask for that one: neither a device, which
+    /// fetches the channels it is a member of, nor a relay, which fetches
+    /// those it holds items for.
+    #[test]
+    fn a_node_fetches_no_channel_whose_id_holds_a_name() {
+        let own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let (db, [inbox, group, local, swarm]) = a_node_that_holds_a_swarm_channel(&own);
+        let pk = own.public_key();
+        assert!(
+            cordelia_storage::channels::is_member(&db, &swarm, &pk).unwrap(),
+            "the node is a member of it, as of the others"
+        );
+
+        for role in ["personal", "relay"] {
+            let fetched = channels_to_fetch(&db, role, &pk);
+            assert_eq!(fetched[0], inbox, "{role}: the inbox comes first");
+            assert_eq!(
+                sorted(fetched),
+                sorted(vec![inbox.clone(), group.clone(), local.clone()]),
+                "{role}"
+            );
+        }
+    }
+
+    /// A relay asks a peer about the channels the peer lists. One whose ID
+    /// may not be told to a peer is not asked about, though the peer
+    /// listed it: asking sends the ID.
+    #[test]
+    fn a_relay_asks_about_no_channel_whose_id_holds_a_name() {
+        let swarm = cordelia_storage::naming::swarm_channel_id("lead_a1b2");
+        let asked = channels_to_ask(Vec::new(), vec![channel(1), swarm, channel(2)], usize::MAX);
+        assert_eq!(sorted(asked), vec![channel(1), channel(2)]);
+    }
+
+    /// A node asked for the items of a channel answers that it holds none
+    /// if the channel's ID may not be told to a peer: each item it would
+    /// list carries the ID. It answers for its other channels as before,
+    /// and for a local channel to a swarm peer only.
+    #[test]
+    fn a_node_answers_no_peer_for_a_channel_whose_id_holds_a_name() {
+        let own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let (db, [inbox, group, local, swarm]) = a_node_that_holds_a_swarm_channel(&own);
+
+        for to_a_swarm_peer in [false, true] {
+            assert!(!answers_for(&db, &swarm, to_a_swarm_peer));
+            assert!(answers_for(&db, &inbox, to_a_swarm_peer));
+            assert!(answers_for(&db, &group, to_a_swarm_peer));
+            // A channel it does not hold: the answer is an empty page.
+            assert!(answers_for(&db, &channel(7), to_a_swarm_peer));
+        }
+        assert!(!answers_for(&db, &local, false));
+        assert!(answers_for(&db, &local, true));
+    }
+
+    /// A relay passes on to the relays it lists what it is sent, but not
+    /// an item of a channel whose ID may not be told to a peer: an item
+    /// carries its channel's ID.
+    #[test]
+    fn a_relay_passes_on_no_item_of_a_channel_whose_id_holds_a_name() {
+        let own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let (db, [inbox, group, local, swarm]) = a_node_that_holds_a_swarm_channel(&own);
+
+        assert!(!passed_on(Some(&db), &swarm));
+        assert!(passed_on(Some(&db), &inbox));
+        assert!(passed_on(Some(&db), &group));
+        assert!(!passed_on(Some(&db), &local), "local scope, as before");
+        // Whether or not the database can be asked for the channel's scope.
+        assert!(!passed_on(None, &swarm));
+        assert!(passed_on(None, &group));
+    }
+
+    /// A relay stores nothing of a channel whose ID may not be told to a
+    /// peer: it would hold, under an ID that holds a name, what it never
+    /// lists, serves or passes on. An item of such a channel is refused as
+    /// one that is not valid, and nothing is made for its channel. A
+    /// device, which stores only what belongs in the channels it holds, is
+    /// as it was.
+    #[test]
+    fn a_relay_stores_no_item_of_a_channel_whose_id_holds_a_name() {
+        use cordelia_network::messages::REFUSED_INVALID;
+        use cordelia_storage::channels;
+        let relay = cordelia_storage::db::open_in_memory().unwrap();
+        let author = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let swarm = cordelia_storage::naming::swarm_channel_id("lead_a1b2");
+
+        let item = arriving_in(&author, &swarm, vec![7; 40]);
+        assert_eq!(
+            store_item(&relay, &item, "relay", &[0x0E; 32]),
+            Err(REFUSED_INVALID)
+        );
+        assert!(!channels::exists(&relay, &swarm).unwrap());
+        assert_eq!(
+            channels::list_stored_channel_ids(&relay).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // An item of another channel, by the same author, is stored.
+        let other = arriving_in(&author, A_CHANNEL, vec![8; 40]);
+        assert_eq!(store_item(&relay, &other, "relay", &[0x0E; 32]), Ok(true));
+
+        // A device that holds such a channel stores what arrives in it,
+        // as it stores what arrives in any channel of that kind.
+        let (device, [_, _, _, held]) = a_node_that_holds_a_swarm_channel(&author);
+        let more = arriving_in(&author, &held, vec![9; 40]);
+        assert_eq!(
+            store_item(&device, &more, "personal", &author.public_key()),
+            Ok(true)
+        );
+    }
+
+    /// Text that a peer chose goes into a warning as its first 64
+    /// characters, with whatever could act on a terminal or pass for
+    /// another line shown as escapes. A peer chooses what an announcement
+    /// names and how long the name is, and the error for an announcement
+    /// that is not valid holds that name too.
+    #[test]
+    fn what_a_peer_sent_goes_into_a_warning_short_and_escaped() {
+        assert_eq!(as_a_peer_sent_it("grp_550e8400"), "grp_550e8400");
+        assert_eq!(as_a_peer_sent_it(&"x".repeat(100_000)), "x".repeat(64));
+        // Characters are counted, not bytes.
+        assert_eq!(
+            as_a_peer_sent_it(&"\u{e9}".repeat(100)),
+            "\u{e9}".repeat(64)
+        );
+
+        let hostile = "grp_\u{1b}[2J\n2026-10-05 INFO a line of its own\u{202e}";
+        let shown = as_a_peer_sent_it(hostile);
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.starts_with("grp_\\u{1b}[2J\\n2026"), "{shown:?}");
+        assert!(shown.ends_with("\\u{202e}"), "{shown:?}");
+
+        let error = cordelia_network::channel_announce::ChannelAnnounceError::InvalidSignature(
+            format!("{}\n", "x".repeat(100_000)),
+        );
+        let shown = as_a_peer_sent_it(&error.to_string());
+        assert_eq!(shown.chars().count(), 64);
+        assert!(shown.starts_with("invalid descriptor signature"), "{shown}");
     }
 
     /// T3. What a relay keeps for a peer it fetches from is bounded for

@@ -15,11 +15,17 @@ Code's memory.
 
 **Pre-release (October 2026).** v1 is built and tested, including end-to-end
 tests with real processes over QUIC through a relay. Two relays are running,
-and `v0.2.0-alpha.7` is the current pre-release, for macOS and Linux:
+and `v0.2.0-alpha.8` is the current pre-release, for macOS and Linux:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.7 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.8 sh
 ```
+
+Running it again with a later version upgrades: it restarts a node that is
+running as the service it set up, waits until the node says that it is the
+new version, and ends with one line that a program can read
+(`cordelia-install: installed=... running=... restart=...`). With
+`CORDELIA_NO_RESTART=1` it leaves the node as it is.
 
 It is an alpha: expect rough edges, and keep your own backup of anything you
 cannot afford to lose.

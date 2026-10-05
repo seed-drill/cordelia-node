@@ -881,34 +881,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let db_path = data_dir.join("cordelia.db");
     let conn = cordelia_storage::db::open(&db_path)?;
 
-    // Auto-create persistent swarm channel for lead nodes (§8.2.2).
-    // Only personal nodes can be swarm leads (not bootnodes or relays).
-    if config.swarm.swarm_index.is_none() && config.network.role == "personal" {
-        let entity_id = &config.identity.entity_id;
-        if !entity_id.is_empty() {
-            let swarm_ch_id = cordelia_storage::naming::swarm_channel_id(entity_id);
-            let now = chrono::Utc::now().to_rfc3339();
-            let pk = identity.public_key();
-            // Generate PSK and store it alongside the channel
-            let swarm_psk = cordelia_crypto::generate_psk()?;
-            let swarm_psk_hash = cordelia_crypto::sha256(&swarm_psk);
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
-                 VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
-                rusqlite::params![swarm_ch_id, pk.as_slice(), swarm_psk_hash.as_slice(), now, now],
-            );
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
-                 VALUES (?1, ?2, 'owner', ?3)",
-                rusqlite::params![swarm_ch_id, pk.as_slice(), now],
-            );
-            // Save PSK using standard psk module (handles path encoding + 0600 permissions)
-            if !cordelia_storage::psk::has_psk(&data_dir, &swarm_ch_id) {
-                let _ = cordelia_storage::psk::write_psk(&data_dir, &swarm_ch_id, &swarm_psk);
-            }
-        }
-    }
-
     // The API listens only on this machine.
     let bind_addr = &config.api.bind_address;
     let Some(host) = api_host(bind_addr) else {
@@ -952,6 +924,29 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         warm_max,
         "node starting"
     );
+
+    // A node makes no channel that it does not use. Up to 0.2.0-alpha.7 a
+    // personal node made a swarm channel for itself each time it started,
+    // and v1 uses none. Any that this node holds is removed, with its key
+    // and whatever it holds. Its ID holds a name, so the log says how many
+    // went and does not say which.
+    let removed = cordelia_storage::channels::remove_swarm_channels(&conn, &data_dir)?;
+    if removed.any() {
+        tracing::info!(
+            channels = removed.channels,
+            items = removed.items,
+            key_files = removed.key_files,
+            "removed swarm channels, which this version does not use"
+        );
+    }
+    // A key file that could not be removed is no reason not to start. The
+    // node says how many, and tries again the next time it starts.
+    if removed.key_files_left > 0 {
+        tracing::warn!(
+            key_files = removed.key_files_left,
+            "could not remove every key file of a swarm channel; they are left, and the node starts"
+        );
+    }
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);
@@ -2291,9 +2286,9 @@ fn api_post_within(
             .as_str()
             .map(|m| m.strip_prefix("bad request: ").unwrap_or(m).to_string())
             .unwrap_or_else(|| format!("HTTP {status}"));
-        // An install leaves the old node running until it is restarted.
-        // A refusal may then mean only that the node is another version
-        // than this command.
+        // A node goes on running the version it was started as until it
+        // is restarted. A refusal may then mean only that the node is
+        // another version than this command.
         let timeout = std::time::Duration::from_secs(3);
         if !VERSION_NOTED.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(node) = local_api(&config, false, "/api/v1/status", timeout)
@@ -2384,13 +2379,27 @@ fn node_version_note(config_path: &str) -> Option<String> {
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
+/// The command that restarts a node which runs as the service that the
+/// install script sets up, on the system named (`std::env::consts::OS`).
+/// The script prints the same one.
+fn restart_command(os: &str) -> &'static str {
+    match os {
+        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+        _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
+    }
+}
+
 /// What to say when the running node is not the version this command is
 /// (`own`). A node from before it reported its version reports none.
 fn version_note(node: Option<&str>, own: &str) -> Option<String> {
     // Which of the two is the older is not judged: version strings are
     // not compared, only found to differ.
-    let after = "They should be the same: an upgrade leaves the old node running until it \
-                 is restarted.";
+    let after = format!(
+        "They should be the same: a node goes on running the version it was started as \
+         until it is restarted. Where it runs as the service that the install script \
+         set up, restart it with `{}`; otherwise stop it and start it again.",
+        restart_command(std::env::consts::OS)
+    );
     match node {
         Some(node) if node == own => None,
         Some(node) => Some(format!(
@@ -2576,9 +2585,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
 
-    // An install leaves the old node running until it is restarted. Said
-    // first, and whether or not the command then works: a node of another
-    // version may take a request and mean something else by it.
+    // A node goes on running the version it was started as until it is
+    // restarted. Said first, and whether or not the command then works: a
+    // node of another version may take a request and mean something else
+    // by it.
     if let Some(note) = node_version_note(config_path) {
         eprintln!("{note}\n");
         VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3744,16 +3754,18 @@ mod tests {
         }
     }
 
-    /// An install leaves the old node running. A command says so, beside
-    /// what the node answered, when the node is not the version it is.
+    /// A node can be another version than the command. A command says so,
+    /// beside what the node answered, and says how to restart the node.
     #[test]
     fn test_a_node_of_another_version_is_named() {
         assert_eq!(version_note(Some("0.2.0-alpha.6"), "0.2.0-alpha.6"), None);
         let other = version_note(Some("0.2.0-alpha.5"), "0.2.0-alpha.6").unwrap();
+        // It names the command that restarts the node on this system.
+        let restart = restart_command(std::env::consts::OS);
         assert!(
             other.contains("node is version 0.2.0-alpha.5")
                 && other.contains("command is version 0.2.0-alpha.6")
-                && other.contains("restarted"),
+                && other.contains(&format!("restart it with `{restart}`")),
             "{other}"
         );
         // A node from before it said its version.
@@ -3761,8 +3773,22 @@ mod tests {
         assert!(
             older.contains("from before nodes said their version")
                 && older.contains("command is version 0.2.0-alpha.6")
-                && older.contains("restarted"),
+                && older.contains(&format!("restart it with `{restart}`")),
             "{older}"
+        );
+    }
+
+    /// Each system's service is restarted by its own command, as the
+    /// install script restarts it.
+    #[test]
+    fn test_the_restart_command_is_the_systems_own() {
+        assert_eq!(
+            restart_command("linux"),
+            "systemctl --user daemon-reload && systemctl --user restart cordelia"
+        );
+        assert_eq!(
+            restart_command("macos"),
+            "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
         );
     }
 

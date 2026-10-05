@@ -11,6 +11,9 @@
 > peer-sharing, channel-announce, the governor and relay forwarding stand.
 > Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.3 and §4.4a:
 >
+> - **Swarm (§8.2.2) is not part of v1.** A node makes no swarm channel, removes
+>   one that an earlier version made when it starts, tells no peer a channel ID
+>   of that kind, and as a relay stores no item of one.
 > - **Items** (`Item`, `ItemHeader`) gain optional `slot` (32 bytes) and `rev`
 >   (u64), both present or both absent and omitted when absent, so ordinary
 >   items encode as before.
