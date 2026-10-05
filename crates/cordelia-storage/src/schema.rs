@@ -413,6 +413,10 @@ CREATE TABLE person_names (
 /// - `used_at`: when the channel's key was last proved, or an entry of it
 ///   last shown that the relay holds. What nobody uses goes after 90 days.
 /// - `bytes`: what the channel holds, as entries are counted.
+/// - `mark`: 8 random bytes that are this holding's own, and never all
+///   zeros. A channel that is dropped loses its row, and is taken again
+///   under another mark: a place in the channel is a count within one
+///   holding, and the mark says which.
 ///
 /// A channel that is dropped loses its row, and is new when it is taken
 /// again. Times are in seconds, in UTC.
@@ -434,7 +438,8 @@ CREATE TABLE relay_channels (
     channel_id  BLOB PRIMARY KEY CHECK(length(channel_id) = 32),
     held_since  INTEGER NOT NULL,
     used_at     INTEGER NOT NULL,
-    bytes       INTEGER NOT NULL CHECK(bytes >= 0)
+    bytes       INTEGER NOT NULL CHECK(bytes >= 0),
+    mark        BLOB NOT NULL CHECK(length(mark) = 8 AND mark != zeroblob(8))
 );
 
 CREATE INDEX idx_relay_channels_held ON relay_channels(held_since);
@@ -1524,8 +1529,8 @@ mod tests {
         // A start after that, and the step asked for again, change
         // nothing: what the relay holds stays.
         conn.execute(
-            "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
-             VALUES (zeroblob(32), 7, 8, 1280)",
+            "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes, mark)
+             VALUES (zeroblob(32), 7, 8, 1280, X'0102030405060708')",
             [],
         )
         .unwrap();
@@ -1611,24 +1616,43 @@ mod tests {
     }
 
     /// The table takes no row that cannot be a channel a relay holds: an
-    /// ID of another length, a second row for one channel, and a channel
-    /// that holds less than nothing.
+    /// ID of another length, a second row for one channel, a channel that
+    /// holds less than nothing, and a holding with no mark, with a mark
+    /// of another length, or with the mark of no holding.
     #[test]
     fn test_the_table_of_a_relays_channels_refuses_a_row_that_is_no_channel() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let insert = |channel: &[u8], bytes: i64| {
+        let marked = |channel: &[u8], bytes: i64, mark: &[u8]| {
             conn.execute(
-                "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
-                 VALUES (?1, 7, 8, ?2)",
-                rusqlite::params![channel, bytes],
+                "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes, mark)
+                 VALUES (?1, 7, 8, ?2, ?3)",
+                rusqlite::params![channel, bytes, mark],
             )
         };
+        let insert = |channel: &[u8], bytes: i64| marked(channel, bytes, &[9u8; 8]);
         assert!(insert(&[1u8; 31], 0).is_err());
         assert!(insert(&[1u8; 33], 0).is_err());
         assert!(insert(&[1u8; 32], -1).is_err());
         assert_eq!(insert(&[1u8; 32], 0), Ok(1));
         assert!(insert(&[1u8; 32], 0).is_err());
         assert_eq!(insert(&[2u8; 32], 1280), Ok(1));
+
+        // The mark of a holding: 8 bytes, and not all zeros.
+        for mark in [&[9u8; 7][..], &[9u8; 9], &[9u8; 32], &[], &[0u8; 8]] {
+            assert!(marked(&[3u8; 32], 0, mark).is_err(), "{mark:?}");
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
+                 VALUES (?1, 7, 8, 0)",
+                [&[3u8; 32][..]],
+            )
+            .is_err(),
+            "a holding with no mark was taken"
+        );
+        assert_eq!(marked(&[3u8; 32], 0, &[0, 0, 0, 0, 0, 0, 0, 1]), Ok(1));
+        // Two holdings may have one mark: it is told apart by its channel.
+        assert_eq!(marked(&[4u8; 32], 0, &[9u8; 8]), Ok(1));
     }
 }

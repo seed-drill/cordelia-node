@@ -1209,6 +1209,24 @@ pub const LABEL_CHANNEL_PROOF: &[u8] = b"cordelia v2 proof";
 /// follows it begins is never in doubt.
 pub const SESSION_VALUE_BYTES: usize = 32;
 
+/// The label under which both ends of a connection export that value from
+/// its TLS session (decision 2026-10-04 §2.4, item 3, and §16), with no
+/// context. It is a label of its own: nothing else that is ever exported
+/// from a session has it, so the value is of use for the proof and for
+/// nothing else. It begins as the labels of exporters do (RFC 5705 §4).
+pub const LABEL_SESSION_VALUE: &[u8] = b"EXPORTER-cordelia v2 session";
+
+/// The most channels that one connection may have proved the keys of, and
+/// so the most a relay remembers for it (decision 2026-10-04 §2.4, item
+/// 3). Whoever holds a secret can prove its channel, held or not, and a
+/// secret costs nothing to make: without a bound one connection could
+/// have a relay remember any number of them. Once a connection has proved
+/// this many, a proof for one more is answered as one that fails. A
+/// person's device holds tens of channels.
+/// Derived: the most channels a relay asks one peer about in a pass,
+/// MAX_CHANNELS_ASKED_OF_A_PEER.
+pub const MAX_CHANNELS_PROVED_ON_A_CONNECTION: usize = MAX_CHANNELS_ASKED_OF_A_PEER;
+
 /// The protocol byte of a stream on which a connection shows an entry, and
 /// is answered with what the receiver holds (decision 2026-10-04 §2.4,
 /// item 5). The four streams of entries begin at 0x10, apart from the
@@ -1228,6 +1246,30 @@ pub const PROTOCOL_ENTRY_PULL: u8 = 0x12;
 /// The protocol byte of a stream on which a connection sends entries to be
 /// stored (decision 2026-10-04 §2.4, items 1 and 2).
 pub const PROTOCOL_ENTRY_PUSH: u8 = 0x13;
+
+/// The protocol byte of the stream between relays that their operator
+/// lists together (decision 2026-10-04 §2.4, item 6): on it a relay tells
+/// which channels it holds, hands a channel's entries without the proof,
+/// and passes on an entry it took, each with how long it has held the
+/// channel and when the channel was last used. A relay refuses the stream
+/// from any peer that its operator does not list by key, and a node that
+/// is no relay refuses it from everyone.
+pub const PROTOCOL_RELAY_ENTRIES: u8 = 0x14;
+
+/// The most channels in one answer of a relay that tells a relay it works
+/// with which channels it holds (decision 2026-10-04 §2.4, item 6). Each
+/// is its ID, its mark, two times and a count: a thousand of them are
+/// well within one message.
+pub const RELAY_CHANNELS_PAGE_MAX: u32 = 1000;
+
+/// How many bytes mark one holding of a channel at a relay: 8, random,
+/// made when the relay takes a channel that it does not hold. A place in
+/// a channel is a count of what the relay stored in this holding of it. A
+/// relay that drops a channel and takes it again counts from 1 again,
+/// under another mark: so whoever kept a place from the earlier holding
+/// is handed the channel from the start, and not from a place that means
+/// something else now.
+pub const CHANNEL_MARK_BYTES: usize = 8;
 
 /// The most entries in one page of a channel, as a relay hands it to a
 /// connection that has proved the channel's key (decision 2026-10-04
@@ -1279,8 +1321,32 @@ pub const NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR: usize = 256;
 /// for that long is dropped.
 pub const ENTRY_CHANNEL_UNUSED_DAYS: u32 = 90;
 
+/// How often a relay drops the channels from their secrets that nobody
+/// uses (decision 2026-10-04 §2.5), and when it starts.
+/// Derived: as often as expired deletes are collected,
+/// TOMBSTONE_GC_INTERVAL_SECS. Hourly is plenty against 90 days.
+pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
+
+/// How often a relay passes the entries it took on to the relays it works
+/// with (decision 2026-10-04 §2.4, item 6).
+/// Derived: as often as it passes on items of the older kind,
+/// REPUSH_INTERVAL_SECS.
+pub const ENTRY_OFFER_INTERVAL_SECS: u64 = REPUSH_INTERVAL_SECS;
+
+/// How often a relay asks each relay it works with which channels from
+/// their secrets it holds, and pulls what it lacks (decision 2026-10-04
+/// §2.4, item 6).
+/// Derived: as often as a node fetches items of the older kind from its
+/// hot peers, REALTIME_SYNC_INTERVAL_SECS.
+pub const RELAY_ENTRY_PULL_INTERVAL_SECS: u64 = REALTIME_SYNC_INTERVAL_SECS;
+
+/// The most pages of one channel that a relay pulls from a relay it works
+/// with in one pass. A longer channel is gone on with in the next pass,
+/// so that one long channel does not keep every other waiting.
+pub const RELAY_ENTRY_PULL_PAGES: usize = 10;
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 21] = [
+pub const LABELS: [&[u8]; 22] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1302,6 +1368,7 @@ pub const LABELS: [&[u8]; 21] = [
     LABEL_ENTRY_CONTENT,
     LABEL_ADDITION,
     LABEL_CHANNEL_PROOF,
+    LABEL_SESSION_VALUE,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -1907,7 +1974,57 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 21);
+        assert_eq!(LABELS.len(), 22);
+    }
+
+    /// The value that a proof is made over is exported from a TLS session
+    /// under a label of its own, which begins as an exporter's does and
+    /// is none of the labels that anything is signed or derived under.
+    #[test]
+    fn test_the_sessions_value_has_a_label_of_its_own_decision_2026_10_04_16() {
+        assert_eq!(LABEL_SESSION_VALUE, b"EXPORTER-cordelia v2 session");
+        assert!(LABEL_SESSION_VALUE.starts_with(b"EXPORTER"));
+        assert_eq!(
+            LABELS
+                .iter()
+                .filter(|label| **label == LABEL_SESSION_VALUE)
+                .count(),
+            1
+        );
+        // A connection remembers only so many channels as proved.
+        assert_eq!(MAX_CHANNELS_PROVED_ON_A_CONNECTION, 1024);
+    }
+
+    /// The stream between relays that work together has a byte of its
+    /// own, after the four of entries, and none of the older kind's. A
+    /// holding of a channel is marked with 8 bytes.
+    #[test]
+    fn test_relays_that_work_together_decision_2026_10_04_2_4() {
+        assert_eq!(PROTOCOL_RELAY_ENTRIES, 0x14);
+        for byte in [
+            PROTOCOL_ENTRY_SHOW,
+            PROTOCOL_CHANNEL_PROVE,
+            PROTOCOL_ENTRY_PULL,
+            PROTOCOL_ENTRY_PUSH,
+        ] {
+            assert_ne!(PROTOCOL_RELAY_ENTRIES, byte);
+        }
+        assert!(!(0x01..=0x08).contains(&PROTOCOL_RELAY_ENTRIES));
+        assert_eq!(CHANNEL_MARK_BYTES, 8);
+        assert_eq!(RELAY_CHANNELS_PAGE_MAX, 1000);
+        // A full answer is well within one message: each channel told is
+        // under 200 bytes as it travels.
+        assert!(RELAY_CHANNELS_PAGE_MAX as usize * 200 < MAX_MESSAGE_BYTES as usize / 2);
+        // What nobody uses is swept hourly, as expired deletes are, and
+        // entries pass between relays as items of the older kind do.
+        assert_eq!(ENTRY_CHANNEL_SWEEP_INTERVAL_SECS, 3_600);
+        assert_eq!(
+            ENTRY_CHANNEL_SWEEP_INTERVAL_SECS,
+            TOMBSTONE_GC_INTERVAL_SECS
+        );
+        assert_eq!(ENTRY_OFFER_INTERVAL_SECS, REPUSH_INTERVAL_SECS);
+        assert_eq!(RELAY_ENTRY_PULL_INTERVAL_SECS, REALTIME_SYNC_INTERVAL_SECS);
+        assert_eq!(RELAY_ENTRY_PULL_PAGES, 10);
     }
 
     /// The four streams of entries have bytes of their own, each another,

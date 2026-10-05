@@ -10,10 +10,15 @@
 //! secret (decision 2026-10-04 §2.4), with protocol bytes of their own:
 //! show, prove, pull and push. A peer that does not know them refuses the
 //! stream, and nothing of the eight is changed by them.
+//!
+//! And a fifth, between relays that their operator lists together (§2.4
+//! item 6): on it a relay tells which channels it holds, hands a channel
+//! without the proof, and passes on what it took, each with how long it
+//! has held the channel and when the channel was last used.
 
 use cordelia_core::protocol::{
-    ENTRY_PAGE_MAX_ENTRIES, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL, PROTOCOL_ENTRY_PUSH,
-    PROTOCOL_ENTRY_SHOW,
+    CHANNEL_MARK_BYTES, ENTRY_PAGE_MAX_ENTRIES, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL,
+    PROTOCOL_ENTRY_PUSH, PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
 };
 use cordelia_storage::relay;
 use serde::{Deserialize, Serialize};
@@ -45,6 +50,11 @@ pub enum Protocol {
     /// A connection sends entries to be stored (decision 2026-10-04 §2.4
     /// items 1 and 2).
     EntryPush = PROTOCOL_ENTRY_PUSH,
+    /// A relay asks a relay it works with which channels it holds, or for
+    /// a page of one, or passes entries on to it (decision 2026-10-04 §2.4
+    /// item 6). For relays that the operator lists by key, and refused
+    /// for anyone else.
+    RelayEntries = PROTOCOL_RELAY_ENTRIES,
 }
 
 impl Protocol {
@@ -62,6 +72,7 @@ impl Protocol {
             PROTOCOL_CHANNEL_PROVE => Some(Self::ChannelProve),
             PROTOCOL_ENTRY_PULL => Some(Self::EntryPull),
             PROTOCOL_ENTRY_PUSH => Some(Self::EntryPush),
+            PROTOCOL_RELAY_ENTRIES => Some(Self::RelayEntries),
             _ => None,
         }
     }
@@ -488,9 +499,17 @@ pub struct EntryPull {
     /// The channel's ID.
     #[serde(with = "serde_bytes")]
     pub channel: [u8; 32],
+    /// The mark of the holding that `after` is a place in, as the
+    /// receiver last said it: all zeros where the sender has no place in
+    /// the channel yet. A receiver that drops a channel and takes it
+    /// again counts its places from the start, under another mark. Where
+    /// this is not the mark of the holding it has now, it hands the
+    /// channel from the start, whatever `after` says.
+    #[serde(with = "serde_bytes")]
+    pub mark: [u8; CHANNEL_MARK_BYTES],
     /// The place after which the page starts, in the order in which the
     /// receiver stored this channel's entries: a count of the channel's
-    /// own. 0 is before the first.
+    /// own, in the holding that `mark` names. 0 is before the first.
     pub after: u64,
     /// The most entries to hand.
     pub limit: u32,
@@ -505,9 +524,14 @@ pub struct EntryPulled {
     #[serde(deserialize_with = "at_most_a_page")]
     pub entries: Vec<ByteBuf>,
     /// The place to ask after next, in the channel's own order: that of
-    /// the last entry here, or the place that was asked after where
+    /// the last entry here, or the place that the page began after where
     /// there is none.
     pub next: u64,
+    /// The mark of the holding that `next` is a place in, to ask with
+    /// next. Where nothing of the channel is handed for want of a proof,
+    /// or because it is not held, it is the mark that was asked with.
+    #[serde(with = "serde_bytes")]
+    pub mark: [u8; CHANNEL_MARK_BYTES],
 }
 
 /// Entry-Push (0x13): entries to be stored.
@@ -542,6 +566,154 @@ pub enum PushAnswer {
     Older,
     /// It was refused.
     Refused(EntryRefused),
+}
+
+// ── Between relays that work together (0x14) ────────────────────────
+//
+// Decision 2026-10-04 §2.4 item 6. One request on a stream, and its
+// answer. A relay serves these to a peer that its operator lists by key,
+// and to no other: which channels a relay holds is told to nobody else,
+// and nobody else is handed a channel without the proof. Each time is in
+// seconds, in UTC, by the clock of the relay that says it. A time that is
+// not after 0 is no time.
+
+/// Read a list of at most `most` things. A longer list is refused where
+/// its first thing too many is met.
+fn at_most<'de, D, T>(deserializer: D, most: u32, what: &'static str) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct AtMost<T> {
+        most: usize,
+        what: &'static str,
+        of: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for AtMost<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {} {}", self.most, self.what)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(one) = seq.next_element::<T>()? {
+                if list.len() >= self.most {
+                    return Err(serde::de::Error::invalid_length(list.len() + 1, &self));
+                }
+                list.push(one);
+            }
+            Ok(list)
+        }
+    }
+
+    deserializer.deserialize_seq(AtMost {
+        most: most as usize,
+        what,
+        of: std::marker::PhantomData,
+    })
+}
+
+/// At most what one answer tells of (RELAY_CHANNELS_PAGE_MAX).
+fn at_most_a_page_of_channels<'de, D>(deserializer: D) -> Result<Vec<RelayChannel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, RELAY_CHANNELS_PAGE_MAX, "channels")
+}
+
+/// At most a page's worth of entries passed on (ENTRY_PAGE_MAX_ENTRIES).
+fn at_most_a_page_passed_on<'de, D>(deserializer: D) -> Result<Vec<RelayEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, ENTRY_PAGE_MAX_ENTRIES, "entries")
+}
+
+/// Relay-Entries (0x14): a relay asks which channels from their secrets
+/// the receiver holds, a page at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayChannelsAsk {
+    /// The ID after which the page starts, in the order of the channels'
+    /// IDs. All zeros is before the first.
+    #[serde(with = "serde_bytes")]
+    pub after: [u8; 32],
+    /// The most channels to tell of.
+    pub limit: u32,
+}
+
+/// One page of the channels that a relay holds, in the order of their
+/// IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayChannelsHeld {
+    /// At most RELAY_CHANNELS_PAGE_MAX: an answer that tells of more is
+    /// not read.
+    #[serde(deserialize_with = "at_most_a_page_of_channels")]
+    pub channels: Vec<RelayChannel>,
+}
+
+/// A channel that a relay tells a relay it works with that it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayChannel {
+    /// The channel's ID.
+    #[serde(with = "serde_bytes")]
+    pub channel: [u8; 32],
+    /// The mark of the sender's holding of it.
+    #[serde(with = "serde_bytes")]
+    pub mark: [u8; CHANNEL_MARK_BYTES],
+    /// Since when the sender has held it.
+    pub held_since: i64,
+    /// When it was last used: its key proved, or an entry of it shown
+    /// that a relay holds, at the sender or at a relay that told it.
+    pub used_at: i64,
+    /// The place of the entry that the sender stored last in this holding
+    /// of it: whoever has pulled as far as this lacks nothing of it.
+    pub places: u64,
+}
+
+/// Relay-Entries (0x14): a relay asks for a page of a channel. It is
+/// answered with [`EntryPulled`], and needs no proof of the channel's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPull {
+    /// The channel's ID.
+    #[serde(with = "serde_bytes")]
+    pub channel: [u8; 32],
+    /// The mark of the holding that `after` is a place in, as for
+    /// [`EntryPull`].
+    #[serde(with = "serde_bytes")]
+    pub mark: [u8; CHANNEL_MARK_BYTES],
+    /// The place after which the page starts.
+    pub after: u64,
+    /// The most entries to hand.
+    pub limit: u32,
+}
+
+/// Relay-Entries (0x14): a relay passes on entries that it took. It is
+/// answered with [`EntryPushed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPush {
+    /// At most a page's worth of them, ENTRY_PAGE_MAX_ENTRIES: a message
+    /// that holds more is not read, and none of it is stored.
+    #[serde(deserialize_with = "at_most_a_page_passed_on")]
+    pub entries: Vec<RelayEntry>,
+}
+
+/// An entry that a relay passes on, with what it says of the entry's
+/// channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayEntry {
+    /// The entry, as its bytes on the wire.
+    #[serde(with = "serde_bytes")]
+    pub entry: Vec<u8>,
+    /// Since when the sender has held the entry's channel.
+    pub held_since: i64,
+    /// When that channel was last used, as far as the sender knows.
+    pub used_at: i64,
 }
 
 // What a relay did, as it is said on the wire.
@@ -595,6 +767,19 @@ impl From<&relay::Page> for EntryPulled {
                 .map(|entry| ByteBuf::from(entry.to_wire()))
                 .collect(),
             next: page.next,
+            mark: page.mark,
+        }
+    }
+}
+
+impl From<&relay::ToldChannel> for RelayChannel {
+    fn from(told: &relay::ToldChannel) -> Self {
+        Self {
+            channel: told.channel,
+            mark: told.held.mark,
+            held_since: told.held.held_since,
+            used_at: told.held.used_at,
+            places: told.places,
         }
     }
 }
@@ -654,6 +839,12 @@ pub enum WireMessage {
     EntryPulled(EntryPulled),
     EntryPush(EntryPush),
     EntryPushed(EntryPushed),
+
+    // Between relays that work together
+    RelayChannelsAsk(RelayChannelsAsk),
+    RelayChannelsHeld(RelayChannelsHeld),
+    RelayPull(RelayPull),
+    RelayPush(RelayPush),
 }
 
 #[cfg(test)]
@@ -792,6 +983,9 @@ mod tests {
 
     const SECRET: [u8; 32] = [0x11; 32];
 
+    /// The mark of a holding of a channel.
+    const MARK: [u8; 8] = [0x4d, 1, 2, 3, 4, 5, 6, 7];
+
     /// An entry of [`SECRET`]'s channel that the device numbered `d` made
     /// of `said` at `rev`, checked.
     fn made(d: u8, rev: u64, said: &str) -> CheckedEntry {
@@ -828,9 +1022,10 @@ mod tests {
         }
     }
 
-    /// The four streams of entries have protocol bytes that an older peer
-    /// reads as none of its own: it refuses the stream. And the eight it
-    /// knows are read as they always were.
+    /// The four streams of entries, and the one between relays that work
+    /// together, have protocol bytes that an older peer reads as none of
+    /// its own: it refuses the stream. And the eight it knows are read as
+    /// they always were.
     #[test]
     fn an_older_peer_takes_no_stream_of_entries_for_one_of_its_own() {
         let new = [
@@ -838,6 +1033,7 @@ mod tests {
             (Protocol::ChannelProve, 0x11),
             (Protocol::EntryPull, 0x12),
             (Protocol::EntryPush, 0x13),
+            (Protocol::RelayEntries, 0x14),
         ];
         for (protocol, byte) in new {
             assert_eq!(protocol.as_byte(), byte);
@@ -845,7 +1041,7 @@ mod tests {
             assert_eq!(read_by_an_older_peer(byte), None, "{byte:#04x}");
         }
 
-        // Every byte: the eight are what they were, by name, the four are
+        // Every byte: the eight are what they were, by name, the five are
         // the new ones, and no other byte is a protocol.
         for byte in 0..=u8::MAX {
             let read = Protocol::from_byte(byte);
@@ -913,16 +1109,19 @@ mod tests {
             WireMessage::ChannelProved(ChannelProved { proved: false }),
             WireMessage::EntryPull(EntryPull {
                 channel,
+                mark: MARK,
                 after: (1 << 53) + 7,
                 limit: 100,
             }),
             WireMessage::EntryPulled(EntryPulled {
                 entries: vec![ByteBuf::from(entry.clone()), ByteBuf::from(other.clone())],
                 next: u64::MAX,
+                mark: MARK,
             }),
             WireMessage::EntryPulled(EntryPulled {
                 entries: Vec::new(),
                 next: 0,
+                mark: [0; 8],
             }),
             WireMessage::EntryPush(EntryPush {
                 entries: vec![ByteBuf::from(entry.clone()), ByteBuf::from(other.clone())],
@@ -942,6 +1141,51 @@ mod tests {
             }),
             WireMessage::EntryPushed(EntryPushed {
                 answers: Vec::new(),
+            }),
+            WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+                after: [0; 32],
+                limit: 1000,
+            }),
+            WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                channels: vec![
+                    RelayChannel {
+                        channel,
+                        mark: MARK,
+                        held_since: 1_700_000_000,
+                        used_at: 1_800_000_000,
+                        places: 57,
+                    },
+                    RelayChannel {
+                        channel: [0xff; 32],
+                        mark: [0xff; 8],
+                        held_since: i64::MIN,
+                        used_at: i64::MAX,
+                        places: u64::MAX,
+                    },
+                ],
+            }),
+            WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                channels: Vec::new(),
+            }),
+            WireMessage::RelayPull(RelayPull {
+                channel,
+                mark: MARK,
+                after: 57,
+                limit: 100,
+            }),
+            WireMessage::RelayPush(RelayPush {
+                entries: vec![
+                    RelayEntry {
+                        entry: entry.clone(),
+                        held_since: 1_700_000_000,
+                        used_at: 1_800_000_000,
+                    },
+                    RelayEntry {
+                        entry: other.clone(),
+                        held_since: 0,
+                        used_at: -1,
+                    },
+                ],
             }),
         ];
         for answer in [
@@ -969,6 +1213,10 @@ mod tests {
             WireMessage::EntryPulled(m) => format!("{m:?}"),
             WireMessage::EntryPush(m) => format!("{m:?}"),
             WireMessage::EntryPushed(m) => format!("{m:?}"),
+            WireMessage::RelayChannelsAsk(m) => format!("{m:?}"),
+            WireMessage::RelayChannelsHeld(m) => format!("{m:?}"),
+            WireMessage::RelayPull(m) => format!("{m:?}"),
+            WireMessage::RelayPush(m) => format!("{m:?}"),
             other => panic!("not a message of entries: {other:?}"),
         }
     }
@@ -1060,6 +1308,7 @@ mod tests {
     fn a_pull_and_its_page_go_through_the_codec() {
         let pull = EntryPull {
             channel: derive::channel_id(&SECRET).unwrap(),
+            mark: MARK,
             after: (1 << 53) + 7,
             limit: 100,
         };
@@ -1075,6 +1324,7 @@ mod tests {
                 .map(|entry| ByteBuf::from(entry.to_wire()))
                 .collect(),
             next: 3,
+            mark: MARK,
         };
         let WireMessage::EntryPulled(read) = through(&WireMessage::EntryPulled(page.clone()))
         else {
@@ -1084,10 +1334,12 @@ mod tests {
         for (bytes, entry) in read.entries.iter().zip(&entries) {
             assert_eq!(&Entry::from_wire(bytes).unwrap().check().unwrap(), entry);
         }
-        // A page with nothing in it, and the furthest place there is.
+        // A page with nothing in it, the furthest place there is, and the
+        // mark of no holding.
         let nothing = EntryPulled {
             entries: Vec::new(),
             next: u64::MAX,
+            mark: [0; 8],
         };
         let WireMessage::EntryPulled(read) = through(&WireMessage::EntryPulled(nothing.clone()))
         else {
@@ -1138,7 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn the_messages_of_entries_travel_in_frames() {
         let messages = every_message_of_entries();
-        assert_eq!(messages.len(), 17);
+        assert_eq!(messages.len(), 22);
         let mut stream = Vec::new();
         for message in &messages {
             write_frame(&mut stream, message).await.unwrap();
@@ -1187,8 +1439,16 @@ mod tests {
         EntryPull {
             #[serde(with = "serde_bytes")]
             channel: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            mark: Vec<u8>,
             after: u64,
             limit: u32,
+        },
+        EntryPulled {
+            entries: Vec<ByteBuf>,
+            next: u64,
+            #[serde(with = "serde_bytes")]
+            mark: Vec<u8>,
         },
         EntryShown {
             answer: String,
@@ -1196,10 +1456,40 @@ mod tests {
         EntryPushed {
             answers: Vec<String>,
         },
+        RelayChannelsAsk {
+            #[serde(with = "serde_bytes")]
+            after: Vec<u8>,
+            limit: u32,
+        },
+        RelayChannelsHeld {
+            channels: Vec<LooseChannel>,
+        },
+        RelayPull {
+            #[serde(with = "serde_bytes")]
+            channel: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            mark: Vec<u8>,
+            after: u64,
+            limit: u32,
+        },
     }
 
-    /// A channel's ID is 32 bytes and a proof 64, and an answer is one of
-    /// those there are: a message that holds anything else is not read.
+    /// A channel as a relay might tell of it that does not keep to the
+    /// form.
+    #[derive(Serialize)]
+    struct LooseChannel {
+        #[serde(with = "serde_bytes")]
+        channel: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        mark: Vec<u8>,
+        held_since: i64,
+        used_at: i64,
+        places: u64,
+    }
+
+    /// A channel's ID is 32 bytes, a proof 64 and a mark 8, and an answer
+    /// is one of those there are: a message that holds anything else is
+    /// not read.
     #[test]
     fn a_message_of_entries_that_is_not_in_its_form_is_not_read() {
         let read = |loose: &Loose| decode_message(&encode(loose));
@@ -1214,10 +1504,48 @@ mod tests {
         assert!(matches!(
             read(&Loose::EntryPull {
                 channel: vec![1; 32],
+                mark: vec![3; 8],
                 after: 0,
                 limit: 1,
             }),
             Ok(WireMessage::EntryPull(_))
+        ));
+        assert!(matches!(
+            read(&Loose::EntryPulled {
+                entries: Vec::new(),
+                next: 0,
+                mark: vec![3; 8],
+            }),
+            Ok(WireMessage::EntryPulled(_))
+        ));
+        assert!(matches!(
+            read(&Loose::RelayChannelsAsk {
+                after: vec![0; 32],
+                limit: 1,
+            }),
+            Ok(WireMessage::RelayChannelsAsk(_))
+        ));
+        let told = |channel: usize, mark: usize| Loose::RelayChannelsHeld {
+            channels: vec![LooseChannel {
+                channel: vec![1; channel],
+                mark: vec![3; mark],
+                held_since: 7,
+                used_at: 8,
+                places: 9,
+            }],
+        };
+        assert!(matches!(
+            read(&told(32, 8)),
+            Ok(WireMessage::RelayChannelsHeld(_))
+        ));
+        assert!(matches!(
+            read(&Loose::RelayPull {
+                channel: vec![1; 32],
+                mark: vec![3; 8],
+                after: 0,
+                limit: 1,
+            }),
+            Ok(WireMessage::RelayPull(_))
         ));
         assert!(matches!(
             read(&Loose::EntryShown {
@@ -1244,15 +1572,57 @@ mod tests {
                 "{channel} {proof}"
             );
         }
-        for channel in [0, 31, 33, 64] {
+        for (channel, mark) in [
+            (0, 8),
+            (31, 8),
+            (33, 8),
+            (64, 8),
+            (32, 0),
+            (32, 7),
+            (32, 9),
+            (32, 32),
+        ] {
             assert!(
                 read(&Loose::EntryPull {
                     channel: vec![1; channel],
+                    mark: vec![3; mark],
                     after: 0,
                     limit: 1,
                 })
                 .is_err(),
-                "{channel}"
+                "{channel} {mark}"
+            );
+            assert!(
+                read(&Loose::RelayPull {
+                    channel: vec![1; channel],
+                    mark: vec![3; mark],
+                    after: 0,
+                    limit: 1,
+                })
+                .is_err(),
+                "{channel} {mark}"
+            );
+            assert!(read(&told(channel, mark)).is_err(), "{channel} {mark}");
+        }
+        for mark in [0, 7, 9, 32] {
+            assert!(
+                read(&Loose::EntryPulled {
+                    entries: Vec::new(),
+                    next: 0,
+                    mark: vec![3; mark],
+                })
+                .is_err(),
+                "{mark}"
+            );
+        }
+        for after in [0, 31, 33] {
+            assert!(
+                read(&Loose::RelayChannelsAsk {
+                    after: vec![0; after],
+                    limit: 1,
+                })
+                .is_err(),
+                "{after}"
             );
         }
         for answer in ["", "Held", "another", "refused", "stored", "yes"] {
@@ -1295,6 +1665,7 @@ mod tests {
                 &encode_message(&WireMessage::EntryPulled(EntryPulled {
                     entries: of(entries),
                     next: 7,
+                    mark: MARK,
                 }))
                 .unwrap(),
             )
@@ -1337,6 +1708,194 @@ mod tests {
             panic!("not a push");
         };
         assert_eq!(read, full);
+    }
+
+    /// What relays that work together say to each other goes through the
+    /// codec as it was written: a question about which channels are held
+    /// and its answer, a question for a page, and entries passed on with
+    /// the two times of each one's channel.
+    #[test]
+    fn the_messages_between_relays_go_through_the_codec() {
+        let channel = derive::channel_id(&SECRET).unwrap();
+        let ask = RelayChannelsAsk {
+            after: channel,
+            limit: 1000,
+        };
+        let WireMessage::RelayChannelsAsk(read) =
+            through(&WireMessage::RelayChannelsAsk(ask.clone()))
+        else {
+            panic!("not a question about channels");
+        };
+        assert_eq!(read, ask);
+
+        let held = RelayChannelsHeld {
+            channels: vec![
+                RelayChannel {
+                    channel,
+                    mark: MARK,
+                    held_since: 1_700_000_000,
+                    used_at: 1_800_000_000,
+                    places: 57,
+                },
+                // Whatever the two times are, they arrive as they were
+                // said: what is no time is for the receiver to say.
+                RelayChannel {
+                    channel: [0xff; 32],
+                    mark: [0xff; 8],
+                    held_since: i64::MIN,
+                    used_at: i64::MAX,
+                    places: u64::MAX,
+                },
+                RelayChannel {
+                    channel: [1; 32],
+                    mark: [1; 8],
+                    held_since: 0,
+                    used_at: -1,
+                    places: 0,
+                },
+            ],
+        };
+        let WireMessage::RelayChannelsHeld(read) =
+            through(&WireMessage::RelayChannelsHeld(held.clone()))
+        else {
+            panic!("not an answer about channels");
+        };
+        assert_eq!(read, held);
+
+        let pull = RelayPull {
+            channel,
+            mark: MARK,
+            after: (1 << 53) + 7,
+            limit: 100,
+        };
+        let WireMessage::RelayPull(read) = through(&WireMessage::RelayPull(pull.clone())) else {
+            panic!("not a question for a page");
+        };
+        assert_eq!(read, pull);
+
+        let entries = [made(1, 5, "one"), made(2, 5, "two")];
+        let push = RelayPush {
+            entries: entries
+                .iter()
+                .map(|entry| RelayEntry {
+                    entry: entry.to_wire(),
+                    held_since: 1_700_000_000,
+                    used_at: 1_800_000_000,
+                })
+                .collect(),
+        };
+        let WireMessage::RelayPush(read) = through(&WireMessage::RelayPush(push.clone())) else {
+            panic!("not entries passed on");
+        };
+        assert_eq!(read, push);
+        for (passed, entry) in read.entries.iter().zip(&entries) {
+            assert_eq!(
+                &Entry::from_wire(&passed.entry).unwrap().check().unwrap(),
+                entry
+            );
+        }
+
+        // As they are spelled: a change to a name is a change to the
+        // protocol.
+        let bytes = encode_message(&WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+            channels: vec![held.channels[0]],
+        }))
+        .unwrap();
+        let spelled: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let text = |text: &str| ciborium::Value::Text(text.into());
+        let number = |n: i64| ciborium::Value::Integer(n.into());
+        assert_eq!(
+            spelled,
+            ciborium::Value::Map(vec![
+                (text("msg_type"), text("RelayChannelsHeld")),
+                (
+                    text("channels"),
+                    ciborium::Value::Array(vec![ciborium::Value::Map(vec![
+                        (text("channel"), ciborium::Value::Bytes(channel.to_vec())),
+                        (text("mark"), ciborium::Value::Bytes(MARK.to_vec())),
+                        (text("held_since"), number(1_700_000_000)),
+                        (text("used_at"), number(1_800_000_000)),
+                        (text("places"), number(57)),
+                    ])])
+                ),
+            ])
+        );
+        // And a pull by a holder of the key says its mark under that
+        // name, beside the place.
+        let bytes = encode_message(&WireMessage::EntryPull(EntryPull {
+            channel,
+            mark: MARK,
+            after: 5,
+            limit: 9,
+        }))
+        .unwrap();
+        let spelled: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            spelled,
+            ciborium::Value::Map(vec![
+                (text("msg_type"), text("EntryPull")),
+                (text("channel"), ciborium::Value::Bytes(channel.to_vec())),
+                (text("mark"), ciborium::Value::Bytes(MARK.to_vec())),
+                (text("after"), number(5)),
+                (text("limit"), number(9)),
+            ])
+        );
+    }
+
+    /// An answer about channels tells of at most a page of them, and
+    /// entries are passed on at most a page's worth at a time: a message
+    /// that holds one more is not read.
+    #[test]
+    fn a_message_between_relays_that_holds_more_than_a_page_is_not_read() {
+        use cordelia_core::protocol::RELAY_CHANNELS_PAGE_MAX;
+        assert_eq!(RELAY_CHANNELS_PAGE_MAX, 1000);
+        let told = |channels: usize| {
+            let one = RelayChannel {
+                channel: [0xff; 32],
+                mark: [0xff; 8],
+                held_since: i64::MAX,
+                used_at: i64::MAX,
+                places: u64::MAX,
+            };
+            WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                channels: vec![one; channels],
+            })
+        };
+        let passed = |entries: usize| {
+            let one = RelayEntry {
+                entry: vec![0x5a; 3],
+                held_since: 7,
+                used_at: 8,
+            };
+            WireMessage::RelayPush(RelayPush {
+                entries: vec![one; entries],
+            })
+        };
+        let read = |message: &WireMessage| decode_message(&encode_message(message).unwrap());
+
+        for channels in [0, 1, 999, 1000] {
+            let Ok(WireMessage::RelayChannelsHeld(read)) = read(&told(channels)) else {
+                panic!("an answer about {channels} channels was not read");
+            };
+            assert_eq!(read.channels.len(), channels);
+        }
+        for channels in [1001, 1002, 5000] {
+            assert!(read(&told(channels)).is_err(), "{channels}");
+        }
+        for entries in [0, 1, 99, 100] {
+            let Ok(WireMessage::RelayPush(read)) = read(&passed(entries)) else {
+                panic!("{entries} entries passed on were not read");
+            };
+            assert_eq!(read.entries.len(), entries);
+        }
+        for entries in [101, 102, 1000] {
+            assert!(read(&passed(entries)).is_err(), "{entries}");
+        }
+
+        // A full answer about channels, with every number at its longest,
+        // is well within one message.
+        let travels = encode_message(&told(1000)).unwrap().len();
+        assert!(travels < MAX_MESSAGE_BYTES as usize / 4, "{travels}");
     }
 
     /// The answers as they are spelled on the wire: a change to one is a
@@ -1417,13 +1976,28 @@ mod tests {
         let page = WireMessage::EntryPulled(EntryPulled {
             entries: entries.clone(),
             next: u64::MAX,
+            mark: [0xff; 8],
         });
         let travels = encode_message(&page).unwrap().len();
         assert!(travels <= MAX_MESSAGE_BYTES as usize, "{travels}");
         // What is around the entries is small: far less than is left for
         // it.
         assert!(travels - bytes < 1024, "{}", travels - bytes);
-        // A push of as much fits as well.
+        // A push of as much fits as well, and so do as many passed on
+        // between relays, each with its two times.
+        let passed_on = WireMessage::RelayPush(RelayPush {
+            entries: entries
+                .iter()
+                .map(|entry| RelayEntry {
+                    entry: entry.to_vec(),
+                    held_since: i64::MAX,
+                    used_at: i64::MAX,
+                })
+                .collect(),
+        });
+        let travels = encode_message(&passed_on).unwrap().len();
+        assert!(travels <= MAX_MESSAGE_BYTES as usize, "{travels}");
+        assert!(travels - bytes < 8 * 1024, "{}", travels - bytes);
         let push = WireMessage::EntryPush(EntryPush { entries });
         assert!(encode_message(&push).unwrap().len() <= MAX_MESSAGE_BYTES as usize);
 
@@ -1519,6 +2093,7 @@ mod tests {
             entries: vec![(*entry).clone(), (*other).clone()],
             next: 9,
             cost: 2560,
+            mark: MARK,
         };
         assert_eq!(
             EntryPulled::from(&page),
@@ -1528,6 +2103,30 @@ mod tests {
                     ByteBuf::from(other.to_wire())
                 ],
                 next: 9,
+                mark: MARK,
+            }
+        );
+
+        // A channel that a relay tells a relay it works with: its ID, the
+        // mark of the holding, the two times, and the last place.
+        let told = cordelia_storage::relay::ToldChannel {
+            channel: [0x21; 32],
+            held: cordelia_storage::relay::HeldChannel {
+                held_since: 1_700_000_000,
+                used_at: 1_800_000_000,
+                bytes: 2560,
+                mark: MARK,
+            },
+            places: 57,
+        };
+        assert_eq!(
+            RelayChannel::from(&told),
+            RelayChannel {
+                channel: [0x21; 32],
+                mark: MARK,
+                held_since: 1_700_000_000,
+                used_at: 1_800_000_000,
+                places: 57,
             }
         );
     }

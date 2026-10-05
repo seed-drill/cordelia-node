@@ -16,7 +16,8 @@
 //! a relay's to count or to drop.
 //!
 //! So each function here that writes or drops ([`take`], [`show`],
-//! [`make_room`], [`sweep_unused`], [`listed_relay_says`]) refuses, with
+//! [`make_room`], [`sweep_unused`], [`listed_relay_says`],
+//! [`listed_relay_used`]) refuses, with
 //! [`RelayError::DeviceFollowsAPhrase`], a database in which a device
 //! follows a phrase ([`crate::person::person`]), and changes nothing in
 //! it.
@@ -73,11 +74,36 @@
 //!   caller says the channel was proved on this connection. Without that
 //!   it is answered as for a channel that is not held.
 //!
+//! ## One holding of a channel
+//!
+//! A place in a channel is a count of what the relay stored in it. A relay
+//! that drops a channel and takes it again counts from 1 again, so a place
+//! means something only within one holding. Each holding has a mark of
+//! its own ([`Mark`]): 8 random bytes, made when the relay takes a channel
+//! that it does not hold. Whoever asks for a page says the mark it holds
+//! with its place, and is given the relay's. Where the two differ, the
+//! place is from another holding, and the channel is handed from the
+//! start.
+//!
 //! ## What nobody uses
 //!
 //! A time for each channel of when its key was last proved, or an entry of
 //! it last shown that the relay holds. [`sweep_unused`] drops each channel
 //! that was last used 90 days ago or longer (§2.5).
+//!
+//! ## Relays that work together
+//!
+//! Relays that their operator lists together pass entries between them
+//! without the proof (§2.4 item 6). A relay that has a channel only from
+//! another sees no proof of it and no entry of it shown, so each tells the
+//! other two times with what it passes on: since when it has held the
+//! channel, and when the channel was last used. The earlier of two "held
+//! since" is kept ([`listed_relay_says`]), and the later of two "last
+//! used" ([`listed_relay_used`]), never later than this relay's own clock.
+//! A channel that is new here from such a relay was last used when that
+//! relay says: taking it from a relay is no use of it. Which channels a
+//! relay holds is told to a listed relay ([`held_channels`]), and to
+//! nobody else: who is one, is the caller's to say.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -86,9 +112,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
+    CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
     ENTRY_WIRE_OVERHEAD_BYTES, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
-    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, SESSION_VALUE_BYTES, entry_cost,
+    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES,
+    entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError};
 use cordelia_crypto::proof;
@@ -105,6 +132,13 @@ const UNUSED_SECS: i64 = ENTRY_CHANNEL_UNUSED_DAYS as i64 * 24 * 60 * 60;
 
 /// How many entries a page is read from the store at a time.
 const PAGE_READ: usize = 16;
+
+/// The mark of one holding of a channel (see the module's documentation).
+pub type Mark = [u8; CHANNEL_MARK_BYTES];
+
+/// The mark of no holding: what an asker sends that has no place in a
+/// channel yet. No holding has it.
+pub const NO_MARK: Mark = [0; CHANNEL_MARK_BYTES];
 
 fn storage(e: rusqlite::Error) -> CordeliaError {
     CordeliaError::Storage(e.to_string())
@@ -193,8 +227,12 @@ pub enum Asker {
     Address(IpAddr),
     /// A relay that the operator lists (decision 2026-10-04 §2.4 item 6).
     /// It is not counted by address, and it alone may say since when it
-    /// has held the entry's channel, in seconds.
-    ListedRelay { held_since: Option<i64> },
+    /// has held the entry's channel, and when that channel was last used,
+    /// each in seconds.
+    ListedRelay {
+        held_since: Option<i64>,
+        used_at: Option<i64>,
+    },
 }
 
 /// Why a relay did not take an entry.
@@ -266,6 +304,10 @@ pub struct Page {
     /// What the entries are counted at together. It counts against the
     /// asker's limits.
     pub cost: u64,
+    /// The mark of the holding that `next` is a place in: the relay's,
+    /// where it holds the channel and hands it, and otherwise the one
+    /// that was asked with.
+    pub mark: Mark,
 }
 
 /// What a relay found of a proof that a connection holds a channel's key
@@ -305,10 +347,27 @@ pub struct HeldChannel {
     /// it, or the earlier time that a relay the operator lists said.
     pub held_since: i64,
     /// When its key was last proved, or an entry of it last shown that
-    /// the relay holds, in seconds.
+    /// the relay holds, in seconds: here, or at a relay the operator
+    /// lists, by its word.
     pub used_at: i64,
     /// What it holds, in bytes as entries are counted.
     pub bytes: u64,
+    /// The mark of this holding of it.
+    pub mark: Mark,
+}
+
+/// A channel as a relay tells a relay it works with that it holds it
+/// ([`held_channels`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToldChannel {
+    /// The channel's ID.
+    pub channel: [u8; 32],
+    /// The channel as the relay holds it.
+    pub held: HeldChannel,
+    /// The place of the entry that the relay stored last in this holding
+    /// of the channel: whoever has pulled as far as this lacks nothing of
+    /// it.
+    pub places: u64,
 }
 
 // ── What a relay takes ───────────────────────────────────────────────
@@ -346,7 +405,7 @@ pub fn take(
 ) -> Result<Taken, RelayError> {
     in_one(conn, || {
         no_device_writes(conn)?;
-        said_by(conn, asker, &entry.channel)?;
+        said_by(conn, asker, &entry.channel, now)?;
         Ok(taken(conn, room, entry, asker, now)?)
     })
 }
@@ -420,18 +479,37 @@ fn taken(
         }
         None => {
             // The relay holds the channel from now, or from the earlier
-            // time that a relay the operator lists says. It is used now.
+            // time that a relay the operator lists says.
             let since = match asker {
                 Asker::ListedRelay {
                     held_since: Some(said),
+                    ..
                 } if *said > 0 => now.min(*said),
                 _ => now,
             };
+            // It is used now. From a relay the operator lists that says
+            // when it was last used, it was last used then: that relay
+            // passing it on is no use of it.
+            let used = match asker {
+                Asker::ListedRelay {
+                    used_at: Some(last),
+                    ..
+                } if *last > 0 => now.min(*last),
+                _ => now,
+            };
             let bytes = entries::channel_cost(conn, &entry.channel)?;
+            // This holding's own mark: another than any it had before.
+            let mark = new_mark()?;
             conn.execute(
-                "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![entry.channel.as_slice(), since, now, to_sql(bytes)],
+                "INSERT INTO relay_channels (channel_id, mark, held_since, used_at, bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    entry.channel.as_slice(),
+                    mark.as_slice(),
+                    since,
+                    used,
+                    to_sql(bytes)
+                ],
             )
             .map_err(storage)?;
             // The address is counted for a channel that the relay took,
@@ -517,6 +595,20 @@ fn drop_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, Cordelia
     Ok(entries)
 }
 
+/// A mark for a holding that begins: 8 random bytes, never all zeros,
+/// which is the mark of no holding.
+fn new_mark() -> Result<Mark, CordeliaError> {
+    loop {
+        let random = cordelia_crypto::generate_psk()
+            .map_err(|e| CordeliaError::Storage(format!("no mark could be made: {e}")))?;
+        let mut mark = NO_MARK;
+        mark.copy_from_slice(&random[..CHANNEL_MARK_BYTES]);
+        if mark != NO_MARK {
+            return Ok(mark);
+        }
+    }
+}
+
 // ── How long it has held a channel ───────────────────────────────────
 
 /// The channel as the relay holds it, or `None` where it does not.
@@ -525,18 +617,58 @@ pub fn held_channel(
     channel: &[u8; 32],
 ) -> Result<Option<HeldChannel>, CordeliaError> {
     conn.query_row(
-        "SELECT held_since, used_at, bytes FROM relay_channels WHERE channel_id = ?1",
+        "SELECT held_since, used_at, bytes, mark FROM relay_channels WHERE channel_id = ?1",
         params![channel.as_slice()],
-        |row| {
-            Ok(HeldChannel {
-                held_since: row.get(0)?,
-                used_at: row.get(1)?,
-                bytes: row.get::<_, i64>(2)?.max(0) as u64,
-            })
-        },
+        held_channel_from_row,
     )
     .optional()
     .map_err(storage)
+}
+
+/// Map a row of `held_since, used_at, bytes, mark` to a [`HeldChannel`].
+fn held_channel_from_row(row: &rusqlite::Row) -> rusqlite::Result<HeldChannel> {
+    Ok(HeldChannel {
+        held_since: row.get(0)?,
+        used_at: row.get(1)?,
+        bytes: row.get::<_, i64>(2)?.max(0) as u64,
+        mark: row.get(3)?,
+    })
+}
+
+/// The channels that the relay holds, in the order of their IDs, after
+/// the ID `after` (all zeros is before the first), and at most `limit` of
+/// them, never more than RELAY_CHANNELS_PAGE_MAX: one page of what a
+/// relay tells a relay it works with (decision 2026-10-04 §2.4 item 6).
+///
+/// A relay tells nobody else which channels it holds (§2.4 item 4). The
+/// caller says who the operator lists: this is called for no other.
+pub fn held_channels(
+    conn: &Connection,
+    after: &[u8; 32],
+    limit: u32,
+) -> Result<Vec<ToldChannel>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT held_since, used_at, bytes, mark, channel_id,
+                    (SELECT COALESCE(MAX(channel_place), 0) FROM entries
+                     WHERE entries.channel_id = relay_channels.channel_id)
+             FROM relay_channels WHERE channel_id > ?1
+             ORDER BY channel_id LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![after.as_slice(), limit.min(RELAY_CHANNELS_PAGE_MAX)],
+            |row| {
+                Ok(ToldChannel {
+                    held: held_channel_from_row(row)?,
+                    channel: row.get(4)?,
+                    places: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            },
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<_, _>>().map_err(storage)
 }
 
 /// A relay that the operator lists says it has held `channel` since
@@ -578,14 +710,72 @@ fn kept_the_earlier(
     .map_err(storage)
 }
 
-/// What the asker says of how long it has held `channel`, kept where it
-/// may say so.
-fn said_by(conn: &Connection, asker: &Asker, channel: &[u8; 32]) -> Result<(), CordeliaError> {
+/// A relay that the operator lists says that `channel` was last used at
+/// `used_at`, in seconds: its key proved there, or an entry of it shown
+/// that that relay holds (decision 2026-10-04 §2.4 item 6). Where this
+/// relay holds the channel, and saw it used last at an earlier time, the
+/// later is kept. Returns whether it was. `now` is this relay's time.
+///
+/// So a channel that this relay has only from another, and of which it
+/// sees no proof and no entry shown, is not dropped as unused while it is
+/// in use there.
+///
+/// No time later than `now` is kept: a relay whose clock runs ahead does
+/// not keep a channel here beyond 90 days after this relay heard of its
+/// use. The caller says who the operator lists: this is called for no
+/// other. Nothing is kept for a channel that this relay does not hold,
+/// and a time that is not after 0 is no time.
+///
+/// Refused, with nothing changed, on a database in which a device follows
+/// a phrase.
+pub fn listed_relay_used(
+    conn: &Connection,
+    channel: &[u8; 32],
+    used_at: i64,
+    now: i64,
+) -> Result<bool, RelayError> {
+    in_one(conn, || {
+        no_device_writes(conn)?;
+        Ok(kept_the_later(conn, channel, used_at, now)?)
+    })
+}
+
+/// [`listed_relay_used`], inside what the caller began. A time that is
+/// not after 0 is never the later of two: a channel is held from a time
+/// after 0, and was last used no earlier.
+fn kept_the_later(
+    conn: &Connection,
+    channel: &[u8; 32],
+    used_at: i64,
+    now: i64,
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "UPDATE relay_channels SET used_at = ?2 WHERE channel_id = ?1 AND used_at < ?2",
+        params![channel.as_slice(), used_at.min(now)],
+    )
+    .map(|rows| rows > 0)
+    .map_err(storage)
+}
+
+/// What the asker says of how long it has held `channel`, and of when it
+/// was last used, kept where it may say so.
+fn said_by(
+    conn: &Connection,
+    asker: &Asker,
+    channel: &[u8; 32],
+    now: i64,
+) -> Result<(), CordeliaError> {
     if let Asker::ListedRelay {
-        held_since: Some(said),
+        held_since,
+        used_at,
     } = asker
     {
-        kept_the_earlier(conn, channel, *said)?;
+        if let Some(said) = held_since {
+            kept_the_earlier(conn, channel, *said)?;
+        }
+        if let Some(last) = used_at {
+            kept_the_later(conn, channel, *last, now)?;
+        }
     }
     Ok(())
 }
@@ -622,7 +812,7 @@ fn shown(
     asker: &Asker,
     now: i64,
 ) -> Result<Shown, CordeliaError> {
-    said_by(conn, asker, &entry.channel)?;
+    said_by(conn, asker, &entry.channel, now)?;
     match entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)? {
         Some(held) if held.entry.rev >= entry.rev => {
             if held.entry.id() == entry.id() {
@@ -702,14 +892,22 @@ pub fn prove(
 /// stored in this channel, from 1. It says nothing of what the relay
 /// stored in any other channel, so the places that a holder of one
 /// channel's key is given do not tell it how much the relay stored for
-/// anyone else in between. A channel that was dropped and is taken again
-/// counts from the start: a place from before means nothing in it.
+/// anyone else in between.
+///
+/// **A place is within one holding of the channel.** A channel that was
+/// dropped and is taken again counts from the start, under another mark.
+/// `mark` is the mark that the asker holds with its place: [`NO_MARK`]
+/// where it has none. The page says the relay's. Where the two differ,
+/// `after` is a place in another holding, or in none, and means nothing
+/// here: the channel is handed from the start. (Without the mark, whoever
+/// kept a place from an earlier holding would be handed nothing until the
+/// new count passed it.)
 ///
 /// `proved` is whether the channel's key was proved on the connection
 /// that asks: a proof that held there ([`Proof::holds`]), also one from
 /// before the relay held the channel. Where it was not, the answer is the
-/// one for a channel that is not held: no entries, and the place that was
-/// asked after. The store is not looked at.
+/// one for a channel that is not held: no entries, and the place and the
+/// mark that were asked with. The store is not looked at.
 ///
 /// A page holds at most ENTRY_PAGE_MAX_ENTRIES entries, and at most
 /// ENTRY_PAGE_MAX_BYTES of them as they travel, so that it fits one
@@ -718,6 +916,7 @@ pub fn pull(
     conn: &Connection,
     channel: &[u8; 32],
     proved: bool,
+    mark: &Mark,
     after: u64,
     limit: u32,
 ) -> Result<Page, CordeliaError> {
@@ -725,10 +924,20 @@ pub fn pull(
         entries: Vec::new(),
         next: after,
         cost: 0,
+        mark: *mark,
     };
     if !proved {
         return Ok(page);
     }
+    // A channel that is not held has no holding to have a place in: the
+    // asker keeps what it asked with.
+    let Some(holding) = held_channel(conn, channel)? else {
+        return Ok(page);
+    };
+    // A place from another holding is no place in this one.
+    let after = if holding.mark == *mark { after } else { 0 };
+    page.mark = holding.mark;
+    page.next = after;
     let most = limit.min(ENTRY_PAGE_MAX_ENTRIES) as usize;
     let mut place = i64::try_from(after).unwrap_or(i64::MAX);
     let mut bytes = 0;
@@ -779,6 +988,15 @@ pub fn sweep_unused(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, RelayE
         no_device_writes(conn)?;
         Ok(swept(conn, now)?)
     })
+}
+
+/// Whether a channel that was last used at `used_at` is one that nobody
+/// uses at `now`, both in seconds: the rule of [`sweep_unused`], for a
+/// relay that is told when a channel was last used and does not hold it.
+/// It takes no such channel from a relay it works with: it would drop it
+/// at its next sweep.
+pub fn unused(used_at: i64, now: i64) -> bool {
+    used_at.saturating_add(UNUSED_SECS) <= now
 }
 
 /// [`sweep_unused`], inside what the caller began.
@@ -919,14 +1137,41 @@ mod tests {
 
     /// A relay that the operator lists, which says nothing of how long it
     /// has held a channel.
-    const LISTED: Asker = Asker::ListedRelay { held_since: None };
+    const LISTED: Asker = Asker::ListedRelay {
+        held_since: None,
+        used_at: None,
+    };
 
     /// A relay that the operator lists, which says it has held the channel
     /// since `since`.
     fn listed_since(since: i64) -> Asker {
         Asker::ListedRelay {
             held_since: Some(since),
+            used_at: None,
         }
+    }
+
+    /// A relay that the operator lists, which says it has held the channel
+    /// since `since`, and that it was last used at `used`.
+    fn listed(since: i64, used: i64) -> Asker {
+        Asker::ListedRelay {
+            held_since: Some(since),
+            used_at: Some(used),
+        }
+    }
+
+    /// The mark of the relay's holding of channel `c`, or the mark of no
+    /// holding where it holds none.
+    fn mark_of(conn: &Connection, c: u16) -> Mark {
+        held_channel(conn, &channel(c))
+            .unwrap()
+            .map_or(NO_MARK, |held| held.mark)
+    }
+
+    /// A page of channel `c`, for an asker whose place is in the holding
+    /// that the relay has of it now.
+    fn paged(conn: &Connection, c: u16, proved: bool, after: u64, limit: u32) -> Page {
+        pull(conn, &channel(c), proved, &mark_of(conn, c), after, limit).unwrap()
     }
 
     /// An entry of channel `c` that device `d` made of `said` under `name`
@@ -1065,12 +1310,15 @@ mod tests {
             take(&conn, &mut room, &checked, &from(1), NOW).unwrap(),
             Taken::Stored
         );
+        let mark = mark_of(&conn, 1);
+        assert_ne!(mark, NO_MARK, "a holding has a mark of its own");
         assert_eq!(
             held_channel(&conn, &channel(1)).unwrap(),
             Some(HeldChannel {
                 held_since: NOW,
                 used_at: NOW,
                 bytes: SMALL,
+                mark,
             })
         );
         assert_eq!(ids(&conn, 1), [first.id()]);
@@ -1086,13 +1334,15 @@ mod tests {
             );
         }
         assert_eq!(ids(&conn, 1), [first.id(), by_another.id(), elsewhere.id()]);
-        // The channel is held from when it was first taken.
+        // The channel is held from when it was first taken, and it is
+        // the one holding still: its mark is as it was.
         assert_eq!(
             held_channel(&conn, &channel(1)).unwrap(),
             Some(HeldChannel {
                 held_since: NOW,
                 used_at: NOW,
                 bytes: 3 * SMALL,
+                mark,
             })
         );
 
@@ -1326,23 +1576,28 @@ mod tests {
         // And asked for without a proof, the channel it holds is handed as
         // the one it does not hold is, from any place.
         for after in [0, 1, 7] {
-            let unproved = pull(&conn, &channel(1), false, after, 100).unwrap();
-            assert_eq!(
-                unproved,
-                Page {
-                    entries: Vec::new(),
-                    next: after,
-                    cost: 0,
-                }
-            );
-            assert_eq!(
-                unproved,
-                pull(&conn, &channel(2), false, after, 100).unwrap()
-            );
-            assert_eq!(
-                unproved,
-                pull(&conn, &channel(2), true, after, 100).unwrap()
-            );
+            // Whatever mark it asks with: none, one it made up, and the
+            // mark of the relay's holding, which it has no way to know.
+            for mark in [NO_MARK, [0x4d; 8], mark_of(&conn, 1)] {
+                let unproved = pull(&conn, &channel(1), false, &mark, after, 100).unwrap();
+                assert_eq!(
+                    unproved,
+                    Page {
+                        entries: Vec::new(),
+                        next: after,
+                        cost: 0,
+                        mark,
+                    }
+                );
+                assert_eq!(
+                    unproved,
+                    pull(&conn, &channel(2), false, &mark, after, 100).unwrap()
+                );
+                assert_eq!(
+                    unproved,
+                    pull(&conn, &channel(2), true, &mark, after, 100).unwrap()
+                );
+            }
         }
         // Nothing of all that counted as use of the channel.
         assert_eq!(used_at(&conn, 1), Some(NOW));
@@ -1354,7 +1609,7 @@ mod tests {
                 .answer()
         );
         assert_eq!(
-            pull(&conn, &channel(1), true, 0, 100).unwrap().entries,
+            paged(&conn, 1, true, 0, 100).entries,
             [held_entry.into_entry()]
         );
     }
@@ -1465,7 +1720,12 @@ mod tests {
             small(1, 1, 5),
             small(3, 1, 6),
         ] {
-            for asker in [from(1), LISTED, listed_since(NOW - DAY)] {
+            for asker in [
+                from(1),
+                LISTED,
+                listed_since(NOW - DAY),
+                listed(NOW - DAY, NOW + 30),
+            ] {
                 refused(take(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
                 refused(show(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
             }
@@ -1478,8 +1738,10 @@ mod tests {
         // anything was used: nothing is dropped.
         refused(make_room(&conn, 0).map(|_| ()));
         refused(sweep_unused(&conn, NOW + 365 * DAY).map(|_| ()));
-        // Nor is what a listed relay says kept.
+        // Nor is what a listed relay says kept: since when it has held a
+        // channel, and when the channel was last used.
         refused(listed_relay_says(&conn, &channel(1), NOW - DAY).map(|_| ()));
+        refused(listed_relay_used(&conn, &channel(1), NOW + 30, NOW + 60).map(|_| ()));
         assert_eq!(all(&conn), before);
         assert!(conn.is_autocommit(), "no transaction is left open");
 
@@ -1487,6 +1749,7 @@ mod tests {
         // what it does.
         conn.execute("DELETE FROM person", []).unwrap();
         assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap());
+        assert!(listed_relay_used(&conn, &channel(2), NOW + 30, NOW + 60).unwrap());
         assert_eq!(
             take(&conn, &mut room, &small(4, 1, 5), &from(1), NOW + 60).unwrap(),
             Taken::Stored
@@ -2229,6 +2492,7 @@ mod tests {
         let (conn, mut room) = relay_of(2 * SMALL);
         take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 10).unwrap();
+        let first_holding = (mark_of(&conn, 1), mark_of(&conn, 2));
         // The older of the two is held from far back, by a listed relay's
         // word, and was used a moment ago.
         assert!(listed_relay_says(&conn, &channel(1), NOW - 365 * DAY).unwrap());
@@ -2256,9 +2520,15 @@ mod tests {
                 held_since: NOW + 600,
                 used_at: NOW + 600,
                 bytes: SMALL,
+                mark: mark_of(&conn, 1),
             })
         );
         assert_eq!(since(&conn, 2), Some(NOW + 500));
+        // Each is another holding, under another mark than the one that
+        // was dropped.
+        assert_ne!(mark_of(&conn, 1), first_holding.0);
+        assert_ne!(mark_of(&conn, 2), first_holding.1);
+        assert_ne!(mark_of(&conn, 1), NO_MARK);
         // It counted against the address again: five channels in all.
         assert_eq!(room.new_channels[&IpAddr::from([192, 0, 2, 1])].len(), 5);
         // And it is the newest now, where it was the oldest: it goes
@@ -2273,6 +2543,338 @@ mod tests {
         );
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 91 * DAY).unwrap();
         assert_eq!(since(&conn, 2), Some(NOW + 91 * DAY));
+    }
+
+    // ── Relays that work together ────────────────────────────────────
+
+    /// A channel was last used at the later of two times: when this relay
+    /// saw its key proved or an entry of it shown, and when a relay that
+    /// the operator lists says it was. No time later than this relay's
+    /// own clock is kept.
+    #[test]
+    fn test_a_channel_was_last_used_at_the_later_of_here_and_what_a_listed_relay_says() {
+        let (conn, mut room) = relay();
+        take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
+        assert_eq!(used_at(&conn, 1), Some(NOW));
+
+        // A listed relay says a later time, with no entry at all: kept.
+        assert!(listed_relay_used(&conn, &channel(1), NOW + 100, NOW + 500).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+        // An earlier time, and the same one, are not kept.
+        for earlier in [NOW + 99, NOW, NOW - 365 * DAY, NOW + 100] {
+            assert!(!listed_relay_used(&conn, &channel(1), earlier, NOW + 500).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+        }
+        // A time that is not after 0 is no time.
+        for none in [0, -1, i64::MIN] {
+            assert!(!listed_relay_used(&conn, &channel(1), none, NOW + 500).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+        }
+        // A time later than this relay's clock is kept as this relay's
+        // time, and no later: also the latest there is.
+        assert!(listed_relay_used(&conn, &channel(1), NOW + 9000, NOW + 600).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 600));
+        assert!(!listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 600).unwrap());
+        assert!(listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 700).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 700));
+
+        // With an entry that it passes on: one that is stored, one that
+        // is already held, and one shown.
+        take(
+            &conn,
+            &mut room,
+            &small(1, 2, 5),
+            &listed(NOW, NOW + 800),
+            NOW + 5000,
+        )
+        .unwrap();
+        assert_eq!(used_at(&conn, 1), Some(NOW + 800));
+        assert_eq!(
+            take(
+                &conn,
+                &mut room,
+                &small(1, 2, 5),
+                &listed(NOW, NOW + 900),
+                NOW + 5000
+            )
+            .unwrap(),
+            Taken::AlreadyHeld
+        );
+        assert_eq!(used_at(&conn, 1), Some(NOW + 900));
+        assert!(matches!(
+            show(
+                &conn,
+                &mut room,
+                &small(1, 2, 4),
+                &listed(NOW, NOW + 1000),
+                NOW + 5000
+            )
+            .unwrap(),
+            Shown::Another { .. }
+        ));
+        assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
+        // An earlier time with an entry, and none said, change nothing.
+        for asker in [listed(NOW, NOW + 10), listed(NOW, 0), listed_since(NOW)] {
+            take(&conn, &mut room, &small(1, 2, 5), &asker, NOW + 5000).unwrap();
+            assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
+        }
+        // An address says nothing of it: a push is no use of a channel.
+        take(&conn, &mut room, &small(1, 3, 5), &from(1), NOW + 6000).unwrap();
+        assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
+        // None of it changed since when the channel is held, its mark, or
+        // what it holds.
+        assert_eq!(since(&conn, 1), Some(NOW));
+        assert_eq!(counted(&conn), 3 * SMALL);
+
+        // Nothing is kept for a channel that the relay does not hold.
+        assert!(!listed_relay_used(&conn, &channel(6), NOW + 100, NOW + 500).unwrap());
+        assert_eq!(held_channel(&conn, &channel(6)).unwrap(), None);
+    }
+
+    /// A channel that is new here, from a relay that the operator lists:
+    /// it was last used when that relay says it was. That relay passing
+    /// it on is no use of it, or a channel that nobody uses would live on
+    /// for as long as relays passed it between them.
+    #[test]
+    fn test_a_channel_from_a_listed_relay_was_last_used_when_that_relay_says() {
+        let (conn, mut room) = relay();
+        // Held there for a year, and last used ten days ago.
+        let said = listed(NOW - 365 * DAY, NOW - 10 * DAY);
+        assert_eq!(
+            take(&conn, &mut room, &small(1, 1, 5), &said, NOW).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(since(&conn, 1), Some(NOW - 365 * DAY));
+        assert_eq!(used_at(&conn, 1), Some(NOW - 10 * DAY));
+        // A time later than this relay's clock is this relay's time.
+        take(
+            &conn,
+            &mut room,
+            &small(2, 1, 5),
+            &listed(NOW - DAY, NOW + 9000),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(used_at(&conn, 2), Some(NOW));
+        // With no time said, or one that is not after 0, it is used now.
+        take(
+            &conn,
+            &mut room,
+            &small(3, 1, 5),
+            &listed(NOW - DAY, 0),
+            NOW,
+        )
+        .unwrap();
+        take(
+            &conn,
+            &mut room,
+            &small(4, 1, 5),
+            &listed_since(NOW - DAY),
+            NOW,
+        )
+        .unwrap();
+        take(
+            &conn,
+            &mut room,
+            &small(5, 1, 5),
+            &listed(NOW - DAY, -5),
+            NOW,
+        )
+        .unwrap();
+        for c in [3, 4, 5] {
+            assert_eq!(used_at(&conn, c), Some(NOW), "{c}");
+        }
+        // From an address it is used now, as it always was.
+        take(&conn, &mut room, &small(6, 1, 5), &from(1), NOW).unwrap();
+        assert_eq!(used_at(&conn, 6), Some(NOW));
+
+        // The first goes 90 days after it was last used there, which is
+        // 80 days from now: not 90 days after this relay took it.
+        assert!(sweep_unused(&conn, NOW + 80 * DAY - 1).unwrap().is_empty());
+        assert_eq!(sweep_unused(&conn, NOW + 80 * DAY).unwrap(), [channel(1)]);
+        assert_eq!(held(&conn), [2, 3, 4, 5, 6]);
+    }
+
+    /// A channel that a relay has only from a relay it works with: it
+    /// sees no proof of it and no entry of it shown. It is not dropped as
+    /// unused while it is in use at the other relay, which says so.
+    #[test]
+    fn test_a_channel_in_use_at_a_listed_relay_is_not_swept_here() {
+        let (conn, mut room) = relay();
+        let said = listed(NOW, NOW);
+        take(&conn, &mut room, &small(1, 1, 5), &said, NOW).unwrap();
+        take(&conn, &mut room, &small(2, 1, 5), &said, NOW).unwrap();
+        // The first is proved at the other relay 89 days on, and that
+        // relay tells this one. The second is used nowhere.
+        let later = NOW + 89 * DAY;
+        assert!(listed_relay_used(&conn, &channel(1), later, later + 60).unwrap());
+
+        // At 90 days the second goes, and the first stays.
+        assert_eq!(sweep_unused(&conn, NOW + 90 * DAY).unwrap(), [channel(2)]);
+        assert_eq!(held(&conn), [1]);
+        // The first goes 90 days after it was last used there.
+        assert!(
+            sweep_unused(&conn, later + 90 * DAY - 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sweep_unused(&conn, later + 90 * DAY).unwrap(), [channel(1)]);
+    }
+
+    /// The rule of the sweep, as a relay asks it of a channel that it is
+    /// told of and does not hold: unused is 90 days to the second, as the
+    /// sweep has it.
+    #[test]
+    fn test_a_channel_that_is_told_of_is_unused_by_the_rule_of_the_sweep() {
+        assert!(!unused(NOW, NOW));
+        assert!(!unused(NOW, NOW + 90 * DAY - 1));
+        assert!(unused(NOW, NOW + 90 * DAY));
+        assert!(unused(NOW, NOW + 365 * DAY));
+        // A time ahead of the clock is not unused, and the latest time
+        // there is does not wrap round to the earliest.
+        assert!(!unused(NOW + DAY, NOW));
+        assert!(!unused(i64::MAX, NOW));
+
+        // The sweep drops a channel exactly where the rule says so.
+        let (conn, mut room) = relay();
+        take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
+        for at in [NOW, NOW + 90 * DAY - 1] {
+            assert!(!unused(used_at(&conn, 1).unwrap(), at));
+            assert!(sweep_unused(&conn, at).unwrap().is_empty());
+        }
+        assert!(unused(used_at(&conn, 1).unwrap(), NOW + 90 * DAY));
+        assert_eq!(sweep_unused(&conn, NOW + 90 * DAY).unwrap(), [channel(1)]);
+    }
+
+    /// What a relay tells a relay it works with: each channel it holds,
+    /// in the order of their IDs and in pages, with its mark, since when
+    /// it is held, when it was last used, and the place of the entry
+    /// stored last in it.
+    #[test]
+    fn test_a_relay_tells_which_channels_it_holds_in_pages_by_their_ids() {
+        let (conn, mut room) = relay();
+        const START: [u8; 32] = [0; 32];
+        assert!(held_channels(&conn, &START, 100).unwrap().is_empty());
+
+        // Seven channels, taken in an order that is not that of their
+        // IDs, each at its own time.
+        for (n, c) in [5u16, 2, 7, 1, 6, 3, 4].into_iter().enumerate() {
+            take(&conn, &mut room, &small(c, 1, 5), &from(1), NOW + n as i64).unwrap();
+        }
+        // One of them holds three entries, of which one replaced another:
+        // four places were given out in it. One was used later, and one
+        // is held from an earlier time by a listed relay's word.
+        take(&conn, &mut room, &small(2, 2, 5), &from(1), NOW + 50).unwrap();
+        take(&conn, &mut room, &small(2, 3, 5), &from(1), NOW + 50).unwrap();
+        take(&conn, &mut room, &small(2, 2, 6), &from(1), NOW + 50).unwrap();
+        let proved = proof::make(&secret(7), &SESSION, &peer()).unwrap();
+        prove(&conn, &channel(7), &SESSION, &peer(), &proved, NOW + 900).unwrap();
+        listed_relay_says(&conn, &channel(6), NOW - DAY).unwrap();
+        // What the relay holds of the older kind is no part of it.
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES ('old_a', 'named', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let all = held_channels(&conn, &START, 100).unwrap();
+        assert_eq!(all.len(), 7);
+        // In the order of their IDs, each once: which is not the order in
+        // which the relay took them.
+        let mut sorted: Vec<[u8; 32]> = (1..=7).map(channel).collect();
+        sorted.sort();
+        let told: Vec<[u8; 32]> = all.iter().map(|told| told.channel).collect();
+        assert_eq!(told, sorted);
+        assert_ne!(sorted, [5u16, 2, 7, 1, 6, 3, 4].map(channel));
+        // Each as the relay holds it.
+        for told in &all {
+            assert_eq!(
+                Some(told.held),
+                held_channel(&conn, &told.channel).unwrap(),
+                "{told:?}"
+            );
+            assert_ne!(told.held.mark, NO_MARK);
+        }
+        let of = |c: u16| *all.iter().find(|told| told.channel == channel(c)).unwrap();
+        assert_eq!((of(2).places, of(2).held.bytes), (4, 3 * SMALL));
+        assert_eq!((of(1).places, of(1).held.bytes), (1, SMALL));
+        assert_eq!(of(7).held.used_at, NOW + 900);
+        assert_eq!(of(6).held.held_since, NOW - DAY);
+        // The places are what a puller is handed as its place: whoever
+        // has pulled a channel to the end holds that place.
+        for c in 1..=7 {
+            assert_eq!(paged(&conn, c, true, 0, 100).next, of(c).places, "{c}");
+        }
+
+        // In pages: each goes on after the last ID of the one before, and
+        // together they are the whole list, with nothing twice.
+        for limit in [1, 2, 3, 6, 7, 8] {
+            let mut after = START;
+            let mut paged = Vec::new();
+            // At most a page for each channel, and one that is empty.
+            for _ in 0..=all.len() {
+                let page = held_channels(&conn, &after, limit).unwrap();
+                assert!(page.len() <= limit as usize);
+                let Some(last) = page.last() else { break };
+                after = last.channel;
+                paged.extend(page);
+            }
+            assert_eq!(paged, all, "{limit}");
+        }
+        assert!(held_channels(&conn, &START, 0).unwrap().is_empty());
+        assert!(
+            held_channels(&conn, &sorted[6], 100).unwrap().is_empty(),
+            "nothing is after the last"
+        );
+        assert_eq!(held_channels(&conn, &[0xff; 32], 100).unwrap(), []);
+
+        // A channel that is dropped is told no more.
+        assert_eq!(make_room(&conn, 6 * SMALL).unwrap().len(), 3);
+        let left: Vec<[u8; 32]> = held_channels(&conn, &START, 100)
+            .unwrap()
+            .iter()
+            .map(|told| told.channel)
+            .collect();
+        assert_eq!(left.len(), 4);
+        assert!(
+            left.iter()
+                .all(|c| held_channel(&conn, c).unwrap().is_some())
+        );
+    }
+
+    /// One answer tells of no more channels than a page of them holds,
+    /// however many are asked for.
+    #[test]
+    fn test_one_answer_tells_of_at_most_a_pages_worth_of_channels() {
+        let (conn, _room) = relay();
+        // Rows as the relay keeps them, without their entries: this is
+        // about how many are told.
+        let most = RELAY_CHANNELS_PAGE_MAX as usize;
+        for n in 0..most + 5 {
+            let mut id = [0x11u8; 32];
+            id[..4].copy_from_slice(&(n as u32 + 1).to_be_bytes());
+            conn.execute(
+                "INSERT INTO relay_channels (channel_id, mark, held_since, used_at, bytes)
+                 VALUES (?1, X'0102030405060708', ?2, ?2, 1280)",
+                params![id.as_slice(), NOW],
+            )
+            .unwrap();
+        }
+        for limit in [
+            RELAY_CHANNELS_PAGE_MAX,
+            RELAY_CHANNELS_PAGE_MAX + 1,
+            u32::MAX,
+        ] {
+            let page = held_channels(&conn, &[0; 32], limit).unwrap();
+            assert_eq!(page.len(), most, "{limit}");
+        }
+        let page = held_channels(&conn, &[0; 32], u32::MAX).unwrap();
+        let rest = held_channels(&conn, &page[most - 1].channel, u32::MAX).unwrap();
+        assert_eq!(rest.len(), 5);
+        // No entry is stored in them: no place was given out.
+        assert!(page.iter().all(|told| told.places == 0));
     }
 
     // ── What it answers ──────────────────────────────────────────────
@@ -2590,6 +3192,7 @@ mod tests {
             entries: Vec::new(),
             next: 0,
             cost: 0,
+            mark: NO_MARK,
         };
         let proof = proof::make(&secret(3), &SESSION, &peer()).unwrap();
 
@@ -2611,15 +3214,22 @@ mod tests {
         // The caller remembers that the proof held. Asked for now, the
         // channel is handed as one that is not held.
         let proved = found.holds();
-        assert_eq!(pull(&conn, &channel(3), proved, 0, 100).unwrap(), nothing);
+        assert_eq!(paged(&conn, 3, proved, 0, 100), nothing);
 
         // A minute later the channel arrives, from elsewhere.
         let entry = small(3, 1, 5);
         take(&conn, &mut room, &entry, &from(2), NOW + 60).unwrap();
-        // The connection is handed it, on what it proved a minute ago.
+        // The connection is handed it, on what it proved a minute ago: it
+        // asks with the mark of no holding, as it did before, and is told
+        // the mark of the holding there is now.
         assert_eq!(
-            pull(&conn, &channel(3), proved, 0, 100).unwrap().entries,
-            [(*entry).clone()]
+            pull(&conn, &channel(3), proved, &NO_MARK, 0, 100).unwrap(),
+            Page {
+                entries: vec![(*entry).clone()],
+                next: 1,
+                cost: SMALL,
+                mark: mark_of(&conn, 3),
+            }
         );
         // The proof was no use of a channel that was not held: the
         // channel was used when it was taken.
@@ -2632,7 +3242,7 @@ mod tests {
         assert_eq!(fails, Proof::Fails);
         assert!(!fails.holds() && !fails.answer());
         assert_eq!(
-            pull(&conn, &channel(3), fails.holds(), 0, 100).unwrap(),
+            pull(&conn, &channel(3), fails.holds(), &NO_MARK, 0, 100).unwrap(),
             nothing
         );
         assert_eq!(used_at(&conn, 3), Some(NOW + 60));
@@ -2660,16 +3270,18 @@ mod tests {
         // Another channel's entries are in no page of this one.
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW).unwrap();
 
-        let page = |after: u64, limit: u32| pull(&conn, &channel(1), true, after, limit).unwrap();
+        let page = |after: u64, limit: u32| paged(&conn, 1, true, after, limit);
         let of = |n: std::ops::RangeInclusive<usize>| -> Vec<Entry> {
             n.map(|n| (*entries[n - 1]).clone()).collect()
         };
+        let mark = mark_of(&conn, 1);
         assert_eq!(
             page(0, 2),
             Page {
                 entries: of(1..=2),
                 next: 2,
                 cost: 2 * SMALL,
+                mark,
             }
         );
         assert_eq!(
@@ -2678,6 +3290,7 @@ mod tests {
                 entries: of(3..=4),
                 next: 4,
                 cost: 2 * SMALL,
+                mark,
             }
         );
         assert_eq!(
@@ -2686,6 +3299,7 @@ mod tests {
                 entries: of(5..=5),
                 next: 5,
                 cost: SMALL,
+                mark,
             }
         );
         // After the last there is nothing, and the place stays.
@@ -2693,6 +3307,7 @@ mod tests {
             entries: Vec::new(),
             next: after,
             cost: 0,
+            mark,
         };
         assert_eq!(page(5, 2), nothing(5));
         assert_eq!(page(0, 0), nothing(0));
@@ -2708,12 +3323,9 @@ mod tests {
         // the relay holds it. That is the answer for a channel that is
         // not held.
         for after in [0, 2, 5] {
+            assert_eq!(paged(&conn, 1, false, after, 100), nothing(after));
             assert_eq!(
-                pull(&conn, &channel(1), false, after, 100).unwrap(),
-                nothing(after)
-            );
-            assert_eq!(
-                pull(&conn, &channel(3), true, after, 100).unwrap(),
+                pull(&conn, &channel(3), true, &mark, after, 100).unwrap(),
                 nothing(after)
             );
         }
@@ -2730,6 +3342,7 @@ mod tests {
                 entries: vec![(*newer).clone()],
                 next: 6,
                 cost: SMALL,
+                mark,
             }
         );
     }
@@ -2781,8 +3394,12 @@ mod tests {
             let mut after = 0;
             let mut places = Vec::new();
             loop {
-                let page = pull(&quiet, &channel(1), true, after, limit).unwrap();
-                assert_eq!(page, pull(&busy, &channel(1), true, after, limit).unwrap());
+                let page = paged(&quiet, 1, true, after, limit);
+                let at_the_other = paged(&busy, 1, true, after, limit);
+                assert_eq!(
+                    (&page.entries, page.next, page.cost),
+                    (&at_the_other.entries, at_the_other.next, at_the_other.cost)
+                );
                 if page.entries.is_empty() {
                     break;
                 }
@@ -2801,16 +3418,163 @@ mod tests {
         }
 
         // A channel that was dropped and is taken again counts from the
-        // start: a place from before means nothing in it.
+        // start, in another holding.
+        let before = mark_of(&quiet, 1);
         assert_eq!(make_room(&quiet, 0).unwrap(), [channel(1)]);
         take(&quiet, &mut quiet_room, &own[0], &from(1), NOW).unwrap();
-        assert_eq!(pull(&quiet, &channel(1), true, 0, 100).unwrap().next, 1);
-        assert!(
-            pull(&quiet, &channel(1), true, 5, 100)
-                .unwrap()
-                .entries
-                .is_empty()
+        assert_eq!(paged(&quiet, 1, true, 0, 100).next, 1);
+        assert_ne!(mark_of(&quiet, 1), before);
+    }
+
+    /// A place is within one holding of a channel. A relay drops a channel
+    /// and takes it again: whoever kept a place from the earlier holding
+    /// asks with that holding's mark, and is handed the channel from the
+    /// start, with the mark of the holding there is now. (Asked by the
+    /// place alone, it would be handed nothing until the new count had
+    /// passed the old place.)
+    #[test]
+    fn test_a_place_kept_from_an_earlier_holding_is_handed_the_channel_from_the_start() {
+        let (conn, mut room) = relay();
+        let entries: Vec<CheckedEntry> = (1..=5u8)
+            .map(|d| made(1, d, 5, &format!("{d}.md"), "a small text"))
+            .collect();
+        for entry in &entries {
+            take(&conn, &mut room, entry, &from(1), NOW).unwrap();
+        }
+        // A holder of the key pulls all of it, and keeps its place: the
+        // fifth, in the holding marked so.
+        let first = mark_of(&conn, 1);
+        let all = pull(&conn, &channel(1), true, &NO_MARK, 0, 100).unwrap();
+        assert_eq!((all.entries.len(), all.next, all.mark), (5, 5, first));
+        // With that mark and that place there is nothing more, and the
+        // place and the mark stay.
+        let nothing_more = pull(&conn, &channel(1), true, &first, 5, 100).unwrap();
+        assert_eq!(
+            nothing_more,
+            Page {
+                entries: Vec::new(),
+                next: 5,
+                cost: 0,
+                mark: first,
+            }
         );
+
+        // The relay drops the channel, and takes it again: two entries,
+        // counted from 1, in another holding.
+        assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
+        for entry in &entries[..2] {
+            take(&conn, &mut room, entry, &from(2), NOW + 60).unwrap();
+        }
+        let second = mark_of(&conn, 1);
+        assert_ne!(second, first);
+        assert_ne!(second, NO_MARK);
+
+        // The holder asks from its place in the earlier holding. It is
+        // handed the channel from the start, and told the new mark.
+        let again = pull(&conn, &channel(1), true, &first, 5, 100).unwrap();
+        assert_eq!(
+            again,
+            Page {
+                entries: vec![(*entries[0]).clone(), (*entries[1]).clone()],
+                next: 2,
+                cost: 2 * SMALL,
+                mark: second,
+            }
+        );
+        // From a place that the new count has not reached, and from one
+        // that it has passed: the same, since neither is a place here.
+        for after in [1, 2, 3, 5, 100, u64::MAX] {
+            let page = pull(&conn, &channel(1), true, &first, after, 100).unwrap();
+            assert_eq!(page, again, "{after}");
+        }
+        // So is it for an asker with no mark, whatever place it says, and
+        // for one with a mark that is no holding's.
+        for mark in [NO_MARK, [0x4d; 8]] {
+            for after in [0, 1, 2, 7] {
+                let page = pull(&conn, &channel(1), true, &mark, after, 100).unwrap();
+                assert_eq!(page, again, "{mark:?} {after}");
+            }
+        }
+        // And where no entry is asked for, the place that is said is the
+        // start of this holding, not the place in the other.
+        let none = pull(&conn, &channel(1), true, &first, 5, 0).unwrap();
+        assert_eq!((none.entries.len(), none.next, none.mark), (0, 0, second));
+        // In pages, the first of them from the start whatever was asked.
+        let one = pull(&conn, &channel(1), true, &first, 5, 1).unwrap();
+        assert_eq!((one.entries.len(), one.next, one.mark), (1, 1, second));
+        // With the mark it was told, the holder goes on from its place in
+        // this holding.
+        let rest = pull(&conn, &channel(1), true, &one.mark, one.next, 100).unwrap();
+        assert_eq!(
+            rest,
+            Page {
+                entries: vec![(*entries[1]).clone()],
+                next: 2,
+                cost: SMALL,
+                mark: second,
+            }
+        );
+        let caught_up = pull(&conn, &channel(1), true, &second, 2, 100).unwrap();
+        assert_eq!(
+            (caught_up.entries.len(), caught_up.next, caught_up.mark),
+            (0, 2, second)
+        );
+        // A place beyond the count, in this holding, is that place still:
+        // nothing is handed, and nothing is said of the start.
+        let beyond = pull(&conn, &channel(1), true, &second, 9, 100).unwrap();
+        assert_eq!((beyond.entries.len(), beyond.next), (0, 9));
+
+        // A holding keeps its mark for as long as it lasts: through an
+        // entry more, a newer revision, a proof, and an entry shown.
+        take(&conn, &mut room, &entries[2], &from(2), NOW + 120).unwrap();
+        take(&conn, &mut room, &small(1, 9, 6), &from(2), NOW + 120).unwrap();
+        let proved = proof::make(&secret(1), &SESSION, &peer()).unwrap();
+        prove(&conn, &channel(1), &SESSION, &peer(), &proved, NOW + 180).unwrap();
+        show(&conn, &mut room, &entries[0], &from(2), NOW + 240).unwrap();
+        listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap();
+        listed_relay_used(&conn, &channel(1), NOW + 300, NOW + 300).unwrap();
+        assert_eq!(mark_of(&conn, 1), second);
+
+        // Dropped because nobody used it, and taken again: a third
+        // holding, under a third mark.
+        assert_eq!(sweep_unused(&conn, NOW + 365 * DAY).unwrap(), [channel(1)]);
+        assert_eq!(mark_of(&conn, 1), NO_MARK);
+        take(&conn, &mut room, &entries[4], &from(2), NOW + 366 * DAY).unwrap();
+        let third = mark_of(&conn, 1);
+        assert!(third != first && third != second && third != NO_MARK);
+        let from_the_start = pull(&conn, &channel(1), true, &second, 4, 100).unwrap();
+        assert_eq!(
+            (
+                from_the_start.entries,
+                from_the_start.next,
+                from_the_start.mark
+            ),
+            (vec![(*entries[4]).clone()], 1, third)
+        );
+
+        // While the relay does not hold the channel there is no holding
+        // to have a place in: the asker keeps the place and the mark it
+        // asked with, proved or not, as for any channel that is not held.
+        assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
+        for proved in [true, false] {
+            for c in [1, 7] {
+                assert_eq!(
+                    pull(&conn, &channel(c), proved, &third, 4, 100).unwrap(),
+                    Page {
+                        entries: Vec::new(),
+                        next: 4,
+                        cost: 0,
+                        mark: third,
+                    },
+                    "{proved} {c}"
+                );
+            }
+        }
+        // And a mark is a holding's own: two channels taken in one moment
+        // have two.
+        take(&conn, &mut room, &small(2, 1, 5), &from(2), NOW).unwrap();
+        take(&conn, &mut room, &small(3, 1, 5), &from(2), NOW).unwrap();
+        assert_ne!(mark_of(&conn, 2), mark_of(&conn, 3));
     }
 
     /// A page holds at most 100 entries, and at most what one message
@@ -2825,16 +3589,16 @@ mod tests {
             take(&conn, &mut room, &entry, &from(1), NOW).unwrap();
         }
         for limit in [100, 101, 1000, u32::MAX] {
-            let page = pull(&conn, &channel(1), true, 0, limit).unwrap();
+            let page = paged(&conn, 1, true, 0, limit);
             assert_eq!(page.entries.len(), 100, "{limit}");
             assert_eq!((page.next, page.cost), (100, 100 * SMALL));
         }
-        let rest = pull(&conn, &channel(1), true, 100, 1000).unwrap();
+        let rest = paged(&conn, 1, true, 100, 1000);
         assert_eq!((rest.entries.len(), rest.next), (3, 103));
         // Fewer where fewer are asked for, across the steps in which a
         // page is read.
         for limit in [1, 15, 16, 17, 33, 99] {
-            let page = pull(&conn, &channel(1), true, 0, limit).unwrap();
+            let page = paged(&conn, 1, true, 0, limit);
             assert_eq!(page.entries.len(), limit as usize);
             assert_eq!(page.next, u64::from(limit));
         }
@@ -2850,16 +3614,16 @@ mod tests {
         }
         let travels =
             |page: &Page| -> usize { page.entries.iter().map(|entry| entry.to_wire().len()).sum() };
-        let first = pull(&conn, &channel(2), true, 0, 100).unwrap();
+        let first = paged(&conn, 2, true, 0, 100);
         assert_eq!(first.entries.len(), 13);
         assert!(travels(&first) <= ENTRY_PAGE_MAX_BYTES);
         assert_eq!(first.cost, 13 * entry_cost(MAX_ITEM_BYTES));
         // The next page starts after the last entry handed, and nothing
         // is passed over between pages.
-        let second = pull(&conn, &channel(2), true, first.next, 100).unwrap();
+        let second = paged(&conn, 2, true, first.next, 100);
         assert_eq!(second.entries.len(), 13);
         assert_eq!(second.entries[0].author, device(14).public_key());
-        let third = pull(&conn, &channel(2), true, second.next, 100).unwrap();
+        let third = paged(&conn, 2, true, second.next, 100);
         assert_eq!(third.entries.len(), 4);
         assert_eq!(third.entries[3].author, device(30).public_key());
 
@@ -2878,11 +3642,11 @@ mod tests {
             )
             .unwrap();
         }
-        let mixed = pull(&conn, &channel(3), true, 0, 100).unwrap();
+        let mixed = paged(&conn, 3, true, 0, 100);
         assert_eq!(mixed.entries.len(), 3 + 13);
         assert!(travels(&mixed) <= ENTRY_PAGE_MAX_BYTES);
         assert!(travels(&mixed) + MAX_ENTRY_WIRE_BYTES > ENTRY_PAGE_MAX_BYTES);
-        let one = pull(&conn, &channel(3), true, mixed.next, 1).unwrap();
+        let one = paged(&conn, 3, true, mixed.next, 1);
         assert_eq!(one.entries.len(), 1);
         assert_eq!(one.entries[0].author, device(17).public_key());
     }
@@ -2936,7 +3700,7 @@ mod tests {
             Taken::Stored
         );
         // And it is handed in pages: that is no use, the proof was.
-        pull(&conn, &channel(6), true, 0, 100).unwrap();
+        paged(&conn, 6, true, 0, 100);
         for (c, at) in [
             (1, NOW),
             (2, yesterday),
