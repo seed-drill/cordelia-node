@@ -1063,6 +1063,13 @@ mod tests {
                 add(on, &new.key(), "new"),
                 Err(PersonError::Stopped(stopped)) if stopped == state
             ));
+            // Nor does it hand the change to a key that its statement
+            // lists: for that key it would make no record, and it is
+            // refused all the same.
+            assert!(matches!(
+                add(on, &s.key(1), "device 1"),
+                Err(PersonError::Stopped(stopped)) if stopped == state
+            ));
         }
         held_rows::set_state(&on.conn, State::Applied).unwrap();
 
