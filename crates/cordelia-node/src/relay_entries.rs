@@ -629,6 +629,12 @@ impl RelayEntries {
 
     /// Answer a request for a page of a channel (decision 2026-10-04 §2.4
     /// item 3): only where the channel was proved on this connection.
+    ///
+    /// The connection's memory is asked before the store (§16). A channel
+    /// that was not proved on it is answered as one that is not held, with
+    /// the place and the mark that were asked with, and the database is
+    /// not waited for: whoever asks without a proof costs the relay no
+    /// look at what it holds.
     fn pulling(
         &self,
         db: &Mutex<Connection>,
@@ -637,10 +643,17 @@ impl RelayEntries {
         proved: &Proved,
         pull: &EntryPull,
     ) -> Answer {
+        let proved = proved.holds(&pull.channel);
+        if !proved {
+            return Answer::of(WireMessage::EntryPulled(EntryPulled {
+                entries: Vec::new(),
+                next: pull.after,
+                mark: pull.mark,
+            }));
+        }
         let Ok(db) = db.lock() else {
             return Answer::Nothing;
         };
-        let proved = proved.holds(&pull.channel);
         // What the peer's allowance has room for, where it is handed
         // anything: a relay the operator lists is not limited, and a
         // channel that was not proved is not handed.
@@ -2035,6 +2048,60 @@ mod tests {
         let other = having_proved(&[2]);
         assert!(page(at.pull(1, 1, &other, mark, 0)).entries.is_empty());
         assert!(page(at.pull(2, 1, &nothing, mark, 0)).entries.is_empty());
+    }
+
+    /// A pull of a channel that was not proved on the connection is
+    /// answered from the connection's memory, and the store is not asked:
+    /// the answer comes while the database is held by another. It is the
+    /// answer for a channel that is not held, to the byte. A pull of a
+    /// channel that was proved waits for the store.
+    #[test]
+    fn a_pull_of_a_channel_that_was_not_proved_does_not_wait_for_the_store() {
+        use std::sync::mpsc;
+        let at = relay();
+        at.hold(&small(1, 1, 5), NOW);
+        let mark = at.held(1).unwrap().mark;
+
+        // The page that a pull with `proved` is handed within two seconds
+        // while this thread holds the database, where one is.
+        let while_held = |proved: &Proved, mark: Mark, after: u64| {
+            let held = lock(&at.db);
+            std::thread::scope(|scope| {
+                let (said, heard) = mpsc::channel();
+                let at = &at;
+                scope.spawn(move || {
+                    let _ = said.send(page(at.pull(1, 1, proved, mark, after)));
+                });
+                let answered = heard.recv_timeout(Duration::from_secs(2));
+                drop(held);
+                answered.ok()
+            })
+        };
+        let nothing_proved = Proved::default();
+        for (asked_mark, after) in [(relay::NO_MARK, 0), (mark, 0), (mark, 1), ([9; 8], 7)] {
+            assert_eq!(
+                while_held(&nothing_proved, asked_mark, after),
+                Some(EntryPulled {
+                    entries: Vec::new(),
+                    next: after,
+                    mark: asked_mark,
+                })
+            );
+        }
+        // Another channel proved is no proof of this one.
+        assert!(while_held(&having_proved(&[2]), mark, 0).is_some());
+        // The control: the channel was proved, and the store is asked.
+        assert_eq!(while_held(&having_proved(&[1]), mark, 0), None);
+        let handed = page(at.pull(1, 1, &having_proved(&[1]), mark, 0));
+        assert_eq!((handed.entries.len(), handed.next), (1, 1));
+
+        // And the answer is the one that the store gives for a channel
+        // that is not held, or was not proved.
+        let stores = relay::pull(&lock(&at.db), &channel(1), false, &[9; 8], 7, 100).unwrap();
+        assert_eq!(
+            page(at.pull(1, 1, &nothing_proved, [9; 8], 7)),
+            EntryPulled::from(&stores)
+        );
     }
 
     /// What a peer is handed in a minute is bounded, as what a relay may
