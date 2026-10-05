@@ -35,15 +35,20 @@ mkdir -p "$STUBS"
 # node would: running, on the version installed.
 cat > "$WORK/cordelia" << 'BINARY'
 #!/bin/sh
-[ -f "$HOME/.fake/binary_does_not_run" ] && exit 126
+if [ -f "$HOME/.fake/binary_does_not_run" ]; then
+    echo "cannot execute binary file" >&2
+    exit 126
+fi
 case "$1" in
     --version) echo "cordelia @NEW@" ;;
     init)
         [ -f "$HOME/.fake/init_fails" ] && exit 7
-        touch "$HOME/.cordelia/identity.key"
+        # Where it is told to, as the real one does.
+        mkdir -p "${CORDELIA_DATA_DIR:-$HOME/.cordelia}"
+        touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/identity.key"
         ;;
     status)
-        if [ -n "${CORDELIA_CONFIG:-}${CORDELIA_HTTP_PORT:-}${CORDELIA_BIND_ADDRESS:-}" ] \
+        if [ -n "${CORDELIA_CONFIG:-}${CORDELIA_HTTP_PORT:-}${CORDELIA_P2P_PORT:-}${CORDELIA_BIND_ADDRESS:-}" ] \
             || [ "${CORDELIA_DATA_DIR:-}" != "$HOME/.cordelia" ]; then
             echo '{ "state": "ok", "summary": "another node", "version": "@NEW@", "running": true,'
             echo '  "node_version": "@NEW@" }'
@@ -205,6 +210,13 @@ check() {
     fi
 }
 
+has() {
+    case "$OUT" in
+        *"$1"*) ;;
+        *) echo "FAILED: $name: says \"$1\""; FAILED=1 ;;
+    esac
+}
+
 expect() {
     check "the last line" "$LAST" "cordelia-install: $1"
     check "the exit code" "$CODE" "$2"
@@ -274,12 +286,6 @@ check "the agent is restarted by its label" \
 
 # What the first ten leave open.
 
-has() {
-    case "$OUT" in
-        *"$1"*) ;;
-        *) echo "FAILED: $name: says \"$1\""; FAILED=1 ;;
-    esac
-}
 
 # A binary that does not run here takes nobody's place.
 setup() {
@@ -292,12 +298,27 @@ check "the exit code" "$CODE" 1
 check "restarts" "$(restarts)" 0
 check "the binary in place" "$(cat "$HOME_DIR/.cordelia/bin/cordelia")" "the one before"
 check "the last line" "$LAST" "Error: the downloaded binary does not run on this machine. Nothing was changed."
+has "  cannot execute binary file"
+check "the new binary beside it" "$(ls "$HOME_DIR/.cordelia/bin")" "cordelia"
 
 # The node is asked as the service runs, whatever the shell carries.
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-shell-with-settings-for-another-node" CORDELIA_CONFIG=/elsewhere/config.toml \
     CORDELIA_DATA_DIR=/elsewhere CORDELIA_HTTP_PORT=9999
 expect "installed=$NEW running=$NEW restart=done" 0 1
+for setting in CORDELIA_CONFIG=/elsewhere/config.toml CORDELIA_HTTP_PORT=9999 \
+    CORDELIA_P2P_PORT=9998 CORDELIA_BIND_ADDRESS=::1; do
+    setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
+    run "a-shell-with-${setting%%=*}" "$setting"
+    expect "installed=$NEW running=$NEW restart=done" 0 1
+done
+
+# A first install sets the node up where the service will look for it.
+setup() { :; }
+run "a-first-install-in-a-shell-with-settings" CORDELIA_DATA_DIR="$WORK/elsewhere"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the key is where the service looks" \
+    "$(ls "$HOME_DIR/.cordelia/identity.key" 2>/dev/null)" "$HOME_DIR/.cordelia/identity.key"
 
 # The restart command itself fails: said as that, and at once.
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; touch "$HOME/.fake/restart_command_fails"; }
@@ -324,6 +345,10 @@ expect "installed=$NEW running=$NEW restart=not-needed" 0 0
 # A wait for an answer that is no number is the default, and the script ends.
 setup() { service; }
 run "a-wait-that-is-no-number" CORDELIA_ANSWER_WAIT_SECS=soon
+expect "installed=$NEW running=unknown restart=needed" 3 0
+
+setup() { service; }
+run "a-wait-that-is-too-long-a-number" CORDELIA_ANSWER_WAIT_SECS=99999999999999999999
 expect "installed=$NEW running=unknown restart=needed" 3 0
 
 # A unit that is starting has a node, or is about to.

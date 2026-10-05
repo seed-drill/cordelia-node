@@ -18,8 +18,9 @@
 # or is from before nodes said their version).
 # It exits 0 where the node that is running, if one is, is the version
 # installed, or was left as it is because that was asked; 3 where a node
-# is on another version, or does not answer, when it ends; 1 where the
-# install did not complete, and then an error is its last line.
+# is on another version, or does not answer, when it ends; and otherwise
+# (1, or the code of the step that failed) where the install did not
+# complete: what it printed then says why, and has no such line.
 #
 # Spec: seed-drill/specs/operations.md §1
 
@@ -32,7 +33,7 @@ VERSION="${CORDELIA_VERSION:-latest}"
 # A count of seconds from the environment, or the default where it is none.
 seconds_or() {
     case "$1" in
-        ''|*[!0-9]*) echo "$2" ;;
+        ''|*[!0-9]*|??????*) echo "$2" ;;
         *)           echo "$1" ;;
     esac
 }
@@ -93,7 +94,9 @@ download_binary() {
 
     echo "Downloading ${BINARY}..."
     TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
+    # Also the new binary where it was put beside the old one and did not
+    # take its place.
+    trap 'rm -rf "$TMPDIR"; rm -f "${INSTALL_DIR}/cordelia.new"' EXIT
 
     if ! curl -fsSL -o "${TMPDIR}/cordelia" "$BINARY_URL"; then
         echo "Error: download failed: ${BINARY_URL}"
@@ -137,10 +140,13 @@ install_binary() {
     chmod +x "${INSTALL_DIR}/cordelia.new"
 
     # It has to run here before it takes the place of one that does.
-    INSTALLED=$("${INSTALL_DIR}/cordelia.new" --version 2>/dev/null | awk '{print $2; exit}') || true
-    INSTALLED=$(printf '%s' "$INSTALLED" | tr -cd '0-9A-Za-z.+-')
+    INSTALLED=$("${INSTALL_DIR}/cordelia.new" --version 2>"${TMPDIR}/version.err" \
+        | awk '{print $2; exit}') || true
+    INSTALLED=$(printf '%s' "$INSTALLED" | tr -cd '0-9A-Za-z.+-') || true
     if [ -z "$INSTALLED" ]; then
-        rm -f "${INSTALL_DIR}/cordelia.new"
+        # What the system said of it, where it said anything. (The new
+        # binary goes as the script ends.)
+        sed 's/^/  /' "${TMPDIR}/version.err" 2>/dev/null || true
         echo "Error: the downloaded binary does not run on this machine. Nothing was changed."
         exit 1
     fi
@@ -170,16 +176,21 @@ service_running() {
     esac
 }
 
-# What the command says of the node on this machine, on one line. Asked as
-# the service runs: with its data directory, and none of the settings that
-# the shell this script runs in may carry for another node.
-node_status() {
+# The command just installed, run as the service runs it: with the
+# service's data directory, and none of the settings that the shell this
+# script runs in may carry for another node.
+as_the_service() {
     (
         unset CORDELIA_CONFIG CORDELIA_HTTP_PORT CORDELIA_P2P_PORT CORDELIA_BIND_ADDRESS
         CORDELIA_DATA_DIR="$DATA_DIR"
         export CORDELIA_DATA_DIR
-        "${INSTALL_DIR}/cordelia" status --json 2>/dev/null
-    ) | tr -d ' \n\t' || true
+        "${INSTALL_DIR}/cordelia" "$@"
+    )
+}
+
+# What the command says of the node on this machine, on one line.
+node_status() {
+    as_the_service status --json 2>/dev/null | tr -d ' \n\t' || true
 }
 
 # Whether a node answers on this machine, however it was started.
@@ -269,7 +280,10 @@ settle_running_node() {
         if ! restart_service; then
             RESTART="failed"
             RUNNING=$(running_version)
-            echo "The restart command failed. The node was not restarted:"
+            echo "The restart command failed. The node may not be running now. Look"
+            echo "before running it again:"
+            echo "  cordelia status"
+            echo "  ${LOGS_CMD}"
             echo "  ${RESTART_CMD}"
         elif wait_for_installed; then
             RESTART="done"
@@ -447,7 +461,7 @@ maybe_init() {
         echo ""
         echo "Running cordelia init..."
         export PATH="${INSTALL_DIR}:$PATH"
-        if ! cordelia init --non-interactive; then
+        if ! as_the_service init --non-interactive; then
             echo "Error: cordelia init failed. The binary is installed; the node is not set up."
             exit 1
         fi
