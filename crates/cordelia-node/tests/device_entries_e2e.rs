@@ -476,7 +476,13 @@ struct Script {
     /// Whether it answers nothing at all, to any request, and keeps each
     /// stream open.
     silent: bool,
+    /// What a pull is answered with, where a test says: a page of
+    /// nothing otherwise.
+    pulled: Option<Pulled>,
 }
+
+/// What a test has a stand-in answer a pull with.
+type Pulled = Box<dyn FnMut(&EntryPull) -> EntryPulled + Send>;
 
 impl Default for Script {
     fn default() -> Self {
@@ -486,6 +492,7 @@ impl Default for Script {
             seen: Vec::new(),
             hook: None,
             silent: false,
+            pulled: None,
         }
     }
 }
@@ -569,11 +576,17 @@ impl StandIn {
                         proved: false,
                     })))
                 }
-                WireMessage::EntryPull(pull) => Ok(Some(WireMessage::EntryPulled(EntryPulled {
-                    entries: Vec::new(),
-                    next: pull.after,
-                    mark: pull.mark,
-                }))),
+                WireMessage::EntryPull(pull) => {
+                    let page = match script.pulled.as_mut() {
+                        Some(pulled) => pulled(pull),
+                        None => EntryPulled {
+                            entries: Vec::new(),
+                            next: pull.after,
+                            mark: pull.mark,
+                        },
+                    };
+                    Ok(Some(WireMessage::EntryPulled(page)))
+                }
                 WireMessage::EntryPush(push) => Ok(Some(WireMessage::EntryPushed(EntryPushed {
                     answers: vec![PushAnswer::Stored; push.entries.len()],
                 }))),
@@ -609,6 +622,11 @@ impl StandIn {
     /// not yet been found dead.
     fn goes_silent(&self) {
         self.script.lock().unwrap().silent = true;
+    }
+
+    /// From now on a pull is answered with what `pulled` gives.
+    fn pulls(&self, pulled: impl FnMut(&EntryPull) -> EntryPulled + Send + 'static) {
+        self.script.lock().unwrap().pulled = Some(Box::new(pulled));
     }
 
     /// From now on `hook` is called as each request arrives, before it is
@@ -1283,10 +1301,13 @@ async fn a_device_asks_only_so_much_of_a_relay_in_a_minute() {
         }
     }
     // It stopped itself, at what a device asks of a relay in a minute:
-    // the relay saw that many requests, and no more.
+    // the relay saw that many requests, and no more. That is fewer than
+    // a relay lets a connection make, so the device is never the one
+    // that is refused for going over.
     assert_eq!(refused, Some(Refused::AskedEnough));
     seen_there += of_a_channel(&relay.seen());
     assert_eq!(seen_there, most);
+    assert!(most < cordelia_core::protocol::ENTRY_REQUESTS_PER_PEER_PER_MINUTE as usize);
 
     // Its passes open no stream of a channel now. They still show.
     device.writes("notes", "a.md", "waiting to be sent");
@@ -1299,6 +1320,17 @@ async fn a_device_asks_only_so_much_of_a_relay_in_a_minute() {
     let after = device.counts("relay");
     assert_eq!(after.short_shows, before.short_shows + 1);
     assert_eq!(after.pushes, before.pushes);
+    assert_eq!(device.has_leave("relay"), Ok(()));
+
+    // The count is the relay's, and not the connection's: on a new
+    // connection to it, within the minute, the device still asks nothing
+    // on a stream of a channel. (A relay counts by the device's key.)
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    device.sends().await;
+    let seen = relay.seen();
+    assert_eq!(of_a_channel(&seen), 0, "{seen:?}");
+    assert!(seen.contains(&Seen::Whole));
     assert_eq!(device.has_leave("relay"), Ok(()));
 }
 
@@ -2515,6 +2547,166 @@ async fn a_relay_that_dropped_a_channel_says_so_and_is_sent_it_again() {
     assert_ne!(new_mark, mark);
     assert_ne!(new_mark, [0; 8]);
     assert_eq!(place, 3);
+}
+
+/// A pull goes on only while it gets somewhere. A relay that answers
+/// every pull of a channel with a full page of entries that the device
+/// holds, under no mark, or under a mark with a place that does not
+/// move, is asked for that channel once in a pass, and not ten times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let held: Vec<Vec<u8>> = ["a.md", "b.md", "c.md"]
+        .iter()
+        .map(|file| device.writes("notes", file, "a text").to_wire())
+        .collect();
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    let pulls_of_notes = |relay: &StandIn| {
+        let of_notes = |one: &WireMessage| matches!(one, WireMessage::EntryPull(pull) if pull.channel == notes);
+        relay.requests().iter().filter(|one| of_notes(one)).count()
+    };
+
+    // Under no mark: the same page, of what the device holds, whatever
+    // place is asked after.
+    let page = held.clone();
+    relay.pulls(move |pull| EntryPulled {
+        entries: if pull.channel == notes {
+            page.iter().map(|entry| entry.clone().into()).collect()
+        } else {
+            Vec::new()
+        },
+        next: 0,
+        mark: [0; 8],
+    });
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 1);
+    let pulled = device.counts("relay").pulled;
+    assert_eq!(pulled, 3);
+    // And once in the next pass.
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 1);
+
+    // Under a mark, with a place that does not move on from the one
+    // asked after: once to find the holding, once more from its place,
+    // and then no more in that pass.
+    let page = held.clone();
+    relay.pulls(move |pull| EntryPulled {
+        entries: if pull.channel == notes {
+            page.iter().map(|entry| entry.clone().into()).collect()
+        } else {
+            Vec::new()
+        },
+        next: pull.after,
+        mark: [7; 8],
+    });
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 2);
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 1);
+
+    // The control: a place that moves on is followed, page after page,
+    // to the end of what the relay holds.
+    let page = held.clone();
+    relay.pulls(move |pull| {
+        let after = if pull.mark == [9; 8] {
+            pull.after as usize
+        } else {
+            0
+        };
+        let entries: Vec<_> = if pull.channel == notes {
+            page.iter()
+                .skip(after)
+                .take(1)
+                .map(|entry| entry.clone().into())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        EntryPulled {
+            next: (after + entries.len()) as u64,
+            entries,
+            mark: [9; 8],
+        }
+    });
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    // Three pages of one entry each, and the page of nothing at the end.
+    assert_eq!(pulls_of_notes(&relay), 4);
+}
+
+/// What a device takes from one relay in a minute is bounded at what a
+/// relay may hand a connection, and is counted for the relay, not for the
+/// connection: a relay that hands page after page of the largest entries
+/// is pulled from until that much was handed, and then not again in that
+/// minute, on that connection or on a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_takes_from_one_relay_only_so_much_in_a_minute() {
+    use cordelia_core::protocol::{
+        MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, PUSH_BYTES_PER_PEER_PER_MINUTE,
+    };
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let notes = device.channel("notes");
+    // Entries of the largest size, by a key that counts: each page holds
+    // new ones, and the place moves on, without end.
+    let secret = device.name_secret("notes");
+    let author = NodeIdentity::from_seed(*device.state.identity.seed()).unwrap();
+    let largest = move |n: u64| -> Vec<u8> {
+        let name = format!("{n}.md");
+        let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - name.len());
+        let entry = sealed(&author, &secret, 1, &name, Value::Text(text));
+        assert_eq!(entry.content.len(), MAX_ITEM_BYTES);
+        entry.to_wire()
+    };
+    const A_PAGE: u64 = 13;
+    relay.pulls(move |pull| {
+        if pull.channel != notes {
+            return EntryPulled {
+                entries: Vec::new(),
+                next: pull.after,
+                mark: pull.mark,
+            };
+        }
+        let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+        EntryPulled {
+            entries: (after..after + A_PAGE).map(|n| largest(n).into()).collect(),
+            next: after + A_PAGE,
+            mark: [5; 8],
+        }
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    let pulls_of_notes = |relay: &StandIn| {
+        let of_notes = |one: &WireMessage| matches!(one, WireMessage::EntryPull(pull) if pull.channel == notes);
+        relay.requests().iter().filter(|one| of_notes(one)).count() as u64
+    };
+
+    device.passes().await;
+    // It pulled until the relay had handed it what a relay may hand a
+    // connection in a minute, and one page that took it over.
+    let a_page = A_PAGE * entry_cost(MAX_ITEM_BYTES);
+    let most = PUSH_BYTES_PER_PEER_PER_MINUTE / a_page + 1;
+    let first = pulls_of_notes(&relay);
+    assert_eq!(first, most);
+    assert!(most < 10, "fewer than a pass would otherwise ask");
+    assert_eq!(device.counts("relay").pulled, most * A_PAGE);
+    // Not again in that minute: on this connection, or on a new one.
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 0);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    device.passes().await;
+    assert_eq!(pulls_of_notes(&relay), 0);
+    assert_eq!(device.has_leave("relay"), Ok(()));
 }
 
 /// An entry that is sealed by `author` in the channel whose secret is

@@ -83,17 +83,21 @@ use cordelia_api::at_relays::{
 };
 use cordelia_api::person::Shown;
 use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn, NoRoom};
+use cordelia_api::take::Taken;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
-    OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, RELAY_ENTRY_PULL_PAGES, entry_cost,
+    ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
+    OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
     ChannelProve, EntryPull, EntryPush, EntryRefused, PushAnswer, ShowAnswer, WireMessage,
 };
 use cordelia_network::rate_limit::ByteCounter;
+use cordelia_storage::entries::Outcome;
 use cordelia_storage::person::State;
+use cordelia_storage::relay::{Mark, NO_MARK};
 use rusqlite::Connection;
 
 pub use leave::{Asked, Clock, Leave, Link, LinkId, NoLeave, Refused};
@@ -202,6 +206,9 @@ struct OfRelay {
     /// What was pushed to it in the last minute: a device paces itself,
     /// so that it is never the one refused for going over.
     sent: Option<ByteCounter>,
+    /// What it handed in pages in the last minute: a device takes from
+    /// one relay no more than a relay may hand a connection.
+    taken: Option<ByteCounter>,
 }
 
 /// What became of the shows of one round at a relay.
@@ -957,10 +964,22 @@ impl DeviceEntries {
     /// device keeps there: so many pages in one pass, each through the
     /// one door, with its place (decision 2026-10-04 §2.4 item 3, §16).
     /// Says whether the channel was read to its end.
+    ///
+    /// **A pull goes on only while it gets somewhere** (§16). A page that
+    /// does not move the device's place in the relay's holding, or that
+    /// comes under no mark and holds nothing the store did not hold, ends
+    /// the channel's pull for this pass: a relay that hands the same page
+    /// again and again is asked once a pass, and not ten times. And what
+    /// a device takes from one relay in a minute is bounded at what a
+    /// relay may hand a connection, counted for the relay and not for
+    /// the connection: a new connection has no allowance of its own.
     async fn pull(&self, at: &At<'_>, channel: &Own) -> Step {
         let link = at.link;
         let relay = link.relay().0;
         for _ in 0..RELAY_ENTRY_PULL_PAGES {
+            if !self.room_to_take(link) {
+                return Step::Done(false);
+            }
             let place = at_relays::place(&lock(&self.state.db), &relay, &channel.id);
             let Ok((mark, after)) = place else {
                 return Step::Done(false);
@@ -988,6 +1007,14 @@ impl DeviceEntries {
                         if page.entries.len() > ENTRY_PAGE_MAX_ENTRIES as usize {
                             return None;
                         }
+                        // What the relay handed counts as taken from it,
+                        // whatever is then done with it.
+                        let handed: u64 = page
+                            .entries
+                            .iter()
+                            .map(|bytes| counted_as_handed(bytes.len()))
+                            .sum();
+                        self.took(link, handed);
                         let entries: Option<Vec<CheckedEntry>> = page
                             .entries
                             .iter()
@@ -996,18 +1023,25 @@ impl DeviceEntries {
                         Some((entries?, page.mark, page.next))
                     },
                     |db, page| {
-                        let (entries, mark, next) = page?;
+                        let (entries, page_mark, next) = page?;
                         let page = Page {
                             relay: &relay,
                             channel,
                             entries: &entries,
-                            mark,
+                            mark: page_mark,
                             next,
                         };
                         match at_relays::take_page(db, &self.state.identity, &page, now) {
-                            Ok(PageTaken::Taken { read_again, .. }) => {
-                                Some((entries.len(), read_again))
-                            }
+                            Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
+                                entries: entries.len(),
+                                read_again,
+                                got_somewhere: got_somewhere(
+                                    (mark, after),
+                                    (page_mark, next),
+                                    &each,
+                                    read_again,
+                                ),
+                            }),
                             Ok(PageTaken::NotThePage) => None,
                             Err(e) => {
                                 tracing::debug!(error = %e, "could not take a page");
@@ -1018,17 +1052,22 @@ impl DeviceEntries {
                 )
                 .await;
             match taken {
-                Ok(Some((0, _))) => return Step::Done(true),
-                Ok(Some((entries, read_again))) => {
+                Ok(Some(page)) if page.entries == 0 => return Step::Done(true),
+                Ok(Some(page)) => {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;
-                    of.counts.pulled += entries as u64;
-                    if read_again {
+                    of.counts.pulled += page.entries as u64;
+                    if page.read_again {
                         tracing::debug!(
                             relay = link.name(),
                             "a key came to count, or to may add: every channel is read again from the start"
                         );
+                    }
+                    // A page that got nowhere: the channel is left for
+                    // the next pass.
+                    if !page.got_somewhere {
+                        return Step::Done(false);
                     }
                 }
                 // What came back was no page of the channel: it is left
@@ -1179,6 +1218,23 @@ impl DeviceEntries {
         Ok(done)
     }
 
+    /// Whether the device takes a page more from the relay at `link`
+    /// now: what that relay handed it in the last minute leaves room for
+    /// one entry of the largest size, within what a relay may hand a
+    /// connection in a minute.
+    fn room_to_take(&self, link: &Link) -> bool {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES)
+    }
+
+    /// The relay at `link` handed a page that is counted at `bytes`.
+    fn took(&self, link: &Link, bytes: u64) {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        taken_from(of).record(bytes);
+    }
+
     /// How many bytes may go to the relay at `link` in the next push,
     /// given what went to it in the last minute. `None` where there is
     /// not room for one entry of the largest size.
@@ -1268,6 +1324,59 @@ impl DeviceEntries {
     }
 }
 
+/// What became of a page that a relay handed.
+struct PageSeen {
+    /// How many entries it held.
+    entries: usize,
+    /// Whether a key came to count by it, so that every channel is read
+    /// again from the start.
+    read_again: bool,
+    /// Whether the pull got somewhere by it ([`got_somewhere`]).
+    got_somewhere: bool,
+}
+
+/// Whether a pull got somewhere by a page: it was `asked` from a mark and
+/// a place, the page says the mark and the place to ask from next
+/// (`told`), and `each` is what became of its entries.
+///
+/// It did where the place moved on within the holding, or the holding is
+/// another than the one asked in. Under the mark of no holding there is
+/// no place to move: it did only where the store took an entry that it
+/// did not hold. A page by which every channel is read again from the
+/// start is one that got somewhere, though every place went back.
+fn got_somewhere(asked: (Mark, u64), told: (Mark, u64), each: &[Taken], read_again: bool) -> bool {
+    if read_again {
+        return true;
+    }
+    if told.0 == NO_MARK {
+        return each.iter().any(|taken| {
+            matches!(
+                taken,
+                Taken::Own {
+                    stored: Outcome::Stored,
+                    ..
+                }
+            )
+        });
+    }
+    told.0 != asked.0 || told.1 > asked.1
+}
+
+/// What the bytes of an entry that a relay handed are counted at, as the
+/// relay counts what it hands: the entry's content, and what an entry
+/// takes beyond it.
+fn counted_as_handed(wire_bytes: usize) -> u64 {
+    entry_cost(wire_bytes.saturating_sub(ENTRY_WIRE_OVERHEAD_BYTES))
+}
+
+/// What a relay has handed a device in pages in the last minute, within
+/// what a relay may hand a connection in one.
+fn taken_from(of: &mut OfRelay) -> &mut ByteCounter {
+    of.taken.get_or_insert_with(|| {
+        ByteCounter::new(Duration::from_secs(60), PUSH_BYTES_PER_PEER_PER_MINUTE)
+    })
+}
+
 /// What a device has pushed to a relay in the last minute.
 fn paced(of: &mut OfRelay) -> &mut ByteCounter {
     of.sent
@@ -1307,6 +1416,57 @@ mod tests {
         let waits: Vec<u64> = (1..=10).map(|n| refused_wait(n).as_secs()).collect();
         assert_eq!(waits, [4, 8, 16, 32, 64, 128, 256, 512, 600, 600]);
         assert_eq!(refused_wait(u32::MAX).as_secs(), 600);
+    }
+
+    /// A pull got somewhere by a page where its place moved on within the
+    /// holding, or the holding is another; under no mark, only where the
+    /// store took something new; and always where everything is read
+    /// again.
+    #[test]
+    fn a_pull_gets_somewhere_by_a_page_that_moves_its_place_or_brings_something_new() {
+        const MARK: Mark = [7; 8];
+        let own = |stored: Outcome| Taken::Own {
+            stored,
+            record: None,
+            came_to_count: 0,
+            came_to_add: 0,
+        };
+        let stored = [own(Outcome::Stored)];
+        let held = [own(Outcome::AlreadyHeld)];
+        let held_and_stored = [own(Outcome::AlreadyHeld), own(Outcome::Stored)];
+        let held_and_refused = [
+            own(Outcome::AlreadyHeld),
+            Taken::Refused(cordelia_api::take::NotTaken::SignerDoesNotCount),
+        ];
+        // Within one holding: the place moved on, or it did not.
+        assert!(got_somewhere((MARK, 4), (MARK, 5), &held, false));
+        assert!(!got_somewhere((MARK, 4), (MARK, 4), &stored, false));
+        assert!(!got_somewhere((MARK, 4), (MARK, 3), &stored, false));
+        // Another holding than the one asked in, from its start.
+        assert!(got_somewhere((MARK, 4), ([8; 8], 0), &held, false));
+        assert!(got_somewhere((NO_MARK, 0), (MARK, 1), &held, false));
+        // Under no mark: only what the store did not hold.
+        assert!(got_somewhere(
+            (NO_MARK, 0),
+            (NO_MARK, 9),
+            &held_and_stored,
+            false
+        ));
+        assert!(!got_somewhere(
+            (NO_MARK, 0),
+            (NO_MARK, 9),
+            &held_and_refused,
+            false
+        ));
+        assert!(!got_somewhere((MARK, 4), (NO_MARK, 9), &held, false));
+        // Everything is read again from the start: that is somewhere.
+        assert!(got_somewhere((MARK, 4), (MARK, 4), &held, true));
+        // What a relay handed is counted as the relay counts it.
+        assert_eq!(
+            counted_as_handed(ENTRY_WIRE_OVERHEAD_BYTES + 256),
+            256 + 1024
+        );
+        assert_eq!(counted_as_handed(3), entry_cost(0));
     }
 
     /// Each answer to a push says one of five things for sending: the

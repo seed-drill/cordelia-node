@@ -32,8 +32,10 @@
 //!   after having reached none.
 //!
 //! With leave, a device still asks only so much of a relay in a minute
-//! (OWN_ENTRY_REQUESTS_PER_MINUTE on one connection): a relay counts the
-//! requests on these streams, and one over its count is a breach.
+//! (OWN_ENTRY_REQUESTS_PER_MINUTE): a relay counts the requests on these
+//! streams, and one over its count is a breach. The relay counts them
+//! for the device's key, whatever connection they come on, so the device
+//! counts them for the relay, across a reconnect.
 //!
 //! [`Leave`] is the one thing that holds this, and the one way to the
 //! streams of a channel of the device's own. [`Leave::open`] opens a
@@ -329,18 +331,18 @@ struct Inner {
     not_applied: bool,
     /// The two clocks as they were read at the pass before.
     last: Option<(Instant, i64)>,
-    /// What was asked on each connection in the last minute, on the
-    /// streams of a channel.
-    asked: HashMap<LinkId, RateCounter>,
+    /// What was asked of each relay in the last minute, on the streams of
+    /// a channel, by the relay's name: on whatever connection.
+    asked: HashMap<String, RateCounter>,
 }
 
 impl Inner {
-    /// Whether one thing more may be asked on the connection `link` in
-    /// this minute, on a stream of a channel. Where it may, it is
+    /// Whether one thing more may be asked of the relay called `relay`
+    /// in this minute, on a stream of a channel. Where it may, it is
     /// counted.
-    fn may_ask(&mut self, link: LinkId) -> bool {
+    fn may_ask(&mut self, relay: &str) -> bool {
         self.asked
-            .entry(link)
+            .entry(relay.to_string())
             .or_insert_with(|| {
                 RateCounter::new(Duration::from_secs(60), OWN_ENTRY_REQUESTS_PER_MINUTE)
             })
@@ -400,7 +402,9 @@ impl Leave {
         inner.set_up_with = set_up_with.to_vec();
         let open: HashSet<LinkId> = reached.iter().map(|link| link.id()).collect();
         inner.given.retain(|link, _| open.contains(link));
-        inner.asked.retain(|link, _| open.contains(link));
+        // What was asked of a relay is kept across a reconnect, for as
+        // long as the device is set up with the relay.
+        inner.asked.retain(|relay, _| set_up_with.contains(relay));
         // The lid was closed, and is open: the connections still look
         // open, and a leave still looks young, by a clock that stood
         // still. Every relay is asked first, as when the node starts.
@@ -574,7 +578,7 @@ impl Leave {
         {
             let conn = lock(db);
             self.may_use(&conn, link, under)?;
-            if !lock(&self.inner).may_ask(link.id()) {
+            if !lock(&self.inner).may_ask(link.name()) {
                 return Err(Refused::AskedEnough);
             }
             opened(&conn);
@@ -737,20 +741,19 @@ mod tests {
         }
     }
 
-    /// A device asks so much on one connection in a minute, on the
-    /// streams of a channel, and no more. What it asks on another
-    /// connection is counted apart.
+    /// A device asks so much of one relay in a minute, on the streams of
+    /// a channel, and no more. What it asks of another relay is counted
+    /// apart.
     #[test]
-    fn a_device_asks_only_so_much_on_one_connection_in_a_minute() {
+    fn a_device_asks_only_so_much_of_one_relay_in_a_minute() {
         assert_eq!(OWN_ENTRY_REQUESTS_PER_MINUTE, 2_250);
         let mut inner = Inner::default();
-        let (one, other) = ([1u8; SESSION_VALUE_BYTES], [2u8; SESSION_VALUE_BYTES]);
         for n in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
-            assert!(inner.may_ask(one), "{n}");
+            assert!(inner.may_ask("one"), "{n}");
         }
-        assert!(!inner.may_ask(one));
-        assert!(!inner.may_ask(one));
-        assert!(inner.may_ask(other));
+        assert!(!inner.may_ask("one"));
+        assert!(!inner.may_ask("one"));
+        assert!(inner.may_ask("other"));
     }
 
     /// A node that reaches no relay is waking. Once it reaches one, it is
