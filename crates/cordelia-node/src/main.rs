@@ -14,6 +14,7 @@ use cordelia_crypto::identity::NodeIdentity;
 mod history_cmd;
 mod indicator;
 mod p2p;
+mod relay_entries;
 
 #[derive(Parser)]
 #[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]

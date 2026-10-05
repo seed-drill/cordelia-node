@@ -159,6 +159,23 @@ impl Rates {
         Ok(())
     }
 
+    /// Whether anything is kept for `peer`: a count of what it sent.
+    #[cfg(test)]
+    pub fn is_counting(&self, peer: &NodeId) -> bool {
+        self.by_peer.contains_key(peer)
+    }
+
+    /// How many bytes of entries `peer` at `address` may still push in this
+    /// window, for the connection and for its address.
+    #[cfg(test)]
+    pub fn push_room(&mut self, peer: &NodeId, address: std::net::IpAddr) -> u64 {
+        self.both(peer, address)
+            .iter_mut()
+            .map(|limiter| limiter.write_bytes.room())
+            .min()
+            .unwrap_or(0)
+    }
+
     /// How many bytes of entries a relay may still fetch from `peer` at
     /// `address` in this window: as many as the peer may push in one, for
     /// the connection and for its address.
@@ -183,6 +200,39 @@ impl Rates {
         let share = bytes.min(of_peer.fetch_bytes.room());
         of_peer.fetch_bytes.record(bytes);
         of_address.fetch_bytes.record(share);
+    }
+
+    /// Count `bytes` of entries that `peer` at `address` asked for and is
+    /// to be handed: a page of a channel from its secret, or the entry it
+    /// was answered with when it showed one (decision 2026-10-04 §2.4
+    /// items 3 and 5). They count against the bytes that may be fetched in
+    /// a minute, for the connection and for its address: the allowance
+    /// that what a relay fetches from the peer is counted against, so that
+    /// the two kinds of channel are bounded by it together.
+    ///
+    /// It is the peer that asked. Where either allowance has no room for
+    /// them, nothing is counted but a breach, and the caller hands
+    /// nothing. Nothing is kept of a request that hands nothing.
+    pub fn handed(
+        &mut self,
+        peer: &NodeId,
+        address: std::net::IpAddr,
+        bytes: u64,
+    ) -> Result<(), OverLimit> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut limiters = self.both(peer, address);
+        if limiters
+            .iter_mut()
+            .any(|limiter| limiter.fetch_bytes.room() < bytes)
+        {
+            return Err(Self::over(limiters));
+        }
+        for limiter in &mut limiters {
+            limiter.fetch_bytes.record(bytes);
+        }
+        Ok(())
     }
 
     /// Whether `address` may make a relay hold a channel it does not hold:
@@ -1687,6 +1737,7 @@ pub fn post_connect(
     swarm_members: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_addrs: &RelayAddrs,
+    relay_entries: &Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
 ) {
     // Step 1: Extract peer roles from handshake
     let (says_relay, is_bootnode) = conn_mgr
@@ -1812,10 +1863,11 @@ pub fn post_connect(
         let gtx = gov_tx.clone();
         let sm = swarm_members.clone();
         let st = seen_table.clone();
+        let entries = relay_entries.clone();
         tokio::spawn(async move {
             handle_peer_streams(
                 conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx, sm,
-                st,
+                st, entries,
             )
             .await;
         });
@@ -1931,6 +1983,24 @@ pub async fn p2p_loop(
     // Governor event channel (created before bootstrap so post_connect can pass it)
     let (gov_tx, mut gov_rx) = tokio::sync::mpsc::unbounded_channel::<GovEvent>();
 
+    // What a relay holds for the entries of channels from their secrets
+    // (decision 2026-10-04 §2.4, §2.5): its room for them, with a cap of
+    // the size of the older kind's, and the relays it works with. A node
+    // of any other role has none, and answers none of their streams.
+    let relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>> =
+        (node_role == "relay").then(|| {
+            std::sync::Arc::new(crate::relay_entries::RelayEntries::new(
+                max_storage_bytes,
+                relay_addrs.clone(),
+                relay_ask_again,
+            ))
+        });
+    // The cap is read here, when the node starts, and at no other time:
+    // a relay whose cap came down drops its newest channels now.
+    if let Some(entries) = &relay_entries {
+        entries.make_room(&state.db);
+    }
+
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
         post_connect(
@@ -1949,6 +2019,7 @@ pub async fn p2p_loop(
             &swarm_members,
             &seen_table,
             &relay_addrs,
+            &relay_entries,
         );
     }
     governor.tick();
@@ -2011,6 +2082,25 @@ pub async fn p2p_loop(
         cordelia_core::protocol::TOMBSTONE_GC_INTERVAL_SECS,
     ));
     gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // The channels of entries that nobody uses (decision 2026-10-04 §2.5),
+    // on a relay: when it starts, and each hour after.
+    let mut entry_sweep_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::ENTRY_CHANNEL_SWEEP_INTERVAL_SECS,
+    ));
+    entry_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Entries between relays that work together (§2.4 item 6): what a
+    // relay took is passed on, and what it lacks is pulled.
+    let mut entry_offer_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::ENTRY_OFFER_INTERVAL_SECS,
+    ));
+    entry_offer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    entry_offer_interval.tick().await;
+    let mut entry_pull_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::RELAY_ENTRY_PULL_INTERVAL_SECS,
+    ));
+    entry_pull_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    entry_pull_interval.tick().await;
 
     // P2P telemetry counters
     let mut select_iterations: u64 = 0;
@@ -2289,7 +2379,7 @@ pub async fn p2p_loop(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
                                     &peer_relays, &gov_tx, &swarm_members, &seen_table,
-                                    &relay_addrs,
+                                    &relay_addrs, &relay_entries,
                                 );
                             }
                             Err(e) => {
@@ -2501,6 +2591,34 @@ pub async fn p2p_loop(
                 if node_role == "personal" && last_outbox_flush.elapsed() >= outbox_interval_dur {
                     last_outbox_flush = std::time::Instant::now();
                     flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
+                }
+            }
+
+            // ── Entries of channels from their secrets, on a relay ────
+            // What nobody uses goes after 90 days (decision 2026-10-04
+            // §2.5). Off the select loop: it writes under the db lock.
+            _ = entry_sweep_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = relay_entries.clone() {
+                    let sweep_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.sweep(&sweep_state.db));
+                }
+            }
+
+            // What this relay took is passed on to the relays it works
+            // with that are connected (§2.4 item 6).
+            _ = entry_offer_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = &relay_entries {
+                    let relays = crate::relay_entries::listed_and_connected(entries, &conn_mgr);
+                    entries.pass_on(&state.db, relays);
+                }
+            }
+
+            // And it asks each of them what it holds, and pulls what it
+            // lacks.
+            _ = entry_pull_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = &relay_entries {
+                    let relays = crate::relay_entries::listed_and_connected(entries, &conn_mgr);
+                    crate::relay_entries::pull_from_each(entries, &state, relays);
                 }
             }
 
@@ -3408,8 +3526,13 @@ pub async fn handle_peer_streams(
     gov_tx: tokio::sync::mpsc::UnboundedSender<GovEvent>,
     swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
+    relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
 ) {
     let mut stream_count: u64 = 0;
+    // The channels of entries whose keys were proved on this connection
+    // (decision 2026-10-04 §2.4 item 3). It is this connection's, and is
+    // gone when the connection closes.
+    let mut proved = crate::relay_entries::Proved::default();
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -3441,6 +3564,11 @@ pub async fn handle_peer_streams(
             cordelia_network::messages::Protocol::ItemSync => "item_sync",
             cordelia_network::messages::Protocol::PeerSharing => "peer_share",
             cordelia_network::messages::Protocol::ChannelAnnounce => "channel_announce",
+            cordelia_network::messages::Protocol::EntryShow => "entry_show",
+            cordelia_network::messages::Protocol::ChannelProve => "channel_prove",
+            cordelia_network::messages::Protocol::EntryPull => "entry_pull",
+            cordelia_network::messages::Protocol::EntryPush => "entry_push",
+            cordelia_network::messages::Protocol::RelayEntries => "relay_entries",
             _ => "other",
         };
         tracing::debug!(peer = %peer_id, protocol = proto_name, stream = stream_count, "stream opened (inbound)");
@@ -3561,6 +3689,41 @@ pub async fn handle_peer_streams(
             }
             cordelia_network::messages::Protocol::ChannelAnnounce => {
                 handle_inbound_channel_announce(&mut recv, &peer_id, &gov_tx).await;
+            }
+            // The streams of entries of channels from their secrets
+            // (decision 2026-10-04 §2.4), which a relay serves. A node of
+            // any other role holds nothing to serve them with, and they
+            // fall through to what it does with a stream it does not
+            // serve. A relay serves them to the peers it serves the older
+            // kind to: those that are warm or hot.
+            cordelia_network::messages::Protocol::EntryShow
+            | cordelia_network::messages::Protocol::ChannelProve
+            | cordelia_network::messages::Protocol::EntryPull
+            | cordelia_network::messages::Protocol::EntryPush
+            | cordelia_network::messages::Protocol::RelayEntries
+                if relay_entries.is_some() =>
+            {
+                if !is_warm_or_hot {
+                    tracing::debug!(peer = %peer_id, protocol = ?protocol, state = peer_state, "rejected: data protocol below required state");
+                    continue;
+                }
+                let Some(entries) = &relay_entries else {
+                    continue;
+                };
+                let serving = crate::relay_entries::Serving {
+                    conn: &conn,
+                    peer: &peer_id,
+                    address,
+                    db: &state.db,
+                    rates: &peer_rates,
+                };
+                let over = entries
+                    .serve(protocol, &mut send, &mut recv, &serving, &mut proved)
+                    .await;
+                if over.is_some_and(|over| over.cut_off) && !own_relay {
+                    cut_off(&conn, &peer_id, address, &gov_tx);
+                    break;
+                }
             }
             other => {
                 tracing::debug!(peer = %peer_id, protocol = ?other, "ignoring unhandled protocol");
@@ -5271,6 +5434,70 @@ mod tests {
         }
         rates.prune(&[], &[]);
         assert_eq!(rates.fetch_room(&peer(200), fetched_from), 0);
+    }
+
+    /// What a peer is handed of channels from their secrets counts against
+    /// the bytes that may be fetched in a minute: the one allowance that
+    /// what a relay fetches from the peer counts against, for the
+    /// connection and for its address. Over either, nothing is counted
+    /// but a breach. What a peer pushes is counted apart.
+    #[test]
+    fn what_a_peer_is_handed_counts_with_what_a_relay_fetches_from_it() {
+        use cordelia_core::protocol::{
+            BAN_THRESHOLD, MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE,
+        };
+        const MINUTE: u64 = PUSH_BYTES_PER_PEER_PER_MINUTE;
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let peer = |n: u8| NodeId([n; 32]);
+        let mut rates = Rates::default();
+
+        // Handed, and fetched, and handed: one count.
+        assert_eq!(rates.handed(&peer(1), address, MINUTE / 2), Ok(()));
+        assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 2);
+        rates.fetched(&peer(1), address, MINUTE / 4);
+        assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 4);
+        // A byte more than there is room for: nothing is counted for it,
+        // and it is a breach.
+        assert_eq!(
+            rates.handed(&peer(1), address, MINUTE / 4 + 1),
+            Err(OverLimit { cut_off: false })
+        );
+        assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 4);
+        // What fits to the byte is handed.
+        assert_eq!(rates.handed(&peer(1), address, MINUTE / 4), Ok(()));
+        assert_eq!(rates.fetch_room(&peer(1), address), 0);
+        // As many breaches as cut a peer off: the last says so.
+        assert_eq!(BAN_THRESHOLD, 3);
+        assert_eq!(
+            rates.handed(&peer(1), address, 1),
+            Err(OverLimit { cut_off: false })
+        );
+        assert_eq!(
+            rates.handed(&peer(1), address, 1),
+            Err(OverLimit { cut_off: true })
+        );
+        // What it pushes is another allowance.
+        assert_eq!(rates.pushed(&peer(1), address, MINUTE), Ok(()));
+
+        // The address: its connections are handed, between them, what
+        // five may be. A sixth key at it has a connection's allowance of
+        // its own, and is handed nothing.
+        let home: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        for n in 10..10 + MAX_CONNECTIONS_PER_IP as u8 {
+            assert_eq!(rates.handed(&peer(n), home, MINUTE), Ok(()), "{n}");
+        }
+        assert!(rates.handed(&peer(20), home, 1).is_err());
+        // And a relay fetches nothing more from that address either.
+        assert_eq!(rates.fetch_room(&peer(21), home), 0);
+
+        // A request that hands nothing counts for nothing, is no breach
+        // where there is no room, and leaves nothing kept for an address.
+        assert_eq!(rates.handed(&peer(1), address, 0), Ok(()));
+        assert_eq!(rates.handed(&peer(20), home, 0), Ok(()));
+        let quiet: std::net::IpAddr = "192.0.2.9".parse().unwrap();
+        assert_eq!(rates.handed(&peer(30), quiet, 0), Ok(()));
+        assert!(!rates.by_address.contains_key(&quiet));
+        assert!(!rates.by_peer.contains_key(&peer(30)));
     }
 
     /// The older kind's room is counted by its own items, and by nothing
