@@ -22,6 +22,8 @@ pub mod entries;
 pub mod error;
 pub mod handlers;
 pub mod history;
+pub mod leaving;
+pub mod look;
 pub mod membership;
 pub mod person;
 pub mod publish;

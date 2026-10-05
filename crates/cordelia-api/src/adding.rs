@@ -77,6 +77,7 @@ use cordelia_crypto::hand_over::{HandOver, HandOverError};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::{Device, Judgement, Statement, StatementError, judge};
+use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Following, State};
@@ -190,6 +191,65 @@ pub fn add_device(
             seen: added.1,
             hand_over,
         })
+    })
+}
+
+/// What adding a key would do, asked before a person's yes (decision
+/// 2026-10-04 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WouldAdd {
+    /// The statement already lists the key, under this label: it is one
+    /// of the person's devices, and is handed the last change again, with
+    /// no record.
+    HandsAgain { label: String },
+    /// A record of the addition would be made, and the hand-over.
+    Adds {
+        /// The key counts already, by a record that the device keeps.
+        counts_already: bool,
+        /// The key was not in the last change: this device counted it
+        /// before the statement it has applied, and that statement lists
+        /// it in neither list (§8). `Some` with the label it was known by.
+        left_out_as: Option<String>,
+    },
+}
+
+/// What [`add_device`] would do with the key `new`, under `label`, with
+/// nothing written: for a command that shows what it is about to do
+/// before it asks its yes. Every refusal of [`add_device`] is a refusal
+/// here, in the same order.
+pub fn would_add(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    new: &[u8; 32],
+    label: &str,
+) -> Result<WouldAdd, PersonError> {
+    let standing = Standing::to_write(conn)?;
+    let own = identity.public_key();
+    let statement = &standing.held.statement.statement;
+    derive::pair_secret(identity, new)?;
+    if statement.removes(new) {
+        return Err(PersonError::KeyRemoved);
+    }
+    if !standing.counting.may_add(&own) {
+        return Err(PersonError::MayNotAdd);
+    }
+    if let Some(listed) = statement.devices.iter().find(|device| device.key == *new) {
+        return Ok(WouldAdd::HandsAgain {
+            label: listed.label.clone(),
+        });
+    }
+    let counts_already = standing.counting.counts(new);
+    if !counts_already && standing.counting.devices() >= MAX_COUNTED_DEVICES {
+        return Err(PersonError::NoRoom);
+    }
+    Device::new(*new, label)?;
+    let left_out_as = acts::left_out(conn)?
+        .into_iter()
+        .find(|shown| shown.key == *new)
+        .map(|shown| shown.label);
+    Ok(WouldAdd::Adds {
+        counts_already,
+        left_out_as,
     })
 }
 
@@ -548,6 +608,168 @@ pub fn accept(
     }
 }
 
+/// Whether a key that was typed at `typed_at` still opens its pair
+/// channel at `now` (decision 2026-10-04 §2.2): for an hour from when it
+/// was typed, and not before.
+pub fn within_its_hour(typed_at: i64, now: i64) -> bool {
+    now.checked_sub(typed_at)
+        .is_some_and(|ago| (0..PAIR_KEY_TYPED_SECS).contains(&ago))
+}
+
+/// The keys that a person typed at `cordelia accept` and that still read
+/// their pair channels at `now`: each was typed within the last hour, and
+/// no hand-over was taken with it since (decision 2026-10-04 §2.2, §5.1).
+pub fn keys_that_read(conn: &Connection, now: i64) -> Result<Vec<TypedKey>, PersonError> {
+    Ok(acts::typed_keys(conn)?
+        .into_iter()
+        .filter(|typed| typed.taken_at.is_none() && within_its_hour(typed.typed_at, now))
+        .collect())
+}
+
+/// Give [`accept`] an entry that came from the pair channel of the key
+/// `typed`, as the device keeps that key (decision 2026-10-04 §5.1): what
+/// the node does with what its one door for a pair channel lets through.
+/// `sync_on` is whether sync is on here.
+///
+/// One transaction: the key is read again as the device keeps it now, the
+/// hand-over is accepted or refused, and what became of it is kept with
+/// the key, for a person to read. **The typed key is spent where the
+/// hand-over was taken** ([`Accepted::Joined`], [`Accepted::Moved`],
+/// [`Accepted::Applied`]), and where it showed a fork: no later entry is
+/// given to [`accept`] with it, until a person types it again.
+///
+/// `None` where the key reads nothing now: a person typed it again since,
+/// it is spent, or its hour has gone. Nothing was given to [`accept`].
+pub fn accept_typed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    typed: &TypedKey,
+    sync_on: bool,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<Option<Accepted>, PersonError> {
+    in_one(conn, || {
+        let reads = acts::typed_key(conn, &typed.key)?.is_some_and(|kept| {
+            kept.typed_at == typed.typed_at
+                && kept.taken_at.is_none()
+                && within_its_hour(kept.typed_at, now)
+        });
+        if !reads {
+            return Ok(None);
+        }
+        let accepted = accept(
+            conn,
+            identity,
+            &typed.key,
+            typed.typed_at,
+            sync_on,
+            entry,
+            now,
+        )?;
+        let said = accepted.says();
+        match &accepted {
+            Accepted::Joined(_) | Accepted::Moved(_) | Accepted::Applied(_) | Accepted::Fork => {
+                acts::spend_typed_key(conn, &typed.key, typed.typed_at, now, &said)?;
+            }
+            Accepted::Refused(_) => {
+                acts::say_of_typed_key(conn, &typed.key, typed.typed_at, &said)?;
+            }
+        }
+        Ok(Some(accepted))
+    })
+}
+
+impl Accepted {
+    /// What became of the hand-over, in words for a person.
+    pub fn says(&self) -> String {
+        match self {
+            Self::Joined(applied) => format!(
+                "this device has joined: it follows the recovery phrase of the device whose key \
+                 was typed, and has applied change {}",
+                applied.number
+            ),
+            Self::Moved(applied) => format!(
+                "this device has left the recovery phrase it followed alone, and has joined: it \
+                 has applied change {}",
+                applied.number
+            ),
+            Self::Applied(applied) => format!(
+                "this device has applied change {}, which it was handed",
+                applied.number
+            ),
+            Self::Fork => "what was handed over is a change made apart from the one this device \
+                           had applied: two changes were made apart, and are settled with the \
+                           phrase (`cordelia settle`)"
+                .into(),
+            Self::Refused(why) => why.says(),
+        }
+    }
+}
+
+impl NotAccepted {
+    /// Why the hand-over was not accepted, in words for a person.
+    pub fn says(&self) -> String {
+        match self {
+            Self::NotTypedInTheLastHour => {
+                "the hour in which that key could hand this device what it needs has gone".into()
+            }
+            Self::NoPairChannel => "that key has no channel with this device: it is this \
+                                    device's own key, or no device's"
+                .into(),
+            Self::NotThePairChannel | Self::SignedByAnotherKey | Self::NotAHandOver => {
+                "what was found is not a hand-over from the device whose key was typed".into()
+            }
+            Self::HandOver(why) => format!("what was handed over does not hold together: {why}"),
+            Self::NotMadeWithinTheHour => "what was handed over was made more than an hour \
+                                           before or after the key was typed here: it is an \
+                                           old one, or the clocks of the two devices are more \
+                                           than an hour apart. Run `cordelia add-device` again \
+                                           on the other device"
+                .into(),
+            Self::NotForThisDevice => {
+                "what was handed over is for another device than this one".into()
+            }
+            Self::AddedByAnotherKey => "what was handed over adds this device in the name of \
+                                        another device than the one whose key was typed"
+                .into(),
+            Self::RecordDoesNotCount(why) => format!(
+                "the device whose key was typed cannot add this one now ({})",
+                match why {
+                    NotCounted::Removed => "this device's key was removed",
+                    NotCounted::CountsAlready => "this device counts already",
+                    NotCounted::MayNotAdd =>
+                        "it was itself added, since the last change, by a device added since",
+                    NotCounted::NoRoom => "64 devices count already: a change makes room",
+                }
+            ),
+            Self::SyncIsOn => "sync is on here: `cordelia sync off` first, and then `cordelia \
+                               accept` again"
+                .into(),
+            Self::AnotherPhrase => "what was handed over is under another recovery phrase than \
+                                    the one this device follows, and this device is one of \
+                                    several: nothing moved. To join other devices it leaves \
+                                    these first: it is removed from them, or `cordelia init \
+                                    --new-key` starts it afresh"
+                .into(),
+            Self::BringsNoChange => "what was handed over brings no change that this device has \
+                                     not applied: nothing was done"
+                .into(),
+            Self::Statement(why) => {
+                format!("the change that was handed over is none that this device takes: {why}")
+            }
+            Self::NotAfterTheChangeThatStoppedIt => "what was handed over is not the change \
+                                                     that stopped this device, nor one made \
+                                                     after it: add this device again from a \
+                                                     device that has that change"
+                .into(),
+            Self::Removed => "this device was removed: `cordelia init --new-key` first".into(),
+            Self::InAFork => "this device has seen two changes made apart: the fork is settled \
+                              first (`cordelia settle`)"
+                .into(),
+        }
+    }
+}
+
 /// Read the hand-over in `entry`, where it is one that this device takes
 /// (decision 2026-10-04 §2.2, §6). The error inside says why it is not.
 fn hand_over_in(
@@ -559,8 +781,7 @@ fn hand_over_in(
 ) -> Result<Result<HandOver, NotAccepted>, PersonError> {
     // A pair channel is read only with a key typed in the last hour. Two
     // times that are too far apart to subtract are not within an hour.
-    let typed_ago = now.checked_sub(typed_at);
-    if !typed_ago.is_some_and(|ago| (0..PAIR_KEY_TYPED_SECS).contains(&ago)) {
+    if !within_its_hour(typed_at, now) {
         return Ok(Err(NotAccepted::NotTypedInTheLastHour));
     }
     let pair = match derive::pair_secret(identity, typed) {
@@ -791,7 +1012,11 @@ impl<'a> Brought<'a> {
 /// 2026-10-04 §5.1): its statement lists no other device, and it has
 /// added none. A record of an addition that it keeps, counted or not, is
 /// a device added.
-fn is_alone(conn: &Connection, held: &Held, own: &[u8; 32]) -> Result<bool, PersonError> {
+pub(crate) fn is_alone(
+    conn: &Connection,
+    held: &Held,
+    own: &[u8; 32],
+) -> Result<bool, PersonError> {
     let statement = &held.statement.statement;
     let lists_no_other = statement.devices.iter().all(|device| device.key == *own);
     Ok(lists_no_other && held_rows::additions(conn)?.is_empty())
@@ -819,7 +1044,7 @@ fn is_alone(conn: &Connection, held: &Held, own: &[u8; 32]) -> Result<bool, Pers
 /// (decision 2026-10-04 §6): a device that has left keeps nothing of the
 /// keys it added under the phrase it left. What it hands one of them
 /// next is above the delete, where one was written.
-fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
+pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     // What is held holds together: the secret applied is the statement's.
     applied_secret(conn, &held.statement.statement)?;
     drop_hand_overs(conn, |_| false)?;
@@ -1284,7 +1509,308 @@ mod tests {
         );
     }
 
+    /// What adding would do is asked with nothing written, and is what
+    /// adding then does: each refusal, a key that the statement lists, a
+    /// key that counts already, and a key that was not in the last
+    /// change.
+    #[test]
+    fn test_what_adding_would_do_is_asked_with_nothing_written() {
+        let new = Machine::new(7);
+        let would = |on: &Machine, key: &[u8; 32], label: &str| {
+            let before = on.everything();
+            let would = would_add(&on.conn, &on.identity, key, label);
+            assert_eq!(on.everything(), before);
+            // It is refused as adding is refused, or adding is not.
+            let added = add_device(&on.conn, &on.identity, key, label, 5);
+            match (&would, &added) {
+                (Ok(_), Ok(_)) => {}
+                (Err(asked), Err(done)) => assert_eq!(asked.to_string(), done.to_string()),
+                other => panic!("{other:?}"),
+            }
+            would
+        };
+        let alone = Machine::new(8);
+        assert!(matches!(
+            would(&alone, &new.key(), "new"),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+
+        let mut s = Several::of_one_person(4);
+        // Statement 2 lists devices 0 and 1, removes device 2, and says
+        // nothing of device 3.
+        s.change(0, &[0, 1], &[2]);
+        let on = &s[0];
+        assert!(matches!(
+            would(on, &s.key(2), "back again"),
+            Err(PersonError::KeyRemoved)
+        ));
+        assert!(matches!(
+            would(on, &on.key(), "itself"),
+            Err(PersonError::Derive(DeriveError::OwnKey))
+        ));
+        assert!(matches!(
+            would(on, &new.key(), ""),
+            Err(PersonError::Statement(StatementError::LabelLength(0)))
+        ));
+        for state in [
+            State::Fork,
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(&on.conn, state).unwrap();
+            for key in [new.key(), s.key(1)] {
+                assert!(matches!(
+                    would(on, &key, "new"),
+                    Err(PersonError::Stopped(stopped)) if stopped == state
+                ));
+            }
+        }
+        held_rows::set_state(&on.conn, State::Applied).unwrap();
+
+        // A key that the statement lists: the statement's label stands.
+        assert_eq!(
+            would(on, &s.key(1), "another name").unwrap(),
+            WouldAdd::HandsAgain {
+                label: "device 1".into()
+            }
+        );
+        // A key that was not in the last change is said to be that,
+        // under the label it was known by.
+        assert_eq!(
+            would_add(&on.conn, &on.identity, &s.key(3), "desktop").unwrap(),
+            WouldAdd::Adds {
+                counts_already: false,
+                left_out_as: Some("device 3".into())
+            }
+        );
+        // A new key, and then the same key once it counts by a record.
+        assert_eq!(
+            would_add(&on.conn, &on.identity, &new.key(), "new").unwrap(),
+            WouldAdd::Adds {
+                counts_already: false,
+                left_out_as: None
+            }
+        );
+        add_device(&on.conn, &on.identity, &new.key(), "new", 5).unwrap();
+        assert_eq!(
+            would_add(&on.conn, &on.identity, &new.key(), "new").unwrap(),
+            WouldAdd::Adds {
+                counts_already: true,
+                left_out_as: None
+            }
+        );
+
+        // A device that may not add: one that a device added since has
+        // added.
+        let mut s = Several::of_one_person(2);
+        assert!(matches!(
+            s.add(1, 0),
+            Accepted::Refused(_) | Accepted::Applied(_)
+        ));
+        let third = Machine::new(9);
+        let by_one = add_device(&s[1].conn, &s[1].identity, &third.key(), "third", s.now).unwrap();
+        let joined = accept(
+            &third.conn,
+            &third.identity,
+            &s.key(1),
+            s.now,
+            false,
+            &by_one.hand_over,
+            s.now,
+        )
+        .unwrap();
+        assert!(matches!(joined, Accepted::Joined(_)));
+        assert!(matches!(
+            would(&third, &new.key(), "new"),
+            Err(PersonError::MayNotAdd)
+        ));
+    }
+
     // ── The device that accepts ──────────────────────────────────────
+
+    /// A key that a person typed reads its pair channel for an hour, and
+    /// until a hand-over is taken with it: then it is spent, and what is
+    /// given with it again is given to nobody.
+    #[test]
+    fn test_a_typed_key_is_spent_where_a_hand_over_is_taken_with_it() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        let now = s.tick();
+        let (on, adder) = (&s[1], s.key(0));
+        assert!(keys_that_read(&on.conn, now).unwrap().is_empty());
+        acts::type_key(&on.conn, &adder, now).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        assert_eq!(
+            keys_that_read(&on.conn, now).unwrap(),
+            std::slice::from_ref(&typed)
+        );
+        assert_eq!(keys_that_read(&on.conn, now + HOUR - 1).unwrap().len(), 1);
+        assert!(keys_that_read(&on.conn, now + HOUR).unwrap().is_empty());
+        assert!(keys_that_read(&on.conn, now - 1).unwrap().is_empty());
+
+        let accepted = accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now)
+            .unwrap()
+            .expect("the key reads");
+        assert!(matches!(accepted, Accepted::Joined(_)));
+        assert!(on.follows_a_phrase());
+        let spent = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        assert_eq!(spent.taken_at, Some(now));
+        assert_eq!(spent.said, Some(accepted.says()));
+        assert!(accepted.says().starts_with("this device has joined"));
+        assert!(keys_that_read(&on.conn, now + 1).unwrap().is_empty());
+
+        // The device then leaves, by a person's act of its own. The same
+        // hand-over, given again with the key as it was typed then, is
+        // given to nobody: the device is not moved back.
+        leave(&on.conn, &on.held()).unwrap();
+        held_rows::forget_person(&on.conn).unwrap();
+        let before = on.everything();
+        let again = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 2,
+        );
+        assert_eq!(again.unwrap(), None);
+        assert_eq!(on.everything(), before);
+        assert!(!on.follows_a_phrase());
+        // A person who means it types the key again.
+        acts::type_key(&on.conn, &adder, now + 3).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        let again = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 3,
+        )
+        .unwrap();
+        assert!(matches!(again, Some(Accepted::Joined(_))));
+    }
+
+    /// A hand-over that is refused spends no key: what became of it is
+    /// kept for a person to read, and the node goes on asking. Once the
+    /// hour has gone, or the key was typed again, what comes through
+    /// under the old typing is given to nobody.
+    #[test]
+    fn test_a_refused_hand_over_spends_no_key_and_an_old_typing_reads_nothing() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        // What device 0 hands device 2 is not for device 1.
+        let for_another = s.hand(0, 2);
+        let added = s.hand(0, 1);
+        let now = s.tick();
+        let (on, adder) = (&s[1], s.key(0));
+        acts::type_key(&on.conn, &adder, now).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        let empty = on.everything();
+
+        let refused = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &for_another.hand_over,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused, Accepted::Refused(NotAccepted::NotThePairChannel));
+        assert_eq!(on.everything(), empty);
+        let kept = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        assert_eq!(kept.taken_at, None);
+        assert_eq!(kept.said, Some(refused.says()));
+        assert_eq!(keys_that_read(&on.conn, now).unwrap().len(), 1);
+
+        // The hour has gone: nothing is given to accept.
+        let late = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + HOUR,
+        );
+        assert_eq!(late.unwrap(), None);
+        assert_eq!(on.everything(), empty);
+        // The key was typed again since: the old typing reads nothing.
+        acts::type_key(&on.conn, &adder, now + 10).unwrap();
+        let old = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 11,
+        );
+        assert_eq!(old.unwrap(), None);
+        assert_eq!(on.everything(), empty);
+        // And the new one does.
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        let taken = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 11,
+        );
+        assert!(matches!(taken.unwrap(), Some(Accepted::Joined(_))));
+    }
+
+    /// Each way a hand-over is not accepted is said in words of its own,
+    /// and so is each way it is.
+    #[test]
+    fn test_what_became_of_a_hand_over_is_said_in_words() {
+        let refusals = [
+            NotAccepted::NotTypedInTheLastHour,
+            NotAccepted::NoPairChannel,
+            NotAccepted::NotAHandOver,
+            NotAccepted::HandOver(HandOverError::Truncated),
+            NotAccepted::NotMadeWithinTheHour,
+            NotAccepted::NotForThisDevice,
+            NotAccepted::AddedByAnotherKey,
+            NotAccepted::RecordDoesNotCount(NotCounted::NoRoom),
+            NotAccepted::SyncIsOn,
+            NotAccepted::AnotherPhrase,
+            NotAccepted::BringsNoChange,
+            NotAccepted::Statement(StatementError::UndoesARemoval),
+            NotAccepted::NotAfterTheChangeThatStoppedIt,
+            NotAccepted::Removed,
+            NotAccepted::InAFork,
+        ];
+        let mut said: Vec<String> = refusals.iter().map(NotAccepted::says).collect();
+        let applied = first();
+        said.extend([
+            Accepted::Joined(applied.clone()).says(),
+            Accepted::Moved(applied.clone()).says(),
+            Accepted::Applied(applied).says(),
+            Accepted::Fork.says(),
+        ]);
+        for (n, one) in said.iter().enumerate() {
+            assert!(!one.is_empty());
+            assert!(!said[..n].contains(one), "{one}");
+        }
+        // The ways on that the table of §5.1 names.
+        assert!(NotAccepted::SyncIsOn.says().contains("`cordelia sync off`"));
+        assert!(
+            NotAccepted::Removed
+                .says()
+                .contains("`cordelia init --new-key`")
+        );
+        assert!(NotAccepted::InAFork.says().contains("`cordelia settle`"));
+        assert!(NotAccepted::AnotherPhrase.says().contains("nothing moved"));
+        assert!(Accepted::Fork.says().contains("`cordelia settle`"));
+        assert_eq!(
+            Accepted::Refused(NotAccepted::Removed).says(),
+            NotAccepted::Removed.says()
+        );
+    }
 
     /// The entry is taken only if the key that was typed signed it, in
     /// the pair channel of that key and this device, under the name

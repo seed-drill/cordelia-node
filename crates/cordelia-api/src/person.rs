@@ -73,6 +73,7 @@ use cordelia_crypto::statement::{
     self, Device, Judgement, SignedStatement, Statement, StatementError, judge,
 };
 use cordelia_crypto::version::{self, Version};
+use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
@@ -85,6 +86,9 @@ pub enum PersonError {
 
     #[error("this device already follows a recovery phrase")]
     FollowsAPhrase,
+
+    #[error("the statement is not the first of a phrase, made on this device and listing it alone")]
+    NotAFirstStatement,
 
     #[error("this device has stopped ({0:?}): the way on is a person's")]
     Stopped(State),
@@ -106,6 +110,9 @@ pub enum PersonError {
 
     #[error("the record of this device's addition does not count under the statement: {0:?}")]
     RecordNotCounted(NotCounted),
+
+    #[error("what this device holds of its person changed since the prompt: nothing was made")]
+    ChangedSincePrompt,
 
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
@@ -285,6 +292,16 @@ impl Counting {
             AdditionSeen::NotCounted(NotCounted::NoRoom)
         } else {
             AdditionSeen::Counted
+        }
+    }
+
+    /// Why a record that adds `key`, signed by `adder`, does not count
+    /// for this reader as things stand: what [`Counting::judge`] says of
+    /// it. `None` where it would count.
+    pub fn why_not(&self, key: &[u8; 32], adder: &[u8; 32]) -> Option<NotCounted> {
+        match self.judge(key, adder) {
+            AdditionSeen::NotCounted(why) => Some(why),
+            AdditionSeen::Counted | AdditionSeen::SeenBefore => None,
         }
     }
 
@@ -842,6 +859,10 @@ pub fn apply(
 /// this one device under `label`, and its change entry. The device
 /// follows the phrase from then.
 ///
+/// It is the two halves in one place, for a caller that holds the phrase
+/// and the database both: what the command makes with the phrase
+/// ([`first_entry`]), and what the node does with it ([`follow_first`]).
+///
 /// A device that already follows a phrase is refused: leaving one is
 /// another act.
 pub fn first_statement(
@@ -851,26 +872,162 @@ pub fn first_statement(
     label: &str,
     now: i64,
 ) -> Result<Applied, PersonError> {
+    if held_rows::person(conn)?.is_some() {
+        return Err(PersonError::FollowsAPhrase);
+    }
+    let made = first_entry(phrase, &identity.public_key(), label)?;
+    follow_first(conn, identity, &made.entry, &made.statement_key, now)
+}
+
+/// Apply the change that a command made on this device, with the phrase
+/// (decision 2026-10-04 §7.1, §7.2): the node's half of `cordelia
+/// remove-device`, `cordelia renew` and `cordelia settle`. `entry` is the
+/// change entry that the command signed and sealed. The node opens the
+/// secret that the entry seals to this device's key, and applies the
+/// statement in one transaction, with its carry.
+///
+/// **What the prompt showed is checked again inside that transaction.**
+/// `over` is what the change entry was named by that the device kept as
+/// the latest when the command was handed what it showed, and `apart`
+/// that of the entry kept of a statement made apart, where the change
+/// settles two. Where the device keeps another entry now, in either
+/// place, a statement arrived between the prompt and the phrase: one that
+/// the device applied, or one that makes a fork. Nothing is made, and the
+/// command asks again ([`PersonError::ChangedSincePrompt`]).
+///
+/// A record of an addition that arrived meanwhile changes neither entry,
+/// and never does that: its key is in neither of the statement's lists,
+/// and is shown as not in the last change (§6, §8).
+///
+/// Refused besides, with nothing changed: whatever [`apply`] refuses, and
+/// an entry that seals no secret to this device.
+pub fn apply_made(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    over: &[u8; 32],
+    apart: Option<&[u8; 32]>,
+    now: i64,
+) -> Result<Applied, PersonError> {
+    in_one(conn, || {
+        let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
+        let kept_apart = kept_entry(conn, Kept::Apart)?.map(|kept| kept.id());
+        let as_shown = latest_entry(conn)?.id() == *over && kept_apart.as_ref() == apart;
+        // A change that settles two is made in a fork, and no other is.
+        let stands = match apart {
+            Some(_) => State::Fork,
+            None => State::Applied,
+        };
+        if !as_shown || held.state != stands {
+            return Err(PersonError::ChangedSincePrompt);
+        }
+        let following = &held.following;
+        let opened = change_entry::open_for_device(
+            entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        )?;
+        let DeviceSecret::Opened(secret) = opened.secret else {
+            return Err(PersonError::SecretNotCommitted);
+        };
+        apply(conn, identity, &opened.statement, &secret, entry, now)
+    })
+}
+
+/// What the command that makes a phrase hands the node (decision
+/// 2026-10-04 §5, §5.2): never the words, and nothing that signs or
+/// seals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstMade {
+    /// The change entry of statement 1: the statement, the new secret
+    /// sealed to the one device it lists, and the part for the phrase.
+    pub entry: CheckedEntry,
+    /// The statement key, which every device that follows the phrase is
+    /// given, and which opens the statement in each change entry.
+    pub statement_key: [u8; 32],
+}
+
+/// Make the first statement of `phrase` for the device whose key is
+/// `device`, under `label`, and its change entry (decision 2026-10-04
+/// §5.2): the part that needs the phrase, done where the phrase is. A new
+/// secret is made here, and is in the entry only sealed: to the device,
+/// and to the phrase.
+pub fn first_entry(
+    phrase: &Phrase,
+    device: &[u8; 32],
+    label: &str,
+) -> Result<FirstMade, PersonError> {
+    let secret = statement::new_secret()?;
+    let device = Device::new(*device, label)?;
+    let statement =
+        Statement::first(device, &secret, phrase.public_key()?)?.sign(&phrase.signing_key()?)?;
+    let entry = change_entry::entry_of(phrase, &statement, &ForPhrase::first(secret))?;
+    Ok(FirstMade {
+        entry: entry.check()?,
+        statement_key: phrase.statement_key()?,
+    })
+}
+
+/// Follow the phrase whose first statement `entry` carries, on a device
+/// that follows none (decision 2026-10-04 §5.2): the node's half of
+/// `cordelia phrase`. `entry` is the change entry that the command made
+/// with the phrase, and `statement_key` the phrase's statement key. The
+/// node is handed those two, and opens the secret that the entry seals to
+/// this device's key.
+///
+/// Refused, with nothing changed: on a device that already follows a
+/// phrase; an entry that is no change entry, or that the statement key
+/// does not open; a statement that is not the first of its phrase, made
+/// on this device and listing it alone; and a secret that is not sealed
+/// to this device, or is not the one that the statement commits to.
+pub fn follow_first(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    statement_key: &[u8; 32],
+    now: i64,
+) -> Result<Applied, PersonError> {
     in_one(conn, || {
         if held_rows::person(conn)?.is_some() {
             return Err(PersonError::FollowsAPhrase);
         }
-        let secret = statement::new_secret()?;
-        let device = Device::new(identity.public_key(), label)?;
-        let statement = Statement::first(device, &secret, phrase.public_key()?)?
-            .sign(&phrase.signing_key()?)?;
-        let entry = change_entry::entry_of(phrase, &statement, &ForPhrase::first(secret))?;
-        let entry = entry.check()?;
+        // The phrase's key is the entry's author, and the phrase's channel
+        // the entry's: the entry is signed by both, and the statement in
+        // it by the first.
         let following = Following {
-            phrase_key: statement.statement.phrase_key,
-            statement_key: phrase.statement_key()?,
+            phrase_key: entry.author,
+            statement_key: *statement_key,
             phrase_channel: entry.channel,
+        };
+        let opened = change_entry::open_for_device(
+            entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        )?;
+        opened.statement.verify()?;
+        let own = identity.public_key();
+        let first = &opened.statement.statement;
+        let is_first = first.number == 1
+            && first.chain.is_empty()
+            && first.removed.is_empty()
+            && first.maker == own
+            && first.devices.len() == 1
+            && first.devices[0].key == own;
+        if !is_first {
+            return Err(PersonError::NotAFirstStatement);
+        }
+        let DeviceSecret::Opened(secret) = opened.secret else {
+            return Err(PersonError::SecretNotCommitted);
         };
         let change = Change {
             following: &following,
-            statement: &statement,
+            statement: &opened.statement,
             secret: &secret,
-            entry: &entry,
+            entry,
         };
         its_own_entry(&change)?;
         apply_judged(conn, identity, None, &change, now)
@@ -987,6 +1144,7 @@ fn come_to(
     };
     if let Some(before) = before {
         let leaving = &before.statement.statement;
+        note_left_out(conn, identity, leaving, statement, now)?;
         let from = Generation {
             number: leaving.number,
             secret: applied_secret(conn, leaving)?,
@@ -1051,6 +1209,16 @@ fn come_to(
     held_rows::drop_change_entry(conn, Kept::Apart)?;
     // Records are not carried: the statement's own list is what stands.
     held_rows::clear_additions(conn)?;
+    // A key that was shown as left out is shown no more once a statement
+    // lists it, in either list. And the notices that a person cleared
+    // were of the statement that is left: its records, and the words in
+    // its personal channel.
+    for shown in acts::left_out(conn)? {
+        if statement.lists(&shown.key) || statement.removes(&shown.key) {
+            acts::clear_left_out(conn, &shown.key)?;
+        }
+    }
+    acts::forget_cleared(conn)?;
     for name in &names {
         let channel = derive::channel_id(&derive::own_secret(&to.secret, &name.name)?)?;
         held_rows::move_name(conn, &name.name, &channel)?;
@@ -1061,6 +1229,47 @@ fn come_to(
 
     write_applied(conn, identity, statement, &to.secret, now)?;
     Ok(applied)
+}
+
+/// Note each key that this device counted under the statement `leaving`
+/// and that `statement`, which it now applies, has in neither of its
+/// lists (decision 2026-10-04 §8). Such a device holds the secret before,
+/// and may not know: it is shown as "not in the last change", by the
+/// label it was known by, until a person clears it or a later statement
+/// lists it.
+///
+/// The keys are those that counted when the statement is applied: the
+/// devices of the statement that is left, and those added since by a
+/// record that counted. This device's own key is none of them: a device
+/// that is in neither list does not apply the statement at all.
+fn note_left_out(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    leaving: &Statement,
+    statement: &Statement,
+    now: i64,
+) -> Result<(), PersonError> {
+    let own = identity.public_key();
+    let kept = held_rows::additions(conn)?;
+    let mut counted: Vec<([u8; 32], String)> = leaving
+        .devices
+        .iter()
+        .map(|device| (device.key, device.label.clone()))
+        .collect();
+    for record in kept.iter().filter(|record| record.counted) {
+        let label = SignedAddition::from_bytes(&record.record)?
+            .addition
+            .device
+            .label;
+        counted.push((record.key, label));
+    }
+    for (key, label) in counted {
+        if key == own || statement.lists(&key) || statement.removes(&key) {
+            continue;
+        }
+        acts::note_left_out(conn, &key, &label, statement.number, now)?;
+    }
+    Ok(())
 }
 
 /// Drop from the store the hand-overs that this device made (decision
@@ -5056,6 +5265,107 @@ mod tests {
             format!("added/{}", encode_public_key(&key(7)).unwrap())
         );
         assert!(name.starts_with("added/cordelia_pk1"));
+    }
+
+    /// The two halves of `cordelia phrase`: the command makes the first
+    /// statement's change entry with the phrase, and the node is handed
+    /// that entry and the statement key, never the words. It opens the
+    /// secret that the entry seals to its own key.
+    #[test]
+    fn test_the_node_follows_a_first_statement_that_a_command_made() {
+        let conn = db::open_in_memory().unwrap();
+        let phrase = phrase();
+        let made = first_entry(&phrase, &key(0), "laptop").unwrap();
+        assert_eq!(made.statement_key, phrase.statement_key().unwrap());
+        assert_eq!(made.entry.author, phrase.public_key().unwrap());
+        assert_eq!(made.entry.rev, 1);
+        // Made again, it is another secret, and another entry.
+        let again = first_entry(&phrase, &key(0), "laptop").unwrap();
+        assert_ne!(again.entry.id(), made.entry.id());
+
+        let applied = follow_first(&conn, &device(0), &made.entry, &made.statement_key, NOW);
+        assert_eq!((applied.unwrap().number, 1), (1, 1));
+        let now = held(&conn).unwrap().unwrap();
+        assert_eq!(now.state, State::Applied);
+        assert_eq!(now.following, following(&phrase));
+        assert_eq!(
+            now.statement.statement.devices,
+            [Device::new(key(0), "laptop").unwrap()]
+        );
+        assert_eq!(
+            kept_entry(&conn, Kept::Latest).unwrap().unwrap(),
+            made.entry
+        );
+        let (_, secret, _) = secrets(&conn)[0];
+        assert!(now.statement.statement.commits_to(&secret));
+
+        // A device that follows a phrase is refused: leaving one is
+        // another act.
+        let before = everything(&conn);
+        assert!(matches!(
+            follow_first(&conn, &device(0), &again.entry, &again.statement_key, NOW),
+            Err(PersonError::FollowsAPhrase)
+        ));
+        assert_eq!(everything(&conn), before);
+    }
+
+    /// A first statement is followed only where it is one: number 1,
+    /// with no chain, made on this device and listing it alone, in an
+    /// entry that the statement key opens.
+    #[test]
+    fn test_a_first_statement_is_followed_only_where_it_is_one_made_on_this_device() {
+        let phrase = phrase();
+        let refused = |entry: &CheckedEntry, statement_key: &[u8; 32]| {
+            let conn = db::open_in_memory().unwrap();
+            let before = everything(&conn);
+            let outcome = follow_first(&conn, &device(0), entry, statement_key, NOW);
+            assert_eq!(everything(&conn), before);
+            outcome.unwrap_err()
+        };
+        let statement_key = phrase.statement_key().unwrap();
+
+        // Made for another device.
+        let for_another = first_entry(&phrase, &key(1), "laptop").unwrap();
+        assert!(matches!(
+            refused(&for_another.entry, &statement_key),
+            PersonError::NotAFirstStatement
+        ));
+        // Another statement key than the phrase's: the entry does not
+        // open.
+        let made = first_entry(&phrase, &key(0), "laptop").unwrap();
+        assert!(matches!(
+            refused(&made.entry, &[7; 32]),
+            PersonError::ChangeEntry(ChangeEntryError::DidNotOpen)
+        ));
+        // A statement that lists another device beside this one, though
+        // it is numbered 1 and has no chain.
+        let secret = secret(3);
+        let two = Statement {
+            number: 1,
+            maker: key(0),
+            chain: Vec::new(),
+            commitment: statement::commitment(&secret),
+            devices: listed(&[0, 1]),
+            removed: Vec::new(),
+            phrase_key: phrase.public_key().unwrap(),
+        };
+        let two = change(&phrase, &two, secret);
+        assert!(matches!(
+            refused(&two, &statement_key),
+            PersonError::NotAFirstStatement
+        ));
+        // A later statement of the phrase that lists this device alone.
+        let all = statements(&phrase);
+        let later = all[0].next(key(0), &secret, listed(&[0]), &[]).unwrap();
+        assert_eq!((later.number, later.devices.len()), (2, 1));
+        let later = change(&phrase, &later, secret);
+        assert!(matches!(
+            refused(&later, &statement_key),
+            PersonError::NotAFirstStatement
+        ));
+        // The control.
+        let conn = db::open_in_memory().unwrap();
+        follow_first(&conn, &device(0), &made.entry, &statement_key, NOW).unwrap();
     }
 
     /// The first statement of a phrase is made on a device that follows

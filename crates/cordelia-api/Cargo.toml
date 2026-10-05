@@ -19,6 +19,9 @@ chrono = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# Overwrites a secret when its value is dropped. The crypto crate already
+# brings it: this adds no crate to the build.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

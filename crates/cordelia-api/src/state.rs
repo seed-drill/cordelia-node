@@ -86,10 +86,21 @@ pub struct AppState {
 /// It also carries the word that something was written in a channel of
 /// the device's own ([`OwnChannels::written`]), for which the node sends
 /// what waits without waiting for its timer.
+///
+/// And it carries a command's asking for a whole pass
+/// ([`OwnChannels::ask_whole`]): a command that prepares a change has the
+/// device show its change entry to each relay and fetch its channels
+/// first (decision 2026-10-04 §7.1, step 1), and waits for a pass that
+/// began after it asked ([`OwnChannels::whole_passes`]).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
     written: tokio::sync::Notify,
+    asked: tokio::sync::Notify,
+    /// How many whole passes the node has begun, and the number of the
+    /// last that it ended.
+    begun: AtomicU64,
+    ended: AtomicU64,
 }
 
 impl OwnChannels {
@@ -113,6 +124,42 @@ impl OwnChannels {
     /// Wait for the word that something was written.
     pub async fn wait_written(&self) {
         self.written.notified().await;
+    }
+
+    /// A command asks for a whole pass now: the show on every connection,
+    /// and then the proving, pulling and pushing that its answers give
+    /// leave for. One asking is kept where the node is not waiting for
+    /// one, and no more than one. A pass that finds another running does
+    /// nothing, so whoever asks goes on asking until a pass that began
+    /// after it asked has ended.
+    pub fn ask_whole(&self) {
+        self.asked.notify_one();
+    }
+
+    /// Wait for a command to ask for a whole pass.
+    pub async fn wait_asked(&self) {
+        self.asked.notified().await;
+    }
+
+    /// The node begins a whole pass. Returns the pass's number, which it
+    /// gives back when the pass ends.
+    pub fn whole_pass_begins(&self) -> u64 {
+        self.begun.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The node has ended the whole pass numbered `pass`.
+    pub fn whole_pass_ended(&self, pass: u64) {
+        self.ended.fetch_max(pass, Ordering::SeqCst);
+    }
+
+    /// How many whole passes the node has begun, and the number of the
+    /// last that it ended. A pass that began after a moment has a number
+    /// above the count at that moment.
+    pub fn whole_passes(&self) -> (u64, u64) {
+        (
+            self.begun.load(Ordering::SeqCst),
+            self.ended.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -635,6 +682,49 @@ impl AppState {
 mod tests {
     use super::*;
     use cordelia_crypto::identity::{is_usable_public_key, key_checks};
+
+    /// A whole pass has a number, which is above the count of passes
+    /// begun at any moment before it began: whoever asked at that moment
+    /// knows a pass that began after by its number, once it has ended.
+    #[test]
+    fn test_a_pass_that_began_after_a_moment_is_known_by_its_number() {
+        let own = OwnChannels::default();
+        assert_eq!(own.whole_passes(), (0, 0));
+        let first = own.whole_pass_begins();
+        assert_eq!((first, own.whole_passes()), (1, (1, 0)));
+        // A command asks while the first pass runs: that pass does not
+        // count for it, and the next does.
+        let (begun, _) = own.whole_passes();
+        own.whole_pass_ended(first);
+        assert!(own.whole_passes().1 <= begun);
+        let second = own.whole_pass_begins();
+        own.whole_pass_ended(second);
+        assert!(own.whole_passes().1 > begun);
+        assert_eq!(own.whole_passes(), (2, 2));
+        // The number of the last pass ended never goes back.
+        own.whole_pass_ended(first);
+        assert_eq!(own.whole_passes(), (2, 2));
+    }
+
+    /// One asking for a whole pass is kept where nobody is waiting for
+    /// one, as one word that something was written is.
+    #[test]
+    fn test_one_asking_for_a_whole_pass_is_kept_until_it_is_waited_for() {
+        let own = OwnChannels::default();
+        own.ask_whole();
+        own.ask_whole();
+        let waited = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let wait = std::time::Duration::from_millis(50);
+                let first = tokio::time::timeout(wait, own.wait_asked()).await.is_ok();
+                let second = tokio::time::timeout(wait, own.wait_asked()).await.is_ok();
+                (first, second)
+            });
+        assert_eq!(waited, (true, false));
+    }
 
     /// `n` keys that are usable and `n` that are not, each different.
     fn keys(n: usize) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
