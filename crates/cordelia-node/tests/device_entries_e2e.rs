@@ -2047,6 +2047,72 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
     assert_eq!(held_at(&relay, &notes).len(), 1);
 }
 
+/// A relay that holds another entry from a device in a slot, at the
+/// revision of the one it is pushed, says so, and does not say "held":
+/// the device signed two at one revision, as one that was put back from
+/// a copy does. The device sends that entry there no more, and what a
+/// status reads says that an entry of its own is at that relay in
+/// another form. Its next edit goes above both, and is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_holds_another_entry_at_that_revision_says_so_and_is_sent_it_no_more() {
+    let relay = relay_started("relay", None);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects("relay", &relay).await;
+    device.passes().await;
+    assert_eq!(device.at("relay").another_form, 0);
+
+    // The device writes a file. Before it is sent, the relay comes to
+    // hold another entry that the device's key signed in that slot at
+    // that revision, with another text.
+    let own = device.writes("notes", "a.md", "what the device holds");
+    let other = sealed(
+        &device.state.identity,
+        &device.name_secret("notes"),
+        own.rev,
+        "a.md",
+        Value::Text("what an earlier copy of it held".into()),
+    );
+    assert_eq!((other.slot, other.author), (own.slot, own.author));
+    assert_ne!(other.id(), own.id());
+    assert_eq!(
+        pushed_by_hand(&device, "relay", &[&other]).await,
+        [PushAnswer::Stored]
+    );
+    // Pushed by hand, the device's own is answered as that: another is
+    // held there. And the very entry that is held is answered "held".
+    let notes = device.channel("notes");
+    let own_entry = own.clone().into_entry();
+    assert_eq!(
+        pushed_by_hand(&device, "relay", &[&own_entry, &other]).await,
+        [PushAnswer::Another, PushAnswer::Held]
+    );
+
+    // The device's pass sends its own, is told the same, and says so
+    // where a status reads it. The relay holds the other, and not this
+    // one.
+    let before = device.counts("relay");
+    device.passes().await;
+    let after = device.counts("relay");
+    assert_eq!(after.pushed, before.pushed + 1);
+    assert_eq!(device.at("relay").another_form, 1);
+    assert!(holds_at(&relay, &notes, &other.id()));
+    assert!(!holds_at(&relay, &notes, &own.id()));
+    // It is sent no more, by either pass.
+    device.passes().await;
+    device.sends().await;
+    assert_eq!(device.counts("relay").pushed, after.pushed);
+    assert_eq!(device.at("relay").another_form, 1);
+
+    // The next edit goes above both, and is stored.
+    let next = device.writes("notes", "a.md", "the next edit");
+    assert!(next.rev > own.rev);
+    device.sends().await;
+    assert!(holds_at(&relay, &notes, &next.id()));
+    assert!(!holds_at(&relay, &notes, &other.id()));
+}
+
 /// A device proves the key of each channel of its own once on a
 /// connection, and that of each name that its personal channel lists and
 /// that it does not hold. Again on a new connection, and again after a

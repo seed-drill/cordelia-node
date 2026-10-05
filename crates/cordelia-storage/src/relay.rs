@@ -334,9 +334,12 @@ pub enum Taken {
     /// It was stored: the relay held none from its author in its slot, or
     /// a lower revision, which it replaces.
     Stored,
-    /// The relay holds one at that revision from that author in that
-    /// slot. It was not stored.
+    /// The relay holds that very entry. It was not stored again.
     AlreadyHeld,
+    /// The relay holds another entry from that author in that slot at
+    /// that revision: one that the author signed apart from this one.
+    /// This one was not stored, and the relay does not hold it.
+    HeldAnother,
     /// The relay holds one at a higher revision from that author in that
     /// slot. It was not stored.
     OlderThanHeld,
@@ -536,7 +539,17 @@ fn taken(
     let replaced = match entries::author_cost(conn, &entry.channel, &entry.slot, &entry.author)? {
         Some((rev, _)) if rev >= entry.rev => {
             return match entries::store(conn, entry, now)? {
-                Outcome::AlreadyHeld => Ok(Taken::AlreadyHeld),
+                // Held at that revision: that very entry, or another
+                // that its author signed at it. The two are told apart
+                // by what an entry is named by.
+                Outcome::AlreadyHeld => {
+                    let held =
+                        entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)?;
+                    match held.is_some_and(|held| held.entry.id() == entry.id()) {
+                        true => Ok(Taken::AlreadyHeld),
+                        false => Ok(Taken::HeldAnother),
+                    }
+                }
                 Outcome::OlderThanHeld => Ok(Taken::OlderThanHeld),
                 Outcome::Stored => Err(CordeliaError::Storage(
                     "an entry no newer than the one held was stored".into(),
@@ -970,9 +983,9 @@ fn shown(
                 Ok(Shown::Taken)
             }
             Taken::Refused(why) => Ok(Shown::Refused(why)),
-            Taken::AlreadyHeld | Taken::OlderThanHeld => Err(CordeliaError::Storage(
-                "an entry newer than the one held was not stored".into(),
-            )),
+            Taken::AlreadyHeld | Taken::HeldAnother | Taken::OlderThanHeld => Err(
+                CordeliaError::Storage("an entry newer than the one held was not stored".into()),
+            ),
         },
     }
 }
@@ -1654,7 +1667,9 @@ mod tests {
 
     /// An entry at the revision of one held from its author in its slot,
     /// and a lower one, are not stored, and are answered by the store's
-    /// rule whatever room there is.
+    /// rule whatever room there is. "Held" is said only of the very entry
+    /// that is held: another that its author signed at that revision is
+    /// said to be that.
     #[test]
     fn test_an_entry_at_the_revision_of_one_held_or_below_it_is_not_stored() {
         let (conn, mut room) = relay();
@@ -1667,10 +1682,14 @@ mod tests {
         let another = made(1, 1, 5, "notes.md", "another text");
         let larger = made(1, 1, 5, "notes.md", &"x".repeat(3000));
         assert_ne!(another.id(), first.id());
-        for entry in [&first, &another, &larger] {
+        assert_eq!(
+            take(&conn, &mut room, &first, &from(1), NOW + 60).unwrap(),
+            Taken::AlreadyHeld
+        );
+        for entry in [&another, &larger] {
             assert_eq!(
                 take(&conn, &mut room, entry, &from(1), NOW + 60).unwrap(),
-                Taken::AlreadyHeld
+                Taken::HeldAnother
             );
         }
         // A lower one, by one revision and by many.
@@ -1689,6 +1708,10 @@ mod tests {
         room.max_channel_bytes = 0;
         assert_eq!(
             take(&conn, &mut room, &another, &from(1), NOW + 60).unwrap(),
+            Taken::HeldAnother
+        );
+        assert_eq!(
+            take(&conn, &mut room, &first, &from(1), NOW + 60).unwrap(),
             Taken::AlreadyHeld
         );
         assert_eq!(
@@ -2778,14 +2801,15 @@ mod tests {
         // A listed relay says an earlier time, with an entry that is
         // stored: the earlier is kept.
         let said = listed_since(NOW - 100);
-        take(&conn, &mut room, &small(1, 4, 5), &said, NOW + 700).unwrap();
+        let passed_on = small(1, 4, 5);
+        take(&conn, &mut room, &passed_on, &said, NOW + 700).unwrap();
         assert_eq!(since(&conn, 1), Some(NOW - 100));
         // With an entry that is already held, and with one shown.
         assert_eq!(
             take(
                 &conn,
                 &mut room,
-                &small(1, 4, 5),
+                &passed_on,
                 &listed_since(NOW - 200),
                 NOW + 700
             )
@@ -3129,10 +3153,11 @@ mod tests {
         // With an entry that it passes on: one that is stored, one that
         // is already held, and one shown.
         let clock = NOW + 50 * HOUR;
+        let passed_on = small(1, 2, 5);
         take(
             &conn,
             &mut room,
-            &small(1, 2, 5),
+            &passed_on,
             &listed(NOW, NOW + 9 * HOUR),
             clock,
         )
@@ -3142,7 +3167,7 @@ mod tests {
             take(
                 &conn,
                 &mut room,
-                &small(1, 2, 5),
+                &passed_on,
                 &listed(NOW, NOW + 11 * HOUR),
                 clock
             )

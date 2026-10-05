@@ -165,6 +165,9 @@ struct OfRelay {
     holds: Option<([u8; 32], bool)>,
     /// Its last refusal for room.
     no_room: Option<NoRoom>,
+    /// How many entries of the device's own it said it holds in another
+    /// form.
+    another_form: usize,
     counts: Counts,
     /// What was pushed to it in the last minute: a device paces itself,
     /// so that it is never the one refused for going over.
@@ -867,6 +870,16 @@ impl DeviceEntries {
                     "a relay refused entries as not signed as they must be; they are not sent there again"
                 );
             }
+            if done.another > 0 {
+                tracing::warn!(
+                    relay = link.name(),
+                    entries = done.another,
+                    "a relay holds entries of this device's own in another form, at their revisions; they are not sent there again, and the next edit goes above both"
+                );
+                let mut kept = lock(&self.kept);
+                let of = kept.relays.entry(link.name().to_string()).or_default();
+                of.another_form += done.another;
+            }
             match done.refused {
                 Some(refused) => {
                     self.no_room(link, refused == Pushed::OverAllowance, false);
@@ -1000,6 +1013,7 @@ impl DeviceEntries {
                         .map(|(_, holds)| holds),
                     heard_since_woke: self.leave.has_heard(&relay.name),
                     no_room: of.and_then(|of| of.no_room),
+                    another_form: of.map_or(0, |of| of.another_form),
                 }
             })
             .collect();
@@ -1031,6 +1045,7 @@ fn paced(of: &mut OfRelay) -> &mut ByteCounter {
 fn pushed_as(answer: &PushAnswer) -> Pushed {
     match answer {
         PushAnswer::Stored | PushAnswer::Held | PushAnswer::Older => Pushed::Holds,
+        PushAnswer::Another => Pushed::HoldsAnother,
         PushAnswer::Refused(EntryRefused::NotSigned) => Pushed::DoesNotCheck,
         PushAnswer::Refused(EntryRefused::NoRoom) => Pushed::NoRoom,
         PushAnswer::Refused(EntryRefused::OverLimit) => Pushed::OverAllowance,
@@ -1060,14 +1075,16 @@ mod tests {
         assert_eq!(refused_wait(u32::MAX).as_secs(), 600);
     }
 
-    /// Each answer to a push says one of four things for sending: the
-    /// relay holds the entry, whichever way; it does not check; there is
-    /// no room; or the address is over its allowance.
+    /// Each answer to a push says one of five things for sending: the
+    /// relay holds the entry, whichever way; it holds another at that
+    /// revision; it does not check; there is no room; or the address is
+    /// over its allowance.
     #[test]
     fn each_answer_to_a_push_is_read_as_what_it_means_for_sending() {
         for holds in [PushAnswer::Stored, PushAnswer::Held, PushAnswer::Older] {
             assert_eq!(pushed_as(&holds), Pushed::Holds);
         }
+        assert_eq!(pushed_as(&PushAnswer::Another), Pushed::HoldsAnother);
         assert_eq!(
             pushed_as(&PushAnswer::Refused(EntryRefused::NotSigned)),
             Pushed::DoesNotCheck

@@ -189,6 +189,11 @@ pub struct AtRelay {
     pub heard_since_woke: bool,
     /// The last time it refused something for room, where it has.
     pub no_room: Option<NoRoom>,
+    /// How many entries of this device's own it holds in another form,
+    /// as it answered since the node started: another entry from this
+    /// device in that slot at that revision. The device sends such an
+    /// entry there no more, and the next edit goes above both.
+    pub another_form: usize,
 }
 
 /// A relay's refusal of something that it would have taken.

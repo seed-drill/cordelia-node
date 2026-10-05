@@ -613,14 +613,19 @@ pub struct EntryPushed {
 pub enum PushAnswer {
     /// It was stored.
     Stored,
-    /// The receiver holds an entry at that revision from that author in
-    /// that slot. It was not stored.
+    /// The receiver holds that very entry. It was not stored again.
     Held,
     /// The receiver holds a later one from that author in that slot. It
     /// was not stored.
     Older,
     /// It was refused.
     Refused(EntryRefused),
+    /// The receiver holds another entry from that author in that slot at
+    /// that revision, and not this one: the author signed two at one
+    /// revision. This one was not stored, and is not sent again: no
+    /// receiver takes it over the other. The author's next entry in the
+    /// slot goes above both.
+    Another,
 }
 
 // ── Between relays that work together (0x14) ────────────────────────
@@ -818,6 +823,7 @@ impl From<&relay::Taken> for PushAnswer {
         match taken {
             relay::Taken::Stored => Self::Stored,
             relay::Taken::AlreadyHeld => Self::Held,
+            relay::Taken::HeldAnother => Self::Another,
             relay::Taken::OlderThanHeld => Self::Older,
             relay::Taken::Refused(why) => Self::Refused(why.into()),
         }
@@ -2407,6 +2413,7 @@ mod tests {
         }
         assert_eq!(PushAnswer::from(&Taken::Stored), PushAnswer::Stored);
         assert_eq!(PushAnswer::from(&Taken::AlreadyHeld), PushAnswer::Held);
+        assert_eq!(PushAnswer::from(&Taken::HeldAnother), PushAnswer::Another);
         assert_eq!(PushAnswer::from(&Taken::OlderThanHeld), PushAnswer::Older);
 
         assert_eq!(ShowAnswer::from(&Shown::Held), ShowAnswer::Held);

@@ -184,6 +184,9 @@ pub struct AtRelayLook {
     pub heard_since_woke: bool,
     /// The relay's last refusal for room, in words.
     pub no_room: Option<String>,
+    /// How many entries of this device's own the relay holds in another
+    /// form.
+    pub another_form: usize,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -762,6 +765,7 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                     }
                 )
             }),
+            another_form: relay.another_form,
         })
         .collect()
 }
@@ -784,6 +788,19 @@ impl AtRelayLook {
             ));
         }
         says.extend(self.no_room.clone());
+        match self.another_form {
+            0 => {}
+            1 => says.push(format!(
+                "an entry of this device's own is at {} in another form: the file's next edit \
+                 goes above both",
+                self.relay
+            )),
+            several => says.push(format!(
+                "{several} entries of this device's own are at {} in another form: each \
+                 file's next edit goes above both",
+                self.relay
+            )),
+        }
         says
     }
 }
@@ -1275,6 +1292,7 @@ mod tests {
             holds_latest: holds,
             heard_since_woke: heard,
             no_room,
+            another_form: 0,
         };
         let full = NoRoom {
             at: 1_800_000_000,
@@ -1310,6 +1328,29 @@ mod tests {
         assert_eq!(look.cannot_go_on, None);
         assert_eq!(look.relays[0].holds_latest, Some(true));
         assert!(!look.relays[1].heard_since_woke);
+
+        // An entry of the device's own that a relay holds in another
+        // form is said in a line, for that relay.
+        at.relays[0].another_form = 1;
+        at.relays[1].another_form = 3;
+        let look = seen_at(&s, &at);
+        assert!(
+            look.says.contains(
+                &"an entry of this device's own is at one.example:1 in another form: the file's \
+              next edit goes above both"
+                    .to_string()
+            )
+        );
+        assert!(
+            look.says.contains(
+                &"3 entries of this device's own are at two.example:1 in another form: each \
+              file's next edit goes above both"
+                    .to_string()
+            )
+        );
+        assert_eq!(look.relays[1].another_form, 3);
+        at.relays[0].another_form = 0;
+        at.relays[1].another_form = 0;
 
         at.cannot_go_on = Some(CannotGoOn::NotApplied {
             relay: "one.example:1".into(),

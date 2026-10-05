@@ -534,6 +534,11 @@ pub enum Pushed {
     /// It stored the entry, or holds it, or holds a later one from that
     /// author in that slot: it is not sent again.
     Holds,
+    /// It holds another entry from that author in that slot at that
+    /// revision, and not this one: the author signed two at one
+    /// revision. This one is not sent again: no relay takes it over the
+    /// other. The author's next entry in the slot goes above both.
+    HoldsAnother,
     /// It refused the entry as not signed as it must be: it is not sent
     /// again.
     DoesNotCheck,
@@ -549,6 +554,9 @@ pub enum Pushed {
 pub struct Sent {
     /// How many entries the relay holds now, or held.
     pub held: usize,
+    /// How many it holds in another form: another entry from that author
+    /// in that slot at that revision. They are sent no more.
+    pub another: usize,
     /// How many it refused as not signed as they must be.
     pub do_not_check: usize,
     /// The refusal that stopped the batch, where one did: for room, or
@@ -728,6 +736,10 @@ pub fn sent(
             Item::Sent(seq) => match answers.next() {
                 Some(Pushed::Holds) => {
                     done.held += 1;
+                    up_to = Some(*seq);
+                }
+                Some(Pushed::HoldsAnother) => {
+                    done.another += 1;
                     up_to = Some(*seq);
                 }
                 Some(Pushed::DoesNotCheck) => {
@@ -1728,6 +1740,7 @@ mod tests {
             done,
             Sent {
                 held: 1,
+                another: 0,
                 do_not_check: 1,
                 refused: Some(Pushed::NoRoom),
             }
@@ -1746,6 +1759,7 @@ mod tests {
             done,
             Sent {
                 held: 0,
+                another: 0,
                 do_not_check: 0,
                 refused: Some(Pushed::OverAllowance),
             }
@@ -1760,13 +1774,39 @@ mod tests {
         assert!(send(&RELAY, MOST).is_empty());
 
         // What one relay was sent is not what another was: the other is
-        // sent all of it.
-        assert_eq!(ids(&send(&OTHER_RELAY, MOST).entries), ids_of(&written));
+        // sent all of it. It says of the last that it holds another
+        // entry from this device at that revision, and not this one: that
+        // one is counted as that, and is sent there no more.
+        let all = send(&OTHER_RELAY, MOST);
+        assert_eq!(ids(&all.entries), ids_of(&written));
+        let done = answered(
+            &OTHER_RELAY,
+            &all,
+            &[
+                Pushed::Holds,
+                Pushed::Holds,
+                Pushed::Holds,
+                Pushed::HoldsAnother,
+            ],
+        );
+        assert_eq!(
+            done,
+            Sent {
+                held: 3,
+                another: 1,
+                do_not_check: 0,
+                refused: None,
+            }
+        );
+        assert!(send(&OTHER_RELAY, MOST).is_empty());
         // And what is written next is sent to both.
         let next = s.write(0, "notes", "e.md", "a text");
         let on = &s[0];
         assert_eq!(sends_all(on, &RELAY, &notes, Which::Since), [next.id()]);
-        assert_eq!(sends_all(on, &OTHER_RELAY, &notes, Which::Since).len(), 5);
+        assert_eq!(
+            sends_all(on, &OTHER_RELAY, &notes, Which::Since),
+            [next.id()]
+        );
     }
 
     /// What a relay handed a device is sent to another relay, which is
