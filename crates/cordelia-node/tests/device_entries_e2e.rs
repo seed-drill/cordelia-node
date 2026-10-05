@@ -26,8 +26,8 @@ use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn};
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
-    CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS, SHOW_LEAVE_SECS,
-    WAKE_WAIT_SECS, entry_cost,
+    CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -1034,6 +1034,66 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     assert_eq!(relay.seen()[0], Seen::Short);
 }
 
+/// With leave, a device still asks only so much of a relay in a minute on
+/// the streams of a channel. At that it opens no more, and its passes
+/// stop there: what they did not ask, they ask later. Its shows go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_asks_only_so_much_of_a_relay_in_a_minute() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    let of_a_channel = |seen: &[Seen]| {
+        let asked = |one: &&Seen| matches!(one, Seen::Prove | Seen::Pull | Seen::Push);
+        seen.iter().filter(asked).count()
+    };
+    device.passes().await;
+    let mut seen_there = of_a_channel(&relay.seen());
+    assert!(seen_there > 0);
+
+    // It asks, and asks, with a fresh show now and then: the leave lasts
+    // ten seconds. The relay answers every one.
+    let most = OWN_ENTRY_REQUESTS_PER_MINUTE as usize;
+    let link = device.link("relay");
+    let proof = proof_on(&device, "relay", "notes");
+    let entry = device.latest();
+    let mut refused = None;
+    for n in 0..most {
+        if n % 200 == 0 {
+            let shown = device.engine.leave().show(&link, &entry, true).await;
+            shown.unwrap();
+        }
+        let asked = device
+            .engine
+            .leave()
+            .open(&device.state.db, &link, &proof, |_| (), |_, _| ())
+            .await;
+        if let Err(why) = asked {
+            refused = Some(why);
+            break;
+        }
+    }
+    // It stopped itself, at what a device asks of a relay in a minute:
+    // the relay saw that many requests, and no more.
+    assert_eq!(refused, Some(Refused::AskedEnough));
+    seen_there += of_a_channel(&relay.seen());
+    assert_eq!(seen_there, most);
+
+    // Its passes open no stream of a channel now. They still show.
+    device.writes("notes", "a.md", "waiting to be sent");
+    let before = device.counts("relay");
+    device.passes().await;
+    device.sends().await;
+    let seen = relay.seen();
+    assert_eq!(of_a_channel(&seen), 0, "{seen:?}");
+    assert!(seen.contains(&Seen::Short));
+    let after = device.counts("relay");
+    assert_eq!(after.short_shows, before.short_shows + 1);
+    assert_eq!(after.pushes, before.pushes);
+    assert_eq!(device.has_leave("relay"), Ok(()));
+}
+
 /// A show that is not answered in time gives no leave, and the device
 /// opens no stream for a channel of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1174,6 +1234,45 @@ async fn a_device_applies_the_change_that_its_relay_holds_before_it_sends_anythi
     assert!(!holds_at(&relay, &new_notes, &never_sent.id()));
     assert_eq!(removed.holds_of(&old_notes), held_before);
     assert!(removed.holds_of(&new_notes).is_empty());
+}
+
+/// A device that shows its entry in short, on a connection where it has
+/// shown it whole, and is told of another that it does not keep: it
+/// shows its own whole, is answered with the entry, applies the change,
+/// and shows what it keeps then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_told_of_a_later_change_shows_its_own_whole_and_is_answered_with_it() {
+    let relay = relay_started("relay", None);
+    let (mut maker, mut other) = (Device::new("desktop"), Device::new("laptop"));
+    maker.makes_the_phrase(&phrase());
+    maker.adds(&other);
+    for device in [&mut maker, &mut other] {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&maker, &other], 2).await;
+    let before = other.counts("relay");
+    assert_eq!(before.whole_shows, 1);
+
+    let change = maker.changes(&phrase(), &[&maker, &other], &[]);
+    maker.passes().await;
+    other.passes().await;
+    assert_eq!(other.latest().id(), change.id());
+    let after = other.counts("relay");
+    // One show in short, which was told of another. Then its own entry
+    // whole, which was answered with the change. Then the change, whole,
+    // since it had not shown that one on this connection.
+    assert_eq!(after.short_shows, before.short_shows + 1);
+    assert_eq!(after.whole_shows, before.whole_shows + 2);
+    assert_eq!(other.has_leave("relay"), Ok(()));
+    assert_eq!(other.at("relay").holds_latest, Some(true));
+    // From then on, in short again.
+    other.passes().await;
+    let later = other.counts("relay");
+    assert_eq!(
+        (later.whole_shows, later.short_shows),
+        (after.whole_shows, after.short_shows + 1)
+    );
 }
 
 /// A device that was answered with a change and could not apply it has no

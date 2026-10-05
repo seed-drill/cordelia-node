@@ -1379,6 +1379,18 @@ pub const RELAY_CHANNEL_PAGES_PER_PASS: usize = 10;
 /// pass and each time it sends; and what it pushes.
 pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
 
+/// How many requests a device makes of one relay in a minute, at most, on
+/// the streams that prove a channel's key, pull a page and push entries
+/// (decision 2026-10-04 §16): three quarters of what a relay allows one
+/// connection, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, as what a device pushes
+/// in a minute (OUTBOX_BYTES_PER_MINUTE) is three quarters of what a relay
+/// allows. A device paces itself, so that it is never the one refused for
+/// going over: a request over a relay's count is a breach, and a few of
+/// those cut a device off. What it does not ask in one minute, it asks in
+/// the next. Its shows are not held back by this, and are few: a device
+/// must still hear of a removal.
+pub const OWN_ENTRY_REQUESTS_PER_MINUTE: u32 = ENTRY_REQUESTS_PER_PEER_PER_MINUTE / 4 * 3;
+
 /// The most slots for which a relay remembers, for one connection, the
 /// last entry that it was shown whole there by each author, where the two
 /// signatures held (decision 2026-10-04 §2.4, item 5). The connection may
@@ -2132,6 +2144,21 @@ mod tests {
     /// nobody uses is kept.
     #[test]
     fn test_a_devices_side_of_a_relay_decision_2026_10_04_4_6() {
+        // A device paces what it asks of a relay as it paces what it
+        // pushes: at three quarters of what the relay allows.
+        assert_eq!(OWN_ENTRY_REQUESTS_PER_MINUTE, 2_250);
+        assert_eq!(
+            u64::from(OWN_ENTRY_REQUESTS_PER_MINUTE) * PUSH_BYTES_PER_PEER_PER_MINUTE,
+            u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE) * OUTBOX_BYTES_PER_MINUTE
+        );
+        // Its shows are beside that, and with them it is still within
+        // what a relay allows: one for each whole pass and each pass that
+        // sends, and as many again where an answer has it show whole.
+        let passes = 60 / REALTIME_SYNC_INTERVAL_SECS + 60 / OUTBOX_FLUSH_INTERVAL_SECS;
+        assert!(
+            u64::from(OWN_ENTRY_REQUESTS_PER_MINUTE) + 2 * passes
+                < u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE)
+        );
         assert_eq!(SHOW_LEAVE_SECS, 10);
         assert_eq!(SHOW_LEAVE_SECS, REALTIME_SYNC_INTERVAL_SECS);
         // What a device sends on its own timer goes several times within

@@ -23,6 +23,10 @@
 //! - **A device that was answered with a change and could not apply it**
 //!   has no leave anywhere until it has.
 //!
+//! With leave, a device still asks only so much of a relay in a minute
+//! (OWN_ENTRY_REQUESTS_PER_MINUTE on one connection): a relay counts the
+//! requests on these streams, and one over its count is a breach.
+//!
 //! [`Leave`] is the one thing that holds this, and the one way to the
 //! streams of a channel of the device's own. [`Leave::open`] opens a
 //! stream to prove a channel's key, to pull a page or to push entries. It
@@ -43,11 +47,14 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::at_relays::{self, Stands};
 use cordelia_core::NodeId;
-use cordelia_core::protocol::{SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS};
+use cordelia_core::protocol::{
+    OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+};
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_network::messages::{
     EntryRefused, EntryShow, EntryShowShort, Protocol, ShowAnswer, WireMessage,
 };
+use cordelia_network::rate_limit::RateCounter;
 use cordelia_network::{codec, transport};
 use cordelia_storage::person::State;
 use rusqlite::Connection;
@@ -206,6 +213,9 @@ pub enum Refused {
     NotAnswered(String),
     /// What was asked is not asked on a stream of a channel.
     NotARequest,
+    /// The device has asked as much of this relay as it asks in a minute.
+    /// Nothing was sent: it is asked again later.
+    AskedEnough,
 }
 
 /// What a show was answered, and what it cost to send.
@@ -250,9 +260,24 @@ struct Inner {
     /// The connections on which the device was answered with a change
     /// that it could not apply.
     not_applied: HashSet<LinkId>,
+    /// What was asked on each connection in the last minute, on the
+    /// streams of a channel.
+    asked: HashMap<LinkId, RateCounter>,
 }
 
 impl Inner {
+    /// Whether one thing more may be asked on the connection `link` in
+    /// this minute, on a stream of a channel. Where it may, it is
+    /// counted.
+    fn may_ask(&mut self, link: LinkId) -> bool {
+        self.asked
+            .entry(link)
+            .or_insert_with(|| {
+                RateCounter::new(Duration::from_secs(60), OWN_ENTRY_REQUESTS_PER_MINUTE)
+            })
+            .check_and_record()
+    }
+
     /// Whether the node is still waking at `now`.
     fn is_waking(&mut self, now: Instant) -> bool {
         let Some(woke) = &mut self.woke else {
@@ -302,6 +327,7 @@ impl Leave {
         let open: HashSet<LinkId> = reached.iter().map(|link| link.id()).collect();
         inner.given.retain(|link, _| open.contains(link));
         inner.not_applied.retain(|link| open.contains(link));
+        inner.asked.retain(|link, _| open.contains(link));
         if reached.is_empty() {
             inner.woke = None;
         } else if inner.woke.is_none() {
@@ -435,7 +461,9 @@ impl Leave {
     /// `take`: a proof of a channel's key, a pull of a page, or a push of
     /// entries, each on the stream of its own.
     ///
-    /// It is refused where there is no leave ([`Leave::has`]). `read` is
+    /// It is refused where there is no leave ([`Leave::has`]), and where
+    /// the device has asked as much on this connection as it asks of a
+    /// relay in a minute. `read` is
     /// given the answer with no database: it checks what came back.
     /// Leave is then asked again, and `take` is called with what `read`
     /// made, under the lock of the database that the leave was asked
@@ -456,6 +484,9 @@ impl Leave {
             _ => return Err(Refused::NotARequest),
         };
         self.has(&lock(db), link).map_err(Refused::NoLeave)?;
+        if !lock(&self.inner).may_ask(link.id()) {
+            return Err(Refused::AskedEnough);
+        }
         let answer = ask(&link.conn, protocol, request)
             .await
             .map_err(Refused::NotAnswered)?;
@@ -546,6 +577,22 @@ mod tests {
         ] {
             assert!(!gives_leave(&answer), "{answer:?}");
         }
+    }
+
+    /// A device asks so much on one connection in a minute, on the
+    /// streams of a channel, and no more. What it asks on another
+    /// connection is counted apart.
+    #[test]
+    fn a_device_asks_only_so_much_on_one_connection_in_a_minute() {
+        assert_eq!(OWN_ENTRY_REQUESTS_PER_MINUTE, 2_250);
+        let mut inner = Inner::default();
+        let (one, other) = ([1u8; SESSION_VALUE_BYTES], [2u8; SESSION_VALUE_BYTES]);
+        for n in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+            assert!(inner.may_ask(one), "{n}");
+        }
+        assert!(!inner.may_ask(one));
+        assert!(!inner.may_ask(one));
+        assert!(inner.may_ask(other));
     }
 
     /// A node that reaches no relay is waking. Once it reaches one, it is
