@@ -126,6 +126,34 @@ pub fn has_psk(home_dir: &Path, channel_id: &str) -> bool {
     psk_path(home_dir, channel_id).exists()
 }
 
+/// Delete every key file kept for a swarm channel: its key, and its ring
+/// and its slot key if it has them. A key file is named for its channel,
+/// so these are found by how their names begin
+/// ([`crate::naming::SWARM_CHANNEL_PREFIX`]), whether or not the database
+/// still has the channel. Returns how many files went.
+pub fn delete_swarm_keys(home_dir: &Path) -> Result<usize, CordeliaError> {
+    let read = |e: std::io::Error| CordeliaError::Storage(format!("read key dir: {e}"));
+    let entries = match std::fs::read_dir(home_dir.join("channel-keys")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(read(e)),
+    };
+    let mut deleted = 0;
+    for entry in entries {
+        let entry = entry.map_err(read)?;
+        let of_a_swarm_channel = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(crate::naming::SWARM_CHANNEL_PREFIX));
+        if of_a_swarm_channel && !entry.path().is_dir() {
+            std::fs::remove_file(entry.path())
+                .map_err(|e| CordeliaError::Storage(format!("delete key: {e}")))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Path to a channel's key ring file.
 pub fn ring_path(home_dir: &Path, channel_id: &str) -> PathBuf {
     home_dir

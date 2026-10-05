@@ -131,12 +131,38 @@ pub fn protocol_channel_psk(channel_name: &str) -> [u8; 32] {
     psk
 }
 
+/// How a swarm channel's ID begins. The rest of it is the entity ID of the
+/// node the channel was made for, and an entity ID holds a name.
+pub const SWARM_CHANNEL_PREFIX: &str = "cordelia:swarm:";
+
 /// Derive the persistent swarm channel ID for a lead entity.
 ///
 /// `channel_id = "cordelia:swarm:<lead_entity_id>"`
 /// This is a protocol-prefixed channel, not subject to RFC 1035 validation.
 pub fn swarm_channel_id(lead_entity_id: &str) -> String {
-    format!("cordelia:swarm:{lead_entity_id}")
+    format!("{SWARM_CHANNEL_PREFIX}{lead_entity_id}")
+}
+
+/// Whether a channel's ID may be told to a peer.
+///
+/// A relay learns a channel's ID (decision 2026-09-30 §5), so an ID must
+/// say nothing about the channel or about whose it is: a group's is
+/// random, and an inbox's or a named channel's is a hash. A swarm channel's
+/// ID holds a name, so it is never told to a peer. v1 makes no such channel
+/// and a node removes one when it starts
+/// ([`crate::channels::remove_swarm_channels`]); should a node hold one all
+/// the same, every place that sends a channel's ID asks here first.
+pub fn may_be_told_to_a_peer(channel_id: &str) -> bool {
+    !channel_id.starts_with(SWARM_CHANNEL_PREFIX)
+}
+
+/// [`may_be_told_to_a_peer`] as a condition in SQL on `column`: for a query
+/// that has to leave such channels out before it counts or limits its rows.
+pub(crate) fn told_to_a_peer_sql(column: &str) -> String {
+    format!(
+        "substr({column}, 1, {}) <> '{SWARM_CHANNEL_PREFIX}'",
+        SWARM_CHANNEL_PREFIX.len()
+    )
 }
 
 /// Determine channel type from an ID string.
@@ -413,6 +439,49 @@ mod tests {
     fn test_swarm_channel_id_is_protocol_type() {
         let id = swarm_channel_id("lead_a1b2");
         assert_eq!(ChannelType::from_id(&id), ChannelType::Protocol);
+    }
+
+    /// A channel ID that holds a name is never told to a peer: a swarm
+    /// channel's holds the entity ID of the node it was made for. An ID of
+    /// any other kind says nothing, and may be told.
+    #[test]
+    fn a_channel_id_that_holds_a_name_is_not_told_to_a_peer() {
+        assert!(!may_be_told_to_a_peer(&swarm_channel_id("lead_a1b2")));
+        assert!(!may_be_told_to_a_peer(SWARM_CHANNEL_PREFIX));
+
+        for told in [
+            group_channel_id(),
+            "grp_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            inbox_channel_id(&[0x01; 32]),
+            dm_channel_id(&[0x01; 32], &[0x02; 32]),
+            named_channel_id("research-findings"),
+            // It is how an ID begins that makes it a swarm channel's.
+            "grp_cordelia:swarm:lead_a1b2".to_string(),
+        ] {
+            assert!(may_be_told_to_a_peer(&told), "{told}");
+        }
+    }
+
+    /// The rule as a query applies it is the same rule, for an ID of every
+    /// kind and for the ones nearest to a swarm channel's.
+    #[test]
+    fn the_rule_on_what_is_told_to_a_peer_is_the_same_in_a_query() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT {}", told_to_a_peer_sql("?1"));
+        for id in [
+            swarm_channel_id("lead_a1b2"),
+            SWARM_CHANNEL_PREFIX.to_string(),
+            "cordelia:swarm".to_string(),
+            "Cordelia:Swarm:lead_a1b2".to_string(),
+            "grp_cordelia:swarm:lead_a1b2".to_string(),
+            "cordelia:local:550e8400".to_string(),
+            "grp_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            inbox_channel_id(&[0x01; 32]),
+            String::new(),
+        ] {
+            let told: bool = db.query_row(&sql, [&id], |row| row.get(0)).unwrap();
+            assert_eq!(told, may_be_told_to_a_peer(&id), "{id:?}");
+        }
     }
 
     // T13-4: Unicode channel names at byte limit
