@@ -74,6 +74,12 @@ pub struct PeerConnection {
     pub keepalive: KeepAliveState,
     /// Who opened the connection.
     pub direction: Direction,
+    /// The peer's address when the connection was made: where it was
+    /// accepted from, or where it was dialled. A connection can move to
+    /// another address while it lasts. Whatever is counted by address is
+    /// counted under this one, read once, so that a peer does not come by
+    /// another address's allowance by moving.
+    pub addr: SocketAddr,
 }
 
 /// Data needed by spawned connect/accept tasks. All fields Clone.
@@ -225,6 +231,7 @@ impl ConnectionManager {
             handshake: outcome.handshake,
             keepalive: KeepAliveState::new(),
             direction: outcome.direction,
+            addr: outcome.addr,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
@@ -280,6 +287,7 @@ impl ConnectionManager {
             handshake: handshake_result,
             keepalive: KeepAliveState::new(),
             direction: Direction::Outbound,
+            addr,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
@@ -303,8 +311,16 @@ impl ConnectionManager {
         closed
     }
 
-    /// Remote addresses of the live inbound connections, leaving out
-    /// `except` (a peer that is reconnecting replaces its own connection).
+    /// The address that the connection of `node_id` was made from, or
+    /// to: what the peer is counted under for as long as the connection
+    /// lasts, wherever it has moved to since.
+    pub fn address_of(&self, node_id: &NodeId) -> Option<std::net::IpAddr> {
+        self.connections.get(node_id).map(|peer| peer.addr.ip())
+    }
+
+    /// The addresses that the live inbound connections were made from,
+    /// leaving out `except` (a peer that is reconnecting replaces its own
+    /// connection).
     pub fn inbound_ips(&self, except: &NodeId) -> Vec<std::net::IpAddr> {
         self.connections
             .iter()
@@ -313,7 +329,7 @@ impl ConnectionManager {
                     && peer.direction == Direction::Inbound
                     && peer.conn.close_reason().is_none()
             })
-            .map(|(_, peer)| peer.conn.remote_address().ip())
+            .map(|(_, peer)| peer.addr.ip())
             .collect()
     }
 
@@ -777,6 +793,82 @@ mod tests {
         let node_id = mgr_b.register(outcome).unwrap();
         assert_eq!(node_id.0, id_a.public_key());
         assert_eq!(mgr_b.connection_count(), 1);
+
+        mgr_a.shutdown();
+        mgr_b.shutdown();
+    }
+
+    /// A connection is counted under the address it was made from. A peer
+    /// that moves to another address while its connection lasts is still
+    /// counted under the first: the connection says the new address, and
+    /// what the manager says of it does not change.
+    #[tokio::test]
+    async fn a_connection_that_moves_is_counted_under_the_address_it_was_made_from() {
+        let id_a = make_test_identity();
+        let id_b = make_test_identity();
+        // The accepting end listens on every address of this machine.
+        let ep_b = transport::create_endpoint(&id_b, "0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = ep_b.local_addr().unwrap().port();
+        let ep_b_accept = ep_b.clone();
+        let ep_a = make_endpoint(&id_a);
+        let ep_a_moves = ep_a.clone();
+        let mut mgr_a =
+            ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
+        let mut mgr_b =
+            ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["relay".into()], 9474);
+        let ctx_b = mgr_b.connect_context();
+        let accept_task = tokio::spawn(async move {
+            let incoming = ep_b_accept.accept().await.unwrap();
+            inbound_accept(&ctx_b, incoming).await.unwrap()
+        });
+        let b_id = mgr_a
+            .connect_to(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+            .unwrap();
+        let a_id = mgr_b.register(accept_task.await.unwrap()).unwrap();
+        let first: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let second: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        let at_b = mgr_b.get_connection(&a_id).unwrap().clone();
+        assert_eq!(at_b.remote_address().ip(), first);
+        assert_eq!(mgr_b.address_of(&a_id), Some(first));
+        assert_eq!(mgr_b.inbound_ips(&NodeId([0; 32])), [first]);
+
+        // The dialling end moves to another address of this machine, and
+        // goes on using the connection: a stream each way.
+        let moved = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        ep_a_moves.rebind(moved).unwrap();
+        let at_a = mgr_a.get_connection(&b_id).unwrap().clone();
+        let serve = at_b.clone();
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = serve.accept_bi().await {
+                let mut byte = [0u8; 1];
+                if recv.read_exact(&mut byte).await.is_ok() {
+                    let _ = send.write_all(&byte).await;
+                    let _ = send.finish();
+                }
+            }
+        });
+        let mut seen = first;
+        for _ in 0..100 {
+            let (mut send, mut recv) = at_a.open_bi().await.unwrap();
+            send.write_all(&[7]).await.unwrap();
+            send.finish().unwrap();
+            let mut byte = [0u8; 1];
+            recv.read_exact(&mut byte).await.unwrap();
+            seen = at_b.remote_address().ip();
+            if seen == second {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The connection says where the peer is now.
+        assert_eq!(seen, second, "the connection did not move");
+        // What it is counted under is where it was made from.
+        assert_eq!(mgr_b.address_of(&a_id), Some(first));
+        assert_eq!(mgr_b.inbound_ips(&NodeId([0; 32])), [first]);
+        assert_eq!(mgr_b.address_of(&NodeId([9; 32])), None);
+        // The dialling end counts its peer under the address it dialled.
+        assert_eq!(mgr_a.address_of(&b_id), Some(first));
 
         mgr_a.shutdown();
         mgr_b.shutdown();

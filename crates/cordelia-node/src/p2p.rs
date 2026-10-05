@@ -1900,6 +1900,12 @@ pub fn post_connect(
     if let Some(conn) = conn_mgr.get_connection(node_id) {
         let conn = conn.clone();
         let peer_id = node_id.clone();
+        // The address that the peer's requests are counted under, for as
+        // long as the connection lasts: the one it was made from, read
+        // once (decision 2026-10-04 §16).
+        let made_from = conn_mgr
+            .address_of(node_id)
+            .unwrap_or_else(|| conn.remote_address().ip());
         let db_state = state.clone();
         let peers_ref = shared_peers.clone();
         let role = node_role.to_string();
@@ -1914,8 +1920,8 @@ pub fn post_connect(
         let entries = relay_entries.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, db_state, peers_ref, role, rtx, dtx, rates, states, relays, gtx, sm,
-                st, entries,
+                conn, peer_id, made_from, db_state, peers_ref, role, rtx, dtx, rates, states,
+                relays, gtx, sm, st, entries,
             )
             .await;
         });
@@ -2329,7 +2335,7 @@ pub async fn p2p_loop(
                         // from bypassing per-IP limits to force CPU-expensive derivations.
                         // The limits count the inbound connections open now.
                         if direction == Direction::Inbound {
-                            let ip = outcome.conn.remote_address().ip();
+                            let ip = outcome.addr.ip();
                             let open = cordelia_network::rate_limit::ConnectionTracker::from_ips(
                                 conn_mgr.inbound_ips(&outcome.node_id),
                             );
@@ -3005,7 +3011,9 @@ pub async fn p2p_loop(
                         channels: if limited { Vec::new() } else { local_channels.clone() },
                         ask_what_it_holds: is_relay,
                         limited,
-                        address: conn.remote_address().ip(),
+                        address: conn_mgr
+                            .address_of(target)
+                            .unwrap_or_else(|| conn.remote_address().ip()),
                         rates: peer_rates.clone(),
                         kept: sync_kept.clone(),
                         repush_tx: repush_tx.clone(),
@@ -3559,10 +3567,16 @@ fn cut_off(
 
 /// Handle inbound protocol streams from a connected peer.
 /// Runs until the connection closes.
+///
+/// `made_from` is the address that the connection was made from. Every
+/// limit by address counts the peer under it, for both kinds of channel,
+/// whatever address the connection has moved to since: one that was read
+/// at each stream would hand a peer that moves a new address's allowance.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_peer_streams(
     conn: quinn::Connection,
     peer_id: NodeId,
+    made_from: std::net::IpAddr,
     state: web::Data<cordelia_api::state::AppState>,
     shared_peers: std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: String,
@@ -3631,7 +3645,7 @@ pub async fn handle_peer_streams(
         // two relays that list each other there is no limit at all: they
         // are one operator's, and each passes on everything its devices
         // send. A device still counts what its relay asks of it.
-        let address = conn.remote_address().ip();
+        let address = made_from;
         let own_relay = peer_relays
             .read()
             .ok()

@@ -58,7 +58,7 @@ fn channel(c: u16) -> [u8; 32] {
 struct Client {
     identity: Arc<NodeIdentity>,
     conn: quinn::Connection,
-    _manager: connection::ConnectionManager,
+    manager: connection::ConnectionManager,
 }
 
 /// Connect a new client, with a key of its own, to `relay`.
@@ -85,7 +85,7 @@ async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, 
     Ok(Client {
         identity,
         conn,
-        _manager: manager,
+        manager,
     })
 }
 
@@ -835,6 +835,85 @@ async fn an_address_may_make_a_relay_take_so_many_new_channels_an_hour() {
             .await
             .unwrap(),
         [PushAnswer::Stored, PushAnswer::Stored]
+    );
+}
+
+/// A connection is counted under the address it was made from, for as
+/// long as it lasts. A client that has had its address's share of new
+/// channels moves its end of the connection to another address of this
+/// machine. The relay sees it there, and still takes no new channel from
+/// it, pushed or shown: one that it counted under the address the
+/// connection has now would take 256 more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_moves_keeps_the_allowance_of_the_address_it_was_made_from() {
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    let first = |c: u16| client.made(c, 5, "notes.md", "a small text").to_wire();
+    for from in [0u16, 100, 200] {
+        let to = (from + 100).min(256);
+        let answers = client.push((from..to).map(first).collect()).await.unwrap();
+        assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
+    }
+    let over = EntryRefused::OverLimit;
+    assert_eq!(
+        client.push(vec![first(256)]).await.unwrap(),
+        [PushAnswer::Refused(over)]
+    );
+
+    // It moves: its end of the connection is at 127.0.0.2 from now on.
+    let before = client.conn.remote_address();
+    let moved = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+    let port = moved.local_addr().unwrap().port();
+    client.manager.endpoint().rebind(moved).unwrap();
+    // The relay comes to see it there: it says so of its peers.
+    let key = cordelia_crypto::bech32::encode_public_key(&client.identity.public_key()).unwrap();
+    let mut seen = String::new();
+    for _ in 0..60 {
+        // What it asks meanwhile is answered as before.
+        assert!(client.pull(1, NO_MARK, 0).await.entries.is_empty());
+        let peers = relay.get("/api/v1/peers").unwrap_or_default();
+        seen = peers["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|peer| peer["key"] == key.as_str())
+            .and_then(|peer| peer["address"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if seen == format!("127.0.0.2:{port}") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        seen,
+        format!("127.0.0.2:{port}"),
+        "the relay did not see the connection move"
+    );
+    assert_eq!(client.conn.remote_address(), before);
+
+    // A new channel from where it is now: refused as before, pushed and
+    // shown. The allowance is the one of the address it connected from.
+    for c in [256, 257] {
+        assert_eq!(
+            client.push(vec![first(c)]).await.unwrap(),
+            [PushAnswer::Refused(over)],
+            "{c}"
+        );
+        assert_eq!(
+            client.show(first(c)).await.unwrap(),
+            ShowAnswer::Refused(over),
+            "{c}"
+        );
+        assert_eq!(held(&relay, c), None);
+    }
+    assert_eq!(holds(&relay).0, 256 * SMALL);
+    // And a connection that is made from the first address meets the
+    // same allowance: used up.
+    let other = client_of(&relay).await.expect("another client connects");
+    assert_eq!(
+        other.push(vec![first(258)]).await.unwrap(),
+        [PushAnswer::Refused(over)]
     );
 }
 
