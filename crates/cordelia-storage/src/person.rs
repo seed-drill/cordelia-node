@@ -631,6 +631,19 @@ pub fn hand_overs_held(conn: &Connection) -> Result<Vec<HandedOver>, CordeliaErr
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// The last hand-over for each key whose entry the store holds no longer,
+/// in order of key.
+pub fn hand_overs_gone(conn: &Connection) -> Result<Vec<HandedOver>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, channel, rev, made_at, held FROM person_hand_overs
+             WHERE held = 0 ORDER BY key ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt.query_map([], handed_over_from_row).map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// The device has made a hand-over for `key`, and its store holds it: in
 /// the pair channel whose ID is `channel`, at revision `rev`, saying it
 /// was made at `made_at`. It takes the place of what was kept of the one
@@ -669,6 +682,14 @@ pub fn hand_over_gone(conn: &Connection, key: &[u8; 32]) -> Result<bool, Cordeli
     )
     .map(|rows| rows > 0)
     .map_err(storage)
+}
+
+/// Keep nothing of any hand-over: for a device that leaves its phrase
+/// (decision 2026-10-04 §6). Each row names a key that it added under the
+/// phrase it leaves. Returns how many there were.
+pub fn forget_hand_overs(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_hand_overs", [])
+        .map_err(storage)
 }
 
 // A secret and the statement key are not printed for debugging: what is
@@ -1333,8 +1354,15 @@ mod tests {
         assert_eq!((held[0].key, held[1].clone()), ([2; 32], first.clone()));
 
         // The store holds one no longer: its revision stays.
+        assert!(hand_overs_gone(&conn).unwrap().is_empty());
         assert!(hand_over_gone(&conn, &[1; 32]).unwrap());
         assert!(!hand_over_gone(&conn, &[1; 32]).unwrap());
+        let gone = hand_overs_gone(&conn).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(
+            (gone[0].key, gone[0].rev, gone[0].held),
+            ([1; 32], 500, false)
+        );
         let gone = HandedOver {
             held: false,
             ..first
@@ -1366,6 +1394,14 @@ mod tests {
         let one_row = "UPDATE person_hand_overs SET held = 0 WHERE rev = 7";
         assert_eq!(conn.execute(one_row, []).unwrap(), 1);
         assert_eq!(handed_over(&conn, &[3; 32]).unwrap(), None);
+
+        // A device that leaves its phrase keeps nothing of any: not the
+        // one its store held, and not the revision of one that had gone.
+        assert_eq!(forget_hand_overs(&conn).unwrap(), 2);
+        assert_eq!(handed_over(&conn, &[1; 32]).unwrap(), None);
+        assert_eq!(handed_over(&conn, &[2; 32]).unwrap(), None);
+        assert!(hand_overs_held(&conn).unwrap().is_empty());
+        assert_eq!(forget_hand_overs(&conn).unwrap(), 0);
     }
 
     #[test]

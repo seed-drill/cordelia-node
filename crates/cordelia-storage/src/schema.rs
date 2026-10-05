@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -493,6 +493,47 @@ CREATE TRIGGER items_counted_again AFTER UPDATE OF content_length ON items BEGIN
 END;
 "#;
 
+/// Migration v14: what a device keeps of each relay it is set up with,
+/// for each channel of its own (decision 2026-10-04 §4.6, §7.3,
+/// `at_relays`), beside everything that is there, which stays as it is.
+///
+/// One row for each relay, by its node key, and channel (`at_relays`):
+///
+/// - `mark`, `place`: the device's place in the relay's holding of the
+///   channel, with the mark of that holding: where its next pull goes on
+///   from. No mark is no place, and the channel is read from the start. A
+///   mark is 8 bytes, and never all zeros, as a relay's is.
+/// - `sent_to`: how far the device has sent the relay what its own store
+///   holds of the channel, in the order in which the store took its
+///   entries (`entries.seq`).
+/// - `carried_to`: the same for what the device carried into the channel
+///   when it applied a statement, which is sent by a rule of its own.
+///
+/// And one row (`person_carried`) that says how far what the store holds
+/// is what the device carried: the store's order as it stood when the
+/// device last applied a statement. It is one of the tables of what a
+/// device holds of its person.
+///
+/// A relay keeps nothing in either.
+const MIGRATION_V14: &str = r#"
+CREATE TABLE at_relays (
+    relay       BLOB NOT NULL CHECK(length(relay) = 32),
+    channel     BLOB NOT NULL CHECK(length(channel) = 32),
+    mark        BLOB CHECK(mark IS NULL OR (length(mark) = 8 AND mark != zeroblob(8))),
+    place       INTEGER NOT NULL DEFAULT 0 CHECK(place >= 0),
+    sent_to     INTEGER NOT NULL DEFAULT 0 CHECK(sent_to >= 0),
+    carried_to  INTEGER NOT NULL DEFAULT 0 CHECK(carried_to >= 0),
+    PRIMARY KEY (relay, channel)
+);
+
+CREATE INDEX idx_at_relays_channel ON at_relays(channel);
+
+CREATE TABLE person_carried (
+    one    INTEGER PRIMARY KEY CHECK(one = 1),
+    up_to  INTEGER NOT NULL CHECK(up_to >= 0)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -612,10 +653,22 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
         migrate_in_one(conn, MIGRATION_V13, 13)?;
     }
 
-    let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let actual = migrate_from_v13(conn, current)?;
     tracing::debug!(schema_version = actual, "database initialised");
 
     Ok(())
+}
+
+/// Run the steps after version 13 that a database at version `current`
+/// has not had, each as the steps before it are run. Returns the version
+/// the database is at then.
+fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError> {
+    if current < 14 {
+        tracing::info!("applying migration v14 (what a device keeps of each relay)");
+        migrate_in_one(conn, MIGRATION_V14, 14)?;
+    }
+
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 /// Apply migration v4 inside one transaction, with foreign keys disabled
@@ -1091,8 +1144,9 @@ mod tests {
     /// table's definition, and each row of the tables an older binary
     /// wrote. What a later step adds is left out too: the tables of what
     /// a device holds of its person, the table of the channels a relay
-    /// holds, the index of each channel's own order of entries, and the
-    /// counts of what `items` holds with the triggers that keep them.
+    /// holds, the index of each channel's own order of entries, the
+    /// counts of what `items` holds with the triggers that keep them, and
+    /// what a device keeps of each relay.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
@@ -1103,6 +1157,7 @@ mod tests {
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
                    AND name NOT LIKE 'items_counted%'
+                   AND name NOT LIKE '%at_relays%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1313,12 +1368,13 @@ mod tests {
         .unwrap()
     }
 
-    /// What a database holds of the step to version 12, by name. One
-    /// table of what a device holds of its person is of a later step.
+    /// What a database holds of the step to version 12, by name. Two
+    /// tables of what a device holds of its person are of later steps.
     fn new_in_v12(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
+               AND name NOT LIKE '%person_carried%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1521,6 +1577,7 @@ mod tests {
         for rows in [
             "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
                  WHERE name LIKE '%person%' AND name NOT LIKE '%person_hand_overs%'
+                   AND name NOT LIKE '%person_carried%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -1587,7 +1644,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 13);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v13(&conn), NEW_IN_V13);
         assert_eq!(channel_places(&conn).map(|places| places.len()), Some(4));
@@ -1691,6 +1747,215 @@ mod tests {
         // them, of one byte and of two.
         assert_eq!(items_as_they_are(&conn), (2, 3));
         assert_eq!(item_counts(&conn), Some((2, 3)));
+    }
+
+    // ── v14: what a device keeps of each relay ───────────────────────
+
+    /// A database at version 13, as the version before what a device
+    /// keeps of each relay leaves it: what [`at_v12`] holds, a channel
+    /// that a relay holds, and what a device keeps of a hand-over.
+    fn at_v13() -> Connection {
+        let conn = at_v12();
+        migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
+        conn.execute_batch(
+            "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes, mark)
+             VALUES (X'0707070707070707070707070707070707070707070707070707070707070707',
+                     7, 8, 2560, X'0102030405060708');
+             INSERT INTO person_hand_overs (key, channel, rev, made_at, held)
+             VALUES (zeroblob(32), zeroblob(32), 1800000000, 1800000000, 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The tables and the index that the step to version 14 adds.
+    const NEW_IN_V14: [&str; 3] = ["at_relays", "idx_at_relays_channel", "person_carried"];
+
+    /// What a database holds of the step to version 14, by name.
+    fn new_in_v14(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE '%at_relays%' OR name = 'person_carried')
+               AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database at version 13 holds: what one at version 12
+    /// holds, each definition of the step to version 13, the table of
+    /// entries as that step left it, each entry's place in its channel,
+    /// and each row of the two tables of that step.
+    fn held_before_v14(conn: &Connection) -> Vec<String> {
+        let mut held = held_before_v13(conn);
+        for rows in [
+            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name LIKE '%relay_channels%' OR name = 'idx_entries_channel_place'
+                    OR name = 'person_hand_overs' OR name LIKE 'items_counted%'
+                    OR name = 'entries'
+                 ORDER BY name",
+            "SELECT hex(channel_id) || seq || ' ' || channel_place FROM entries ORDER BY seq",
+            "SELECT hex(channel_id) || held_since || used_at || bytes || hex(mark)
+                 FROM relay_channels",
+            "SELECT hex(key) || hex(channel) || rev || made_at || held FROM person_hand_overs",
+            "SELECT name || value FROM counters WHERE name IN ('item_count', 'item_bytes')
+                 ORDER BY name",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// The two tables of what a device keeps of each relay are made in
+    /// one step with their version, as the steps before it are: a failure
+    /// between them leaves none, and the step asked for twice is run
+    /// once.
+    #[test]
+    fn test_v14_adds_what_a_device_keeps_of_each_relay_and_its_version_as_one() {
+        let conn = at_v13();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 13);
+        assert!(new_in_v14(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V14} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 14).is_err());
+        assert_eq!(version(&conn), 13);
+        assert!(
+            new_in_v14(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 14);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v14(&conn), NEW_IN_V14);
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        conn.execute_batch(
+            "INSERT INTO at_relays (relay, channel, mark, place, sent_to, carried_to)
+             VALUES (zeroblob(32), zeroblob(32), X'0102030405060708', 7, 9, 3);
+             INSERT INTO person_carried (one, up_to) VALUES (1, 9);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V14, 14).unwrap();
+        let kept: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM at_relays), (SELECT up_to FROM person_carried)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version(&conn), kept), (SCHEMA_VERSION, (1, 9)));
+    }
+
+    /// A database at version 13 that an older binary wrote is taken to
+    /// version 14 with everything it held as it was: the step adds two
+    /// tables and an index, with nothing in them, and touches nothing
+    /// else. A device has no place at any relay, has sent none anything,
+    /// and has carried nothing.
+    #[test]
+    fn test_a_database_at_v13_that_an_older_binary_wrote_is_taken_to_v14() {
+        let conn = at_v13();
+        let before = held_before_v14(&conn);
+        assert!(before.iter().any(|row| row.starts_with("relay_channels: ")));
+        assert!(before.iter().any(|row| row.starts_with("entries: ")));
+        assert!(before.iter().any(|row| row.starts_with("item_count2")));
+
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 13);
+
+        // The step by itself, and then a start, which has no more to do
+        // for it.
+        migrate_in_one(&conn, MIGRATION_V14, 14).unwrap();
+        assert_eq!(version(&conn), 14);
+        assert_eq!(held_before_v14(&conn), before);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(held_before_v14(&conn), before);
+
+        // What is new: the tables, with nothing in them, and the index.
+        assert_eq!(new_in_v14(&conn), NEW_IN_V14);
+        for table in ["at_relays", "person_carried"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        // The index is by channel, for what is forgotten of a channel at
+        // every relay.
+        assert!(definition_of(&conn, "idx_at_relays_channel").contains("at_relays(channel)"));
+    }
+
+    /// A database that is stepped from any version has what every later
+    /// step makes: each step runs, and sets its own version and no later
+    /// one. (A step that set the next one's version would leave the next
+    /// step not run, with nothing to say so but what is missing.) From
+    /// nothing, and from each version that a fixture here stands for.
+    #[test]
+    fn test_a_database_stepped_from_any_version_has_what_every_later_step_makes() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let table_of = |conn: &Connection, name: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        let from: [(u32, Connection); 6] = [
+            (0, Connection::open_in_memory().unwrap()),
+            (8, at_v8()),
+            (10, at_v10()),
+            (11, at_v11()),
+            (12, at_v12()),
+            (13, at_v13()),
+        ];
+        for (at, conn) in from {
+            assert_eq!(version(&conn), at);
+            init_db(&conn).unwrap();
+            assert_eq!(version(&conn), SCHEMA_VERSION, "from version {at}");
+            // The steps to versions 9, 10 and 11: the writer of what a
+            // folder agreed, the table of lines, and the table of entries.
+            assert!(
+                conn.prepare("SELECT author FROM sync_files").is_ok(),
+                "from version {at}"
+            );
+            assert!(table_of(&conn, "index_lines"), "from version {at}");
+            assert!(table_of(&conn, "entries"), "from version {at}");
+            // And each step since, by everything it makes.
+            assert_eq!(new_in_v12(&conn), NEW_IN_V12, "from version {at}");
+            assert_eq!(new_in_v13(&conn), NEW_IN_V13, "from version {at}");
+            assert_eq!(new_in_v14(&conn), NEW_IN_V14, "from version {at}");
+            assert!(item_counts(&conn).is_some(), "from version {at}");
+            assert!(channel_places(&conn).is_some(), "from version {at}");
+        }
     }
 
     /// The two counts of what `items` holds are kept in the write that
