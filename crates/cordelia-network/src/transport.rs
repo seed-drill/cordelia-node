@@ -272,6 +272,42 @@ pub fn extract_peer_node_id(cert_chain: &[CertificateDer<'_>]) -> Result<[u8; 32
     Ok(key)
 }
 
+/// The node key of the peer at the other end of `conn`: the key of the
+/// certificate that the peer presented in this connection's TLS handshake
+/// ([`extract_peer_node_id`]), which TLS proved the peer holds.
+///
+/// Whoever checks what a peer signs for this connection takes the peer's
+/// key from here, and from nothing that the peer says in a message.
+pub fn peer_key(conn: &quinn::Connection) -> Result<[u8; 32], TransportError> {
+    let certs = conn
+        .peer_identity()
+        .ok_or_else(|| TransportError::IdentityBinding("the peer presented no identity".into()))?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| {
+            TransportError::IdentityBinding("the peer's identity is not a certificate".into())
+        })?;
+    extract_peer_node_id(&certs)
+}
+
+/// The value that both ends of `conn` export from its one TLS session
+/// (decision 2026-10-04 §2.4 item 3, §16): SESSION_VALUE_BYTES of keying
+/// material, exported under LABEL_SESSION_VALUE with no context (RFC 8446
+/// §7.5, RFC 5705).
+///
+/// The two ends of one connection get the same bytes, and no other
+/// connection gets them: not one between the same two nodes, and not one
+/// that either of them has with a third. So what is signed over the value
+/// was signed for this connection. Both ends get the same bytes, so what
+/// is signed over it must also say which end signed.
+pub fn session_value(
+    conn: &quinn::Connection,
+) -> Result<[u8; protocol::SESSION_VALUE_BYTES], TransportError> {
+    let mut value = [0u8; protocol::SESSION_VALUE_BYTES];
+    conn.export_keying_material(&mut value, protocol::LABEL_SESSION_VALUE, &[])
+        .map_err(|_| TransportError::Tls("the session's value could not be exported".into()))?;
+    Ok(value)
+}
+
 // ── Custom TLS verifiers ───────────────────────────────────────────
 
 /// Cached signature verification algorithms from the ring provider.
@@ -431,6 +467,106 @@ mod tests {
             .unwrap();
         let server_end = accepting.await.unwrap();
         (client_end, server_end, client, server)
+    }
+
+    /// Both ends of one connection export the same value from its TLS
+    /// session, and no other connection exports it: not another between
+    /// the same two nodes, and not one with a third. The value is what the
+    /// session gives under the label for it, with no context, and under
+    /// no other label.
+    #[tokio::test]
+    async fn both_ends_export_one_value_from_a_session_and_no_other_session_gives_it() {
+        let server_id = NodeIdentity::generate().unwrap();
+        let client_id = NodeIdentity::generate().unwrap();
+        let other_id = NodeIdentity::generate().unwrap();
+        let server = create_endpoint(&server_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        // The client's end and the server's, of a connection from the
+        // node with `identity`.
+        let connect = |identity: &NodeIdentity| {
+            let client = create_client_endpoint(identity, "127.0.0.1".parse().unwrap()).unwrap();
+            let server = server.clone();
+            async move {
+                let accepting =
+                    tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() });
+                let client_end = client
+                    .connect(server_addr, "cordelia")
+                    .unwrap()
+                    .await
+                    .unwrap();
+                (client_end, accepting.await.unwrap(), client)
+            }
+        };
+        let (client_end, server_end, _c1) = connect(&client_id).await;
+        let (again_client, again_server, _c2) = connect(&client_id).await;
+        let (other_client, other_server, _c3) = connect(&other_id).await;
+
+        // Both ends of one connection: the same 32 bytes, each time asked.
+        let value = session_value(&client_end).unwrap();
+        assert_eq!(value.len(), protocol::SESSION_VALUE_BYTES);
+        assert_eq!(session_value(&server_end).unwrap(), value);
+        assert_eq!(session_value(&client_end).unwrap(), value);
+        assert_ne!(value, [0u8; 32]);
+
+        // A second connection between the same two nodes, and one from
+        // another node: each has a value of its own, at both its ends.
+        let again = session_value(&again_client).unwrap();
+        assert_eq!(session_value(&again_server).unwrap(), again);
+        let other = session_value(&other_client).unwrap();
+        assert_eq!(session_value(&other_server).unwrap(), other);
+        assert!(value != again && value != other && again != other);
+
+        // It is what the session exports under the label for it, with no
+        // context, and under no other label or context.
+        let exported = |conn: &quinn::Connection, label: &[u8], context: &[u8]| {
+            let mut out = [0u8; 32];
+            conn.export_keying_material(&mut out, label, context)
+                .unwrap();
+            out
+        };
+        assert_eq!(
+            protocol::LABEL_SESSION_VALUE,
+            b"EXPORTER-cordelia v2 session"
+        );
+        assert_eq!(
+            exported(&server_end, b"EXPORTER-cordelia v2 session", &[]),
+            value
+        );
+        assert_ne!(
+            exported(&server_end, b"EXPORTER-cordelia v2 other", &[]),
+            value
+        );
+        assert_ne!(
+            exported(&server_end, protocol::LABEL_CHANNEL_PROOF, &[]),
+            value
+        );
+        assert_ne!(
+            exported(&server_end, protocol::LABEL_SESSION_VALUE, b"context"),
+            value
+        );
+    }
+
+    /// The key of the peer at the other end is the key of the certificate
+    /// it presented, at both ends of a connection.
+    #[tokio::test]
+    async fn the_peers_key_is_the_key_of_its_certificate() {
+        let server_id = NodeIdentity::generate().unwrap();
+        let client_id = NodeIdentity::generate().unwrap();
+        let server = create_endpoint(&server_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = create_client_endpoint(&client_id, "127.0.0.1".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_end = client
+            .connect(server_addr, "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_end = accepting.await.unwrap();
+        assert_eq!(peer_key(&server_end).unwrap(), client_id.public_key());
+        assert_eq!(peer_key(&client_end).unwrap(), server_id.public_key());
     }
 
     /// T3. A peer can have 64 streams open on one connection at once. The
