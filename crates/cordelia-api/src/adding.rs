@@ -1610,6 +1610,28 @@ mod tests {
                 left_out_as: None
             }
         );
+        // With 64 that count, a record would be made for no other key:
+        // and still for one that counts already.
+        let statement = on.held().statement.statement;
+        for n in 100..161 {
+            let record = Addition::under(&statement, listed_as(n), on.key(), 5)
+                .unwrap()
+                .sign(&on.identity)
+                .unwrap();
+            see_addition(&on.conn, &record, 5).unwrap();
+        }
+        assert_eq!(who_counts(&on.conn).unwrap().devices(), 64);
+        assert!(matches!(
+            would(on, &Machine::new(200).key(), "one more"),
+            Err(PersonError::NoRoom)
+        ));
+        assert_eq!(
+            would_add(&on.conn, &on.identity, &listed_as(130).key, "again").unwrap(),
+            WouldAdd::Adds {
+                counts_already: true,
+                left_out_as: None
+            }
+        );
 
         // A device that may not add: one that a device added since has
         // added.

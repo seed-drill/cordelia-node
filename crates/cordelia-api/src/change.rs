@@ -651,6 +651,28 @@ mod tests {
             ),
             Err(PersonError::ChangedSincePrompt)
         ));
+
+        // A device that has stopped makes no change, whatever it is
+        // handed over the entry it keeps: here, one that was removed.
+        let mut s = Several::of_one_person(3);
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[2];
+        shown(&on.conn, &on.identity, &removal, now).unwrap();
+        assert_eq!(on.state(), State::Removed);
+        let before = on.everything();
+        assert!(matches!(
+            apply_made(
+                &on.conn,
+                &on.identity,
+                &removal,
+                &on.latest().id(),
+                None,
+                now
+            ),
+            Err(PersonError::ChangedSincePrompt)
+        ));
+        assert_eq!(on.everything(), before);
     }
 
     /// A record of an addition that arrives between the prompt and the

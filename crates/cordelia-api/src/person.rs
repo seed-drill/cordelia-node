@@ -1268,8 +1268,12 @@ fn note_left_out(
             .label;
         counted.push((record.key, label));
     }
+    // Each is noted. One that the statement lists, in either list, is
+    // shown no more by the time the statement is applied: that is asked
+    // for every key that is noted, this statement's and an earlier
+    // one's, where the device comes to the statement.
     for (key, label) in counted {
-        if key == own || statement.lists(&key) || statement.removes(&key) {
+        if key == own {
             continue;
         }
         acts::note_left_out(conn, &key, &label, statement.number, now)?;
@@ -5357,6 +5361,22 @@ mod tests {
         let two = change(&phrase, &two, secret);
         assert!(matches!(
             refused(&two, &statement_key),
+            PersonError::NotAFirstStatement
+        ));
+        // A statement numbered 1, with no chain, that lists this device
+        // alone and a removed key beside it.
+        let with_removed = Statement {
+            number: 1,
+            maker: key(0),
+            chain: Vec::new(),
+            commitment: statement::commitment(&secret),
+            devices: listed(&[0]),
+            removed: vec![key(5)],
+            phrase_key: phrase.public_key().unwrap(),
+        };
+        let with_removed = change(&phrase, &with_removed, secret);
+        assert!(matches!(
+            refused(&with_removed, &statement_key),
             PersonError::NotAFirstStatement
         ));
         // A later statement of the phrase that lists this device alone.

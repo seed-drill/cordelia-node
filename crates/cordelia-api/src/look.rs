@@ -576,8 +576,10 @@ fn told(
         id,
         left_out,
     };
-    // Each record of an addition (§6).
-    for record in kept {
+    // Each record of an addition (§6). A record for a key that the
+    // statement lists adds no device, and tells of none: a device that
+    // is handed the change again is handed it with no record.
+    for record in kept.iter().filter(|record| !statement.lists(&record.key)) {
         let read = SignedAddition::from_bytes(&record.record)?.addition;
         let by = Shown::of(&record.adder, &reader.label(&record.adder))?;
         let says = match record.key == own {
@@ -1026,13 +1028,17 @@ mod tests {
         assert!(s[0].counts(&s.key(1)));
         assert_eq!(seen(&s, 0).added.len(), 2);
 
-        // A statement that lists them ends the notices everywhere.
+        // A statement that lists them ends the notices everywhere, and
+        // what a person cleared under the statement before is kept no
+        // more.
+        assert!(acts::is_cleared(&s[0].conn, &id).unwrap());
         s.change(0, &[0, 1, 2], &[]);
         s.meet(&[0, 1, 2]);
         for n in 0..3 {
             assert!(seen(&s, n).notices.is_empty(), "{n}");
             assert!(seen(&s, n).added.is_empty(), "{n}");
         }
+        assert!(!acts::is_cleared(&s[0].conn, &id).unwrap());
     }
 
     /// A record that is not counted is listed as that, with why.
@@ -1097,6 +1103,38 @@ mod tests {
                 .iter()
                 .any(|n| n.says.starts_with("new device: device 10"))
         );
+        // Device 9 counts, and may add nothing: its own look says so.
+        // Device 0, which the statement lists, may.
+        let nines = super::look(&nine.conn, &nine.identity, &AtRelays::default(), now).unwrap();
+        assert_eq!((nines.state, nines.may_add), ("applied", false));
+        assert!(seen(&s, 0).may_add);
+
+        // A record for a key that the statement lists adds no device:
+        // it is kept, is not listed as a device added since, and tells
+        // of nothing.
+        let told_before = seen(&s, 0).notices.len();
+        let again = cordelia_crypto::addition::Addition::under(
+            statement,
+            cordelia_crypto::statement::Device::new(s.key(0), "the first again").unwrap(),
+            s.key(1),
+            now as u64,
+        )
+        .unwrap()
+        .sign(&s[1].identity)
+        .unwrap();
+        let kept_before = held_rows::additions(&s[0].conn).unwrap().len();
+        crate::person::see_addition(&s[0].conn, &again, now).unwrap();
+        assert_eq!(
+            held_rows::additions(&s[0].conn).unwrap().len(),
+            kept_before + 1
+        );
+        let look = seen(&s, 0);
+        assert!(
+            look.added
+                .iter()
+                .all(|a| a.device.label != "the first again")
+        );
+        assert_eq!(look.notices.len(), told_before);
     }
 
     /// The keys that the statement removed are listed, bare: a statement
@@ -1183,6 +1221,8 @@ mod tests {
             .unwrap()
             .word
             .unwrap();
+        // The device that left is told nothing of itself.
+        assert!(seen(&s, 2).notices.is_empty());
         for n in [0, 1] {
             assert!(seen(&s, n).notices.is_empty());
             give(&mut s, n, &word);

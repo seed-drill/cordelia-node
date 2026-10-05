@@ -39,7 +39,7 @@ use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::fingerprint;
 use cordelia_storage::acts;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept, State};
+use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
 
 use crate::adding::{self, WouldAdd};
 use crate::at_relays;
@@ -78,7 +78,8 @@ fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
         .and_then(|seed| <[u8; 32]>::try_from(seed).ok());
     match on_disk {
         Some(seed) if seed != *state.identity.seed() => Err(ApiError::Conflict(
-            "this device was given a new key, and the node still runs under the old one: stop              the node and start it again (`cordelia start`)."
+            "this device was given a new key, and the node still runs under the old one: stop \
+             the node and start it again (`cordelia start`)."
                 .into(),
         )),
         _ => Ok(()),
@@ -514,10 +515,10 @@ async fn fetch(state: &AppState) -> bool {
 
 /// What a command that makes a statement is handed before it asks
 /// anything (decision 2026-10-04 §5, §7.1): the statement that the device
-/// has applied, as its signed bytes; the change entry it keeps; each
-/// record of an addition it keeps, as its signed bytes; and, in a fork,
-/// the statement made apart and its entry. The command reads what it
-/// shows from those bytes.
+/// has applied, as its signed bytes; the change entry it keeps; the
+/// record of each device added since that counts, as its signed bytes
+/// ([`asked_about`]); and, in a fork, the statement made apart and its
+/// entry. The command reads what it shows from those bytes.
 ///
 /// Before that the device shows its change entry to each relay and
 /// fetches, for two minutes at most, and what it could not fetch is said
@@ -591,9 +592,9 @@ pub async fn change_prepare(
             Some(hex::encode(read.to_bytes().map_err(|e| refused(e.into()))?))
         }
     };
-    let additions: Vec<serde_json::Value> = held_rows::additions(&conn)?
+    let additions: Vec<String> = asked_about(&held_rows::additions(&conn)?)
         .into_iter()
-        .map(|kept| json!({ "record": hex::encode(&kept.record), "counted": kept.counted }))
+        .map(|kept| hex::encode(&kept.record))
         .collect();
     let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
     Ok(HttpResponse::Ok().json(json!({
@@ -608,6 +609,16 @@ pub async fn change_prepare(
         "could_not_fetch": could_not_fetch,
         "look": seen,
     })))
+}
+
+/// The records of additions that a command asks a person about at a
+/// change (decision 2026-10-04 §6): for each device added since the
+/// statement that counts, the record it counts by, in the order the
+/// device saw them. A key counts by one record. A record that does not
+/// count adds no device: its key is in no list, and nothing is asked of
+/// it.
+fn asked_about(kept: &[KeptAddition]) -> Vec<&KeptAddition> {
+    kept.iter().filter(|record| record.counted).collect()
 }
 
 /// A change entry that the device keeps, checked as it is read.
@@ -673,4 +684,64 @@ pub async fn change_make(
         "carried": applied.carried,
         "no_version": applied.no_version,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use cordelia_crypto::addition::Addition;
+    use cordelia_crypto::statement::Device;
+
+    use crate::adding::add_device;
+    use crate::several::{Machine, Several};
+    use crate::take::take;
+
+    /// A command asks about each device added since the statement that
+    /// counts, once, and about no key whose record does not count: that
+    /// key is in no list of the change, whatever a person would say.
+    #[test]
+    fn test_a_change_asks_about_each_device_added_since_that_counts_and_no_other() {
+        let mut s = Several::of_one_person(3);
+        // Device 1 was added by device 0, which made the phrase, and adds
+        // device 9: device 9 counts, and may add nothing. It writes a
+        // record all the same, of device 10, which does not count.
+        let now = s.tick();
+        let nine = Machine::new(9);
+        let by_one = add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now).unwrap();
+        let record = by_one.record.clone().unwrap();
+        take(&s[0].conn, &s[0].identity, &record, now).unwrap();
+        let ten = Machine::new(10);
+        let statement = s[0].held().statement.statement;
+        let record = Addition::under(
+            &statement,
+            Device::new(ten.key(), "device 10").unwrap(),
+            nine.key(),
+            now as u64,
+        )
+        .unwrap()
+        .sign(&nine.identity)
+        .unwrap();
+        crate::person::see_addition(&s[0].conn, &record, now).unwrap();
+        let kept = held_rows::additions(&s[0].conn).unwrap();
+        let not_counted: Vec<[u8; 32]> = kept
+            .iter()
+            .filter(|record| !record.counted)
+            .map(|record| record.key)
+            .collect();
+        assert_eq!(not_counted, [ten.key()]);
+
+        let asked: Vec<[u8; 32]> = asked_about(&kept).iter().map(|record| record.key).collect();
+        assert_eq!(asked.len(), kept.len() - 1);
+        for counts in [s.key(1), s.key(2), nine.key()] {
+            assert!(asked.contains(&counts));
+        }
+        assert!(!asked.contains(&ten.key()));
+        // Each key once: a key counts by one record.
+        let mut once = asked.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(once.len(), asked.len());
+        assert!(asked_about(&[]).is_empty());
+    }
 }

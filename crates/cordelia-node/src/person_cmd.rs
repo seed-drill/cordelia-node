@@ -48,7 +48,7 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
-use crate::terminal;
+use crate::terminal::Terminal;
 use crate::{Told, api_post, api_post_told};
 
 /// Whose words a recovery phrase is, and what it is for: said wherever
@@ -183,19 +183,19 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// before anything is made. The node is handed the first statement's
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
-    terminal::require()?;
+    let at = Terminal::at()?;
     let seen = look(config_path)?;
     let among = text(&seen, "among").to_string();
     println!("{WHOSE_WORDS}\n");
     let agreed = match among.as_str() {
         "no_phrase" => true,
-        "alone" => terminal::yes(
+        "alone" => at.yes(
             "This replaces the recovery phrase that this device follows: the old one stops \
              working here, and what the relays hold under it is left behind.",
         )?,
         "several" => {
             let others = seen["others"].as_u64().unwrap_or(0);
-            terminal::yes(&format!(
+            at.yes(&format!(
                 "This device leaves the {others} device{} it is with and starts again alone, \
                  under a new phrase. It says so to {} first. It still holds what it held, and \
                  is still listed there: removing it, with the old phrase, is what cuts it off.",
@@ -222,7 +222,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     Device::new(this_device, &label)?;
 
     let phrase = Phrase::generate()?;
-    terminal::once(
+    at.once(
         "The recovery phrase, shown once:",
         phrase.words()?.as_str(),
         "Write the twelve words down, in their order, and keep them where only you can \
@@ -230,7 +230,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          screen. ",
     )?;
     let made = {
-        let typed = terminal::phrase(
+        let typed = at.phrase(
             "Type the twelve words back, from what you wrote (what you type is not shown): ",
         )?;
         // The same words give the same key: the words themselves are
@@ -284,14 +284,14 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 /// the person's (decision 2026-10-04 §6). The phrase is not typed to
 /// add: a device that is in vouches for the new one.
 pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
-    terminal::require()?;
+    let at = Terminal::at()?;
     let device = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
     let body = json!({ "device": key, "label": name });
     let would = api_post(config_path, "/api/v1/devices/add/look", body.clone())?;
     let agreed = match text(&would, "would") {
-        "hand_again" => terminal::yes(&format!(
+        "hand_again" => at.yes(&format!(
             "{} is one of your devices already: this hands it the last change again, and \
              adds nothing.",
             named(text(&would, "label"), &device)
@@ -307,7 +307,7 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
             if would["counts_already"] == true {
                 println!("This key counts as one of your devices already, by an earlier addition.");
             }
-            terminal::yes(&format!(
+            at.yes(&format!(
                 "This gives {} every name's memory, and the means to read what your devices \
                  write from now on.",
                 named(label, &device)
@@ -342,7 +342,7 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
 /// (decision 2026-10-04 §5.1). What it does goes by the state this
 /// device is in, and its yes says which.
 pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
-    terminal::require()?;
+    let at = Terminal::at()?;
     let typed = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
@@ -389,7 +389,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
              change it can apply. Anything else moves nothing."
         ),
     };
-    if !terminal::yes(&says)? {
+    if !at.yes(&says)? {
         println!("{NOT_A_YES}");
         return Ok(());
     }
@@ -434,12 +434,10 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
 /// says yes to is shown on this device no more.
 pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
     if clear {
-        terminal::require()?;
+        let at = Terminal::at()?;
+        return clear_notices(config_path, &at, &look(config_path)?);
     }
     let seen = look(config_path)?;
-    if clear {
-        return clear_notices(config_path, &seen);
-    }
     for line in devices_lines(&seen) {
         println!("{line}");
     }
@@ -631,14 +629,14 @@ fn devices_lines(seen: &Value) -> Vec<String> {
 
 /// Ask of each notice whether it is cleared on this device, and clear
 /// those that a person says yes to.
-fn clear_notices(config_path: &str, seen: &Value) -> anyhow::Result<()> {
+fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Result<()> {
     let notices: Vec<&Value> = list(seen, "notices").collect();
     if notices.is_empty() {
         println!("There is nothing to clear on this device.");
         return Ok(());
     }
     for notice in notices {
-        let clears = terminal::yes(&format!(
+        let clears = at.yes(&format!(
             "\n{}.\nClearing it changes what this device shows, and nothing else.",
             text(notice, "says")
         ))?;
@@ -670,26 +668,26 @@ enum Which {
 
 /// `cordelia remove-device <key>` (decision 2026-10-04 §7.1).
 pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
-    terminal::require()?;
+    let at = Terminal::at()?;
     let device = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia devices` lists one: {e}")
     })?;
-    change(config_path, &Which::Remove(device))
+    change(config_path, &at, &Which::Remove(device))
 }
 
 /// `cordelia renew`: a new secret for the devices that stay, with no
 /// device removed but those added since that a person says go (decision
 /// 2026-10-04 §6, §7.1).
 pub fn renew(config_path: &str) -> anyhow::Result<()> {
-    terminal::require()?;
-    change(config_path, &Which::Renew)
+    let at = Terminal::at()?;
+    change(config_path, &at, &Which::Renew)
 }
 
 /// `cordelia settle`: settle two changes that were made apart, on a
 /// device that has seen both (decision 2026-10-04 §4.5).
 pub fn settle(config_path: &str) -> anyhow::Result<()> {
-    terminal::require()?;
-    change(config_path, &Which::Settle)
+    let at = Terminal::at()?;
+    change(config_path, &at, &Which::Settle)
 }
 
 /// What the node hands a command that makes a change: read from the
@@ -704,8 +702,9 @@ struct Handed {
     /// The statement made apart, its entry, and what the entry is named
     /// by, where the device is in a fork.
     apart: Option<(SignedStatement, CheckedEntry, String)>,
-    /// Each record of an addition that the device counts, of a key that
-    /// the statement lists in neither list.
+    /// The record of each device added since that counts, of a key that
+    /// the statement lists in neither list: what the node says a person
+    /// is asked about.
     added: Vec<SignedAddition>,
 }
 
@@ -724,10 +723,8 @@ impl Handed {
         };
         let mut added: Vec<SignedAddition> = Vec::new();
         for kept in list(handed, "additions") {
-            if kept["counted"] != true {
-                continue;
-            }
-            let record = SignedAddition::from_bytes(&hex::decode(text(kept, "record"))?)?;
+            let record =
+                SignedAddition::from_bytes(&hex::decode(kept.as_str().unwrap_or_default())?)?;
             record.verify()?;
             let key = record.addition.device.key;
             let known = applied.statement.lists(&key)
@@ -779,7 +776,12 @@ enum Answer {
 /// Ask whether a device stays or is removed. `suggested` is the answer
 /// that pressing Enter gives, where one is suggested. `neither` says
 /// that the third answer is on offer: the device is in no list.
-fn asks_of(says: &str, suggested: Option<Answer>, neither: bool) -> anyhow::Result<Answer> {
+fn asks_of(
+    at: &Terminal,
+    says: &str,
+    suggested: Option<Answer>,
+    neither: bool,
+) -> anyhow::Result<Answer> {
     let third = match neither {
         true => ", or `neither` (it is in no list, and is added again by hand)",
         false => "",
@@ -790,7 +792,7 @@ fn asks_of(says: &str, suggested: Option<Answer>, neither: bool) -> anyhow::Resu
         _ => " [no answer is suggested]",
     };
     loop {
-        let typed = terminal::answer(&format!(
+        let typed = at.answer(&format!(
             "{says}\n  Type `stays` or `removed`{third}{enter}: "
         ))?;
         match (typed.as_str(), suggested) {
@@ -807,7 +809,7 @@ fn asks_of(says: &str, suggested: Option<Answer>, neither: bool) -> anyhow::Resu
 /// prepared is shown, a person answers, the lists are shown from the
 /// bytes that will be signed, and then the yes and the phrase. Where a
 /// statement arrived meanwhile, nothing is made and it asks again.
-fn change(config_path: &str, which: &Which) -> anyhow::Result<()> {
+fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()> {
     let settles = matches!(which, Which::Settle);
     loop {
         println!(
@@ -828,7 +830,7 @@ fn change(config_path: &str, which: &Which) -> anyhow::Result<()> {
             println!("  Could not fetch: {}.", line.as_str().unwrap_or_default());
         }
         let handed = Handed::of(&handed)?;
-        let prepared = asked(&handed, which)?;
+        let prepared = asked(at, &handed, which)?;
 
         // The lists, from the bytes that the phrase will sign.
         let signs = Statement::from_bytes(prepared.bytes())?;
@@ -839,11 +841,11 @@ fn change(config_path: &str, which: &Which) -> anyhow::Result<()> {
         for line in lists_shown(&signs, &handed)? {
             println!("{line}");
         }
-        if !terminal::yes("\nMake this change?")? {
+        if !at.yes("\nMake this change?")? {
             println!("{NOT_A_YES}");
             return Ok(());
         }
-        let entry = signed(prepared, &handed)?;
+        let entry = signed(at, prepared, &handed)?;
 
         // The phrase is dropped: the node is handed the entry.
         let made = api_post_told(
@@ -884,7 +886,7 @@ fn change(config_path: &str, which: &Which) -> anyhow::Result<()> {
 
 /// Show what the node handed, ask of each device what a person has to
 /// say of it, and prepare the statement, with no phrase.
-fn asked(handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
+fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
     let own = handed.this_device;
     let applied = &handed.applied.statement;
     let mut stay: Vec<Device> = Vec::new();
@@ -931,7 +933,7 @@ fn asked(handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
                     (false, false) => "the change made apart",
                 }
             );
-            match asks_of(&says, None, true)? {
+            match asks_of(at, &says, None, true)? {
                 Answer::Stays => stay.push(device.clone()),
                 Answer::Removed => removed.push(device.key),
                 Answer::Neither => {}
@@ -1004,7 +1006,7 @@ fn asked(handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
             }
         );
         let suggested = (!by_the_one_that_goes).then_some(Answer::Stays);
-        match asks_of(&says, suggested, false)? {
+        match asks_of(at, &says, suggested, false)? {
             Answer::Stays => stay.push(added.device.clone()),
             Answer::Removed => removed.push(key),
             Answer::Neither => {}
@@ -1063,12 +1065,12 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
 /// A mistyped phrase is told from a wrong one: words that are no
 /// recovery phrase fail its checksum, and may be typed again. A phrase
 /// that is one, and not the one that this device follows, makes nothing.
-fn signed(prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
+fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
     let mut tries = 0;
     let phrase = loop {
         tries += 1;
         let typed =
-            terminal::phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
+            at.phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
         match Phrase::parse(&typed) {
             Ok(phrase) => break phrase,
             Err(e) if tries < PHRASE_TRIES => {
@@ -1175,7 +1177,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
 /// everything else that it held of its person. It then follows no
 /// phrase.
 pub fn new_key(config_path: &str) -> anyhow::Result<()> {
-    terminal::require()?;
+    let at = Terminal::at()?;
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     // The configuration as its file has it, to write back with the new
@@ -1201,7 +1203,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         ("no_phrase", _) => "It follows no recovery phrase, and has nothing to leave.".into(),
         _ => "It has stopped, and says nothing to the devices it was with.".into(),
     };
-    let agreed = terminal::yes(&format!(
+    let agreed = at.yes(&format!(
         "This gives this device a new key. {leaves}\nIt keeps its memory folders and their \
          mappings, and forgets everything else that it held of your devices: the phrase it \
          followed, every secret, and what its folders had agreed. It then follows no recovery \
@@ -1243,7 +1245,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
             );
         }
         if !not_sent.is_empty() {
-            let goes_on = terminal::yes(
+            let goes_on = at.yes(
                 "Under a new key nothing more can be sent in the old one's name. Go on \
                  without having told them?",
             )?;
@@ -1282,4 +1284,206 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
          this device from one that has one."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use cordelia_crypto::addition::Addition;
+    use cordelia_crypto::change_entry::open_statement;
+
+    const WORDS: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    /// A device under a phrase, at its second statement, which lists it
+    /// and one other device and removes one key: the statement, its
+    /// change entry, and what a node hands a command of them, with the
+    /// records in `additions`.
+    struct Fixture {
+        own: NodeIdentity,
+        listed: [u8; 32],
+        removed: [u8; 32],
+        statement: SignedStatement,
+        entry: CheckedEntry,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let phrase = Phrase::parse(WORDS).unwrap();
+            let own = NodeIdentity::from_seed([1; 32]).unwrap();
+            let removed = NodeIdentity::from_seed([2; 32]).unwrap().public_key();
+            let listed = NodeIdentity::from_seed([3; 32]).unwrap().public_key();
+            let first = first_entry(&phrase, &own.public_key(), "laptop").unwrap();
+            let read = |entry: &CheckedEntry| {
+                open_statement(
+                    entry,
+                    &phrase.public_key().unwrap(),
+                    &entry.channel,
+                    &phrase.statement_key().unwrap(),
+                )
+                .unwrap()
+            };
+            let one = read(&first.entry);
+            let mut stay = one.statement.devices.clone();
+            stay.push(Device::new(listed, "phone").unwrap());
+            let entry = prepare_change(&one, &own.public_key(), stay, &[removed])
+                .unwrap()
+                .sign(&phrase, &first.entry, None)
+                .unwrap();
+            Self {
+                listed,
+                removed,
+                statement: read(&entry),
+                entry,
+                own,
+            }
+        }
+
+        /// The record in which this device adds `key` under `label`.
+        fn adds(&self, key: [u8; 32], label: &str) -> SignedAddition {
+            let device = Device::new(key, label).unwrap();
+            Addition::under(&self.statement.statement, device, self.own.public_key(), 7)
+                .unwrap()
+                .sign(&self.own)
+                .unwrap()
+        }
+
+        fn handed(&self, statement: &SignedStatement, additions: &[SignedAddition]) -> Value {
+            let additions: Vec<String> = additions
+                .iter()
+                .map(|record| hex::encode(record.to_bytes().unwrap()))
+                .collect();
+            json!({
+                "this_device": encode_public_key(&self.own.public_key()).unwrap(),
+                "statement": hex::encode(statement.to_bytes().unwrap()),
+                "over": hex::encode(self.entry.id()),
+                "entry": hex::encode(self.entry.to_wire()),
+                "additions": additions,
+            })
+        }
+    }
+
+    /// What a command is handed is read from the signed bytes of each
+    /// thing, and each signature is checked before anything is shown: a
+    /// statement or a record that its key did not sign is refused. Of
+    /// the records, a person is asked about each key once, and about no
+    /// key that the statement lists, in either list.
+    #[test]
+    fn what_a_command_is_handed_is_checked_before_anything_is_shown() {
+        let f = Fixture::new();
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let (desktop, tablet) = (f.adds(key(5), "desktop"), f.adds(key(6), "tablet"));
+        let records = [
+            desktop.clone(),
+            f.adds(f.listed, "the phone again"),
+            f.adds(f.removed, "a removed key"),
+            tablet.clone(),
+            f.adds(key(5), "the desktop again"),
+        ];
+        let handed = Handed::of(&f.handed(&f.statement, &records)).unwrap();
+        assert_eq!(handed.this_device, f.own.public_key());
+        assert_eq!(handed.applied, f.statement);
+        assert_eq!(handed.held, f.entry);
+        assert!(handed.apart.is_none());
+        assert_eq!(handed.added, [desktop.clone(), tablet]);
+        // The labels that the device knows a key by.
+        assert_eq!(handed.label(&f.own.public_key()), "laptop");
+        assert_eq!(handed.label(&f.listed), "phone");
+        assert_eq!(handed.label(&key(5)), "desktop");
+        assert_eq!(handed.label(&key(9)), "");
+
+        // A statement that its phrase did not sign.
+        let mut forged = f.statement.clone();
+        forged.signature[0] ^= 1;
+        assert!(Handed::of(&f.handed(&forged, &[])).is_err());
+        // A record that its adder did not sign.
+        let mut forged = desktop.clone();
+        forged.signature[0] ^= 1;
+        assert!(Handed::of(&f.handed(&f.statement, &[forged])).is_err());
+        // The statement made apart, where there is one, likewise.
+        let mut with_apart = f.handed(&f.statement, &[]);
+        with_apart["apart_statement"] = with_apart["statement"].clone();
+        with_apart["apart_entry"] = with_apart["entry"].clone();
+        with_apart["apart"] = with_apart["over"].clone();
+        let handed = Handed::of(&with_apart).unwrap();
+        assert_eq!(handed.apart.unwrap().0, f.statement);
+        let mut forged = f.statement.clone();
+        forged.signature[0] ^= 1;
+        with_apart["apart_statement"] = hex::encode(forged.to_bytes().unwrap()).into();
+        assert!(Handed::of(&with_apart).is_err());
+        // And what is no entry at all.
+        let mut no_entry = f.handed(&f.statement, &[]);
+        no_entry["entry"] = "00".into();
+        assert!(Handed::of(&no_entry).is_err());
+    }
+
+    /// A statement's lists are shown from the statement: each device by
+    /// its label and the first four words of its key's fingerprint, and
+    /// each key that it removes beyond those of the statement before, by
+    /// its words.
+    #[test]
+    fn the_lists_that_are_shown_are_read_from_the_statement() {
+        let f = Fixture::new();
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let handed = Handed::of(&f.handed(&f.statement, &[f.adds(key(5), "desktop")])).unwrap();
+        let own = f.own.public_key();
+        // The next statement: the desktop stays, and a key is removed.
+        let mut stay = f.statement.statement.devices.clone();
+        stay.push(Device::new(key(5), "desktop").unwrap());
+        let prepared = prepare_change(&f.statement, &own, stay, &[key(6)]).unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        let shown = lists_shown(&signs, &handed).unwrap();
+        assert_eq!(
+            shown,
+            [
+                format!("  made on laptop ({})", fingerprint::shown(&own)),
+                "  devices (3):".to_string(),
+                format!("    laptop ({})  (this device)", fingerprint::shown(&own)),
+                format!("    phone ({})", fingerprint::shown(&f.listed)),
+                format!("    desktop ({})", fingerprint::shown(&key(5))),
+                "  removed keys (1):".to_string(),
+                format!("    ({})", fingerprint::shown(&key(6))),
+                "  and the 1 key that earlier changes removed".to_string(),
+            ]
+        );
+        // The statement that the device has applied, shown as it is: its
+        // one removed key is its own.
+        let shown = lists_shown(&f.statement.statement, &handed).unwrap();
+        assert_eq!(shown.len(), 6);
+        assert_eq!(shown[4], "  removed keys (1):");
+        assert_eq!(
+            shown[5],
+            format!("    ({})", fingerprint::shown(&f.removed))
+        );
+    }
+
+    /// What `cordelia status` says of a device and its person in a few
+    /// words: the words that the node gives where it has any, and
+    /// otherwise how many devices there are, counting those added since
+    /// that count.
+    #[test]
+    fn status_says_in_a_few_words_where_a_device_stands() {
+        let (short, says) = status_lines(&json!({
+            "short": "not added yet",
+            "says": ["no recovery phrase yet: memory stays on this machine."],
+        }));
+        assert_eq!(short, "not added yet");
+        assert_eq!(
+            says,
+            ["no recovery phrase yet: memory stays on this machine."]
+        );
+        let (short, says) = status_lines(&json!({ "change": 1, "devices": [{}], "says": [] }));
+        assert_eq!(
+            short,
+            "this device alone, under a recovery phrase (change 1)"
+        );
+        assert!(says.is_empty());
+        let (short, _) = status_lines(&json!({
+            "change": 4,
+            "devices": [{}, {}],
+            "added": [{ "counted": true }, { "counted": false }],
+        }));
+        assert_eq!(short, "3 devices under a recovery phrase (change 4)");
+    }
 }

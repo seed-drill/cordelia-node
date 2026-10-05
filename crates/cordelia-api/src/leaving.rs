@@ -537,6 +537,23 @@ mod tests {
         // Forgotten twice, there is nothing more to forget.
         assert!(!forget(&on.conn, &on.identity, false, now).unwrap());
         assert_eq!(among(&on.conn, &on.identity).unwrap(), Among::NoPhrase);
+
+        // A device in a fork keeps two change entries: it forgets both.
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        s.change(0, &[0, 1], &[2]);
+        let apart = s.change(1, &[0, 1, 2], &[]);
+        give(&mut s, 0, &apart);
+        let on = &s[0];
+        assert_eq!(on.state(), State::Fork);
+        for kept in [Kept::Latest, Kept::Apart] {
+            assert!(held_rows::change_entry(&on.conn, kept).unwrap().is_some());
+        }
+        assert!(forget(&on.conn, &on.identity, false, s.now).unwrap());
+        for kept in [Kept::Latest, Kept::Apart] {
+            assert_eq!(held_rows::change_entry(&on.conn, kept).unwrap(), None);
+        }
     }
 
     /// `cordelia phrase`, the node's half: a device that follows no
