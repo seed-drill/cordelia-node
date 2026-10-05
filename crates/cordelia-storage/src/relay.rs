@@ -191,6 +191,12 @@ pub struct Room {
     /// When each address made the relay take a channel it did not hold,
     /// within the last hour.
     new_channels: HashMap<IpAddr, Vec<i64>>,
+    /// The channels that addresses made the relay take in a write that is
+    /// not written for good yet. They are part of the address's share
+    /// while the write is under way, stay counted once it is written
+    /// ([`Room::written`]), and are taken back where it is undone
+    /// ([`Room::undone`]).
+    not_yet: Vec<(IpAddr, i64)>,
 }
 
 impl Room {
@@ -201,6 +207,7 @@ impl Room {
             max_bytes,
             max_channel_bytes: MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
             new_channels: HashMap::new(),
+            not_yet: Vec::new(),
         }
     }
 
@@ -215,9 +222,56 @@ impl Room {
         made.len() < NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR
     }
 
-    /// Count a channel that `address` made the relay take at `now`.
+    /// Count a channel that `address` made the relay take at `now`, in a
+    /// write that is under way: it is part of the address's share from
+    /// now, and is taken back where the write is undone.
     fn added_channel(&mut self, address: IpAddr, now: i64) {
         self.new_channels.entry(address).or_default().push(now);
+        self.not_yet.push((address, now));
+    }
+
+    /// What was taken is written for good: each address stays counted for
+    /// the channels it made the relay take in it.
+    ///
+    /// [`take`] and [`show`] call this themselves where the write is
+    /// their own. Whoever takes several entries in one transaction of its
+    /// own calls it once that is committed, and [`Room::undone`] where it
+    /// is not: an address is not counted for a channel that the relay did
+    /// not come to hold (decision 2026-10-04 §2.5).
+    pub fn written(&mut self) {
+        self.not_yet.clear();
+    }
+
+    /// What was taken was undone: no address is counted for it.
+    pub fn undone(&mut self) {
+        self.taken_back(0);
+    }
+
+    /// The channels that were counted in a write under way, after the
+    /// first `kept` of them, are counted no more.
+    fn taken_back(&mut self, kept: usize) {
+        for (address, at) in self.not_yet.split_off(kept.min(self.not_yet.len())) {
+            let Some(made) = self.new_channels.get_mut(&address) else {
+                continue;
+            };
+            if let Some(counted) = made.iter().rposition(|made_at| *made_at == at) {
+                made.remove(counted);
+            }
+            if made.is_empty() {
+                self.new_channels.remove(&address);
+            }
+        }
+    }
+
+    /// One write ended: `own` says whether it was a write of its own, or
+    /// part of a transaction of the caller's, `before` how many channels
+    /// were under way when it began, and `done` whether it was done.
+    fn ended(&mut self, own: bool, before: usize, done: bool) {
+        if !done {
+            self.taken_back(before);
+        } else if own {
+            self.written();
+        }
     }
 
     /// Forget each address that has made the relay take no channel within
@@ -408,7 +462,26 @@ pub fn check(bytes: &[u8]) -> Result<CheckedEntry, Refused> {
 ///
 /// Refused, with nothing changed, on a database in which a device follows
 /// a phrase.
+///
+/// An address is counted for a channel that it made the relay take only
+/// where the write is written for good. Where the write is part of a
+/// transaction of the caller's, the caller says what became of that
+/// ([`Room::written`], [`Room::undone`]).
 pub fn take(
+    conn: &Connection,
+    room: &mut Room,
+    entry: &CheckedEntry,
+    asker: &Asker,
+    now: i64,
+) -> Result<Taken, RelayError> {
+    let (own, before) = (conn.is_autocommit(), room.not_yet.len());
+    let done = taken_as_one(conn, room, entry, asker, now);
+    room.ended(own, before, done.is_ok());
+    done
+}
+
+/// [`take`], as one write: all of it happens, or none.
+fn taken_as_one(
     conn: &Connection,
     room: &mut Room,
     entry: &CheckedEntry,
@@ -825,10 +898,13 @@ pub fn show(
 ) -> Result<Shown, RelayError> {
     no_device_writes(conn)?;
     let to_write = would_take(conn, entry)?;
-    in_one_begun(conn, to_write, || {
+    let (own, before) = (conn.is_autocommit(), room.not_yet.len());
+    let done = in_one_begun(conn, to_write, || {
         no_device_writes(conn)?;
         Ok(shown(conn, room, entry, asker, now)?)
-    })
+    });
+    room.ended(own, before, done.is_ok());
+    done
 }
 
 /// Whether the relay would take `entry` where it is shown: it holds none
@@ -2325,6 +2401,90 @@ mod tests {
         take(&conn, &mut room, &small(3, 1, 5), &LISTED, NOW + 20).unwrap();
         assert_eq!(make_room(&conn, 2 * SMALL).unwrap(), [channel(3)]);
         assert_eq!(held(&conn), [1, 2]);
+    }
+
+    /// An address is counted for a channel that it made the relay take
+    /// only where the write is written for good. Inside a transaction of
+    /// the caller's the channels taken so far are part of the address's
+    /// share while the write is under way, stay counted where the caller
+    /// says that it is written, and are taken back where it is undone. A
+    /// write of its own that fails counts nothing either.
+    #[test]
+    fn test_an_address_is_counted_for_a_new_channel_only_once_it_is_written() {
+        let (conn, mut room) = relay();
+        let address = IpAddr::from([192, 0, 2, 1]);
+        let made = |room: &Room| room.new_channels.get(&address).map_or(0, Vec::len);
+
+        // A write of several entries, in a transaction of the caller's:
+        // nothing is counted yet, and the share is used all the same.
+        conn.execute_batch("BEGIN").unwrap();
+        for c in 0..256 {
+            assert_eq!(
+                take(&conn, &mut room, &small(c, 1, 5), &from(1), NOW).unwrap(),
+                Taken::Stored
+            );
+        }
+        assert_eq!((made(&room), room.not_yet.len()), (256, 256));
+        assert!(!room.may_add_channel(address, NOW));
+        assert_eq!(
+            take(&conn, &mut room, &small(256, 1, 5), &from(1), NOW).unwrap(),
+            Taken::Refused(Refused::OverAllowance)
+        );
+        assert_eq!(
+            show(&conn, &mut room, &small(257, 1, 5), &from(1), NOW).unwrap(),
+            Shown::Refused(Refused::OverAllowance)
+        );
+        // It is undone: the relay holds none of them, and the address is
+        // counted for none.
+        conn.execute_batch("ROLLBACK").unwrap();
+        room.undone();
+        assert_eq!(held(&conn), [0u16; 0]);
+        assert_eq!((made(&room), room.not_yet.len()), (0, 0));
+        assert!(room.may_add_channel(address, NOW));
+
+        // The same again, written: counted from then.
+        conn.execute_batch("BEGIN").unwrap();
+        for c in 0..3 {
+            take(&conn, &mut room, &small(c, 1, 5), &from(1), NOW).unwrap();
+        }
+        assert_eq!(
+            show(&conn, &mut room, &small(3, 1, 5), &from(1), NOW).unwrap(),
+            Shown::Taken
+        );
+        assert_eq!((made(&room), room.not_yet.len()), (4, 4));
+        conn.execute_batch("COMMIT").unwrap();
+        room.written();
+        assert_eq!((made(&room), room.not_yet.len()), (4, 0));
+
+        // A write of its own is counted as it is written.
+        take(&conn, &mut room, &small(4, 1, 5), &from(1), NOW).unwrap();
+        show(&conn, &mut room, &small(5, 1, 5), &from(1), NOW).unwrap();
+        assert_eq!((made(&room), room.not_yet.len()), (6, 0));
+
+        // One that fails counts nothing: the store refuses the entry.
+        conn.execute_batch(
+            "CREATE TRIGGER refuses BEFORE INSERT ON relay_channels
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+        assert!(take(&conn, &mut room, &small(6, 1, 5), &from(1), NOW).is_err());
+        assert!(show(&conn, &mut room, &small(7, 1, 5), &from(1), NOW).is_err());
+        assert_eq!((made(&room), room.not_yet.len()), (6, 0));
+        // Inside a transaction of the caller's, one that fails takes back
+        // what it added, and leaves what the others before it added.
+        conn.execute_batch("DROP TRIGGER refuses; BEGIN").unwrap();
+        take(&conn, &mut room, &small(8, 1, 5), &from(1), NOW).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuses BEFORE INSERT ON relay_channels
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+        assert!(take(&conn, &mut room, &small(9, 1, 5), &from(1), NOW).is_err());
+        assert_eq!((made(&room), room.not_yet.len()), (7, 1));
+        conn.execute_batch("COMMIT").unwrap();
+        room.written();
+        assert_eq!(made(&room), 7);
+        assert_eq!(held(&conn), [0, 1, 2, 3, 4, 5, 8]);
     }
 
     /// The 257th channel that one address makes a relay take in an hour

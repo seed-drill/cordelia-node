@@ -1354,6 +1354,14 @@ pub const RELAY_ENTRY_PULL_INTERVAL_SECS: u64 = REALTIME_SYNC_INTERVAL_SECS;
 /// so that one long channel does not keep every other waiting.
 pub const RELAY_ENTRY_PULL_PAGES: usize = 10;
 
+/// The most pages of the list of the channels it holds that a relay reads
+/// from a relay it works with in one pass (decision 2026-10-04 §2.4, item
+/// 6). A longer list is gone on with in the next pass, from where this
+/// one stopped, so that a list which never ends keeps a relay asking no
+/// longer than this, and nothing is remembered of more than a page of it
+/// at a time. Ten pages are ten thousand channels.
+pub const RELAY_CHANNEL_PAGES_PER_PASS: usize = 10;
+
 /// How many requests one connection may make in a minute on the streams of
 /// entries of channels from their secrets, all of them counted together:
 /// 3,000 (decision 2026-10-04 §16). A request beyond it is refused, and is
@@ -2051,6 +2059,7 @@ mod tests {
         assert_eq!(ENTRY_OFFER_INTERVAL_SECS, REPUSH_INTERVAL_SECS);
         assert_eq!(RELAY_ENTRY_PULL_INTERVAL_SECS, REALTIME_SYNC_INTERVAL_SECS);
         assert_eq!(RELAY_ENTRY_PULL_PAGES, 10);
+        assert_eq!(RELAY_CHANNEL_PAGES_PER_PASS, 10);
     }
 
     /// A connection may make 3,000 requests a minute on the streams of

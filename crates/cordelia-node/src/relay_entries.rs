@@ -80,6 +80,12 @@
 //! takes, from anyone, is passed on to the listed relays that are
 //! connected, but for the one it came from ([`RelayEntries::pass_on`]).
 //! Nothing is tried again: what did not arrive is pulled.
+//!
+//! A pass reads only so many pages of a relay's list, and the next goes
+//! on from where it stopped: a list that never ends does not keep a
+//! relay asking, and what is remembered of a list is a page of it at a
+//! time. A channel whose page cannot be taken is left for the next pass,
+//! and the channels after it are pulled all the same.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -90,7 +96,8 @@ use cordelia_core::NodeId;
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MIN_ENTRY_CONTENT_BYTES,
-    RELAY_CHANNELS_PAGE_MAX, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, entry_cost,
+    RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX, RELAY_ENTRY_PULL_PAGES,
+    SESSION_VALUE_BYTES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
@@ -250,6 +257,11 @@ pub enum Answer {
     NotNow,
     /// It could not be served: nothing is said.
     Nothing,
+    /// It is no request for the stream it came on: one of another
+    /// stream's, or one on the stream between relays from a peer that the
+    /// operator does not list. Nothing is said, and the bytes of its
+    /// frame count as pushed.
+    Stray,
 }
 
 impl Answer {
@@ -310,11 +322,18 @@ impl Places {
         }
     }
 
-    /// Keep for `peer` only the places in channels that it told of: what
-    /// it holds no more has no place.
-    fn keep_only(&mut self, peer: &NodeId, told: &HashSet<[u8; 32]>) {
+    /// Keep for `peer`, of the places in channels whose IDs are after
+    /// `from` and up to `to`, only those in channels that it told of: a
+    /// page of its list tells every channel it holds between those two,
+    /// and what it holds no more has no place.
+    fn keep_only(
+        &mut self,
+        peer: &NodeId,
+        (from, to): (&[u8; 32], &[u8; 32]),
+        told: &HashSet<[u8; 32]>,
+    ) {
         if let Some(kept) = self.by_peer.get_mut(peer) {
-            kept.retain(|channel, _| told.contains(channel));
+            kept.retain(|channel, _| channel <= from || channel > to || told.contains(channel));
         }
     }
 
@@ -380,6 +399,10 @@ pub struct RelayEntries {
     places: Mutex<Places>,
     /// The relays a pull is running from.
     pulling: Mutex<HashSet<NodeId>>,
+    /// Where the last pass stopped in the list of each relay that tells
+    /// of more channels than one pass reads: the next goes on after that
+    /// ID. A relay whose list was read to its end has none.
+    stopped_at: Mutex<HashMap<NodeId, [u8; 32]>>,
     /// How long a channel that found no room here is left before it is
     /// pulled again from a listed relay.
     ask_again: Duration,
@@ -395,6 +418,7 @@ impl RelayEntries {
             taken: Mutex::default(),
             places: Mutex::default(),
             pulling: Mutex::default(),
+            stopped_at: Mutex::default(),
             ask_again,
         }
     }
@@ -514,7 +538,7 @@ impl RelayEntries {
             (Protocol::RelayEntries, request) if who.listed => {
                 self.asked_by_a_relay(db, who.peer, request, now)
             }
-            _ => Answer::Nothing,
+            _ => Answer::Stray,
         }
     }
 
@@ -709,7 +733,7 @@ impl RelayEntries {
         // and its address's. Over either, it is refused whole.
         let bytes: u64 = push.entries.iter().map(|entry| counted(entry)).sum();
         if !who.listed
-            && let Err(over) = lock(rates).pushed(who.peer, who.address, bytes)
+            && let Err(over) = lock(rates).may_push(who.peer, who.address, bytes)
         {
             return Answer::Over(over);
         }
@@ -722,16 +746,27 @@ impl RelayEntries {
         let asker = who.asker();
         let from = who.listed.then_some(who.peer);
         match self.take_all(db, checked.iter().map(|entry| (entry, &asker)), from, now) {
-            Some(taken) => Answer::of(WireMessage::EntryPushed(EntryPushed {
-                answers: taken.iter().map(PushAnswer::from).collect(),
-            })),
+            Some(taken) => {
+                // Counted once what was pushed is written, and for every
+                // entry of it, whatever became of each. A push that the
+                // relay could not write is undone, and is not held
+                // against whoever sent it.
+                if !who.listed {
+                    lock(rates).count_pushed(who.peer, who.address, bytes);
+                }
+                Answer::of(WireMessage::EntryPushed(EntryPushed {
+                    answers: taken.iter().map(PushAnswer::from).collect(),
+                }))
+            }
             None => Answer::Nothing,
         }
     }
 
     /// Take each entry by the store's rule, as one write, and say what
     /// became of each. What was stored is kept to be passed on. `None`
-    /// where the store could not be written: then nothing was taken.
+    /// where the store could not be written: then nothing was taken, and
+    /// no address is counted for a channel that the write would have made
+    /// the relay take.
     fn take_all<'a>(
         &self,
         db: &Mutex<Connection>,
@@ -739,36 +774,58 @@ impl RelayEntries {
         from: Option<&NodeId>,
         now: i64,
     ) -> Option<Vec<Taken>> {
-        let mut all = Vec::new();
-        let mut stored = Vec::new();
-        {
+        let (all, stored) = {
             let db = db.lock().ok()?;
             let mut room = lock(&self.room);
-            // One transaction for all of them: one write to disk however
-            // many entries there are.
-            let batch = db
-                .unchecked_transaction()
-                .map_err(|e| tracing::warn!(error = %e, "could not begin storing entries"))
-                .ok()?;
-            for (entry, asker) in entries {
-                let taken = match entry {
-                    Ok(entry) => relay::take(&db, &mut room, entry, asker, now)
-                        .map_err(|e| tracing::warn!(error = %e, "could not take an entry"))
-                        .ok()?,
-                    Err(why) => Taken::Refused(why.clone()),
-                };
-                if let (Taken::Stored, Ok(entry)) = (&taken, entry) {
-                    stored.push(entry);
-                }
-                all.push(taken);
+            let written = Self::written_as_one(&db, &mut room, entries, now);
+            // An address is counted for the channels it made the relay
+            // take once they are written for good, and for none where
+            // the write was undone.
+            match written {
+                Some(_) => room.written(),
+                None => room.undone(),
             }
-            batch
-                .commit()
-                .map_err(|e| tracing::warn!(error = %e, "could not store entries"))
-                .ok()?;
-        }
+            written?
+        };
         self.took(stored.into_iter(), from);
         Some(all)
+    }
+
+    /// [`Self::take_all`], in the one transaction: what became of each
+    /// entry, and the entries that were stored. `None` where any of it
+    /// could not be written: the transaction is then undone as it is
+    /// dropped.
+    fn written_as_one<'a>(
+        db: &Connection,
+        room: &mut Room,
+        entries: impl Iterator<Item = (&'a Result<CheckedEntry, Refused>, &'a Asker)>,
+        now: i64,
+    ) -> Option<(Vec<Taken>, Vec<&'a CheckedEntry>)> {
+        let mut all = Vec::new();
+        let mut stored = Vec::new();
+        // One transaction for all of them: one write to disk however
+        // many entries there are.
+        let batch = db
+            .unchecked_transaction()
+            .map_err(|e| tracing::warn!(error = %e, "could not begin storing entries"))
+            .ok()?;
+        for (entry, asker) in entries {
+            let taken = match entry {
+                Ok(entry) => relay::take(db, room, entry, asker, now)
+                    .map_err(|e| tracing::warn!(error = %e, "could not take an entry"))
+                    .ok()?,
+                Err(why) => Taken::Refused(why.clone()),
+            };
+            if let (Taken::Stored, Ok(entry)) = (&taken, entry) {
+                stored.push(entry);
+            }
+            all.push(taken);
+        }
+        batch
+            .commit()
+            .map_err(|e| tracing::warn!(error = %e, "could not store entries"))
+            .ok()?;
+        Some((all, stored))
     }
 
     /// The relay took these entries, from `from` where that is a relay it
@@ -845,7 +902,7 @@ impl RelayEntries {
                     None => Answer::Nothing,
                 }
             }
-            _ => Answer::Nothing,
+            _ => Answer::Stray,
         }
     }
 
@@ -964,8 +1021,11 @@ impl RelayEntries {
         }
         // The place is kept: in the holding that the page says. (A page
         // that says the mark of no holding is of no holding, and no place
-        // is kept for it.)
-        if page.mark != relay::NO_MARK {
+        // is kept for it. Nor is one kept for a page with nothing in it
+        // where none was kept: a relay that tells of channels and hands
+        // nothing of them has this relay remember nothing.)
+        let kept_before = lock(&self.places).get(relay, &told.channel).is_some();
+        if page.mark != relay::NO_MARK && (kept_before || !page.entries.is_empty()) {
             lock(&self.places).keep(
                 relay,
                 told.channel,
@@ -1120,11 +1180,19 @@ impl RelayEntries {
             // known by that key.
             listed: self.lists(serving.peer),
         };
-        let request = match codec::read_frame(recv).await {
-            Ok(request) => request,
+        // The frame as its bytes: what is no request is counted by them.
+        let frame = match codec::read_raw_frame(recv).await {
+            Ok(frame) => frame,
             Err(e) => {
                 tracing::debug!(peer = %who.peer, error = %e, "failed to read a request for entries");
                 return None;
+            }
+        };
+        let request = match codec::decode_message(&frame) {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::debug!(peer = %who.peer, error = %e, "a frame on a stream of entries that is no message");
+                return Self::no_request(send, recv, &who, serving.rates, &frame);
             }
         };
         // What a proof is checked against is this connection's own: the
@@ -1162,7 +1230,45 @@ impl RelayEntries {
                 None
             }
             Answer::Nothing => None,
+            Answer::Stray => {
+                tracing::debug!(peer = %who.peer, ?protocol, "a request that is not for this stream");
+                Self::no_request(send, recv, &who, serving.rates, &frame)
+            }
         }
+    }
+
+    /// A frame that was read and is no request for its stream: bytes that
+    /// decode as no message, a request of another stream, or one on the
+    /// stream between relays from a peer that is not listed. Nothing is
+    /// answered. Its bytes count as pushed, and where they are over what
+    /// the peer may push the stream is refused: returns the breach.
+    fn no_request(
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        who: &Who,
+        rates: &Mutex<Rates>,
+        frame: &[u8],
+    ) -> Option<OverLimit> {
+        let over = Self::counted_as_pushed(rates, who, frame)?;
+        let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
+        let _ = send.reset(code);
+        let _ = recv.stop(code);
+        Some(over)
+    }
+
+    /// Count the bytes of a frame that is no request for its stream
+    /// against what `who` may push (decision 2026-10-04 §16): the relay
+    /// read them, and a megabyte that is read for nothing is still a
+    /// megabyte. They count as bytes that are no entry's do. Returns the
+    /// breach where they are over either allowance. A relay that the
+    /// operator lists is not limited.
+    fn counted_as_pushed(rates: &Mutex<Rates>, who: &Who, frame: &[u8]) -> Option<OverLimit> {
+        if who.listed {
+            return None;
+        }
+        lock(rates)
+            .pushed(who.peer, who.address, counted(frame))
+            .err()
     }
 
     /// Pass the entries that wait on to `relays`, the listed relays that
@@ -1210,51 +1316,82 @@ impl RelayEntries {
     /// Ask `relay`, a listed relay that is reached by `link`, which
     /// channels it holds, and pull what this relay lacks of them. One pull
     /// at a time runs from each relay.
+    ///
+    /// A pass reads at most RELAY_CHANNEL_PAGES_PER_PASS pages of the
+    /// relay's list. Where the list is longer, the next pass goes on after
+    /// the last ID that this one read, and starts again from the first
+    /// once the end is reached. Of the list itself, one page is held at a
+    /// time.
+    ///
+    /// A channel whose page was not the one asked for, could not be
+    /// stored, or was not answered, is left where it was, and the pass
+    /// goes on with the next channel: one channel does not keep those
+    /// after it waiting.
     pub async fn pull_from(&self, link: &impl Asked, relay: NodeId, db: &Mutex<Connection>) {
         let Some(_pulling) = Pulling::begin(&self.pulling, &relay) else {
             return;
         };
-        let mut told_of: HashSet<[u8; 32]> = HashSet::new();
-        let mut after = [0u8; 32];
+        let mut after = lock(&self.stopped_at)
+            .get(&relay)
+            .copied()
+            .unwrap_or([0u8; 32]);
         let mut stored = 0usize;
-        // Whether every channel that the relay holds was told of.
-        let whole = loop {
+        // Where the next pass goes on: `None` from the start.
+        let mut goes_on = Some(after);
+        for _ in 0..RELAY_CHANNEL_PAGES_PER_PASS {
             let asked = WireMessage::RelayChannelsAsk(RelayChannelsAsk {
                 after,
                 limit: RELAY_CHANNELS_PAGE_MAX,
             });
             let channels = match link.ask(asked).await {
                 Ok(WireMessage::RelayChannelsHeld(held)) => held.channels,
-                Ok(_) => break false,
+                Ok(_) => break,
                 Err(e) => {
                     tracing::debug!(peer = %relay, error = %e, "asking a relay what it holds failed");
-                    break false;
+                    break;
                 }
             };
+            // In the order of their IDs, each after the last: or this is
+            // not the list that was asked for, and nothing of it is used.
+            let in_order = channels.iter().try_fold(after, |last, told| {
+                (told.channel > last).then_some(told.channel)
+            });
+            if in_order.is_none() || channels.len() > RELAY_CHANNELS_PAGE_MAX as usize {
+                tracing::debug!(peer = %relay, "a list of channels that was not the one asked for");
+                goes_on = None;
+                break;
+            }
+            let from = after;
             for told in &channels {
-                // In the order of their IDs, each after the last: or this
-                // is not the list that was asked for.
-                if told.channel <= after {
-                    tracing::debug!(peer = %relay, "a list of channels that was not the one asked for");
-                    return;
-                }
                 after = told.channel;
-                told_of.insert(told.channel);
                 match self.pull_channel(link, &relay, db, told).await {
                     Ok(taken) => stored += taken,
+                    // It is left as it was, and asked for in a later
+                    // pass. The next channel is pulled all the same.
                     Err(e) => {
-                        tracing::debug!(peer = %relay, error = %e, "pulling a channel from a relay failed");
-                        return;
+                        tracing::debug!(peer = %relay, error = %e, "pulling a channel from a relay failed; going on with the next");
                     }
                 }
             }
-            if channels.len() < RELAY_CHANNELS_PAGE_MAX as usize {
-                break true;
+            // The page told of every channel that the relay holds between
+            // the ID that was asked after and its last one, or to the end
+            // of the list where it was not full: a place kept in any other
+            // channel between them is a place in one it holds no more.
+            let last = channels.len() < RELAY_CHANNELS_PAGE_MAX as usize;
+            let to = if last { [0xff; 32] } else { after };
+            let told: HashSet<[u8; 32]> = channels.iter().map(|told| told.channel).collect();
+            lock(&self.places).keep_only(&relay, (&from, &to), &told);
+            goes_on = (!last).then_some(after);
+            if last {
+                break;
             }
-        };
-        if whole {
-            lock(&self.places).keep_only(&relay, &told_of);
         }
+        match goes_on {
+            Some(after) if after != [0u8; 32] => {
+                lock(&self.stopped_at).insert(relay.clone(), after)
+            }
+            _ => lock(&self.stopped_at).remove(&relay),
+        };
         if stored > 0 {
             tracing::info!(peer = %relay, entries = stored, "pulled entries from a relay");
         }
@@ -1748,7 +1885,7 @@ mod tests {
                 None,
                 &mut Proved::default(),
             );
-            assert!(matches!(answer, Answer::Nothing), "{protocol:?}");
+            assert!(matches!(answer, Answer::Stray), "{protocol:?}");
         }
         assert_eq!(at.held(3), None);
     }
@@ -1970,7 +2107,7 @@ mod tests {
             Some(&session),
             &mut none,
         );
-        assert!(matches!(answer, Answer::Nothing));
+        assert!(matches!(answer, Answer::Stray));
         assert_eq!(none.len(), 0);
     }
 
@@ -2356,8 +2493,137 @@ mod tests {
             None,
             &mut Proved::default(),
         );
-        assert!(matches!(answer, Answer::Nothing));
+        assert!(matches!(answer, Answer::Stray));
         assert_eq!(at.held(3), None);
+    }
+
+    /// A frame that is no request for its stream counts as pushed, for
+    /// every byte of it and for no less than an entry: the relay read it.
+    /// Over what its sender may push, it is a breach, as a push is. A
+    /// relay that the operator lists is not limited.
+    #[test]
+    fn a_frame_that_is_no_request_counts_as_pushed() {
+        let at = relay_of(u64::MAX, &[9]);
+        let sent_by = |n: u8, frame: &[u8]| {
+            let peer = peer(n);
+            RelayEntries::counted_as_pushed(&at.rates, &at.who(&peer, n), frame)
+        };
+        // A few bytes count for what the smallest entry does.
+        assert_eq!(sent_by(1, &[1, 2, 3]), None);
+        assert_eq!(at.push_room(1), MINUTE - 1024);
+        assert_eq!(sent_by(1, &[]), None);
+        assert_eq!(at.push_room(1), MINUTE - 2 * 1024);
+        // A megabyte counts for a megabyte.
+        let megabyte = vec![0x5a; 1_000_000];
+        assert_eq!(sent_by(1, &megabyte), None);
+        assert_eq!(
+            at.push_room(1),
+            MINUTE - 2 * 1024 - (1_000_000 - 237 + 1024)
+        );
+        // Another does not fit what is left of the minute: nothing is
+        // counted for it, and it is a breach. The third cuts off.
+        assert_eq!(sent_by(1, &megabyte), None);
+        let room = at.push_room(1);
+        assert!(room < 1_000_000);
+        assert_eq!(sent_by(1, &megabyte), Some(OverLimit { cut_off: false }));
+        assert_eq!(at.push_room(1), room);
+        // It is one allowance with what is pushed as entries: two of the
+        // largest do not fit it either, and that is the second breach.
+        assert!(room < 2 * LARGEST);
+        assert!(!over(at.push(1, vec![largest(1, 1).to_wire(); 2])).cut_off);
+        assert_eq!(sent_by(1, &megabyte), Some(OverLimit { cut_off: true }));
+
+        // A relay that the operator lists is not counted.
+        assert!(at.entries.lists(&peer(9)));
+        for _ in 0..5 {
+            assert_eq!(sent_by(9, &megabyte), None);
+        }
+        assert_eq!(at.push_room(9), MINUTE);
+
+        // What is one: a request of another stream, on each of the four,
+        // and what is asked on the stream between relays by a peer that
+        // is not listed. Each is a stray one, and is not answered.
+        let stray = |n: u8, protocol: Protocol, request: WireMessage| {
+            let answer = at.answer(n, protocol, request, None, &mut Proved::default());
+            matches!(answer, Answer::Stray)
+        };
+        let pull = WireMessage::EntryPull(EntryPull {
+            channel: channel(1),
+            mark: relay::NO_MARK,
+            after: 0,
+            limit: 100,
+        });
+        for protocol in [
+            Protocol::EntryShow,
+            Protocol::ChannelProve,
+            Protocol::EntryPush,
+            Protocol::RelayEntries,
+        ] {
+            assert!(stray(2, protocol, pull.clone()), "{protocol:?}");
+        }
+        for request in requests_of_a_relay() {
+            assert!(stray(2, Protocol::RelayEntries, request.clone()));
+            // From the listed relay it is a request, and is answered.
+            assert!(!stray(9, Protocol::RelayEntries, request));
+        }
+        // A message that is no request at all, on any of them.
+        let an_answer = WireMessage::ChannelProved(ChannelProved { proved: true });
+        for protocol in [Protocol::EntryShow, Protocol::RelayEntries] {
+            assert!(stray(2, protocol, an_answer.clone()));
+            assert!(stray(9, protocol, an_answer.clone()));
+        }
+        // The control: a request on its own stream is none.
+        assert!(!stray(2, Protocol::EntryPull, pull));
+    }
+
+    /// A push that the relay cannot write is undone, and is counted for
+    /// nothing: not against the bytes that its sender may push, and not
+    /// against the channels that its address may make the relay take. A
+    /// push that is written is counted for both.
+    #[test]
+    fn a_push_that_cannot_be_written_is_counted_for_nothing() {
+        let at = relay();
+        // The store refuses every entry of the channel numbered 300.
+        lock(&at.db)
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuses BEFORE INSERT ON entries
+                 WHEN NEW.channel_id = X'{}'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+                hex::encode(channel(300))
+            ))
+            .unwrap();
+        // A push of two entries, each in a channel that the relay does
+        // not hold. The first is taken, the second cannot be written: the
+        // push is not answered, and nothing of it is held.
+        let cannot = vec![small(299, 1, 5).to_wire(), small(300, 1, 5).to_wire()];
+        for _ in 0..3 {
+            assert!(matches!(at.push(1, cannot.clone()), Answer::Nothing));
+        }
+        assert_eq!(at.held(299), None);
+        assert_eq!(at.used(), 0);
+        // Its bytes were not counted against what the peer may push.
+        assert_eq!(at.push_room(1), MINUTE);
+        // Nor was its address counted for the channel that was taken and
+        // undone: it may still make the relay take all of its share.
+        assert_eq!(NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, 256);
+        for from in [0u16, 100, 200] {
+            let to = (from + 100).min(256);
+            let answers =
+                pushed(at.push(1, (from..to).map(|c| small(c, 1, 5).to_wire()).collect()));
+            assert!(
+                answers.iter().all(|answer| *answer == PushAnswer::Stored),
+                "{from}: {answers:?}"
+            );
+        }
+        // Those were written, and are counted: the bytes, and the share.
+        assert_eq!(at.push_room(1), MINUTE - 256 * SMALL);
+        assert_eq!(
+            pushed(at.push(1, vec![small(299, 1, 5).to_wire()])),
+            [PushAnswer::Refused(EntryRefused::OverLimit)]
+        );
+        // A push that is refused for a limit is written all the same, as
+        // a push of nothing new: its bytes count.
+        assert_eq!(at.push_room(1), MINUTE - 257 * SMALL);
     }
 
     /// What a peer pushes counts against the bytes it may push in a
@@ -2575,7 +2841,7 @@ mod tests {
         let before = (at.held(1), at.held(2), at.held(3));
         for n in [1, 200] {
             for request in requests() {
-                assert!(matches!(ask(n, request), Answer::Nothing), "{n}");
+                assert!(matches!(ask(n, request), Answer::Stray), "{n}");
             }
         }
         for request in requests() {
@@ -2586,7 +2852,7 @@ mod tests {
                 None,
                 &mut having_proved(&[1, 2, 3]),
             );
-            assert!(matches!(answer, Answer::Nothing));
+            assert!(matches!(answer, Answer::Stray));
         }
         assert_eq!((at.held(1), at.held(2), at.held(3)), before);
 
@@ -2640,7 +2906,7 @@ mod tests {
             after: 0,
             limit: 100,
         });
-        assert!(matches!(ask(9, stray), Answer::Nothing));
+        assert!(matches!(ask(9, stray), Answer::Stray));
         for protocol in [
             Protocol::EntryShow,
             Protocol::ChannelProve,
@@ -2649,7 +2915,7 @@ mod tests {
         ] {
             for request in self::requests_of_a_relay() {
                 let answer = at.answer(9, protocol, request, None, &mut Proved::default());
-                assert!(matches!(answer, Answer::Nothing), "{protocol:?}");
+                assert!(matches!(answer, Answer::Stray), "{protocol:?}");
             }
         }
     }
@@ -2798,6 +3064,9 @@ mod tests {
         relay: &'a Relay,
         asked: Mutex<Vec<WireMessage>>,
         spoil: Option<fn(WireMessage) -> WireMessage>,
+        /// The requests that are not answered at all, as where the relay
+        /// is too slow: asking fails.
+        unanswered: Option<fn(&WireMessage) -> bool>,
     }
 
     impl<'a> Link<'a> {
@@ -2806,6 +3075,7 @@ mod tests {
                 relay,
                 asked: Mutex::default(),
                 spoil: None,
+                unanswered: None,
             }
         }
 
@@ -2825,6 +3095,12 @@ mod tests {
     impl Asked for Link<'_> {
         async fn ask(&self, request: WireMessage) -> Result<WireMessage, String> {
             lock(&self.asked).push(request.clone());
+            if self
+                .unanswered
+                .is_some_and(|unanswered| unanswered(&request))
+            {
+                return Err("timed out".into());
+            }
             // The asker is the one relay that `relay` lists: number 9.
             let answer = self.relay.answer(
                 9,
@@ -3223,13 +3499,13 @@ mod tests {
                 other => other,
             }
         }
-        for (spoil, of_the_first_listed) in [
-            (with_another as fn(WireMessage) -> WireMessage, 0),
-            (changed, 0),
-            (something_else, 0),
-            // The first that is told is the last by its ID: it is taken,
-            // and the list is not gone on with.
-            (turned, 1),
+        for (spoil, asked_for) in [
+            (with_another as fn(WireMessage) -> WireMessage, 2),
+            (changed, 2),
+            (something_else, 2),
+            // A list that is not in the order of its IDs is not the list
+            // that was asked for: no channel of it is asked for at all.
+            (turned, 0),
         ] {
             let this = relay_of(u64::MAX, &[8]);
             let link = Link {
@@ -3237,15 +3513,13 @@ mod tests {
                 ..Link::to(&other)
             };
             this.entries.pull_from(&link, peer(8), &this.db).await;
-            assert_eq!(this.used(), of_the_first_listed * SMALL);
+            assert_eq!(this.used(), 0);
             assert_eq!(this.held(77), None);
-            // The pass ended there: one page was asked for, and no more.
-            assert_eq!(link.pulls().len(), 1);
+            // Each channel's page was asked for once, and none taken: a
+            // page that is not taken does not end the pass.
+            assert_eq!(link.pulls().len(), asked_for);
             // And no place was kept for a page that was not taken.
-            assert_eq!(
-                lock(&this.entries.places).total(),
-                of_the_first_listed as usize
-            );
+            assert_eq!(lock(&this.entries.places).total(), 0);
         }
 
         // A page that says a place no further on than the one it was
@@ -3279,6 +3553,212 @@ mod tests {
             .pull_from(&Link::to(&other), peer(8), &this.db)
             .await;
         assert_eq!(this.used(), 2 * SMALL);
+    }
+
+    /// A channel whose page is not the one asked for, cannot be stored,
+    /// or is not answered, is left as it was, and the pass goes on with
+    /// the next channel: the channels after it arrive all the same. It is
+    /// asked for again in the next pass, from where it was.
+    #[tokio::test]
+    async fn a_channel_that_cannot_be_pulled_does_not_keep_the_others_waiting() {
+        let other = relay_of(u64::MAX, &[9]);
+        for c in 1..=5 {
+            other.hold(&small(c, 1, 5), NOW);
+        }
+        // The channels in the order of their IDs, which is the order they
+        // are told and pulled in. The one that fails is the second.
+        let mut by_id: Vec<u16> = (1..=5).collect();
+        by_id.sort_by_key(|c| channel(*c));
+        assert_eq!(
+            by_id[1], FAILS,
+            "the channel that fails is the second by its ID"
+        );
+        const FAILS: u16 = 2;
+        let arrived =
+            |this: &Relay| -> Vec<u16> { (1..=5).filter(|c| this.held(*c).is_some()).collect() };
+        let but_the_one: Vec<u16> = (1..=5).filter(|c| *c != FAILS).collect();
+
+        // Its page holds an entry of another channel: not the page.
+        fn not_the_page(answer: WireMessage) -> WireMessage {
+            match answer {
+                WireMessage::EntryPulled(mut page)
+                    if page
+                        .entries
+                        .first()
+                        .is_some_and(|entry| entry.starts_with(&channel(FAILS))) =>
+                {
+                    page.entries.push(small(77, 1, 5).to_wire().into());
+                    WireMessage::EntryPulled(page)
+                }
+                other => other,
+            }
+        }
+        // Its page is not answered.
+        fn unanswered(request: &WireMessage) -> bool {
+            matches!(request, WireMessage::RelayPull(pull) if pull.channel == channel(FAILS))
+        }
+        for link in [
+            Link {
+                spoil: Some(not_the_page),
+                ..Link::to(&other)
+            },
+            Link {
+                unanswered: Some(unanswered),
+                ..Link::to(&other)
+            },
+        ] {
+            let this = relay_of(u64::MAX, &[8]);
+            this.entries.pull_from(&link, peer(8), &this.db).await;
+            assert_eq!(arrived(&this), but_the_one);
+            assert_eq!(link.pulls().len(), 5, "each channel was asked for once");
+            assert_eq!(lock(&this.entries.places).total(), 4);
+            // The next pass asks for that one alone, from the start, and
+            // it arrives where the relay answers as it should.
+            let whole = Link::to(&other);
+            this.entries.pull_from(&whole, peer(8), &this.db).await;
+            let mark = other.held(FAILS).unwrap().mark;
+            assert_eq!(whole.pulls(), [(channel(FAILS), mark, 0)]);
+            assert_eq!(arrived(&this), [1, 2, 3, 4, 5]);
+        }
+
+        // A page that cannot be stored: the store refuses it. The others
+        // are stored, each in a write of its own.
+        let this = relay_of(u64::MAX, &[8]);
+        lock(&this.db)
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuses BEFORE INSERT ON entries
+                 WHEN NEW.channel_id = X'{}'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+                hex::encode(channel(FAILS))
+            ))
+            .unwrap();
+        let link = Link::to(&other);
+        this.entries.pull_from(&link, peer(8), &this.db).await;
+        assert_eq!(arrived(&this), but_the_one);
+        assert_eq!(link.pulls().len(), 5);
+        lock(&this.db)
+            .execute_batch("DROP TRIGGER refuses")
+            .unwrap();
+        this.entries.pull_from(&link, peer(8), &this.db).await;
+        assert_eq!(arrived(&this), [1, 2, 3, 4, 5]);
+    }
+
+    /// A relay's list of channels that never ends is read for so many
+    /// pages in a pass, and no more. The next pass goes on from where
+    /// that one stopped, and what is remembered of the list is where it
+    /// stopped: no place is kept for a channel of which nothing was
+    /// handed. A list that is longer than one pass reads is read to its
+    /// end over several, and then from the start again.
+    #[tokio::test]
+    async fn a_list_of_channels_that_never_ends_is_read_so_many_pages_at_a_time() {
+        /// A relay that tells of a thousand channels more whenever it is
+        /// asked, up to `ends_after` pages, and hands nothing of any.
+        struct Endless {
+            asked: Mutex<Vec<[u8; 32]>>,
+            /// How many pages of its list it has told, and how many pages
+            /// of channels it was asked for.
+            pages: Mutex<usize>,
+            pulls: Mutex<usize>,
+            ends_after: Option<usize>,
+        }
+        /// The ID numbered `n`, in the order of the IDs.
+        fn id(n: u64) -> [u8; 32] {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            id[31] = 1;
+            id
+        }
+        impl Asked for Endless {
+            async fn ask(&self, request: WireMessage) -> Result<WireMessage, String> {
+                match request {
+                    WireMessage::RelayChannelsAsk(ask) => {
+                        lock(&self.asked).push(ask.after);
+                        let pages = {
+                            let mut pages = lock(&self.pages);
+                            *pages += 1;
+                            *pages
+                        };
+                        let from = u64::from_be_bytes(ask.after[..8].try_into().unwrap());
+                        let last = self.ends_after.is_some_and(|ends| pages % ends == 0);
+                        let told = if last { 10 } else { 1000 };
+                        let now = now();
+                        Ok(WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                            channels: (1..=told)
+                                .map(|n| RelayChannel {
+                                    channel: id(from + n),
+                                    mark: [7; 8],
+                                    held_since: now,
+                                    used_at: now,
+                                    places: 1,
+                                })
+                                .collect(),
+                        }))
+                    }
+                    WireMessage::RelayPull(pull) => {
+                        *lock(&self.pulls) += 1;
+                        Ok(WireMessage::EntryPulled(EntryPulled {
+                            entries: Vec::new(),
+                            next: 0,
+                            mark: pull.mark,
+                        }))
+                    }
+                    _ => Err("not answered".into()),
+                }
+            }
+        }
+        assert_eq!(RELAY_CHANNEL_PAGES_PER_PASS, 10);
+        assert_eq!(RELAY_CHANNELS_PAGE_MAX, 1000);
+
+        let this = relay_of(u64::MAX, &[8]);
+        let endless = Endless {
+            asked: Mutex::default(),
+            pages: Mutex::default(),
+            pulls: Mutex::default(),
+            ends_after: None,
+        };
+        this.entries.pull_from(&endless, peer(8), &this.db).await;
+        // Ten pages, each after the last ID of the one before.
+        let asked = std::mem::take(&mut *lock(&endless.asked));
+        assert_eq!(asked.len(), 10);
+        assert_eq!(asked[0], [0u8; 32]);
+        for (n, after) in asked.iter().enumerate().skip(1) {
+            assert_eq!(*after, id(1000 * n as u64), "page {n}");
+        }
+        assert_eq!(*lock(&endless.pulls), 10_000);
+        // Nothing was handed, and nothing is remembered but where the
+        // pass stopped.
+        assert_eq!(this.used(), 0);
+        assert_eq!(lock(&this.entries.places).total(), 0);
+        assert_eq!(
+            lock(&this.entries.stopped_at).get(&peer(8)),
+            Some(&id(10_000))
+        );
+        // The next pass goes on from there, for ten pages more.
+        this.entries.pull_from(&endless, peer(8), &this.db).await;
+        let asked = std::mem::take(&mut *lock(&endless.asked));
+        assert_eq!(asked.len(), 10);
+        assert_eq!(asked[0], id(10_000));
+        assert_eq!(asked[9], id(19_000));
+        assert_eq!(lock(&this.entries.stopped_at).len(), 1);
+
+        // A list of 25 pages: read to its end in three passes, and the
+        // fourth starts from the first channel again.
+        let this = relay_of(u64::MAX, &[8]);
+        let long = Endless {
+            asked: Mutex::default(),
+            pages: Mutex::default(),
+            pulls: Mutex::default(),
+            ends_after: Some(25),
+        };
+        let mut pages = Vec::new();
+        for _ in 0..3 {
+            this.entries.pull_from(&long, peer(8), &this.db).await;
+            pages.push(std::mem::take(&mut *lock(&long.asked)).len());
+        }
+        assert_eq!(pages, [10, 10, 5]);
+        assert!(lock(&this.entries.stopped_at).is_empty());
+        this.entries.pull_from(&long, peer(8), &this.db).await;
+        assert_eq!(lock(&long.asked)[0], [0u8; 32]);
     }
 
     /// One pull at a time runs from each relay.

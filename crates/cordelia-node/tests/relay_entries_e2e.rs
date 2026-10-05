@@ -838,6 +838,70 @@ async fn an_address_may_make_a_relay_take_so_many_new_channels_an_hour() {
     );
 }
 
+/// What a connection sends on a stream of entries that is no request
+/// for it counts against what it may push, by its bytes: a frame that is
+/// no message, a request of another stream, and a request on the stream
+/// between relays from a peer that the operator does not list. None of
+/// them is answered. What they leave of the minute's allowance is what a
+/// push then finds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_is_no_request_for_its_stream_counts_as_pushed() {
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    // Bytes that are no message, as a frame on a stream of `protocol`.
+    // `true` where an answer came back.
+    let sends = |protocol: Protocol, frame: Vec<u8>| {
+        let conn = client.conn.clone();
+        async move {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            codec::write_protocol_byte(&mut send, protocol)
+                .await
+                .unwrap();
+            codec::write_raw_frame(&mut send, &frame).await.unwrap();
+            let _ = send.finish();
+            codec::read_frame(&mut recv).await.is_ok()
+        }
+    };
+    // 900 KB that are no message, twice, on two of the streams.
+    for protocol in [Protocol::EntryPush, Protocol::EntryShow] {
+        assert!(!sends(protocol, vec![0x5a; 900_000]).await);
+    }
+    // A request of another stream: a pull on the stream of a show. And
+    // what a relay asks a relay, from a peer that is not listed.
+    let pull = WireMessage::EntryPull(EntryPull {
+        channel: channel(1),
+        mark: NO_MARK,
+        after: 0,
+        limit: 100,
+    });
+    assert!(client.ask(Protocol::EntryShow, pull).await.is_err());
+    let asks = WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+        after: [0; 32],
+        limit: 1000,
+    });
+    assert!(client.ask(Protocol::RelayEntries, asks).await.is_err());
+
+    // Each counted for its bytes, and the two requests for the least an
+    // entry counts at. What is left of the minute is room for four
+    // entries of the largest size, and not for five.
+    let counted = 2 * (900_000 - 237 + 1024) + 2 * 1024;
+    let left = PUSH_BYTES_PER_PEER_PER_MINUTE - counted;
+    assert_eq!(left / LARGEST, 4);
+    let largest: Vec<Vec<u8>> = (0..5)
+        .map(|n| largest_by(&client.identity, 1, &format!("{n}.md")).to_wire())
+        .collect();
+    assert!(
+        client.push(largest.clone()).await.is_err(),
+        "what was no request was not counted as pushed"
+    );
+    assert_eq!(held(&relay, 1), None);
+    // The control: four fit, and are stored.
+    assert_eq!(
+        client.push(largest[..4].to_vec()).await.unwrap(),
+        [PushAnswer::Stored; 4]
+    );
+}
+
 /// A connection is counted under the address it was made from, for as
 /// long as it lasts. A client that has had its address's share of new
 /// channels moves its end of the connection to another address of this

@@ -156,6 +156,21 @@ impl Rates {
         address: std::net::IpAddr,
         bytes: u64,
     ) -> Result<(), OverLimit> {
+        self.may_push(peer, address, bytes)?;
+        self.count_pushed(peer, address, bytes);
+        Ok(())
+    }
+
+    /// Whether `peer` at `address` may push `bytes` of entries now: a
+    /// breach where either allowance has no room for them. Counts nothing
+    /// else. What is then taken is counted once it is written
+    /// ([`Self::count_pushed`]).
+    pub fn may_push(
+        &mut self,
+        peer: &NodeId,
+        address: std::net::IpAddr,
+        bytes: u64,
+    ) -> Result<(), OverLimit> {
         let mut limiters = self.both(peer, address);
         if limiters
             .iter_mut()
@@ -163,10 +178,16 @@ impl Rates {
         {
             return Err(Self::over(limiters));
         }
-        for limiter in &mut limiters {
-            limiter.write_bytes.check_and_record(bytes);
-        }
         Ok(())
+    }
+
+    /// Count `bytes` of entries that `peer` at `address` pushed, and that
+    /// [`Self::may_push`] allowed, against both allowances: whatever has
+    /// been counted against them since.
+    pub fn count_pushed(&mut self, peer: &NodeId, address: std::net::IpAddr, bytes: u64) {
+        for limiter in self.both(peer, address) {
+            limiter.write_bytes.record(bytes);
+        }
     }
 
     /// Whether anything is kept for `peer`: a count of what it sent.
