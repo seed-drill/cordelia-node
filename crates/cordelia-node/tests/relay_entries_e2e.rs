@@ -308,6 +308,21 @@ fn held(relay: &Node, c: u16) -> Option<HeldChannel> {
     cordelia_storage::relay::held_channel(&store_of(relay), &channel(c)).unwrap()
 }
 
+/// Time goes by for the channel numbered `c` as `relay` holds it: it was
+/// last used `secs` earlier than the relay has it. Written to the relay's
+/// database beside the relay, which reads the time each time it asks.
+fn used_earlier(relay: &Node, c: u16, secs: i64) {
+    let db = rusqlite::Connection::open(relay.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE relay_channels SET used_at = used_at - ?1 WHERE channel_id = ?2",
+            rusqlite::params![secs, channel(c).as_slice()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the relay does not hold channel {c}");
+}
+
 /// What `relay` holds of channels from their secrets, as entries are
 /// counted, and of the older kind, as its items are.
 fn holds(relay: &Node) -> (u64, u64) {
@@ -1071,6 +1086,9 @@ async fn two_relays_that_work_together_pass_entries_on_with_how_long_each_was_he
         [PushAnswer::Stored]
     );
     let since = held(&r1, 1).expect("relay1 holds it").held_since;
+    // The channel was last used two hours ago, as the first relay has it:
+    // a relay writes down a use at most once an hour.
+    used_earlier(&r1, 1, 2 * 60 * 60);
     // Some seconds go by before the second relay starts.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let started = std::time::SystemTime::now()
@@ -1140,12 +1158,12 @@ async fn two_relays_that_work_together_pass_entries_on_with_how_long_each_was_he
         || passed_on_by(&r2).then_some(()),
     );
 
-    // The first channel was proved at the second relay, some seconds
-    // after the first relay last saw it used. The first relay sees no
-    // proof of it: it is told, and keeps the later time, so that it does
-    // not drop as unused a channel that is in use at the other.
+    // The first channel was proved at the second relay, two hours after
+    // the first relay last saw it used. The first relay sees no proof of
+    // it: it is told, and keeps the later time, so that it does not drop
+    // as unused a channel that is in use at the other.
     let used_there = held(&r2, 1).unwrap().used_at;
-    assert!(used_there > since);
+    assert!(used_there >= started, "the proof was not written down");
     wait_for(
         "relay1 is told the channel is in use",
         &[&r1, &r2],

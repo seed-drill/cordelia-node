@@ -1321,6 +1321,15 @@ pub const NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR: usize = 256;
 /// for that long is dropped.
 pub const ENTRY_CHANNEL_UNUSED_DAYS: u32 = 90;
 
+/// How much later than the time a relay keeps for a channel a use of the
+/// channel must be, for the relay to write it down: more than an hour
+/// (decision 2026-10-04 §16). A proof, or an entry shown that the relay
+/// holds, is use of a channel, and a device makes both on every pass: if
+/// each were written, every one would be a write to the relay's disk for
+/// whoever asks. Against the ENTRY_CHANNEL_UNUSED_DAYS that an unused
+/// channel is kept, an hour is nothing.
+pub const ENTRY_CHANNEL_USED_STEP_SECS: u64 = 60 * 60;
+
 /// How often a relay drops the channels from their secrets that nobody
 /// uses (decision 2026-10-04 §2.5), and when it starts.
 /// Derived: as often as expired deletes are collected,
@@ -2099,6 +2108,12 @@ mod tests {
         assert_eq!(NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, 256);
         assert_eq!(NEW_CHANNELS_PER_ADDRESS_PER_HOUR, 16);
         assert_eq!(ENTRY_CHANNEL_UNUSED_DAYS, 90);
+        // When a channel was last used is written down at most once an
+        // hour: against 90 days, the hour is under a tenth of a percent.
+        assert_eq!(ENTRY_CHANNEL_USED_STEP_SECS, 3_600);
+        assert!(
+            ENTRY_CHANNEL_USED_STEP_SECS * 1000 < u64::from(ENTRY_CHANNEL_UNUSED_DAYS) * 86_400
+        );
         // One entry of the largest size is within what a channel may hold.
         assert!(entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
     }

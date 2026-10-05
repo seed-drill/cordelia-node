@@ -91,6 +91,14 @@
 //! it last shown that the relay holds. [`sweep_unused`] drops each channel
 //! that was last used 90 days ago or longer (§2.5).
 //!
+//! The time is written at most once an hour for a channel, and never an
+//! earlier time than the one kept (§16): a use is written down only where
+//! it is more than an hour later than what is kept. A device proves and
+//! shows on every pass, and each would otherwise be a write for whoever
+//! asks. Whether to write is decided by reading: an answer that writes
+//! nothing takes the database for reading alone. The same holds for the
+//! time that a relay the operator lists says.
+//!
 //! ## Relays that work together
 //!
 //! Relays that their operator lists together pass entries between them
@@ -112,10 +120,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
-    ENTRY_WIRE_OVERHEAD_BYTES, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
-    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES,
-    entry_cost,
+    CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_CHANNEL_USED_STEP_SECS,
+    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
+    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR,
+    RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES, entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError};
 use cordelia_crypto::proof;
@@ -129,6 +137,10 @@ const HOUR_SECS: i64 = 60 * 60;
 
 /// How long a channel that nobody uses is kept, in seconds.
 const UNUSED_SECS: i64 = ENTRY_CHANNEL_UNUSED_DAYS as i64 * 24 * 60 * 60;
+
+/// How much later than the time kept a use must be to be written, in
+/// seconds.
+const USED_STEP_SECS: i64 = ENTRY_CHANNEL_USED_STEP_SECS as i64;
 
 /// How many entries a page is read from the store at a time.
 const PAGE_READ: usize = 16;
@@ -687,19 +699,25 @@ pub fn listed_relay_says(
     channel: &[u8; 32],
     held_since: i64,
 ) -> Result<bool, RelayError> {
-    in_one(conn, || {
+    in_one_reading(conn, || {
         no_device_writes(conn)?;
         Ok(kept_the_earlier(conn, channel, held_since)?)
     })
 }
 
-/// [`listed_relay_says`], inside what the caller began.
+/// [`listed_relay_says`], inside what the caller began. What is kept is
+/// read first: where the time said is no earlier, nothing is written.
 fn kept_the_earlier(
     conn: &Connection,
     channel: &[u8; 32],
     held_since: i64,
 ) -> Result<bool, CordeliaError> {
     if held_since <= 0 {
+        return Ok(false);
+    }
+    // Read first: where nothing is to be kept, nothing is written.
+    let later = held_channel(conn, channel)?.is_some_and(|held| held.held_since > held_since);
+    if !later {
         return Ok(false);
     }
     conn.execute(
@@ -726,6 +744,11 @@ fn kept_the_earlier(
 /// other. Nothing is kept for a channel that this relay does not hold,
 /// and a time that is not after 0 is no time.
 ///
+/// The time is kept only where it is more than an hour later than the one
+/// this relay has (ENTRY_CHANNEL_USED_STEP_SECS): a relay is told of every
+/// channel in every pass, and what it is told is no reason to write each
+/// time. Where nothing is kept, the database is read and not written.
+///
 /// Refused, with nothing changed, on a database in which a device follows
 /// a phrase.
 pub fn listed_relay_used(
@@ -734,7 +757,7 @@ pub fn listed_relay_used(
     used_at: i64,
     now: i64,
 ) -> Result<bool, RelayError> {
-    in_one(conn, || {
+    in_one_reading(conn, || {
         no_device_writes(conn)?;
         Ok(kept_the_later(conn, channel, used_at, now)?)
     })
@@ -749,12 +772,7 @@ fn kept_the_later(
     used_at: i64,
     now: i64,
 ) -> Result<bool, CordeliaError> {
-    conn.execute(
-        "UPDATE relay_channels SET used_at = ?2 WHERE channel_id = ?1 AND used_at < ?2",
-        params![channel.as_slice(), used_at.min(now)],
-    )
-    .map(|rows| rows > 0)
-    .map_err(storage)
+    Ok(used_then(conn, channel, used_at.min(now))? == Some(true))
 }
 
 /// What the asker says of how long it has held `channel`, and of when it
@@ -791,6 +809,13 @@ fn said_by(
 ///
 /// Refused, with nothing changed, on a database in which a device follows
 /// a phrase.
+///
+/// **An entry that the relay does not take is answered by reading.** A
+/// device shows its entry on every pass, and nearly every time the relay
+/// holds it. Whether the relay would take the entry is read first, and
+/// decides how the database is taken: for writing where it would, and
+/// otherwise for reading alone, with nothing written but when the channel
+/// was last used, at most once an hour (§16).
 pub fn show(
     conn: &Connection,
     room: &mut Room,
@@ -798,10 +823,19 @@ pub fn show(
     asker: &Asker,
     now: i64,
 ) -> Result<Shown, RelayError> {
-    in_one(conn, || {
+    no_device_writes(conn)?;
+    let to_write = would_take(conn, entry)?;
+    in_one_begun(conn, to_write, || {
         no_device_writes(conn)?;
         Ok(shown(conn, room, entry, asker, now)?)
     })
+}
+
+/// Whether the relay would take `entry` where it is shown: it holds none
+/// from that author in that slot, or an earlier one.
+fn would_take(conn: &Connection, entry: &CheckedEntry) -> Result<bool, CordeliaError> {
+    let held = entries::author_cost(conn, &entry.channel, &entry.slot, &entry.author)?;
+    Ok(held.is_none_or(|(rev, _)| rev < entry.rev))
 }
 
 /// [`show`], inside what the caller began.
@@ -968,11 +1002,34 @@ pub fn pull(
 /// The channel was used at `now`: its key was proved, or an entry of it
 /// was shown that the relay holds. Returns whether the relay holds it.
 fn used(conn: &Connection, channel: &[u8; 32], now: i64) -> Result<bool, CordeliaError> {
+    Ok(used_then(conn, channel, now)?.is_some())
+}
+
+/// The channel was used at `at`, here or at a relay that the operator
+/// lists. `None` where the relay does not hold it, and otherwise whether
+/// the time was written down.
+///
+/// It is written only where it is more than an hour later than the time
+/// kept (decision 2026-10-04 §16), and so never an earlier time than that
+/// one. The time kept is read first, and decides: where nothing is
+/// written, no statement that writes is run, so the database is not taken
+/// for writing.
+fn used_then(
+    conn: &Connection,
+    channel: &[u8; 32],
+    at: i64,
+) -> Result<Option<bool>, CordeliaError> {
+    let Some(held) = held_channel(conn, channel)? else {
+        return Ok(None);
+    };
+    if at.saturating_sub(held.used_at) <= USED_STEP_SECS {
+        return Ok(Some(false));
+    }
     conn.execute(
-        "UPDATE relay_channels SET used_at = ?2 WHERE channel_id = ?1",
-        params![channel.as_slice(), now],
+        "UPDATE relay_channels SET used_at = ?2 WHERE channel_id = ?1 AND used_at < ?2",
+        params![channel.as_slice(), at],
     )
-    .map(|rows| rows > 0)
+    .map(|rows| Some(rows > 0))
     .map_err(storage)
 }
 
@@ -1036,9 +1093,37 @@ fn in_one<T>(
     conn: &Connection,
     work: impl FnOnce() -> Result<T, RelayError>,
 ) -> Result<T, RelayError> {
+    in_one_begun(conn, true, work)
+}
+
+/// [`in_one`], for work that mostly writes nothing: the database is taken
+/// for reading, and for writing only where the work comes to write
+/// (decision 2026-10-04 §16). So an answer that is read from what the
+/// relay holds waits for no writer, and makes none wait.
+///
+/// What the work reads is still what it writes over: where another
+/// writer came between, its write is refused, and nothing is changed.
+fn in_one_reading<T>(
+    conn: &Connection,
+    work: impl FnOnce() -> Result<T, RelayError>,
+) -> Result<T, RelayError> {
+    in_one_begun(conn, false, work)
+}
+
+/// Run `work` as one: in a transaction of its own, which takes the
+/// database for writing at once where `to_write` says so and otherwise
+/// when the work first writes, or in a savepoint inside a transaction of
+/// the caller's.
+fn in_one_begun<T>(
+    conn: &Connection,
+    to_write: bool,
+    work: impl FnOnce() -> Result<T, RelayError>,
+) -> Result<T, RelayError> {
     let storage = |e: rusqlite::Error| RelayError::Storage(storage(e));
-    let (begin, commit, undo) = if conn.is_autocommit() {
+    let (begin, commit, undo) = if conn.is_autocommit() && to_write {
         ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+    } else if conn.is_autocommit() {
+        ("BEGIN", "COMMIT", "ROLLBACK")
     } else {
         (
             "SAVEPOINT relay",
@@ -1102,6 +1187,7 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 24 * 60 * 60;
+    const HOUR: i64 = 60 * 60;
     /// What an entry with a small text is counted at: 256 bytes of content
     /// and what an entry takes beyond it.
     const SMALL: u64 = 256 + 1024;
@@ -1749,7 +1835,7 @@ mod tests {
         // what it does.
         conn.execute("DELETE FROM person", []).unwrap();
         assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap());
-        assert!(listed_relay_used(&conn, &channel(2), NOW + 30, NOW + 60).unwrap());
+        assert!(listed_relay_used(&conn, &channel(2), NOW + 2 * HOUR, NOW + 3 * HOUR).unwrap());
         assert_eq!(
             take(&conn, &mut room, &small(4, 1, 5), &from(1), NOW + 60).unwrap(),
             Taken::Stored
@@ -1760,7 +1846,7 @@ mod tests {
         );
         assert_eq!(
             sweep_unused(&conn, NOW + 365 * DAY).unwrap(),
-            [channel(2), channel(1), channel(4)]
+            [channel(1), channel(4), channel(2)]
         );
         assert!(make_room(&conn, 0).unwrap().is_empty());
     }
@@ -2545,82 +2631,231 @@ mod tests {
         assert_eq!(since(&conn, 2), Some(NOW + 91 * DAY));
     }
 
+    /// When a channel was last used is written at most once an hour, and
+    /// never an earlier time than the one kept: a proof that holds, an
+    /// entry shown that the relay holds, and one shown that it takes, each
+    /// within the hour of the time kept, leave that time as it is. One
+    /// second past the hour, the time is written.
+    #[test]
+    fn test_when_a_channel_was_used_is_written_at_most_once_an_hour_and_never_earlier() {
+        assert_eq!(USED_STEP_SECS, 3600);
+        let (conn, mut room) = relay();
+        let held_entry = small(1, 1, 5);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+        let proof = proof::make(&secret(1), &SESSION, &peer()).unwrap();
+        let proved = |at: i64| {
+            let found = prove(&conn, &channel(1), &SESSION, &peer(), &proof, at).unwrap();
+            assert_eq!(found, Proof::Holds { channel_held: true });
+        };
+        let shown_held = |at: i64| {
+            let mut room = Room::new(u64::MAX);
+            assert_eq!(
+                show(&conn, &mut room, &held_entry, &from(1), at).unwrap(),
+                Shown::Held
+            );
+        };
+
+        // Within the hour, to the second: nothing is written.
+        for at in [NOW, NOW + 1, NOW + 600, NOW + HOUR - 1, NOW + HOUR] {
+            proved(at);
+            shown_held(at);
+            assert_eq!(used_at(&conn, 1), Some(NOW), "{}", at - NOW);
+        }
+        // A second past it: a proof is written down.
+        proved(NOW + HOUR + 1);
+        assert_eq!(used_at(&conn, 1), Some(NOW + HOUR + 1));
+        // And then the next hour runs from there, for a show as well.
+        shown_held(NOW + 2 * HOUR);
+        shown_held(NOW + 2 * HOUR + 1);
+        assert_eq!(used_at(&conn, 1), Some(NOW + HOUR + 1));
+        shown_held(NOW + 2 * HOUR + 2);
+        assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR + 2));
+
+        // An earlier time is never written: a clock that was set back,
+        // by a minute and by a year.
+        let kept = NOW + 2 * HOUR + 2;
+        for at in [kept - 60, kept - 365 * DAY, 1, 0] {
+            proved(at);
+            shown_held(at);
+            assert_eq!(used_at(&conn, 1), Some(kept), "{at}");
+        }
+
+        // An entry that is shown and taken, in a channel that the relay
+        // holds: within the hour it is taken, and no time is written.
+        let later = small(1, 1, 6);
+        assert_eq!(
+            show(&conn, &mut room, &later, &from(1), kept + 60).unwrap(),
+            Shown::Taken
+        );
+        assert_eq!(ids(&conn, 1), [later.id()]);
+        assert_eq!(used_at(&conn, 1), Some(kept));
+        // Past the hour, it is.
+        let latest = small(1, 1, 7);
+        assert_eq!(
+            show(&conn, &mut room, &latest, &from(1), kept + HOUR + 1).unwrap(),
+            Shown::Taken
+        );
+        assert_eq!(used_at(&conn, 1), Some(kept + HOUR + 1));
+        // Since when the channel is held is as it was all along.
+        assert_eq!(since(&conn, 1), Some(NOW));
+    }
+
+    /// Where the time a channel was used is not written, nothing is: an
+    /// entry shown that the relay holds, another that it holds, a proof,
+    /// and what a listed relay says of when the channel was used, are each
+    /// answered while another connection holds the database for writing.
+    /// Only what has something to write waits for it.
+    #[test]
+    fn test_an_answer_that_writes_nothing_does_not_take_the_database_for_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.db");
+        let conn = db::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut room = Room::new(u64::MAX);
+        let held_entry = small(1, 1, 5);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+        let proof = proof::make(&secret(1), &SESSION, &peer()).unwrap();
+
+        // Another connection takes the database for writing, and keeps it.
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // Within the hour of the time kept: each is answered, by reading.
+        let at = NOW + 600;
+        assert_eq!(
+            show(&conn, &mut room, &held_entry, &from(2), at).unwrap(),
+            Shown::Held
+        );
+        assert!(matches!(
+            show(&conn, &mut room, &small(1, 1, 4), &from(2), at).unwrap(),
+            Shown::Another { .. }
+        ));
+        assert_eq!(
+            prove(&conn, &channel(1), &SESSION, &peer(), &proof, at).unwrap(),
+            Proof::Holds { channel_held: true }
+        );
+        assert!(!listed_relay_used(&conn, &channel(1), at, at).unwrap());
+        // And so is an earlier "held since" that is no earlier, and what
+        // a listed relay shows with both of its times.
+        assert!(!listed_relay_says(&conn, &channel(1), NOW + 5).unwrap());
+        assert_eq!(
+            show(&conn, &mut room, &held_entry, &listed(NOW + 5, at), at).unwrap(),
+            Shown::Held
+        );
+
+        // The control: what has something to write cannot, while the
+        // other connection holds the database. An entry that the relay
+        // would take, and a use that is past the hour.
+        assert!(show(&conn, &mut room, &small(1, 1, 6), &from(2), at).is_err());
+        let past = NOW + HOUR + 1;
+        assert!(show(&conn, &mut room, &held_entry, &from(2), past).is_err());
+        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &proof, past).is_err());
+        assert!(listed_relay_used(&conn, &channel(1), past, past).is_err());
+        assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).is_err());
+
+        // Once the other lets go, each is done.
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            show(&conn, &mut room, &held_entry, &from(2), past).unwrap(),
+            Shown::Held
+        );
+        assert_eq!(used_at(&conn, 1), Some(past));
+        assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap());
+    }
+
     // ── Relays that work together ────────────────────────────────────
 
     /// A channel was last used at the later of two times: when this relay
     /// saw its key proved or an entry of it shown, and when a relay that
     /// the operator lists says it was. No time later than this relay's
-    /// own clock is kept.
+    /// own clock is kept, and none that is not more than an hour later
+    /// than the one kept.
     #[test]
     fn test_a_channel_was_last_used_at_the_later_of_here_and_what_a_listed_relay_says() {
         let (conn, mut room) = relay();
         take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
         assert_eq!(used_at(&conn, 1), Some(NOW));
+        let clock = NOW + 3 * HOUR;
 
         // A listed relay says a later time, with no entry at all: kept.
-        assert!(listed_relay_used(&conn, &channel(1), NOW + 100, NOW + 500).unwrap());
-        assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+        assert!(listed_relay_used(&conn, &channel(1), NOW + 2 * HOUR, clock).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
         // An earlier time, and the same one, are not kept.
-        for earlier in [NOW + 99, NOW, NOW - 365 * DAY, NOW + 100] {
-            assert!(!listed_relay_used(&conn, &channel(1), earlier, NOW + 500).unwrap());
-            assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+        for earlier in [NOW + 2 * HOUR - 1, NOW, NOW - 365 * DAY, NOW + 2 * HOUR] {
+            assert!(!listed_relay_used(&conn, &channel(1), earlier, clock).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
         }
+        // Nor is a later one that is within the hour of the one kept, to
+        // the second. One second more, and it is.
+        for within in [NOW + 2 * HOUR + 1, NOW + 3 * HOUR - 1, NOW + 3 * HOUR] {
+            assert!(!listed_relay_used(&conn, &channel(1), within, NOW + DAY).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
+        }
+        assert!(listed_relay_used(&conn, &channel(1), NOW + 3 * HOUR + 1, NOW + DAY).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 3 * HOUR + 1));
         // A time that is not after 0 is no time.
         for none in [0, -1, i64::MIN] {
-            assert!(!listed_relay_used(&conn, &channel(1), none, NOW + 500).unwrap());
-            assert_eq!(used_at(&conn, 1), Some(NOW + 100));
+            assert!(!listed_relay_used(&conn, &channel(1), none, clock).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 3 * HOUR + 1));
         }
         // A time later than this relay's clock is kept as this relay's
         // time, and no later: also the latest there is.
-        assert!(listed_relay_used(&conn, &channel(1), NOW + 9000, NOW + 600).unwrap());
-        assert_eq!(used_at(&conn, 1), Some(NOW + 600));
-        assert!(!listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 600).unwrap());
-        assert!(listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 700).unwrap());
-        assert_eq!(used_at(&conn, 1), Some(NOW + 700));
+        assert!(listed_relay_used(&conn, &channel(1), NOW + 100 * HOUR, NOW + 5 * HOUR).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 5 * HOUR));
+        assert!(!listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 5 * HOUR).unwrap());
+        assert!(listed_relay_used(&conn, &channel(1), i64::MAX, NOW + 7 * HOUR).unwrap());
+        assert_eq!(used_at(&conn, 1), Some(NOW + 7 * HOUR));
 
         // With an entry that it passes on: one that is stored, one that
         // is already held, and one shown.
+        let clock = NOW + 50 * HOUR;
         take(
             &conn,
             &mut room,
             &small(1, 2, 5),
-            &listed(NOW, NOW + 800),
-            NOW + 5000,
+            &listed(NOW, NOW + 9 * HOUR),
+            clock,
         )
         .unwrap();
-        assert_eq!(used_at(&conn, 1), Some(NOW + 800));
+        assert_eq!(used_at(&conn, 1), Some(NOW + 9 * HOUR));
         assert_eq!(
             take(
                 &conn,
                 &mut room,
                 &small(1, 2, 5),
-                &listed(NOW, NOW + 900),
-                NOW + 5000
+                &listed(NOW, NOW + 11 * HOUR),
+                clock
             )
             .unwrap(),
             Taken::AlreadyHeld
         );
-        assert_eq!(used_at(&conn, 1), Some(NOW + 900));
+        assert_eq!(used_at(&conn, 1), Some(NOW + 11 * HOUR));
         assert!(matches!(
             show(
                 &conn,
                 &mut room,
                 &small(1, 2, 4),
-                &listed(NOW, NOW + 1000),
-                NOW + 5000
+                &listed(NOW, NOW + 13 * HOUR),
+                clock
             )
             .unwrap(),
             Shown::Another { .. }
         ));
-        assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
-        // An earlier time with an entry, and none said, change nothing.
-        for asker in [listed(NOW, NOW + 10), listed(NOW, 0), listed_since(NOW)] {
-            take(&conn, &mut room, &small(1, 2, 5), &asker, NOW + 5000).unwrap();
-            assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
+        assert_eq!(used_at(&conn, 1), Some(NOW + 13 * HOUR));
+        // An earlier time with an entry, one within the hour, and none
+        // said, change nothing.
+        for asker in [
+            listed(NOW, NOW + 10),
+            listed(NOW, NOW + 14 * HOUR),
+            listed(NOW, 0),
+            listed_since(NOW),
+        ] {
+            take(&conn, &mut room, &small(1, 2, 5), &asker, clock).unwrap();
+            assert_eq!(used_at(&conn, 1), Some(NOW + 13 * HOUR));
         }
         // An address says nothing of it: a push is no use of a channel.
-        take(&conn, &mut room, &small(1, 3, 5), &from(1), NOW + 6000).unwrap();
-        assert_eq!(used_at(&conn, 1), Some(NOW + 1000));
+        take(&conn, &mut room, &small(1, 3, 5), &from(1), NOW + 60 * HOUR).unwrap();
+        assert_eq!(used_at(&conn, 1), Some(NOW + 13 * HOUR));
         // None of it changed since when the channel is held, its mark, or
         // what it holds.
         assert_eq!(since(&conn, 1), Some(NOW));
@@ -2768,7 +3003,7 @@ mod tests {
         take(&conn, &mut room, &small(2, 3, 5), &from(1), NOW + 50).unwrap();
         take(&conn, &mut room, &small(2, 2, 6), &from(1), NOW + 50).unwrap();
         let proved = proof::make(&secret(7), &SESSION, &peer()).unwrap();
-        prove(&conn, &channel(7), &SESSION, &peer(), &proved, NOW + 900).unwrap();
+        prove(&conn, &channel(7), &SESSION, &peer(), &proved, NOW + DAY).unwrap();
         listed_relay_says(&conn, &channel(6), NOW - DAY).unwrap();
         // What the relay holds of the older kind is no part of it.
         conn.execute(
@@ -2800,7 +3035,7 @@ mod tests {
         let of = |c: u16| *all.iter().find(|told| told.channel == channel(c)).unwrap();
         assert_eq!((of(2).places, of(2).held.bytes), (4, 3 * SMALL));
         assert_eq!((of(1).places, of(1).held.bytes), (1, SMALL));
-        assert_eq!(of(7).held.used_at, NOW + 900);
+        assert_eq!(of(7).held.used_at, NOW + DAY);
         assert_eq!(of(6).held.held_since, NOW - DAY);
         // The places are what a puller is handed as its place: whoever
         // has pulled a channel to the end holds that place.
@@ -3027,7 +3262,7 @@ mod tests {
 
         // The channel's key, on this connection, for a channel it holds.
         assert!(
-            prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW + 60)
+            prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW + 2 * HOUR)
                 .unwrap()
                 .answer()
         );
@@ -3042,7 +3277,7 @@ mod tests {
                 &SESSION,
                 &peer(),
                 &for_another,
-                NOW + 60
+                NOW + 2 * HOUR
             )
             .unwrap()
             .answer()
@@ -3054,14 +3289,14 @@ mod tests {
                 &SESSION,
                 &peer(),
                 &for_another,
-                NOW + 120
+                NOW + 4 * HOUR
             )
             .unwrap()
             .answer()
         );
         // And the proof of channel 1 is none for channel 2.
         assert!(
-            !prove(&conn, &channel(2), &SESSION, &peer(), &good, NOW + 120)
+            !prove(&conn, &channel(2), &SESSION, &peer(), &good, NOW + 4 * HOUR)
                 .unwrap()
                 .answer()
         );
@@ -3070,9 +3305,16 @@ mod tests {
         // another connection, and from here on another.
         let elsewhere = proof::make(&secret(1), &other_session, &peer()).unwrap();
         assert!(
-            !prove(&conn, &channel(1), &SESSION, &peer(), &elsewhere, NOW + 120)
-                .unwrap()
-                .answer()
+            !prove(
+                &conn,
+                &channel(1),
+                &SESSION,
+                &peer(),
+                &elsewhere,
+                NOW + 4 * HOUR
+            )
+            .unwrap()
+            .answer()
         );
         assert!(
             !prove(
@@ -3081,7 +3323,7 @@ mod tests {
                 &other_session,
                 &peer(),
                 &good,
-                NOW + 120
+                NOW + 4 * HOUR
             )
             .unwrap()
             .answer()
@@ -3105,23 +3347,30 @@ mod tests {
                 &SESSION,
                 &peer(),
                 &sent_by_this_end,
-                NOW + 120
+                NOW + 4 * HOUR
             )
             .unwrap()
             .answer()
         );
         let another = device(9).public_key();
         assert!(
-            !prove(&conn, &channel(1), &SESSION, &another, &good, NOW + 120)
-                .unwrap()
-                .answer()
+            !prove(
+                &conn,
+                &channel(1),
+                &SESSION,
+                &another,
+                &good,
+                NOW + 4 * HOUR
+            )
+            .unwrap()
+            .answer()
         );
 
         // What the caller is given is two things: whether the proof
         // holds, and whether the channel is held. What the other end is
         // told is one: yes only where both are so.
         let found = |c: u16, proof: &[u8; 64]| {
-            prove(&conn, &channel(c), &SESSION, &peer(), proof, NOW + 60).unwrap()
+            prove(&conn, &channel(c), &SESSION, &peer(), proof, NOW + 2 * HOUR).unwrap()
         };
         assert_eq!(found(1, &good), Proof::Holds { channel_held: true });
         assert_eq!(found(1, &for_another), Proof::Fails);
@@ -3153,16 +3402,23 @@ mod tests {
         let not_held = proof::make(&secret(3), &SESSION, &peer()).unwrap();
         assert!(proof::check(&channel(3), &SESSION, &peer(), &not_held));
         assert!(
-            !prove(&conn, &channel(3), &SESSION, &peer(), &not_held, NOW + 120)
-                .unwrap()
-                .answer()
+            !prove(
+                &conn,
+                &channel(3),
+                &SESSION,
+                &peer(),
+                &not_held,
+                NOW + 4 * HOUR
+            )
+            .unwrap()
+            .answer()
         );
         // And nothing is kept of having been asked.
         assert_eq!(held_channel(&conn, &channel(3)).unwrap(), None);
 
         // Only a proof that holds is use of a channel.
-        assert_eq!(used_at(&conn, 1), Some(NOW + 60));
-        assert_eq!(used_at(&conn, 2), Some(NOW + 60));
+        assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
+        assert_eq!(used_at(&conn, 2), Some(NOW + 2 * HOUR));
 
         // The channel is looked up only after the signature holds: with
         // nothing to look channels up in, a proof that fails is still
@@ -3238,7 +3494,15 @@ mod tests {
         // A proof that fails is nothing to remember, also where the
         // channel is held: this one was made over another session's
         // value. A connection that has only that is handed nothing.
-        let fails = prove(&conn, &channel(3), &[0x52; 32], &peer(), &proof, NOW + 120).unwrap();
+        let fails = prove(
+            &conn,
+            &channel(3),
+            &[0x52; 32],
+            &peer(),
+            &proof,
+            NOW + 2 * HOUR,
+        )
+        .unwrap();
         assert_eq!(fails, Proof::Fails);
         assert!(!fails.holds() && !fails.answer());
         assert_eq!(
@@ -3249,10 +3513,18 @@ mod tests {
 
         // Proved again now that it is held: yes, to the caller and to the
         // other end, and the channel was used.
-        let again = prove(&conn, &channel(3), &SESSION, &peer(), &proof, NOW + 180).unwrap();
+        let again = prove(
+            &conn,
+            &channel(3),
+            &SESSION,
+            &peer(),
+            &proof,
+            NOW + 3 * HOUR,
+        )
+        .unwrap();
         assert_eq!(again, Proof::Holds { channel_held: true });
         assert!(again.holds() && again.answer());
-        assert_eq!(used_at(&conn, 3), Some(NOW + 180));
+        assert_eq!(used_at(&conn, 3), Some(NOW + 3 * HOUR));
     }
 
     /// A channel is handed in pages, in the order the relay stored its

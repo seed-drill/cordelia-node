@@ -1312,6 +1312,7 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 24 * 60 * 60;
+    const HOUR: i64 = 60 * 60;
     /// What an entry with a small text is counted at: 256 bytes of content
     /// and what an entry takes beyond it.
     const SMALL: u64 = 256 + 1024;
@@ -1775,7 +1776,7 @@ mod tests {
     #[test]
     fn a_proof_holds_only_over_this_connections_value_and_for_the_peer_that_sends_it() {
         let at = relay();
-        at.hold(&small(1, 1, 5), NOW - 60);
+        at.hold(&small(1, 1, 5), NOW - 2 * HOUR);
         // The connection: the value its session exports, and the peer's
         // key as its certificate says it.
         let session = Session {
@@ -1815,7 +1816,7 @@ mod tests {
         }
         // None of it was use of the channel, and nothing is remembered of
         // a proof that failed.
-        assert_eq!(at.held(1).unwrap().used_at, NOW - 60);
+        assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
         assert_eq!(proved.len(), 0);
         assert!(!proved.holds(&channel(1)));
 
@@ -1915,8 +1916,8 @@ mod tests {
     fn a_connection_is_remembered_to_have_proved_only_so_many_channels() {
         assert_eq!(MAX_CHANNELS_PROVED_ON_A_CONNECTION, 1024);
         let at = relay();
-        at.hold(&small(7, 1, 5), NOW - 60);
-        at.hold(&small(2000, 1, 5), NOW - 60);
+        at.hold(&small(7, 1, 5), NOW - 2 * HOUR);
+        at.hold(&small(2000, 1, 5), NOW - 2 * HOUR);
         let session = Session {
             value: [0x51; 32],
             prover: peer(1).0,
@@ -1955,7 +1956,7 @@ mod tests {
         // One more, which the relay holds, with a proof that holds: no.
         // Nothing is remembered for it, and it was no use of the channel.
         assert!(!prove(2000, &mut proved));
-        assert_eq!(at.held(2000).unwrap().used_at, NOW - 60);
+        assert_eq!(at.held(2000).unwrap().used_at, NOW - 2 * HOUR);
         assert!(!proved.holds(&channel(2000)));
         // Nor any after it.
         assert!(!prove(2001, &mut proved));
@@ -1963,7 +1964,7 @@ mod tests {
         // One of those that are remembered is proved again: yes, and it
         // is use of the channel.
         lock(&at.db)
-            .execute("UPDATE relay_channels SET used_at = ?1", [NOW - 60])
+            .execute("UPDATE relay_channels SET used_at = ?1", [NOW - 2 * HOUR])
             .unwrap();
         assert!(prove(7, &mut proved));
         assert_eq!(at.held(7).unwrap().used_at, NOW);
@@ -2722,7 +2723,7 @@ mod tests {
         // the other (number 8).
         let other = relay_of(u64::MAX, &[9]);
         let this = relay_of(u64::MAX, &[8]);
-        let then = now() - 1000;
+        let then = now() - 10 * HOUR;
         for c in 1..=5 {
             other.hold(&small(c, 1, 5), then + i64::from(c));
             other.hold(&small(c, 2, 5), then + i64::from(c));
@@ -2736,7 +2737,7 @@ mod tests {
             &session,
             &peer(1).0,
             &proof,
-            then + 500,
+            then + 2 * HOUR,
         )
         .unwrap();
 
@@ -2755,7 +2756,7 @@ mod tests {
             assert_eq!(here.held_since, then + i64::from(c));
             assert_ne!(here.mark, there.mark);
         }
-        assert_eq!(this.held(3).unwrap().used_at, then + 500);
+        assert_eq!(this.held(3).unwrap().used_at, then + 2 * HOUR);
         assert_eq!(this.used(), 10 * SMALL);
         // Each was asked for once, from the start, with the mark that was
         // told.
@@ -2839,12 +2840,12 @@ mod tests {
         let now = now();
         // Both hold the first channel, whole. There it is held from
         // earlier, and was used later.
-        other.hold(&small(1, 1, 5), now - 9000);
-        this.hold(&small(1, 1, 5), now - 500);
+        other.hold(&small(1, 1, 5), now - 9 * HOUR);
+        this.hold(&small(1, 1, 5), now - 5 * HOUR);
         lock(&other.db)
             .execute(
                 "UPDATE relay_channels SET used_at = ?1 WHERE channel_id = ?2",
-                rusqlite::params![now - 60, channel(1).as_slice()],
+                rusqlite::params![now - 3 * HOUR, channel(1).as_slice()],
             )
             .unwrap();
         // The second is held here from earlier, and was used here later:
@@ -2872,7 +2873,10 @@ mod tests {
         let link = Link::to(&other);
         this.entries.pull_from(&link, peer(8), &this.db).await;
         let first = this.held(1).unwrap();
-        assert_eq!((first.held_since, first.used_at), (now - 9000, now - 60));
+        assert_eq!(
+            (first.held_since, first.used_at),
+            (now - 9 * HOUR, now - 3 * HOUR)
+        );
         let second = this.held(2).unwrap();
         assert_eq!((second.held_since, second.used_at), (now - 7000, now - 30));
         // The unused one was not asked for, and is not held. The other
@@ -2895,13 +2899,16 @@ mod tests {
         lock(&other.db)
             .execute(
                 "UPDATE relay_channels SET held_since = ?1, used_at = ?2 WHERE channel_id = ?3",
-                rusqlite::params![now - 20_000, now - 5, channel(1).as_slice()],
+                rusqlite::params![now - 20 * HOUR, now - 5, channel(1).as_slice()],
             )
             .unwrap();
         this.entries.pull_from(&link, peer(8), &this.db).await;
         assert!(link.pulls().is_empty());
         let first = this.held(1).unwrap();
-        assert_eq!((first.held_since, first.used_at), (now - 20_000, now - 5));
+        assert_eq!(
+            (first.held_since, first.used_at),
+            (now - 20 * HOUR, now - 5)
+        );
         // What is told of a later "held since", and of an earlier "last
         // used", changes nothing.
         let second = this.held(2).unwrap();
