@@ -458,6 +458,20 @@ pub fn count_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError>
     Ok(())
 }
 
+/// Keep at most `keep` of the records that are not counted: the oldest
+/// of them go, by the order in which the device saw them. Returns how
+/// many went. A record that counts is never dropped here, and the records
+/// that stay keep their places.
+pub fn drop_oldest_not_counted(conn: &Connection, keep: usize) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM person_additions WHERE seen IN (
+             SELECT seen FROM person_additions WHERE counted = 0
+             ORDER BY seen DESC LIMIT -1 OFFSET ?1)",
+        params![i64::try_from(keep).unwrap_or(i64::MAX)],
+    )
+    .map_err(storage)
+}
+
 /// Keep no record of an addition: the next statement's own list is what
 /// stands (decision 2026-10-04 §6). Returns how many were kept.
 pub fn clear_additions(conn: &Connection) -> Result<usize, CordeliaError> {
@@ -1073,6 +1087,63 @@ mod tests {
         count_addition(&conn, before[0].seen).unwrap();
         assert!(count_addition(&conn, before[2].seen + 1).is_err());
         assert_eq!(additions(&conn).unwrap(), after);
+    }
+
+    /// The records that are not counted are kept to a bound: beyond it
+    /// the oldest of them go. A record that counts stays, however old.
+    #[test]
+    fn test_of_the_records_that_are_not_counted_the_oldest_go_beyond_a_bound() {
+        let conn = db::open_in_memory().unwrap();
+        // Ten records, of which the first, the fourth and the last count.
+        for n in 1..=10u8 {
+            let counted = [1, 4, 10].contains(&n);
+            keep_addition(&conn, &[n; 100], &[n; 32], &[0xd0; 32], counted, NOW).unwrap();
+        }
+        let kept = |conn: &Connection| -> Vec<(u8, bool)> {
+            additions(conn)
+                .unwrap()
+                .iter()
+                .map(|one| (one.key[0], one.counted))
+                .collect()
+        };
+        // Seven are not counted. At a bound of seven, and above, none goes.
+        assert_eq!(drop_oldest_not_counted(&conn, 9).unwrap(), 0);
+        assert_eq!(drop_oldest_not_counted(&conn, 7).unwrap(), 0);
+        assert_eq!(kept(&conn).len(), 10);
+
+        // At a bound of four the three oldest that are not counted go: the
+        // second, the third and the fifth.
+        let places: Vec<i64> = additions(&conn)
+            .unwrap()
+            .iter()
+            .map(|one| one.seen)
+            .collect();
+        assert_eq!(drop_oldest_not_counted(&conn, 4).unwrap(), 3);
+        assert_eq!(
+            kept(&conn),
+            [
+                (1, true),
+                (4, true),
+                (6, false),
+                (7, false),
+                (8, false),
+                (9, false),
+                (10, true)
+            ]
+        );
+        // Those that stay keep their places.
+        let after: Vec<i64> = additions(&conn)
+            .unwrap()
+            .iter()
+            .map(|one| one.seen)
+            .collect();
+        assert!(after.iter().all(|seen| places.contains(seen)));
+        assert_eq!(drop_oldest_not_counted(&conn, 4).unwrap(), 0);
+
+        // At a bound of none every record that is not counted goes, and
+        // each that counts stays.
+        assert_eq!(drop_oldest_not_counted(&conn, 0).unwrap(), 4);
+        assert_eq!(kept(&conn), [(1, true), (4, true), (10, true)]);
     }
 
     // ── The names it holds ───────────────────────────────────────────

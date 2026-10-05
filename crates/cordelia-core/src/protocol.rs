@@ -1147,6 +1147,14 @@ const _: () = assert!(HAND_OVER_NAME.len() + MAX_HAND_OVER_BYTES <= MAX_ENTRY_NA
 /// every device that counts.
 pub const MAX_COUNTED_DEVICES: usize = MAX_STATEMENT_DEVICES;
 
+/// The most records of additions a reader keeps as not counted (decision
+/// 2026-10-04 §6). A device that counts can sign any number of records,
+/// and every reader loads what it keeps each time it asks who counts. Over
+/// this bound the oldest record that is not counted goes when a new one is
+/// kept: it is seen again as any record is, where it is given again. A
+/// record that counts is never dropped for room.
+pub const MAX_NOT_COUNTED_RECORDS: usize = 256;
+
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
 /// forgotten. It is for a carry that a person asks for.
@@ -1850,7 +1858,9 @@ mod tests {
             MAX_ENTRY_NAME_AND_VALUE_BYTES - HAND_OVER_NAME.len() - MAX_HAND_OVER_BYTES,
             7_164
         );
-        // A reader counts as many devices as a statement may list.
+        // A reader counts as many devices as a statement may list, and
+        // keeps a bounded number of records that do not count.
+        assert_eq!(MAX_NOT_COUNTED_RECORDS, 256);
         assert_eq!(MAX_COUNTED_DEVICES, 64);
         assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
     }

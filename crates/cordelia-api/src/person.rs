@@ -49,7 +49,7 @@ use rusqlite::Connection;
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    MAX_COUNTED_DEVICES, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
+    MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
@@ -353,6 +353,12 @@ pub enum NotCounted {
 /// a statement makes room. Whether a key that counts may add is read from
 /// every record kept for it ([`Counting::may_add`]).
 ///
+/// The records that are kept as not counted have a bound, 256: every
+/// time a device asks who counts it loads what it keeps, and a device that
+/// counts can sign any number of records. Beyond the bound the oldest that
+/// is not counted goes when a new one is kept. It is then as a record
+/// that was never seen: given again, it is judged as any record is.
+///
 /// What is returned is what the record was when it was seen. A caller that
 /// asks how many keys came to count with it reads [`who_counts`] before
 /// and after.
@@ -393,6 +399,8 @@ pub fn see_addition(
             now,
         )?;
         judge_again(conn, statement)?;
+        // What then still does not count is kept to a bound.
+        held_rows::drop_oldest_not_counted(conn, MAX_NOT_COUNTED_RECORDS)?;
         Ok(seen)
     })
 }
@@ -2293,6 +2301,77 @@ mod tests {
                 "{first}"
             );
         }
+    }
+
+    /// A device keeps at most 256 records that are not counted. Beyond
+    /// that the oldest of them goes when a new one is kept, and no record
+    /// that counts goes with it. One that went is as one never seen: it
+    /// is judged when it is given again.
+    #[test]
+    fn test_the_records_kept_as_not_counted_have_a_bound() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+        see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+        // The oldest record that does not count: "8 adds 9".
+        let oldest = added(&two, 8, 9);
+        assert_eq!(
+            see_addition(&conn, &oldest, NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        );
+        // And 255 more, as a device that counts could sign them: the
+        // device keeps 256 that are not counted, which is the bound.
+        for n in 0..255u16 {
+            let record = format!("a record that does not count: {n}");
+            let key = [(n % 250) as u8 + 1; 32];
+            held_rows::keep_addition(&conn, record.as_bytes(), &key, &[0xee; 32], false, NOW)
+                .unwrap();
+        }
+        let not_counted = |conn: &Connection| {
+            let kept = held_rows::additions(conn).unwrap();
+            kept.iter().filter(|one| !one.counted).count()
+        };
+        let keeps = |conn: &Connection, record: &SignedAddition| {
+            let bytes = record.to_bytes().unwrap();
+            let kept = held_rows::additions(conn).unwrap();
+            kept.iter().any(|one| one.record == bytes)
+        };
+        assert_eq!(not_counted(&conn), 256);
+        assert!(keeps(&conn, &oldest));
+
+        // One more that does not count: the oldest goes, and the new one
+        // is kept. The two that count stay.
+        let newest = added(&two, 8, 11);
+        assert_eq!(
+            see_addition(&conn, &newest, NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+        );
+        assert_eq!(not_counted(&conn), 256);
+        assert!(!keeps(&conn, &oldest) && keeps(&conn, &newest));
+        assert_eq!(counting_of(&conn), (vec![0, 1, 2, 7, 8], vec![0, 1, 2, 7]));
+
+        // "0 adds 8" lets device 8 add. The record that is still kept
+        // comes to count, which makes room for the one that was seen, and
+        // nothing goes. The record that went is not there to be judged.
+        assert_eq!(
+            see_addition(&conn, &added(&two, 0, 8), NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(
+            counting_of(&conn),
+            (vec![0, 1, 2, 7, 8, 11], vec![0, 1, 2, 7, 8])
+        );
+        // Given again, it is seen as a record that was never seen.
+        assert_eq!(
+            see_addition(&conn, &oldest, NOW).unwrap(),
+            AdditionSeen::Counted
+        );
+        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(
+            counting_of(&conn),
+            (vec![0, 1, 2, 7, 8, 9, 11], vec![0, 1, 2, 7, 8])
+        );
     }
 
     /// The bound of 64 stands where a record is judged again: one that
