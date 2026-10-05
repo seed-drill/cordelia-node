@@ -43,6 +43,25 @@ fn look(node: &Node) -> Value {
     node.post("/api/v1/devices/list", json!({}))
 }
 
+/// Ask the node's API as a program that holds its token does, with no
+/// command and no terminal: the status of the answer, and what it says.
+fn asks(node: &Node, path: &str, body: Value) -> (u16, String) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut answer = agent
+        .post(format!("http://127.0.0.1:{}{path}", node.http))
+        .header("Authorization", &format!("Bearer {}", node.token()))
+        .send_json(&body)
+        .unwrap();
+    let status = answer.status().as_u16();
+    let said: Value = answer.body_mut().read_json().unwrap_or(Value::Null);
+    let message = said["error"]["message"].as_str().map(str::to_string);
+    (status, message.unwrap_or_else(|| said.to_string()))
+}
+
 /// What the node says that its device holds of its person: [`look`],
 /// without what it says of its relays, which changes as it reaches them.
 fn holds(node: &Node) -> Value {
@@ -364,7 +383,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let before = holds(&laptop);
     let key_before = key_of(&laptop);
 
-    let asks: [&[&str]; 9] = [
+    let commands: [&[&str]; 9] = [
         &["phrase"],
         &["phrase", "--name", "laptop"],
         &["add-device", &other],
@@ -375,7 +394,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         &["devices", "--clear"],
         &["init", "--new-key"],
     ];
-    for args in asks {
+    for args in commands {
         let said = laptop.refused(args);
         assert!(
             said.contains("it asks at a terminal: its input is not one. Nothing was done."),
@@ -401,6 +420,87 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         let said = laptop.at_terminal(args).refused();
         assert!(said.contains("follows no recovery phrase yet"), "{said}");
     }
+
+    // The routes behind the commands refuse what the commands refuse,
+    // whoever asks: a program that holds the node's token gets no
+    // further than a person does.
+    for (path, body) in [
+        ("/api/v1/change/prepare", json!({})),
+        ("/api/v1/change/prepare", json!({ "settle": true })),
+        ("/api/v1/devices/add/look", json!({ "device": other })),
+        ("/api/v1/devices/add", json!({ "device": other })),
+    ] {
+        let (status, said) = asks(&laptop, path, body);
+        assert_eq!(status, 400, "{path}: {said}");
+        assert!(
+            said.contains("follows no recovery phrase yet"),
+            "{path}: {said}"
+        );
+    }
+    // A key that is this device's own has no pair channel with it, and
+    // is not kept; nor is one that is no key.
+    for key in [key_before.as_str(), "cordelia_pk1nothing"] {
+        let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": key }));
+        assert_eq!(status, 400, "{said}");
+    }
+    assert!(look(&laptop)["accepting"].as_array().unwrap().is_empty());
+    // A notice that the device does not show is not cleared, and what
+    // is no name of a notice is refused.
+    let (status, _) = asks(
+        &laptop,
+        "/api/v1/devices/clear",
+        json!({ "notice": hex::encode([7u8; 32]) }),
+    );
+    assert_eq!(status, 404);
+    let (status, _) = asks(&laptop, "/api/v1/devices/clear", json!({ "notice": "07" }));
+    assert_eq!(status, 400);
+    // What is no change entry makes no phrase, and nor does a change
+    // entry that is said to be from where the device does not stand.
+    let made = {
+        let phrase = cordelia_crypto::phrase::Phrase::generate().unwrap();
+        let key = cordelia_crypto::bech32::decode_public_key(&key_before).unwrap();
+        cordelia_api::person::first_entry(&phrase, &key, "laptop").unwrap()
+    };
+    let entry = hex::encode(made.entry.to_wire());
+    let statement_key = hex::encode(made.statement_key);
+    for (body, refused_as) in [
+        (
+            json!({ "entry": "zz", "statement_key": statement_key, "from": "no_phrase" }),
+            400,
+        ),
+        (
+            json!({ "entry": entry, "statement_key": "00", "from": "no_phrase" }),
+            400,
+        ),
+        (
+            json!({ "entry": entry, "statement_key": statement_key, "from": "nowhere" }),
+            400,
+        ),
+        (
+            json!({ "entry": entry, "statement_key": hex::encode([9u8; 32]), "from": "no_phrase" }),
+            400,
+        ),
+        (
+            json!({ "entry": entry, "statement_key": statement_key, "from": "alone" }),
+            409,
+        ),
+        (
+            json!({ "entry": entry, "statement_key": statement_key, "from": "several" }),
+            409,
+        ),
+    ] {
+        let (status, said) = asks(&laptop, "/api/v1/phrase/make", body.clone());
+        assert_eq!(status, refused_as, "{body}: {said}");
+    }
+    assert_eq!(holds(&laptop), before);
+    // Without the node's token nothing is asked at all.
+    let unasked = direct()
+        .post(format!(
+            "http://127.0.0.1:{}/api/v1/devices/list",
+            laptop.http
+        ))
+        .send_json(json!({}));
+    assert!(unasked.is_err());
 
     // The words typed back are not the words shown: nothing is made.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
@@ -473,6 +573,42 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         "{said}"
     );
     assert_eq!(look(&laptop)["change"], 1);
+
+    // The node's half of a change, asked without a command: what is no
+    // entry, an entry that is no change the device can apply, and a
+    // change that is said to be made over another entry than the one
+    // the device keeps, make nothing.
+    let handed = laptop.post("/api/v1/change/prepare", json!({}));
+    let (over, kept) = (text(&handed, "over"), text(&handed, "entry"));
+    for (body, refused_as) in [
+        (json!({ "entry": "zz", "over": over }), 400),
+        (json!({ "entry": kept, "over": "00" }), 400),
+        (
+            json!({ "entry": kept, "over": hex::encode([3u8; 32]) }),
+            409,
+        ),
+        (json!({ "entry": entry, "over": over }), 400),
+        (json!({ "entry": kept, "over": over, "apart": over }), 409),
+    ] {
+        let (status, said) = asks(&laptop, "/api/v1/change/make", body.clone());
+        assert_eq!(status, refused_as, "{body}: {said}");
+    }
+    let (status, said) = asks(&laptop, "/api/v1/change/prepare", json!({ "settle": true }));
+    assert_eq!(status, 400, "{said}");
+    assert!(said.contains("nothing to settle"), "{said}");
+    assert_eq!(look(&laptop)["change"], 1);
+    // Alone under a phrase, with sync on: a key is not kept.
+    let claude = laptop.home().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+    let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": other }));
+    assert_eq!(status, 400, "{said}");
+    assert!(said.contains("`cordelia sync off` first"), "{said}");
+    assert!(look(&laptop)["accepting"].as_array().unwrap().is_empty());
+    laptop.cli(&["sync", "off"]);
+    let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": other }));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(look(&laptop)["accepting"].as_array().unwrap().len(), 1);
 }
 
 // ── cordelia remove-device ───────────────────────────────────────────
@@ -693,6 +829,21 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     );
     let said = desktop.at_terminal(&["renew"]).refused();
     assert!(said.contains("this device was removed"), "{said}");
+    // The route keeps no key for it either, whoever asks.
+    let (status, said) = asks(
+        &desktop,
+        "/api/v1/devices/accept",
+        json!({ "key": laptop_key }),
+    );
+    assert_eq!(status, 400, "{said}");
+    assert!(said.contains("this device was removed"), "{said}");
+    assert!(
+        look(&desktop)["accepting"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|typed| typed["key"] != laptop_key.as_str() || typed["taken"] == true)
+    );
 
     // Its key is refused when it is added again.
     let said = laptop
@@ -1223,6 +1374,16 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     assert!(said.contains("the fork is settled"), "{said}");
     let said = forked.at_terminal(&["renew"]).refused();
     assert!(said.contains("two changes were made apart"), "{said}");
+    // The routes refuse the same, whoever asks.
+    let (status, said) = asks(
+        forked,
+        "/api/v1/devices/accept",
+        json!({ "key": key_of(other) }),
+    );
+    assert_eq!(status, 400, "{said}");
+    assert!(said.contains("two changes were made apart"), "{said}");
+    let (status, _) = asks(forked, "/api/v1/change/prepare", json!({}));
+    assert_eq!(status, 400);
 
     // The settlement.
     let mut at = forked.at_terminal(&["settle"]);

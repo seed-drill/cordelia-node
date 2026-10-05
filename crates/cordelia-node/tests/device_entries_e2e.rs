@@ -42,8 +42,9 @@ use cordelia_network::messages::{
 };
 use cordelia_network::{codec, connection, transport};
 use cordelia_node::device_entries::{
-    Asked, Clock, Counts, DeviceEntries, Link, NoLeave, Pass, Refused, Relay,
+    Asked, Clock, Counts, DeviceEntries, Link, NoLeave, PairRead, Pass, Refused, Relay,
 };
+use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::person::State;
 use cordelia_storage::{at_relays as kept_rows, entries, person as held_rows};
 
@@ -501,6 +502,9 @@ struct Script {
     /// What each entry of a push is answered with, where a test says:
     /// "stored" otherwise.
     pushed: Option<Pushed>,
+    /// Whether a proof is answered as one that holds, for a channel
+    /// that is held: it is answered with no otherwise.
+    proves: bool,
 }
 
 /// What a test has a stand-in answer a pull with.
@@ -519,6 +523,7 @@ impl Default for Script {
             silent: false,
             pulled: None,
             pushed: None,
+            proves: false,
         }
     }
 }
@@ -599,7 +604,7 @@ impl StandIn {
                 }
                 WireMessage::ChannelProve(_) => {
                     Ok(Some(WireMessage::ChannelProved(ChannelProved {
-                        proved: false,
+                        proved: script.proves,
                     })))
                 }
                 WireMessage::EntryPull(pull) => {
@@ -656,6 +661,13 @@ impl StandIn {
     /// not yet been found dead.
     fn goes_silent(&self) {
         self.script.lock().unwrap().silent = true;
+    }
+
+    /// From now on a proof is answered as one that holds, for a channel
+    /// that is held, or as one for a channel that is not, as `holds`
+    /// says.
+    fn holds_what_is_proved(&self, holds: bool) {
+        self.script.lock().unwrap().proves = holds;
     }
 
     /// From now on a pull is answered with what `pulled` gives.
@@ -3498,6 +3510,269 @@ async fn what_is_kept_of_a_relay_that_is_set_up_no_longer_is_forgotten() {
     device.passes().await;
     assert_eq!(pushed_of_notes(&goes), [written.id()]);
     assert!(keeps(&device, &goes.key));
+}
+
+// ── The pair channel of a key typed at `accept` ──────────────────────
+
+/// The key of `of`, as `on` keeps it typed now.
+fn types(on: &Device, of: &Device) -> TypedKey {
+    acts::type_key(&on.db(), &of.key(), on.now()).unwrap();
+    acts::typed_key(&on.db(), &of.key()).unwrap().unwrap()
+}
+
+/// Ask the relay that `device` calls `relay` for what the device of the
+/// key `typed` hands over, through the one door for that.
+async fn asks_for_hand_over(
+    device: &Device,
+    relay: &str,
+    typed: &TypedKey,
+) -> Result<PairRead, Refused> {
+    let link = device.link(relay);
+    let leave = device.engine.leave();
+    leave
+        .pair(
+            &device.state.db,
+            &device.state.identity,
+            &link,
+            typed,
+            |_| false,
+        )
+        .await
+}
+
+/// One channel is read without leave: the pair channel of a key typed at
+/// `accept`, within its hour (decision 2026-10-04 §4.6, §5.1). A device
+/// that follows no phrase has no leave anywhere, and nothing to show: its
+/// whole pass asks its relay for what the device of the typed key hands
+/// over, and it is accepted. The key is then spent, nothing of the pair
+/// channel is in the device's store, and no place is kept in it. The pass
+/// that sends asks for no hand-over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_typed_keys_pair_channel_is_read_without_leave_and_its_hand_over_accepted() {
+    let relay = relay_started("relay", None);
+    let (mut adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    let pair = added.unwrap().hand_over.channel;
+    adder.connects("relay", &relay).await;
+    adder.passes().await;
+    assert_eq!(held_at(&relay, &pair).len(), 1);
+
+    // The new device follows no phrase: it has no leave, and no channel
+    // of its own.
+    new.connects("relay", &relay).await;
+    new.passes().await;
+    assert_eq!(new.stands(), Stands::NoPhrase);
+    assert!(new.has_leave("relay").is_err());
+    assert_eq!(new.counts("relay"), Counts::default());
+
+    // A person types the key. The pass that sends asks for nothing.
+    let typed = types(&new, &adder);
+    new.sends().await;
+    assert_eq!(new.stands(), Stands::NoPhrase);
+    // The whole pass asks, and what the relay holds is accepted: the
+    // device follows the phrase, and has applied its statement.
+    new.passes().await;
+    assert_eq!(new.stands(), Stands::Applied);
+    assert_eq!(new.latest().id(), adder.latest().id());
+    // The key is spent, and reads nothing more.
+    let kept = acts::typed_key(&new.db(), &adder.key()).unwrap().unwrap();
+    assert!(kept.taken_at.is_some());
+    assert!(kept.said.unwrap().contains("this device has joined"));
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::NotNow)
+    );
+    // Nothing of the pair channel is in its store, and it keeps no
+    // place in it: what came through the door went to `accept`, and
+    // nowhere else.
+    assert!(new.holds_of(&pair).is_empty());
+    assert!(!kept_rows::keeps_any_anywhere(&new.db(), &pair).unwrap());
+    // A whole pass is counted as it begins and as it ends.
+    let (begun, ended) = new.state.own_channels.whole_passes();
+    assert_eq!((begun, ended), (2, 2));
+    new.sends().await;
+    assert_eq!(new.state.own_channels.whole_passes(), (2, 2));
+}
+
+/// The door for a typed key can do nothing else. It asks the relay
+/// nothing for a key that the device does not keep as typed, or whose
+/// hour has gone. For one it keeps, it proves the pair channel of that
+/// key and this device, and pulls that channel's first page, and makes
+/// no other request. Of what comes back, only an entry of that channel
+/// that the typed key signed is given to `accept`: anything else is
+/// dropped, and nothing is stored. What it asks is counted with what
+/// the device asks of a relay in a minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_nothing_else() {
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let now = adder.now();
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        now,
+    );
+    let hand_over = added.unwrap().hand_over;
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    let pair = derive::channel_id(&pair_secret).unwrap();
+    assert_eq!(hand_over.channel, pair);
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+    let stored = |device: &Device| -> i64 {
+        let db = device.db();
+        db.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    // A key that the device does not keep as typed: nothing is asked.
+    let not_typed = TypedKey {
+        key: adder.key(),
+        typed_at: new.now(),
+        taken_at: None,
+        said: None,
+    };
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &not_typed).await,
+        Ok(PairRead::NotNow)
+    );
+    // A key that was typed an hour ago, and one typed at another time
+    // than the device keeps it: nothing either.
+    let an_hour = cordelia_core::protocol::PAIR_KEY_TYPED_SECS;
+    acts::type_key(&new.db(), &adder.key(), new.now() - an_hour).unwrap();
+    let old = acts::typed_key(&new.db(), &adder.key()).unwrap().unwrap();
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &old).await,
+        Ok(PairRead::NotNow)
+    );
+    let typed = types(&new, &adder);
+    let typed_before = TypedKey {
+        typed_at: typed.typed_at - 5,
+        ..typed.clone()
+    };
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed_before).await,
+        Ok(PairRead::NotNow)
+    );
+    assert!(relay.requests().is_empty());
+
+    // A key it keeps: the proof, of the pair channel and of no other.
+    // The relay does not hold the channel, and is asked no more.
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::NotHeld)
+    );
+    let asked = relay.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        matches!(&asked[0], WireMessage::ChannelProve(prove) if prove.channel == pair),
+        "{asked:?}"
+    );
+
+    // The relay holds it, and hands a page: an entry of another channel
+    // that the typed key signed, an entry of the pair channel that
+    // another key signed, and bytes that are no entry. None is given to
+    // `accept`, and none is stored.
+    relay.holds_what_is_proved(true);
+    let elsewhere = sealed(
+        &adder.state.identity,
+        &adder.personal_secret(),
+        7,
+        "hand-over",
+        Value::Text("not here".into()),
+    );
+    let by_another = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "hand-over",
+        Value::Text("not by the typed key".into()),
+    );
+    let handed = Arc::new(Mutex::new(vec![
+        elsewhere.to_wire(),
+        by_another.to_wire(),
+        vec![1, 2, 3],
+    ]));
+    let hands = handed.clone();
+    relay.pulls(move |pull| EntryPulled {
+        entries: hands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bytes| bytes.clone().into())
+            .collect(),
+        next: 3,
+        mark: pull.mark,
+    });
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::Read(Vec::new()))
+    );
+    let asked = relay.requests();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(matches!(&asked[0], WireMessage::ChannelProve(prove) if prove.channel == pair));
+    match &asked[1] {
+        WireMessage::EntryPull(pull) => {
+            assert_eq!((pull.channel, pull.after), (pair, 0));
+            assert_eq!(pull.mark, [0u8; 8], "from the start, under no mark");
+        }
+        other => panic!("not a pull: {other:?}"),
+    }
+    assert_eq!(new.stands(), Stands::NoPhrase);
+    assert_eq!(stored(&new), 0);
+    let kept = acts::typed_key(&new.db(), &adder.key()).unwrap().unwrap();
+    assert_eq!((kept.taken_at, kept.said), (None, None));
+
+    // The hand-over, among the rest: it is given to `accept`, and the
+    // device follows the phrase. The rest is still dropped.
+    handed.lock().unwrap().push(hand_over.to_wire());
+    let read = asks_for_hand_over(&new, "relay", &typed).await.unwrap();
+    match read {
+        PairRead::Read(each) => {
+            assert_eq!(each.len(), 1);
+            assert!(matches!(each[0], Accepted::Joined(_)), "{each:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(new.stands(), Stands::Applied);
+    // Of the page, nothing is in its store: what it holds now is what
+    // applying the statement wrote.
+    assert!(new.holds_of(&pair).is_empty());
+    assert!(!kept_rows::keeps_any_anywhere(&new.db(), &pair).unwrap());
+    // Every request was a proof or a pull, of that one channel.
+    let asked = relay.requests();
+    assert!(asked.iter().all(|request| match request {
+        WireMessage::ChannelProve(prove) => prove.channel == pair,
+        WireMessage::EntryPull(pull) => pull.channel == pair,
+        _ => false,
+    }));
+
+    // What the door asks is counted with what a device asks of a relay
+    // in a minute: a key typed again and again is refused before the
+    // relay would count a breach.
+    relay.holds_what_is_proved(false);
+    let mut refused = None;
+    for _ in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+        let typed = types(&new, &adder);
+        match asks_for_hand_over(&new, "relay", &typed).await {
+            Ok(_) => {}
+            Err(why) => {
+                refused = Some(why);
+                break;
+            }
+        }
+    }
+    assert_eq!(refused, Some(Refused::AskedEnough));
+    assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
 }
 
 // ── The node, as a process ───────────────────────────────────────────
