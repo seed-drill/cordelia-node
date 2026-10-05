@@ -1187,6 +1187,56 @@ pub const LABEL_CHANNEL_PROOF: &[u8] = b"cordelia v2 proof";
 /// channel's ID begins is never in doubt.
 pub const SESSION_VALUE_BYTES: usize = 32;
 
+/// The most entries in one page of a channel, as a relay hands it to a
+/// connection that has proved the channel's key (decision 2026-10-04
+/// §2.4, item 3).
+/// Derived: what one page of the older kind lists, DEFAULT_SYNC_LIMIT.
+pub const ENTRY_PAGE_MAX_ENTRIES: u32 = DEFAULT_SYNC_LIMIT;
+
+/// The most the entries of one page take on the wire together. A page
+/// travels in one message, and 128 KB of the message is left for what is
+/// around the entries, as it is around a push of the older kind.
+pub const ENTRY_PAGE_MAX_BYTES: usize = MAX_MESSAGE_BYTES as usize - 128 * 1024;
+
+// Checked at compile time: a page always has room for one entry, whatever
+// its size, so a channel is never stuck behind an entry that fits no page.
+// And a full page, counted as entries are counted, is within what one
+// connection may be handed in a minute.
+const _: () = assert!(MAX_ENTRY_WIRE_BYTES <= ENTRY_PAGE_MAX_BYTES);
+const _: () = assert!(
+    ENTRY_PAGE_MAX_BYTES as u64 + ENTRY_PAGE_MAX_ENTRIES as u64 * ENTRY_OVERHEAD_BYTES as u64
+        <= PUSH_BYTES_PER_PEER_PER_MINUTE
+);
+
+/// The most one channel from its secret may hold at a relay (decision
+/// 2026-10-04 §2.5), in bytes as entries are counted ([`entry_cost`]).
+/// Derived: what a channel of the older kind may hold. The two kinds are
+/// counted apart, each against a cap of its own.
+pub const MAX_ENTRY_CHANNEL_BYTES_AT_RELAY: u64 = MAX_CHANNEL_BYTES_AT_RELAY;
+
+/// How many channels from their secrets one address may make a relay hold
+/// for the first time in an hour: 256 (decision 2026-10-04 §2.5).
+///
+/// After a removal every channel of a person's own is new: the personal
+/// channel, and one for each name. So is a pair channel, each time a
+/// device is added. At 16 an hour, which is what the older kind allows, a
+/// person with thirty names would wait two hours for the last of them,
+/// and a home with three devices shares one address. At 256 a home of
+/// several people, each with tens of names, moves within the hour.
+///
+/// What it still bounds: a channel costs nothing to make, so without an
+/// allowance one address could make a relay hold any number of them. A
+/// relay's cap is what bounds its storage, and it drops its newest
+/// channels first, so the channels that an address makes in an hour can
+/// push out only one another and what is newer still.
+pub const NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR: usize = 256;
+
+/// How long a relay keeps a channel from its secret that nobody uses: 90
+/// days (decision 2026-10-04 §2.5). A channel whose key no connection has
+/// proved, and of which nobody has shown an entry that the relay holds,
+/// for that long is dropped.
+pub const ENTRY_CHANNEL_UNUSED_DAYS: u32 = 90;
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 21] = [
     LABEL_ENTRY_KEY,
@@ -1812,5 +1862,30 @@ mod tests {
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
         assert_eq!(LABELS.len(), 21);
+    }
+
+    /// A page of a channel's entries: at most 100 of them, and at most
+    /// 917,504 bytes as they travel, which is 13 of the largest.
+    #[test]
+    fn test_a_page_of_entries_decision_2026_10_04_2_4() {
+        assert_eq!(ENTRY_PAGE_MAX_ENTRIES, 100);
+        assert_eq!(ENTRY_PAGE_MAX_BYTES, 917_504);
+        assert_eq!(ENTRY_PAGE_MAX_BYTES / MAX_ENTRY_WIRE_BYTES, 13);
+        assert!(ENTRY_PAGE_MAX_BYTES < MAX_MESSAGE_BYTES as usize);
+    }
+
+    /// A relay's room for channels from their secrets: a channel's cap is
+    /// the older kind's, the allowance of new channels is 256 an hour
+    /// where the older kind's is 16, and what nobody uses goes after 90
+    /// days.
+    #[test]
+    fn test_a_relays_room_decision_2026_10_04_2_5() {
+        assert_eq!(MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, 16 * 1024 * 1024);
+        assert_eq!(MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, MAX_CHANNEL_BYTES_AT_RELAY);
+        assert_eq!(NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, 256);
+        assert_eq!(NEW_CHANNELS_PER_ADDRESS_PER_HOUR, 16);
+        assert_eq!(ENTRY_CHANNEL_UNUSED_DAYS, 90);
+        // One entry of the largest size is within what a channel may hold.
+        assert!(entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
     }
 }

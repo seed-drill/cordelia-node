@@ -22,10 +22,10 @@
 //! handed out as it is stored ([`channel_entries_after`]): whoever
 //! receives it checks it.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
-use cordelia_core::protocol::ENTRY_OVERHEAD_BYTES;
+use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, entry_cost};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 
 /// What became of an entry that the store was given.
@@ -255,6 +255,51 @@ pub fn channel_cost(conn: &Connection, channel: &[u8; 32]) -> Result<u64, Cordel
         |row| row.get::<_, i64>(0),
     )
     .map(|bytes| bytes.max(0) as u64)
+    .map_err(storage)
+}
+
+/// The entry that the store holds from one author in one slot of a
+/// channel, as it is stored: whoever is handed it checks it. `None` where
+/// it holds none from that author there.
+pub fn author_entry(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Option<StoredEntry>, CordeliaError> {
+    conn.query_row(
+        &format!(
+            "SELECT {ENTRY_COLUMNS} FROM entries
+             WHERE channel_id = ?1 AND slot = ?2 AND author = ?3"
+        ),
+        params![channel.as_slice(), slot.as_slice(), author.as_slice()],
+        stored_entry_from_row,
+    )
+    .optional()
+    .map_err(storage)
+}
+
+/// The revision of the entry that the store holds from one author in one
+/// slot of a channel, and what that entry is counted at
+/// ([`cordelia_core::protocol::entry_cost`]): what an entry that replaces
+/// it gives back. `None` where it holds none from that author there.
+pub fn author_cost(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Option<(u64, u64)>, CordeliaError> {
+    conn.query_row(
+        "SELECT rev, length(content) FROM entries
+         WHERE channel_id = ?1 AND slot = ?2 AND author = ?3",
+        params![channel.as_slice(), slot.as_slice(), author.as_slice()],
+        |row| {
+            let rev = row.get::<_, i64>(0)?.max(0) as u64;
+            let content = row.get::<_, i64>(1)?.max(0) as usize;
+            Ok((rev, entry_cost(content)))
+        },
+    )
+    .optional()
     .map_err(storage)
 }
 
@@ -862,6 +907,70 @@ mod tests {
         // A larger one takes the difference.
         store(&conn, &text(1, 7, "a.md", &"x".repeat(300)), NOW).unwrap();
         assert_eq!(channel_cost(&conn, &channel()).unwrap(), by_entry + 256);
+    }
+
+    /// One author's entry in one slot is read alone, as it is stored, with
+    /// its revision and what it is counted at.
+    #[test]
+    fn test_one_authors_entry_in_a_slot_is_read_with_its_revision_and_its_cost() {
+        let conn = db::open_in_memory().unwrap();
+        let read = |n: u8, name: &str| {
+            let (of, cost) = (
+                author_entry(&conn, &channel(), &slot(name), &key(n)).unwrap(),
+                author_cost(&conn, &channel(), &slot(name), &key(n)).unwrap(),
+            );
+            // The two say the same of whether one is held, and at which
+            // revision.
+            assert_eq!(
+                of.as_ref().map(|held| held.entry.rev),
+                cost.map(|(rev, _)| rev)
+            );
+            (of.map(|held| held.entry), cost)
+        };
+        assert_eq!(read(1, "a.md"), (None, None));
+
+        let small = text(1, 5, "a.md", "a small text");
+        let large = text(2, 7, "a.md", &"x".repeat(3000));
+        let elsewhere = text(1, 9, "b.md", "another slot");
+        let others = made(&OTHER_SECRET, 1, 11, "a.md", Value::Delete);
+        for entry in [&small, &large, &elsewhere, &others] {
+            store(&conn, entry, NOW).unwrap();
+        }
+        assert_eq!(
+            read(1, "a.md"),
+            (Some((*small).clone()), Some((5, 256 + 1024)))
+        );
+        assert_eq!(
+            read(2, "a.md"),
+            (Some((*large).clone()), Some((7, 4096 + 1024)))
+        );
+        assert_eq!(
+            read(1, "b.md"),
+            (Some((*elsewhere).clone()), Some((9, 256 + 1024)))
+        );
+        // An author with no entry in the slot, and this slot in another
+        // channel.
+        assert_eq!(read(3, "a.md"), (None, None));
+        assert_eq!(
+            author_cost(&conn, &other_channel(), &others.slot, &key(1)).unwrap(),
+            Some((11, 256 + 1024))
+        );
+        assert_eq!(
+            author_entry(&conn, &other_channel(), &slot("a.md"), &key(2)).unwrap(),
+            None
+        );
+
+        // A newer revision is what is read from then, with its place.
+        let newer = text(1, 6, "a.md", &"y".repeat(300));
+        store(&conn, &newer, NOW + 1).unwrap();
+        assert_eq!(
+            read(1, "a.md"),
+            (Some((*newer).clone()), Some((6, 512 + 1024)))
+        );
+        let held = author_entry(&conn, &channel(), &slot("a.md"), &key(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!((held.seq, held.stored_at), (5, NOW + 1));
     }
 
     /// Only a checked entry is stored, and what a slot hands out is

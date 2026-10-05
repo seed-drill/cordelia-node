@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -400,6 +400,34 @@ CREATE TABLE person_names (
 );
 "#;
 
+/// Migration v13: the channels from their secrets that a relay holds
+/// (decision 2026-10-04 §2.4, §2.5, `relay`), beside everything that is
+/// there, which stays as it is. One row for each channel that this node
+/// holds as a relay:
+///
+/// - `held_since`: since when it has held the channel, which is when it
+///   first took it, or an earlier time that a relay its operator lists
+///   says it has held it since. Over its cap a relay drops the channels it
+///   has held for the shortest time first, and of two held since one time,
+///   the one whose row was made later.
+/// - `used_at`: when the channel's key was last proved, or an entry of it
+///   last shown that the relay holds. What nobody uses goes after 90 days.
+/// - `bytes`: what the channel holds, as entries are counted.
+///
+/// A channel that is dropped loses its row, and is new when it is taken
+/// again. Times are in seconds, in UTC.
+const MIGRATION_V13: &str = r#"
+CREATE TABLE relay_channels (
+    channel_id  BLOB PRIMARY KEY CHECK(length(channel_id) = 32),
+    held_since  INTEGER NOT NULL,
+    used_at     INTEGER NOT NULL,
+    bytes       INTEGER NOT NULL CHECK(bytes >= 0)
+);
+
+CREATE INDEX idx_relay_channels_held ON relay_channels(held_since);
+CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -512,6 +540,11 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 12 {
         tracing::info!("applying migration v12 (what a device holds of its person)");
         migrate_in_one(conn, MIGRATION_V12, 12)?;
+    }
+
+    if current < 13 {
+        tracing::info!("applying migration v13 (the channels a relay holds, from their secrets)");
+        migrate_in_one(conn, MIGRATION_V13, 13)?;
     }
 
     let actual: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -992,7 +1025,8 @@ mod tests {
     /// Everything a database holds but the new table and its index: each
     /// table's definition, and each row of the tables an older binary
     /// wrote. What a later step adds is left out too: the tables of what
-    /// a device holds of its person.
+    /// a device holds of its person, and the table of the channels a relay
+    /// holds.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
@@ -1000,6 +1034,7 @@ mod tests {
                  WHERE name NOT IN ('entries', 'idx_entries_channel_seq')
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
+                   AND name NOT LIKE '%relay_channels%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1232,7 +1267,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 12);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v12(&conn), NEW_IN_V12);
 
@@ -1303,5 +1337,169 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(entries, 2);
+    }
+
+    /// A database at version 12, as the version before the channels a
+    /// relay holds leaves it: what [`at_v11`] holds, and what a device
+    /// holds of its person.
+    fn at_v12() -> Connection {
+        let conn = at_v11();
+        migrate_in_one(&conn, MIGRATION_V12, 12).unwrap();
+        conn.execute_batch(
+            "INSERT INTO person (one, state, phrase_key, statement_key, phrase_channel, statement)
+             VALUES (1, 'applied', zeroblob(32), zeroblob(32), zeroblob(32), X'0D0E');
+             INSERT INTO person_secrets (number, secret, left_at) VALUES (3, zeroblob(32), NULL);
+             INSERT INTO person_names (name, channel, held_at)
+             VALUES ('team', zeroblob(32), 1800000000);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The table and the indexes that the step to version 13 adds.
+    const NEW_IN_V13: [&str; 3] = [
+        "idx_relay_channels_held",
+        "idx_relay_channels_used",
+        "relay_channels",
+    ];
+
+    /// Everything a database at version 12 holds: what one at version 11
+    /// holds, each definition of the step to version 12, and each row of
+    /// what a device holds of its person.
+    fn held_before_v13(conn: &Connection) -> Vec<String> {
+        let mut held = held_before_v12(conn);
+        for rows in [
+            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name LIKE '%person%' ORDER BY name",
+            "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
+                 || hex(statement) FROM person",
+            "SELECT number || hex(secret) || COALESCE(left_at, '') FROM person_secrets",
+            "SELECT name || hex(channel) || held_at FROM person_names",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// What a database holds of the step to version 13, by name.
+    fn new_in_v13(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE '%relay_channels%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// The table of the channels a relay holds is made in one step with
+    /// its version, as the steps before it are: a failure between them
+    /// leaves none, and the step asked for twice is run once.
+    #[test]
+    fn test_v13_adds_the_channels_a_relay_holds_and_its_version_as_one() {
+        let conn = at_v12();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 12);
+        assert!(new_in_v13(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V13} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 13).is_err());
+        assert_eq!(version(&conn), 12);
+        assert!(
+            new_in_v13(&conn).is_empty(),
+            "the table goes with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 13);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v13(&conn), NEW_IN_V13);
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the relay holds stays.
+        conn.execute(
+            "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
+             VALUES (zeroblob(32), 7, 8, 1280)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
+        let channels: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relay_channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version(&conn), channels), (SCHEMA_VERSION, 1));
+    }
+
+    /// A database at version 12 that an older binary wrote is taken to
+    /// version 13 with everything it held as it was: the step adds one
+    /// table and two indexes, with nothing in them, and touches nothing
+    /// else. The entries it held are in no channel that a relay holds.
+    #[test]
+    fn test_a_database_at_v12_that_an_older_binary_wrote_is_taken_to_v13() {
+        let conn = at_v12();
+        let before = held_before_v13(&conn);
+        assert!(before.iter().any(|row| row.starts_with("person: ")));
+        assert!(before.iter().any(|row| row.starts_with("entries: ")));
+        assert!(before.iter().any(|row| row.starts_with("ci_2grp_a")));
+
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 12);
+
+        // The step by itself, and then a start, which has no more to do
+        // for it.
+        migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
+        assert_eq!(version(&conn), 13);
+        assert_eq!(held_before_v13(&conn), before);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(held_before_v13(&conn), before);
+
+        // What is new: the table, with nothing in it, and its indexes.
+        assert_eq!(new_in_v13(&conn), NEW_IN_V13);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relay_channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// The table takes no row that cannot be a channel a relay holds: an
+    /// ID of another length, a second row for one channel, and a channel
+    /// that holds less than nothing.
+    #[test]
+    fn test_the_table_of_a_relays_channels_refuses_a_row_that_is_no_channel() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let insert = |channel: &[u8], bytes: i64| {
+            conn.execute(
+                "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes)
+                 VALUES (?1, 7, 8, ?2)",
+                rusqlite::params![channel, bytes],
+            )
+        };
+        assert!(insert(&[1u8; 31], 0).is_err());
+        assert!(insert(&[1u8; 33], 0).is_err());
+        assert!(insert(&[1u8; 32], -1).is_err());
+        assert_eq!(insert(&[1u8; 32], 0), Ok(1));
+        assert!(insert(&[1u8; 32], 0).is_err());
+        assert_eq!(insert(&[2u8; 32], 1280), Ok(1));
     }
 }

@@ -15,6 +15,7 @@ pub mod naming;
 pub mod offers;
 pub mod person;
 pub mod psk;
+pub mod relay;
 pub mod schema;
 pub mod search;
 pub mod sync_state;
