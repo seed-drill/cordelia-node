@@ -363,18 +363,18 @@ impl Standing {
 
 /// What an entry is written over: a slot of a channel, as the device
 /// reads it now, inside the caller's transaction.
-pub(crate) struct Over<'a> {
+struct Over<'a> {
     /// The channel's secret.
-    pub(crate) channel: &'a [u8; 32],
-    pub(crate) slot: &'a Slot,
+    channel: &'a [u8; 32],
+    slot: &'a Slot,
     /// The other source, where the entry is a merged index.
-    pub(crate) merge: Option<&'a OtherSource>,
+    merge: Option<&'a OtherSource>,
 }
 
 /// Write `value` under `file` over what a slot holds, as this device's
 /// own entry at the slot's next revision. `None`, with nothing written,
 /// where the slot has no next revision.
-pub(crate) fn written_over(
+fn written_over(
     conn: &Connection,
     identity: &NodeIdentity,
     over: &Over,

@@ -50,6 +50,7 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{HAND_OVER_NAME, MAX_COUNTED_DEVICES, PAIR_KEY_TYPED_SECS};
+use cordelia_core::revision::next_under;
 use cordelia_crypto::addition::{Addition, SignedAddition};
 use cordelia_crypto::change_entry;
 use cordelia_crypto::derive::{self, DeriveError};
@@ -66,7 +67,7 @@ use crate::person::{
     applied_secret, apply_added, apply_judged, held, in_one, its_own_entry, latest_entry,
     see_addition, shown,
 };
-use crate::publish::{Over, Standing, written_over};
+use crate::publish::Standing;
 
 // ── The device that adds ─────────────────────────────────────────────
 
@@ -167,6 +168,12 @@ fn at(now: i64) -> u64 {
 /// Write the record of an addition in the personal channel, as this
 /// device's own entry under the name of the key it adds: bytes that are
 /// no text.
+///
+/// Its revision is one above this device's own entry in that slot, and 1
+/// where it has none, whatever another key has written there. A record is
+/// read only from its adder's own entry, and each author has an entry of
+/// its own in a slot: no other key's entry there stops this one being
+/// written, at whatever revision it stands.
 fn record_written(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -176,16 +183,25 @@ fn record_written(
 ) -> Result<CheckedEntry, PersonError> {
     let personal = derive::personal_secret(&standing.secret)?;
     let name = added_name(&record.addition.device.key)?;
-    let slot = standing.slot(conn, &personal, &name)?;
-    let over = Over {
-        channel: &personal,
-        slot: &slot,
-        merge: None,
-    };
+    let channel = derive::channel_id(&personal)?;
+    let slot = slot_id(&derive::slot_key(&personal)?, &name);
+    let own = entries::author_entry(conn, &channel, &slot, &identity.public_key())?
+        .map(|held| held.entry.rev);
+    let rev = next_under(own, standing.number()).ok_or_else(|| {
+        PersonError::Held(
+            "this device's own record in that slot is at the last revision under the statement"
+                .into(),
+        )
+    })?;
     let value = Value::Other(record.to_bytes()?);
-    written_over(conn, identity, &over, &name, &value, now)?.ok_or_else(|| {
-        PersonError::Held("the record's slot has no next revision under the statement".into())
-    })
+    let inside = Inside {
+        name,
+        value,
+        chain: Some(Vec::new()),
+    };
+    let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
+    entries::store(conn, &entry, now)?;
+    Ok(entry)
 }
 
 /// The record of this device's own addition, where the statement does not
@@ -834,6 +850,58 @@ mod tests {
             Err(PersonError::Entry(_))
         ));
         assert_eq!(adder.everything(), before);
+    }
+
+    /// A record is written at one above this device's own entry in its
+    /// slot, whatever another key has written there: a device that counts
+    /// cannot stop another adding a key by writing under the record's
+    /// name, at the last revision the statement has.
+    #[test]
+    fn test_no_other_keys_entry_stops_a_record_being_written() {
+        use crate::take::{NotRead, Record, take};
+        use cordelia_core::protocol::{REV_BAND_SIZE, REV_COUNT_BITS};
+
+        let mut s = Several::of_one_person(2);
+        let new = Machine::new(7);
+        let name = added_name(&new.key()).unwrap();
+        let top = (1 << REV_COUNT_BITS) + REV_BAND_SIZE - 1;
+        let in_the_way = entry_by(
+            &s[1].identity,
+            &s[0].personal(),
+            top,
+            &name,
+            text("in the way"),
+            &[],
+        );
+        let adder = &s[0];
+        assert_eq!(
+            take(&adder.conn, &adder.identity, &in_the_way, s.now).unwrap(),
+            Taken::Own {
+                stored: entries::Outcome::Stored,
+                record: Some(Record::NotRead(NotRead::NoBytes)),
+                came_to_count: 0,
+            }
+        );
+
+        // Device 0 adds the key all the same: its record is its own entry
+        // there, at revision 1, and says nothing of the other.
+        let now = s.tick();
+        let (adder, other) = (&s[0], &s[1]);
+        let added = add_device(&adder.conn, &adder.identity, &new.key(), "device 7", now);
+        let record = added.unwrap().record.unwrap();
+        assert_eq!((record.author, record.rev), (adder.key(), 1));
+        let inside = record.open(&adder.personal()).unwrap();
+        assert_eq!((inside.name, inside.chain), (name, Some(Vec::new())));
+        assert!(adder.counts(&new.key()));
+        // A device that is given it reads the record from it.
+        assert_eq!(
+            take(&other.conn, &other.identity, &record, now).unwrap(),
+            Taken::Own {
+                stored: entries::Outcome::Stored,
+                record: Some(Record::Seen(AdditionSeen::Counted)),
+                came_to_count: 1,
+            }
+        );
     }
 
     /// A key that the statement already lists is handed the change again,
