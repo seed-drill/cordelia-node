@@ -1551,10 +1551,10 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?.len();
     let usage = cordelia_storage::usage::snapshot(&conn, chrono::Utc::now().timestamp())?;
-    // What a relay's storage cap counts, and the cap: the database's pages
-    // in use, which fall when a channel is dropped (the file does not
-    // shrink).
-    let used = cordelia_storage::db::used_bytes(&conn)?;
+    // What a relay's storage cap counts, and the cap: what its items are
+    // counted at, each its content and what an entry takes beyond it. It
+    // falls when a channel is dropped (the file does not shrink).
+    let used = cordelia_storage::items::stored_cost(&conn)?;
     let cap = config.node.max_storage_bytes;
 
     if json {

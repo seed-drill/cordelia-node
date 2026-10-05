@@ -38,7 +38,8 @@ pub struct Rates {
     /// How long a relay leaves a channel it dropped before it takes it
     /// again, the first time.
     ask_again: std::time::Duration,
-    /// The most a relay's database may hold (its operator's setting).
+    /// The most a relay may hold of the older kind of channel (its
+    /// operator's setting), as its items are counted.
     relay_max_bytes: u64,
 }
 
@@ -65,7 +66,8 @@ pub struct OverLimit {
 }
 
 impl Rates {
-    /// For a node whose database, if it is a relay, may hold `relay_max_bytes`.
+    /// For a node that, if it is a relay, may hold `relay_max_bytes` of the
+    /// older kind of channel.
     pub fn new(relay_max_bytes: u64) -> Self {
         Self {
             relay_max_bytes,
@@ -296,7 +298,12 @@ pub fn store_item(
 }
 
 /// What a relay needs to decide whether it has room for an item (decision
-/// 2026-09-30 §4.6). A relay is a cache with a cap:
+/// 2026-09-30 §4.6). A relay is a cache with a cap, and the cap is set
+/// against what its items are counted at
+/// ([`cordelia_storage::items::stored_cost`]): this kind's own rows, and
+/// nothing of the entries of channels from their secrets, which have a
+/// room and a cap of their own (decision 2026-10-04 §2.5, §16). Neither
+/// kind is refused or dropped for what the relay holds of the other.
 ///
 /// - At its cap it takes no channel that it does not already hold.
 /// - A write that takes it over its cap makes it drop the channels it
@@ -313,7 +320,8 @@ pub fn store_item(
 /// RELAY_ASK_AGAIN_SECS after. A channel it dropped is left for that long
 /// before it is taken again, and is then listed again from the start.
 pub struct RelayRoom<'a> {
-    /// The most the relay's database may hold, in bytes.
+    /// The most the relay may hold of this kind of channel, in bytes as
+    /// its items are counted.
     pub max_bytes: u64,
     /// The most one channel may hold, in bytes of entries.
     pub max_channel_bytes: u64,
@@ -361,7 +369,7 @@ impl<'a> RelayRoom<'a> {
         channel_id: &str,
     ) -> Result<(), &'static str> {
         use cordelia_network::messages::{REFUSED_FULL, REFUSED_STORAGE};
-        let used = cordelia_storage::db::used_bytes(db).map_err(|_| REFUSED_STORAGE)?;
+        let used = cordelia_storage::items::stored_cost(db).map_err(|_| REFUSED_STORAGE)?;
         if used >= self.max_bytes {
             tracing::debug!(channel = %channel_id, used, "at the storage cap; not taking a channel this relay does not hold");
             return Err(REFUSED_FULL);
@@ -466,7 +474,7 @@ impl<'a> RelayRoom<'a> {
     fn make_room(&mut self, db: &rusqlite::Connection, written: &str) -> bool {
         use cordelia_storage::channels;
         let mut kept = true;
-        while cordelia_storage::db::used_bytes(db).is_ok_and(|used| used > self.max_bytes) {
+        while cordelia_storage::items::stored_cost(db).is_ok_and(|used| used > self.max_bytes) {
             let Ok(Some(newest)) = channels::newest_stored(db) else {
                 break;
             };
@@ -4569,7 +4577,7 @@ mod tests {
         use cordelia_network::messages::REFUSED_FULL;
         const ENTRY: usize = 60_000;
         let db = cordelia_storage::db::open_in_memory().unwrap();
-        let empty = cordelia_storage::db::used_bytes(&db).unwrap();
+        let empty = cordelia_storage::items::stored_cost(&db).unwrap();
         let mut room = RelayRoom::new(empty + 400_000, None, None);
 
         // The first channel, then newer ones, one entry each, until the
@@ -4587,7 +4595,7 @@ mod tests {
             assert!(newer.len() < 50, "the relay is never full");
         }
         assert!(newer.len() >= 3, "{}", newer.len());
-        let used = cordelia_storage::db::used_bytes(&db).unwrap();
+        let used = cordelia_storage::items::stored_cost(&db).unwrap();
         assert!(used <= room.max_bytes, "{used} > {}", room.max_bytes);
         // The channel that was refused, or was the newest when the cap was
         // passed, is not held; all the others are.
@@ -4604,7 +4612,7 @@ mod tests {
                 "write {write}"
             );
             assert_eq!(holds(&db, &first), (ENTRY * (write + 1)) as u64);
-            let used = cordelia_storage::db::used_bytes(&db).unwrap();
+            let used = cordelia_storage::items::stored_cost(&db).unwrap();
             assert!(used <= room.max_bytes, "{used} > {}", room.max_bytes);
             // Whatever was dropped is a suffix of the newer channels.
             let held: Vec<bool> = newer.iter().map(|c| holds(&db, c) > 0).collect();
@@ -5265,6 +5273,135 @@ mod tests {
         assert_eq!(rates.fetch_room(&peer(200), fetched_from), 0);
     }
 
+    /// The older kind's room is counted by its own items, and by nothing
+    /// else that the database holds (decision 2026-10-04 §2.5, §16). A
+    /// relay that holds a megabyte of entries of channels from their
+    /// secrets beside them does, at its cap for the older kind, exactly
+    /// what a relay that holds none does: it takes the same channels,
+    /// refuses the same one, and drops the same ones to make room. And
+    /// what it drops is never of the other kind.
+    #[test]
+    fn the_older_kinds_room_is_counted_by_its_own_items_whatever_else_the_relay_holds() {
+        use cordelia_core::protocol::entry_cost;
+        use cordelia_network::messages::REFUSED_FULL;
+        use cordelia_storage::relay;
+        const ENTRY: usize = 60_000;
+        const CAP: u64 = 400_000;
+
+        // What a relay does at its cap for the older kind: what each
+        // write came to, and the channels it holds after it.
+        fn at_its_cap(db: &rusqlite::Connection) -> Vec<String> {
+            let mut room = RelayRoom::new(CAP, None, None);
+            let mut done = Vec::new();
+            let channels = |from: usize| -> Vec<String> { (from..from + 9).map(channel).collect() };
+            let mut note = |what: String, db: &rusqlite::Connection| {
+                let held: Vec<usize> = (900..909).filter(|n| holds(db, &channel(*n)) > 0).collect();
+                let used = cordelia_storage::items::stored_cost(db).unwrap();
+                done.push(format!("{what}: holds {held:?}, {used} in use"));
+            };
+            // Nine channels, one entry each, the oldest first.
+            for id in channels(900) {
+                let stored = relay_store(db, &mut room, &id, ENTRY);
+                note(format!("{stored:?}"), db);
+            }
+            // The oldest grows, four times.
+            for _ in 0..4 {
+                let stored = relay_store(db, &mut room, &channel(900), ENTRY);
+                note(format!("{stored:?}"), db);
+            }
+            // Whether it would take a channel that it does not hold.
+            let asked = room.takes_new_channel(db, &channel(950));
+            note(format!("{asked:?}"), db);
+            done
+        }
+
+        let alone = cordelia_storage::db::open_in_memory().unwrap();
+        let beside = cordelia_storage::db::open_in_memory().unwrap();
+        // The other relay holds sixteen entries of the largest size, of
+        // channels from their secrets: more than a megabyte, where its
+        // cap for the older kind is 400,000 bytes.
+        let author = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let mut of_entries = relay::Room::new(u64::MAX);
+        for n in 0..16u8 {
+            let inside = cordelia_crypto::entry::Inside {
+                name: "n".into(),
+                value: cordelia_crypto::entry::Value::Text(
+                    "x".repeat(cordelia_core::protocol::MAX_ENTRY_NAME_AND_VALUE_BYTES - 1),
+                ),
+                chain: Some(Vec::new()),
+            };
+            let entry = cordelia_crypto::entry::Entry::seal(&[n; 32], &author, 1, &inside)
+                .unwrap()
+                .check()
+                .unwrap();
+            let asker = relay::Asker::Address("192.0.2.7".parse().unwrap());
+            assert_eq!(
+                relay::take(&beside, &mut of_entries, &entry, &asker, 1_800_000_000).unwrap(),
+                relay::Taken::Stored
+            );
+        }
+        let entries_held = relay::used_bytes(&beside).unwrap();
+        assert_eq!(entries_held, 16 * entry_cost(65_536));
+        assert!(entries_held > 2 * CAP);
+        // None of it counts for the older kind: both relays hold nothing
+        // of that.
+        assert_eq!(cordelia_storage::items::stored_cost(&beside).unwrap(), 0);
+
+        let did = at_its_cap(&alone);
+        assert_eq!(at_its_cap(&beside), did);
+
+        // And what it did is what a relay does at its cap: six channels
+        // fit, the seventh takes it over and is itself the newest, so it
+        // goes and the write is refused. Then the relay is still under
+        // its cap, so the eighth and the ninth are tried the same way.
+        let one = entry_cost(ENTRY);
+        assert_eq!(6 * one, 366_144);
+        let full = format!("Err({REFUSED_FULL:?})");
+        for (write, held) in (0..6).map(|n| (n, (900..=900 + n).collect::<Vec<usize>>())) {
+            assert_eq!(
+                did[write],
+                format!(
+                    "Ok(true): holds {held:?}, {} in use",
+                    (write as u64 + 1) * one
+                )
+            );
+        }
+        let six: Vec<usize> = (900..906).collect();
+        for refused in &did[6..9] {
+            assert_eq!(*refused, format!("{full}: holds {six:?}, 366144 in use"));
+        }
+        // The oldest grows: each write is taken, and the newest channel
+        // goes for it. The oldest is never touched.
+        for (write, newest) in [(9, 904), (10, 903), (11, 902), (12, 901)] {
+            let held: Vec<usize> = (900..=newest).collect();
+            assert_eq!(
+                did[write],
+                format!("Ok(true): holds {held:?}, 366144 in use")
+            );
+        }
+        // Under its cap, it would take a channel it does not hold.
+        assert_eq!(did[13], "Ok(()): holds [900, 901], 366144 in use");
+        assert_eq!(did.len(), 14);
+        assert_eq!(holds(&alone, &channel(900)), 5 * ENTRY as u64);
+
+        // Making room for the older kind took nothing of the other kind:
+        // every entry is still there.
+        assert_eq!(relay::used_bytes(&beside).unwrap(), entries_held);
+        // At the older kind's cap to the byte, no new channel is taken,
+        // whatever the other kind holds.
+        let used = cordelia_storage::items::stored_cost(&beside).unwrap();
+        let full_room = RelayRoom::new(used, None, None);
+        assert_eq!(
+            full_room.takes_new_channel(&beside, &channel(950)),
+            Err(REFUSED_FULL)
+        );
+        let a_byte_more = RelayRoom::new(used + 1, None, None);
+        assert_eq!(
+            a_byte_more.takes_new_channel(&beside, &channel(950)),
+            Ok(())
+        );
+    }
+
     /// A relay can say whether it would take a channel it does not hold
     /// without counting it, so that it does not fetch what it would then
     /// refuse: not at its cap, and not from an address that has had its
@@ -5302,7 +5439,7 @@ mod tests {
         let listed = RelayRoom::new(u64::MAX, Some(&rates), None);
         assert_eq!(listed.takes_new_channel(&db, &channel(600)), Ok(()));
         // At the cap, nobody's new channel is taken.
-        let used = cordelia_storage::db::used_bytes(&db).unwrap();
+        let used = cordelia_storage::items::stored_cost(&db).unwrap();
         let full = RelayRoom::new(used, Some(&rates), None);
         assert_eq!(
             full.takes_new_channel(&db, &channel(600)),
@@ -5319,7 +5456,7 @@ mod tests {
         use cordelia_network::messages::REFUSED_FULL;
         const ENTRY: usize = 60_000;
         let db = cordelia_storage::db::open_in_memory().unwrap();
-        let empty = cordelia_storage::db::used_bytes(&db).unwrap();
+        let empty = cordelia_storage::items::stored_cost(&db).unwrap();
         let rates = std::sync::Mutex::new(Rates::default());
         let mut room = RelayRoom::new(empty + 400_000, Some(&rates), None);
 

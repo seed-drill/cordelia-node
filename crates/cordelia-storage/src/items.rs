@@ -765,6 +765,29 @@ pub fn channel_cost(conn: &Connection, channel_id: &str) -> Result<u64, Cordelia
     .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
+/// What every item here costs together: each its ciphertext and what an
+/// entry takes beyond it ([`cordelia_core::protocol::entry_cost`]). This is
+/// what a relay's cap for this kind of channel is set against (decision
+/// 2026-10-04 §2.5, §16): what its own rows are counted at, and not the
+/// database's pages, which hold the entries of channels from their secrets
+/// too. So neither kind is refused or dropped for what the relay holds of
+/// the other.
+///
+/// It is read from two counts that the database keeps as `items` is
+/// written (`item_count` and `item_bytes`, made by schema step 13), and
+/// costs the same however much is held.
+pub fn stored_cost(conn: &Connection) -> Result<u64, CordeliaError> {
+    conn.query_row(
+        "SELECT (SELECT value FROM counters WHERE name = 'item_bytes')
+              + (SELECT value FROM counters WHERE name = 'item_count') * ?1",
+        params![cordelia_core::protocol::ENTRY_OVERHEAD_BYTES as i64],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map_err(|e| CordeliaError::Storage(e.to_string()))?
+    .map(|bytes| bytes.max(0) as u64)
+    .ok_or_else(|| CordeliaError::Storage("the counts of what `items` holds are missing".into()))
+}
+
 /// The cost of what one author holds in one slot of a channel: what a new
 /// revision by that author would replace.
 pub fn author_slot_cost(
@@ -1633,6 +1656,110 @@ mod tests {
             author_slot_cost(&conn, "ch1", &[0u8; 32], &author).unwrap(),
             0
         );
+    }
+
+    /// What every item costs together is what each channel's items cost,
+    /// added up: it is the sum over the rows that are there, through every
+    /// way this module writes them. It counts nothing of the entries of
+    /// channels from their secrets, which share the database.
+    #[test]
+    fn what_every_item_costs_together_is_counted_from_the_rows_of_items() {
+        use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, entry_cost};
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access,
+                                   creator_id, created_at, updated_at)
+             VALUES ('ch2', 'other', 'named', 'realtime', 'open', X'42',
+                     '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // What the rows cost, added up from the table itself.
+        let from_the_rows = |conn: &Connection| -> u64 {
+            conn.query_row(
+                "SELECT COALESCE(SUM(content_length), 0) + COUNT(*) * ?1 FROM items",
+                params![ENTRY_OVERHEAD_BYTES as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+        };
+        let cost = |conn: &Connection| -> u64 {
+            let cost = stored_cost(conn).unwrap();
+            assert_eq!(cost, from_the_rows(conn));
+            assert_eq!(
+                cost,
+                channel_cost(conn, "ch1").unwrap() + channel_cost(conn, "ch2").unwrap()
+            );
+            cost
+        };
+        assert_eq!(cost(&conn), 0);
+
+        // Plain items, in two channels: each its ciphertext and what an
+        // entry takes beyond it.
+        let blob = [7u8; 5000];
+        let mut one = test_item("ci_one", "2026-01-01T00:01:00Z");
+        one.content_hash = &[0xC0; 32];
+        assert!(insert_item(&conn, &one).unwrap());
+        assert_eq!(cost(&conn), entry_cost(100));
+        let mut two = test_item("ci_two", "2026-01-01T00:02:00Z");
+        two.content_hash = &[0xC1; 32];
+        two.channel_id = "ch2";
+        two.encrypted_blob = &blob;
+        assert!(insert_item(&conn, &two).unwrap());
+        assert_eq!(cost(&conn), entry_cost(100) + entry_cost(5000));
+        // One that is not stored, since it is held already, costs nothing.
+        assert!(!insert_item(&conn, &one).unwrap());
+        assert_eq!(cost(&conn), entry_cost(100) + entry_cost(5000));
+
+        // A newer revision takes the place of the one it replaces: what
+        // that one cost is given back.
+        let (author, slot) = ([0xA1u8; 32], [0x51u8; 32]);
+        let mut first = slotted("ci_r1", &author, &slot, 1, &[0xD1; 32]);
+        first.encrypted_blob = &blob;
+        assert!(insert_item(&conn, &first).unwrap());
+        let with_first = 2 * entry_cost(5000) + entry_cost(100);
+        assert_eq!(cost(&conn), with_first);
+        let small = [9u8; 100];
+        let mut second = slotted("ci_r2", &author, &slot, 2, &[0xD2; 32]);
+        second.encrypted_blob = &small;
+        assert!(insert_item(&conn, &second).unwrap());
+        assert_eq!(cost(&conn), with_first - entry_cost(5000) + entry_cost(100));
+        // An older one is not stored, and costs nothing.
+        assert!(!insert_item(&conn, &slotted("ci_r0", &author, &slot, 1, &[0xD0; 32])).unwrap());
+        let kept = entry_cost(5000) + 2 * entry_cost(100);
+        assert_eq!(cost(&conn), kept);
+
+        // A delete that has expired is collected, with what it replaced:
+        // of the two that were written under the name, the delete is what
+        // was left to collect.
+        member(&conn, &author);
+        let gone = [0x52u8; 32];
+        old(&conn, "ci_g1", &author, &gone, 1, false);
+        old(&conn, "ci_g2", &author, &gone, 2, true);
+        assert!(cost(&conn) > kept);
+        assert_eq!(gc_keyed_tombstones(&conn, 90, true).unwrap(), 1);
+        assert_eq!(cost(&conn), kept);
+
+        // A channel that is dropped gives back all that it held.
+        assert_eq!(crate::channels::drop_stored(&conn, "ch2").unwrap(), 1);
+        assert_eq!(cost(&conn), 2 * entry_cost(100));
+        assert_eq!(channel_cost(&conn, "ch2").unwrap(), 0);
+
+        // The entries of a channel from its secret are no part of it.
+        conn.execute(
+            "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content, author_sig,
+                                  channel_sig, seq, stored_at, channel_place)
+             VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 1, 0, zeroblob(65536),
+                     zeroblob(64), zeroblob(64), 1, 1800000000, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(cost(&conn), 2 * entry_cost(100));
+
+        // With its counts gone, there is no answer: not nothing held.
+        conn.execute("DELETE FROM counters WHERE name = 'item_bytes'", [])
+            .unwrap();
+        assert!(stored_cost(&conn).is_err());
     }
 
     /// T2. The same ciphertext stored by another author does not stop an

@@ -433,6 +433,16 @@ CREATE TABLE person_names (
 /// made, and whether the store still holds it. Never the hand-over
 /// itself, which holds the secret. It is one of the tables of what a
 /// device holds of its person, and is made by this step.
+///
+/// And what `items` holds is counted as it is written (`item_count`,
+/// `item_bytes` in `counters`): how many items there are, and the bytes of
+/// their content together. A relay's cap for the older kind of channel is
+/// set against what those items are counted at, and not against the
+/// database's pages, which hold the table of entries too (decision
+/// 2026-10-04 §2.5, §16). Three triggers keep the two counts, in the
+/// write that changes a row, whoever makes it; the rows that are there
+/// are counted by this step. So the count costs the same to read however
+/// much is held.
 const MIGRATION_V13: &str = r#"
 CREATE TABLE relay_channels (
     channel_id  BLOB PRIMARY KEY CHECK(length(channel_id) = 32),
@@ -461,6 +471,26 @@ CREATE TABLE person_hand_overs (
     made_at  INTEGER NOT NULL,
     held     INTEGER NOT NULL CHECK(held IN (0, 1))
 );
+
+INSERT OR REPLACE INTO counters (name, value)
+    VALUES ('item_count', (SELECT COUNT(*) FROM items));
+INSERT OR REPLACE INTO counters (name, value)
+    VALUES ('item_bytes', (SELECT COALESCE(SUM(content_length), 0) FROM items));
+
+CREATE TRIGGER items_counted_in AFTER INSERT ON items BEGIN
+    UPDATE counters SET value = value + 1 WHERE name = 'item_count';
+    UPDATE counters SET value = value + NEW.content_length WHERE name = 'item_bytes';
+END;
+
+CREATE TRIGGER items_counted_out AFTER DELETE ON items BEGIN
+    UPDATE counters SET value = value - 1 WHERE name = 'item_count';
+    UPDATE counters SET value = value - OLD.content_length WHERE name = 'item_bytes';
+END;
+
+CREATE TRIGGER items_counted_again AFTER UPDATE OF content_length ON items BEGIN
+    UPDATE counters SET value = value - OLD.content_length + NEW.content_length
+        WHERE name = 'item_bytes';
+END;
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -1061,7 +1091,8 @@ mod tests {
     /// table's definition, and each row of the tables an older binary
     /// wrote. What a later step adds is left out too: the tables of what
     /// a device holds of its person, the table of the channels a relay
-    /// holds, and the index of each channel's own order of entries.
+    /// holds, the index of each channel's own order of entries, and the
+    /// counts of what `items` holds with the triggers that keep them.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
@@ -1071,6 +1102,7 @@ mod tests {
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
+                   AND name NOT LIKE 'items_counted%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1083,7 +1115,8 @@ mod tests {
                  || is_tombstone || hex(content_hash) || hex(signature) || hex(encrypted_blob)
                  || content_length || seq || hex(slot) || rev FROM items ORDER BY item_id",
             "SELECT channel_id || channel_type || scope || epoch FROM channels",
-            "SELECT name || value FROM counters WHERE name != 'entry_seq'",
+            "SELECT name || value FROM counters
+                 WHERE name NOT IN ('entry_seq', 'item_count', 'item_bytes')",
             "SELECT folder || channel_id || key || COALESCE(hex(hash), '') || rev FROM sync_files
                  ORDER BY key",
             "SELECT folder || channel_id || file || line || line_at FROM index_lines",
@@ -1254,7 +1287,8 @@ mod tests {
             "SELECT hex(channel_id) || hex(slot) || hex(author) || rev || is_delete
                  || hex(content) || hex(author_sig) || hex(channel_sig) || seq || stored_at
                  FROM entries",
-            "SELECT name || value FROM counters ORDER BY name",
+            "SELECT name || value FROM counters
+                 WHERE name NOT IN ('item_count', 'item_bytes') ORDER BY name",
         ] {
             let rows: Vec<String> = conn
                 .prepare(rows)
@@ -1425,14 +1459,44 @@ mod tests {
         conn
     }
 
-    /// The tables and the indexes that the step to version 13 adds.
-    const NEW_IN_V13: [&str; 5] = [
+    /// The tables, the indexes and the triggers that the step to version
+    /// 13 adds.
+    const NEW_IN_V13: [&str; 8] = [
         "idx_entries_channel_place",
         "idx_relay_channels_held",
         "idx_relay_channels_used",
+        "items_counted_again",
+        "items_counted_in",
+        "items_counted_out",
         "person_hand_overs",
         "relay_channels",
     ];
+
+    /// The two counts of what `items` holds, or `None` where there are
+    /// none: how many items, and the bytes of their content.
+    fn item_counts(conn: &Connection) -> Option<(i64, i64)> {
+        conn.query_row(
+            "SELECT (SELECT value FROM counters WHERE name = 'item_count'),
+                    (SELECT value FROM counters WHERE name = 'item_bytes')",
+            [],
+            |row| {
+                Ok(row
+                    .get::<_, Option<i64>>(0)?
+                    .zip(row.get::<_, Option<i64>>(1)?))
+            },
+        )
+        .unwrap()
+    }
+
+    /// What `items` holds, counted from its rows.
+    fn items_as_they_are(conn: &Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(content_length), 0) FROM items",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
 
     /// Each entry's channel by its first byte, its place in this node's
     /// order, and its place in its channel's own, or `None` where entries
@@ -1481,7 +1545,7 @@ mod tests {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE (name LIKE '%relay_channels%' OR name = 'idx_entries_channel_place'
-                    OR name = 'person_hand_overs')
+                    OR name = 'person_hand_overs' OR name LIKE 'items_counted%')
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1493,10 +1557,10 @@ mod tests {
     }
 
     /// The table of the channels a relay holds, each entry's place in its
-    /// channel's own order, and the table of the hand-overs a device
-    /// made, are made in one step with their version, as the steps before
-    /// it are: a failure between them leaves none, and the step asked for
-    /// twice is run once.
+    /// channel's own order, the table of the hand-overs a device made,
+    /// and the counts of what `items` holds, are made in one step with
+    /// their version, as the steps before it are: a failure between them
+    /// leaves none, and the step asked for twice is run once.
     #[test]
     fn test_v13_adds_the_channels_a_relay_holds_and_its_version_as_one() {
         let conn = at_v12();
@@ -1507,6 +1571,7 @@ mod tests {
         assert_eq!(version(&conn), 12);
         assert!(new_in_v13(&conn).is_empty());
         assert_eq!(channel_places(&conn), None);
+        assert_eq!(item_counts(&conn), None);
         let entries_before = definition_of(&conn, "entries");
 
         let failing = format!("{MIGRATION_V13} SELECT no_such_function();");
@@ -1517,6 +1582,7 @@ mod tests {
             "the table goes with the version"
         );
         assert_eq!(channel_places(&conn), None, "and so does the column");
+        assert_eq!(item_counts(&conn), None, "and so do the counts");
         assert_eq!(definition_of(&conn, "entries"), entries_before);
 
         // The next start runs the step from the beginning.
@@ -1525,30 +1591,37 @@ mod tests {
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v13(&conn), NEW_IN_V13);
         assert_eq!(channel_places(&conn).map(|places| places.len()), Some(4));
+        assert_eq!(item_counts(&conn), Some((2, 3)));
 
         // A start after that, and the step asked for again, change
-        // nothing: what the relay holds stays.
+        // nothing: what the relay holds stays, and the counts stay where
+        // writing has brought them.
         conn.execute(
             "INSERT INTO relay_channels (channel_id, held_since, used_at, bytes, mark)
              VALUES (zeroblob(32), 7, 8, 1280, X'0102030405060708')",
             [],
         )
         .unwrap();
+        conn.execute("DELETE FROM items WHERE item_id = 'ci_1'", [])
+            .unwrap();
+        assert_eq!(item_counts(&conn), Some((1, 2)));
         init_db(&conn).unwrap();
         migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
         let channels: i64 = conn
             .query_row("SELECT COUNT(*) FROM relay_channels", [], |row| row.get(0))
             .unwrap();
         assert_eq!((version(&conn), channels), (SCHEMA_VERSION, 1));
+        assert_eq!(item_counts(&conn), Some((1, 2)));
     }
 
     /// A database at version 12 that an older binary wrote is taken to
     /// version 13 with everything it held as it was: the step adds two
     /// tables and two indexes, with nothing in them, and to each entry
-    /// its place in its channel's own order, with an index. It touches
-    /// nothing else. The entries it held are in no channel that a relay
-    /// holds, and the device has made no hand-over that it keeps
-    /// anything of.
+    /// its place in its channel's own order, with an index. It counts the
+    /// items that are there, and adds the triggers that keep the counts.
+    /// It touches nothing else. The entries it held are in no channel
+    /// that a relay holds, and the device has made no hand-over that it
+    /// keeps anything of.
     #[test]
     fn test_a_database_at_v12_that_an_older_binary_wrote_is_taken_to_v13() {
         let conn = at_v12();
@@ -1613,6 +1686,97 @@ mod tests {
             conn.execute("UPDATE entries SET channel_place = 1", [])
                 .is_err()
         );
+
+        // And the items that an older binary wrote are counted: two of
+        // them, of one byte and of two.
+        assert_eq!(items_as_they_are(&conn), (2, 3));
+        assert_eq!(item_counts(&conn), Some((2, 3)));
+    }
+
+    /// The two counts of what `items` holds are kept in the write that
+    /// changes a row, whoever makes it: an item more, an item fewer, many
+    /// at once, and a content of another length. A write that is undone
+    /// is not counted.
+    #[test]
+    fn test_the_counts_of_what_items_holds_are_kept_as_it_is_written() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(item_counts(&conn), Some((0, 0)));
+        conn.execute_batch(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES ('grp_a', 'group', 'realtime', 'invite_only', X'AA',
+                     '2026-01-01', '2026-01-01'),
+                    ('grp_b', 'group', 'realtime', 'invite_only', X'AA',
+                     '2026-01-01', '2026-01-01');",
+        )
+        .unwrap();
+        let insert = |id: &str, channel: &str, bytes: i64| {
+            conn.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length, seq)
+                 VALUES (?1, ?2, X'AA', 'memory', '2026-01-01', ?1, X'02', zeroblob(?3), ?3, 1)",
+                rusqlite::params![id, channel, bytes],
+            )
+        };
+        let kept = |conn: &Connection| {
+            let counts = item_counts(conn).unwrap();
+            assert_eq!(counts, items_as_they_are(conn));
+            counts
+        };
+
+        // An item more, and another, and one of no bytes.
+        assert_eq!(insert("ci_1", "grp_a", 100), Ok(1));
+        assert_eq!(kept(&conn), (1, 100));
+        assert_eq!(insert("ci_2", "grp_a", 4096), Ok(1));
+        assert_eq!(insert("ci_3", "grp_b", 0), Ok(1));
+        assert_eq!(insert("ci_4", "grp_b", 7), Ok(1));
+        assert_eq!(kept(&conn), (4, 4203));
+        // An item that is not stored is not counted: its ID is taken.
+        assert!(insert("ci_1", "grp_a", 50).is_err());
+        conn.execute(
+            "INSERT OR IGNORE INTO items (item_id, channel_id, author_id, item_type,
+                                          published_at, content_hash, signature,
+                                          encrypted_blob, content_length, seq)
+             VALUES ('ci_1', 'grp_a', X'AA', 'memory', '2026-01-01', X'09', X'02', X'03', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(kept(&conn), (4, 4203));
+
+        // A content of another length, in the row that holds it.
+        conn.execute(
+            "UPDATE items SET encrypted_blob = zeroblob(10), content_length = 10
+             WHERE item_id = 'ci_1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(kept(&conn), (4, 4113));
+        // A write that changes no length changes no count.
+        conn.execute("UPDATE items SET is_tombstone = 1", [])
+            .unwrap();
+        assert_eq!(kept(&conn), (4, 4113));
+
+        // An item fewer, and a whole channel's at once.
+        conn.execute("DELETE FROM items WHERE item_id = 'ci_2'", [])
+            .unwrap();
+        assert_eq!(kept(&conn), (3, 17));
+        conn.execute("DELETE FROM items WHERE channel_id = 'grp_b'", [])
+            .unwrap();
+        assert_eq!(kept(&conn), (1, 10));
+
+        // What is written and undone is not counted.
+        conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(insert("ci_5", "grp_a", 900), Ok(1));
+        conn.execute("DELETE FROM items WHERE item_id = 'ci_1'", [])
+            .unwrap();
+        assert_eq!(kept(&conn), (1, 900));
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(kept(&conn), (1, 10));
+
+        // Every one gone: nothing is held.
+        conn.execute("DELETE FROM items", []).unwrap();
+        assert_eq!(kept(&conn), (0, 0));
     }
 
     /// The table takes no row that cannot be a channel a relay holds: an
