@@ -98,14 +98,15 @@ pub struct Added {
 ///   without a new key;
 /// - on a device that may not add: one that was itself added, since the
 ///   last statement, by a device added since;
-/// - where the device already counts 64, and the key is not one that the
-///   statement lists;
+/// - where the device already counts 64, and the key does not count yet;
 /// - this device's own key, a key that is no usable public key, and a
 ///   label that a statement could not carry.
 ///
 /// A key that the statement already lists is handed the change again,
 /// with no record, and `label` is not used: the statement's own label
-/// stands.
+/// stands. A key that already counts by a record this device keeps is
+/// handed the change again too, with a record of this device's own: it
+/// takes no room, and the bound of 64 is not asked for it.
 pub fn add_device(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -135,7 +136,8 @@ pub fn add_device(
         };
         let mut added = (None, None);
         if !statement.lists(new) {
-            if standing.counting.devices() >= MAX_COUNTED_DEVICES {
+            let counts_already = standing.counting.counts(new);
+            if !counts_already && standing.counting.devices() >= MAX_COUNTED_DEVICES {
                 return Err(PersonError::NoRoom);
             }
             let record = Addition::under(statement, Device::new(*new, label)?, own, at(now))?
@@ -979,7 +981,7 @@ mod tests {
         held_rows::set_state(&on.conn, State::Applied).unwrap();
 
         // The statement lists devices 0 and 1. With 62 more that count,
-        // the device counts 64: it adds no other, and still hands the
+        // the device counts 64: it adds no other. It still hands the
         // change to a key that the statement lists.
         let statement = on.held().statement.statement;
         for n in 100..162 {
@@ -999,6 +1001,19 @@ mod tests {
         ));
         let listed = add(on, &s.key(1), "device 1").unwrap();
         assert_eq!(listed.record, None);
+        // And to a key that counts already by a record it keeps: that key
+        // takes no room. The record it makes for it adds nobody.
+        let counted = add(on, &listed_as(130).key, "added again").unwrap();
+        assert!(counted.record.is_some());
+        assert_eq!(
+            counted.seen,
+            Some(AdditionSeen::NotCounted(NotCounted::CountsAlready))
+        );
+        assert_eq!(who_counts(&on.conn).unwrap().devices(), 64);
+        assert!(matches!(
+            add(on, &new.key(), "new"),
+            Err(PersonError::NoRoom)
+        ));
         // The control: with room for one, it is added.
         held_rows::clear_additions(&on.conn).unwrap();
         assert_eq!(
