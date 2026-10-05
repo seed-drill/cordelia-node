@@ -1107,7 +1107,10 @@ pub const HAND_OVER_NAME: &str = "hand-over";
 /// How long a key that a person typed on a device opens the pair channel
 /// with that key: one hour (decision 2026-10-04 §2.2, §6). A device reads
 /// a pair channel only with a key that was typed on it within that time,
-/// so nothing that a removed device goes on writing there is read.
+/// so nothing that a removed device goes on writing there is read. And it
+/// takes from it only a hand-over that was made less than this long before
+/// or after the key was typed: a pair channel outlives a phrase, and what
+/// was handed long ago is not taken for what a person means now.
 pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
 
 /// The most records of additions a hand-over carries (decision 2026-10-04
