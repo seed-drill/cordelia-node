@@ -301,7 +301,8 @@ pub fn start_again(
 ///
 /// It is read from what the device keeps of the relay, and writes
 /// nothing. A delete over a hand-over waits only for a relay that was
-/// sent the hand-over ([`crate::at_relays::to_send`]).
+/// sent the hand-over ([`crate::at_relays::to_send`]). What the relay
+/// had no room for waits too: it is kept, to be sent again.
 pub fn waits_at(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -335,7 +336,8 @@ pub fn waits_at(
                     .any(|held| held.entry.author == own && (was_sent || !held.entry.delete))
             }
         };
-        waiting += usize::from(waits);
+        let refused = !kept_rows::waiting_refused(conn, relay, &channel.id)?.is_empty();
+        waiting += usize::from(waits || refused);
     }
     Ok(waiting)
 }
@@ -636,7 +638,8 @@ mod tests {
     /// What waits to be sent to a relay is counted by channel, from what
     /// the device keeps of the relay: its word that it has left waits
     /// until the relay was sent it, and a delete over a hand-over waits
-    /// only for a relay that was sent the hand-over.
+    /// only for a relay that was sent the hand-over. What a relay had no
+    /// room for waits there, although the relay was sent it.
     #[test]
     fn test_what_waits_to_be_sent_to_a_relay_is_counted_by_channel() {
         let mut s = Several::of_one_person(2);
@@ -658,6 +661,14 @@ mod tests {
         sent_all(&relay);
         assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 0);
         assert_eq!(waits_at(&on.conn, &on.identity, &other).unwrap(), 2);
+        // The relay had no room for one entry of the personal channel:
+        // that channel waits there, until the relay holds the entry.
+        let personal = derive::channel_id(&on.personal()).unwrap();
+        let last = kept_rows::last_taken(&on.conn, &personal).unwrap();
+        kept_rows::refused(&on.conn, &relay, &personal, last).unwrap();
+        assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 1);
+        kept_rows::not_refused(&on.conn, &relay, &personal, last).unwrap();
+        assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 0);
 
         // It says that it leaves: its word waits, and the delete over
         // the hand-over waits for the relay that was sent the hand-over.
@@ -713,6 +724,7 @@ mod tests {
                 left[0],
                 at_relays::Which::Since,
                 most,
+                true,
             )
             .unwrap();
             assert_eq!(batch.entries, [word.clone().into_entry()]);

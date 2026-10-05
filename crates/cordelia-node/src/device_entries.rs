@@ -229,6 +229,20 @@ struct LeftFor {
     until: Instant,
 }
 
+/// What a relay refused, for room, of one part of a channel (decision
+/// 2026-10-04 §16).
+struct Left {
+    wait: LeftFor,
+    /// Whether nothing of it is sent until the wait has gone by: the
+    /// relay stopped there, at a channel it would not begin or at what
+    /// was carried. Otherwise only what it refused waits, and what
+    /// follows is still offered.
+    all: bool,
+}
+
+/// A relay by its key, a channel by its ID, and the part of it.
+type Part = ([u8; 32], [u8; 32], Which);
+
 /// A change that the device was answered with and could not apply
 /// (decision 2026-10-04 §4.2): it is kept, whatever becomes of the
 /// connection it came on, and tried again at each pass.
@@ -247,8 +261,8 @@ struct NotApplied {
 struct Kept {
     links: HashMap<LinkId, OfLink>,
     relays: HashMap<String, OfRelay>,
-    /// By the relay's key and the channel's ID.
-    left: HashMap<([u8; 32], [u8; 32]), LeftFor>,
+    /// What a relay refused for room, and when it is sent there again.
+    left: HashMap<Part, Left>,
     /// A change that the device was answered with and could not apply.
     not_applied: Option<NotApplied>,
 }
@@ -1082,13 +1096,22 @@ impl DeviceEntries {
     /// Push to the relay at `link` what it has not been sent of
     /// `channel`, and act on each answer (decision 2026-10-04 §2.4 items
     /// 1 and 2, §7.3). Says whether everything was sent.
+    ///
+    /// The device goes on past an entry that the relay has no room for
+    /// (§16): what follows it is still offered, at this pass and at each
+    /// one after, and the entry is offered again once a wait has gone
+    /// by, which doubles each time. Where the relay will not begin the
+    /// channel, nothing of it is offered until then.
     async fn push(&self, at: &At<'_>, channel: &Own, which: Which) -> Step {
         let link = at.link;
         let relay = link.relay().0;
+        let part = (relay, channel.id, which);
+        let mut again = match self.left(&part) {
+            Some(true) => return Step::Done(false),
+            Some(false) => false,
+            None => true,
+        };
         loop {
-            if self.is_left(&relay, &channel.id) {
-                return Step::Done(false);
-            }
             let Some(bytes) = self.room_to_push(link) else {
                 return Step::Done(false);
             };
@@ -1098,10 +1121,17 @@ impl DeviceEntries {
             };
             let batch = {
                 let db = lock(&self.state.db);
-                at_relays::to_send(&db, &self.state.identity, &relay, channel, which, most)
+                let own = &self.state.identity;
+                at_relays::to_send(&db, own, &relay, channel, which, most, again)
             };
             let batch = match batch {
-                Ok(batch) if batch.is_empty() => return Step::Done(true),
+                Ok(batch) if batch.is_empty() => {
+                    // Nothing waits there: no wait is kept.
+                    if !batch.waits {
+                        lock(&self.kept).left.remove(&part);
+                    }
+                    return Step::Done(!batch.waits);
+                }
                 Ok(batch) => batch,
                 Err(e) => {
                     tracing::debug!(error = %e, "could not read what to send");
@@ -1138,16 +1168,20 @@ impl DeviceEntries {
                 let of = kept.relays.entry(link.name().to_string()).or_default();
                 of.another_form += done.another;
             }
-            match done.refused {
-                Some(refused) => {
-                    self.no_room(link, refused == Pushed::OverAllowance, false);
-                    self.leave_for_a_while(&relay, &channel.id);
+            let stopped = done.refused.is_some();
+            if stopped || done.no_room > 0 {
+                self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                // The wait begins, or doubles, once for what was offered:
+                // and not for what is refused while it lasts.
+                if again || stopped {
+                    self.leave_for_a_while(part, stopped);
+                }
+                again = false;
+                if stopped {
                     return Step::Done(false);
                 }
-                None if done == Sent::default() => return Step::Done(false),
-                None => {
-                    lock(&self.kept).left.remove(&(relay, channel.id));
-                }
+            } else if done == Sent::default() {
+                return Step::Done(false);
             }
         }
     }
@@ -1244,28 +1278,36 @@ impl DeviceEntries {
         (room >= entry_cost(MAX_ITEM_BYTES)).then(|| ENTRY_PAGE_MAX_BYTES.min(room as usize))
     }
 
-    /// Whether `channel` is left for now at `relay`: it found no room
-    /// there, and the wait since has not gone by.
-    fn is_left(&self, relay: &[u8; 32], channel: &[u8; 32]) -> bool {
+    /// Whether something of `part` is left for now: the relay found no
+    /// room for it, and the wait since has not gone by. `Some(true)`
+    /// where nothing of the part is sent until then, and `Some(false)`
+    /// where only what the relay refused waits.
+    fn left(&self, part: &Part) -> Option<bool> {
         let now = self.clock.now();
         lock(&self.kept)
             .left
-            .get(&(*relay, *channel))
-            .is_some_and(|left| now < left.until)
+            .get(part)
+            .filter(|left| now < left.wait.until)
+            .map(|left| left.all)
     }
 
-    /// `channel` found no room at `relay`: it is left for a while, a
-    /// little longer each time, as the node leaves what a relay refuses
-    /// today.
-    fn leave_for_a_while(&self, relay: &[u8; 32], channel: &[u8; 32]) {
+    /// The relay found no room for something of `part`: that is left for
+    /// a while, a little longer each time, as the node leaves what a
+    /// relay refuses today. `all` says that the relay stopped there, and
+    /// nothing of the part is sent until then.
+    fn leave_for_a_while(&self, part: Part, all: bool) {
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
-        let left = kept.left.entry((*relay, *channel)).or_insert(LeftFor {
-            refusals: 0,
-            until: now,
+        let left = kept.left.entry(part).or_insert(Left {
+            wait: LeftFor {
+                refusals: 0,
+                until: now,
+            },
+            all,
         });
-        left.refusals = left.refusals.saturating_add(1);
-        left.until = now + refused_wait(left.refusals);
+        left.all = all;
+        left.wait.refusals = left.wait.refusals.saturating_add(1);
+        left.wait.until = now + refused_wait(left.wait.refusals);
     }
 
     // ── What is kept, and what is said ──────────────────────────────

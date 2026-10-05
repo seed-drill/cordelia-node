@@ -45,6 +45,13 @@
 //! relay that is not listed with that one. What it took from a relay is
 //! not sent back there, where nothing else was waiting.
 //!
+//! An entry that a relay has no room for does not hold up what follows
+//! it (§16): a delete, or a replacement that is no larger, makes room.
+//! How far the relay was sent the channel goes on past it, and the entry
+//! is kept apart, to be sent again after a wait: behind whatever is new,
+//! so that what makes room reaches the relay first. Nothing that a relay
+//! answered that it holds is sent it twice.
+//!
 //! What a device carried into the channel of a name when it applied a
 //! statement is sent by a rule of its own ([`Which::Carried`]): after the
 //! channel was fetched from the relay, and not where the device holds, in
@@ -477,7 +484,7 @@ pub fn read_again(conn: &Connection) -> Result<(), PersonError> {
 // ── Sending ──────────────────────────────────────────────────────────
 
 /// Which part of what a device holds of a channel is sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Which {
     /// What the device wrote or took since it last applied a statement:
     /// sent whenever there is leave to send.
@@ -497,6 +504,9 @@ enum Item {
     Passed(i64),
     /// The entry at this place is sent.
     Sent(i64),
+    /// The entry at this place, which the relay had no room for before,
+    /// is sent again.
+    Again(i64),
 }
 
 /// What a device sends a relay of one channel in one push: the entries,
@@ -509,6 +519,9 @@ pub struct Batch {
     items: Vec<Item>,
     /// The entries that are sent, in that order, as they are stored.
     pub entries: Vec<Entry>,
+    /// Whether entries that the relay had no room for wait to be sent it
+    /// again and are not in this batch.
+    pub waits: bool,
 }
 
 impl Batch {
@@ -543,6 +556,7 @@ pub enum Pushed {
     /// again.
     DoesNotCheck,
     /// It had no room for the entry: it is kept, and sent again later.
+    /// What follows it is still offered.
     NoRoom,
     /// The device's address is over its allowance of new channels there:
     /// the entry is kept, and sent again later.
@@ -559,9 +573,12 @@ pub struct Sent {
     pub another: usize,
     /// How many it refused as not signed as they must be.
     pub do_not_check: usize,
-    /// The refusal that stopped the batch, where one did: for room, or
-    /// for the allowance. That entry, and every one after it, is sent
-    /// again.
+    /// How many it had no room for, and are kept to be sent again after
+    /// a wait. What followed each was still offered.
+    pub no_room: usize,
+    /// The refusal that stopped the batch, where one did: for the
+    /// allowance, or for room where the batch is of what was carried.
+    /// That entry, and every one after it, is sent again from there.
     pub refused: Option<Pushed>,
 }
 
@@ -587,6 +604,12 @@ const READ: u32 = 64;
 /// as one push may hold (see the module's documentation). [`sent`] is
 /// told what the relay answered.
 ///
+/// `again` says that what the relay had no room for is offered it again
+/// (decision 2026-10-04 §16): the wait since it refused has gone by. It
+/// goes behind what is new, where the batch has room left. Without it
+/// only what is new is offered, and [`Batch::waits`] says that something
+/// waits.
+///
 /// Nothing is written. Whoever goes on to send the batch says so once
 /// the stream for it is opened ([`opened_for`]).
 pub fn to_send(
@@ -596,8 +619,49 @@ pub fn to_send(
     channel: &Own,
     which: Which,
     most: Most,
+    again: bool,
 ) -> Result<Batch, PersonError> {
-    batch_of(conn, identity, relay, channel, which, most)
+    let mut batch = Batch {
+        which,
+        items: Vec::new(),
+        entries: Vec::new(),
+        waits: false,
+    };
+    let mut bytes = 0;
+    batch_of(conn, identity, relay, channel, most, &mut batch, &mut bytes)?;
+    // Only what came since has its refusals kept apart: a batch of what
+    // was carried stops at one ([`sent`]).
+    if which != Which::Since {
+        return Ok(batch);
+    }
+    let refused = kept_rows::waiting_refused(conn, relay, &channel.id)?;
+    let mut offered = 0;
+    if again {
+        for seq in &refused {
+            let held = entries::channel_entries_after(conn, &channel.id, seq - 1, 1)?;
+            let Some(held) = held.into_iter().find(|held| held.seq == *seq) else {
+                continue;
+            };
+            let travels = ENTRY_WIRE_OVERHEAD_BYTES + held.entry.content.len();
+            if !fits(&batch, bytes, travels, most) {
+                break;
+            }
+            bytes += travels;
+            batch.items.push(Item::Again(held.seq));
+            batch.entries.push(held.entry);
+            offered += 1;
+        }
+    }
+    batch.waits = offered < refused.len();
+    Ok(batch)
+}
+
+/// Whether one entry more, of `travels` bytes as it travels, goes into
+/// `batch`, which holds `bytes`: by the number of its entries and by
+/// their bytes. The first is sent whatever its size.
+fn fits(batch: &Batch, bytes: usize, travels: usize, most: Most) -> bool {
+    batch.entries.len() < most.entries
+        && (batch.entries.is_empty() || bytes + travels <= most.bytes)
 }
 
 /// A stream is about to be opened to send `relay` the batch `batch` of
@@ -620,15 +684,19 @@ pub fn opened_for(
     Ok(())
 }
 
-/// [`to_send`].
+/// [`to_send`], of what the store holds from where the last batch ended:
+/// it goes into `batch`, whose bytes as they travel are counted in
+/// `bytes`.
 fn batch_of(
     conn: &Connection,
     identity: &NodeIdentity,
     relay: &[u8; 32],
     channel: &Own,
-    which: Which,
     most: Most,
-) -> Result<Batch, PersonError> {
+    batch: &mut Batch,
+    bytes: &mut usize,
+) -> Result<(), PersonError> {
+    let which = batch.which;
     let own = identity.public_key();
     let kept = kept_rows::kept(conn, relay, &channel.id)?;
     // Whether the relay was sent anything of a pair channel.
@@ -641,18 +709,12 @@ fn batch_of(
         // Only the channel of a name has what was carried sent apart.
         (Which::Carried, _) => (0, 0),
     };
-    let mut batch = Batch {
-        which,
-        items: Vec::new(),
-        entries: Vec::new(),
-    };
-    let mut bytes = 0;
     loop {
         let read = entries::channel_entries_after(conn, &channel.id, after, READ)?;
         let last = read.len() < READ as usize;
         for held in read {
             if held.seq > up_to {
-                return Ok(batch);
+                return Ok(());
             }
             after = held.seq;
             // A delete in a pair channel is for a relay that was sent
@@ -674,17 +736,15 @@ fn batch_of(
                 continue;
             }
             let travels = ENTRY_WIRE_OVERHEAD_BYTES + held.entry.content.len();
-            let full = batch.entries.len() >= most.entries
-                || (!batch.entries.is_empty() && bytes + travels > most.bytes);
-            if full {
-                return Ok(batch);
+            if !fits(batch, *bytes, travels, most) {
+                return Ok(());
             }
-            bytes += travels;
+            *bytes += travels;
             batch.items.push(Item::Sent(held.seq));
             batch.entries.push(held.entry);
         }
         if last {
-            return Ok(batch);
+            return Ok(());
         }
     }
 }
@@ -725,12 +785,23 @@ fn held_back(
 /// A relay answered a batch: `answers` says what it answered for each
 /// entry that was sent, in their order. How far the relay was sent the
 /// channel moves on past each entry that it holds now or will not take,
-/// and past what was passed over, up to the first that it refused for
-/// room or for the allowance: that one, and what follows it, is sent
-/// again.
+/// and past what was passed over.
+///
+/// It moves on past an entry that the relay had no room for as well
+/// (decision 2026-10-04 §16): that entry is kept apart, to be sent again
+/// after a wait, and what follows it is still offered. An entry that was
+/// sent again, and that the relay holds now or will not take, waits no
+/// more.
+///
+/// Two refusals stop a batch where they are, and that entry and what
+/// follows it are sent again from there. Over the allowance, the relay
+/// will not begin the channel: nothing that follows makes room for it.
+/// And for room, where the batch is of what was carried: what makes
+/// room is something new, which is sent before it at every pass.
 ///
 /// An answer that does not say one thing for each entry says nothing of
-/// any: nothing moves, and all of it is sent again.
+/// any: nothing moves, and all of it is sent again. All of it is written
+/// as one.
 pub fn sent(
     conn: &Connection,
     relay: &[u8; 32],
@@ -742,39 +813,52 @@ pub fn sent(
     if answers.len() != batch.entries.len() {
         return Ok(done);
     }
-    let mut answers = answers.iter();
-    let mut up_to = None;
-    for item in &batch.items {
-        match item {
-            Item::Passed(seq) => up_to = Some(*seq),
-            Item::Sent(seq) => match answers.next() {
-                Some(Pushed::Holds) => {
-                    done.held += 1;
+    in_one(conn, || {
+        let mut answers = answers.iter();
+        let mut up_to = None;
+        for item in &batch.items {
+            let (seq, again) = match item {
+                Item::Passed(seq) => {
                     up_to = Some(*seq);
+                    continue;
                 }
-                Some(Pushed::HoldsAnother) => {
-                    done.another += 1;
-                    up_to = Some(*seq);
-                }
-                Some(Pushed::DoesNotCheck) => {
-                    done.do_not_check += 1;
-                    up_to = Some(*seq);
+                Item::Sent(seq) => (*seq, false),
+                Item::Again(seq) => (*seq, true),
+            };
+            match answers.next() {
+                Some(Pushed::Holds) => done.held += 1,
+                Some(Pushed::HoldsAnother) => done.another += 1,
+                Some(Pushed::DoesNotCheck) => done.do_not_check += 1,
+                Some(Pushed::NoRoom) if batch.which == Which::Since => {
+                    done.no_room += 1;
+                    kept_rows::refused(conn, relay, &channel.id, seq)?;
+                    if !again {
+                        up_to = Some(seq);
+                    }
+                    continue;
                 }
                 Some(refused @ (Pushed::NoRoom | Pushed::OverAllowance)) => {
                     done.refused = Some(*refused);
                     break;
                 }
                 None => break,
-            },
+            }
+            // The relay holds it now, or will not take it.
+            match again {
+                true => {
+                    kept_rows::not_refused(conn, relay, &channel.id, seq)?;
+                }
+                false => up_to = Some(seq),
+            }
         }
-    }
-    if let Some(up_to) = up_to {
-        match batch.which {
-            Which::Since => kept_rows::sent(conn, relay, &channel.id, up_to)?,
-            Which::Carried => kept_rows::carried(conn, relay, &channel.id, up_to)?,
+        if let Some(up_to) = up_to {
+            match batch.which {
+                Which::Since => kept_rows::sent(conn, relay, &channel.id, up_to)?,
+                Which::Carried => kept_rows::carried(conn, relay, &channel.id, up_to)?,
+            }
         }
-    }
-    Ok(done)
+        Ok(done)
+    })
 }
 
 #[cfg(test)]
@@ -790,6 +874,7 @@ mod tests {
 
     use crate::adding::{Accepted, drop_old_hand_overs, write_over_dropped};
     use crate::person::{AdditionSeen, NotCounted, added_name};
+    use crate::publish::{PlannedAgainst, Published, Write, publish};
     use crate::several::{Machine, Several, entry_by, identity_of, listed_as, signed_in, text};
     use crate::take::{NotTaken, Record};
 
@@ -842,9 +927,42 @@ mod tests {
         entries.iter().map(|entry| entry.id()).collect()
     }
 
-    /// What `on` sends `relay` next of `channel`.
+    /// What `on` sends `relay` next of `channel`, what the relay had no
+    /// room for among it.
     fn sends(on: &Machine, relay: &[u8; 32], channel: &Own, which: Which) -> Batch {
-        to_send(&on.conn, &on.identity, relay, channel, which, MOST).unwrap()
+        to_send(&on.conn, &on.identity, relay, channel, which, MOST, true).unwrap()
+    }
+
+    /// Device `n` deletes `file` in `name`, over what it reads there.
+    fn deleted(s: &mut Several, n: usize, name: &str, file: &str) -> CheckedEntry {
+        let now = s.tick();
+        let on = &s[n];
+        let write = Write {
+            name,
+            file,
+            value: Value::Delete,
+            planned: PlannedAgainst::what_is_in(&on.slot(name, file)),
+            merge: None,
+        };
+        match publish(&on.conn, &on.identity, &write, now).unwrap() {
+            Published::Made(entry) => *entry,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// What `on` sends `relay` next of `channel` while what the relay
+    /// had no room for waits.
+    fn sends_new(on: &Machine, relay: &[u8; 32], channel: &Own) -> Batch {
+        to_send(
+            &on.conn,
+            &on.identity,
+            relay,
+            channel,
+            Which::Since,
+            MOST,
+            false,
+        )
+        .unwrap()
     }
 
     /// `on` sends `relay` everything that waits of `channel`, and the
@@ -1699,8 +1817,8 @@ mod tests {
     /// in which its store took it, as much as one push may hold, and how
     /// far it has got is kept for each relay. An entry that the relay
     /// holds, or refuses as not signed as it must be, is not sent again.
-    /// One that it refuses for room, or for the allowance, is kept, with
-    /// everything after it, and sent again.
+    /// One that it refuses for the allowance is kept, with everything
+    /// after it, and sent again.
     #[test]
     fn test_what_a_relay_has_not_been_sent_is_sent_and_each_answer_is_acted_on() {
         let mut s = Several::of_one_person(2);
@@ -1712,7 +1830,16 @@ mod tests {
         let on = &s[0];
         let notes = notes_of(on);
         let send = |relay: &[u8; 32], most: Most| {
-            to_send(&on.conn, &on.identity, relay, &notes, Which::Since, most).unwrap()
+            to_send(
+                &on.conn,
+                &on.identity,
+                relay,
+                &notes,
+                Which::Since,
+                most,
+                true,
+            )
+            .unwrap()
         };
         let answered = |relay: &[u8; 32], batch: &Batch, answers: &[Pushed]| {
             sent(&on.conn, relay, &notes, batch, answers).unwrap()
@@ -1738,15 +1865,16 @@ mod tests {
         }
 
         // The relay stores the first, refuses the second as not signed as
-        // it must be, and has no room for the third: the first two are
-        // not sent again, and the third and what follows it are.
+        // it must be, and is over its allowance at the third: the first
+        // two are not sent again, and the third and what follows it are,
+        // whatever it said of what follows.
         let done = answered(
             &RELAY,
             &batch,
             &[
                 Pushed::Holds,
                 Pushed::DoesNotCheck,
-                Pushed::NoRoom,
+                Pushed::OverAllowance,
                 Pushed::Holds,
             ],
         );
@@ -1756,11 +1884,16 @@ mod tests {
                 held: 1,
                 another: 0,
                 do_not_check: 1,
-                refused: Some(Pushed::NoRoom),
+                no_room: 0,
+                refused: Some(Pushed::OverAllowance),
             }
         );
         let again = send(&RELAY, MOST);
         assert_eq!(ids(&again.entries), ids_of(&written[2..]));
+        assert!(
+            !again.waits,
+            "nothing is kept apart of a batch that stopped"
+        );
         // An answer that does not say one thing for each entry says
         // nothing of any: nothing moves.
         for answers in [&[][..], &[Pushed::Holds][..], &[Pushed::Holds; 3][..]] {
@@ -1775,6 +1908,7 @@ mod tests {
                 held: 0,
                 another: 0,
                 do_not_check: 0,
+                no_room: 0,
                 refused: Some(Pushed::OverAllowance),
             }
         );
@@ -1809,6 +1943,7 @@ mod tests {
                 held: 3,
                 another: 1,
                 do_not_check: 0,
+                no_room: 0,
                 refused: None,
             }
         );
@@ -1821,6 +1956,210 @@ mod tests {
             sends_all(on, &OTHER_RELAY, &notes, Which::Since),
             [next.id()]
         );
+    }
+
+    /// An entry that a relay has no room for does not hold up what
+    /// follows it (decision 2026-10-04 §16): how far the relay was sent
+    /// the channel goes on past it, and it is kept apart. While it
+    /// waits, only what is new is offered. Once the wait has gone by it
+    /// is offered again, behind what is new, and what the relay holds
+    /// then waits no more. Nothing that the relay answered that it holds
+    /// is sent twice.
+    #[test]
+    fn test_what_a_relay_had_no_room_for_waits_apart_and_what_follows_is_still_offered() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let written: Vec<CheckedEntry> = ["a.md", "b.md", "c.md", "d.md"]
+            .iter()
+            .map(|file| s.write(0, "notes", file, "a text"))
+            .collect();
+        let answered = |s: &Several, relay: &[u8; 32], batch: &Batch, answers: &[Pushed]| {
+            sent(&s[0].conn, relay, &notes_of(&s[0]), batch, answers).unwrap()
+        };
+        let notes = notes_of(&s[0]);
+        let waiting = |s: &Several, relay: &[u8; 32]| {
+            kept_rows::waiting_refused(&s[0].conn, relay, &notes.id)
+                .unwrap()
+                .len()
+        };
+
+        // The relay has no room for the second and the third, and holds
+        // the first and the fourth: each answer is acted on, and the
+        // fourth was offered although the two before it found no room.
+        let batch = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&batch.entries), ids_of(&written));
+        let done = answered(
+            &s,
+            &RELAY,
+            &batch,
+            &[Pushed::Holds, Pushed::NoRoom, Pushed::NoRoom, Pushed::Holds],
+        );
+        assert_eq!(
+            done,
+            Sent {
+                held: 2,
+                another: 0,
+                do_not_check: 0,
+                no_room: 2,
+                refused: None,
+            }
+        );
+        assert_eq!(waiting(&s, &RELAY), 2);
+        // While the two wait, nothing is offered: nothing is new. The
+        // batch says that something waits.
+        let new = sends_new(&s[0], &RELAY, &notes);
+        assert!(new.is_empty());
+        assert!(new.waits);
+        // And another relay is sent all four: what waits, waits at the
+        // one relay.
+        assert_eq!(waiting(&s, &OTHER_RELAY), 0);
+        let other = sends_new(&s[0], &OTHER_RELAY, &notes);
+        assert_eq!(ids(&other.entries), ids_of(&written));
+        assert!(!other.waits);
+
+        // What follows is still offered while they wait: a delete of the
+        // first, which makes room. Only it is sent, and the first and
+        // the fourth, which the relay holds, are not sent again.
+        let delete = deleted(&mut s, 0, "notes", "a.md");
+        let new = sends_new(&s[0], &RELAY, &notes);
+        assert_eq!(ids(&new.entries), [delete.id()]);
+        assert!(new.waits);
+        assert_eq!(answered(&s, &RELAY, &new, &[Pushed::Holds]).held, 1);
+        assert_eq!(waiting(&s, &RELAY), 2);
+
+        // The wait has gone by: the two are offered again, behind what
+        // is new, so that what makes room reaches the relay first.
+        let next = s.write(0, "notes", "e.md", "a text");
+        let again = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(
+            ids(&again.entries),
+            [next.id(), written[1].id(), written[2].id()]
+        );
+        assert!(!again.waits);
+        // Asking writes nothing.
+        assert_eq!(sends(&s[0], &RELAY, &notes, Which::Since), again);
+        // An answer that does not say one thing for each says nothing of
+        // any: nothing moves, and nothing waits the less.
+        assert_eq!(
+            answered(&s, &RELAY, &again, &[Pushed::Holds; 2]),
+            Sent::default()
+        );
+        assert_eq!(sends(&s[0], &RELAY, &notes, Which::Since), again);
+        // The relay holds the new one and the first of the two now, and
+        // still has no room for the second: that one goes on waiting,
+        // and the others are sent no more.
+        let done = answered(
+            &s,
+            &RELAY,
+            &again,
+            &[Pushed::Holds, Pushed::Holds, Pushed::NoRoom],
+        );
+        assert_eq!((done.held, done.no_room, done.refused), (2, 1, None));
+        assert_eq!(waiting(&s, &RELAY), 1);
+        let again = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&again.entries), [written[2].id()]);
+        assert!(sends_new(&s[0], &RELAY, &notes).is_empty());
+        // As many as one push may hold: where what is new fills it, what
+        // waits is not in it, and the batch says so.
+        let last = s.write(0, "notes", "f.md", "a text");
+        let one = Most { entries: 1, ..MOST };
+        let full = to_send(
+            &s[0].conn,
+            &s[0].identity,
+            &RELAY,
+            &notes,
+            Which::Since,
+            one,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ids(&full.entries), [last.id()]);
+        assert!(full.waits);
+        assert_eq!(answered(&s, &RELAY, &full, &[Pushed::Holds]).held, 1);
+
+        // An entry that waits and is written again waits no more: the
+        // new revision is new, and is sent as anything new is, once.
+        let rewritten = s.write(0, "notes", "c.md", "another text");
+        assert_eq!(waiting(&s, &RELAY), 0);
+        let again = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&again.entries), [rewritten.id()]);
+        assert!(!again.waits);
+        // The relay will not take it, as not signed as it must be, when
+        // it is sent again after it found no room: it waits no more.
+        assert_eq!(answered(&s, &RELAY, &again, &[Pushed::NoRoom]).no_room, 1);
+        let again = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&again.entries), [rewritten.id()]);
+        let done = answered(&s, &RELAY, &again, &[Pushed::DoesNotCheck]);
+        assert_eq!((done.do_not_check, done.no_room), (1, 0));
+        assert_eq!(waiting(&s, &RELAY), 0);
+        assert!(sends(&s[0], &RELAY, &notes, Which::Since).is_empty());
+
+        // Over its allowance for one that waited: the batch stops there,
+        // and it goes on waiting.
+        let more = s.write(0, "notes", "g.md", "a text");
+        let batch = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(answered(&s, &RELAY, &batch, &[Pushed::NoRoom]).no_room, 1);
+        let again = sends(&s[0], &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&again.entries), [more.id()]);
+        let done = answered(&s, &RELAY, &again, &[Pushed::OverAllowance]);
+        assert_eq!(done.refused, Some(Pushed::OverAllowance));
+        assert_eq!(waiting(&s, &RELAY), 1);
+        // A relay that holds the channel anew is sent all of it from the
+        // start, once: what waited is among it, and waits apart no more.
+        kept_rows::start_again(&s[0].conn, &RELAY, &notes.id).unwrap();
+        let all = sends(&s[0], &RELAY, &notes, Which::Since);
+        let mut unique = ids(&all.entries);
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), all.entries.len());
+        assert!(ids(&all.entries).contains(&more.id()));
+        assert!(!all.waits);
+    }
+
+    /// What was carried is sent in its order, and a refusal for room
+    /// stops a batch of it where it is (decision 2026-10-04 §7.3, §16):
+    /// nothing of it is kept apart, and that entry and what follows it
+    /// are sent again from there. What makes room is something new,
+    /// which is sent before what was carried at every pass.
+    #[test]
+    fn test_a_refusal_for_room_stops_a_batch_of_what_was_carried() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(0, "notes", "a.md", "a text");
+        s.write(0, "notes", "b.md", "a text");
+        s.write(0, "notes", "c.md", "a text");
+        s.meet(&[0, 1]);
+        s.change(0, &[0, 1], &[]);
+        let on = &s[0];
+        let notes = notes_of(on);
+        let carried = sends(on, &RELAY, &notes, Which::Carried);
+        assert_eq!(carried.entries.len(), 3);
+        let done = sent(
+            &on.conn,
+            &RELAY,
+            &notes,
+            &carried,
+            &[Pushed::Holds, Pushed::NoRoom, Pushed::Holds],
+        )
+        .unwrap();
+        assert_eq!(
+            done,
+            Sent {
+                held: 1,
+                another: 0,
+                do_not_check: 0,
+                no_room: 0,
+                refused: Some(Pushed::NoRoom),
+            }
+        );
+        assert!(
+            kept_rows::waiting_refused(&on.conn, &RELAY, &notes.id)
+                .unwrap()
+                .is_empty()
+        );
+        let again = sends(on, &RELAY, &notes, Which::Carried);
+        assert_eq!(ids(&again.entries), ids(&carried.entries[1..]));
+        assert!(!again.waits);
     }
 
     /// What a relay handed a device is sent to another relay, which is

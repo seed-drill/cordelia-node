@@ -23,6 +23,13 @@
 //!   channel of a name, that the store took no later than that, is one it
 //!   carried.
 //!
+//! - **What a relay refused for room** (`at_relays_refused`, one row for
+//!   each relay, channel and entry): an entry that the relay had no room
+//!   for, by its place in the store's own order. How far the relay was
+//!   sent the channel goes on past it, so that what follows is still
+//!   offered, and the entry is kept here to be sent again after a wait
+//!   (§16).
+//!
 //! A relay is known here by its node key. Nothing here decides anything:
 //! what is sent, what is taken and when a channel is read again are
 //! decided where these are read.
@@ -169,13 +176,18 @@ pub fn carried(
 
 /// `relay` holds nothing of `channel`, or holds it anew: nothing is kept
 /// of what it was sent, and there is no place in it. Everything the store
-/// holds of the channel is to be sent there again. Returns whether
-/// anything was kept.
+/// holds of the channel is to be sent there again, what it refused
+/// before among it. Returns whether anything was kept.
 pub fn start_again(
     conn: &Connection,
     relay: &[u8; 32],
     channel: &[u8; 32],
 ) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "DELETE FROM at_relays_refused WHERE relay = ?1 AND channel = ?2",
+        params![relay.as_slice(), channel.as_slice()],
+    )
+    .map_err(storage)?;
     conn.execute(
         "DELETE FROM at_relays WHERE relay = ?1 AND channel = ?2",
         params![relay.as_slice(), channel.as_slice()],
@@ -187,6 +199,11 @@ pub fn start_again(
 /// Keep nothing of `channel`, at any relay: the device holds the channel
 /// no more. Returns how many relays something was kept for.
 pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM at_relays_refused WHERE channel = ?1",
+        params![channel.as_slice()],
+    )
+    .map_err(storage)?;
     conn.execute(
         "DELETE FROM at_relays WHERE channel = ?1",
         params![channel.as_slice()],
@@ -227,6 +244,80 @@ pub fn keeps_any_anywhere(conn: &Connection, channel: &[u8; 32]) -> Result<bool,
         |row| row.get(0),
     )
     .map_err(storage)
+}
+
+// ── What a relay refused for room ────────────────────────────────────
+
+/// `relay` had no room for the entry of `channel` at the place `seq` in
+/// the store's own order: it is kept, to be sent there again after a
+/// wait. Kept twice, it is kept.
+///
+/// What is kept is for entries that the store holds. An entry that it
+/// holds no more waits no more: a later revision took its place, at a
+/// place of its own, and is sent as anything new is. Each such row of
+/// the relay and the channel goes as this one is written.
+pub fn refused(
+    conn: &Connection,
+    relay: &[u8; 32],
+    channel: &[u8; 32],
+    seq: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "DELETE FROM at_relays_refused
+         WHERE relay = ?1 AND channel = ?2
+           AND seq NOT IN (SELECT seq FROM entries WHERE channel_id = ?2)",
+        params![relay.as_slice(), channel.as_slice()],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "INSERT INTO at_relays_refused (relay, channel, seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT(relay, channel, seq) DO NOTHING",
+        params![relay.as_slice(), channel.as_slice(), seq],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The entry of `channel` at the place `seq` waits for `relay` no more:
+/// the relay holds it, or will not take it. Returns whether it was
+/// waiting.
+pub fn not_refused(
+    conn: &Connection,
+    relay: &[u8; 32],
+    channel: &[u8; 32],
+    seq: i64,
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "DELETE FROM at_relays_refused WHERE relay = ?1 AND channel = ?2 AND seq = ?3",
+        params![relay.as_slice(), channel.as_slice(), seq],
+    )
+    .map(|rows| rows > 0)
+    .map_err(storage)
+}
+
+/// The places, in the store's own order, of the entries of `channel`
+/// that `relay` had no room for and that wait to be sent there again, in
+/// that order: those that the store holds still. Nothing is written.
+pub fn waiting_refused(
+    conn: &Connection,
+    relay: &[u8; 32],
+    channel: &[u8; 32],
+) -> Result<Vec<i64>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT refused.seq FROM at_relays_refused AS refused
+             JOIN entries ON entries.channel_id = refused.channel
+                         AND entries.seq = refused.seq
+             WHERE refused.relay = ?1 AND refused.channel = ?2
+             ORDER BY refused.seq ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![relay.as_slice(), channel.as_slice()], |row| {
+            row.get(0)
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
 // ── What the device carried ──────────────────────────────────────────
@@ -529,6 +620,116 @@ mod tests {
             );
         }
         assert_eq!(kept(&conn, &OTHER_RELAY, &channel(1)).unwrap(), sent_only);
+    }
+
+    /// What a relay had no room for is kept by its place in the store's
+    /// order, for that relay and that channel, until the relay holds it
+    /// or the store holds it no more. A relay that holds a channel anew
+    /// keeps nothing of it, and a channel that the device holds no more
+    /// is kept at no relay.
+    #[test]
+    fn test_what_a_relay_refused_for_room_waits_while_the_store_holds_it() {
+        let conn = db::open_in_memory().unwrap();
+        let rows = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM at_relays_refused", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        for name in ["a.md", "b.md", "c.md"] {
+            entries::store(&conn, &made(1, 1, 5, name), 100).unwrap();
+        }
+        entries::store(&conn, &made(2, 1, 5, "a.md"), 100).unwrap();
+        assert!(
+            waiting_refused(&conn, &RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Kept in the store's order, whatever the order of the refusals,
+        // and once however often it is said.
+        for seq in [3, 1, 3] {
+            refused(&conn, &RELAY, &channel(1), seq).unwrap();
+        }
+        refused(&conn, &OTHER_RELAY, &channel(1), 2).unwrap();
+        refused(&conn, &RELAY, &channel(2), 4).unwrap();
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(1)).unwrap(), [1, 3]);
+        assert_eq!(
+            waiting_refused(&conn, &OTHER_RELAY, &channel(1)).unwrap(),
+            [2]
+        );
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(2)).unwrap(), [4]);
+        assert_eq!(rows(), 4);
+
+        // The relay holds one: it waits no more, and the others do.
+        assert!(not_refused(&conn, &RELAY, &channel(1), 1).unwrap());
+        assert!(!not_refused(&conn, &RELAY, &channel(1), 1).unwrap());
+        assert!(!not_refused(&conn, &OTHER_RELAY, &channel(1), 3).unwrap());
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(1)).unwrap(), [3]);
+        assert_eq!(rows(), 3);
+
+        // The store holds one no more: a later revision took its place.
+        // It waits no more, and asking writes nothing: its row goes when
+        // the next refusal of that relay and channel is written.
+        entries::store(&conn, &made(1, 1, 6, "c.md"), 100).unwrap();
+        assert!(
+            waiting_refused(&conn, &RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(rows(), 3);
+        refused(&conn, &RELAY, &channel(1), 2).unwrap();
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(1)).unwrap(), [2]);
+        assert_eq!(
+            rows(),
+            3,
+            "one written, and the one of the entry that is gone taken out"
+        );
+        // Another relay's rows, and another channel's, are as they were.
+        assert_eq!(
+            waiting_refused(&conn, &OTHER_RELAY, &channel(1)).unwrap(),
+            [2]
+        );
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(2)).unwrap(), [4]);
+
+        // A relay that holds the channel anew is sent all of it: nothing
+        // of it waits there apart. Another relay's rows stay.
+        sent(&conn, &RELAY, &channel(1), 3).unwrap();
+        start_again(&conn, &RELAY, &channel(1)).unwrap();
+        assert!(
+            waiting_refused(&conn, &RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            waiting_refused(&conn, &OTHER_RELAY, &channel(1)).unwrap(),
+            [2]
+        );
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(2)).unwrap(), [4]);
+        // And with no row of what was sent, what was refused goes too.
+        refused(&conn, &RELAY, &channel(1), 2).unwrap();
+        assert!(!start_again(&conn, &RELAY, &channel(1)).unwrap());
+        assert!(
+            waiting_refused(&conn, &RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A channel that the device holds no more: at no relay.
+        refused(&conn, &RELAY, &channel(1), 2).unwrap();
+        forget_channel(&conn, &channel(1)).unwrap();
+        assert!(
+            waiting_refused(&conn, &RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            waiting_refused(&conn, &OTHER_RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(waiting_refused(&conn, &RELAY, &channel(2)).unwrap(), [4]);
+        assert_eq!(rows(), 1);
     }
 
     /// What the device carried is everything the store had taken when it

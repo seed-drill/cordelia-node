@@ -289,12 +289,23 @@ impl Device {
     /// The device writes the text `said` under `file` in `name`, over
     /// what it reads there.
     fn writes(&self, name: &str, file: &str, said: &str) -> CheckedEntry {
+        self.puts(name, file, Value::Text(said.to_string()))
+    }
+
+    /// The device deletes `file` in `name`, over what it reads there.
+    fn deletes(&self, name: &str, file: &str) -> CheckedEntry {
+        self.puts(name, file, Value::Delete)
+    }
+
+    /// The device writes `value` under `file` in `name`, over what it
+    /// reads there.
+    fn puts(&self, name: &str, file: &str, value: Value) -> CheckedEntry {
         let db = self.db();
         let slot = read(&db, name, file).unwrap().slot;
         let write = Write {
             name,
             file,
-            value: Value::Text(said.to_string()),
+            value,
             planned: PlannedAgainst::what_is_in(&slot),
             merge: None,
         };
@@ -479,10 +490,16 @@ struct Script {
     /// What a pull is answered with, where a test says: a page of
     /// nothing otherwise.
     pulled: Option<Pulled>,
+    /// What each entry of a push is answered with, where a test says:
+    /// "stored" otherwise.
+    pushed: Option<Pushed>,
 }
 
 /// What a test has a stand-in answer a pull with.
 type Pulled = Box<dyn FnMut(&EntryPull) -> EntryPulled + Send>;
+
+/// What a test has a stand-in answer one entry of a push with.
+type Pushed = Box<dyn FnMut(&Entry) -> PushAnswer + Send>;
 
 impl Default for Script {
     fn default() -> Self {
@@ -493,6 +510,7 @@ impl Default for Script {
             hook: None,
             silent: false,
             pulled: None,
+            pushed: None,
         }
     }
 }
@@ -587,9 +605,17 @@ impl StandIn {
                     };
                     Ok(Some(WireMessage::EntryPulled(page)))
                 }
-                WireMessage::EntryPush(push) => Ok(Some(WireMessage::EntryPushed(EntryPushed {
-                    answers: vec![PushAnswer::Stored; push.entries.len()],
-                }))),
+                WireMessage::EntryPush(push) => {
+                    let answers = match script.pushed.as_mut() {
+                        Some(pushed) => push
+                            .entries
+                            .iter()
+                            .map(|entry| pushed(&Entry::from_wire(entry).unwrap()))
+                            .collect(),
+                        None => vec![PushAnswer::Stored; push.entries.len()],
+                    };
+                    Ok(Some(WireMessage::EntryPushed(EntryPushed { answers })))
+                }
                 _ => Ok(None),
             };
             script.seen.push((protocol, request));
@@ -627,6 +653,12 @@ impl StandIn {
     /// From now on a pull is answered with what `pulled` gives.
     fn pulls(&self, pulled: impl FnMut(&EntryPull) -> EntryPulled + Send + 'static) {
         self.script.lock().unwrap().pulled = Some(Box::new(pulled));
+    }
+
+    /// From now on each entry of a push is answered with what `pushed`
+    /// gives.
+    fn pushes(&self, pushed: impl FnMut(&Entry) -> PushAnswer + Send + 'static) {
+        self.script.lock().unwrap().pushed = Some(Box::new(pushed));
     }
 
     /// From now on `hook` is called as each request arrives, before it is
@@ -2978,6 +3010,202 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
     assert!(device.holds_of(&notes).contains(&does_not.id()));
     assert!(device.at("relay").no_room.is_some());
     assert_eq!(held_at(&relay, &notes).len(), 1);
+}
+
+/// A device goes on past what a relay refuses for room (decision
+/// 2026-10-04 §16). A relay at its cap has no room for an entry: what
+/// follows that entry is still offered, at once, and the entry is not
+/// sent again while its wait lasts. A delete behind it reaches the
+/// relay, which makes room, and the refused entry then fits. An entry
+/// that is refused while the wait lasts does not make the wait longer.
+/// Nothing that the relay holds is sent twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_behind_an_entry_that_found_no_room_reaches_the_relay_and_the_entry_then_fits() {
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let large = device.writes("notes", "a.md", &"a".repeat(8000));
+    let refused = device.writes("notes", "b.md", &"b".repeat(3000));
+    let notes = device.channel("notes");
+    // The relay has room for the change entry, what the personal channel
+    // holds, and the large entry: and for no entry more.
+    let cost = |entry: &Entry| entry_cost(entry.content.len());
+    let personal = device.personal();
+    let personal: u64 = entries::channel_entries_after(&device.db(), &personal, 0, 100)
+        .unwrap()
+        .iter()
+        .map(|held| cost(&held.entry))
+        .sum();
+    let slack = 512;
+    let room = cost(&device.latest()) + personal + cost(&large) + slack;
+    let relay = relay_started("relay", Some(room));
+    device.connects("relay", &relay).await;
+
+    device.passes().await;
+    assert!(holds_at(&relay, &notes, &large.id()));
+    assert!(!holds_at(&relay, &notes, &refused.id()));
+    assert!(device.at("relay").no_room.is_some());
+    let first = device.counts("relay");
+
+    // What is written behind the refused entry is offered at once, and
+    // alone: the relay has no room for it either.
+    let behind = device.writes("notes", "c.md", &"c".repeat(500));
+    device.sends().await;
+    let second = device.counts("relay");
+    assert_eq!(
+        (second.pushes, second.pushed),
+        (first.pushes + 1, first.pushed + 1),
+        "what follows a refused entry is offered, and the refused one is not sent while it waits"
+    );
+    assert!(!holds_at(&relay, &notes, &behind.id()));
+
+    // A delete of the large entry, behind both: it reaches the relay
+    // while they wait, and the relay holds it over the large one.
+    let delete = device.deletes("notes", "a.md");
+    assert!(
+        cost(&delete) + cost(&refused) + cost(&behind) <= cost(&large) + slack,
+        "the delete makes room for both"
+    );
+    device.sends().await;
+    let third = device.counts("relay");
+    assert_eq!(
+        (third.pushes, third.pushed),
+        (second.pushes + 1, second.pushed + 1)
+    );
+    assert!(holds_at(&relay, &notes, &delete.id()));
+    assert!(!holds_at(&relay, &notes, &large.id()));
+    assert!(!holds_at(&relay, &notes, &refused.id()));
+    // Nothing more goes while the wait lasts.
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(device.counts("relay").pushes, third.pushes);
+
+    // Four seconds after the first refusal both are sent again, and
+    // fit: the second refusal, which came while the wait lasted, did not
+    // make it longer.
+    device.clock.run_ahead(Duration::from_secs(4));
+    device.sends().await;
+    let fourth = device.counts("relay");
+    assert_eq!(
+        (fourth.pushes, fourth.pushed),
+        (third.pushes + 1, third.pushed + 2)
+    );
+    let held: BTreeSet<[u8; 32]> = held_at(&relay, &notes).iter().map(Entry::id).collect();
+    assert_eq!(
+        held,
+        BTreeSet::from([delete.id(), refused.id(), behind.id()])
+    );
+    // And nothing is sent after that, at once or once any wait is over:
+    // nothing waits.
+    device.sends().await;
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(device.counts("relay").pushes, fourth.pushes);
+    assert_eq!(held_at(&relay, &notes).len(), 3);
+}
+
+/// A relay that will not begin a channel, because the device's address
+/// is over its allowance of new channels there, is sent nothing of that
+/// channel until a wait has gone by: nothing that follows makes room for
+/// it. It is then sent the channel from where it stopped, and the wait
+/// doubles while it refuses. The other channels go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_that_a_relay_will_not_begin_is_left_whole_until_the_wait_has_gone_by() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let written = [
+        device.writes("notes", "a.md", "one"),
+        device.writes("notes", "b.md", "two"),
+    ];
+    let notes = device.channel("notes");
+    // What the stand-in says of an entry of the name's channel: that it
+    // will not begin the channel, until the test says that it takes it,
+    // and that it has no room where the test says so.
+    const TAKES: u64 = 1;
+    const NO_ROOM: u64 = 2;
+    let says = Arc::new(AtomicU64::new(0));
+    let said = says.clone();
+    relay.pushes(move |entry| match entry.channel == notes {
+        true => match said.load(Ordering::SeqCst) {
+            TAKES => PushAnswer::Stored,
+            NO_ROOM => PushAnswer::Refused(EntryRefused::NoRoom),
+            _ => PushAnswer::Refused(EntryRefused::OverLimit),
+        },
+        false => PushAnswer::Stored,
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    // What was pushed of the name's channel, by what each entry is named
+    // by, one list for each push.
+    let pushed_of_notes = |relay: &StandIn| -> Vec<Vec<[u8; 32]>> {
+        relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(
+                    push.entries
+                        .iter()
+                        .map(|entry| Entry::from_wire(entry).unwrap())
+                        .filter(|entry| entry.channel == notes)
+                        .map(|entry| entry.id())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .filter(|ids| !ids.is_empty())
+            .collect()
+    };
+    let both = vec![written[0].id(), written[1].id()];
+
+    device.passes().await;
+    assert_eq!(pushed_of_notes(&relay), std::slice::from_ref(&both));
+    let no_room = device.at("relay").no_room.expect("the refusal is kept");
+    assert!(no_room.over_allowance && !no_room.of_the_change);
+
+    // While the wait lasts nothing of the channel goes, what is written
+    // meanwhile among it.
+    let third = device.writes("notes", "c.md", "three");
+    device.sends().await;
+    device.passes().await;
+    assert!(pushed_of_notes(&relay).is_empty());
+    // After four seconds, all of it from where it stopped: nothing was
+    // passed by.
+    let all = vec![written[0].id(), written[1].id(), third.id()];
+    device.clock.run_ahead(Duration::from_secs(4));
+    device.sends().await;
+    assert_eq!(pushed_of_notes(&relay), std::slice::from_ref(&all));
+    // Refused again: then after eight, and not after four.
+    device.clock.run_ahead(Duration::from_secs(4));
+    device.sends().await;
+    assert!(pushed_of_notes(&relay).is_empty());
+    device.clock.run_ahead(Duration::from_secs(4));
+    says.store(TAKES, Ordering::SeqCst);
+    device.sends().await;
+    assert_eq!(pushed_of_notes(&relay), [all]);
+    // The relay took it: there is nothing more, and what is written next
+    // goes at once.
+    device.sends().await;
+    assert!(pushed_of_notes(&relay).is_empty());
+    let fourth = device.writes("notes", "d.md", "four");
+    device.sends().await;
+    assert_eq!(pushed_of_notes(&relay), [vec![fourth.id()]]);
+
+    // Nothing waited there any more, so no wait was kept: the next
+    // refusal is the first again, and what it refused is sent after
+    // four seconds, and not after the sixteen that a third would give.
+    says.store(NO_ROOM, Ordering::SeqCst);
+    let fifth = device.writes("notes", "e.md", "five");
+    device.sends().await;
+    assert_eq!(pushed_of_notes(&relay), [vec![fifth.id()]]);
+    device.sends().await;
+    assert!(pushed_of_notes(&relay).is_empty());
+    device.clock.run_ahead(Duration::from_secs(4));
+    device.sends().await;
+    assert_eq!(pushed_of_notes(&relay), [vec![fifth.id()]]);
 }
 
 /// A relay that holds another entry from a device in a slot, at the

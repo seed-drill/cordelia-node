@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -575,6 +575,30 @@ CREATE TABLE person_cleared (
 );
 "#;
 
+/// Migration v16: what a relay refused for room, kept to be sent again
+/// (decision 2026-10-04 §16).
+///
+/// One row for each entry of a channel of the device's own that a relay
+/// had no room for (`at_relays_refused`): the relay by its node key, the
+/// channel, and the entry's place in the order in which the device's own
+/// store took its entries (`entries.seq`). How far a relay was sent a
+/// channel goes on past such an entry, so that what follows it is still
+/// offered: a delete, or a replacement that is no larger, makes room.
+/// The entry itself is sent again after a wait, and its row goes when
+/// the relay holds it, or when the store holds it no more.
+///
+/// A relay keeps nothing in it.
+const MIGRATION_V16: &str = r#"
+CREATE TABLE at_relays_refused (
+    relay BLOB NOT NULL CHECK(length(relay) = 32),
+    channel BLOB NOT NULL CHECK(length(channel) = 32),
+    seq INTEGER NOT NULL CHECK(seq > 0),
+    PRIMARY KEY (relay, channel, seq)
+);
+
+CREATE INDEX idx_at_relays_refused_channel ON at_relays_refused(channel);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -712,6 +736,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 15 {
         tracing::info!("applying migration v15 (what a person typed, cleared and is to be told)");
         migrate_in_one(conn, MIGRATION_V15, 15)?;
+    }
+
+    if current < 16 {
+        tracing::info!("applying migration v16 (what a relay refused for room, to send again)");
+        migrate_in_one(conn, MIGRATION_V16, 16)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1828,6 +1857,7 @@ mod tests {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE (name LIKE '%at_relays%' OR name = 'person_carried')
+               AND name NOT LIKE '%at_relays_refused%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -2001,7 +2031,8 @@ mod tests {
         let mut held = held_before_v14(conn);
         for rows in [
             "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
-                 WHERE name LIKE '%at_relays%' OR name = 'person_carried'
+                 WHERE (name LIKE '%at_relays%' AND name NOT LIKE '%at_relays_refused%')
+                    OR name = 'person_carried'
                  ORDER BY name",
             "SELECT hex(relay) || hex(channel) || hex(mark) || place || sent_to || carried_to
                  FROM at_relays",
@@ -2043,7 +2074,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 15);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v15(&conn), NEW_IN_V15);
 
@@ -2114,6 +2144,132 @@ mod tests {
         }
     }
 
+    // ── v16: what a relay refused for room ───────────────────────────
+
+    /// A database at version 15, as the version before what a relay
+    /// refused is kept leaves it: what [`at_v14`] holds, and a key that a
+    /// person typed.
+    fn at_v15() -> Connection {
+        let conn = at_v14();
+        migrate_in_one(&conn, MIGRATION_V15, 15).unwrap();
+        conn.execute_batch(
+            "INSERT INTO person_typed_keys (key, typed_at) VALUES (zeroblob(32), 7);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The table and the index that the step to version 16 adds.
+    const NEW_IN_V16: [&str; 2] = ["at_relays_refused", "idx_at_relays_refused_channel"];
+
+    /// What a database holds of the step to version 16, by name.
+    fn new_in_v16(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE '%at_relays_refused%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database at version 15 holds: what one at version 14
+    /// holds, each definition of the step to version 15, and each row of
+    /// its tables.
+    fn held_before_v16(conn: &Connection) -> Vec<String> {
+        let mut held = held_before_v15(conn);
+        for rows in [
+            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+                 WHERE name IN ('person_cleared', 'person_left_out', 'person_typed_keys')
+                 ORDER BY name",
+            "SELECT hex(key) || typed_at FROM person_typed_keys",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(rows)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!rows.is_empty());
+            held.extend(rows);
+        }
+        held
+    }
+
+    /// The table of what a relay refused for room is made in one step
+    /// with its version: a failure between them leaves neither, and the
+    /// step asked for twice is run once. A database that an older binary
+    /// wrote is taken to version 16 with everything it held as it was.
+    #[test]
+    fn test_v16_adds_what_a_relay_refused_for_room_and_its_version_as_one() {
+        let conn = at_v15();
+        let before = held_before_v16(&conn);
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&conn), 15);
+        assert!(new_in_v16(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V16} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 16).is_err());
+        assert_eq!(version(&conn), 15);
+        assert!(
+            new_in_v16(&conn).is_empty(),
+            "the table goes with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 16);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v16(&conn), NEW_IN_V16);
+        assert_eq!(held_before_v16(&conn), before);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM at_relays_refused", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        conn.execute_batch(
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+             VALUES (zeroblob(32), zeroblob(32), 7);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V16, 16).unwrap();
+        let kept: i64 = conn
+            .query_row("SELECT seq FROM at_relays_refused", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version(&conn), kept), (SCHEMA_VERSION, 7));
+        // A row that is not what a device keeps is refused: a relay or a
+        // channel of another length, a place that is none, and the same
+        // entry twice.
+        for refused in [
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+                 VALUES (zeroblob(31), zeroblob(32), 1)",
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+                 VALUES (zeroblob(32), zeroblob(33), 1)",
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+                 VALUES (zeroblob(32), zeroblob(32), 0)",
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+                 VALUES (zeroblob(32), zeroblob(32), 7)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        assert!(
+            definition_of(&conn, "idx_at_relays_refused_channel")
+                .contains("at_relays_refused(channel)")
+        );
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -2134,7 +2290,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 7] = [
+        let from: [(u32, Connection); 8] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -2142,6 +2298,7 @@ mod tests {
             (12, at_v12()),
             (13, at_v13()),
             (14, at_v14()),
+            (15, at_v15()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -2160,6 +2317,7 @@ mod tests {
             assert_eq!(new_in_v13(&conn), NEW_IN_V13, "from version {at}");
             assert_eq!(new_in_v14(&conn), NEW_IN_V14, "from version {at}");
             assert_eq!(new_in_v15(&conn), NEW_IN_V15, "from version {at}");
+            assert_eq!(new_in_v16(&conn), NEW_IN_V16, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }
