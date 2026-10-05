@@ -578,7 +578,10 @@ pub struct EntryPulled {
     pub next: u64,
     /// The mark of the holding that `next` is a place in, to ask with
     /// next. Where nothing of the channel is handed for want of a proof,
-    /// or because it is not held, it is the mark that was asked with.
+    /// it is the mark that was asked with. Where the channel was proved
+    /// on the connection and is not held, it is all zeros, the mark of no
+    /// holding, and `next` is 0: the sender holds nothing of the channel
+    /// now, whatever it was sent before.
     #[serde(with = "serde_bytes")]
     pub mark: [u8; CHANNEL_MARK_BYTES],
 }

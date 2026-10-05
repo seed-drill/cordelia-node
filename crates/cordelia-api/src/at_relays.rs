@@ -385,6 +385,11 @@ pub enum PageTaken {
 ///   the relay dropped the channel and took it again. It holds nothing of
 ///   what it was sent before, so nothing is kept of that either, and the
 ///   device sends it the channel again.
+/// - A page with nothing in it under the mark of no holding, against a
+///   place that the device keeps, says that the relay holds the channel
+///   no more: it is as [`not_held_at`]. (A relay says so only to a
+///   connection that proved the channel. A pull that was not proved is
+///   answered with the mark that was asked with.)
 /// - An entry of this device's own that it carried is not sent to this
 ///   relay where the relay hands another key's entry of that version, or
 ///   one at a higher revision: that is decided where the carried entries
@@ -406,7 +411,12 @@ pub fn take_page(
         let kept = kept_rows::kept(conn, page.relay, channel)?;
         let another_holding =
             page.mark != NO_MARK && kept.place.is_some_and(|(mark, _)| mark != page.mark);
-        if another_holding {
+        // A relay answers a pull of a channel that was proved and that
+        // it does not hold with the mark of no holding. Against a place
+        // that the device keeps there, the relay dropped the channel
+        // since.
+        let no_holding = page.mark == NO_MARK && page.entries.is_empty() && kept.place.is_some();
+        if another_holding || no_holding {
             kept_rows::start_again(conn, page.relay, channel)?;
         }
         let kept = kept_rows::kept(conn, page.relay, channel)?;
@@ -1233,13 +1243,21 @@ mod tests {
             stored(2)
         );
         assert_eq!(kept(&RELAY, &notes), (MARK, 4));
-        // A page with nothing in it, at the end: the place stays.
+        // A page with nothing in it, at the end: the place stays. That
+        // is also the answer to a pull that was not proved.
         assert_eq!(take_one(on, &notes, &RELAY, &[], (MARK, 4)), stored(0));
         assert_eq!(kept(&RELAY, &notes), (MARK, 4));
-        // The answer for a channel that is not held, or not proved: no
-        // entries, and the mark of no holding. Nothing is kept of it.
-        assert_eq!(take_one(on, &notes, &RELAY, &[], (NO_MARK, 0)), stored(0));
-        assert_eq!(kept(&RELAY, &notes), (MARK, 4));
+        // The mark of no holding, to a device that keeps no place there:
+        // nothing is kept of it, and what the device sent that relay
+        // stays as sent. (It is also what a pull that was not proved is
+        // answered, where it was asked with no mark.)
+        assert_eq!(sends_all(on, &OTHER_RELAY, &notes, Which::Since).len(), 4);
+        assert_eq!(
+            take_one(on, &notes, &OTHER_RELAY, &[], (NO_MARK, 0)),
+            stored(0)
+        );
+        assert_eq!(kept(&OTHER_RELAY, &notes), (NO_MARK, 0));
+        assert!(sends(on, &OTHER_RELAY, &notes, Which::Since).is_empty());
 
         // What it then writes itself is sent there, and held. What the
         // relay handed it is not sent back.
@@ -1278,6 +1296,81 @@ mod tests {
         not_held_at(&on.conn, &RELAY, &notes.id).unwrap();
         assert_eq!(kept(&RELAY, &notes), (NO_MARK, 0));
         assert_eq!(sends(on, &RELAY, &notes, Which::Since).entries.len(), 6);
+    }
+
+    /// A relay that answers a pull with the mark of no holding, and
+    /// nothing, holds the channel no more. Against a place that the
+    /// device keeps there, nothing it sent is there: the place is
+    /// forgotten, and everything it holds of the channel is sent again.
+    /// At another relay nothing changes.
+    #[test]
+    fn test_a_page_of_no_holding_against_a_place_kept_has_everything_sent_again() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let written = [
+            s.write(0, "notes", "a.md", "a text"),
+            s.write(0, "notes", "b.md", "a text"),
+        ];
+        let now = s.tick();
+        let notes = notes_of(&s[1]);
+        fn page(
+            on: &Machine,
+            notes: &Own,
+            relay: &[u8; 32],
+            entries: &[CheckedEntry],
+            (mark, next): (Mark, u64),
+        ) -> PageTaken {
+            let page = Page {
+                relay,
+                channel: notes,
+                entries,
+                mark,
+                next,
+            };
+            take_page(&on.conn, &on.identity, &page, 1_800_001_000).unwrap()
+        }
+        // Both relays handed it the two entries, and were then sent what
+        // it wrote itself.
+        for relay in [&RELAY, &OTHER_RELAY] {
+            page(&s[1], &notes, relay, &written, (MARK, 2));
+        }
+        let mine = s.write(1, "notes", "mine.md", "by device 1");
+        assert!(now > 0);
+        let on = &s[1];
+        let page = |relay: &[u8; 32], entries: &[CheckedEntry], mark: Mark, next: u64| {
+            page(on, &notes, relay, entries, (mark, next))
+        };
+        for relay in [&RELAY, &OTHER_RELAY] {
+            // (What the first relay handed it goes to the second too.)
+            let sent = sends_all(on, relay, &notes, Which::Since);
+            assert_eq!(sent.last(), Some(&mine.id()));
+            assert!(sends(on, relay, &notes, Which::Since).is_empty());
+            assert_eq!(place(&on.conn, relay, &notes.id).unwrap(), (MARK, 2));
+        }
+
+        // One of them says that it holds nothing of the channel now.
+        let taken = page(&RELAY, &[], NO_MARK, 0);
+        assert_eq!(
+            taken,
+            PageTaken::Taken {
+                each: Vec::new(),
+                read_again: false
+            }
+        );
+        assert_eq!(place(&on.conn, &RELAY, &notes.id).unwrap(), (NO_MARK, 0));
+        let again: BTreeSet<[u8; 32]> = sends_all(on, &RELAY, &notes, Which::Since)
+            .into_iter()
+            .collect();
+        let all: BTreeSet<[u8; 32]> = [written[0].id(), written[1].id(), mine.id()]
+            .into_iter()
+            .collect();
+        assert_eq!(again, all);
+        // The other relay still holds what it held.
+        assert_eq!(place(&on.conn, &OTHER_RELAY, &notes.id).unwrap(), (MARK, 2));
+        assert!(sends(on, &OTHER_RELAY, &notes, Which::Since).is_empty());
+        // Said again, with no place kept: nothing more happens.
+        page(&RELAY, &[], NO_MARK, 0);
+        assert!(sends(on, &RELAY, &notes, Which::Since).is_empty());
     }
 
     /// The place moves only past what the one door has dealt with: a page

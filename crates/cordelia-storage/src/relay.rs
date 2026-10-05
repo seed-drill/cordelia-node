@@ -396,8 +396,9 @@ pub struct Page {
     /// asker's limits.
     pub cost: u64,
     /// The mark of the holding that `next` is a place in: the relay's,
-    /// where it holds the channel and hands it, and otherwise the one
-    /// that was asked with.
+    /// where it holds the channel and hands it. The one that was asked
+    /// with, where the channel was not proved. And the mark of no holding
+    /// where it was proved and is not held.
     pub mark: Mark,
 }
 
@@ -1105,9 +1106,17 @@ pub fn prove(
 ///
 /// `proved` is whether the channel's key was proved on the connection
 /// that asks: a proof that held there ([`Proof::holds`]), also one from
-/// before the relay held the channel. Where it was not, the answer is the
-/// one for a channel that is not held: no entries, and the place and the
-/// mark that were asked with. The store is not looked at.
+/// before the relay held the channel. Where it was not, nothing is said
+/// of the channel: no entries, and the place and the mark that were asked
+/// with. The store is not looked at.
+///
+/// **A channel that was proved and is not held is answered as no
+/// holding:** no entries, [`NO_MARK`], and the start. Whoever holds the
+/// channel's key and keeps a place in it then knows that the relay holds
+/// nothing of it now, and so nothing of what it was sent: the relay
+/// dropped the channel since. (A pull tells this only to a connection
+/// that proved the key. A proof is answered yes only for a channel that
+/// is held, so the same connection could have asked that.)
 ///
 /// A page holds at most ENTRY_PAGE_MAX_ENTRIES entries, and at most
 /// ENTRY_PAGE_MAX_BYTES of them as they travel, so that it fits one
@@ -1130,8 +1139,10 @@ pub fn pull(
         return Ok(page);
     }
     // A channel that is not held has no holding to have a place in: the
-    // asker keeps what it asked with.
+    // asker is told so, by the mark of no holding.
     let Some(holding) = held_channel(conn, channel)? else {
+        page.mark = NO_MARK;
+        page.next = 0;
         return Ok(page);
     };
     // A place from another holding is no place in this one.
@@ -1867,9 +1878,16 @@ mod tests {
                     unproved,
                     pull(&conn, &channel(2), false, &mark, after, 100).unwrap()
                 );
+                // Only a connection that proved a channel is told that it
+                // is not held: by the mark of no holding, and the start.
                 assert_eq!(
-                    unproved,
-                    pull(&conn, &channel(2), true, &mark, after, 100).unwrap()
+                    pull(&conn, &channel(2), true, &mark, after, 100).unwrap(),
+                    Page {
+                        entries: Vec::new(),
+                        next: 0,
+                        cost: 0,
+                        mark: NO_MARK,
+                    }
                 );
             }
         }
@@ -4032,13 +4050,24 @@ mod tests {
         }
 
         // Not proved on this connection: nothing, from any place, though
-        // the relay holds it. That is the answer for a channel that is
-        // not held.
+        // the relay holds it, and the place and the mark that were asked
+        // with. So is a channel that is not held, to a connection that
+        // has not proved it. To one that has, a channel that is not held
+        // is no holding: the mark of none, and the start.
         for after in [0, 2, 5] {
             assert_eq!(paged(&conn, 1, false, after, 100), nothing(after));
             assert_eq!(
-                pull(&conn, &channel(3), true, &mark, after, 100).unwrap(),
+                pull(&conn, &channel(3), false, &mark, after, 100).unwrap(),
                 nothing(after)
+            );
+            assert_eq!(
+                pull(&conn, &channel(3), true, &mark, after, 100).unwrap(),
+                Page {
+                    entries: Vec::new(),
+                    next: 0,
+                    cost: 0,
+                    mark: NO_MARK,
+                }
             );
         }
 
@@ -4265,22 +4294,32 @@ mod tests {
         );
 
         // While the relay does not hold the channel there is no holding
-        // to have a place in: the asker keeps the place and the mark it
-        // asked with, proved or not, as for any channel that is not held.
+        // to have a place in. A connection that proved the channel is
+        // told so, by the mark of no holding and the start: it knows
+        // then that nothing it sent is there. One that did not prove it
+        // keeps the place and the mark it asked with, as for any channel.
         assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
-        for proved in [true, false] {
-            for c in [1, 7] {
-                assert_eq!(
-                    pull(&conn, &channel(c), proved, &third, 4, 100).unwrap(),
-                    Page {
-                        entries: Vec::new(),
-                        next: 4,
-                        cost: 0,
-                        mark: third,
-                    },
-                    "{proved} {c}"
-                );
-            }
+        for c in [1, 7] {
+            assert_eq!(
+                pull(&conn, &channel(c), true, &third, 4, 100).unwrap(),
+                Page {
+                    entries: Vec::new(),
+                    next: 0,
+                    cost: 0,
+                    mark: NO_MARK,
+                },
+                "{c}"
+            );
+            assert_eq!(
+                pull(&conn, &channel(c), false, &third, 4, 100).unwrap(),
+                Page {
+                    entries: Vec::new(),
+                    next: 4,
+                    cost: 0,
+                    mark: third,
+                },
+                "{c}"
+            );
         }
         // And a mark is a holding's own: two channels taken in one moment
         // have two.

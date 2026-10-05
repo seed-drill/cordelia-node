@@ -34,8 +34,11 @@
 //!   channel for which a proof held, up to a bound, for as long as it
 //!   lasts, and forgets them when it closes.
 //! - **Pull** (§2.4 item 3). A page of a channel, only where the channel
-//!   was proved on this connection. Without that the answer is the one
-//!   for a channel that the relay does not hold.
+//!   was proved on this connection. Without that nothing is said of the
+//!   channel: no entries, and the place and the mark that were asked
+//!   with. A channel that was proved and is not held is answered as no
+//!   holding, by the mark of none: whoever holds its key then knows that
+//!   nothing it sent is there.
 //! - **Push** (§2.4 items 1 and 2). Each entry is checked and taken by the
 //!   store's rule, and each is answered for.
 //!
@@ -2754,7 +2757,9 @@ mod tests {
 
     /// A channel is handed only to a connection that has proved its key.
     /// Without that the answer is the one for a channel that the relay
-    /// does not hold, byte for byte, and counts for nothing.
+    /// does not hold and that was not proved either, byte for byte, and
+    /// counts for nothing. A connection that proved a channel which is
+    /// not held is told so: by the mark of no holding, and the start.
     #[test]
     fn a_channel_is_handed_only_to_a_connection_that_proved_it() {
         let at = relay();
@@ -2768,8 +2773,8 @@ mod tests {
         };
 
         // Not proved on this connection: nothing, whatever mark and place
-        // are asked with. A channel that is not held is answered so,
-        // proved or not.
+        // are asked with. A channel that is not held, and was not proved,
+        // is answered so too.
         let nothing = Proved::default();
         for (asked_mark, after) in [(relay::NO_MARK, 0), (mark, 0), (mark, 2), ([9; 8], 7)] {
             let unproved = page(at.pull(1, 1, &nothing, asked_mark, after));
@@ -2781,10 +2786,19 @@ mod tests {
                     mark: asked_mark,
                 }
             );
-            for proved in [&nothing, &having_proved(&[2])] {
-                let not_held = page(at.pull(1, 2, proved, asked_mark, after));
-                assert_eq!(bytes(&not_held), bytes(&unproved));
-            }
+            let not_held = page(at.pull(1, 2, &nothing, asked_mark, after));
+            assert_eq!(bytes(&not_held), bytes(&unproved));
+            // Proved, and not held: no holding. Whoever holds the key and
+            // keeps a place then knows that nothing it sent is there.
+            let proved_not_held = page(at.pull(1, 2, &having_proved(&[2]), asked_mark, after));
+            assert_eq!(
+                proved_not_held,
+                EntryPulled {
+                    entries: Vec::new(),
+                    next: 0,
+                    mark: relay::NO_MARK,
+                }
+            );
         }
         assert_eq!(at.fetch_room(1), MINUTE, "nothing was handed");
 

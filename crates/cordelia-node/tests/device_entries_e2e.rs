@@ -1711,6 +1711,68 @@ async fn a_second_pull_starts_where_the_first_ended_and_a_new_holding_is_read_fr
     assert_eq!(reader.holds_of(&notes), held);
 }
 
+/// A relay that drops a channel while a device's connection lasts answers
+/// the device's next pull with the mark of no holding: the device proved
+/// the channel there, and the relay holds it no more. The device then
+/// knows that nothing it sent is there, and sends it all again, on the
+/// same connection and with no proof more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_dropped_a_channel_says_so_and_is_sent_it_again() {
+    let relay = relay_started("relay", None);
+    let mut writer = Device::new("desktop");
+    writer.makes_the_phrase(&phrase());
+    writer.holds("notes");
+    writer.connects("relay", &relay).await;
+    let written: Vec<CheckedEntry> = ["a.md", "b.md", "c.md"]
+        .iter()
+        .map(|file| writer.writes("notes", file, "a text"))
+        .collect();
+    writer.passes().await;
+    writer.passes().await;
+    let notes = writer.channel("notes");
+    assert_eq!(held_at(&relay, &notes).len(), 3);
+    let (mark, _) = writer.place("relay", &notes);
+    assert_ne!(mark, [0; 8]);
+    let proofs = writer.counts("relay").proofs;
+
+    // The relay drops the channel, as it does for room or where nobody
+    // has used it: here its rows are taken out while it runs.
+    {
+        let db = rusqlite::Connection::open(relay.data_dir().join("cordelia.db")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let entries = db
+            .execute(
+                "DELETE FROM entries WHERE channel_id = ?1",
+                rusqlite::params![notes.as_slice()],
+            )
+            .unwrap();
+        let channels = db
+            .execute(
+                "DELETE FROM relay_channels WHERE channel_id = ?1",
+                rusqlite::params![notes.as_slice()],
+            )
+            .unwrap();
+        assert_eq!((entries, channels), (3, 1));
+    }
+    assert!(held_at(&relay, &notes).is_empty());
+
+    // The next pass pulls from the place it keeps, is told that there is
+    // no holding, and sends the channel again.
+    writer.passes().await;
+    writer.passes().await;
+    let held: BTreeSet<[u8; 32]> = held_at(&relay, &notes).iter().map(Entry::id).collect();
+    let all: BTreeSet<[u8; 32]> = written.iter().map(|entry| entry.id()).collect();
+    assert_eq!(held, all);
+    // It made no proof more: the connection is the one it proved on.
+    assert_eq!(writer.counts("relay").proofs, proofs);
+    // Its place is in the new holding, under another mark.
+    writer.passes().await;
+    let (new_mark, place) = writer.place("relay", &notes);
+    assert_ne!(new_mark, mark);
+    assert_ne!(new_mark, [0; 8]);
+    assert_eq!(place, 3);
+}
+
 /// An entry that is sealed by `author` in the channel whose secret is
 /// `secret`: for what a test writes with a key that is no device's here.
 fn sealed(author: &NodeIdentity, secret: &[u8; 32], rev: u64, name: &str, value: Value) -> Entry {
