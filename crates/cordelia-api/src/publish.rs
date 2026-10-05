@@ -27,8 +27,8 @@
 //!
 //! - It is made only where the slot's current version is still the one
 //!   the caller read: the same kind of value, with the same bytes, at the
-//!   same revision ([`PlannedAgainst`]). Otherwise nothing is written,
-//!   and it says so.
+//!   same revision, and the same entries held of it ([`PlannedAgainst`]).
+//!   Otherwise nothing is written, and it says so.
 //! - Its chain is that of an entry written over one entry of that version
 //!   ([`chain::written_over`]): this device's own where it holds one, and
 //!   otherwise the one whose signer has the lowest key. A merged index is
@@ -56,18 +56,27 @@ use cordelia_storage::person::{self as held_rows, State};
 use crate::person::{Counting, Held, PersonError, applied_secret, held, in_one};
 
 /// What a caller planned against: what it read in a slot before it wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedAgainst {
     /// The slot held no version.
     NoVersion,
-    /// The slot's current version was this one: a value at a revision.
-    /// The value is said by which of the three it is, and by its hash
-    /// ([`value_hash`]). Two entries that are one version are one here,
-    /// whichever of them the caller read.
+    /// The slot's current version was this one: a value at a revision,
+    /// and the entries that the device held of it. The value is said by
+    /// which of the three it is, and by its hash ([`value_hash`]). Each
+    /// entry is said by what it is named by
+    /// ([`cordelia_crypto::entry::Entry::id`]), in any order.
+    ///
+    /// What a caller asks of a version, it asks of every entry held of
+    /// it: whether it is known to follow a text is so only if each entry
+    /// shows it ([`follows`]). An entry of that version that arrives
+    /// later may say less. So the version with another entry, or without
+    /// one of these, is not what was planned against: the caller reads
+    /// again, and asks again.
     Version {
         rev: u64,
         kind: Kind,
         hash: [u8; 32],
+        entries: Vec<[u8; 32]>,
     },
 }
 
@@ -104,19 +113,31 @@ impl PlannedAgainst {
                 rev: version.rev,
                 kind: Kind::of(&version.value),
                 hash: value_hash(&version.value),
+                entries: version.entries.iter().map(|one| one.id).collect(),
             },
         }
     }
 
     /// Whether `current` is still what was planned against: the same
-    /// kind of value, with the same bytes, at the same revision.
+    /// kind of value, with the same bytes, at the same revision, and the
+    /// same entries held of it, no more and no fewer.
     fn is_still(&self, current: Option<&Version>) -> bool {
         match (self, current) {
             (Self::NoVersion, None) => true,
-            (Self::Version { rev, kind, hash }, Some(version)) => {
+            (
+                Self::Version {
+                    rev,
+                    kind,
+                    hash,
+                    entries,
+                },
+                Some(version),
+            ) => {
                 version.rev == *rev
                     && Kind::of(&version.value) == *kind
                     && value_hash(&version.value) == *hash
+                    && version.entries.len() == entries.len()
+                    && version.entries.iter().all(|one| entries.contains(&one.id))
             }
             _ => false,
         }
@@ -589,31 +610,35 @@ mod tests {
         let mut s = alone();
         let on = |s: &Several| PlannedAgainst::what_is_in(&s[0].slot("notes", "a.md"));
         assert_eq!(on(&s), PlannedAgainst::NoVersion);
-        published(&mut s, 0, "a.md", text("one"));
+        // With the one entry that the device holds of it.
+        let entry = made(published(&mut s, 0, "a.md", text("one")));
         assert_eq!(
             on(&s),
             PlannedAgainst::Version {
                 rev: 1,
                 kind: Kind::Text,
-                hash: hash("one")
+                hash: hash("one"),
+                entries: vec![entry.id()],
             }
         );
-        published(&mut s, 0, "a.md", Value::Delete);
+        let entry = made(published(&mut s, 0, "a.md", Value::Delete));
         assert_eq!(
             on(&s),
             PlannedAgainst::Version {
                 rev: 2,
                 kind: Kind::Delete,
-                hash: [0u8; 32]
+                hash: [0u8; 32],
+                entries: vec![entry.id()],
             }
         );
-        published(&mut s, 0, "a.md", Value::Other(b"one".to_vec()));
+        let entry = made(published(&mut s, 0, "a.md", Value::Other(b"one".to_vec())));
         assert_eq!(
             on(&s),
             PlannedAgainst::Version {
                 rev: 3,
                 kind: Kind::Other,
-                hash: hash("one")
+                hash: hash("one"),
+                entries: vec![entry.id()],
             }
         );
     }
@@ -640,50 +665,46 @@ mod tests {
             }
             outcome
         };
-        let version = |rev: u64, said: &str| PlannedAgainst::Version {
-            rev,
-            kind: Kind::Text,
-            hash: hash(said),
-        };
+        let read =
+            |rev: u64, kind: Kind, hash: [u8; 32], entries: &[[u8; 32]]| PlannedAgainst::Version {
+                rev,
+                kind,
+                hash,
+                entries: entries.to_vec(),
+            };
 
         // The slot holds no version: a caller that read one finds it
         // changed.
-        assert_eq!(
-            attempt(&mut s, "a.md", version(1, "one")),
-            Published::Changed
-        );
-        published(&mut s, 0, "a.md", text("one"));
-        published(&mut s, 0, "a.md", text("two"));
+        let none = read(1, Kind::Text, hash("one"), &[[7; 32]]);
+        assert_eq!(attempt(&mut s, "a.md", none), Published::Changed);
+        let one = made(published(&mut s, 0, "a.md", text("one"))).id();
+        let two = made(published(&mut s, 0, "a.md", text("two"))).id();
+        let version = |rev: u64, said: &str| read(rev, Kind::Text, hash(said), &[two]);
 
         // It holds "two" at revision 2. A caller that read no version,
         // the version before, that text at another revision, or another
         // text at that revision, finds it changed.
         for planned in [
             PlannedAgainst::NoVersion,
-            version(1, "one"),
+            read(1, Kind::Text, hash("one"), &[one]),
             version(1, "two"),
             version(3, "two"),
             version(2, "one"),
-            PlannedAgainst::Version {
-                rev: 2,
-                kind: Kind::Delete,
-                hash: [0u8; 32],
-            },
+            read(2, Kind::Delete, [0u8; 32], &[two]),
             // That text's bytes at that revision, as bytes that are no
             // text, and as a delete.
-            PlannedAgainst::Version {
-                rev: 2,
-                kind: Kind::Other,
-                hash: hash("two"),
-            },
-            PlannedAgainst::Version {
-                rev: 2,
-                kind: Kind::Delete,
-                hash: hash("two"),
-            },
+            read(2, Kind::Other, hash("two"), &[two]),
+            read(2, Kind::Delete, hash("two"), &[two]),
+            // That text at that revision, with another entry than the
+            // one the device holds of it, with none, with one more, and
+            // with the one twice.
+            read(2, Kind::Text, hash("two"), &[one]),
+            read(2, Kind::Text, hash("two"), &[]),
+            read(2, Kind::Text, hash("two"), &[two, one]),
+            read(2, Kind::Text, hash("two"), &[two, two]),
         ] {
             assert_eq!(
-                attempt(&mut s, "a.md", planned),
+                attempt(&mut s, "a.md", planned.clone()),
                 Published::Changed,
                 "{planned:?}"
             );
@@ -699,38 +720,67 @@ mod tests {
         assert_eq!(entry.rev, 1);
     }
 
-    /// Two entries that are one version are one for the check, whichever
-    /// of them the caller read: a second device's entry of the same text
-    /// at the same revision changes nothing that was planned against.
+    /// What was planned against holds the entries the version was judged
+    /// by. A second device's entry of the same text at the same revision
+    /// is the same version, and may say less of it: a version that was
+    /// known to follow a text is then not known to. What was planned
+    /// against the version with one entry is not made over it with two.
     #[test]
-    fn test_two_entries_that_are_one_version_are_one_for_what_was_planned_against() {
+    fn test_an_entry_more_of_the_version_planned_against_is_a_change() {
         let mut s = Several::of_one_person(2);
         s.hold(&[0, 1], "notes");
-        s.write(0, "notes", "a.md", "the same edit");
-        let planned = PlannedAgainst::what_is_in(&s[0].slot("notes", "a.md"));
+        s.write(0, "notes", "a.md", "before");
+        let own = s.write(0, "notes", "a.md", "the same edit");
+        let was = read(&s[0].conn, "notes", "a.md").unwrap();
+        assert!(was.follows(&hash("before")));
+        let planned = PlannedAgainst::what_is_in(&was.slot);
 
-        // Device 1 made the same edit apart.
+        // Device 1 made the same edit apart, over nothing.
         let same = entry_by(
             &s[1].identity,
             &s[0].own("notes"),
-            1,
+            2,
             "a.md",
             text("the same edit"),
             &[],
         );
         holds(&s, 0, &same);
-        assert_eq!(s[0].slot("notes", "a.md").current.unwrap().entries.len(), 2);
+        let is = read(&s[0].conn, "notes", "a.md").unwrap();
+        let version = is.slot.current.as_ref().unwrap();
+        assert_eq!((version.rev, &version.value), (2, &text("the same edit")));
+        assert_eq!(version.entries.len(), 2);
+        // One of the two entries does not show that the version follows
+        // what the caller asked about.
+        assert!(!is.follows(&hash("before")));
+
         let now = s.tick();
         let on = &s[0];
-        let write = Write {
+        let write = |planned: PlannedAgainst| Write {
             name: "notes",
             file: "a.md",
             value: text("over both"),
             planned,
             merge: None,
         };
+        let before = on.everything();
+        assert_eq!(
+            publish(&on.conn, &on.identity, &write(planned), now).unwrap(),
+            Published::Changed
+        );
+        assert_eq!(on.everything(), before);
+
+        // Planned against the version with both entries, it is made: in
+        // whichever order the caller says them.
+        let mut read_again = PlannedAgainst::what_is_in(&is.slot);
+        let PlannedAgainst::Version { entries, .. } = &mut read_again else {
+            panic!("the slot holds a version");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&same.id()) && entries.contains(&own.id()));
+        entries.reverse();
+        assert_ne!(read_again, PlannedAgainst::what_is_in(&is.slot));
         assert!(matches!(
-            publish(&on.conn, &on.identity, &write, now).unwrap(),
+            publish(&on.conn, &on.identity, &write(read_again), now).unwrap(),
             Published::Made(_)
         ));
 

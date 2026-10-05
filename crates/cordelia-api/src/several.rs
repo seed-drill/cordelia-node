@@ -650,7 +650,7 @@ mod tests {
     fn test_an_edit_planned_against_a_version_that_has_since_changed_is_not_made() {
         let mut s = Several::of_one_person(2);
         s.hold(&[0, 1], "notes");
-        s.write(0, "notes", "a.md", "one");
+        let one = s.write(0, "notes", "a.md", "one");
         s.pass(0, 1);
         let planned = PlannedAgainst::what_is_in(&s[1].slot("notes", "a.md"));
         assert_eq!(
@@ -658,7 +658,8 @@ mod tests {
             PlannedAgainst::Version {
                 rev: 1,
                 kind: Kind::Text,
-                hash: hash("one")
+                hash: hash("one"),
+                entries: vec![one.id()],
             }
         );
 
