@@ -70,6 +70,109 @@ pub struct AppState {
     pub usable_keys: UsableKeys,
     /// Local history, and the turn its users take.
     pub history: History,
+    /// Where this device stands at its relays for the channels of its
+    /// own, as the node last said it, and the word that something was
+    /// written in one.
+    pub own_channels: OwnChannels,
+}
+
+/// What a status will read of a device's side of its relays, for the
+/// channels of its own (decision 2026-10-04 §4.6, §8).
+///
+/// The node says it as it goes ([`OwnChannels::say`]), and [`OwnChannels::
+/// read`] is the one function that reads it. It is in memory: a node that
+/// starts has heard from no relay.
+///
+/// It also carries the word that something was written in a channel of
+/// the device's own ([`OwnChannels::written`]), for which the node sends
+/// what waits without waiting for its timer.
+#[derive(Default)]
+pub struct OwnChannels {
+    said: Mutex<AtRelays>,
+    written: tokio::sync::Notify,
+}
+
+impl OwnChannels {
+    /// Where the device stands at its relays, as the node last said it.
+    pub fn read(&self) -> AtRelays {
+        self.said.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The node says where the device stands at its relays now.
+    pub fn say(&self, now: AtRelays) {
+        *self.said.lock().unwrap_or_else(|e| e.into_inner()) = now;
+    }
+
+    /// Something was written in a channel of the device's own: the node
+    /// sends what waits. One word is kept where the node is not waiting
+    /// for one, and no more than one.
+    pub fn written(&self) {
+        self.written.notify_one();
+    }
+
+    /// Wait for the word that something was written.
+    pub async fn wait_written(&self) {
+        self.written.notified().await;
+    }
+}
+
+/// Where a device stands at the relays it is set up with, for the
+/// channels of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AtRelays {
+    /// Each relay the device is set up with, in the order of its
+    /// configuration.
+    pub relays: Vec<AtRelay>,
+    /// Why the device cannot go on, where it cannot.
+    pub cannot_go_on: Option<CannotGoOn>,
+}
+
+/// Where a device stands at one relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtRelay {
+    /// The relay, as the device's configuration calls it.
+    pub relay: String,
+    /// Whether it holds the latest change entry that the device keeps, as
+    /// it last answered a show of that entry. `None` where it has not
+    /// answered one.
+    pub holds_latest: Option<bool>,
+    /// Whether the device has heard from it since it woke: it answered a
+    /// show. Where it has not, a change made while the device was off may
+    /// not have reached the device (§4.6).
+    pub heard_since_woke: bool,
+    /// The last time it refused something for room, where it has.
+    pub no_room: Option<NoRoom>,
+}
+
+/// A relay's refusal of something that it would have taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoRoom {
+    /// When, in seconds, in UTC.
+    pub at: i64,
+    /// Whether it was for the address's allowance of new channels, and
+    /// not for the relay's room.
+    pub over_allowance: bool,
+    /// Whether it was the change entry that was refused, and not an entry
+    /// of a channel of the device's own.
+    pub of_the_change: bool,
+}
+
+/// Why a device cannot go on in the channels of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CannotGoOn {
+    /// It follows no phrase yet.
+    NoPhrase,
+    /// It was removed.
+    Removed,
+    /// It is in no list.
+    NotListed,
+    /// Two changes were made apart, and it keeps both.
+    Fork,
+    /// A change lists it, and it could not open the change.
+    NotOpened,
+    /// It was answered with a change that it could not apply, by the
+    /// relay of this name. It says why.
+    NotApplied { relay: String, why: String },
 }
 
 /// Whether a key is a usable public key

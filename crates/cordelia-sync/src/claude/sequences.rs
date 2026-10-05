@@ -299,6 +299,7 @@ impl World {
                     relist: Default::default(),
                     sync_control: Default::default(),
                     usable_keys: Default::default(),
+                    own_channels: Default::default(),
                     history: Default::default(),
                 };
                 Device {
