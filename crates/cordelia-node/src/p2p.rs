@@ -2075,6 +2075,16 @@ pub async fn p2p_loop(
     if let Some(entries) = &relay_entries {
         entries.make_room(&state.db);
     }
+    // A device's side of its relays, for the channels of its own
+    // (decision 2026-10-04 §4.6): the show, the leave it gives, and the
+    // passes that prove, pull and push. Only a personal node has one, and
+    // it does nothing on a device that follows no phrase.
+    let device_entries = (node_role == "personal").then(|| {
+        cordelia_node::device_entries::DeviceEntries::new(
+            state.clone().into_inner(),
+            cordelia_node::device_entries::Clock::system(),
+        )
+    });
 
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
@@ -2667,6 +2677,15 @@ pub async fn p2p_loop(
                     last_outbox_flush = std::time::Instant::now();
                     flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
                 }
+                // What waits in a channel of the device's own is sent on
+                // the same timer, through the leave that a show gives.
+                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
+            }
+
+            // Something was written in a channel of the device's own: it
+            // is sent without waiting for the timer, through that leave.
+            _ = state.own_channels.wait_written(), if device_entries.is_some() => {
+                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
             }
 
             // ── Entries of channels from their secrets, on a relay ────
@@ -2913,6 +2932,11 @@ pub async fn p2p_loop(
             // Personal nodes: subscribed channels (list_for_entity), skip Phase 0.
             _ = sync_interval.tick() => {
                 if node_role == "bootnode" { continue; }
+
+                // A device's own channels, at each relay it is set up
+                // with: it shows its change entry, and then proves, pulls
+                // and pushes where the answer gives it leave.
+                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
 
                 // Apply channel states that arrived in our inbox since the last
                 // cycle (decision 2026-09-30 §4.1). Off the select loop: it does
@@ -3446,6 +3470,56 @@ fn relay_connected(
                 .is_some_and(|c| c.remote_address() == relay.addr)
         }),
     }
+}
+
+/// The relays this node is set up with, each with its connection where
+/// there is one: by its key if one is configured, otherwise by the address
+/// it was dialled at.
+fn relays_with_links(
+    relay_addrs: &RelayAddrs,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> Vec<cordelia_node::device_entries::Relay> {
+    use cordelia_node::device_entries::{Link, Relay};
+    let Ok(relays) = relay_addrs.read() else {
+        return Vec::new();
+    };
+    relays
+        .iter()
+        .map(|relay| {
+            let peer = match relay.key {
+                Some(key) => Some(NodeId(key)),
+                None => conn_mgr.connected_peers().into_iter().find(|peer| {
+                    conn_mgr
+                        .get_connection(peer)
+                        .is_some_and(|conn| conn.remote_address() == relay.addr)
+                }),
+            };
+            let link = peer.and_then(|peer| {
+                let conn = conn_mgr.get_connection(&peer)?.clone();
+                Some(Link::new(relay.host.clone(), peer, conn))
+            });
+            Relay {
+                name: relay.host.clone(),
+                link,
+            }
+        })
+        .collect()
+}
+
+/// Start a pass of a device's side of its relays, where this node has
+/// one: off the select loop, since it waits on the relays. A pass that
+/// finds another running does nothing.
+fn device_pass(
+    device: &Option<std::sync::Arc<cordelia_node::device_entries::DeviceEntries>>,
+    relay_addrs: &RelayAddrs,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    kind: cordelia_node::device_entries::Pass,
+) {
+    let Some(device) = device.clone() else {
+        return;
+    };
+    let relays = relays_with_links(relay_addrs, conn_mgr);
+    tokio::spawn(async move { device.pass(&relays, kind).await });
 }
 
 fn any_relay_connected(
