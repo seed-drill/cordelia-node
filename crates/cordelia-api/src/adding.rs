@@ -651,21 +651,32 @@ fn is_alone(conn: &Connection, held: &Held, own: &[u8; 32]) -> Result<bool, Pers
 }
 
 /// A device that is alone under a phrase leaves it, to start afresh under
-/// another (decision 2026-10-04 §4.2, §5.1): it forgets every secret it
-/// holds under that phrase, and its names forget what they held, as does
-/// the personal channel it leaves. It keeps its names: each has its
-/// channel under the statement it then applies.
+/// another (decision 2026-10-04 §4.2, §5.1): its names forget what they
+/// held, and it forgets every secret it holds under that phrase.
+///
+/// The store drops every entry of every channel that the device can name
+/// of the generations it leaves: the one it has applied, and each one it
+/// left before and still holds the secret of. For each, that is the
+/// personal channel, and the channel of each name it holds now. It keeps
+/// its names: each has its channel under the statement it then applies.
 ///
 /// What it follows, its statement and the change entry it keeps are
 /// replaced where it applies the statement it is handed. It keeps no
 /// record of an addition, and no entry of a statement made apart: it is
-/// alone, and in no fork.
+/// alone, and in no fork. What it wrote in a pair channel stays, since
+/// that channel is of no generation, and what it hands the same key next
+/// is written above it.
 fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
-    let secret = applied_secret(conn, &held.statement.statement)?;
-    let personal = derive::channel_id(&derive::personal_secret(&secret)?)?;
-    entries::remove_channel(conn, &personal)?;
-    for name in held_rows::names(conn)? {
-        entries::remove_channel(conn, &name.channel)?;
+    // What is held holds together: the secret applied is the statement's.
+    applied_secret(conn, &held.statement.statement)?;
+    let names = held_rows::names(conn)?;
+    for generation in held_rows::secrets(conn)? {
+        let personal = derive::personal_secret(&generation.secret)?;
+        entries::remove_channel(conn, &derive::channel_id(&personal)?)?;
+        for name in &names {
+            let own = derive::own_secret(&generation.secret, &name.name)?;
+            entries::remove_channel(conn, &derive::channel_id(&own)?)?;
+        }
     }
     held_rows::forget_secrets(conn)?;
     Ok(())
@@ -1676,6 +1687,65 @@ mod tests {
             Accepted::Refused(NotAccepted::AnotherPhrase)
         );
         assert_eq!(s[2].everything(), before);
+    }
+
+    /// A device that leaves a phrase drops what its store holds of every
+    /// generation it leaves: the one it has applied, and each one it left
+    /// before and still holds the secret of.
+    #[test]
+    fn test_leaving_a_phrase_drops_what_the_store_holds_of_every_generation_left() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        // Device 1 is alone under a phrase of its own, at its second
+        // statement: it holds the secret it left, too.
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let on = &s[1];
+        first_statement(&on.conn, &on.identity, &other, &on.label, s.now).unwrap();
+        s.hold(&[1], "notes");
+        let first = s[1].secret();
+        let on = &s[1];
+        let change = crate::change::make_change(
+            &other,
+            &on.held().statement,
+            &on.latest(),
+            &on.key(),
+            vec![on.listed()],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            shown(&on.conn, &on.identity, &change, s.now).unwrap(),
+            Shown::Applied(_)
+        ));
+        s.write(1, "notes", "a.md", "under its second statement");
+        // Entries of the generation it left, as a store holds them that
+        // was written to past the rule.
+        let on = &s[1];
+        let left = [
+            derive::personal_secret(&first).unwrap(),
+            derive::own_secret(&first, "notes").unwrap(),
+        ];
+        for channel in &left {
+            let entry = entry_by(&on.identity, channel, 3, "a.md", text("left behind"), &[]);
+            entries::store(&on.conn, &entry, s.now).unwrap();
+        }
+        let applied = [on.personal(), on.own("notes")];
+        for channel in left.iter().chain(&applied) {
+            assert_eq!(on.stored_in(channel).len(), 1);
+        }
+        assert_eq!(held_rows::secrets(&on.conn).unwrap().len(), 2);
+
+        let added = s.hand(0, 1);
+        assert!(matches!(
+            s.accept(1, 0, &added.hand_over),
+            Accepted::Moved(_)
+        ));
+        let moved = &s[1];
+        for channel in left.iter().chain(&applied) {
+            assert!(moved.stored_in(channel).is_empty());
+        }
+        assert_eq!(held_rows::secrets(&moved.conn).unwrap().len(), 1);
+        assert_eq!(moved.stored().len(), 1);
     }
 
     /// The third row: a device that is one of several takes only a
