@@ -63,7 +63,7 @@ use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Following, State};
 
 use crate::person::{
-    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Shown, added_name,
+    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Refused, Shown, added_name,
     applied_secret, apply_added, apply_judged, held, in_one, its_own_entry, latest_entry,
     see_addition, shown,
 };
@@ -329,6 +329,10 @@ pub enum NotAccepted {
     /// The hand-over's statement is none that this device takes beside
     /// the one it has applied.
     Statement(StatementError),
+    /// The hand-over's statement was made apart from the one this device
+    /// has applied, and its change entry was refused where it was shown to
+    /// the device as one: this is why.
+    NotShown(Refused),
     /// This device has stopped, and the hand-over's statement was made
     /// apart from the one it has applied, or is behind the change that
     /// stopped it.
@@ -584,6 +588,9 @@ impl<'a> Brought<'a> {
             Judgement::Fork if held.state == State::Applied => {
                 match shown(conn, identity, &self.entry, now)? {
                     Shown::Fork => Ok(Accepted::Fork),
+                    // The entry was refused where it was shown: that is
+                    // the hand-over's, and nothing changed.
+                    Shown::Refused(why) => Ok(Accepted::Refused(NotAccepted::NotShown(why))),
                     other => Err(PersonError::Held(format!(
                         "a statement made apart was shown, and was {other:?}"
                     ))),
