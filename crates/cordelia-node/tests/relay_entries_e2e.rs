@@ -726,6 +726,67 @@ async fn shown_an_entry_a_relay_answers_held_taken_or_another() {
     assert_eq!(holds(&relay).0, SMALL);
 }
 
+/// A stranger with one large entry at a relay, who shows a small earlier
+/// one again and again, is handed the large one while it is not over the
+/// bytes that a connection may be handed in a minute, once more as it
+/// goes over, and then no more until the minute frees: each further show
+/// is refused, and is no breach. The answers that carry no entry are
+/// given all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_shows_an_earlier_entry_again_and_again_is_handed_only_its_bytes() {
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    let large = largest_by(&client.identity, 1, "n");
+    assert_eq!(
+        client.show(large.to_wire()).await.unwrap(),
+        ShowAnswer::Taken
+    );
+    let earlier = client.made(1, 4, "n", "a small earlier one");
+
+    let most = PUSH_BYTES_PER_PEER_PER_MINUTE / LARGEST + 1;
+    let began = std::time::Instant::now();
+    let mut handed = 0;
+    loop {
+        match client.show(earlier.to_wire()).await {
+            Ok(ShowAnswer::Another(bytes)) => {
+                assert_eq!(bytes, large.to_wire());
+                handed += 1;
+                assert!(handed <= most, "it is handed without bound");
+            }
+            // Refused: the stream is reset, and nothing is said.
+            Err(_) => break,
+            Ok(other) => panic!("{other:?}"),
+        }
+    }
+    // All within the one minute, so that none of it was freed.
+    assert!(
+        began.elapsed() < Duration::from_secs(45),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(handed, most);
+
+    // From then on it is refused, as often as cuts a peer off for a
+    // breach and more, and is not cut off: it is no breach.
+    for _ in 0..2 * BAN_THRESHOLD {
+        assert!(client.show(earlier.to_wire()).await.is_err());
+    }
+    // What carries no entry is answered all the same: the entry that the
+    // relay holds is held, whole and in short, and the earlier one in
+    // short is word of another.
+    assert_eq!(
+        client.show(large.to_wire()).await.unwrap(),
+        ShowAnswer::Held
+    );
+    assert_eq!(client.show_short(&large).await.unwrap(), ShowAnswer::Held);
+    // Another connection has its own allowance, and is handed the entry.
+    let other = client_of(&relay).await.expect("another client connects");
+    assert_eq!(
+        other.show(earlier.to_wire()).await.unwrap(),
+        ShowAnswer::Another(large.to_wire())
+    );
+}
+
 /// A short show is only ever of the entry that the connection last showed
 /// whole in that slot. Of that entry the relay answers held (which is use
 /// of the channel), "show it whole", or the revision and ID of another:
@@ -1298,18 +1359,23 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
     assert!(client.pull(1, mark, 35).await.entries.is_empty());
 
     // It shows an entry, in a slot where the relay holds a later one of
-    // the largest size. It has no room left to be handed that: it is
-    // answered with the entry all the same.
+    // the largest size. It has not the room left to be handed that, and
+    // is not over yet: it is answered with the entry all the same.
     let earlier = client.made(1, 4, "0000.md", "an earlier one");
     match client.show(earlier.to_wire()).await {
         Ok(ShowAnswer::Another(bytes)) => assert_eq!(bytes, entries[0]),
-        other => panic!("a connection over its bytes was not answered with the entry: {other:?}"),
+        other => panic!("a connection near its bytes was not answered with the entry: {other:?}"),
     }
-    // And once more: it is over by an entry now, and is answered still.
-    assert!(matches!(
-        client.show(earlier.to_wire()).await,
-        Ok(ShowAnswer::Another(_))
-    ));
+    // And once more: it is over by an entry now, and is refused, with
+    // the error of a limit. That is no breach, however often it asks.
+    for _ in 0..2 * BAN_THRESHOLD {
+        let refused = client.show(earlier.to_wire()).await;
+        let why = refused.expect_err("a connection over its bytes was handed an entry");
+        assert!(
+            why.ends_with(&format!("stream reset by peer: error {ERR_RATE_LIMIT}")),
+            "refused for another reason: {why}"
+        );
+    }
     assert!(client.conn.close_reason().is_none());
 
     // What it pushes over its allowance is a breach, as before: the third

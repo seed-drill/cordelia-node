@@ -294,10 +294,12 @@ impl Rates {
     /// with when it showed one (decision 2026-10-04 §2.4 item 5), against
     /// the bytes that may be fetched in a minute, as a page is counted.
     ///
-    /// The answer to a show is always handed, and always counted, though
-    /// it take the asker over by that one entry (§16): a device that has
-    /// had its bytes for the minute must still hear of a removal. What it
-    /// is over by, it waits out before it is handed a page again.
+    /// The answer to a show is handed while the asker is not over either
+    /// allowance already, and is always counted, though it take the asker
+    /// over by that one entry (§16): a device that is near its bytes for
+    /// the minute must still hear of a removal. Whoever calls this has
+    /// asked [`Self::fetch_room`] first. What the asker is over by, it
+    /// waits out before it is handed an entry again.
     pub fn answered(&mut self, peer: &NodeId, address: std::net::IpAddr, bytes: u64) {
         for limiter in self.both(peer, address) {
             limiter.fetch_bytes.record(bytes);
@@ -3522,6 +3524,36 @@ fn device_pass(
     tokio::spawn(async move { device.pass(&relays, kind).await });
 }
 
+/// Whether the requests that a peer makes on a stream of `protocol` are
+/// counted against what a connection, and its address, may ask in a
+/// minute.
+///
+/// `own_relay` is whether this node is a relay and the peer is one that
+/// the governor calls a relay of this node's: by its key where one is
+/// configured, and otherwise by its address, or by its address and its
+/// own word. `listed_by_key` is whether the operator lists the peer by
+/// key ([`crate::relay_entries::RelayEntries::lists`]).
+///
+/// For the older kind of channel, the requests of this node's own relays
+/// are not counted. For the streams of entries of channels from their
+/// secrets, only those of a relay that is listed by key are not: the
+/// address a connection comes from is no key.
+fn requests_are_counted(
+    protocol: cordelia_network::messages::Protocol,
+    own_relay: bool,
+    listed_by_key: bool,
+) -> bool {
+    use cordelia_network::messages::Protocol;
+    match protocol {
+        Protocol::EntryShow
+        | Protocol::ChannelProve
+        | Protocol::EntryPull
+        | Protocol::EntryPush
+        | Protocol::RelayEntries => !listed_by_key,
+        _ => !own_relay,
+    }
+}
+
 fn any_relay_connected(
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
@@ -3743,13 +3775,23 @@ pub async fn handle_peer_streams(
         // two relays that list each other there is no limit at all: they
         // are one operator's, and each passes on everything its devices
         // send. A device still counts what its relay asks of it.
+        //
+        // On the streams of entries of channels from their secrets, the
+        // only peer whose requests are not counted is a relay that the
+        // operator lists by key (decision 2026-10-04 §2.4 item 6). A
+        // relay that is configured by address alone is known by where it
+        // connected from, or by that and its own word: whoever came from
+        // that address would otherwise ask without a count.
         let address = made_from;
         let own_relay = peer_relays
             .read()
             .ok()
             .is_some_and(|relays| relays.contains(&peer_id));
         let unlimited = own_relay && node_role == "relay";
-        let over = if unlimited {
+        let listed_by_key = relay_entries
+            .as_ref()
+            .is_some_and(|entries| entries.lists(&peer_id));
+        let over = if !requests_are_counted(protocol, unlimited, listed_by_key) {
             None
         } else {
             peer_rates
@@ -6049,6 +6091,45 @@ mod tests {
                 .is_err(),
             "the address's share is five connections' worth"
         );
+    }
+
+    /// On the streams of entries, the only peer whose requests are not
+    /// counted is a relay that the operator lists by key. One that the
+    /// governor calls a relay of this node's by its address, or by its
+    /// address and its word, is counted as any peer is. The older kind's
+    /// requests are counted as they were: not for a relay of this node's
+    /// own.
+    #[test]
+    fn requests_on_the_streams_of_entries_are_counted_but_for_a_relay_listed_by_key() {
+        use cordelia_network::messages::Protocol;
+        for of_entries in [
+            Protocol::EntryShow,
+            Protocol::ChannelProve,
+            Protocol::EntryPull,
+            Protocol::EntryPush,
+            Protocol::RelayEntries,
+        ] {
+            // Called a relay by the governor, and not listed by key.
+            assert!(
+                requests_are_counted(of_entries, true, false),
+                "{of_entries:?}"
+            );
+            assert!(requests_are_counted(of_entries, false, false));
+            // Listed by key, whatever the governor calls it.
+            assert!(!requests_are_counted(of_entries, true, true));
+            assert!(!requests_are_counted(of_entries, false, true));
+        }
+        for older in [
+            Protocol::ItemPush,
+            Protocol::ItemSync,
+            Protocol::PeerSharing,
+            Protocol::ChannelAnnounce,
+        ] {
+            assert!(!requests_are_counted(older, true, false), "{older:?}");
+            assert!(!requests_are_counted(older, true, true));
+            assert!(requests_are_counted(older, false, false));
+            assert!(requests_are_counted(older, false, true));
+        }
     }
 
     /// Requests on the streams of entries of channels from their secrets

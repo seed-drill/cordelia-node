@@ -63,10 +63,14 @@
 //!   refused for a time;
 //! - a pull that would hand more than the asker may be handed for now is
 //!   refused, and is no breach: the relay sized the page, and the asker
-//!   cannot know its room. The entry that answers a show is always
-//!   handed, and counted, though it take the asker over by that one
-//!   entry: a device that is over its bytes must still hear of a removal
-//!   (§16).
+//!   cannot know its room. Where the asker has no room at all, that is
+//!   decided before the store is read.
+//! - the entry that answers a show is handed while the asker is not yet
+//!   over its bytes, and counted, so it can take the asker over by that
+//!   one entry and no more: a device that is near its bytes must still
+//!   hear of a removal. After that a show that would be answered with an
+//!   entry is refused as "not now", with no breach, until the minute
+//!   frees (§16). The answers that carry no entry are always given.
 //!
 //! Every entry counts as its content and what an entry takes beyond it.
 //! Bytes that are no entry's count for all of them, and for no less than
@@ -668,13 +672,20 @@ impl RelayEntries {
                 }
             };
             // The entry that goes back counts against the asker's limits
-            // as anything fetched does. It goes back all the same where
-            // it takes the asker over: this is how a change reaches a
-            // device.
+            // as anything fetched does. It goes back while neither
+            // allowance is over already, also where it takes the asker
+            // over: this is how a change reaches a device. An asker that
+            // is over is told "not now", and that is no breach: whoever
+            // shows an earlier entry again and again is handed one entry
+            // beyond its bytes for the minute, and no more.
             if !who.listed
                 && let Shown::Another { cost, .. } = &found
             {
-                lock(rates).answered(who.peer, who.address, *cost);
+                let mut rates = lock(rates);
+                if rates.fetch_room(who.peer, who.address) == 0 {
+                    return Answer::NotNow;
+                }
+                rates.answered(who.peer, who.address, *cost);
             }
             found
         };
@@ -816,6 +827,11 @@ impl RelayEntries {
     /// the place and the mark that were asked with, and the database is
     /// not waited for: whoever asks without a proof costs the relay no
     /// look at what it holds.
+    ///
+    /// **A refusal for the asker's bytes is decided first.** Where its
+    /// allowance has not room for the smallest thing an entry is counted
+    /// at, nothing could be handed: the pull is refused before the
+    /// database is waited for, and the store is not read.
     fn pulling(
         &self,
         db: &Mutex<Connection>,
@@ -832,13 +848,18 @@ impl RelayEntries {
                 mark: pull.mark,
             }));
         }
-        let Ok(db) = db.lock() else {
-            return Answer::Nothing;
-        };
         // What the peer's allowance has room for, where it is handed
         // anything: a relay the operator lists is not limited, and a
         // channel that was not proved is not handed.
         let room = (proved && !who.listed).then(|| lock(rates).fetch_room(who.peer, who.address));
+        // With no room for even the smallest entry, the answer is known
+        // before the store is asked.
+        if room.is_some_and(|room| room < entry_cost(MIN_ENTRY_CONTENT_BYTES)) {
+            return Answer::NotNow;
+        }
+        let Ok(db) = db.lock() else {
+            return Answer::Nothing;
+        };
         let limit = room.map_or(pull.limit, |room| page_limit(pull.limit, room));
         let page = match relay::pull(&db, &pull.channel, proved, &pull.mark, pull.after, limit) {
             Ok(page) => page,
@@ -2091,8 +2112,8 @@ mod tests {
 
         // With the older kind, one allowance. A peer from which the relay
         // has fetched all but a little of what it may in a minute is
-        // handed the entry all the same: the answer to a show is always
-        // handed. It is counted, and takes the peer over by that entry.
+        // handed the entry all the same, while it is not over yet. It is
+        // counted, and takes the peer over by that entry.
         lock(&at.rates).fetched(&peer(3), address(3), MINUTE - 5000);
         assert_eq!(at.fetch_room(3), 5000);
         assert_eq!(
@@ -2101,19 +2122,25 @@ mod tests {
         );
         assert_eq!(at.fetch_room(3), 0);
         assert_eq!(lock(&at.rates).fetched_of_peer(&peer(3)), MINUTE + 120);
-        // And again, with no room at all: handed, and counted.
-        assert_eq!(
-            shown(at.show(3, first.to_wire())),
-            ShowAnswer::Another(larger.to_wire())
-        );
-        assert_eq!(
-            lock(&at.rates).fetched_of_peer(&peer(3)),
-            MINUTE + 120 + 5120
-        );
+        // And again, now that it is over: "not now", and nothing more is
+        // counted as fetched, however often it shows.
+        for _ in 0..3 * BAN_THRESHOLD {
+            not_now(at.show(3, first.to_wire()));
+        }
+        assert_eq!(lock(&at.rates).fetched_of_peer(&peer(3)), MINUTE + 120);
         // It is no breach.
         assert_eq!(breaches(&at, 3), (0, 0));
         // What it showed was counted as pushed, each time.
-        assert_eq!(at.push_room(3), MINUTE - 2 * SMALL);
+        assert_eq!(
+            at.push_room(3),
+            MINUTE - (1 + 3 * BAN_THRESHOLD as u64) * SMALL
+        );
+        // The answers that carry no entry are given all the same: the
+        // entry that the relay holds, shown by a peer that is over, is
+        // held, and one that it lacks is taken.
+        assert_eq!(shown(at.show(3, larger.to_wire())), ShowAnswer::Held);
+        let lacked = small(8, 1, 5);
+        assert_eq!(shown(at.show(3, lacked.to_wire())), ShowAnswer::Taken);
         // With room for it to the byte, it is handed, and none is left.
         lock(&at.rates).fetched(&peer(4), address(4), MINUTE - 5120);
         assert_eq!(
@@ -2835,6 +2862,110 @@ mod tests {
         assert_eq!(
             page(at.pull(1, 1, &nothing_proved, [9; 8], 7)),
             EntryPulled::from(&stores)
+        );
+    }
+
+    /// A stranger with one large entry at a relay, who shows a small
+    /// earlier one again and again, is handed the large one while it is
+    /// not over its bytes for the minute, once more as it goes over, and
+    /// then no more: about what a connection may be handed in a minute,
+    /// and not as much as it cares to ask for. A relay that the operator
+    /// lists is not limited.
+    #[test]
+    fn the_answer_to_a_show_is_handed_only_while_the_asker_is_not_over_its_bytes() {
+        let at = relay_of(u64::MAX, &[9]);
+        let big = largest(1, 1);
+        at.hold(&big, NOW);
+        let earlier = made(1, 1, 4, "n", "a small earlier one");
+        // It is handed the large one until it is refused.
+        let mut handed = 0u64;
+        loop {
+            match at.show(1, earlier.to_wire()) {
+                Answer::Message(answer) => {
+                    assert!(matches!(
+                        *answer,
+                        WireMessage::EntryShown(EntryShown {
+                            answer: ShowAnswer::Another(_)
+                        })
+                    ));
+                    handed += 1;
+                    assert!(handed <= 100, "it is handed without bound");
+                }
+                Answer::NotNow => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        // As many as fit in the minute's bytes, and the one that took it
+        // over.
+        assert_eq!(handed, MINUTE / LARGEST + 1);
+        assert_eq!(lock(&at.rates).fetched_of_peer(&peer(1)), handed * LARGEST);
+        // From then on it is refused, and nothing more is counted as
+        // fetched. It is no breach.
+        for _ in 0..3 * BAN_THRESHOLD {
+            not_now(at.show(1, earlier.to_wire()));
+        }
+        assert_eq!(lock(&at.rates).fetched_of_peer(&peer(1)), handed * LARGEST);
+        assert_eq!(breaches(&at, 1), (0, 0));
+        // A relay that the operator lists is handed it however often.
+        for _ in 0..2 * handed {
+            assert_eq!(
+                shown(at.show(9, earlier.to_wire())),
+                ShowAnswer::Another(big.to_wire())
+            );
+        }
+    }
+
+    /// A pull that is refused for the asker's bytes is refused before the
+    /// store is read: with no room for the smallest entry it does not
+    /// wait for the database. With room for one, the store is asked.
+    #[test]
+    fn a_pull_that_is_refused_for_the_askers_bytes_does_not_wait_for_the_store() {
+        use std::sync::mpsc;
+        let at = relay();
+        at.hold(&small(1, 1, 5), NOW);
+        let proved = having_proved(&[1]);
+        // Whether the pull is refused within two seconds while this
+        // thread holds the database: `None` where it waited.
+        let while_held = |n: u8| {
+            let held = lock(&at.db);
+            std::thread::scope(|scope| {
+                let (said, heard) = mpsc::channel();
+                let (at, proved) = (&at, &proved);
+                scope.spawn(move || {
+                    let refused =
+                        matches!(at.pull(n, 1, proved, relay::NO_MARK, 0), Answer::NotNow);
+                    let _ = said.send(refused);
+                });
+                let answered = heard.recv_timeout(Duration::from_secs(2));
+                drop(held);
+                answered.ok()
+            })
+        };
+        // No room at all, and room for less than the smallest entry.
+        lock(&at.rates).fetched(&peer(1), address(1), MINUTE);
+        assert_eq!(at.fetch_room(1), 0);
+        assert_eq!(while_held(1), Some(true));
+        lock(&at.rates).fetched(&peer(2), address(2), MINUTE - (SMALL - 1));
+        assert_eq!(while_held(2), Some(true));
+        assert_eq!(breaches(&at, 1), (0, 0));
+        // Room for the smallest: the store is asked, and the entry
+        // handed.
+        for n in [3, 4] {
+            lock(&at.rates).fetched(&peer(n), address(n), MINUTE - SMALL);
+        }
+        assert_eq!(while_held(3), None);
+        let handed = page(at.pull(4, 1, &proved, relay::NO_MARK, 0));
+        assert_eq!(handed.entries.len(), 1);
+        // A relay that the operator lists is not limited, and is not
+        // refused.
+        let listed = relay_of(u64::MAX, &[9]);
+        listed.hold(&small(1, 1, 5), NOW);
+        lock(&listed.rates).fetched(&peer(9), address(9), MINUTE);
+        assert_eq!(
+            page(listed.pull(9, 1, &proved, relay::NO_MARK, 0))
+                .entries
+                .len(),
+            1
         );
     }
 
