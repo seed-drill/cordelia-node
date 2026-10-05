@@ -974,6 +974,24 @@ fn the_harness_takes_an_address_of_this_machine() {
     }
 }
 
+/// One name passes that is no address of this machine: the one under
+/// which nothing can be looked up, since it has no port. The same name
+/// with a port could be looked up, and does not pass.
+#[test]
+fn the_harness_takes_the_name_under_which_nothing_is_looked_up() {
+    use std::net::ToSocketAddrs;
+    assert!(!NO_SUCH_NAME.contains(':'));
+    let read = NO_SUCH_NAME.to_socket_addrs().map(|_| ());
+    assert_eq!(
+        read.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::InvalidInput)
+    );
+    assert_on_this_machine("here", NO_SUCH_NAME);
+    let with_a_port = format!("{NO_SUCH_NAME}:9474");
+    let refused = std::panic::catch_unwind(|| assert_on_this_machine("odd", &with_a_port));
+    assert!(refused.is_err(), "{with_a_port} passed");
+}
+
 /// What the node would not read as an address it takes for a name, and
 /// looks up: such a form does not pass, though the address inside it is
 /// this machine's.

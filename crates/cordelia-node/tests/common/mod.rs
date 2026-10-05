@@ -428,15 +428,33 @@ pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 /// channels behind. So no test node is ever left with none.
 pub const NOWHERE: &str = "127.0.0.1:9";
 
+/// A relay's name under which nothing can be looked up, on any machine:
+/// it has no port, and a name with none is refused where it is read,
+/// before any lookup is made. A test gives a node this relay where it
+/// needs one whose name does not resolve: the node is set up with it, and
+/// dials nothing for it.
+pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve";
+
 /// A test node dials nothing that is not on this machine, whatever a test
 /// gives it: a loopback address with its port, read as the node first
 /// reads what it is given (so `[::1]:9474` is one, and `[127.0.0.1]:9`,
 /// which the node would take for a name, is not); or `localhost` where
 /// the machine's own resolver gives that name loopback addresses and no
 /// other. No other name is looked up to find out, so none passes,
-/// wherever it leads.
+/// wherever it leads: but for [`NO_SUCH_NAME`], under which nothing can
+/// be looked up, and which so leads nowhere.
 pub fn assert_on_this_machine(name: &str, addr: &str) {
     use std::net::{SocketAddr, ToSocketAddrs};
+    if addr == NO_SUCH_NAME {
+        // It has no port: it is refused as no address, with no lookup.
+        let read = addr.to_socket_addrs().map(|_| ());
+        let no_address = matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::InvalidInput);
+        assert!(
+            !addr.contains(':') && no_address,
+            "the test node {name} was given {addr}, under which something could be looked up"
+        );
+        return;
+    }
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
     let here = match addr.parse::<SocketAddr>() {
         Ok(literal) => literal.ip().is_loopback(),

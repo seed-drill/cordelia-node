@@ -230,6 +230,120 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     assert!(!log.contains(&words));
 }
 
+/// A relay that a device is set up with and whose name does not resolve
+/// is one of its relays all the same (decision 2026-10-04 §4.6). The
+/// device cannot tell what that relay holds: a change made while it was
+/// off may be there, and nowhere else.
+///
+/// - When the device wakes it shows its change entry to the relay that
+///   answers, and then neither sends to a channel of its own nor takes
+///   from one until the 30 seconds have gone by. Then it goes on with the
+///   relay that answers.
+/// - Its status, and `cordelia devices`, name the relay it has not heard
+///   from.
+/// - A command that makes a change says of that relay that it could not
+///   be fetched from, and that it does not hold the change: it never says
+///   that the machine may be closed.
+#[test]
+fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
+    use std::time::{Duration, Instant};
+    let relay = relay_started();
+    let reached = format!("127.0.0.1:{}", relay.p2p);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
+    );
+    assert_eq!(laptop.will_dial(), [reached.as_str(), NO_SUCH_NAME]);
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("device healthy", &all, 30, || healthy(&laptop));
+    wait_for("device reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
+    });
+    // What the device says of one of its relays, by the relay's name.
+    let of = |name: &str| -> Option<Value> {
+        let seen = look(&laptop);
+        let relays = seen["relays"].as_array()?;
+        relays.iter().find(|relay| relay["relay"] == name).cloned()
+    };
+    // How many of its channels have something that waits to be sent to
+    // the relay it reaches.
+    let waits = || -> Option<u64> {
+        let seen = look(&laptop);
+        let waiting = seen["waiting"].as_array()?;
+        waiting.first()?["waits"].as_u64()
+    };
+
+    // The device wakes when it first has a change entry to show: the
+    // relay that answers is shown it, and holds it.
+    let words = makes_a_phrase(&laptop, "laptop");
+    let woke = Instant::now();
+    wait_for("the relay that answers holds the change", &all, 20, || {
+        (of(&reached)?["holds_latest"] == true).then_some(())
+    });
+    let named = of(NO_SUCH_NAME).expect("the relay whose name does not resolve is listed");
+    assert_eq!(named["heard_since_woke"], false, "{named}");
+    assert_eq!(named["holds_latest"], Value::Null, "{named}");
+
+    // While it wakes it sends nothing in a channel of its own: half of
+    // the wait on, what it wrote in its personal channel still waits.
+    std::thread::sleep(Duration::from_secs(15).saturating_sub(woke.elapsed()));
+    assert!(
+        woke.elapsed() < Duration::from_secs(25),
+        "the test was slow"
+    );
+    assert_eq!(waits(), Some(1), "{}", look(&laptop));
+    // The status, and `cordelia devices`, name the relay not heard from.
+    let not_heard = format!(
+        "has not heard from {NO_SUCH_NAME} since it woke: a change made while it was off may \
+         not have reached it"
+    );
+    let status = laptop.cli(&["status"]);
+    assert!(status.contains(&not_heard), "{status}");
+    let devices = laptop.cli(&["devices"]);
+    assert!(
+        devices.contains(&format!(
+            "{NO_SUCH_NAME}: has not answered since this device woke"
+        )),
+        "{devices}"
+    );
+    assert!(
+        devices.contains(&format!("{reached}: holds the latest change")),
+        "{devices}"
+    );
+
+    // Once the 30 seconds have gone by it goes on with the other relay.
+    wait_for("the device sends what waits", &all, 60, || {
+        (waits()? == 0).then_some(())
+    });
+    assert!(
+        woke.elapsed() >= Duration::from_secs(25),
+        "the device did not wait for the relay it had not heard from: it sent after {:?}",
+        woke.elapsed()
+    );
+
+    // A command that makes a change says what it could not fetch, and
+    // which relay does not hold the change. It goes on saying so.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    assert!(
+        at.said
+            .contains(&format!("Could not fetch: {NO_SUCH_NAME} did not answer.")),
+        "{}",
+        at.said
+    );
+    at.says(&format!("{reached} holds the change"));
+    let said = at.hears_for(Duration::from_secs(5)).to_string();
+    assert!(
+        said.contains(&format!(
+            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("Every relay holds the change"), "{said}");
+}
+
 // ── cordelia add-device, cordelia accept, cordelia devices ───────────
 
 /// The notices that a device shows, by what each says.
