@@ -535,8 +535,11 @@ pub fn show(
 
 /// Whether the other end of the connection whose TLS session exports
 /// `session` has proved, with `proof`, that it holds the key of a channel
-/// this relay holds (decision 2026-10-04 §2.4 items 3 and 4). `now` is
-/// the relay's time, in seconds.
+/// this relay holds (decision 2026-10-04 §2.4 items 3 and 4). `prover` is
+/// the node key of the peer at the other end, as the connection says it:
+/// a proof says which end made it, and one that this end made is no proof
+/// when the other end sends it back. `now` is the relay's time, in
+/// seconds.
 ///
 /// The signature is checked first, and the channel is looked up only
 /// where it holds. No, for a proof that fails; and no, for a channel that
@@ -549,10 +552,11 @@ pub fn prove(
     conn: &Connection,
     channel: &[u8; 32],
     session: &[u8; SESSION_VALUE_BYTES],
+    prover: &[u8; 32],
     proof: &[u8; 64],
     now: i64,
 ) -> Result<bool, CordeliaError> {
-    if !proof::check(channel, session, proof) {
+    if !proof::check(channel, session, prover, proof) {
         return Ok(false);
     }
     used(conn, channel, now)
@@ -749,6 +753,12 @@ mod tests {
 
     fn device(d: u8) -> NodeIdentity {
         NodeIdentity::from_seed([d; 32]).unwrap()
+    }
+
+    /// The node key of the peer at the other end of the connection whose
+    /// session exports [`SESSION`].
+    fn peer() -> [u8; 32] {
+        device(7).public_key()
     }
 
     /// A connection from the address numbered `n`, of those kept for
@@ -1121,22 +1131,40 @@ mod tests {
             &conn,
             &channel(2),
             &SESSION,
-            &proof::make(&secret(2), &SESSION).unwrap(),
+            &peer(),
+            &proof::make(&secret(2), &SESSION, &peer()).unwrap(),
             NOW,
         )
         .unwrap();
         assert!(!not_held);
+        // The stranger is the peer on its connection, and says so in what
+        // it signs.
+        let itself = stranger.public_key();
         let mut what_it_signs = cordelia_core::protocol::LABEL_CHANNEL_PROOF.to_vec();
         what_it_signs.extend_from_slice(&SESSION);
+        what_it_signs.extend_from_slice(&itself);
         what_it_signs.extend_from_slice(&channel(1));
         for forged in [
             stranger.sign(&what_it_signs),
             strangers_channel.sign(&what_it_signs),
-            proof::make(&secret(99), &SESSION).unwrap(),
+            proof::make(&secret(99), &SESSION, &itself).unwrap(),
             [0; 64],
         ] {
             assert_eq!(
-                prove(&conn, &channel(1), &SESSION, &forged, NOW + 60).unwrap(),
+                prove(&conn, &channel(1), &SESSION, &itself, &forged, NOW + 60).unwrap(),
+                not_held
+            );
+        }
+        // It has come by a proof of the channel: one that a node which
+        // holds the key made on another connection, and one that the node
+        // at this end of its own connection made and sent to it. It sends
+        // each as its own: neither says that it made it.
+        for seen in [
+            proof::make(&secret(1), &[0x52; 32], &peer()).unwrap(),
+            proof::make(&secret(1), &SESSION, &peer()).unwrap(),
+        ] {
+            assert_eq!(
+                prove(&conn, &channel(1), &SESSION, &itself, &seen, NOW + 60).unwrap(),
                 not_held
             );
         }
@@ -1164,8 +1192,8 @@ mod tests {
         // Nothing of all that counted as use of the channel.
         assert_eq!(used_at(&conn, 1), Some(NOW));
         // The control: whoever holds the key is handed it.
-        let proved = proof::make(&secret(1), &SESSION).unwrap();
-        assert!(prove(&conn, &channel(1), &SESSION, &proved, NOW + 60).unwrap());
+        let proved = proof::make(&secret(1), &SESSION, &peer()).unwrap();
+        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &proved, NOW + 60).unwrap());
         assert_eq!(
             pull(&conn, &channel(1), true, 0, 100).unwrap().entries,
             [held_entry.into_entry()]
@@ -1982,30 +2010,85 @@ mod tests {
         take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW).unwrap();
         let other_session = [0x52; 32];
-        let good = proof::make(&secret(1), &SESSION).unwrap();
+        let good = proof::make(&secret(1), &SESSION, &peer()).unwrap();
 
         // The channel's key, on this connection, for a channel it holds.
-        assert!(prove(&conn, &channel(1), &SESSION, &good, NOW + 60).unwrap());
+        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW + 60).unwrap());
 
         // A proof for another channel: the holder of channel 2 proves
         // that one, and shows the proof for channel 1.
-        let for_another = proof::make(&secret(2), &SESSION).unwrap();
-        assert!(prove(&conn, &channel(2), &SESSION, &for_another, NOW + 60).unwrap());
-        assert!(!prove(&conn, &channel(1), &SESSION, &for_another, NOW + 120).unwrap());
+        let for_another = proof::make(&secret(2), &SESSION, &peer()).unwrap();
+        assert!(
+            prove(
+                &conn,
+                &channel(2),
+                &SESSION,
+                &peer(),
+                &for_another,
+                NOW + 60
+            )
+            .unwrap()
+        );
+        assert!(
+            !prove(
+                &conn,
+                &channel(1),
+                &SESSION,
+                &peer(),
+                &for_another,
+                NOW + 120
+            )
+            .unwrap()
+        );
         // And the proof of channel 1 is none for channel 2.
-        assert!(!prove(&conn, &channel(2), &SESSION, &good, NOW + 120).unwrap());
+        assert!(!prove(&conn, &channel(2), &SESSION, &peer(), &good, NOW + 120).unwrap());
 
         // A proof made over another session's value: replayed here from
         // another connection, and from here on another.
-        let elsewhere = proof::make(&secret(1), &other_session).unwrap();
-        assert!(!prove(&conn, &channel(1), &SESSION, &elsewhere, NOW + 120).unwrap());
-        assert!(!prove(&conn, &channel(1), &other_session, &good, NOW + 120).unwrap());
+        let elsewhere = proof::make(&secret(1), &other_session, &peer()).unwrap();
+        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &elsewhere, NOW + 120).unwrap());
+        assert!(
+            !prove(
+                &conn,
+                &channel(1),
+                &other_session,
+                &peer(),
+                &good,
+                NOW + 120
+            )
+            .unwrap()
+        );
+
+        // A proof says which end made it. One that this end made, over
+        // the value that both ends export, is none when the other end
+        // sends it back; and one that the peer made is none from another.
+        let this_end = device(3).public_key();
+        let sent_by_this_end = proof::make(&secret(1), &SESSION, &this_end).unwrap();
+        assert!(proof::check(
+            &channel(1),
+            &SESSION,
+            &this_end,
+            &sent_by_this_end
+        ));
+        assert!(
+            !prove(
+                &conn,
+                &channel(1),
+                &SESSION,
+                &peer(),
+                &sent_by_this_end,
+                NOW + 120
+            )
+            .unwrap()
+        );
+        let another = device(9).public_key();
+        assert!(!prove(&conn, &channel(1), &SESSION, &another, &good, NOW + 120).unwrap());
 
         // A channel that the relay does not hold, proved as it should be:
         // the same no.
-        let not_held = proof::make(&secret(3), &SESSION).unwrap();
-        assert!(proof::check(&channel(3), &SESSION, &not_held));
-        assert!(!prove(&conn, &channel(3), &SESSION, &not_held, NOW + 120).unwrap());
+        let not_held = proof::make(&secret(3), &SESSION, &peer()).unwrap();
+        assert!(proof::check(&channel(3), &SESSION, &peer(), &not_held));
+        assert!(!prove(&conn, &channel(3), &SESSION, &peer(), &not_held, NOW + 120).unwrap());
         // And nothing is kept of having been asked.
         assert_eq!(held_channel(&conn, &channel(3)).unwrap(), None);
 
@@ -2017,9 +2100,9 @@ mod tests {
         // nothing to look channels up in, a proof that fails is still
         // answered, and one that holds is not.
         conn.execute_batch("DROP TABLE relay_channels").unwrap();
-        assert!(!prove(&conn, &channel(1), &SESSION, &for_another, NOW).unwrap());
-        assert!(!prove(&conn, &channel(1), &SESSION, &[0; 64], NOW).unwrap());
-        assert!(prove(&conn, &channel(1), &SESSION, &good, NOW).is_err());
+        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &for_another, NOW).unwrap());
+        assert!(!prove(&conn, &channel(1), &SESSION, &peer(), &[0; 64], NOW).unwrap());
+        assert!(prove(&conn, &channel(1), &SESSION, &peer(), &good, NOW).is_err());
     }
 
     /// A channel is handed in pages, in the order the relay stored its
@@ -2202,8 +2285,8 @@ mod tests {
             Shown::Held
         );
         // The third: its key is proved.
-        let proved = proof::make(&secret(3), &SESSION).unwrap();
-        assert!(prove(&conn, &channel(3), &SESSION, &proved, yesterday).unwrap());
+        let proved = proof::make(&secret(3), &SESSION, &peer()).unwrap();
+        assert!(prove(&conn, &channel(3), &SESSION, &peer(), &proved, yesterday).unwrap());
         // The fourth: an entry is shown that the relay did not hold, and
         // took. It holds it now.
         assert_eq!(
@@ -2216,7 +2299,7 @@ mod tests {
             show(&conn, &mut room, &small(5, 1, 4), &from(1), yesterday).unwrap(),
             Shown::Another { .. }
         ));
-        assert!(!prove(&conn, &channel(5), &SESSION, &proved, yesterday).unwrap());
+        assert!(!prove(&conn, &channel(5), &SESSION, &peer(), &proved, yesterday).unwrap());
         // The sixth: an entry is pushed, and stored. Whoever holds an
         // entry can push it: it proves no key, and is no use either.
         assert_eq!(

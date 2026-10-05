@@ -428,8 +428,10 @@ pub struct ChannelProve {
     #[serde(with = "serde_bytes")]
     pub channel: [u8; 32],
     /// The signature of the channel's signing key over the value that
-    /// both ends export from this connection's TLS session, and the
-    /// channel's ID (`cordelia_crypto::proof`).
+    /// both ends export from this connection's TLS session, the sender's
+    /// node key, and the channel's ID (`cordelia_crypto::proof`). The
+    /// sender's key is not sent: the receiver knows it from the
+    /// connection.
     #[serde(with = "serde_bytes")]
     pub proof: [u8; 64],
 }
@@ -853,7 +855,7 @@ mod tests {
             }),
             WireMessage::ChannelProve(ChannelProve {
                 channel,
-                proof: proof::make(&SECRET, &[0x51; 32]).unwrap(),
+                proof: proof::make(&SECRET, &[0x51; 32], &[0x07; 32]).unwrap(),
             }),
             WireMessage::ChannelProved(ChannelProved { proved: true }),
             WireMessage::ChannelProved(ChannelProved { proved: false }),
@@ -965,9 +967,12 @@ mod tests {
     fn a_proof_and_its_answer_go_through_the_codec() {
         let channel = derive::channel_id(&SECRET).unwrap();
         let session = [0x51; 32];
+        // The node key of the end that proves. It is not sent: whoever
+        // checks knows it from the connection.
+        let prover = NodeIdentity::from_seed([7; 32]).unwrap().public_key();
         let prove = ChannelProve {
             channel,
-            proof: proof::make(&SECRET, &session).unwrap(),
+            proof: proof::make(&SECRET, &session, &prover).unwrap(),
         };
         let WireMessage::ChannelProve(read) = through(&WireMessage::ChannelProve(prove.clone()))
         else {
@@ -975,7 +980,7 @@ mod tests {
         };
         assert_eq!(read, prove);
         // What arrives is checked from the ID alone.
-        assert!(proof::check(&read.channel, &session, &read.proof));
+        assert!(proof::check(&read.channel, &session, &prover, &read.proof));
 
         for proved in [true, false] {
             let message = WireMessage::ChannelProved(ChannelProved { proved });

@@ -1188,14 +1188,15 @@ const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u64 <= entry_cost(MAX_ITEM_BYTES))
 /// The label that a proof is signed under, that a connection holds a
 /// channel's key (decision 2026-10-04 §2.4, item 3): the channel's signing
 /// key signs this label, the value that both ends export from the one TLS
-/// session, and the channel's ID. The label is the proof's own, so that an
-/// entry's signature is never taken for a proof, nor a proof for one.
+/// session, the node key of the end that proves, and the channel's ID. The
+/// label is the proof's own, so that an entry's signature is never taken
+/// for a proof, nor a proof for one.
 pub const LABEL_CHANNEL_PROOF: &[u8] = b"cordelia v2 proof";
 
 /// How long the value is that both ends of a connection export from its
 /// TLS session, for a proof to be made over: 32 bytes (decision 2026-10-04
-/// §2.4, item 3). One length, so that where the value ends and the
-/// channel's ID begins is never in doubt.
+/// §2.4, item 3). One length, so that where the value ends and what
+/// follows it begins is never in doubt.
 pub const SESSION_VALUE_BYTES: usize = 32;
 
 /// The protocol byte of a stream on which a connection shows an entry, and
