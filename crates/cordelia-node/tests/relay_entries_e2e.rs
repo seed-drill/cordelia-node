@@ -841,8 +841,14 @@ async fn an_address_may_make_a_relay_take_so_many_new_channels_an_hour() {
 /// The limits by address are the older kind's, and count both kinds
 /// together: what a connection pushes in a minute, in items and in
 /// entries, is one allowance; what it is handed is bounded as what may be
-/// fetched is; and a peer that goes over as many times as cut a peer off
-/// today is cut off, with its address refused for a time.
+/// fetched is; and a peer that pushes over it as many times as cut a peer
+/// off today is cut off, with its address refused for a time.
+///
+/// A pull for more than the connection may be handed for now is refused,
+/// with the error of a limit, and is no breach however often it is made:
+/// the relay sized the page, and the asker cannot know its room. And the
+/// entry that answers a show is handed all the same to a connection that
+/// has had its bytes for the minute: so a device hears of a change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_limits_by_address_count_both_kinds_of_channel_together() {
     let relay = relay_started(None);
@@ -928,14 +934,45 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
     // A page with nothing in it is still answered.
     assert!(client.pull(1, mark, 35).await.entries.is_empty());
 
-    // The next entry does not fit in what is left: the pull is refused.
-    // It is the third breach, counted with the two of pushing, and the
-    // relay cuts the connection off and says why.
+    // The next entry does not fit in what is left: the pull is refused,
+    // with the error of a limit. It is no breach: made many more times
+    // than cut a peer off, it is refused each time, and the connection
+    // stays.
     assert_eq!(BAN_THRESHOLD, 3);
+    for _ in 0..2 * BAN_THRESHOLD {
+        let refused = client.pull_id(channel(1), mark, after).await;
+        let why = refused.expect_err("the connection was handed more than may be fetched");
+        assert!(
+            why.ends_with(&format!("stream reset by peer: error {ERR_RATE_LIMIT}")),
+            "refused for another reason: {why}"
+        );
+    }
     assert!(
-        client.pull_id(channel(1), mark, after).await.is_err(),
-        "the connection was handed more than may be fetched in a minute"
+        client.conn.close_reason().is_none(),
+        "the pulls were breaches"
     );
+    // A pull that hands nothing is still answered.
+    assert!(client.pull(1, mark, 35).await.entries.is_empty());
+
+    // It shows an entry, in a slot where the relay holds a later one of
+    // the largest size. It has no room left to be handed that: it is
+    // answered with the entry all the same.
+    let earlier = client.made(1, 4, "0000.md", "an earlier one");
+    match client.show(earlier.to_wire()).await {
+        Ok(ShowAnswer::Another(bytes)) => assert_eq!(bytes, entries[0]),
+        other => panic!("a connection over its bytes was not answered with the entry: {other:?}"),
+    }
+    // And once more: it is over by an entry now, and is answered still.
+    assert!(matches!(
+        client.show(earlier.to_wire()).await,
+        Ok(ShowAnswer::Another(_))
+    ));
+    assert!(client.conn.close_reason().is_none());
+
+    // What it pushes over its allowance is a breach, as before: the third
+    // one, counted with the two above, and the relay cuts the connection
+    // off and says why.
+    assert!(client.push(largest(&client, 40, 42)).await.is_err());
     let closed = tokio::time::timeout(Duration::from_secs(10), client.conn.closed())
         .await
         .expect("the relay did not close the connection");

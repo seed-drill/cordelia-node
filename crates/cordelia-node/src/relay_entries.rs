@@ -48,9 +48,16 @@
 //!   minute;
 //! - what it is handed, in a page or in the answer to an entry shown,
 //!   against the bytes that may be fetched in a minute;
-//! - each for the connection and for its address, and a peer that goes
-//!   over is refused that request, and cut off after as many breaches as
-//!   cut a peer off today, with its address refused for a time.
+//! - each for the connection and for its address, and a peer that pushes
+//!   or shows over its allowance is refused that request, and cut off
+//!   after as many breaches as cut a peer off today, with its address
+//!   refused for a time;
+//! - a pull that would hand more than the asker may be handed for now is
+//!   refused, and is no breach: the relay sized the page, and the asker
+//!   cannot know its room. The entry that answers a show is always
+//!   handed, and counted, though it take the asker over by that one
+//!   entry: a device that is over its bytes must still hear of a removal
+//!   (§16).
 //!
 //! Every entry counts as its content and what an entry takes beyond it.
 //! Bytes that are no entry's count for all of them, and for no less than
@@ -237,6 +244,10 @@ pub enum Answer {
     Message(Box<WireMessage>),
     /// It is over a limit: the stream is refused, and nothing is said.
     Over(OverLimit),
+    /// It asks for more than the asker may be handed for now: the stream
+    /// is refused, nothing is said, and nothing is counted. It is no
+    /// breach.
+    NotNow,
     /// It could not be served: nothing is said.
     Nothing,
 }
@@ -549,12 +560,13 @@ impl RelayEntries {
                 }
             };
             // The entry that goes back counts against the asker's limits
-            // as anything fetched does. Over either, it does not go back.
+            // as anything fetched does. It goes back all the same where
+            // it takes the asker over: this is how a change reaches a
+            // device.
             if !who.listed
                 && let Shown::Another { cost, .. } = &found
-                && let Err(over) = lock(rates).handed(who.peer, who.address, *cost)
             {
-                return Answer::Over(over);
+                lock(rates).answered(who.peer, who.address, *cost);
             }
             found
         };
@@ -668,11 +680,10 @@ impl RelayEntries {
         };
         // What is handed counts against the asker's limits. A page is
         // sized to the room there is, so this is over only where not even
-        // the first entry fits: then nothing is handed.
-        if room.is_some()
-            && let Err(over) = lock(rates).handed(who.peer, who.address, page.cost)
-        {
-            return Answer::Over(over);
+        // the first entry fits: then nothing is handed, and nothing is
+        // counted. The asker could not know: it is no breach.
+        if room.is_some() && !lock(rates).handed(who.peer, who.address, page.cost) {
+            return Answer::NotNow;
         }
         Answer::of(WireMessage::EntryPulled((&page).into()))
     }
@@ -1143,6 +1154,13 @@ impl RelayEntries {
                 let _ = recv.stop(code);
                 Some(over)
             }
+            Answer::NotNow => {
+                tracing::debug!(peer = %who.peer, ?protocol, "a pull for more than the peer may be handed for now; refused, and no breach");
+                let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                None
+            }
             Answer::Nothing => None,
         }
     }
@@ -1585,6 +1603,25 @@ mod tests {
         }
     }
 
+    /// A pull that asked for more than the peer may be handed for now:
+    /// refused, with nothing said, and no breach.
+    fn not_now(answer: Answer) {
+        assert!(matches!(answer, Answer::NotNow), "not refused for now");
+    }
+
+    /// How many breaches are counted for the peer numbered `n`, and for
+    /// the address numbered `n`.
+    fn breaches(at: &Relay, n: u8) -> (u32, u32) {
+        let rates = lock(&at.rates);
+        let of = |limiter: Option<&cordelia_network::rate_limit::PeerRateLimiter>| {
+            limiter.map_or(0, |limiter| limiter.breach_count)
+        };
+        (
+            of(rates.breaches_of_peer(&peer(n))),
+            of(rates.breaches_of_address(address(n))),
+        )
+    }
+
     /// The breach, where a request was over a limit.
     fn over(answer: Answer) -> OverLimit {
         match answer {
@@ -1748,16 +1785,31 @@ mod tests {
         assert_eq!(at.fetch_room(2), MINUTE - (4096 + 1024));
 
         // With the older kind, one allowance. A peer from which the relay
-        // has fetched all but a little of what it may in a minute is not
-        // handed the entry: nothing is said, and it is a breach.
+        // has fetched all but a little of what it may in a minute is
+        // handed the entry all the same: the answer to a show is always
+        // handed. It is counted, and takes the peer over by that entry.
         lock(&at.rates).fetched(&peer(3), address(3), MINUTE - 5000);
         assert_eq!(at.fetch_room(3), 5000);
-        let breach = over(at.show(3, first.to_wire()));
-        assert!(!breach.cut_off);
-        assert_eq!(at.fetch_room(3), 5000, "nothing was counted for it");
-        // What it showed was counted, and is not given back.
-        assert_eq!(at.push_room(3), MINUTE - SMALL);
-        // With room for it, it is handed.
+        assert_eq!(
+            shown(at.show(3, first.to_wire())),
+            ShowAnswer::Another(larger.to_wire())
+        );
+        assert_eq!(at.fetch_room(3), 0);
+        assert_eq!(lock(&at.rates).fetched_of_peer(&peer(3)), MINUTE + 120);
+        // And again, with no room at all: handed, and counted.
+        assert_eq!(
+            shown(at.show(3, first.to_wire())),
+            ShowAnswer::Another(larger.to_wire())
+        );
+        assert_eq!(
+            lock(&at.rates).fetched_of_peer(&peer(3)),
+            MINUTE + 120 + 5120
+        );
+        // It is no breach.
+        assert_eq!(breaches(&at, 3), (0, 0));
+        // What it showed was counted as pushed, each time.
+        assert_eq!(at.push_room(3), MINUTE - 2 * SMALL);
+        // With room for it to the byte, it is handed, and none is left.
         lock(&at.rates).fetched(&peer(4), address(4), MINUTE - 5120);
         assert_eq!(
             shown(at.show(4, first.to_wire())),
@@ -2107,7 +2159,7 @@ mod tests {
     /// What a peer is handed in a minute is bounded, as what a relay may
     /// fetch from it is. A page is sized to the room there is, an entry
     /// that fits is still handed, and a pull whose first entry does not
-    /// fit is refused, and is a breach.
+    /// fit is refused, and is no breach.
     #[test]
     fn a_peer_is_handed_only_what_may_be_fetched_in_a_minute() {
         let at = relay();
@@ -2135,9 +2187,11 @@ mod tests {
         assert!(at.fetch_room(1) < LARGEST);
 
         // The next entry of the largest size does not fit: the pull is
-        // refused, nothing is counted for it, and it is a breach.
-        assert!(!over(at.pull(1, 1, &proved, mark, after)).cut_off);
+        // refused, and nothing is counted for it. It is no breach: the
+        // relay sized the page, and the asker cannot know its room.
+        not_now(at.pull(1, 1, &proved, mark, after));
         assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST);
+        assert_eq!(breaches(&at, 1), (0, 0));
         // A page with nothing in it is still answered: the end of the
         // channel, and a channel that is not held.
         let end = page(at.pull(1, 1, &proved, mark, 40));
@@ -2148,9 +2202,13 @@ mod tests {
         assert_eq!((one.entries.len(), one.next), (1, 1));
         assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST - SMALL);
 
-        // As many breaches as cut a peer off: the last says so.
-        assert!(!over(at.pull(1, 1, &proved, mark, after)).cut_off);
-        assert!(over(at.pull(1, 1, &proved, mark, after)).cut_off);
+        // Asked for many more times than cut a peer off, it is refused
+        // each time, and never a breach.
+        for _ in 0..3 * BAN_THRESHOLD {
+            not_now(at.pull(1, 1, &proved, mark, after));
+        }
+        assert_eq!(breaches(&at, 1), (0, 0));
+        assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST - SMALL);
 
         // Another connection, at another address, has an allowance of its
         // own.
@@ -2178,7 +2236,7 @@ mod tests {
         let one = page(at.pull(1, 1, &proved, relay::NO_MARK, 0));
         assert_eq!(one.entries.len(), 1);
         assert_eq!(at.fetch_room(1), 2000 - SMALL);
-        assert!(!over(at.pull(1, 1, &proved, one.mark, one.next)).cut_off);
+        not_now(at.pull(1, 1, &proved, one.mark, one.next));
         // And what was handed counts where the older kind looks: it is
         // one count.
         assert_eq!(
@@ -2197,7 +2255,7 @@ mod tests {
         };
         assert_eq!(MAX_CONNECTIONS_PER_IP, 5);
         for n in 10..15 {
-            lock(&at.rates).handed(&peer(n), home, MINUTE).unwrap();
+            assert!(lock(&at.rates).handed(&peer(n), home, MINUTE));
         }
         // A sixth key at that address has a connection's allowance of its
         // own, and the address has none left: nothing is handed.
@@ -2215,10 +2273,19 @@ mod tests {
                 },
             )
         };
-        assert!(!over(pull(&at_home(16), 1)).cut_off);
-        assert!(!over(pull(&at_home(16), 2)).cut_off);
-        // The third breach of the address cuts off whoever makes it.
-        assert!(over(pull(&at_home(17), 1)).cut_off);
+        not_now(pull(&at_home(16), 1));
+        not_now(pull(&at_home(16), 2));
+        // However often, and under whatever key: refused, and no breach
+        // of the address.
+        for n in 17..17 + 2 * BAN_THRESHOLD as u8 {
+            not_now(pull(&at_home(n), 1));
+        }
+        assert_eq!(
+            lock(&at.rates)
+                .breaches_of_address(home)
+                .map(|limiter| limiter.breach_count),
+            Some(0)
+        );
         // Another address is handed the same channel.
         assert_eq!(
             page(at.pull(3, 1, &proved, relay::NO_MARK, 0))
