@@ -3663,6 +3663,16 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
         asks_for_hand_over(&new, "relay", &typed_before).await,
         Ok(PairRead::NotNow)
     );
+    // And another key than the one it keeps, though it is said to have
+    // been typed at that very time.
+    let another = TypedKey {
+        key: Device::new("tablet").key(),
+        ..typed.clone()
+    };
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &another).await,
+        Ok(PairRead::NotNow)
+    );
     assert!(relay.requests().is_empty());
 
     // A key it keeps: the proof, of the pair channel and of no other.

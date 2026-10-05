@@ -188,8 +188,18 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
             "the command did not say {says:?}:\n{said}"
         );
     }
-    // The words are shown once: what was typed back is not shown.
+    // The words are shown once: what was typed back is not shown. And
+    // they are shown on the terminal's other screen, which is put away
+    // once they are written down.
     assert_eq!(said.matches(&words).count(), 1, "{said}");
+    let shown_at = said.find(&words).unwrap();
+    let (other_screen, put_away) = (
+        said.find("\u{1b}[?1049h").expect("the other screen"),
+        said.find("\u{1b}[?1049l")
+            .expect("the other screen is put away"),
+    );
+    assert!(other_screen < shown_at && shown_at < put_away, "{said}");
+    assert!(put_away < said.find("Type the twelve words back").unwrap());
     assert_eq!(words.split(' ').count(), 12);
 
     // It follows the phrase, alone, and has applied change 1.
@@ -255,6 +265,13 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
         cordelia_crypto::fingerprint::shown(&key)
     };
 
+    // Without its yes nothing is added.
+    let mut at = laptop.at_terminal(&["add-device", &desktop_key, "--name", "desktop"]);
+    at.says("Type yes to go on").types("");
+    assert!(at.done().contains("That was not a yes. Nothing was done."));
+    assert!(look(&laptop)["added"].as_array().unwrap().is_empty());
+    assert!(notices(&laptop).is_empty());
+
     // `add-device`: what it hands over, the words of the key beside the
     // label, its yes, and what to run on the other device.
     let mut at = laptop.at_terminal(&["add-device", &desktop_key, "--name", "desktop"]);
@@ -281,6 +298,10 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
          is in those folders will be sent to them.",
         words_of(&laptop_key)
     ));
+    at.says("Type yes to go on").types("n");
+    assert!(at.done().contains("That was not a yes. Nothing was done."));
+    assert!(look(&desktop)["accepting"].as_array().unwrap().is_empty());
+    let mut at = desktop.at_terminal(&["accept", &laptop_key]);
     at.says("Type yes to go on").types("yes");
     let accepted = at.done();
     println!("{accepted}");
@@ -404,9 +425,44 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     assert_eq!(holds(&laptop), before);
     assert_eq!(key_of(&laptop), key_before);
     assert_eq!(text(&before, "state"), "no_phrase");
+    // It refuses before it asks or does anything: on a device whose
+    // node is not running, each says that it has no terminal, and not
+    // that it could not reach the node. It never asked it.
+    let idle = node("idle", "personal", None);
+    for args in commands {
+        let out = idle.command(args);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "cordelia {args:?}");
+        assert!(
+            said.contains("it asks at a terminal: its input is not one. Nothing was done."),
+            "cordelia {args:?}: {said}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "cordelia {args:?} said something first"
+        );
+    }
     // What only reads asks nothing, and is not refused.
     laptop.cli(&["devices"]);
     laptop.cli(&["status"]);
+    // The commands are in the help, and those of the older kind of
+    // device, which go on working for now, are not.
+    let help = laptop.cli(&["--help"]);
+    for command in [
+        "phrase",
+        "add-device",
+        "accept",
+        "remove-device",
+        "renew",
+        "settle",
+    ] {
+        assert!(
+            help.contains(&format!("\n  {command} ")),
+            "{command}: {help}"
+        );
+    }
+    assert!(!help.contains("old-"), "{help}");
+    assert!(laptop.cli(&["old-devices"]).contains("this device"));
 
     // On a device that follows no phrase, nothing can be added: the
     // refusal says the way on.
@@ -719,6 +775,23 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         }
         at
     };
+    // Without its yes nothing is made, and the phrase is not asked for.
+    let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("no");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert!(
+        !said.contains("The recovery phrase, twelve words"),
+        "{said}"
+    );
+    assert_eq!(look(&laptop)["change"], 1);
+
     let said = removes(&[other_phrase]).refused();
     assert!(
         said.contains(
@@ -829,6 +902,16 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     );
     let said = desktop.at_terminal(&["renew"]).refused();
     assert!(said.contains("this device was removed"), "{said}");
+    // It makes no phrase of its own: no words are shown.
+    let said = desktop
+        .at_terminal(&["phrase", "--name", "desktop"])
+        .refused();
+    assert!(
+        said.contains("A device that has stopped makes no phrase of its own"),
+        "{said}"
+    );
+    assert!(!said.contains("The recovery phrase, shown once:"), "{said}");
+    assert_eq!(text(&look(&desktop), "state"), "removed");
     // The route keeps no key for it either, whoever asks.
     let (status, said) = asks(
         &desktop,
@@ -994,6 +1077,15 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         (text(&seen, "state"), &seen["change"]),
         ("applied", &json!(2))
     );
+    // It is told that it was added, and nothing of itself as a key
+    // that a change left out.
+    assert_eq!(
+        notices(&tablet),
+        [format!(
+            "this device was added from laptop ({})",
+            words_of(&laptop_key)
+        )]
+    );
 
     // The key is still shown as not in the last change until a person
     // clears it there: and the addition beside it.
@@ -1007,6 +1099,35 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     at.done();
     assert!(notices(&laptop).is_empty());
     assert!(!laptop.cli(&["devices"]).contains("Not in the last change"));
+
+    // At the next change the tablet, added since, is asked about, and
+    // the person says that it is removed: it is among the removed keys
+    // of the change, which the lists show before the yes, and it stops.
+    let mut at = laptop.at_terminal(&["renew"]);
+    at.says(&format!(
+        "tablet ({}), added since the last change",
+        words_of(&tablet_key)
+    ));
+    at.says("Type `stays` or `removed` [Enter: stays]")
+        .types("removed");
+    at.says("The change that the recovery phrase will sign (change 3):");
+    at.says("devices (2):");
+    at.says("removed keys (1):");
+    at.says(&format!(
+        "({}), known here as tablet",
+        words_of(&tablet_key)
+    ));
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 3).");
+    at.done();
+    wait_for("the tablet learns that it was removed", &all, 120, || {
+        (text(&look(&tablet), "state") == "removed").then_some(())
+    });
+    applies(&desktop, 3, &all);
+    assert_eq!(look(&laptop)["removed"][0]["key"], tablet_key.as_str());
 }
 
 /// A statement that arrives between the prompt and the phrase: nothing
@@ -1049,7 +1170,15 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
         .types("yes");
     at.says("The recovery phrase, twelve words").types(&words);
     at.says("The change is made (change 3).");
-    at.done();
+    let said = at.done();
+    // What is typed is shown again once the phrase has been read: each
+    // of the two yeses is on the terminal, and the phrase never is.
+    assert_eq!(
+        said.matches("anything else to stop: yes").count(),
+        2,
+        "{said}"
+    );
+    assert!(!said.contains(&words), "{said}");
     assert_eq!(look(&laptop)["change"], 3);
     applies(&desktop, 3, &all);
     // One change was made by each command, and no two apart.
@@ -1241,11 +1370,31 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     tablet.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
     let sync_before = tablet.post("/api/v1/sync/status", json!({}));
     assert_eq!(sync_before["enabled"], true);
+    // Without its yes nothing is done: it has the key it had, and
+    // follows the phrase it followed.
+    let mut at = tablet.at_terminal(&["init", "--new-key"]);
+    at.says("Type yes to go on").types("");
+    assert!(at.done().contains("That was not a yes. Nothing was done."));
+    assert_eq!(key_of(&tablet), tablet_key);
+    assert_eq!(text(&look(&tablet), "among"), "several");
+    assert!(
+        notices(&laptop)
+            .iter()
+            .all(|says| !says.starts_with("tablet"))
+    );
+
     let mut at = tablet.at_terminal(&["init", "--new-key"]);
     at.says("This gives this device a new key. It leaves the 2 devices it is with");
     at.says("It keeps its memory folders and their mappings");
     at.says("Type yes to go on").types("yes");
     let said = at.done();
+    // It waited for its relay to be sent what it leaves behind, before
+    // the key that could send it was gone.
+    assert!(
+        said.contains("Telling the relays what this device leaves behind..."),
+        "{said}"
+    );
+    assert!(!said.contains("Could not send it"), "{said}");
     assert!(said.contains("This device has a new key:"), "{said}");
     let new_key = key_of(&tablet);
     assert_ne!(new_key, tablet_key);
@@ -1267,6 +1416,20 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     assert_eq!(text(&seen, "state"), "no_phrase");
     assert_eq!(text(&seen, "this_device"), new_key);
     assert!(tablet.cli(&["status"]).contains("no recovery phrase yet"));
+    // Nothing that it held under the phrase is in its store: no entry
+    // of any channel, its own word that it left among them, which is
+    // not sent in the name of a key that the device has no more.
+    {
+        let db = rusqlite::Connection::open_with_flags(
+            tablet.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let held: i64 = db
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(held, 0);
+    }
     let sync_after = tablet.post("/api/v1/sync/status", json!({}));
     assert_eq!(sync_after["enabled"], true);
     assert_eq!(sync_after["dir"], sync_before["dir"]);
@@ -1334,6 +1497,10 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         let mut at = renews(device, &[], &words);
         at.says("The change is made (change 3).");
         at.says("keep this machine on:");
+        // It stays, and does not say that the machine may be closed:
+        // no relay holds the change.
+        let said = at.hears_for(std::time::Duration::from_secs(3));
+        assert!(!said.contains("this machine may be closed."), "{said}");
         drop(at);
         assert_eq!(look(device)["change"], 3);
     }

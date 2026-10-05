@@ -665,6 +665,16 @@ impl AtTerminal {
         }
     }
 
+    /// Go on reading what the command says for `long`, and give back
+    /// everything it has said so far.
+    pub fn hears_for(&mut self, long: Duration) -> &str {
+        let until = Instant::now() + long;
+        while Instant::now() < until {
+            self.hears(Duration::from_millis(100));
+        }
+        &self.said
+    }
+
     /// Type `line` and press Enter, as a person does.
     pub fn types(&mut self, line: &str) -> &mut Self {
         use std::io::Write;
