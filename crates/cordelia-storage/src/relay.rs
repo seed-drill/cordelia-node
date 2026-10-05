@@ -7,6 +7,20 @@
 //! kind: the two kinds are counted apart, each against a cap of its own,
 //! and neither is refused or dropped to make room for the other (§2.5).
 //!
+//! ## Whose database
+//!
+//! **These rules are for a database that no device writes.** A relay
+//! counts every entry of a channel in `entries` as its own to hold, and
+//! drops them all with the channel. A device's own code writes the same
+//! table, for the channels of its person, and what it holds there is not
+//! a relay's to count or to drop.
+//!
+//! So each function here that writes or drops ([`take`], [`show`],
+//! [`make_room`], [`sweep_unused`], [`listed_relay_says`]) refuses, with
+//! [`RelayError::DeviceFollowsAPhrase`], a database in which a device
+//! follows a phrase ([`crate::person::person`]), and changes nothing in
+//! it.
+//!
 //! ## What a relay takes
 //!
 //! Only an entry that passed the check ([`check`], which reads it from its
@@ -88,6 +102,28 @@ const PAGE_READ: usize = 16;
 
 fn storage(e: rusqlite::Error) -> CordeliaError {
     CordeliaError::Storage(e.to_string())
+}
+
+/// Why a function here that writes or drops did nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayError {
+    /// A device follows a phrase in this database: it is a device's, and
+    /// what it holds is not a relay's to count or to drop.
+    #[error("a device follows a phrase in this database: a relay's rules are not for it")]
+    DeviceFollowsAPhrase,
+
+    /// The database could not be read or written, and nothing was changed.
+    #[error(transparent)]
+    Storage(#[from] CordeliaError),
+}
+
+/// Refuse a database in which a device follows a phrase (see the module's
+/// documentation).
+fn no_device_writes(conn: &Connection) -> Result<(), RelayError> {
+    if crate::person::person(conn)?.is_some() {
+        return Err(RelayError::DeviceFollowsAPhrase);
+    }
+    Ok(())
 }
 
 /// A relay's room for channels from their secrets (decision 2026-10-04
@@ -261,16 +297,20 @@ pub fn check(bytes: &[u8]) -> Result<CheckedEntry, Refused> {
 /// ([`Taken::AlreadyHeld`], [`Taken::OlderThanHeld`]), whatever room there
 /// is. The entry is stored and the relay's counts are changed as one: all
 /// of it happens, or none.
+///
+/// Refused, with nothing changed, on a database in which a device follows
+/// a phrase.
 pub fn take(
     conn: &Connection,
     room: &mut Room,
     entry: &CheckedEntry,
     asker: &Asker,
     now: i64,
-) -> Result<Taken, CordeliaError> {
+) -> Result<Taken, RelayError> {
     in_one(conn, || {
+        no_device_writes(conn)?;
         said_by(conn, asker, &entry.channel)?;
-        taken(conn, room, entry, asker, now)
+        Ok(taken(conn, room, entry, asker, now)?)
     })
 }
 
@@ -386,8 +426,14 @@ pub fn used_bytes(conn: &Connection) -> Result<u64, CordeliaError> {
 ///
 /// So what was there first is never pushed out by what came later
 /// (decision 2026-10-04 §2.5).
-pub fn make_room(conn: &Connection, max_bytes: u64) -> Result<Vec<[u8; 32]>, CordeliaError> {
-    in_one(conn, || dropped_for_room(conn, max_bytes))
+///
+/// Refused, with nothing dropped, on a database in which a device follows
+/// a phrase.
+pub fn make_room(conn: &Connection, max_bytes: u64) -> Result<Vec<[u8; 32]>, RelayError> {
+    in_one(conn, || {
+        no_device_writes(conn)?;
+        Ok(dropped_for_room(conn, max_bytes)?)
+    })
 }
 
 /// [`make_room`], inside what the caller began.
@@ -459,7 +505,22 @@ pub fn held_channel(
 /// The caller says who the operator lists: this is called for no other.
 /// Nothing is kept for a channel that this relay does not hold, and a
 /// time that is not after 0 is no time.
+///
+/// Refused, with nothing changed, on a database in which a device follows
+/// a phrase.
 pub fn listed_relay_says(
+    conn: &Connection,
+    channel: &[u8; 32],
+    held_since: i64,
+) -> Result<bool, RelayError> {
+    in_one(conn, || {
+        no_device_writes(conn)?;
+        Ok(kept_the_earlier(conn, channel, held_since)?)
+    })
+}
+
+/// [`listed_relay_says`], inside what the caller began.
+fn kept_the_earlier(
     conn: &Connection,
     channel: &[u8; 32],
     held_since: i64,
@@ -482,7 +543,7 @@ fn said_by(conn: &Connection, asker: &Asker, channel: &[u8; 32]) -> Result<(), C
         held_since: Some(said),
     } = asker
     {
-        listed_relay_says(conn, channel, *said)?;
+        kept_the_earlier(conn, channel, *said)?;
     }
     Ok(())
 }
@@ -495,42 +556,57 @@ fn said_by(conn: &Connection, asker: &Asker, channel: &[u8; 32]) -> Result<(), C
 ///
 /// What comes back with [`Shown::Another`] counts against the asker's
 /// limits as anything fetched does: its cost is given with it.
+///
+/// Refused, with nothing changed, on a database in which a device follows
+/// a phrase.
 pub fn show(
     conn: &Connection,
     room: &mut Room,
     entry: &CheckedEntry,
     asker: &Asker,
     now: i64,
-) -> Result<Shown, CordeliaError> {
+) -> Result<Shown, RelayError> {
     in_one(conn, || {
-        said_by(conn, asker, &entry.channel)?;
-        match entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)? {
-            Some(held) if held.entry.rev >= entry.rev => {
-                if held.entry.id() == entry.id() {
-                    used(conn, &entry.channel, now)?;
-                    return Ok(Shown::Held);
-                }
-                let cost = entry_cost(held.entry.content.len());
-                let other = held.entry.check().map_err(|e| {
-                    CordeliaError::Storage(format!("a stored entry does not pass the check: {e}"))
-                })?;
-                Ok(Shown::Another {
-                    entry: Box::new(other),
-                    cost,
-                })
-            }
-            _ => match taken(conn, room, entry, asker, now)? {
-                Taken::Stored => {
-                    used(conn, &entry.channel, now)?;
-                    Ok(Shown::Taken)
-                }
-                Taken::Refused(why) => Ok(Shown::Refused(why)),
-                Taken::AlreadyHeld | Taken::OlderThanHeld => Err(CordeliaError::Storage(
-                    "an entry newer than the one held was not stored".into(),
-                )),
-            },
-        }
+        no_device_writes(conn)?;
+        Ok(shown(conn, room, entry, asker, now)?)
     })
+}
+
+/// [`show`], inside what the caller began.
+fn shown(
+    conn: &Connection,
+    room: &mut Room,
+    entry: &CheckedEntry,
+    asker: &Asker,
+    now: i64,
+) -> Result<Shown, CordeliaError> {
+    said_by(conn, asker, &entry.channel)?;
+    match entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)? {
+        Some(held) if held.entry.rev >= entry.rev => {
+            if held.entry.id() == entry.id() {
+                used(conn, &entry.channel, now)?;
+                return Ok(Shown::Held);
+            }
+            let cost = entry_cost(held.entry.content.len());
+            let other = held.entry.check().map_err(|e| {
+                CordeliaError::Storage(format!("a stored entry does not pass the check: {e}"))
+            })?;
+            Ok(Shown::Another {
+                entry: Box::new(other),
+                cost,
+            })
+        }
+        _ => match taken(conn, room, entry, asker, now)? {
+            Taken::Stored => {
+                used(conn, &entry.channel, now)?;
+                Ok(Shown::Taken)
+            }
+            Taken::Refused(why) => Ok(Shown::Refused(why)),
+            Taken::AlreadyHeld | Taken::OlderThanHeld => Err(CordeliaError::Storage(
+                "an entry newer than the one held was not stored".into(),
+            )),
+        },
+    }
 }
 
 /// Whether the other end of the connection whose TLS session exports
@@ -631,25 +707,34 @@ fn used(conn: &Connection, channel: &[u8; 32], now: i64) -> Result<bool, Cordeli
 /// 2026-10-04 §2.5): whose key no connection has proved, and of which
 /// nobody has shown an entry that the relay holds, since 90 days before
 /// `now`, the relay's time in seconds. Returns the channels dropped.
-pub fn sweep_unused(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, CordeliaError> {
+///
+/// Refused, with nothing dropped, on a database in which a device follows
+/// a phrase.
+pub fn sweep_unused(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, RelayError> {
     in_one(conn, || {
-        let unused: Vec<[u8; 32]> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT channel_id FROM relay_channels WHERE used_at + ?1 <= ?2
-                     ORDER BY used_at, rowid",
-                )
-                .map_err(storage)?;
-            let rows = stmt
-                .query_map(params![UNUSED_SECS, now], |row| row.get(0))
-                .map_err(storage)?;
-            rows.collect::<Result<_, _>>().map_err(storage)?
-        };
-        for channel in &unused {
-            drop_channel(conn, channel)?;
-        }
-        Ok(unused)
+        no_device_writes(conn)?;
+        Ok(swept(conn, now)?)
     })
+}
+
+/// [`sweep_unused`], inside what the caller began.
+fn swept(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let unused: Vec<[u8; 32]> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT channel_id FROM relay_channels WHERE used_at + ?1 <= ?2
+                 ORDER BY used_at, rowid",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![UNUSED_SECS, now], |row| row.get(0))
+            .map_err(storage)?;
+        rows.collect::<Result<_, _>>().map_err(storage)?
+    };
+    for channel in &unused {
+        drop_channel(conn, channel)?;
+    }
+    Ok(unused)
 }
 
 // ── As one ───────────────────────────────────────────────────────────
@@ -667,8 +752,9 @@ fn to_sql(bytes: u64) -> i64 {
 /// one. Where the work fails, or unwinds, what it wrote is undone.
 fn in_one<T>(
     conn: &Connection,
-    work: impl FnOnce() -> Result<T, CordeliaError>,
-) -> Result<T, CordeliaError> {
+    work: impl FnOnce() -> Result<T, RelayError>,
+) -> Result<T, RelayError> {
+    let storage = |e: rusqlite::Error| RelayError::Storage(storage(e));
     let (begin, commit, undo) = if conn.is_autocommit() {
         ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
     } else {
@@ -1245,6 +1331,102 @@ mod tests {
             Taken::Stored
         );
         assert_eq!(counted(&conn), SMALL);
+    }
+
+    /// A relay's rules are for a database that no device writes. On one
+    /// in which a device follows a phrase, taking and showing refuse and
+    /// store nothing, and nothing is dropped to make room or as unused.
+    #[test]
+    fn test_a_database_in_which_a_device_follows_a_phrase_is_refused() {
+        use crate::person::{Following, Person, State, put_person};
+
+        let (conn, mut room) = relay();
+        // What a relay took here before, and what a device's own code
+        // wrote in the same table.
+        take(&conn, &mut room, &small(1, 1, 5), &from(1), NOW).unwrap();
+        take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 10).unwrap();
+        entries::store(&conn, &small(3, 1, 5), NOW + 20).unwrap();
+        // A device follows a phrase in this database.
+        let follows = Person {
+            state: State::Applied,
+            following: Following {
+                phrase_key: [1; 32],
+                statement_key: [2; 32],
+                phrase_channel: [3; 32],
+            },
+            statement: vec![4, 5, 6],
+        };
+        put_person(&conn, &follows).unwrap();
+
+        let all = |conn: &Connection| {
+            let rows: Vec<([u8; 32], i64, i64, i64)> = conn
+                .prepare(
+                    "SELECT channel_id, held_since, used_at, bytes FROM relay_channels
+                     ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (ids(conn, 1), ids(conn, 2), ids(conn, 3), ids(conn, 4), rows)
+        };
+        let before = all(&conn);
+        assert_eq!((before.0.len(), before.1.len(), before.2.len()), (1, 1, 1));
+        assert_eq!(before.4.len(), 2);
+        let refused = |done: Result<(), RelayError>| {
+            assert!(
+                matches!(done, Err(RelayError::DeviceFollowsAPhrase)),
+                "{done:?}"
+            );
+        };
+
+        // Taking, and showing: a new channel, a newer revision in a
+        // channel held, an entry already held, and one in the channel
+        // that the device wrote. Each is refused, and nothing is stored.
+        for entry in [
+            small(4, 1, 5),
+            small(1, 1, 6),
+            small(1, 1, 5),
+            small(3, 1, 6),
+        ] {
+            for asker in [from(1), LISTED, listed_since(NOW - DAY)] {
+                refused(take(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
+                refused(show(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
+            }
+        }
+        assert_eq!(all(&conn), before);
+        // Nor is an address counted for what was refused.
+        assert_eq!(room.new_channels[&IpAddr::from([192, 0, 2, 1])].len(), 2);
+
+        // Making room with no room at all, and sweeping long after
+        // anything was used: nothing is dropped.
+        refused(make_room(&conn, 0).map(|_| ()));
+        refused(sweep_unused(&conn, NOW + 365 * DAY).map(|_| ()));
+        // Nor is what a listed relay says kept.
+        refused(listed_relay_says(&conn, &channel(1), NOW - DAY).map(|_| ()));
+        assert_eq!(all(&conn), before);
+        assert!(conn.is_autocommit(), "no transaction is left open");
+
+        // The control: with no device following a phrase there, each does
+        // what it does.
+        conn.execute("DELETE FROM person", []).unwrap();
+        assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap());
+        assert_eq!(
+            take(&conn, &mut room, &small(4, 1, 5), &from(1), NOW + 60).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(
+            show(&conn, &mut room, &small(1, 1, 6), &from(1), NOW + 60).unwrap(),
+            Shown::Taken
+        );
+        assert_eq!(
+            sweep_unused(&conn, NOW + 365 * DAY).unwrap(),
+            [channel(2), channel(1), channel(4)]
+        );
+        assert!(make_room(&conn, 0).unwrap().is_empty());
     }
 
     // ── Its room ─────────────────────────────────────────────────────
