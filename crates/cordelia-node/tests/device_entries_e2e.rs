@@ -1384,6 +1384,77 @@ async fn a_device_that_could_not_apply_a_change_has_no_leave_anywhere_until_it_h
     assert!(holds_at(&lacks, &change.channel, &change.id()));
 }
 
+/// A change that could not be applied is kept, whatever becomes of the
+/// connection it came on. With that connection closed, the device still
+/// sends nothing and takes nothing at its other relay, which lacks the
+/// change, and still says why. At each pass it tries the change again:
+/// once its store is whole it applies it, with no relay to answer it
+/// again, and shows it to the relay that lacked it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_that_could_not_be_applied_is_kept_when_its_connection_closes() {
+    let (lacks, has) = (relay_started("lacks", None), relay_started("has", None));
+    let (mut maker, mut behind) = (Device::new("desktop"), Device::new("laptop"));
+    maker.makes_the_phrase(&phrase());
+    maker.adds(&behind);
+    for device in [&mut maker, &mut behind] {
+        device.holds("notes");
+        device.connects("lacks", &lacks).await;
+        device.connects("has", &has).await;
+    }
+    all_pass(&[&maker, &behind], 3).await;
+    let old_notes = maker.channel("notes");
+    maker.disconnects("lacks");
+    let change = maker.changes(&phrase(), &[&maker, &behind], &[]);
+    maker.passes().await;
+    let waiting = behind.writes("notes", "a.md", "written before it heard of the change");
+
+    // Its store fails where it applies: it is answered with the change,
+    // by the relay that has it, and cannot apply it.
+    behind
+        .db()
+        .execute_batch("ALTER TABLE person_carried RENAME TO elsewhere")
+        .unwrap();
+    behind.passes().await;
+    assert_ne!(behind.latest().id(), change.id());
+    assert_eq!(behind.has_leave("lacks"), Err(NoLeave::NotApplied));
+
+    // The connection that the change came on closes. Nothing is taken
+    // back by that: there is still no leave at the relay that lacks the
+    // change, pass after pass, and nothing goes to it.
+    behind.disconnects("has");
+    let before = behind.counts("lacks");
+    for _ in 0..2 {
+        behind.passes().await;
+        behind.sends().await;
+    }
+    assert_eq!(behind.has_leave("lacks"), Err(NoLeave::NotApplied));
+    let after = behind.counts("lacks");
+    assert_eq!(
+        (after.proofs, after.pages, after.pushes),
+        (before.proofs, before.pages, before.pushes)
+    );
+    assert!(!holds_at(&lacks, &old_notes, &waiting.id()));
+    assert!(matches!(
+        behind.status().cannot_go_on,
+        Some(CannotGoOn::NotApplied { relay, .. }) if relay == "has"
+    ));
+
+    // Its store is whole again. The next pass tries the change that it
+    // kept, and applies it: no relay it reaches holds that change. Then
+    // it shows it to the relay that lacked it, and goes on.
+    behind
+        .db()
+        .execute_batch("ALTER TABLE elsewhere RENAME TO person_carried")
+        .unwrap();
+    behind.passes().await;
+    assert_eq!(behind.latest().id(), change.id());
+    assert_eq!(behind.status().cannot_go_on, None);
+    assert!(holds_at(&lacks, &change.channel, &change.id()));
+    behind.passes().await;
+    assert_eq!(behind.has_leave("lacks"), Ok(()));
+    assert!(!holds_at(&lacks, &old_notes, &waiting.id()));
+}
+
 /// A device that follows no phrase opens no stream, and says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_follows_no_phrase_opens_no_stream() {
@@ -2057,6 +2128,63 @@ async fn with_a_relay_out_of_reach_a_device_waits_half_a_minute_and_then_goes_on
     let next = device.writes("notes", "b.md", "written once it was awake");
     device.sends().await;
     assert!(holds_at(&relay, &notes, &next.id()));
+}
+
+/// A machine that slept wakes. Its connections still look open, and its
+/// leave is measured by a clock that stood still while it slept. Where
+/// the time of day has run ahead of that clock by more than a leave
+/// lasts since the pass before, every leave is dropped, and the device
+/// asks every relay first, as when it starts: it neither takes nor sends
+/// until each has answered, or half a minute has gone by. A clock that
+/// simply ran on, however far, wakes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_that_slept_asks_every_relay_first_when_it_wakes() {
+    let relay = relay_started("reached", None);
+    let unreached = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects("reached", &relay).await;
+    device
+        .connects_to("unreached", unreached.port, unreached.key)
+        .await;
+    device.passes().await;
+    let notes = device.channel("notes");
+    for name in ["reached", "unreached"] {
+        assert_eq!(device.has_leave(name), Ok(()));
+    }
+
+    // Time goes by with the machine awake: both clocks run on together.
+    // The leave runs out, and the next pass that sends shows and sends.
+    device.clock.run_ahead(Duration::from_secs(3600));
+    let first = device.writes("notes", "a.md", "written while it was awake");
+    device.sends().await;
+    assert!(holds_at(&relay, &notes, &first.id()));
+    assert!(device.at("unreached").heard_since_woke);
+
+    // The lid is closed for an hour. One relay answers nothing when it
+    // opens: its connection still looks open.
+    unreached.says(Say::Reset, Say::Reset);
+    device.clock.slept(Duration::from_secs(3600));
+    let waiting = device.writes("notes", "b.md", "written before the lid was closed");
+    let before = device.counts("reached");
+    device.sends().await;
+    device.passes().await;
+    device.sends().await;
+    // It woke: the relay that answers was asked, and nothing was sent to
+    // it, since the other has not answered.
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    assert!(device.at("reached").heard_since_woke);
+    assert!(!device.at("unreached").heard_since_woke);
+    let asked = device.counts("reached");
+    assert!(asked.whole_shows + asked.short_shows > before.whole_shows + before.short_shows);
+    assert_eq!(asked.pushes, before.pushes);
+    assert!(!holds_at(&relay, &notes, &waiting.id()));
+    // Half a minute on, it goes on with the relay that answers.
+    device.clock.run_ahead(Duration::from_secs(WAKE_WAIT_SECS));
+    device.sends().await;
+    assert!(holds_at(&relay, &notes, &waiting.id()));
+    assert_eq!(device.has_leave("reached"), Ok(()));
 }
 
 // ── Pulling ──────────────────────────────────────────────────────────

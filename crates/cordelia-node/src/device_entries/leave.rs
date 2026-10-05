@@ -21,7 +21,15 @@
 //!   anywhere until each relay it is set up with has answered a show, or
 //!   WAKE_WAIT_SECS have gone by.
 //! - **A device that was answered with a change and could not apply it**
-//!   has no leave anywhere until it has.
+//!   has no leave anywhere until it has: whatever becomes of the
+//!   connection that the change came on.
+//! - **A machine that slept wakes.** Leave is measured on a clock that
+//!   does not run while a machine sleeps, and the connections that it
+//!   had still look open when it opens its lid. So at each pass the time
+//!   of day is set beside that clock: where the time of day has run
+//!   ahead of it by more than a leave lasts since the pass before, every
+//!   leave is dropped, and the device wakes as one that reaches a relay
+//!   after having reached none.
 //!
 //! With leave, a device still asks only so much of a relay in a minute
 //! (OWN_ENTRY_REQUESTS_PER_MINUTE on one connection): a relay counts the
@@ -86,6 +94,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Clone, Default)]
 pub struct Clock {
     ahead_ms: Arc<AtomicU64>,
+    /// How far the time of day is ahead besides: time that went by while
+    /// the clock that waits are measured by stood still.
+    slept_ms: Arc<AtomicU64>,
 }
 
 impl Clock {
@@ -101,9 +112,18 @@ impl Clock {
 
     /// Now, in seconds, in UTC.
     pub fn unix(&self) -> i64 {
-        let ahead = self.ahead_ms.load(Ordering::Relaxed) / 1000;
+        self.wall_ms() / 1000
+    }
+
+    /// The time of day now, in milliseconds, in UTC: the clock that goes
+    /// on while a machine sleeps, and that can be set.
+    pub fn wall_ms(&self) -> i64 {
+        let ahead = self
+            .ahead_ms
+            .load(Ordering::Relaxed)
+            .saturating_add(self.slept_ms.load(Ordering::Relaxed));
         chrono::Utc::now()
-            .timestamp()
+            .timestamp_millis()
             .saturating_add(i64::try_from(ahead).unwrap_or(i64::MAX))
     }
 
@@ -112,6 +132,27 @@ impl Clock {
         let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         self.ahead_ms.fetch_add(by, Ordering::Relaxed);
     }
+
+    /// The machine slept for `by`: the time of day runs ahead by that,
+    /// and the clock that waits are measured by does not. For tests.
+    pub fn slept(&self, by: Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.slept_ms.fetch_add(by, Ordering::Relaxed);
+    }
+}
+
+/// Whether a machine slept between two readings of its two clocks: the
+/// time of day ran ahead of the clock that cannot go back by more than a
+/// leave lasts. Each reading is that clock, and the time of day in
+/// milliseconds.
+///
+/// A time of day that was set back says nothing, and nor does one that
+/// was set ahead by less than a leave: a leave that a sleep of that
+/// length leaves standing is checked again by the show that follows.
+fn slept_between(before: (Instant, i64), now: (Instant, i64)) -> bool {
+    let ran = now.0.saturating_duration_since(before.0);
+    let by_the_day = u64::try_from(now.1.saturating_sub(before.1)).unwrap_or(0);
+    Duration::from_millis(by_the_day).saturating_sub(ran) > LEAVE
 }
 
 /// What tells one connection from every other that this node has or had:
@@ -283,9 +324,11 @@ struct Inner {
     woke: Option<Woke>,
     /// The relays that the device is set up with, by name.
     set_up_with: Vec<String>,
-    /// The connections on which the device was answered with a change
-    /// that it could not apply.
-    not_applied: HashSet<LinkId>,
+    /// Whether the device was answered with a change that it could not
+    /// apply, and has not applied since.
+    not_applied: bool,
+    /// The two clocks as they were read at the pass before.
+    last: Option<(Instant, i64)>,
     /// What was asked on each connection in the last minute, on the
     /// streams of a channel.
     asked: HashMap<LinkId, RateCounter>,
@@ -344,16 +387,28 @@ impl Leave {
     ///
     /// A node that reaches a relay after having reached none wakes: there
     /// is no leave anywhere until each relay it is set up with has
-    /// answered a show, or the wait has gone by. What is kept of a
-    /// connection that is gone is forgotten.
+    /// answered a show, or the wait has gone by. So does one whose
+    /// machine slept since the pass before ([`slept_between`]): every
+    /// leave it was given is dropped. What is kept of a connection that
+    /// is gone is forgotten.
+    ///
+    /// It is called at each pass, and the two clocks are read here.
     pub fn reaches(&self, set_up_with: &[String], reached: &[&Link]) {
         let now = self.clock.now();
+        let read = (now, self.clock.wall_ms());
         let mut inner = lock(&self.inner);
         inner.set_up_with = set_up_with.to_vec();
         let open: HashSet<LinkId> = reached.iter().map(|link| link.id()).collect();
         inner.given.retain(|link, _| open.contains(link));
-        inner.not_applied.retain(|link| open.contains(link));
         inner.asked.retain(|link, _| open.contains(link));
+        // The lid was closed, and is open: the connections still look
+        // open, and a leave still looks young, by a clock that stood
+        // still. Every relay is asked first, as when the node starts.
+        if inner.last.is_some_and(|before| slept_between(before, read)) {
+            inner.given.clear();
+            inner.woke = None;
+        }
+        inner.last = Some(read);
         if reached.is_empty() {
             inner.woke = None;
         } else if inner.woke.is_none() {
@@ -379,24 +434,20 @@ impl Leave {
             .is_some_and(|woke| woke.heard.contains(name))
     }
 
-    /// The device was answered on `link` with a change that it could not
-    /// apply (`false`), or has dealt with what it was answered with there
-    /// (`true`). Until it has, there is no leave anywhere: it sends
-    /// nothing and takes nothing in a channel of its own (decision
-    /// 2026-10-04 §4.2).
-    pub fn dealt_with(&self, link: &Link, done: bool) {
-        let mut inner = lock(&self.inner);
-        if done {
-            inner.not_applied.remove(&link.id());
-        } else {
-            inner.not_applied.insert(link.id());
-        }
+    /// The device was answered with a change that it could not apply
+    /// (`true`), or has applied it since (`false`). Until it has, there
+    /// is no leave anywhere: it sends nothing and takes nothing in a
+    /// channel of its own (decision 2026-10-04 §4.2). That is so on every
+    /// connection, and whatever becomes of the one that the change came
+    /// on: a connection that closes takes nothing back.
+    pub fn could_not_apply(&self, could_not: bool) {
+        lock(&self.inner).not_applied = could_not;
     }
 
     /// Whether the device was answered with a change that it has not
     /// applied.
     pub fn is_not_applied(&self) -> bool {
-        !lock(&self.inner).not_applied.is_empty()
+        lock(&self.inner).not_applied
     }
 
     /// Whether there is leave to use `link` now, and why not where there
@@ -408,7 +459,7 @@ impl Leave {
         if inner.is_waking(now) {
             return Err(NoLeave::Waking);
         }
-        if !inner.not_applied.is_empty() {
+        if inner.not_applied {
             return Err(NoLeave::NotApplied);
         }
         match at_relays::stands(conn) {
@@ -604,6 +655,61 @@ mod tests {
         copy.run_ahead(Duration::from_secs(7200));
         assert!(clock.now() >= began + Duration::from_secs(7230));
         assert!((began_unix + 7230..began_unix + 7235).contains(&clock.unix()));
+    }
+
+    /// A machine slept where the time of day ran ahead of the clock that
+    /// cannot go back by more than a leave lasts: to the millisecond. A
+    /// time of day that was set back says nothing.
+    #[test]
+    fn a_machine_slept_where_the_time_of_day_ran_ahead_by_more_than_a_leave() {
+        assert_eq!(LEAVE, Duration::from_secs(10));
+        let began = Instant::now();
+        let at = |ran_ms: u64, by_the_day_ms: i64| {
+            let before = (began, 1_800_000_000_000i64);
+            let now = (
+                began + Duration::from_millis(ran_ms),
+                1_800_000_000_000i64 + by_the_day_ms,
+            );
+            slept_between(before, now)
+        };
+        // Both clocks ran alike: two seconds, ten, an hour.
+        for ran in [0, 2_000, 10_000, 3_600_000] {
+            assert!(!at(ran, ran as i64), "{ran}");
+        }
+        // The time of day ran ahead by a leave, and by a millisecond
+        // more.
+        assert!(!at(2_000, 12_000));
+        assert!(at(2_000, 12_001));
+        assert!(at(0, 8 * 3_600_000));
+        // It was set back, or stood still.
+        assert!(!at(2_000, -3_600_000));
+        assert!(!at(60_000, 0));
+        assert!(!at(0, i64::MIN));
+        assert!(at(0, i64::MAX - 1_800_000_000_000));
+    }
+
+    /// The test clock sleeps: the time of day runs ahead, and the clock
+    /// that waits are measured by does not.
+    #[test]
+    fn a_clock_that_slept_ran_ahead_by_the_day_alone() {
+        let clock = Clock::system();
+        let (began, began_ms) = (clock.now(), clock.wall_ms());
+        clock.slept(Duration::from_secs(3600));
+        assert!(clock.now() < began + Duration::from_secs(5));
+        let after = clock.wall_ms() - began_ms;
+        assert!((3_600_000..3_605_000).contains(&after), "{after}");
+        assert!(slept_between(
+            (began, began_ms),
+            (clock.now(), clock.wall_ms())
+        ));
+        // Run ahead, both go on together.
+        let (began, began_ms) = (clock.now(), clock.wall_ms());
+        clock.run_ahead(Duration::from_secs(3600));
+        assert!(clock.now() >= began + Duration::from_secs(3600));
+        assert!(!slept_between(
+            (began, began_ms),
+            (clock.now(), clock.wall_ms())
+        ));
     }
 
     /// Each answer to a show that says the relay holds no later change

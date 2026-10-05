@@ -193,15 +193,28 @@ struct LeftFor {
     until: Instant,
 }
 
+/// A change that the device was answered with and could not apply
+/// (decision 2026-10-04 §4.2): it is kept, whatever becomes of the
+/// connection it came on, and tried again at each pass.
+struct NotApplied {
+    /// The relay that answered with it, by its name.
+    relay: String,
+    /// Why it could not be applied, as the last try said.
+    why: String,
+    /// The entry that was shown, and the one that the relay answered
+    /// with.
+    shown: CheckedEntry,
+    answer: CheckedEntry,
+}
+
 #[derive(Default)]
 struct Kept {
     links: HashMap<LinkId, OfLink>,
     relays: HashMap<String, OfRelay>,
     /// By the relay's key and the channel's ID.
     left: HashMap<([u8; 32], [u8; 32]), LeftFor>,
-    /// The relay that answered with a change which the device could not
-    /// apply, and why.
-    not_applied: Option<(String, String)>,
+    /// A change that the device was answered with and could not apply.
+    not_applied: Option<NotApplied>,
 }
 
 /// A device's side of its relays, for the channels of its own (see the
@@ -275,11 +288,9 @@ impl DeviceEntries {
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
         self.leave.reaches(&names, &links);
         self.forget_gone(&links);
-        // The connection on which a change could not be applied is gone:
-        // nothing is held up by it now.
-        if !self.leave.is_not_applied() {
-            lock(&self.kept).not_applied = None;
-        }
+        // A change that could not be applied is tried again, whichever
+        // relays are reached now.
+        self.try_again();
 
         let whole = kind == Pass::Whole;
         if whole {
@@ -397,6 +408,47 @@ impl DeviceEntries {
         }
     }
 
+    // ── A change that could not be applied ──────────────────────────
+
+    /// Try again the change that the device was answered with and could
+    /// not apply, where there is one (decision 2026-10-04 §4.2): at each
+    /// pass, whatever became of the connection it came on. Until it is
+    /// dealt with, there is no leave anywhere.
+    fn try_again(&self) {
+        let Some((shown, answer)) = lock(&self.kept)
+            .not_applied
+            .as_ref()
+            .map(|kept| (kept.shown.clone(), kept.answer.clone()))
+        else {
+            return;
+        };
+        let now = self.clock.unix();
+        let outcome = {
+            let db = lock(&self.state.db);
+            at_relays::answered(&db, &self.state.identity, &shown, &answer, now)
+        };
+        match outcome {
+            // The entry went through the one door, and the device did
+            // with it what a change entry has it do: nothing waits now.
+            Ok(done) => {
+                tracing::info!(?done, "a change that could not be applied was dealt with");
+                self.applied();
+            }
+            Err(e) => {
+                if let Some(kept) = &mut lock(&self.kept).not_applied {
+                    kept.why = e.to_string();
+                }
+            }
+        }
+    }
+
+    /// The device has no change that it was answered with and has not
+    /// applied.
+    fn applied(&self) {
+        lock(&self.kept).not_applied = None;
+        self.leave.could_not_apply(false);
+    }
+
     // ── The show ────────────────────────────────────────────────────
 
     /// Show the change entry that the device keeps on `link`, and deal
@@ -440,7 +492,6 @@ impl DeviceEntries {
             match answered.answer {
                 ShowAnswer::Held | ShowAnswer::Taken => {
                     self.holds(link, entry, true);
-                    self.dealt_with(link);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit) => {
@@ -450,7 +501,6 @@ impl DeviceEntries {
                         answered.answer == ShowAnswer::Refused(EntryRefused::OverLimit);
                     self.holds(link, entry, false);
                     self.no_room(link, over_allowance, true);
-                    self.dealt_with(link);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
@@ -515,7 +565,7 @@ impl DeviceEntries {
                     carried = applied.carried,
                     "applied a change that a relay held"
                 );
-                self.dealt_with(link);
+                self.applied();
                 true
             }
             Ok(Answered::Shown(Shown::Fork)) => {
@@ -553,11 +603,17 @@ impl DeviceEntries {
             }
             // The device's own fault, and not the entry's: it has been
             // answered with a change that it has not applied, and neither
-            // sends nor takes anywhere until it has.
+            // sends nor takes anywhere until it has. The entry is kept,
+            // and tried again at each pass.
             Err(e) => {
                 tracing::warn!(relay, error = %e, "could not apply the change that a relay answered with");
-                self.leave.dealt_with(link, false);
-                lock(&self.kept).not_applied = Some((relay.to_string(), e.to_string()));
+                self.leave.could_not_apply(true);
+                lock(&self.kept).not_applied = Some(NotApplied {
+                    relay: relay.to_string(),
+                    why: e.to_string(),
+                    shown: shown.clone(),
+                    answer: another.clone(),
+                });
                 false
             }
         }
@@ -612,19 +668,6 @@ impl DeviceEntries {
             over_allowance,
             of_the_change,
         });
-    }
-
-    /// What the device was answered with on `link` is dealt with.
-    fn dealt_with(&self, link: &Link) {
-        self.leave.dealt_with(link, true);
-        let mut kept = lock(&self.kept);
-        if kept
-            .not_applied
-            .as_ref()
-            .is_some_and(|(relay, _)| relay == link.name())
-        {
-            kept.not_applied = None;
-        }
     }
 
     // ── One relay's pass ────────────────────────────────────────────
@@ -1125,10 +1168,14 @@ impl DeviceEntries {
             Stands::Stopped(State::NotListed) => Some(CannotGoOn::NotListed),
             Stands::Stopped(State::Fork) => Some(CannotGoOn::Fork),
             Stands::Stopped(State::NotOpened) => Some(CannotGoOn::NotOpened),
-            Stands::Stopped(State::Applied) | Stands::Applied => kept
-                .not_applied
-                .clone()
-                .map(|(relay, why)| CannotGoOn::NotApplied { relay, why }),
+            Stands::Stopped(State::Applied) | Stands::Applied => {
+                kept.not_applied
+                    .as_ref()
+                    .map(|kept| CannotGoOn::NotApplied {
+                        relay: kept.relay.clone(),
+                        why: kept.why.clone(),
+                    })
+            }
         };
         self.state.own_channels.say(AtRelays {
             relays,
