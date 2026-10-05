@@ -14,7 +14,9 @@
 //! the form such a channel has, with its seal, its two signatures and its
 //! chain ([`entry`]), the one place that builds a chain ([`chain`]), and
 //! how a slot's current version is read ([`version`]); and, for a device that is added, the record of its
-//! addition ([`addition`]) and what it is handed ([`hand_over`]).
+//! addition ([`addition`]) and what it is handed ([`hand_over`]). An entry
+//! travels in one form ([`wire`]), and a connection proves that it holds a
+//! channel's key with a signature of its own ([`proof`]).
 
 pub mod addition;
 pub mod aes_gcm;
@@ -28,11 +30,13 @@ pub mod entry;
 pub mod hand_over;
 pub mod identity;
 pub mod phrase;
+pub mod proof;
 pub mod psk_envelope;
 pub mod signing;
 pub mod slots;
 pub mod statement;
 pub mod version;
+pub mod wire;
 
 #[cfg(test)]
 mod vectors;

@@ -1161,8 +1161,34 @@ pub const PERSONAL_APPLIED_PREFIX: &str = "applied/";
 /// stands (§7.3).
 pub const PERSONAL_ADDED_PREFIX: &str = "added/";
 
+/// What an entry takes on the wire beside its content (decision 2026-10-04
+/// §2.3, §2.4): its clear fields and its two signatures, and the content's
+/// length as four bytes.
+pub const ENTRY_WIRE_OVERHEAD_BYTES: usize = ENTRY_CLEAR_BYTES + 4;
+
+/// The most an entry takes on the wire: the largest content, and what an
+/// entry takes beside it.
+pub const MAX_ENTRY_WIRE_BYTES: usize = ENTRY_WIRE_OVERHEAD_BYTES + MAX_ITEM_BYTES;
+
+// Checked at compile time: an entry on the wire is within what it is
+// counted at, so a limit on bytes that counts entries bounds what travels.
+const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u64 <= entry_cost(MAX_ITEM_BYTES));
+
+/// The label that a proof is signed under, that a connection holds a
+/// channel's key (decision 2026-10-04 §2.4, item 3): the channel's signing
+/// key signs this label, the value that both ends export from the one TLS
+/// session, and the channel's ID. The label is the proof's own, so that an
+/// entry's signature is never taken for a proof, nor a proof for one.
+pub const LABEL_CHANNEL_PROOF: &[u8] = b"cordelia v2 proof";
+
+/// How long the value is that both ends of a connection export from its
+/// TLS session, for a proof to be made over: 32 bytes (decision 2026-10-04
+/// §2.4, item 3). One length, so that where the value ends and the
+/// channel's ID begins is never in doubt.
+pub const SESSION_VALUE_BYTES: usize = 32;
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 20] = [
+pub const LABELS: [&[u8]; 21] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1183,6 +1209,7 @@ pub const LABELS: [&[u8]; 20] = [
     LABEL_ENTRY_CHANNEL,
     LABEL_ENTRY_CONTENT,
     LABEL_ADDITION,
+    LABEL_CHANNEL_PROOF,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -1765,5 +1792,25 @@ mod tests {
         assert_eq!(PERSONAL_ADDED_PREFIX, "added/");
         assert!(!PERSONAL_APPLIED_PREFIX.starts_with(PERSONAL_ADDED_PREFIX));
         assert!(!PERSONAL_ADDED_PREFIX.starts_with(PERSONAL_APPLIED_PREFIX));
+    }
+
+    /// An entry on the wire: the largest is 65,773 bytes, within the
+    /// 66,560 it is counted at.
+    #[test]
+    fn test_an_entry_on_the_wire_decision_2026_10_04_2_4() {
+        assert_eq!(ENTRY_WIRE_OVERHEAD_BYTES, 237);
+        assert_eq!(ENTRY_WIRE_OVERHEAD_BYTES, ENTRY_CLEAR_BYTES + 4);
+        assert_eq!(MAX_ENTRY_WIRE_BYTES, 65_773);
+        assert!(MAX_ENTRY_WIRE_BYTES as u64 <= entry_cost(MAX_ITEM_BYTES));
+    }
+
+    /// The proof that a connection holds a channel's key: its label, and
+    /// the length of the session's value.
+    #[test]
+    fn test_the_proof_of_a_channels_key_decision_2026_10_04_2_4() {
+        assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
+        assert_eq!(SESSION_VALUE_BYTES, 32);
+        assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
+        assert_eq!(LABELS.len(), 21);
     }
 }
