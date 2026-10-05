@@ -15,15 +15,15 @@ use std::time::Duration;
 
 use cordelia_core::protocol::{
     BAN_THRESHOLD, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, ERR_RATE_LIMIT,
-    MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR,
-    PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
+    MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
+    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
-    ChannelProve, EntryPull, EntryPulled, EntryPush, EntryRefused, EntryShow, Item, Protocol,
-    PushAck, PushAnswer, PushPayload, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush,
+    ChannelProve, EntryPull, EntryPulled, EntryPush, EntryRefused, EntryShow, EntryShowShort, Item,
+    Protocol, PushAck, PushAnswer, PushPayload, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush,
     ShowAnswer, WireMessage,
 };
 use cordelia_network::{codec, connection, transport};
@@ -144,6 +144,25 @@ impl Client {
                 Protocol::EntryShow,
                 WireMessage::EntryShow(EntryShow { entry }),
             )
+            .await?
+        {
+            WireMessage::EntryShown(shown) => Ok(shown.answer),
+            other => Err(format!("not an answer to a show: {other:?}")),
+        }
+    }
+
+    /// Show `entry` in short: by its channel, its slot, its author, its
+    /// revision and its ID. `Err` where nothing was answered.
+    async fn show_short(&self, entry: &CheckedEntry) -> Result<ShowAnswer, String> {
+        let short = EntryShowShort {
+            channel: entry.channel,
+            author: entry.author,
+            slot: entry.slot,
+            rev: entry.rev,
+            id: entry.id(),
+        };
+        match self
+            .ask(Protocol::EntryShow, WireMessage::EntryShowShort(short))
             .await?
         {
             WireMessage::EntryShown(shown) => Ok(shown.answer),
@@ -705,6 +724,163 @@ async fn shown_an_entry_a_relay_answers_held_taken_or_another() {
     assert!(client.prove(1).await);
     assert_eq!(texts(&client.pull(1, NO_MARK, 0).await, 1), ["a later one"]);
     assert_eq!(holds(&relay).0, SMALL);
+}
+
+/// A short show is only ever of the entry that the connection last showed
+/// whole in that slot. Of that entry the relay answers held (which is use
+/// of the channel), "show it whole", or the revision and ID of another:
+/// never an entry. A connection that is told of another shows its own
+/// whole, and is answered with the entry. A short show of anything else is
+/// told to show it whole, whatever the relay holds: on a connection that
+/// has shown nothing, and on one that showed another entry of that slot.
+/// What a connection showed is that connection's: a new one, under the
+/// same key, starts with nothing remembered. A relay remembers 8 slots for
+/// a connection, and a ninth is shown whole each time. And a short show
+/// counts for 1 KB where the whole entry counts for all of it: a
+/// connection shows a large entry in short many more times in a minute
+/// than it could show it whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole() {
+    let relay = relay_started(None);
+    let holder = client_of(&relay).await.expect("the holder connects");
+    let first = holder.made(1, 5, "change", "the first");
+    assert_eq!(
+        holder.show(first.to_wire()).await.unwrap(),
+        ShowAnswer::Taken
+    );
+
+    // A connection that has shown nothing whole, with everything a short
+    // show says: whole, where the relay holds that entry, where it holds
+    // a later one, and where it holds nothing.
+    let stranger = client_of(&relay).await.expect("a stranger connects");
+    let earlier = holder.made(1, 4, "change", "an earlier one");
+    let elsewhere = holder.made(2, 5, "change", "in a channel that is not held");
+    for entry in [&first, &earlier, &elsewhere] {
+        assert_eq!(stranger.show_short(entry).await.unwrap(), ShowAnswer::Whole);
+    }
+
+    // The connection that showed it whole: held, in short. That is use
+    // of the channel, written where the last use is more than an hour
+    // old.
+    assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Held);
+    let before = held(&relay, 1).unwrap().used_at;
+    used_earlier(&relay, 1, 2 * 60 * 60);
+    // A short show that is told to show it whole is no use.
+    assert_eq!(
+        stranger.show_short(&first).await.unwrap(),
+        ShowAnswer::Whole
+    );
+    assert_eq!(held(&relay, 1).unwrap().used_at, before - 2 * 60 * 60);
+    assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Held);
+    assert!(held(&relay, 1).unwrap().used_at >= before);
+    // Another entry of that slot, from that connection: whole, though
+    // the relay holds one at a later revision than it.
+    assert_eq!(
+        holder.show_short(&earlier).await.unwrap(),
+        ShowAnswer::Whole
+    );
+
+    // Another connection shows a later entry whole, and the relay takes
+    // it. The first connection's short show is answered with word of it,
+    // and no more: its revision and its ID.
+    let other = client_of(&relay).await.expect("another client connects");
+    let later = holder.made(1, 6, "change", "a later one");
+    assert_eq!(
+        other.show(later.to_wire()).await.unwrap(),
+        ShowAnswer::Taken
+    );
+    let word = ShowAnswer::Other {
+        rev: 6,
+        id: later.id(),
+    };
+    assert_eq!(holder.show_short(&first).await.unwrap(), word);
+    // Told of another that it does not keep, it shows its own whole, and
+    // is answered with the entry.
+    assert_eq!(
+        holder.show(first.to_wire()).await.unwrap(),
+        ShowAnswer::Another(later.to_wire())
+    );
+    // What it was answered with is not what it showed: the later one is
+    // to be shown whole, once, and is then held in short. The first is
+    // remembered no more.
+    assert_eq!(holder.show_short(&later).await.unwrap(), ShowAnswer::Whole);
+    assert_eq!(
+        holder.show(later.to_wire()).await.unwrap(),
+        ShowAnswer::Held
+    );
+    assert_eq!(holder.show_short(&later).await.unwrap(), ShowAnswer::Held);
+    assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Whole);
+    // One the relay would take, shown whole and refused nowhere, is
+    // taken; in short, before that, nothing is stored.
+    let latest = holder.made(1, 7, "change", "the latest");
+    assert_eq!(holder.show_short(&latest).await.unwrap(), ShowAnswer::Whole);
+    assert!(other.prove(1).await);
+    assert_eq!(texts(&other.pull(1, NO_MARK, 0).await, 1), ["a later one"]);
+
+    // A new connection under the holder's key starts with nothing
+    // remembered, and is answered in short once it has shown it whole.
+    let again = client_as(holder.identity.clone(), &relay)
+        .await
+        .expect("the holder connects again");
+    assert_eq!(again.show_short(&later).await.unwrap(), ShowAnswer::Whole);
+    assert_eq!(again.show(later.to_wire()).await.unwrap(), ShowAnswer::Held);
+    assert_eq!(again.show_short(&later).await.unwrap(), ShowAnswer::Held);
+
+    // Eight slots are remembered for a connection, and a ninth is not:
+    // on the connection that had shown nothing whole.
+    assert_eq!(MAX_SLOTS_SHOWN_ON_A_CONNECTION, 8);
+    let many = &stranger;
+    let slots: Vec<CheckedEntry> = (10..19)
+        .map(|c| many.made(c, 1, "notes.md", "a small text"))
+        .collect();
+    for entry in &slots {
+        assert_eq!(many.show(entry.to_wire()).await.unwrap(), ShowAnswer::Taken);
+    }
+    for entry in &slots[..8] {
+        assert_eq!(many.show_short(entry).await.unwrap(), ShowAnswer::Held);
+    }
+    assert_eq!(many.show_short(&slots[8]).await.unwrap(), ShowAnswer::Whole);
+    assert_eq!(
+        many.show(slots[8].to_wire()).await.unwrap(),
+        ShowAnswer::Held
+    );
+    assert_eq!(many.show_short(&slots[8]).await.unwrap(), ShowAnswer::Whole);
+
+    // Counted by bytes. An entry of the largest size, shown whole, counts
+    // for 65 KB: a connection may show it some thirty times in a minute.
+    // In short it counts for 1 KB, and a hundred shows are all answered.
+    // (An address may have five connections: these are two of the four.)
+    let large = &other;
+    let largest = largest_by(&large.identity, 30, "change");
+    assert_eq!(
+        large.show(largest.to_wire()).await.unwrap(),
+        ShowAnswer::Taken
+    );
+    const { assert!(100 * LARGEST > PUSH_BYTES_PER_PEER_PER_MINUTE) };
+    const { assert!(LARGEST + 100 * 1024 < PUSH_BYTES_PER_PEER_PER_MINUTE) };
+    for n in 0..100 {
+        assert_eq!(
+            large.show_short(&largest).await,
+            Ok(ShowAnswer::Held),
+            "the short show numbered {n}"
+        );
+    }
+    // The control: whole, that many do not fit the minute.
+    let whole = &again;
+    let mut answered = 0;
+    for _ in 0..40 {
+        match whole.show(largest.to_wire()).await {
+            Ok(ShowAnswer::Held) => answered += 1,
+            Ok(other) => panic!("a whole show was answered {other:?}"),
+            Err(_) => break,
+        }
+    }
+    // What it showed before was a small entry whole, and two short shows.
+    assert_eq!(
+        answered,
+        (PUSH_BYTES_PER_PEER_PER_MINUTE - SMALL - 2 * 1024) / LARGEST,
+        "whole shows answered in a minute"
+    );
 }
 
 /// A relay near its cap for channels from their secrets: it takes no

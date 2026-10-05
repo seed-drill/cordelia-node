@@ -3616,6 +3616,9 @@ pub async fn handle_peer_streams(
     // (decision 2026-10-04 §2.4 item 3). It is this connection's, and is
     // gone when the connection closes.
     let mut proved = crate::relay_entries::Proved::default();
+    // And what this connection showed whole, by author's slot (§2.4 item
+    // 5): gone with it, as what it proved is.
+    let mut shown_whole = crate::relay_entries::ShownWhole::default();
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -3801,7 +3804,14 @@ pub async fn handle_peer_streams(
                     rates: &peer_rates,
                 };
                 let over = entries
-                    .serve(protocol, &mut send, &mut recv, &serving, &mut proved)
+                    .serve(
+                        protocol,
+                        &mut send,
+                        &mut recv,
+                        &serving,
+                        &mut proved,
+                        &mut shown_whole,
+                    )
                     .await;
                 if over.is_some_and(|over| over.cut_off) && !own_relay {
                     cut_off(&conn, &peer_id, address, &gov_tx);

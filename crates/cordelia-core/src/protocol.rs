@@ -1379,6 +1379,52 @@ pub const RELAY_CHANNEL_PAGES_PER_PASS: usize = 10;
 /// pass and each time it sends; and what it pushes.
 pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
 
+/// The most slots for which a relay remembers, for one connection, the
+/// last entry that it was shown whole there by each author, where the two
+/// signatures held (decision 2026-10-04 §2.4, item 5). The connection may
+/// then show that same entry in short: by its channel, slot, author,
+/// revision and ID alone. A device shows one entry, the change entry of
+/// the phrase it follows, so 8 is room to spare. A ninth is not
+/// remembered, and is shown whole each time; all are forgotten when the
+/// connection closes.
+pub const MAX_SLOTS_SHOWN_ON_A_CONNECTION: usize = 8;
+
+/// How long the leave lasts that a relay's answer to a show gives a device
+/// on that connection (decision 2026-10-04 §4.6): 10 seconds from an
+/// answer which says that the relay holds no later change than the one
+/// the device keeps. A device opens a stream for a channel of its own, and
+/// takes what comes back on it, only with leave. So what a device sends on
+/// its own timer, at each publish and from what it sends again, comes
+/// after a show, and a pass that is long shows again as it goes.
+/// Derived: the time between two passes, REALTIME_SYNC_INTERVAL_SECS.
+pub const SHOW_LEAVE_SECS: u64 = REALTIME_SYNC_INTERVAL_SECS;
+
+/// How long a device that wakes waits for the relays it is set up with
+/// (decision 2026-10-04 §4.6): when the node starts, or reaches a relay
+/// after having reached none, it neither takes from a channel of its own
+/// nor sends to one until each of them has answered a show, or this long
+/// has gone by. Connections come up one at a time: without the wait a
+/// device would take what the first relay held, and send it what waited,
+/// before a second, which had a change, had answered. The cost is that
+/// with one relay out of reach a device waits this long before it syncs.
+pub const WAKE_WAIT_SECS: u64 = 30;
+
+/// How often a device proves again, on a connection that lasts, the key of
+/// each channel of its own and of each name that its personal channel
+/// lists: once a day (decision 2026-10-04 §2.5). A relay drops a channel
+/// that nobody has used for ENTRY_CHANNEL_UNUSED_DAYS, and a proof is use.
+/// So a name whose only device is gone is not dropped while any device of
+/// the person's is on.
+pub const CHANNEL_PROOF_AGAIN_SECS: u64 = 24 * 60 * 60;
+
+/// The first part of the name, in the personal channel, of a device's word
+/// that it syncs a name (decision 2026-10-04 §2.2, §7.3). The name
+/// follows it, in its one spelling. Each device that syncs the name has an
+/// entry of its own there, and an entry that is no delete lists the name.
+/// A device proves the channel of every name that is listed, whether or
+/// not it syncs the name itself (§2.5).
+pub const PERSONAL_NAME_PREFIX: &str = "name/";
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 22] = [
     LABEL_ENTRY_KEY,
@@ -2076,6 +2122,31 @@ mod tests {
         let sends = 2 * (60 / OUTBOX_FLUSH_INTERVAL_SECS);
         assert_eq!(pulls + proofs + sends, 2_626);
         assert!(pulls + proofs + sends <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
+    }
+
+    /// A device's side of a relay: the leave that an answer to a show
+    /// gives lasts as long as the time between two passes, a device that
+    /// wakes waits half a minute for its relays, a relay remembers 8
+    /// slots as shown whole for a connection, and a proof is made again
+    /// once a day, which is well within the 90 days that a channel
+    /// nobody uses is kept.
+    #[test]
+    fn test_a_devices_side_of_a_relay_decision_2026_10_04_4_6() {
+        assert_eq!(SHOW_LEAVE_SECS, 10);
+        assert_eq!(SHOW_LEAVE_SECS, REALTIME_SYNC_INTERVAL_SECS);
+        // What a device sends on its own timer goes several times within
+        // one leave.
+        const { assert!(OUTBOX_FLUSH_INTERVAL_SECS < SHOW_LEAVE_SECS) };
+        assert_eq!(WAKE_WAIT_SECS, 30);
+        const { assert!(WAKE_WAIT_SECS > SHOW_LEAVE_SECS) };
+        assert_eq!(MAX_SLOTS_SHOWN_ON_A_CONNECTION, 8);
+        assert_eq!(CHANNEL_PROOF_AGAIN_SECS, 86_400);
+        const { assert!(CHANNEL_PROOF_AGAIN_SECS < ENTRY_CHANNEL_UNUSED_DAYS as u64 * 86_400) };
+        assert_eq!(PERSONAL_NAME_PREFIX, "name/");
+        for other in [PERSONAL_APPLIED_PREFIX, PERSONAL_ADDED_PREFIX] {
+            assert!(!PERSONAL_NAME_PREFIX.starts_with(other));
+            assert!(!other.starts_with(PERSONAL_NAME_PREFIX));
+        }
     }
 
     /// The four streams of entries have bytes of their own, each another,

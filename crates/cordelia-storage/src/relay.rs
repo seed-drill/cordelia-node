@@ -16,7 +16,7 @@
 //! a relay's to count or to drop.
 //!
 //! So each function here that writes or drops ([`take`], [`show`],
-//! [`make_room`], [`sweep_unused`], [`listed_relay_says`],
+//! [`show_short`], [`make_room`], [`sweep_unused`], [`listed_relay_says`],
 //! [`listed_relay_used`]) refuses, with
 //! [`RelayError::DeviceFollowsAPhrase`], a database in which a device
 //! follows a phrase ([`crate::person::person`]), and changes nothing in
@@ -66,6 +66,14 @@
 //!   entry; that it held none from that author in that slot, or an earlier
 //!   one, and took this one; or the other entry it holds from that author
 //!   in that slot, at that revision or a later one.
+//! - **Shown an entry in short** ([`show_short`], §2.4 item 5): its
+//!   channel, its slot, its author, its revision and its ID, and nothing
+//!   else of it. The relay holds that entry; or it holds none, or an
+//!   earlier one, and the entry is to be shown whole; or it holds another
+//!   at that revision or a later one, and says that one's revision and ID
+//!   and no more. The answer never carries an entry. Who may show in short
+//!   is the caller's to say: a connection that last showed that very entry
+//!   whole in that slot.
 //! - **A proof** ([`prove`], §2.4 items 3 and 4): yes or no. The signature
 //!   is checked before the channel is looked up, and a proof that fails
 //!   and a channel that is not held are answered alike. The caller is
@@ -355,6 +363,23 @@ pub enum Shown {
     },
     /// The relay would have taken it, and did not.
     Refused(Refused),
+}
+
+/// What a relay answers to an entry that it is shown in short (decision
+/// 2026-10-04 §2.4 item 5): by its channel, its slot, its author, its
+/// revision and its ID. The answer never carries an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShownShort {
+    /// The relay holds that very entry.
+    Held,
+    /// The relay holds none from that author in that slot, or an earlier
+    /// one. It would take the entry, and cannot from its short form: the
+    /// entry is to be shown whole.
+    Whole,
+    /// The relay holds another entry from that author in that slot, at
+    /// that revision or a later one: that one's revision and ID, and no
+    /// more.
+    Other { rev: u64, id: [u8; 32] },
 }
 
 /// One page of a channel's entries.
@@ -951,6 +976,71 @@ fn shown(
     }
 }
 
+/// Answer an entry that the relay is shown in short (decision 2026-10-04
+/// §2.4 item 5): the entry of `author` in `slot` of `channel`, at `rev`,
+/// whose ID is `id` ([`Entry::id`]). `now` is the relay's time, in
+/// seconds.
+///
+/// The relay holds that very entry, which is use of the channel as with
+/// the whole one. Or it holds none from that author in that slot, or an
+/// earlier one: there is nothing here for it to take, and the entry is to
+/// be shown whole. Or it holds another, at that revision or a later one,
+/// and says that one's revision and ID, and no more: whoever is told of
+/// one that it does not keep shows its own whole, and is answered with the
+/// entry then.
+///
+/// **Whoever calls this says who may ask.** A short form is looked up only
+/// for a connection that last showed that very entry whole in that slot,
+/// with both signatures: anyone else could ask what a relay holds from an
+/// ID alone. For any other the caller answers [`ShownShort::Whole`] from
+/// what it remembers of the connection, and does not call this at all.
+///
+/// It is answered by reading: nothing is written but when the channel was
+/// last used, at most once an hour (§16).
+///
+/// Refused, with nothing changed, on a database in which a device follows
+/// a phrase.
+pub fn show_short(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+    rev: u64,
+    id: &[u8; 32],
+    now: i64,
+) -> Result<ShownShort, RelayError> {
+    in_one_reading(conn, || {
+        no_device_writes(conn)?;
+        Ok(shown_short(conn, (channel, slot, author), rev, id, now)?)
+    })
+}
+
+/// [`show_short`], inside what the caller began. `place` is the channel,
+/// the slot and the author.
+fn shown_short(
+    conn: &Connection,
+    place: (&[u8; 32], &[u8; 32], &[u8; 32]),
+    rev: u64,
+    id: &[u8; 32],
+    now: i64,
+) -> Result<ShownShort, CordeliaError> {
+    let (channel, slot, author) = place;
+    match entries::author_entry(conn, channel, slot, author)? {
+        Some(held) if held.entry.rev >= rev => {
+            let held_id = held.entry.id();
+            if held_id == *id {
+                used(conn, channel, now)?;
+                return Ok(ShownShort::Held);
+            }
+            Ok(ShownShort::Other {
+                rev: held.entry.rev,
+                id: held_id,
+            })
+        }
+        _ => Ok(ShownShort::Whole),
+    }
+}
+
 /// Check the proof that the other end of the connection whose TLS session
 /// exports `session` sent, that it holds the key of `channel` (decision
 /// 2026-10-04 §2.4 items 3 and 4). `prover` is the node key of the peer at
@@ -1356,6 +1446,20 @@ mod tests {
         let entry = made(c, d, rev, "notes.md", "a small text");
         assert_eq!(entry_cost(entry.content.len()), SMALL);
         entry
+    }
+
+    /// `entry` shown in short: its channel, its slot, its author, its
+    /// revision and its ID.
+    fn short(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<ShownShort, RelayError> {
+        show_short(
+            conn,
+            &entry.channel,
+            &entry.slot,
+            &entry.author,
+            entry.rev,
+            &entry.id(),
+            now,
+        )
     }
 
     /// A relay with room for everything.
@@ -1891,6 +1995,9 @@ mod tests {
                 refused(take(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
                 refused(show(&conn, &mut room, &entry, &asker, NOW + 60).map(|_| ()));
             }
+            // Shown in short, it is refused as well: where it is held,
+            // that would be use of its channel.
+            refused(short(&conn, &entry, NOW + 60).map(|_| ()));
         }
         assert_eq!(all(&conn), before);
         // Nor is an address counted for what was refused.
@@ -3374,6 +3481,144 @@ mod tests {
             Shown::Taken
         );
         assert_eq!(counted(&conn), 4096 + 1024 + 2 * SMALL);
+    }
+
+    /// Shown an entry in short, a relay answers one of three things. It
+    /// holds that entry. It holds none, or an earlier one: the entry is to
+    /// be shown whole, and nothing is taken from a short form. Or it holds
+    /// another at that revision or a later one: it says that one's
+    /// revision and ID, and no more.
+    #[test]
+    fn test_shown_an_entry_in_short_a_relay_says_held_whole_or_which_other() {
+        let (conn, mut room) = relay();
+        let held_entry = small(1, 1, 5);
+        // It holds nothing there: whole.
+        assert_eq!(short(&conn, &held_entry, NOW).unwrap(), ShownShort::Whole);
+        assert_eq!(held(&conn), [0u16; 0]);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+
+        // The same entry: it holds that very one.
+        assert_eq!(
+            short(&conn, &held_entry, NOW + 60).unwrap(),
+            ShownShort::Held
+        );
+        // An earlier one, and another at that revision: the revision and
+        // the ID of the one it holds.
+        let other = ShownShort::Other {
+            rev: 5,
+            id: held_entry.id(),
+        };
+        let at_that_revision = made(1, 1, 5, "notes.md", "another text");
+        assert_ne!(at_that_revision.id(), held_entry.id());
+        for shown in [small(1, 1, 4), small(1, 1, 1), at_that_revision] {
+            assert_eq!(short(&conn, &shown, NOW + 60).unwrap(), other);
+            // The whole entry is answered with that one.
+            assert_eq!(
+                show(&conn, &mut room, &shown, &from(2), NOW + 60).unwrap(),
+                Shown::Another {
+                    entry: Box::new(held_entry.clone()),
+                    cost: SMALL,
+                }
+            );
+        }
+        // A later one: the relay holds an earlier one, and would take
+        // this. It cannot from its short form: whole. Nothing is stored.
+        let later = made(1, 1, 6, "notes.md", &"x".repeat(3000));
+        assert_eq!(short(&conn, &later, NOW + 120).unwrap(), ShownShort::Whole);
+        assert_eq!(ids(&conn, 1), [held_entry.id()]);
+        // Whole, it is taken: and then its short form is held, and the
+        // first is answered with word of it.
+        assert_eq!(
+            show(&conn, &mut room, &later, &from(2), NOW + 120).unwrap(),
+            Shown::Taken
+        );
+        assert_eq!(short(&conn, &later, NOW + 180).unwrap(), ShownShort::Held);
+        assert_eq!(
+            short(&conn, &held_entry, NOW + 180).unwrap(),
+            ShownShort::Other {
+                rev: 6,
+                id: later.id(),
+            }
+        );
+
+        // The answer is about that author in that slot, in that channel:
+        // another author's there, that author's under another name, and
+        // that slot in another channel, each hold nothing.
+        let elsewhere = made(1, 1, 6, "other.md", "another name");
+        for shown in [small(1, 2, 6), elsewhere, small(2, 1, 6)] {
+            assert_eq!(short(&conn, &shown, NOW + 180).unwrap(), ShownShort::Whole);
+        }
+        assert_eq!(held(&conn), [1]);
+        assert_eq!(ids(&conn, 1), [later.id()]);
+    }
+
+    /// A short form that the relay answers with "holds that entry" is use
+    /// of the channel, as the whole one is. One that it answers with word
+    /// of another, or with a call for the whole one, is not.
+    #[test]
+    fn test_an_entry_shown_in_short_that_is_held_is_use_of_its_channel() {
+        let (conn, mut room) = relay();
+        let held_entry = small(1, 1, 5);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+        assert_eq!(used_at(&conn, 1), Some(NOW));
+
+        // Another, and whole: the channel was last used when it was.
+        assert!(matches!(
+            short(&conn, &small(1, 1, 4), NOW + DAY).unwrap(),
+            ShownShort::Other { .. }
+        ));
+        assert_eq!(
+            short(&conn, &small(1, 1, 6), NOW + DAY).unwrap(),
+            ShownShort::Whole
+        );
+        assert_eq!(used_at(&conn, 1), Some(NOW));
+        // Held: it is used now.
+        assert_eq!(
+            short(&conn, &held_entry, NOW + 2 * DAY).unwrap(),
+            ShownShort::Held
+        );
+        assert_eq!(used_at(&conn, 1), Some(NOW + 2 * DAY));
+        // So a channel of which an entry is shown in short is not swept.
+        assert_eq!(
+            short(&conn, &held_entry, NOW + 100 * DAY).unwrap(),
+            ShownShort::Held
+        );
+        assert!(sweep_unused(&conn, NOW + 150 * DAY).unwrap().is_empty());
+        assert_eq!(sweep_unused(&conn, NOW + 190 * DAY).unwrap(), [channel(1)]);
+    }
+
+    /// A short form is answered by reading: while another connection
+    /// holds the database for writing, each of its three answers is
+    /// given. Only a use that is past the hour has something to write.
+    #[test]
+    fn test_an_entry_shown_in_short_is_answered_by_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.db");
+        let conn = db::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut room = Room::new(u64::MAX);
+        let held_entry = small(1, 1, 5);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let at = NOW + 600;
+        assert_eq!(short(&conn, &held_entry, at).unwrap(), ShownShort::Held);
+        assert!(matches!(
+            short(&conn, &small(1, 1, 4), at).unwrap(),
+            ShownShort::Other { .. }
+        ));
+        assert_eq!(
+            short(&conn, &small(1, 1, 6), at).unwrap(),
+            ShownShort::Whole
+        );
+        // The control: a use that is past the hour is written, and cannot
+        // be while the other holds the database.
+        let past = NOW + HOUR + 1;
+        assert!(short(&conn, &held_entry, past).is_err());
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(short(&conn, &held_entry, past).unwrap(), ShownShort::Held);
+        assert_eq!(used_at(&conn, 1), Some(past));
     }
 
     /// An entry that is shown and not held is taken as any entry is:

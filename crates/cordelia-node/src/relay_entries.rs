@@ -17,7 +17,16 @@
 //! - **Show** (§2.4 item 5). The entry is read from its bytes and both its
 //!   signatures are checked before the store is looked at (§16). The
 //!   answer is the store's: it holds that entry; it took it; or it holds
-//!   another from that author in that slot, and here it is.
+//!   another from that author in that slot, and here it is. The
+//!   connection remembers, for each author's slot, the last entry that it
+//!   showed whole there whose signatures held, up to a bound and for as
+//!   long as it lasts. It may then show that same entry in short: by its
+//!   channel, slot, author, revision and ID. A short show of anything else
+//!   is answered "show it whole" from what the connection remembers,
+//!   before the store is looked at and with no lock on the database
+//!   taken. One of the entry remembered is answered from the store: held,
+//!   "show it whole", or the revision and ID of another. The answer to a
+//!   short show never carries an entry.
 //! - **Prove** (§2.4 items 3 and 4). The proof is checked against the
 //!   value that this connection's TLS session exports, and against the
 //!   node key of the peer as its certificate says it: nothing that says
@@ -61,7 +70,8 @@
 //!
 //! Every entry counts as its content and what an entry takes beyond it.
 //! Bytes that are no entry's count for all of them, and for no less than
-//! an entry. A relay that the operator lists is not limited.
+//! an entry. The short form of a show counts as bytes that are no entry's.
+//! A relay that the operator lists is not limited.
 //!
 //! ## Relays that work together
 //!
@@ -95,17 +105,17 @@ use std::time::{Duration, Instant};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MIN_ENTRY_CONTENT_BYTES,
-    RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX, RELAY_ENTRY_PULL_PAGES,
-    SESSION_VALUE_BYTES, entry_cost,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
+    MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX,
+    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
 use cordelia_network::codec;
 use cordelia_network::messages::{
     ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryShow,
-    EntryShown, Protocol, PushAnswer, RelayChannel, RelayChannelsAsk, RelayChannelsHeld,
-    RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
+    EntryShowShort, EntryShown, Protocol, PushAnswer, RelayChannel, RelayChannelsAsk,
+    RelayChannelsHeld, RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
 };
 use cordelia_network::transport;
 use cordelia_storage::relay::{self, Asker, Mark, Refused, Room, Shown, Taken};
@@ -197,6 +207,69 @@ impl Proved {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.channels.len()
+    }
+}
+
+/// What a relay remembers of one connection besides: for each author's
+/// slot in a channel, the last entry that the connection showed whole
+/// there whose two signatures held, by its revision and its ID, whatever
+/// the relay answered (decision 2026-10-04 §2.4 item 5).
+///
+/// The connection may show that same entry in short, and is answered from
+/// the store. A short show of anything else, a slot that is not remembered
+/// included, is answered "show it whole" from here alone: so the short
+/// form tells nothing, and hands nothing, to anyone who has not shown that
+/// very entry whole.
+///
+/// It lives and goes as [`Proved`] does. At most
+/// MAX_SLOTS_SHOWN_ON_A_CONNECTION slots are remembered: one more is not,
+/// and is shown whole each time. None is put out for it.
+#[derive(Debug, Default)]
+pub struct ShownWhole {
+    slots: Vec<ShownSlot>,
+}
+
+/// An author's slot in a channel, and the entry that a connection last
+/// showed whole there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShownSlot {
+    /// The slot: its channel, its slot and its author.
+    place: [[u8; 32]; 3],
+    /// The entry's revision.
+    rev: u64,
+    /// The entry's ID.
+    id: [u8; 32],
+}
+
+impl ShownWhole {
+    /// Whether `show` is of the very entry that the connection last
+    /// showed whole in that author's slot.
+    pub fn is_of(&self, show: &EntryShowShort) -> bool {
+        self.slots.contains(&ShownSlot {
+            place: [show.channel, show.slot, show.author],
+            rev: show.rev,
+            id: show.id,
+        })
+    }
+
+    /// The connection showed `entry` whole, and both its signatures held.
+    fn remember(&mut self, entry: &CheckedEntry) {
+        let shown = ShownSlot {
+            place: [entry.channel, entry.slot, entry.author],
+            rev: entry.rev,
+            id: entry.id(),
+        };
+        if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == shown.place) {
+            *kept = shown;
+        } else if self.slots.len() < MAX_SLOTS_SHOWN_ON_A_CONNECTION {
+            self.slots.push(shown);
+        }
+    }
+
+    /// How many slots are remembered.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -501,8 +574,8 @@ impl RelayEntries {
 
     /// Answer one request that `who` made on a stream of `protocol`, at
     /// `now`, this relay's time in seconds. `session` is what a proof on
-    /// this connection is checked against, and `proved` what the
-    /// connection has proved so far.
+    /// this connection is checked against, `proved` what the connection
+    /// has proved so far, and `whole` what it has shown whole.
     ///
     /// A stream carries its own kind of request and no other. The stream
     /// between relays that work together is answered for a relay that the
@@ -518,13 +591,17 @@ impl RelayEntries {
         who: &Who,
         session: Option<&Session>,
         proved: &mut Proved,
+        whole: &mut ShownWhole,
         db: &Mutex<Connection>,
         rates: &Mutex<Rates>,
         now: i64,
     ) -> Answer {
         match (protocol, request) {
             (Protocol::EntryShow, WireMessage::EntryShow(show)) => {
-                self.shown(db, rates, who, show, now)
+                self.shown(db, rates, who, whole, show, now)
+            }
+            (Protocol::EntryShow, WireMessage::EntryShowShort(show)) => {
+                self.shown_short(db, rates, who, whole, show, now)
             }
             (Protocol::ChannelProve, WireMessage::ChannelProve(prove)) => {
                 self.proving(db, session, proved, prove, now)
@@ -543,11 +620,15 @@ impl RelayEntries {
     }
 
     /// Answer an entry that is shown (decision 2026-10-04 §2.4 item 5).
+    /// Where both its signatures hold, the connection is remembered to
+    /// have shown it whole in its slot, whatever the store then answers:
+    /// `whole` is what the connection has shown so.
     fn shown(
         &self,
         db: &Mutex<Connection>,
         rates: &Mutex<Rates>,
         who: &Who,
+        whole: &mut ShownWhole,
         show: &EntryShow,
         now: i64,
     ) -> Answer {
@@ -568,6 +649,9 @@ impl RelayEntries {
                 }));
             }
         };
+        // Its signatures held: from now on the connection may show this
+        // entry in short, and no other of its slot.
+        whole.remember(&entry);
         let found = {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
@@ -600,6 +684,67 @@ impl RelayEntries {
         Answer::of(WireMessage::EntryShown(EntryShown {
             answer: (&found).into(),
         }))
+    }
+
+    /// Answer an entry that is shown in short (decision 2026-10-04 §2.4
+    /// item 5): by its channel, slot, author, revision and ID. `whole` is
+    /// what this connection has shown whole.
+    ///
+    /// **The connection's memory is asked before the store.** A short show
+    /// of anything but the entry that the connection last showed whole in
+    /// that slot is answered "show it whole" from the memory alone: the
+    /// store is not looked at and the database is not locked, so the
+    /// answer says nothing of what the relay holds, takes no longer where
+    /// something is held, and waits for no writer.
+    ///
+    /// Where it is of that entry, the store answers: held, "show it
+    /// whole", or the revision and ID of another. No entry goes back, so
+    /// nothing counts as fetched.
+    fn shown_short(
+        &self,
+        db: &Mutex<Connection>,
+        rates: &Mutex<Rates>,
+        who: &Who,
+        whole: &ShownWhole,
+        show: &EntryShowShort,
+        now: i64,
+    ) -> Answer {
+        // It counts as bytes that are no entry's do: for no less than the
+        // smallest thing an entry is counted at. Over either allowance, it
+        // is not looked at.
+        if !who.listed
+            && let Err(over) = lock(rates).pushed(who.peer, who.address, counted(&[]))
+        {
+            return Answer::Over(over);
+        }
+        if !whole.is_of(show) {
+            return Answer::of(WireMessage::EntryShown(EntryShown {
+                answer: ShowAnswer::Whole,
+            }));
+        }
+        let found = {
+            let Ok(db) = db.lock() else {
+                return Answer::Nothing;
+            };
+            relay::show_short(
+                &db,
+                &show.channel,
+                &show.slot,
+                &show.author,
+                show.rev,
+                &show.id,
+                now,
+            )
+        };
+        match found {
+            Ok(found) => Answer::of(WireMessage::EntryShown(EntryShown {
+                answer: (&found).into(),
+            })),
+            Err(e) => {
+                tracing::warn!(peer = %who.peer, error = %e, "could not answer an entry shown in short");
+                Answer::Nothing
+            }
+        }
     }
 
     /// Answer a proof that the peer holds a channel's key (decision
@@ -1161,7 +1306,8 @@ pub struct Serving<'a> {
 impl RelayEntries {
     /// Serve one stream of `protocol`: one of the four streams of
     /// entries, or the one between relays that work together. `proved` is
-    /// what this connection has proved.
+    /// what this connection has proved, and `whole` what it has shown
+    /// whole.
     ///
     /// Returns the breach where the request was over a limit: the stream
     /// was refused, and the caller cuts the peer off where it says so.
@@ -1172,6 +1318,7 @@ impl RelayEntries {
         recv: &mut quinn::RecvStream,
         serving: &Serving<'_>,
         proved: &mut Proved,
+        whole: &mut ShownWhole,
     ) -> Option<OverLimit> {
         let who = Who {
             peer: serving.peer,
@@ -1206,6 +1353,7 @@ impl RelayEntries {
             &who,
             session.as_ref(),
             proved,
+            whole,
             serving.db,
             serving.rates,
             unix_now(),
@@ -1599,7 +1747,8 @@ mod tests {
 
         /// The answer to `request`, made by the peer numbered `n` on a
         /// stream of `protocol`, on a connection that has proved `proved`
-        /// and whose session is `session`.
+        /// and whose session is `session`, and that has shown nothing
+        /// whole.
         fn answer(
             &self,
             n: u8,
@@ -1615,10 +1764,29 @@ mod tests {
                 &self.who(&peer, n),
                 session,
                 proved,
+                &mut ShownWhole::default(),
                 &self.db,
                 &self.rates,
                 NOW,
             )
+        }
+
+        /// The answer to a show that the peer numbered `n` makes on a
+        /// connection that has shown `whole` so far: of the entry whole,
+        /// or in short.
+        fn show_on(&self, n: u8, whole: &mut ShownWhole, request: WireMessage) -> ShowAnswer {
+            let peer = peer(n);
+            shown(self.entries.answer(
+                Protocol::EntryShow,
+                &request,
+                &self.who(&peer, n),
+                None,
+                &mut Proved::default(),
+                whole,
+                &self.db,
+                &self.rates,
+                NOW,
+            ))
         }
 
         /// The peer numbered `n` shows `entry`.
@@ -1967,6 +2135,383 @@ mod tests {
         assert_eq!(BAN_THRESHOLD, 3);
         assert!(!over(at.show(5, unseen.to_wire())).cut_off);
         assert!(over(at.show(5, unseen.to_wire())).cut_off);
+    }
+
+    /// `entry` as it is shown whole.
+    fn whole_of(entry: &CheckedEntry) -> WireMessage {
+        WireMessage::EntryShow(EntryShow {
+            entry: entry.to_wire(),
+        })
+    }
+
+    /// `entry` as it is shown in short: by its channel, slot, author,
+    /// revision and ID.
+    fn short_of(entry: &CheckedEntry) -> WireMessage {
+        WireMessage::EntryShowShort(EntryShowShort {
+            channel: entry.channel,
+            author: entry.author,
+            slot: entry.slot,
+            rev: entry.rev,
+            id: entry.id(),
+        })
+    }
+
+    /// A short show is only ever of the entry that this connection last
+    /// showed whole in that slot. Of that entry, the relay looks, and
+    /// answers held, "show it whole", or the revision and ID of another.
+    /// Of anything else it answers "show it whole", whatever it holds: an
+    /// entry that it holds and the connection never showed, another
+    /// revision in a slot the connection did show, another entry at that
+    /// revision, the same entry on another connection.
+    #[test]
+    fn a_short_show_is_only_ever_of_the_entry_last_shown_whole_on_the_connection() {
+        let at = relay();
+        let first = small(1, 1, 5);
+        at.hold(&first, NOW);
+        let earlier = small(1, 1, 4);
+        let later = small(1, 1, 6);
+        let at_that_revision = made(1, 1, 5, "notes.md", "another text");
+
+        // A connection that has shown nothing whole: a short show of the
+        // very entry that the relay holds is told to show it whole, and so
+        // is one of anything else. Nothing is learnt from either.
+        let mut whole = ShownWhole::default();
+        for entry in [&first, &earlier, &later, &at_that_revision] {
+            assert_eq!(
+                at.show_on(1, &mut whole, short_of(entry)),
+                ShowAnswer::Whole
+            );
+        }
+        assert_eq!(whole.len(), 0);
+
+        // It shows the entry whole, and then the short show of that entry
+        // is answered from the store: held.
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&first)),
+            ShowAnswer::Held
+        );
+        assert_eq!(whole.len(), 1);
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Held
+        );
+        // Anything else in that slot is still to be shown whole, though
+        // the relay holds an entry at that revision or a later one: the
+        // connection has not shown it.
+        for entry in [&earlier, &later, &at_that_revision] {
+            assert_eq!(
+                at.show_on(1, &mut whole, short_of(entry)),
+                ShowAnswer::Whole
+            );
+        }
+        // So is the same entry by another revision or another ID.
+        for (rev, id) in [(4, first.id()), (6, first.id()), (5, [7; 32])] {
+            let other = WireMessage::EntryShowShort(EntryShowShort {
+                channel: first.channel,
+                author: first.author,
+                slot: first.slot,
+                rev,
+                id,
+            });
+            assert_eq!(at.show_on(1, &mut whole, other), ShowAnswer::Whole);
+        }
+        // And the same entry on a connection that has not shown it.
+        assert_eq!(
+            at.show_on(1, &mut ShownWhole::default(), short_of(&first)),
+            ShowAnswer::Whole
+        );
+
+        // The relay comes to hold a later one. The short show of the
+        // entry remembered is answered with word of it: its revision and
+        // its ID, and no more. The connection shows its own whole, and is
+        // answered with the entry.
+        at.hold(&later, NOW);
+        let word = ShowAnswer::Other {
+            rev: 6,
+            id: later.id(),
+        };
+        assert_eq!(at.show_on(1, &mut whole, short_of(&first)), word);
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&first)),
+            ShowAnswer::Another(later.to_wire())
+        );
+        // What it was answered with is not what it showed: the entry
+        // remembered is still its own, and a short show of the later one
+        // is to be shown whole.
+        assert_eq!(at.show_on(1, &mut whole, short_of(&first)), word);
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&later)),
+            ShowAnswer::Whole
+        );
+        // It shows the later one whole: that is the one remembered now,
+        // and the first is not.
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&later)),
+            ShowAnswer::Held
+        );
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&later)),
+            ShowAnswer::Held
+        );
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Whole
+        );
+        assert_eq!(whole.len(), 1);
+    }
+
+    /// What is remembered is the last entry shown whole whose signatures
+    /// held, whatever the relay answered: one that it took, one that it
+    /// answered with another, and one that found no room. An entry whose
+    /// signatures do not hold is not remembered.
+    #[test]
+    fn what_was_shown_whole_is_remembered_whatever_was_answered() {
+        // Taken: remembered, and held.
+        let at = relay();
+        let mut whole = ShownWhole::default();
+        let first = small(1, 1, 5);
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&first)),
+            ShowAnswer::Taken
+        );
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Held
+        );
+
+        // Answered with another: remembered, and the short show is told
+        // which other.
+        let mut behind = ShownWhole::default();
+        let earlier = small(1, 1, 4);
+        assert_eq!(
+            at.show_on(2, &mut behind, whole_of(&earlier)),
+            ShowAnswer::Another(first.to_wire())
+        );
+        assert_eq!(
+            at.show_on(2, &mut behind, short_of(&earlier)),
+            ShowAnswer::Other {
+                rev: 5,
+                id: first.id(),
+            }
+        );
+
+        // No room for it: remembered, and the short show is answered from
+        // the store, which holds none and says to show it whole.
+        let full = relay_of(SMALL, &[]);
+        let mut refused = ShownWhole::default();
+        full.hold(&small(2, 1, 1), NOW);
+        assert_eq!(
+            full.show_on(1, &mut refused, whole_of(&first)),
+            ShowAnswer::Refused(EntryRefused::NoRoom)
+        );
+        assert_eq!(refused.len(), 1);
+        assert!(refused.is_of(&EntryShowShort {
+            channel: first.channel,
+            author: first.author,
+            slot: first.slot,
+            rev: 5,
+            id: first.id(),
+        }));
+        assert_eq!(
+            full.show_on(1, &mut refused, short_of(&first)),
+            ShowAnswer::Whole
+        );
+
+        // Signatures that do not hold: not remembered.
+        let mut unsigned = ShownWhole::default();
+        let mut by_a_stranger = small(3, 1, 9).into_entry();
+        by_a_stranger.channel_signature = device(9).sign(b"anything");
+        assert_eq!(
+            at.show_on(
+                3,
+                &mut unsigned,
+                WireMessage::EntryShow(EntryShow {
+                    entry: by_a_stranger.to_wire(),
+                })
+            ),
+            ShowAnswer::Refused(EntryRefused::NotSigned)
+        );
+        assert_eq!(unsigned.len(), 0);
+    }
+
+    /// A short show of anything but the entry remembered is answered from
+    /// the connection's memory, before the store is looked at and with no
+    /// lock on the database taken: the answer comes while the database is
+    /// held by another. One of the entry remembered waits for the store.
+    #[test]
+    fn a_short_show_of_anything_else_does_not_wait_for_the_store() {
+        use std::sync::mpsc;
+        let at = relay();
+        let first = small(1, 1, 5);
+        at.hold(&first, NOW);
+        let shown_whole = {
+            let mut whole = ShownWhole::default();
+            assert_eq!(
+                at.show_on(1, &mut whole, whole_of(&first)),
+                ShowAnswer::Held
+            );
+            whole
+        };
+
+        // What a short show of `entry` is answered within two seconds, on
+        // a connection that has shown `whole`, while this thread holds
+        // the database.
+        let while_held = |whole: &ShownWhole, entry: &CheckedEntry| {
+            let WireMessage::EntryShowShort(show) = short_of(entry) else {
+                unreachable!()
+            };
+            let held = lock(&at.db);
+            std::thread::scope(|scope| {
+                let (said, heard) = mpsc::channel();
+                let (at, show) = (&at, &show);
+                scope.spawn(move || {
+                    let peer = peer(1);
+                    let answer = at.entries.shown_short(
+                        &at.db,
+                        &at.rates,
+                        &at.who(&peer, 1),
+                        whole,
+                        show,
+                        NOW,
+                    );
+                    let _ = said.send(shown(answer));
+                });
+                let answered = heard.recv_timeout(Duration::from_secs(2));
+                drop(held);
+                answered.ok()
+            })
+        };
+        let nothing = ShownWhole::default();
+        assert_eq!(while_held(&nothing, &first), Some(ShowAnswer::Whole));
+        assert_eq!(
+            while_held(&nothing, &small(9, 1, 5)),
+            Some(ShowAnswer::Whole)
+        );
+        for other in [small(1, 1, 4), small(1, 1, 6), small(1, 2, 5)] {
+            assert_eq!(while_held(&shown_whole, &other), Some(ShowAnswer::Whole));
+        }
+        // The control: the entry remembered is looked up in the store.
+        assert_eq!(while_held(&shown_whole, &first), None);
+        let mut whole = shown_whole;
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Held
+        );
+    }
+
+    /// A connection is remembered for eight slots and no more: a ninth is
+    /// not remembered, and is shown whole each time. Showing another
+    /// entry in a slot that is remembered takes no slot more.
+    #[test]
+    fn what_a_connection_showed_whole_is_remembered_for_eight_slots() {
+        assert_eq!(MAX_SLOTS_SHOWN_ON_A_CONNECTION, 8);
+        let at = relay();
+        let mut whole = ShownWhole::default();
+        let entries: Vec<CheckedEntry> = (1..=9).map(|d| small(1, d, 5)).collect();
+        for entry in &entries {
+            assert_eq!(
+                at.show_on(1, &mut whole, whole_of(entry)),
+                ShowAnswer::Taken
+            );
+        }
+        assert_eq!(whole.len(), 8);
+        for entry in &entries[..8] {
+            assert_eq!(at.show_on(1, &mut whole, short_of(entry)), ShowAnswer::Held);
+        }
+        // The ninth, though the relay holds it and it was shown whole.
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&entries[8])),
+            ShowAnswer::Whole
+        );
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&entries[8])),
+            ShowAnswer::Held
+        );
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&entries[8])),
+            ShowAnswer::Whole
+        );
+        assert_eq!(whole.len(), 8);
+        // A later entry in the first slot: the slot is remembered already.
+        let later = small(1, 1, 6);
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&later)),
+            ShowAnswer::Taken
+        );
+        assert_eq!(whole.len(), 8);
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&later)),
+            ShowAnswer::Held
+        );
+        // A slot is an author's, in a channel: that author under another
+        // name, and that slot in another channel, are others.
+        let mut one = ShownWhole::default();
+        one.remember(&entries[0]);
+        for elsewhere in [
+            made(1, 1, 5, "other.md", "a small text"),
+            small(2, 1, 5),
+            small(1, 2, 5),
+        ] {
+            let WireMessage::EntryShowShort(show) = short_of(&elsewhere) else {
+                unreachable!()
+            };
+            assert!(!one.is_of(&show));
+        }
+    }
+
+    /// A short show counts as bytes that are no entry's, against what the
+    /// peer may push: whatever it is answered. Nothing goes back that
+    /// counts as fetched. Over the allowance it is not looked at.
+    #[test]
+    fn a_short_show_counts_as_pushed_and_nothing_goes_back() {
+        let at = relay();
+        let first = small(1, 1, 5);
+        let later = small(1, 1, 6);
+        at.hold(&first, NOW);
+        let mut whole = ShownWhole::default();
+        // Told to show it whole: counted.
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Whole
+        );
+        assert_eq!(at.push_room(1), MINUTE - 1024);
+        assert_eq!(
+            at.show_on(1, &mut whole, whole_of(&first)),
+            ShowAnswer::Held
+        );
+        assert_eq!(at.push_room(1), MINUTE - 1024 - SMALL);
+        // Held: counted.
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Held
+        );
+        assert_eq!(at.push_room(1), MINUTE - 2 * 1024 - SMALL);
+        // Word of another: counted as pushed, and nothing as fetched.
+        at.hold(&later, NOW);
+        assert!(matches!(
+            at.show_on(1, &mut whole, short_of(&first)),
+            ShowAnswer::Other { .. }
+        ));
+        assert_eq!(at.push_room(1), MINUTE - 3 * 1024 - SMALL);
+        assert_eq!(at.fetch_room(1), MINUTE);
+
+        // A peer with less left than a short show counts at: it is not
+        // looked at, and is a breach.
+        lock(&at.rates)
+            .pushed(&peer(5), address(5), MINUTE - 1000)
+            .unwrap();
+        let peer5 = peer(5);
+        let mut whole = ShownWhole::default();
+        whole.remember(&later);
+        let WireMessage::EntryShowShort(show) = short_of(&later) else {
+            unreachable!()
+        };
+        let answer =
+            at.entries
+                .shown_short(&at.db, &at.rates, &at.who(&peer5, 5), &whole, &show, NOW);
+        assert!(!over(answer).cut_off);
+        assert_eq!(at.push_room(5), 1000);
+        assert_eq!(breaches(&at, 5), (1, 1));
     }
 
     // ── Prove ────────────────────────────────────────────────────────

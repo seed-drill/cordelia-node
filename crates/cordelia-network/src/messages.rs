@@ -9,7 +9,10 @@
 //! Beside the eight are the four streams of entries of a channel from its
 //! secret (decision 2026-10-04 §2.4), with protocol bytes of their own:
 //! show, prove, pull and push. A peer that does not know them refuses the
-//! stream, and nothing of the eight is changed by them.
+//! stream, and nothing of the eight is changed by them. A show has a short
+//! form, on the stream of a show: an entry's channel, slot, author,
+//! revision and ID, for a connection that last showed that very entry
+//! whole in that slot. Its answer never carries an entry.
 //!
 //! And a fifth, between relays that their operator lists together (§2.4
 //! item 6): on it a relay tells which channels it holds, hands a channel
@@ -385,7 +388,8 @@ pub struct PairingResponse {
 // (`cordelia_crypto::wire`), which whoever receives it reads strictly and
 // checks. A channel's ID is 32 bytes and a proof 64: a message that holds
 // one of another length is not read. A push and a page hold at most a
-// page's worth of entries: one that holds more is not read.
+// page's worth of entries, and the answer to a push says at most as many
+// things: one that holds more is not read.
 
 /// Read a list of entries, each as its bytes on the wire, that holds at
 /// most a page's worth of them (ENTRY_PAGE_MAX_ENTRIES). A longer list is
@@ -446,6 +450,39 @@ pub struct EntryShow {
     pub entry: Vec<u8>,
 }
 
+/// Entry-Show (0x10), in short: a connection shows an entry by its
+/// channel, slot, author, revision and ID alone (decision 2026-10-04 §2.4
+/// item 5).
+///
+/// It is only ever of the entry that the connection last showed whole in
+/// that slot, with both signatures. A short show of anything else, a slot
+/// that the receiver does not remember included, is answered "show it
+/// whole" without a look at what the receiver holds: so the short form
+/// tells nothing, and hands nothing, to anyone who has not shown that very
+/// entry whole. Where it is of the entry remembered, the receiver looks,
+/// and answers that it holds that entry; or "show it whole", where it
+/// holds none or an earlier one; or, where it holds another at that
+/// revision or a later one, that one's revision and ID and no more. The
+/// answer to a short show never carries an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryShowShort {
+    /// The channel's ID.
+    #[serde(with = "serde_bytes")]
+    pub channel: [u8; 32],
+    /// The key that signed the entry.
+    #[serde(with = "serde_bytes")]
+    pub author: [u8; 32],
+    /// The entry's slot.
+    #[serde(with = "serde_bytes")]
+    pub slot: [u8; 32],
+    /// The entry's revision.
+    pub rev: u64,
+    /// The entry's ID: SHA-256 of what is signed of it, which holds the
+    /// hash of its content (`cordelia_crypto::entry::Entry::id`).
+    #[serde(with = "serde_bytes")]
+    pub id: [u8; 32],
+}
+
 /// The answer to an entry shown (decision 2026-10-04 §2.4 item 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryShown {
@@ -466,6 +503,18 @@ pub enum ShowAnswer {
     Another(#[serde(with = "serde_bytes")] Vec<u8>),
     /// It would have taken the entry, and did not.
     Refused(EntryRefused),
+    /// The entry was shown in short, and is to be shown whole: it is not
+    /// the entry that the connection last showed whole in that slot, or
+    /// the receiver holds none from that author there, or an earlier one.
+    Whole,
+    /// The entry was shown in short, and the receiver holds another from
+    /// that author in that slot, at that revision or a later one: that
+    /// one's revision and ID, and no more.
+    Other {
+        rev: u64,
+        #[serde(with = "serde_bytes")]
+        id: [u8; 32],
+    },
 }
 
 /// Channel-Prove (0x11): a connection proves that it holds a channel's
@@ -549,6 +598,9 @@ pub struct EntryPush {
 /// nothing of any.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryPushed {
+    /// At most one for each entry that a push may hold,
+    /// ENTRY_PAGE_MAX_ENTRIES: an answer that says more is not read.
+    #[serde(deserialize_with = "at_most_a_page_of_answers")]
     pub answers: Vec<PushAnswer>,
 }
 
@@ -625,6 +677,15 @@ where
     D: serde::Deserializer<'de>,
 {
     at_most(deserializer, RELAY_CHANNELS_PAGE_MAX, "channels")
+}
+
+/// At most what a push may hold, one answer for each entry
+/// (ENTRY_PAGE_MAX_ENTRIES).
+fn at_most_a_page_of_answers<'de, D>(deserializer: D) -> Result<Vec<PushAnswer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, ENTRY_PAGE_MAX_ENTRIES, "answers")
 }
 
 /// At most a page's worth of entries passed on (ENTRY_PAGE_MAX_ENTRIES).
@@ -739,6 +800,16 @@ impl From<&relay::Shown> for ShowAnswer {
     }
 }
 
+impl From<&relay::ShownShort> for ShowAnswer {
+    fn from(shown: &relay::ShownShort) -> Self {
+        match shown {
+            relay::ShownShort::Held => Self::Held,
+            relay::ShownShort::Whole => Self::Whole,
+            relay::ShownShort::Other { rev, id } => Self::Other { rev: *rev, id: *id },
+        }
+    }
+}
+
 impl From<&relay::Taken> for PushAnswer {
     fn from(taken: &relay::Taken) -> Self {
         match taken {
@@ -832,6 +903,7 @@ pub enum WireMessage {
 
     // Entries of a channel from its secret
     EntryShow(EntryShow),
+    EntryShowShort(EntryShowShort),
     EntryShown(EntryShown),
     ChannelProve(ChannelProve),
     ChannelProved(ChannelProved),
@@ -1101,6 +1173,7 @@ mod tests {
             WireMessage::EntryShow(EntryShow {
                 entry: entry.clone(),
             }),
+            WireMessage::EntryShowShort(short_of(&made(1, 5, "what the file holds"))),
             WireMessage::ChannelProve(ChannelProve {
                 channel,
                 proof: proof::make(&SECRET, &[0x51; 32], &[0x07; 32]).unwrap(),
@@ -1195,10 +1268,27 @@ mod tests {
             ShowAnswer::Refused(EntryRefused::NotSigned),
             ShowAnswer::Refused(EntryRefused::NoRoom),
             ShowAnswer::Refused(EntryRefused::OverLimit),
+            ShowAnswer::Whole,
+            ShowAnswer::Other {
+                rev: 6,
+                id: [0x1d; 32],
+            },
         ] {
             messages.push(WireMessage::EntryShown(EntryShown { answer }));
         }
         messages
+    }
+
+    /// The short form of `entry`: what a connection shows of it once it
+    /// has shown it whole.
+    fn short_of(entry: &CheckedEntry) -> EntryShowShort {
+        EntryShowShort {
+            channel: entry.channel,
+            author: entry.author,
+            slot: entry.slot,
+            rev: entry.rev,
+            id: entry.id(),
+        }
     }
 
     /// What a message of the four streams holds, for setting two side by
@@ -1206,6 +1296,7 @@ mod tests {
     fn of_entries(message: &WireMessage) -> String {
         match message {
             WireMessage::EntryShow(m) => format!("{m:?}"),
+            WireMessage::EntryShowShort(m) => format!("{m:?}"),
             WireMessage::EntryShown(m) => format!("{m:?}"),
             WireMessage::ChannelProve(m) => format!("{m:?}"),
             WireMessage::ChannelProved(m) => format!("{m:?}"),
@@ -1242,6 +1333,11 @@ mod tests {
             ShowAnswer::Refused(EntryRefused::NotSigned),
             ShowAnswer::Refused(EntryRefused::NoRoom),
             ShowAnswer::Refused(EntryRefused::OverLimit),
+            ShowAnswer::Whole,
+            ShowAnswer::Other {
+                rev: 6,
+                id: [0x1d; 32],
+            },
         ] {
             let message = WireMessage::EntryShown(EntryShown {
                 answer: answer.clone(),
@@ -1261,6 +1357,126 @@ mod tests {
             panic!("not another entry");
         };
         assert_eq!(Entry::from_wire(&bytes).unwrap().check(), Ok(other));
+    }
+
+    /// The short form of a show goes through the codec as it was written:
+    /// the entry's channel, its author, its slot, its revision and its ID.
+    /// It is some two hundred bytes, whatever the entry's size, and holds
+    /// nothing of the entry's content or its signatures. Nor does any
+    /// answer to it: word of another entry is that one's revision and ID.
+    #[test]
+    fn the_short_form_of_a_show_goes_through_the_codec() {
+        let entry = made(1, 5, "what the file holds");
+        let short = short_of(&entry);
+        assert_eq!(
+            (short.channel, short.author, short.slot, short.rev),
+            (entry.channel, entry.author, entry.slot, 5)
+        );
+        assert_eq!(short.id, entry.id());
+        let WireMessage::EntryShowShort(read) =
+            through(&WireMessage::EntryShowShort(short.clone()))
+        else {
+            panic!("not the short form of a show");
+        };
+        assert_eq!(read, short);
+
+        let largest = Entry::seal(
+            &SECRET,
+            &NodeIdentity::from_seed([1; 32]).unwrap(),
+            (1 << 53) - 1,
+            &Inside {
+                name: "n".into(),
+                value: Value::Text("x".repeat(60_000)),
+                chain: Some(Vec::new()),
+            },
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let whole = encode_message(&WireMessage::EntryShow(EntryShow {
+            entry: largest.to_wire(),
+        }))
+        .unwrap();
+        let in_short = encode_message(&WireMessage::EntryShowShort(short_of(&largest))).unwrap();
+        assert!(whole.len() > 65_536, "{}", whole.len());
+        assert!(in_short.len() < 256, "{}", in_short.len());
+        for part in [
+            &largest.content[..64],
+            &largest.author_signature[..],
+            &largest.channel_signature[..],
+        ] {
+            assert!(!in_short.windows(part.len()).any(|bytes| bytes == part));
+        }
+
+        // What a relay found of a short form, as it is said: held, a call
+        // for the whole entry, or the revision and the ID of another.
+        use cordelia_storage::relay::ShownShort;
+        assert_eq!(ShowAnswer::from(&ShownShort::Held), ShowAnswer::Held);
+        assert_eq!(ShowAnswer::from(&ShownShort::Whole), ShowAnswer::Whole);
+        let other = ShowAnswer::from(&ShownShort::Other {
+            rev: largest.rev,
+            id: largest.id(),
+        });
+        assert_eq!(
+            other,
+            ShowAnswer::Other {
+                rev: (1 << 53) - 1,
+                id: largest.id(),
+            }
+        );
+        // Each of the three is small, and none holds anything of an
+        // entry but its revision and its ID.
+        for answer in [ShowAnswer::Held, ShowAnswer::Whole, other.clone()] {
+            let said = encode_message(&WireMessage::EntryShown(EntryShown {
+                answer: answer.clone(),
+            }))
+            .unwrap();
+            assert!(said.len() < 128, "{answer:?}: {}", said.len());
+            for part in [
+                &largest.content[..64],
+                &largest.author_signature[..],
+                &largest.channel_signature[..],
+            ] {
+                assert!(!said.windows(part.len()).any(|bytes| bytes == part));
+            }
+        }
+        let WireMessage::EntryShown(read) = through(&WireMessage::EntryShown(EntryShown {
+            answer: other.clone(),
+        })) else {
+            panic!("not the answer to a show");
+        };
+        assert_eq!(read.answer, other);
+
+        // Word of another entry whose ID is not 32 bytes is not read.
+        let said = |id: usize| {
+            let text = |s: &str| ciborium::Value::Text(s.into());
+            let other = ciborium::Value::Map(vec![
+                (text("rev"), ciborium::Value::Integer(6.into())),
+                (text("id"), ciborium::Value::Bytes(vec![4; id])),
+            ]);
+            let mut bytes = Vec::new();
+            ciborium::into_writer(
+                &ciborium::Value::Map(vec![
+                    (text("msg_type"), text("EntryShown")),
+                    (
+                        text("answer"),
+                        ciborium::Value::Map(vec![(text("other"), other)]),
+                    ),
+                ]),
+                &mut bytes,
+            )
+            .unwrap();
+            decode_message(&bytes)
+        };
+        assert!(matches!(
+            said(32),
+            Ok(WireMessage::EntryShown(EntryShown {
+                answer: ShowAnswer::Other { rev: 6, id },
+            })) if id == [4; 32]
+        ));
+        for id in [0, 31, 33, 64] {
+            assert!(said(id).is_err(), "{id}");
+        }
     }
 
     #[test]
@@ -1390,7 +1606,7 @@ mod tests {
     #[tokio::test]
     async fn the_messages_of_entries_travel_in_frames() {
         let messages = every_message_of_entries();
-        assert_eq!(messages.len(), 22);
+        assert_eq!(messages.len(), 25);
         let mut stream = Vec::new();
         for message in &messages {
             write_frame(&mut stream, message).await.unwrap();
@@ -1452,6 +1668,17 @@ mod tests {
         },
         EntryShown {
             answer: String,
+        },
+        EntryShowShort {
+            #[serde(with = "serde_bytes")]
+            channel: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            author: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            slot: Vec<u8>,
+            rev: u64,
+            #[serde(with = "serde_bytes")]
+            id: Vec<u8>,
         },
         EntryPushed {
             answers: Vec<String>,
@@ -1561,6 +1788,40 @@ mod tests {
             }),
             Ok(WireMessage::EntryPushed(_))
         ));
+        let short = |channel: usize, author: usize, slot: usize, id: usize| Loose::EntryShowShort {
+            channel: vec![1; channel],
+            author: vec![2; author],
+            slot: vec![3; slot],
+            rev: 5,
+            id: vec![4; id],
+        };
+        assert!(matches!(
+            read(&short(32, 32, 32, 32)),
+            Ok(WireMessage::EntryShowShort(_))
+        ));
+        assert!(matches!(
+            read(&Loose::EntryShown {
+                answer: "whole".into(),
+            }),
+            Ok(WireMessage::EntryShown(EntryShown {
+                answer: ShowAnswer::Whole,
+            }))
+        ));
+        // Each of the four that a short form holds is 32 bytes.
+        for other in [0, 31, 33, 64] {
+            for lengths in [
+                (other, 32, 32, 32),
+                (32, other, 32, 32),
+                (32, 32, other, 32),
+                (32, 32, 32, other),
+            ] {
+                let (channel, author, slot, id) = lengths;
+                assert!(
+                    read(&short(channel, author, slot, id)).is_err(),
+                    "{lengths:?}"
+                );
+            }
+        }
 
         for (channel, proof) in [(31, 64), (33, 64), (0, 64), (32, 63), (32, 65), (32, 0)] {
             assert!(
@@ -1625,7 +1886,7 @@ mod tests {
                 "{after}"
             );
         }
-        for answer in ["", "Held", "another", "refused", "stored", "yes"] {
+        for answer in ["", "Held", "another", "refused", "stored", "yes", "Whole"] {
             assert!(
                 read(&Loose::EntryShown {
                     answer: answer.into(),
@@ -1634,7 +1895,7 @@ mod tests {
                 "{answer}"
             );
         }
-        for answer in ["", "Stored", "taken", "refused", "full"] {
+        for answer in ["", "Stored", "taken", "refused", "full", "whole"] {
             assert!(
                 read(&Loose::EntryPushed {
                     answers: vec!["stored".into(), answer.into()],
@@ -1708,6 +1969,42 @@ mod tests {
             panic!("not a push");
         };
         assert_eq!(read, full);
+    }
+
+    /// The answer to a push says at most one thing for each entry that a
+    /// push may hold: an answer that says more is not read, so that
+    /// whoever reads one is not made to hold any number of them.
+    #[test]
+    fn an_answer_to_a_push_that_says_more_than_a_push_holds_is_not_read() {
+        assert_eq!(ENTRY_PAGE_MAX_ENTRIES, 100);
+        let pushed = |answers: usize| {
+            decode_message(
+                &encode_message(&WireMessage::EntryPushed(EntryPushed {
+                    answers: vec![PushAnswer::Stored; answers],
+                }))
+                .unwrap(),
+            )
+        };
+        for answers in [0, 1, 99, 100] {
+            let Ok(WireMessage::EntryPushed(read)) = pushed(answers) else {
+                panic!("an answer for {answers} entries was not read");
+            };
+            assert_eq!(read.answers, vec![PushAnswer::Stored; answers]);
+        }
+        for answers in [101, 102, 1000, 100_000] {
+            assert!(pushed(answers).is_err(), "{answers}");
+        }
+        // The same by itself, outside the envelope.
+        let alone = |answers: usize| -> Result<EntryPushed, _> {
+            ciborium::from_reader(
+                encode(&EntryPushed {
+                    answers: vec![PushAnswer::Held; answers],
+                })
+                .as_slice(),
+            )
+        };
+        assert_eq!(alone(100).unwrap().answers.len(), 100);
+        assert!(alone(101).is_err());
     }
 
     /// What relays that work together say to each other goes through the
@@ -1917,6 +2214,7 @@ mod tests {
         assert_eq!(spelled(ShowAnswer::Held).msg_type, "EntryShown");
         assert_eq!(spelled(ShowAnswer::Held).answer, text("held"));
         assert_eq!(spelled(ShowAnswer::Taken).answer, text("taken"));
+        assert_eq!(spelled(ShowAnswer::Whole).answer, text("whole"));
         assert_eq!(
             spelled(ShowAnswer::Another(vec![7, 8])).answer,
             one("another", ciborium::Value::Bytes(vec![7, 8]))
@@ -1931,6 +2229,39 @@ mod tests {
                 one("refused", text(name))
             );
         }
+
+        // The short form of a show: its name, and the five things it
+        // holds, each by its name.
+        let entry = made(1, 5, "what the file holds");
+        let bytes = encode_message(&WireMessage::EntryShowShort(short_of(&entry))).unwrap();
+        let short: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let held = |bytes: [u8; 32]| ciborium::Value::Bytes(bytes.to_vec());
+        assert_eq!(
+            short,
+            ciborium::Value::Map(vec![
+                (text("msg_type"), text("EntryShowShort")),
+                (text("channel"), held(entry.channel)),
+                (text("author"), held(entry.author)),
+                (text("slot"), held(entry.slot)),
+                (text("rev"), ciborium::Value::Integer(5.into())),
+                (text("id"), held(entry.id())),
+            ])
+        );
+        // Word of another entry: its revision and its ID, by their names.
+        assert_eq!(
+            spelled(ShowAnswer::Other {
+                rev: 6,
+                id: entry.id(),
+            })
+            .answer,
+            one(
+                "other",
+                ciborium::Value::Map(vec![
+                    (text("rev"), ciborium::Value::Integer(6.into())),
+                    (text("id"), held(entry.id())),
+                ])
+            )
+        );
 
         #[derive(Debug, PartialEq, Deserialize)]
         struct Pushed {
