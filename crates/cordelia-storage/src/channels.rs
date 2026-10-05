@@ -627,12 +627,15 @@ pub struct RemovedSwarmChannels {
     pub items: usize,
     /// The key files kept for them.
     pub key_files: usize,
+    /// The key files kept for them that could not be removed, and are
+    /// still there.
+    pub key_files_left: usize,
 }
 
 impl RemovedSwarmChannels {
-    /// Whether there was anything to remove.
+    /// Whether anything was removed.
     pub fn any(&self) -> bool {
-        *self != Self::default()
+        self.channels > 0 || self.items > 0 || self.key_files > 0
     }
 }
 
@@ -650,6 +653,10 @@ impl RemovedSwarmChannels {
 /// The rows go in one transaction, and the key files after it. The files
 /// are found by name, so a start that is cut short between the two leaves
 /// nothing for good: the next start takes the files.
+///
+/// It fails only where the database does. A key file that cannot be
+/// removed is counted and left, and tried again at the next start: it is
+/// for the node to say so, and no reason for it not to start.
 pub fn remove_swarm_channels(
     conn: &Connection,
     home_dir: &std::path::Path,
@@ -678,11 +685,12 @@ pub fn remove_swarm_channels(
         items += remove(&batch, id)?;
     }
     batch.commit().map_err(storage)?;
-    let key_files = crate::psk::delete_swarm_keys(home_dir)?;
+    let (key_files, key_files_left) = crate::psk::delete_swarm_keys(home_dir);
     Ok(RemovedSwarmChannels {
         channels: ids.len(),
         items,
         key_files,
+        key_files_left,
     })
 }
 
@@ -1264,6 +1272,7 @@ mod tests {
                 channels: 2,
                 items: 1,
                 key_files: 4,
+                key_files_left: 0,
             }
         );
         assert!(removed.any());
@@ -1347,6 +1356,48 @@ mod tests {
         // A node with no key directory at all has nothing to remove.
         let empty = tempfile::tempdir().unwrap();
         assert!(!remove_swarm_channels(&conn, empty.path()).unwrap().any());
+    }
+
+    /// A key file that cannot be removed does not fail the removal. It is
+    /// counted, and all that can go goes: the channel's rows, and its
+    /// other key files. The next removal tries it again, and takes it once
+    /// it can be removed. (Here it is a directory where a slot key would
+    /// be, which cannot be removed as a file is.)
+    #[test]
+    fn a_key_file_that_cannot_be_removed_is_counted_and_fails_nothing() {
+        let conn = db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let own = swarm_channel_as_it_was_made(&conn, home, "lead_a1b2", &test_creator());
+        let stuck = crate::psk::slot_key_path(home, &own);
+        std::fs::create_dir(&stuck).unwrap();
+
+        let removed = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!(
+            removed,
+            RemovedSwarmChannels {
+                channels: 1,
+                items: 0,
+                key_files: 1,
+                key_files_left: 1,
+            }
+        );
+        assert!(!exists(&conn, &own).unwrap());
+        assert!(!crate::psk::has_psk(home, &own));
+        assert!(stuck.exists());
+
+        // Nothing more to remove, and the one that is left is counted
+        // again: there was nothing to say was removed.
+        let again = remove_swarm_channels(&conn, home).unwrap();
+        assert!(!again.any(), "{again:?}");
+        assert_eq!(again.key_files_left, 1);
+
+        // Once it can be removed, it is.
+        std::fs::remove_dir(&stuck).unwrap();
+        crate::psk::write_slot_key(home, &own, &[0x5E; 32]).unwrap();
+        let last = remove_swarm_channels(&conn, home).unwrap();
+        assert_eq!((last.key_files, last.key_files_left), (1, 0));
+        assert!(!stuck.exists());
     }
 
     #[test]

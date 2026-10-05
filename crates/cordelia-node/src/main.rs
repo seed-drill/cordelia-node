@@ -867,6 +867,14 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             "removed swarm channels, which this version does not use"
         );
     }
+    // A key file that could not be removed is no reason not to start. The
+    // node says how many, and tries again the next time it starts.
+    if removed.key_files_left > 0 {
+        tracing::warn!(
+            key_files = removed.key_files_left,
+            "could not remove every key file of a swarm channel; they are left, and the node starts"
+        );
+    }
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);

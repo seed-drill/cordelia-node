@@ -10,6 +10,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -3061,4 +3062,368 @@ fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     wait_for("nothing is left waiting to be sent", &all, 60, || {
         (c.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
     });
+}
+
+/// A key file that cannot be removed does not stop the node. A node that
+/// ran an earlier version holds the swarm channel that version made; where
+/// a slot key of it would be there is a directory, which cannot be removed
+/// as a file is. The node starts, removes the channel and the key it can
+/// remove, and warns once that one could not be removed: how many, and not
+/// which.
+#[test]
+fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
+    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
+    let mut a = node("stuck-canary", "personal", None);
+    let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
+    let stuck = cordelia_storage::psk::slot_key_path(&a.data_dir(), &swarm);
+    std::fs::create_dir(&stuck).unwrap();
+
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+
+    let channels = a.cli(&["channels"]);
+    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert_eq!(swarm_key_files(&a), vec![format!("{swarm}.slot")]);
+    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
+    let warned: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("could not remove every key file"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{log}");
+    for said in ["WARN", "key_files=1"] {
+        assert!(warned[0].contains(said), "{}", warned[0]);
+    }
+    assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{log}");
+}
+
+/// An entry of `channel` with this ciphertext, signed by `author`, as it
+/// travels.
+fn entry_in(
+    author: &cordelia_crypto::identity::NodeIdentity,
+    channel: &str,
+    blob: Vec<u8>,
+) -> cordelia_network::messages::Item {
+    let item_id = cordelia_storage::items::generate_item_id();
+    let hash = cordelia_crypto::sha256(&blob);
+    let published_at = "2026-10-02T00:00:00Z";
+    let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
+        &author.public_key(),
+        channel,
+        &hash,
+        false,
+        &item_id,
+        1,
+        published_at,
+    )
+    .unwrap();
+    cordelia_network::messages::Item {
+        item_id,
+        channel_id: channel.into(),
+        item_type: "memory".into(),
+        content_length: blob.len() as u32,
+        encrypted_blob: blob,
+        content_hash: hash.to_vec(),
+        author_id: author.public_key().to_vec(),
+        signature: author.sign(&cbor).to_vec(),
+        key_version: 1,
+        published_at: published_at.into(),
+        is_tombstone: false,
+        parent_id: None,
+        slot: None,
+        rev: None,
+    }
+}
+
+/// Connect to `relay` as any node may, under `key`. The connection lasts
+/// as long as what is returned is kept.
+async fn client_of(
+    relay: &Node,
+    key: Arc<cordelia_crypto::identity::NodeIdentity>,
+) -> (
+    cordelia_network::connection::ConnectionManager,
+    quinn::Connection,
+) {
+    use cordelia_network::{connection, transport};
+    let endpoint = transport::create_endpoint(&key, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let mut manager =
+        connection::ConnectionManager::new(key, endpoint, vec![], vec!["personal".into()], port);
+    let relay_id = manager
+        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
+        .await
+        .expect("the client connects, as any node may");
+    let conn = manager.get_connection(&relay_id).unwrap().clone();
+    (manager, conn)
+}
+
+/// Push `items` to `relay` in one push, as a client under `author`'s key.
+/// Returns the relay's answer.
+async fn push_to(
+    relay: &Node,
+    author: Arc<cordelia_crypto::identity::NodeIdentity>,
+    items: &[cordelia_network::messages::Item],
+) -> cordelia_network::messages::PushAck {
+    let (_manager, conn) = client_of(relay, author).await;
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    cordelia_network::item_sync::send_push(&mut stream, items)
+        .await
+        .expect("the relay answers the push")
+}
+
+/// A relay passes on to the relays it lists what it comes to hold, and
+/// nothing of a channel whose ID may not be told to a peer. Two relays
+/// that list each other; a client pushes to the first an entry of a swarm
+/// channel and an entry of a group, in one push. The second relay is sent
+/// the group's entry, and nothing of the other: nothing it has written to
+/// disk holds that entry's ID, or how a swarm channel's ID begins. Nor did
+/// the first relay store it: a relay stores nothing of such a channel, and
+/// says so to whoever pushed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_passes_on_nothing_of_a_swarm_channel() {
+    use cordelia_network::messages::{REFUSED_INVALID, Refusal};
+    use cordelia_storage::naming::{SWARM_CHANNEL_PREFIX, swarm_channel_id};
+    let mut r1 = node("relay1", "relay", None);
+    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let mut r2 = node_with_relays(
+        "relay2",
+        "relay",
+        &[(format!("localhost:{}", r1.p2p), Some(key_of(&r1)))],
+    );
+    r1.add_relay(&format!("localhost:{}", r2.p2p), Some(&key_of(&r2)));
+    let (r1_key, r2_key) = (key_of(&r1), key_of(&r2));
+    r1.start();
+    wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
+    r2.start();
+    let both = [&r1, &r2];
+    wait_for("relay2 healthy", &both, 30, || healthy(&r2));
+    wait_for("the relays mesh", &both, 60, || {
+        (peer_keys(&r1).contains(&r2_key) && peer_keys(&r2).contains(&r1_key)).then_some(())
+    });
+
+    let client = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let held = entry_in(&client, &swarm_channel_id("pushed-canary"), vec![7; 40]);
+    let sent = entry_in(
+        &client,
+        "grp_550e8400-e29b-41d4-a716-446655440000",
+        vec![8; 40],
+    );
+    let ack = push_to(&r1, client, &[held.clone(), sent.clone()]).await;
+
+    // What the second relay was sent, read from the second relay.
+    wait_for(
+        "the second relay is sent the group's entry",
+        &both,
+        90,
+        || (!files_holding(&r2, &sent.item_id).is_empty()).then_some(()),
+    );
+    assert_eq!(files_holding(&r2, &held.item_id), Vec::<PathBuf>::new());
+    assert_eq!(
+        files_holding(&r2, SWARM_CHANNEL_PREFIX),
+        Vec::<PathBuf>::new()
+    );
+
+    // And the first stored the one entry, and refused the other.
+    assert_eq!(ack.stored, 1, "{ack:?}");
+    assert_eq!(
+        ack.refused,
+        vec![Refusal {
+            item_id: held.item_id.clone(),
+            why: REFUSED_INVALID.into(),
+        }],
+        "{ack:?}"
+    );
+    let stats: serde_json::Value = serde_json::from_str(&r1.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], 1, "{stats}");
+}
+
+/// A stand-in for a relay that asks. It answers a device's handshake as a
+/// relay does, and hands the test each connection a device makes to it, so
+/// that the test can ask the device what a relay asks. Whatever the device
+/// sends it is dropped unanswered.
+fn relay_that_asks() -> (u16, std::sync::mpsc::Receiver<quinn::Connection>) {
+    use cordelia_network::{connection, transport};
+    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let manager = connection::ConnectionManager::new(
+        identity,
+        endpoint.clone(),
+        vec![],
+        vec!["relay".into()],
+        port,
+    );
+    let ctx = manager.connect_context();
+    let (made, connections) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _manager = manager; // keeps the endpoint's context alive
+        while let Some(incoming) = endpoint.accept().await {
+            let (ctx, made) = (ctx.clone(), made.clone());
+            tokio::spawn(async move {
+                let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
+                    return;
+                };
+                let _ = made.send(outcome.conn.clone());
+                while let Ok(streams) = outcome.conn.accept_bi().await {
+                    drop(streams);
+                }
+            });
+        }
+    });
+    (port, connections)
+}
+
+/// Ask a device over `conn`, as its relay does in one fetch: which
+/// channels it holds, and then for a page of each of `channels`. `None` if
+/// the device did not answer.
+async fn ask_as_its_relay(
+    conn: &quinn::Connection,
+    channels: &[&str],
+) -> Option<(Vec<String>, Vec<cordelia_network::messages::SyncResponse>)> {
+    use cordelia_network::messages::Protocol;
+    use cordelia_network::{codec, item_sync};
+    let (mut send, mut recv) = conn.open_bi().await.ok()?;
+    codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+        .await
+        .ok()?;
+    let listed = item_sync::send_channel_list_request(&mut send, &mut recv)
+        .await
+        .ok()?
+        .channel_ids;
+    let mut pages = Vec::new();
+    for channel in channels {
+        pages.push(
+            item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
+                .await
+                .ok()?,
+        );
+    }
+    let _ = send.finish();
+    Some((listed, pages))
+}
+
+/// A device answers its relay with nothing of a channel whose ID may not
+/// be told to a peer, though it holds the channel and an entry in it (put
+/// there as in the test of what a running node tells its relay). The test
+/// is the relay: it asks the device which channels it holds, and then for
+/// the swarm channel's entries by its ID, and reads both answers off the
+/// stream. The list has the group and not the swarm channel, and the page
+/// for the swarm channel is empty, where the page for the group has its
+/// entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
+    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
+    let (port, connections) = relay_that_asks();
+    let mut a = node("asked-canary", "personal", Some(port));
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+
+    let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
+    let publish = |channel: &str| -> String {
+        let published = a.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": channel, "content": { "text": "an entry" } }),
+        );
+        published["item_id"].as_str().unwrap().to_string()
+    };
+    let held = publish(&swarm);
+    let group = a.post(
+        "/api/v1/channels/group",
+        serde_json::json!({ "mode": "realtime" }),
+    )["channel_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sent = publish(&group);
+
+    let mut conn = connections
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the device connected to its relay");
+    let (listed, pages) = wait_for("the device answers its relay", &[&a], 60, || {
+        // The latest connection, if the device has made another.
+        while let Ok(newer) = connections.try_recv() {
+            conn = newer;
+        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let both = [swarm.as_str(), group.as_str()];
+                tokio::time::timeout(Duration::from_secs(5), ask_as_its_relay(&conn, &both))
+                    .await
+                    .ok()
+                    .flatten()
+            })
+        })
+    });
+
+    // The list: the group, which holds an entry, and not the swarm channel,
+    // which holds one too.
+    assert!(listed.contains(&group), "{listed:?}");
+    assert!(
+        !listed.iter().any(|id| id.starts_with(SWARM_CHANNEL_PREFIX)),
+        "the device listed a swarm channel to its relay: {listed:?}"
+    );
+    // The pages: nothing for the swarm channel, and the group's entry.
+    let entries = |page: &cordelia_network::messages::SyncResponse| -> Vec<String> {
+        page.items.iter().map(|h| h.item_id.clone()).collect()
+    };
+    assert_eq!(entries(&pages[0]), Vec::<String>::new());
+    assert!(!pages[0].has_more);
+    assert_eq!(entries(&pages[1]), vec![sent]);
+
+    // The device holds the channel and its entry all the while.
+    let channels = a.cli(&["channels"]);
+    assert!(channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert!(!files_holding(&a, &held).is_empty());
+}
+
+/// A relay warns of an announcement that is not valid, and what it names
+/// in the warning is text that the peer chose. A client announces a
+/// channel under a name of thousands of characters that has a line break
+/// in it and what looks like a line of a log after that, with a signature
+/// that is not its own. The relay's warning has the first 64 characters
+/// of the name, with the line break shown as an escape: it is one line, of
+/// ordinary length, and nothing in the relay's log is the line that the
+/// peer wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_warns_of_what_a_peer_announced_in_a_few_safe_characters() {
+    use cordelia_network::channel_announce::{announcement, send_channel_joined};
+    use cordelia_network::messages::Protocol;
+    const FORGED: &str = "2026-10-05T00:00:00.000000Z  INFO a line the peer wrote";
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+
+    let key = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let named = format!("grp_canary\n{FORGED}{}", "x".repeat(5000));
+    // An announcement that does not verify, whose own channel ID has a
+    // line break too: the reason the relay gives holds that one.
+    let mut descriptor = announcement(&key, &format!("grp_inner\n{FORGED}"));
+    descriptor.signature[0] ^= 0xFF;
+    let (_manager, conn) = client_of(&relay, key).await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
+        .await
+        .unwrap();
+    send_channel_joined(&mut send, &named, &descriptor)
+        .await
+        .unwrap();
+    let _ = send.finish();
+
+    let warned = wait_for("the relay warns of the announcement", &[&relay], 60, || {
+        let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
+        log.lines()
+            .find(|line| line.contains("channel-announce: invalid descriptor"))
+            .map(String::from)
+    });
+    assert!(warned.contains("WARN"), "{warned}");
+    assert!(
+        warned.contains(r"channel=grp_canary\n2026-10-05"),
+        "{warned}"
+    );
+    assert!(warned.contains(r"grp_inner\n2026-10-05"), "{warned}");
+    assert!(warned.len() < 400, "{} characters: {warned}", warned.len());
+    let log = std::fs::read_to_string(relay.log()).unwrap();
+    assert!(!log.lines().any(|line| line.starts_with(FORGED)), "{log}");
+    assert!(!log.contains(&"x".repeat(100)));
 }

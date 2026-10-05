@@ -145,12 +145,15 @@ pub fn swarm_channel_id(lead_entity_id: &str) -> String {
 
 /// Whether a channel's ID may be told to a peer.
 ///
-/// A relay learns a channel's ID (decision 2026-09-30 §5), so an ID must
-/// say nothing about the channel or about whose it is: a group's is
-/// random, and an inbox's or a named channel's is a hash. A swarm channel's
-/// ID holds a name, so it is never told to a peer. v1 makes no such channel
-/// and a node removes one when it starts
-/// ([`crate::channels::remove_swarm_channels`]); should a node hold one all
+/// A relay learns the ID of each channel it carries (decision 2026-09-30
+/// §5), so an ID that holds a name is not told to a peer. A swarm channel's
+/// ID holds the entity ID of the node it was made for, which holds a name.
+/// The other kinds of ID hold no name: a group's is random, a named
+/// channel's is a hash of its name, and a direct channel's and an inbox's
+/// are derived from keys.
+///
+/// v1 makes no swarm channel, and a node removes one when it starts
+/// ([`crate::channels::remove_swarm_channels`]). Should a node hold one all
 /// the same, every place that sends a channel's ID asks here first.
 pub fn may_be_told_to_a_peer(channel_id: &str) -> bool {
     !channel_id.starts_with(SWARM_CHANNEL_PREFIX)
@@ -443,7 +446,7 @@ mod tests {
 
     /// A channel ID that holds a name is never told to a peer: a swarm
     /// channel's holds the entity ID of the node it was made for. An ID of
-    /// any other kind says nothing, and may be told.
+    /// any other kind holds no name, and may be told.
     #[test]
     fn a_channel_id_that_holds_a_name_is_not_told_to_a_peer() {
         assert!(!may_be_told_to_a_peer(&swarm_channel_id("lead_a1b2")));

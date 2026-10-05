@@ -130,28 +130,38 @@ pub fn has_psk(home_dir: &Path, channel_id: &str) -> bool {
 /// and its slot key if it has them. A key file is named for its channel,
 /// so these are found by how their names begin
 /// ([`crate::naming::SWARM_CHANNEL_PREFIX`]), whether or not the database
-/// still has the channel. Returns how many files went.
-pub fn delete_swarm_keys(home_dir: &Path) -> Result<usize, CordeliaError> {
-    let read = |e: std::io::Error| CordeliaError::Storage(format!("read key dir: {e}"));
+/// still has the channel.
+///
+/// Returns how many files went, and how many are left: those that could
+/// not be deleted. Nothing here fails. A node does this when it starts,
+/// and a file it cannot delete is no reason for it not to start: it is
+/// counted, for the node to say, and tried again at the next start. (Where
+/// the directory itself, or an entry of it, cannot be read, that counts as
+/// one left: whatever it is could not be deleted either.)
+pub fn delete_swarm_keys(home_dir: &Path) -> (usize, usize) {
+    let (mut deleted, mut left) = (0, 0);
     let entries = match std::fs::read_dir(home_dir.join("channel-keys")) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(read(e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+        Err(_) => return (0, 1),
     };
-    let mut deleted = 0;
     for entry in entries {
-        let entry = entry.map_err(read)?;
+        let Ok(entry) = entry else {
+            left += 1;
+            continue;
+        };
         let of_a_swarm_channel = entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.starts_with(crate::naming::SWARM_CHANNEL_PREFIX));
-        if of_a_swarm_channel && !entry.path().is_dir() {
-            std::fs::remove_file(entry.path())
-                .map_err(|e| CordeliaError::Storage(format!("delete key: {e}")))?;
-            deleted += 1;
+        if of_a_swarm_channel {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => deleted += 1,
+                Err(_) => left += 1,
+            }
         }
     }
-    Ok(deleted)
+    (deleted, left)
 }
 
 /// Path to a channel's key ring file.

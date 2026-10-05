@@ -1343,6 +1343,11 @@ pub fn check_item(item: &cordelia_network::messages::Item) -> Result<Checked, &'
 
 /// Store an item that [`check_item`] has passed. A relay passes its
 /// [`RelayRoom`]; a device passes none.
+///
+/// A relay stores nothing of a channel whose ID may not be told to a peer.
+/// It would hold, under an ID that holds a name, what it never lists,
+/// serves or passes on. Such an item is refused as one that is not valid,
+/// before anything is made for its channel.
 pub fn store_checked(
     db: &rusqlite::Connection,
     item: &cordelia_network::messages::Item,
@@ -1354,6 +1359,11 @@ pub fn store_checked(
     use cordelia_network::messages::{
         REFUSED_INVALID, REFUSED_NOT_MEMBER, REFUSED_STORAGE, REFUSED_TOO_LARGE,
     };
+
+    if node_role == "relay" && !cordelia_storage::naming::may_be_told_to_a_peer(&item.channel_id) {
+        tracing::debug!(item = %item.item_id, channel = %item.channel_id, "an item of a channel whose ID is not told to a peer; a relay does not store it");
+        return Err(REFUSED_INVALID);
+    }
 
     let will_hold = match room.as_deref_mut() {
         Some(room) => Some(room.admit(db, item, checked)?),
@@ -4063,6 +4073,16 @@ async fn handle_inbound_peer_share(
     }
 }
 
+/// Text that a peer chose, as it is safe to put in a warning: its first 64
+/// characters, with control characters and the marks that change the
+/// direction of text shown as escapes. A peer chooses what the text holds
+/// and how long it is.
+fn as_a_peer_sent_it(text: &str) -> String {
+    const MOST: usize = 64;
+    let start: String = text.chars().take(MOST).collect();
+    crate::history_cmd::printable(&start)
+}
+
 /// Handle inbound ChannelAnnounce (0x04) stream.
 /// Reads frames until EOF/error, dispatches ChannelJoined/ChannelLeft to governor.
 ///
@@ -4084,10 +4104,11 @@ async fn handle_inbound_channel_announce(
                 if let Err(e) =
                     cordelia_network::channel_announce::validate_descriptor(&joined.descriptor)
                 {
+                    // Both are what the peer sent, or hold it.
                     tracing::warn!(
                         peer = %peer_id,
-                        channel = %joined.channel_id,
-                        error = %e,
+                        channel = %as_a_peer_sent_it(&joined.channel_id),
+                        error = %as_a_peer_sent_it(&e.to_string()),
                         "channel-announce: invalid descriptor"
                     );
                     continue;
@@ -5208,6 +5229,74 @@ mod tests {
         // Whether or not the database can be asked for the channel's scope.
         assert!(!passed_on(None, &swarm));
         assert!(passed_on(None, &group));
+    }
+
+    /// A relay stores nothing of a channel whose ID may not be told to a
+    /// peer: it would hold, under an ID that holds a name, what it never
+    /// lists, serves or passes on. An item of such a channel is refused as
+    /// one that is not valid, and nothing is made for its channel. A
+    /// device, which stores only what belongs in the channels it holds, is
+    /// as it was.
+    #[test]
+    fn a_relay_stores_no_item_of_a_channel_whose_id_holds_a_name() {
+        use cordelia_network::messages::REFUSED_INVALID;
+        use cordelia_storage::channels;
+        let relay = cordelia_storage::db::open_in_memory().unwrap();
+        let author = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let swarm = cordelia_storage::naming::swarm_channel_id("lead_a1b2");
+
+        let item = arriving_in(&author, &swarm, vec![7; 40]);
+        assert_eq!(
+            store_item(&relay, &item, "relay", &[0x0E; 32]),
+            Err(REFUSED_INVALID)
+        );
+        assert!(!channels::exists(&relay, &swarm).unwrap());
+        assert_eq!(
+            channels::list_stored_channel_ids(&relay).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // An item of another channel, by the same author, is stored.
+        let other = arriving_in(&author, A_CHANNEL, vec![8; 40]);
+        assert_eq!(store_item(&relay, &other, "relay", &[0x0E; 32]), Ok(true));
+
+        // A device that holds such a channel stores what arrives in it,
+        // as it stores what arrives in any channel of that kind.
+        let (device, [_, _, _, held]) = a_node_that_holds_a_swarm_channel(&author);
+        let more = arriving_in(&author, &held, vec![9; 40]);
+        assert_eq!(
+            store_item(&device, &more, "personal", &author.public_key()),
+            Ok(true)
+        );
+    }
+
+    /// Text that a peer chose goes into a warning as its first 64
+    /// characters, with whatever could act on a terminal or pass for
+    /// another line shown as escapes. A peer chooses what an announcement
+    /// names and how long the name is, and the error for an announcement
+    /// that is not valid holds that name too.
+    #[test]
+    fn what_a_peer_sent_goes_into_a_warning_short_and_escaped() {
+        assert_eq!(as_a_peer_sent_it("grp_550e8400"), "grp_550e8400");
+        assert_eq!(as_a_peer_sent_it(&"x".repeat(100_000)), "x".repeat(64));
+        // Characters are counted, not bytes.
+        assert_eq!(
+            as_a_peer_sent_it(&"\u{e9}".repeat(100)),
+            "\u{e9}".repeat(64)
+        );
+
+        let hostile = "grp_\u{1b}[2J\n2026-10-05 INFO a line of its own\u{202e}";
+        let shown = as_a_peer_sent_it(hostile);
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.starts_with("grp_\\u{1b}[2J\\n2026"), "{shown:?}");
+        assert!(shown.ends_with("\\u{202e}"), "{shown:?}");
+
+        let error = cordelia_network::channel_announce::ChannelAnnounceError::InvalidSignature(
+            format!("{}\n", "x".repeat(100_000)),
+        );
+        let shown = as_a_peer_sent_it(&error.to_string());
+        assert_eq!(shown.chars().count(), 64);
+        assert!(shown.starts_with("invalid descriptor signature"), "{shown}");
     }
 
     /// T3. What a relay keeps for a peer it fetches from is bounded for
