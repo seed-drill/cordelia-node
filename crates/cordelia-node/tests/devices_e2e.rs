@@ -93,14 +93,14 @@ fn add_device_accept_and_sync_through_a_relay() {
 
     // The documented flow: one key copied in each direction.
     let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["add-device", &b_key, "--name", "b"]);
+    let added = a.cli(&["old-add-device", &b_key, "--name", "b"]);
     let a_key = added
         .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia accept "))
+        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
         .unwrap_or_else(|| panic!("add-device output lacks the accept line:\n{added}"))
         .to_string();
     assert_eq!(a_key, a.cli(&["id"]).trim());
-    b.cli(&["accept", &a_key, "--name", "a"]);
+    b.cli(&["old-accept", &a_key, "--name", "a"]);
 
     let personal = groups(&a)
         .into_iter()
@@ -110,7 +110,7 @@ fn add_device_accept_and_sync_through_a_relay() {
         groups(&b).contains(&personal).then_some(())
     });
 
-    let devices = b.post("/api/v1/devices/list", serde_json::json!({}));
+    let devices = b.post("/api/v1/old-devices/list", serde_json::json!({}));
     assert!(
         devices["devices"]
             .as_array()
@@ -138,7 +138,7 @@ fn add_device_accept_and_sync_through_a_relay() {
     });
 
     // Nothing is waiting: every invite was applied.
-    let invites = b.cli(&["invites"]);
+    let invites = b.cli(&["old-invites"]);
     assert!(invites.contains("No invites waiting"), "{invites}");
 
     // Keyed items (§4.3): A writes a key, B reads it; B edits, A sees it.
@@ -309,8 +309,8 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
 
     let b_key = b.cli(&["id"]).trim().to_string();
     let a_key = a.cli(&["id"]).trim().to_string();
-    a.cli(&["add-device", &b_key, "--name", "b"]);
-    b.cli(&["accept", &a_key, "--name", "a"]);
+    a.cli(&["old-add-device", &b_key, "--name", "b"]);
+    b.cli(&["old-accept", &a_key, "--name", "a"]);
     let personal = groups(&a)
         .into_iter()
         .next()
@@ -1234,7 +1234,7 @@ fn a_command_asks_its_own_node_and_no_proxy() {
         command.output().unwrap()
     };
     // One that reads, one that posts, and the one that does both.
-    for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
+    for args in [&["peers", "--json"][..], &["old-devices"], &["status"]] {
         let out = run(args);
         assert!(
             out.status.success(),
@@ -1247,7 +1247,7 @@ fn a_command_asks_its_own_node_and_no_proxy() {
     // The answers came from the node: its own key is in what it lists,
     // and `status`, which succeeds whether or not it reached a node, says
     // that it did.
-    let listed = String::from_utf8_lossy(&run(&["devices"]).stdout).into_owned();
+    let listed = String::from_utf8_lossy(&run(&["old-devices"]).stdout).into_owned();
     assert!(listed.contains("this device"), "{listed}");
     let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
     assert!(status.contains("Running:   yes"), "{status}");
@@ -1273,7 +1273,7 @@ fn a_command_asks_no_address_but_the_nodes_own() {
     for other in ["127.0.0.2", "localhost"] {
         let given = [("CORDELIA_BIND_ADDRESS", other)];
         let named = format!("'{other}'");
-        for args in [&["peers", "--json"][..], &["devices"]] {
+        for args in [&["peers", "--json"][..], &["old-devices"]] {
             let out = n.command_given(&given, args);
             let said = String::from_utf8_lossy(&out.stderr);
             assert!(!out.status.success(), "cordelia {args:?}");
@@ -1368,7 +1368,7 @@ fn a_node_at_the_ipv6_address_is_reached_there() {
         said.contains("Running:   yes").then_some(())
     };
     wait_for("the node to answer at ::1", &[&n], 30, running);
-    let out = n.command_given(&given, &["devices"]);
+    let out = n.command_given(&given, &["old-devices"]);
     let listed = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && listed.contains("this device"),
@@ -1453,7 +1453,7 @@ fn a_command_follows_no_redirect() {
     assert!(said.contains("Running:   no (start it"), "{said}");
     // One that reads, and one that posts: each fails, says that what
     // answered is not the node, and repeats nothing of what it said.
-    for args in [&["peers", "--json"][..], &["devices"]] {
+    for args in [&["peers", "--json"][..], &["old-devices"]] {
         let out = n.command(args);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "cordelia {args:?}: {said}");
@@ -1468,7 +1468,7 @@ fn a_command_follows_no_redirect() {
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
-    let stderr = n.refused(&["devices"]);
+    let stderr = n.refused(&["old-devices"]);
     assert!(stderr.contains("cordelia start"), "{stderr}");
 
     // `status` still works, and says the node is not running.
@@ -1587,13 +1587,13 @@ fn claude_memory_syncs_between_two_machines() {
 
     // Pair, then switch sync on.
     let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["add-device", &b_key]);
+    let added = a.cli(&["old-add-device", &b_key]);
     let a_key = added
         .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia accept "))
+        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
         .unwrap()
         .to_string();
-    b.cli(&["accept", &a_key]);
+    b.cli(&["old-accept", &a_key]);
     for n in [&a, &b] {
         let out = n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
         assert!(out.starts_with("Sync turned on.\n"), "{out}");

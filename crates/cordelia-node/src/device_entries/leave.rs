@@ -55,27 +55,49 @@
 //! sent, and nothing is taken. So nothing is sent in a channel that the
 //! device has left, and nothing is written down of one.
 //!
+//! **One channel is read without leave: the pair channel of a key typed
+//! at `cordelia accept`,** for the hour that `accept` allows (§4.6, §5.1).
+//! A device that follows no phrase has nothing to show, and one that has
+//! stopped has no leave, and each has to be handed a change.
+//! [`Leave::pair`] is the one door for that, beside the one way in, and
+//! it can do nothing else. It is given a key, and no channel and no
+//! request: the key must be one that the device keeps as typed within
+//! the last hour, with no hand-over taken since, which is read from the
+//! database here. The channel is derived here, from that key and the
+//! device's own. The two requests are made here: a proof of that
+//! channel's key, and a pull of its first page. Nothing is pushed, and no
+//! place is kept. What comes back is given to
+//! [`cordelia_api::adding::accept_typed`], which judges a hand-over by
+//! the state the device is in, and to nothing else.
+//!
 //! A connection is a [`Link`], which keeps the connection to itself:
 //! outside this file there is no way to open a stream on one but
-//! [`Leave::show`] and [`Leave::open`].
+//! [`Leave::show`], [`Leave::open`] and [`Leave::pair`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use cordelia_api::adding::{self, Accepted};
 use cordelia_api::at_relays::{self, Stands};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
-    OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    ENTRY_PAGE_MAX_ENTRIES, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
+    WAKE_WAIT_SECS,
 };
-use cordelia_crypto::entry::CheckedEntry;
+use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
-    EntryRefused, EntryShow, EntryShowShort, Protocol, ShowAnswer, WireMessage,
+    ChannelProve, EntryPull, EntryRefused, EntryShow, EntryShowShort, Protocol, ShowAnswer,
+    WireMessage,
 };
 use cordelia_network::rate_limit::RateCounter;
 use cordelia_network::{codec, transport};
+use cordelia_storage::acts::TypedKey;
 use cordelia_storage::person::State;
+use cordelia_storage::relay::NO_MARK;
 use rusqlite::Connection;
 
 /// How long a leave lasts.
@@ -285,6 +307,21 @@ pub struct Asked<'a> {
     /// A proof of a channel's key, a pull of a page, or a push of
     /// entries.
     pub request: &'a WireMessage,
+}
+
+/// What a relay handed of the pair channel of a key that a person typed
+/// ([`Leave::pair`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairRead {
+    /// The key reads nothing now: its hour has gone, a hand-over was
+    /// taken with it, or a person has typed it again since. Nothing was
+    /// asked of the relay.
+    NotNow,
+    /// The relay does not hold the channel, as it answered the proof.
+    NotHeld,
+    /// What became of each entry that the relay handed and that the
+    /// device of the typed key signed, in the relay's order.
+    Read(Vec<Accepted>),
 }
 
 /// What a show was answered, and what it cost to send.
@@ -590,6 +627,117 @@ impl Leave {
         let conn = lock(db);
         self.may_use(&conn, link, under)?;
         Ok(take(&conn, answer))
+    }
+
+    /// The one door beside the one way in (decision 2026-10-04 §4.6):
+    /// read, on `link`, the pair channel of this device and the key
+    /// `typed`, which a person typed at `cordelia accept`, and give what
+    /// the device of that key wrote there to
+    /// [`adding::accept_typed`]. No leave is asked: a device that follows
+    /// no phrase has nothing to show, and one that has stopped has no
+    /// leave, and each is handed a change this way.
+    ///
+    /// It does that and nothing else (see the module's documentation):
+    ///
+    /// - The key is read again from the database, under its lock: one
+    ///   that the device does not keep as typed then, within its hour and
+    ///   with no hand-over taken, reads nothing, and the relay is asked
+    ///   nothing.
+    /// - The channel is this device's pair channel with that key, derived
+    ///   here. No caller names a channel.
+    /// - Two requests are made, each built here: a proof of the
+    ///   channel's key, and a pull of its first page, from the start.
+    ///   Each counts against what the device asks of a relay in a
+    ///   minute. Nothing is pushed.
+    /// - Of what comes back, each entry of that channel that the typed
+    ///   key signed is given to [`adding::accept_typed`], under the
+    ///   database's lock, and to nothing else: none is stored, and no
+    ///   place is kept. An entry of another channel, or by another key,
+    ///   is dropped.
+    ///
+    /// `sync_on` says whether sync is on here, as the database says it.
+    pub async fn pair(
+        &self,
+        db: &Mutex<Connection>,
+        identity: &NodeIdentity,
+        link: &Link,
+        typed: &TypedKey,
+        sync_on: impl Fn(&Connection) -> bool,
+    ) -> Result<PairRead, Refused> {
+        let reads = |conn: &Connection, now: i64| {
+            adding::keys_that_read(conn, now).is_ok_and(|keys| {
+                keys.iter()
+                    .any(|kept| kept.key == typed.key && kept.typed_at == typed.typed_at)
+            })
+        };
+        if !reads(&lock(db), self.clock.unix()) {
+            return Ok(PairRead::NotNow);
+        }
+        let not = |why: &str| Refused::NotAnswered(why.to_string());
+        let secret =
+            derive::pair_secret(identity, &typed.key).map_err(|_| not("no pair channel"))?;
+        let channel = derive::channel_id(&secret).map_err(|_| not("no pair channel"))?;
+        let session = link.session().ok_or_else(|| not("no session"))?;
+        let proof =
+            proof::make(&secret, &session, &identity.public_key()).map_err(|_| not("no proof"))?;
+
+        let prove = WireMessage::ChannelProve(ChannelProve { channel, proof });
+        let proved = match self.asks(link, Protocol::ChannelProve, &prove).await? {
+            WireMessage::ChannelProved(proved) => proved.proved,
+            _ => return Err(not("a proof was not answered as one")),
+        };
+        if !proved {
+            return Ok(PairRead::NotHeld);
+        }
+        let pull = WireMessage::EntryPull(EntryPull {
+            channel,
+            mark: NO_MARK,
+            after: 0,
+            limit: ENTRY_PAGE_MAX_ENTRIES,
+        });
+        let page = match self.asks(link, Protocol::EntryPull, &pull).await? {
+            WireMessage::EntryPulled(page) => page,
+            _ => return Err(not("a pull was not answered with a page")),
+        };
+        // Each entry is checked as whatever a device is sent is checked,
+        // with no database held.
+        let handed: Vec<CheckedEntry> = page
+            .entries
+            .iter()
+            .take(ENTRY_PAGE_MAX_ENTRIES as usize)
+            .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+            .filter(|entry| entry.channel == channel && entry.author == typed.key)
+            .collect();
+        let mut read = Vec::new();
+        for entry in &handed {
+            let conn = lock(db);
+            let now = self.clock.unix();
+            match adding::accept_typed(&conn, identity, typed, sync_on(&conn), entry, now) {
+                Ok(Some(accepted)) => read.push(accepted),
+                // The key reads nothing more: it was spent, or typed
+                // again, or its hour went by.
+                Ok(None) => break,
+                Err(e) => return Err(not(&format!("could not judge a hand-over: {e}"))),
+            }
+        }
+        Ok(PairRead::Read(read))
+    }
+
+    /// Ask `request` of the relay at `link` on a stream of `protocol`,
+    /// for the pair channel of a typed key, where the device has not
+    /// asked as much of that relay as it asks in a minute.
+    async fn asks(
+        &self,
+        link: &Link,
+        protocol: Protocol,
+        request: &WireMessage,
+    ) -> Result<WireMessage, Refused> {
+        if !lock(&self.inner).may_ask(link.name()) {
+            return Err(Refused::AskedEnough);
+        }
+        ask(&link.conn, protocol, request)
+            .await
+            .map_err(Refused::NotAnswered)
     }
 
     /// Whether a request that was built under the change entry named

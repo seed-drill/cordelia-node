@@ -77,7 +77,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cordelia_api::adding::{drop_old_hand_overs, write_over_dropped};
+use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
 use cordelia_api::at_relays::{
     self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
 };
@@ -95,12 +95,13 @@ use cordelia_network::messages::{
     ChannelProve, EntryPull, EntryPush, EntryRefused, PushAnswer, ShowAnswer, WireMessage,
 };
 use cordelia_network::rate_limit::ByteCounter;
+use cordelia_storage::acts::TypedKey;
 use cordelia_storage::entries::Outcome;
 use cordelia_storage::person::State;
 use cordelia_storage::relay::{Mark, NO_MARK};
 use rusqlite::Connection;
 
-pub use leave::{Asked, Clock, Leave, Link, LinkId, NoLeave, Refused};
+pub use leave::{Asked, Clock, Leave, Link, LinkId, NoLeave, PairRead, Refused};
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -278,6 +279,9 @@ pub struct DeviceEntries {
     waking: tokio::sync::Mutex<()>,
     /// One turn at a time at each relay, by the relay's name.
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One asking at a time at each relay for what the device of a typed
+    /// key hands over, by the relay's name.
+    asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DeviceEntries {
@@ -290,6 +294,7 @@ impl DeviceEntries {
             kept: Mutex::default(),
             waking: tokio::sync::Mutex::new(()),
             turns: Mutex::default(),
+            asking: Mutex::default(),
         })
     }
 
@@ -315,12 +320,94 @@ impl DeviceEntries {
     /// comes back when each has ended. A relay at which a turn of an
     /// earlier pass is still running is left out of this one, and no
     /// other relay waits for it.
+    ///
+    /// The whole pass also asks each relay for what the device of a key
+    /// typed at `cordelia accept` hands over, beside everything else and
+    /// whatever state the device is in ([`Self::asks_for_hand_overs`]).
+    /// A whole pass is counted as it begins and as it ends, for a
+    /// command that waits for one ([`cordelia_api::state::OwnChannels`]).
     pub async fn pass(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
+        let whole = kind == Pass::Whole;
+        let number = whole.then(|| self.state.own_channels.whole_pass_begins());
         let links: Vec<&Link> = relays
             .iter()
             .filter_map(|relay| relay.link.as_ref())
             .filter(|link| link.is_open())
             .collect();
+        let mut asking = tokio::task::JoinSet::new();
+        if whole {
+            let typed = adding::keys_that_read(&lock(&self.state.db), self.clock.unix());
+            let typed = typed.unwrap_or_default();
+            for link in links.iter().filter(|_| !typed.is_empty()) {
+                let (engine, link, typed) = (Arc::clone(self), (*link).clone(), typed.clone());
+                asking.spawn(async move { engine.asks_for_hand_overs(&link, &typed).await });
+            }
+        }
+        self.pass_at(relays, &links, kind).await;
+        let mut taken = false;
+        while let Some(done) = asking.join_next().await {
+            taken |= done.unwrap_or(false);
+        }
+        // The device stands elsewhere than the pass found it: it says so
+        // now, and makes its next pass at once, under what it was
+        // handed.
+        if taken {
+            let stands = at_relays::stands(&lock(&self.state.db));
+            if let Ok(stands) = stands {
+                self.say(relays, stands);
+            }
+            self.state.own_channels.ask_whole();
+        }
+        if let Some(number) = number {
+            self.state.own_channels.whole_pass_ended(number);
+        }
+    }
+
+    /// Ask the relay at `link` for what the device of each key in `typed`
+    /// hands over, through the one door for that ([`Leave::pair`]):
+    /// keys that a person typed at `cordelia accept` within the last
+    /// hour (decision 2026-10-04 §4.6, §5.1). Says whether a hand-over
+    /// was taken.
+    ///
+    /// One asking runs at a time at a relay: one that finds another
+    /// running there does nothing.
+    async fn asks_for_hand_overs(&self, link: &Link, typed: &[TypedKey]) -> bool {
+        let asking = {
+            let mut asking = lock(&self.asking);
+            Arc::clone(asking.entry(link.name().to_string()).or_default())
+        };
+        let Ok(_asking) = asking.try_lock() else {
+            return false;
+        };
+        let sync_on = |db: &Connection| cordelia_api::commands::sync_is_on(db).unwrap_or(true);
+        let mut taken = false;
+        for key in typed {
+            let read = self
+                .leave
+                .pair(&self.state.db, &self.state.identity, link, key, sync_on)
+                .await;
+            match read {
+                Ok(PairRead::Read(each)) => {
+                    for accepted in &each {
+                        tracing::info!(
+                            relay = link.name(),
+                            "what a typed key's device handed over: {}",
+                            accepted.says()
+                        );
+                        taken |= !matches!(accepted, Accepted::Refused(_));
+                    }
+                }
+                Ok(PairRead::NotNow | PairRead::NotHeld) => {}
+                Err(e) => {
+                    tracing::debug!(relay = link.name(), error = ?e, "could not ask for a hand-over");
+                }
+            }
+        }
+        taken
+    }
+
+    /// [`Self::pass`], for the channels of the device's own.
+    async fn pass_at(self: &Arc<Self>, relays: &[Relay], links: &[&Link], kind: Pass) {
         let stands = at_relays::stands(&lock(&self.state.db));
         let stands = match stands {
             Ok(stands) => stands,
@@ -336,8 +423,8 @@ impl DeviceEntries {
             return;
         }
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
-        self.leave.reaches(&names, &links);
-        self.forget_gone(&links);
+        self.leave.reaches(&names, links);
+        self.forget_gone(links);
         // A change that could not be applied is tried again, whichever
         // relays are reached now.
         self.try_again();
@@ -365,7 +452,7 @@ impl DeviceEntries {
                 return;
             };
             let mut shows = tokio::task::JoinSet::new();
-            for link in &links {
+            for link in links {
                 if whole || !self.leave.has_heard(link.name()) {
                     let (engine, link) = (Arc::clone(self), (*link).clone());
                     shows.spawn(async move { (link.id(), engine.show_at(&link).await) });
@@ -384,7 +471,7 @@ impl DeviceEntries {
 
         // Awake: each relay has its turn, and none waits for another.
         let mut turns = tokio::task::JoinSet::new();
-        for link in &links {
+        for link in links {
             let shown = shown.get(&link.id()).copied();
             let (engine, link) = (Arc::clone(self), (*link).clone());
             turns.spawn(async move { engine.turn(&link, kind, shown).await });

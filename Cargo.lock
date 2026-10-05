@@ -758,6 +758,7 @@ dependencies = [
  "hex",
  "quinn",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
@@ -765,6 +766,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

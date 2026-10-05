@@ -897,7 +897,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     // A second device, so that there is a personal channel. It never runs.
     let b = node("b", "personal", None);
     let b_key = b.cli(&["id"]).trim().to_string();
-    a.cli(&["add-device", &b_key, "--name", "laptop"]);
+    a.cli(&["old-add-device", &b_key, "--name", "laptop"]);
     let personal = groups(&a).into_iter().next().expect("a personal channel");
     a.stop();
 
@@ -930,7 +930,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     // The devices are the real ones, and nothing else is said of the key:
     // not where the person looks at their devices, and not in the status
     // that panels read.
-    let devices = a.post("/api/v1/devices/list", serde_json::json!({}));
+    let devices = a.post("/api/v1/old-devices/list", serde_json::json!({}));
     let keys: Vec<&str> = devices["devices"]
         .as_array()
         .into_iter()
@@ -942,7 +942,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     assert!(devices["not_devices"].is_null(), "{devices}");
     let status = a.cli(&["status", "--json"]);
     assert!(!status.contains(&listed_as), "{status}");
-    let said = a.cli(&["devices"]);
+    let said = a.cli(&["old-devices"]);
     assert!(!said.contains(&listed_as), "{said}");
     // The log says what was done, that the channels keep their keys, and
     // which channels, by name: no command shows them afterwards.
@@ -965,7 +965,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     let log = std::fs::read_to_string(a.log()).unwrap();
     assert!(!log.contains(taken_off), "{log}");
-    let said = a.refused(&["remove-device", &listed_as]);
+    let said = a.refused(&["old-remove-device", &listed_as]);
     assert!(
         said.contains("not a usable public key, so it is no device's key")
             && said.contains("nothing is removed")
@@ -974,7 +974,7 @@ fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
     );
 
     // A real device is removed as it always was.
-    let said = a.cli(&["remove-device", &b_key]);
+    let said = a.cli(&["old-remove-device", &b_key]);
     assert!(
         said.contains("from 1 channel and rotated its key"),
         "{said}"
@@ -1053,7 +1053,7 @@ fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
 
     // A removes R. R is not told, and writes on.
     let r_key = r.cli(&["id"]).trim().to_string();
-    a.cli(&["remove-device", &r_key]);
+    a.cli(&["old-remove-device", &r_key]);
     assert_eq!(reads(&a), held, "removing r changed what the channel holds");
     publish(&r, "edited.md", "after removal");
     publish(&r, "created.md", "after removal");
@@ -1125,7 +1125,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
     // Adding a device writes one item for the relay: the offer to it.
     let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
     let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
-    a.cli(&["add-device", &other]);
+    a.cli(&["old-add-device", &other]);
 
     // Refused twice: the item is still waiting, and status says a relay
     // refused it and why.
@@ -1188,7 +1188,7 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
     let (b_key, r_key) = (key_of(&b), key_of(&r));
     // The devices a node lists, by key.
     let devices = |n: &Node| -> BTreeMap<String, serde_json::Value> {
-        n.post("/api/v1/devices/list", serde_json::json!({}))["devices"]
+        n.post("/api/v1/old-devices/list", serde_json::json!({}))["devices"]
             .as_array()
             .into_iter()
             .flatten()
@@ -1219,7 +1219,7 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
 
     // B goes away. A removes R, and the relay has it.
     b.stop();
-    a.cli(&["remove-device", &r_key]);
+    a.cli(&["old-remove-device", &r_key]);
     wait_for("the removal reached the relay", &[&relay, &a], 60, || {
         (status(&a)["outbox_waiting"] == 0).then_some(())
     });

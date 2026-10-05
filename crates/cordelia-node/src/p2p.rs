@@ -2690,6 +2690,14 @@ pub async fn p2p_loop(
                 device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
             }
 
+            // A command asked for a whole pass: the show to each relay,
+            // and the fetch, before it prepares a change; the first show
+            // of a new phrase; the asking for what a typed key's device
+            // hands over (decision 2026-10-04 §5.1, §5.2, §7.1).
+            _ = state.own_channels.wait_asked(), if device_entries.is_some() => {
+                device_pass(&device_entries, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
+            }
+
             // ── Entries of channels from their secrets, on a relay ────
             // What nobody uses goes after 90 days (decision 2026-10-04
             // §2.5). Off the select loop: it writes under the db lock.

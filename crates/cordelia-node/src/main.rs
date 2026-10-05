@@ -14,7 +14,9 @@ use cordelia_crypto::identity::NodeIdentity;
 mod history_cmd;
 mod indicator;
 mod p2p;
+mod person_cmd;
 mod relay_entries;
+mod terminal;
 
 #[derive(Parser)]
 #[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
@@ -51,6 +53,12 @@ enum Commands {
         /// Show secrets (node token) in output
         #[arg(long)]
         show_secrets: bool,
+
+        /// Give this device a new key: it leaves the devices it is with,
+        /// keeps its memory folders and their mappings, and follows no
+        /// recovery phrase. Asks at a terminal.
+        #[arg(long, conflicts_with_all = ["name", "force", "show_secrets"])]
+        new_key: bool,
     },
     /// Show node status (`--line` for a status bar, `--json` for tools)
     Status {
@@ -85,7 +93,16 @@ enum Commands {
     /// Print this device's public key (give it to `add-device` elsewhere)
     #[command(alias = "pubkey")]
     Id,
-    /// Add another of your devices; then run `cordelia accept` on it
+    /// Make the recovery phrase of your devices on this one: twelve
+    /// words, shown once. Asks at a terminal.
+    Phrase {
+        /// What your devices call this one, e.g. "laptop" (default: the
+        /// machine's name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Add another of your devices; then run `cordelia accept` on it,
+    /// within the hour. Asks at a terminal.
     AddDevice {
         /// The other device's key, from `cordelia id` on that device
         key: String,
@@ -93,23 +110,52 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Trust the device that added this one with `add-device`
+    /// Take what the device that added this one hands over. Asks at a
+    /// terminal.
     Accept {
         /// The key printed by `add-device` on the other device
         key: String,
-        /// A name for the device, e.g. "laptop"
+    },
+    /// Remove one of your devices, with the recovery phrase. Asks at a
+    /// terminal.
+    RemoveDevice {
+        /// The device's key, as `cordelia devices` lists it
+        key: String,
+    },
+    /// Give the devices that stay a new secret, with the recovery
+    /// phrase: of each device added since the last change, you say
+    /// whether it stays. Asks at a terminal.
+    Renew,
+    /// Settle two changes that were made apart, with the recovery
+    /// phrase, on a device that has seen both. Asks at a terminal.
+    Settle,
+    /// List your devices, what each has applied, and what each relay
+    /// holds
+    Devices {
+        /// Go through what this device is to tell you, and clear what
+        /// you say yes to. Asks at a terminal.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// The devices of the older kind of channel, which sync still uses.
+    #[command(name = "old-add-device", hide = true)]
+    OldAddDevice {
+        key: String,
         #[arg(long)]
         name: Option<String>,
     },
-    /// Remove one of your devices and rotate the keys it held
-    RemoveDevice {
-        /// The device's key
+    #[command(name = "old-accept", hide = true)]
+    OldAccept {
         key: String,
+        #[arg(long)]
+        name: Option<String>,
     },
-    /// List your devices
-    Devices,
-    /// List invites waiting for `accept`
-    Invites,
+    #[command(name = "old-remove-device", hide = true)]
+    OldRemoveDevice { key: String },
+    #[command(name = "old-devices", hide = true)]
+    OldDevices,
+    #[command(name = "old-invites", hide = true)]
+    OldInvites,
     /// Sync an agent's memory across your devices
     Sync {
         #[command(subcommand)]
@@ -244,11 +290,13 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Init { new_key: true, .. }) => person_cmd::new_key(&cli.config),
         Some(Commands::Init {
             name,
             non_interactive,
             force,
             show_secrets,
+            new_key: false,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
         Some(Commands::Status { line, json, waybar }) => {
             cmd_status(&cli.config, line, json, waybar)
@@ -262,11 +310,18 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats { json }) => cmd_stats(&cli.config, json),
         Some(Commands::Id) => cmd_pubkey(&cli.config),
-        Some(Commands::AddDevice { key, name }) => cmd_add_device(&cli.config, &key, name),
-        Some(Commands::Accept { key, name }) => cmd_accept(&cli.config, &key, name),
-        Some(Commands::RemoveDevice { key }) => cmd_remove_device(&cli.config, &key),
-        Some(Commands::Devices) => cmd_devices(&cli.config),
-        Some(Commands::Invites) => cmd_invites(&cli.config),
+        Some(Commands::Phrase { name }) => person_cmd::phrase(&cli.config, name),
+        Some(Commands::AddDevice { key, name }) => person_cmd::add_device(&cli.config, &key, name),
+        Some(Commands::Accept { key }) => person_cmd::accept(&cli.config, &key),
+        Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
+        Some(Commands::Renew) => person_cmd::renew(&cli.config),
+        Some(Commands::Settle) => person_cmd::settle(&cli.config),
+        Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
+        Some(Commands::OldAddDevice { key, name }) => cmd_add_device(&cli.config, &key, name),
+        Some(Commands::OldAccept { key, name }) => cmd_accept(&cli.config, &key, name),
+        Some(Commands::OldRemoveDevice { key }) => cmd_remove_device(&cli.config, &key),
+        Some(Commands::OldDevices) => cmd_devices(&cli.config),
+        Some(Commands::OldInvites) => cmd_invites(&cli.config),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::History {
             of,
@@ -585,8 +640,14 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 out["peers"]["list"] = peers["peers"].clone();
                 out["peers"]["relays"] = peers["relays"].clone();
             }
-            if let Ok(devices) = local_api(&config, true, "/api/v1/devices/list", timeout) {
+            if let Ok(devices) = local_api(&config, true, "/api/v1/old-devices/list", timeout) {
                 out["devices"] = devices["devices"].clone();
+            }
+            // What this device holds of its person, under a recovery
+            // phrase (decision 2026-10-04 §8): where it stands, what it
+            // says in words, and what it is to tell a person.
+            if let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout) {
+                out["person"] = person;
             }
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -660,6 +721,16 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 }
                 for e in &status.facts.errors {
                     println!("    error:    {e}");
+                }
+                // What this device says of itself and its person's
+                // devices (decision 2026-10-04 §5.1, §5.2, §8).
+                let timeout = std::time::Duration::from_secs(3);
+                if let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout) {
+                    let (short, says) = person_cmd::status_lines(&person);
+                    println!("  Devices:   {short}");
+                    for line in says {
+                        println!("    {line}");
+                    }
                 }
             }
         }
@@ -2235,6 +2306,70 @@ fn api_post_within(
     Ok(json)
 }
 
+/// What the node answered a command.
+pub(crate) enum Told {
+    /// It did what was asked, and says this.
+    Yes(serde_json::Value),
+    /// It refused: the HTTP status, and why, in its words.
+    No { status: u16, message: String },
+}
+
+/// POST `body` to the local node's API, waiting for `limit`, and give
+/// back what it answered, a refusal among it: for a command that does
+/// something else where the node refuses for one reason than where it
+/// refuses for another. A node that is not reached, or an answer that is
+/// not the node's, is an error.
+pub(crate) fn api_post_told(
+    config_path: &str,
+    path: &str,
+    body: serde_json::Value,
+    limit: Option<std::time::Duration>,
+) -> anyhow::Result<Told> {
+    let config_file = config::expand_tilde(config_path);
+    let mut config = Config::load(&config_file)?;
+    config.apply_env_overrides();
+    let (client, url) = to_this_machine(&config, path, limit)?;
+    let token_path = config.token_path();
+    let token = std::fs::read_to_string(&token_path).map_err(|e| {
+        anyhow::anyhow!(
+            "read node token {}: {e}. Run `cordelia init` first.",
+            token_path.display()
+        )
+    })?;
+    let agent: ureq::Agent = client.http_status_as_error(false).build().into();
+    let mut resp = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", token.trim()))
+        .send_json(&body)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
+            )
+        })?;
+    let status = resp.status();
+    if status.is_redirection() {
+        anyhow::bail!("what answered at {url} is not the node (HTTP {status})");
+    }
+    let json: serde_json::Value = resp
+        .body_mut()
+        .read_json()
+        .unwrap_or(serde_json::Value::Null);
+    if status.is_success() {
+        return Ok(Told::Yes(json));
+    }
+    let message = json["error"]["message"]
+        .as_str()
+        .map(|said| {
+            let said = said.strip_prefix("bad request: ").unwrap_or(said);
+            said.strip_prefix("conflict: ").unwrap_or(said).to_string()
+        })
+        .unwrap_or_else(|| format!("HTTP {status}"));
+    Ok(Told::No {
+        status: status.as_u16(),
+        message,
+    })
+}
+
 /// Set once this command has said that the node is another version, so that
 /// it is not said again beside a refusal.
 static VERSION_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2296,7 +2431,7 @@ fn mapping_meant<'a>(
 fn cmd_add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
     let resp = api_post(
         config_path,
-        "/api/v1/devices/add",
+        "/api/v1/old-devices/add",
         serde_json::json!({ "device": key, "name": name }),
     )?;
     let channels = resp["channels"].as_array().map(Vec::len).unwrap_or(0);
@@ -2308,14 +2443,14 @@ fn cmd_add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     );
     println!();
     println!("On the other device, run:");
-    println!("  cordelia accept {this_device}");
+    println!("  cordelia old-accept {this_device}");
     Ok(())
 }
 
 fn cmd_accept(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
     let resp = api_post(
         config_path,
-        "/api/v1/devices/accept",
+        "/api/v1/old-devices/accept",
         serde_json::json!({ "key": key, "name": name }),
     )?;
     let joined = resp["applied"].as_array().map(Vec::len).unwrap_or(0);
@@ -2343,7 +2478,7 @@ fn cmd_accept(config_path: &str, key: &str, name: Option<String>) -> anyhow::Res
 fn cmd_remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
     let resp = api_post(
         config_path,
-        "/api/v1/devices/remove",
+        "/api/v1/old-devices/remove",
         serde_json::json!({ "device": key }),
     )?;
     let rotated = resp["channels_rotated"]
@@ -2369,7 +2504,11 @@ fn cmd_remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
-    let resp = api_post(config_path, "/api/v1/devices/list", serde_json::json!({}))?;
+    let resp = api_post(
+        config_path,
+        "/api/v1/old-devices/list",
+        serde_json::json!({}),
+    )?;
     for d in resp["devices"].as_array().into_iter().flatten() {
         let key = d["key"].as_str().unwrap_or_default();
         let name = d["name"].as_str().unwrap_or("");
@@ -2406,7 +2545,11 @@ fn unconfirmed_for(since: &serde_json::Value) -> Option<i64> {
 }
 
 fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
-    let resp = api_post(config_path, "/api/v1/invites/list", serde_json::json!({}))?;
+    let resp = api_post(
+        config_path,
+        "/api/v1/old-invites/list",
+        serde_json::json!({}),
+    )?;
     let pending = resp["pending"].as_array().cloned().unwrap_or_default();
     if pending.is_empty() {
         println!("No invites waiting.");
@@ -2424,7 +2567,7 @@ fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
     println!("These are from keys this device has not accepted.");
     println!(
         "Accept one only if it is another of your own devices, and you added this device \
-         from it: cordelia accept <from>"
+         from it: cordelia old-accept <from>"
     );
     Ok(())
 }

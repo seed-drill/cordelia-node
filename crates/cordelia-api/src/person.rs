@@ -52,6 +52,7 @@
 //! a channel that it left goes with the channel.
 
 use rusqlite::Connection;
+use zeroize::{Zeroize, Zeroizing};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
@@ -959,13 +960,17 @@ pub fn first_entry(
     device: &[u8; 32],
     label: &str,
 ) -> Result<FirstMade, PersonError> {
-    let secret = statement::new_secret()?;
+    let secret = Zeroizing::new(statement::new_secret()?);
     let device = Device::new(*device, label)?;
     let statement =
         Statement::first(device, &secret, phrase.public_key()?)?.sign(&phrase.signing_key()?)?;
-    let entry = change_entry::entry_of(phrase, &statement, &ForPhrase::first(secret))?;
+    let mut for_phrase = ForPhrase::first(*secret);
+    let entry = change_entry::entry_of(phrase, &statement, &for_phrase);
+    // The new secret is in the entry, sealed: what is left of it here is
+    // overwritten.
+    for_phrase.secret.zeroize();
     Ok(FirstMade {
-        entry: entry.check()?,
+        entry: entry?.check()?,
         statement_key: phrase.statement_key()?,
     })
 }

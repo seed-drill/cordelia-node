@@ -658,7 +658,7 @@ async fn test_group_lifecycle() {
 
     // Once the key is one of this person's devices, it can be invited.
     let req = test::TestRequest::post()
-        .uri("/api/v1/devices/add")
+        .uri("/api/v1/old-devices/add")
         .insert_header(auth_header())
         .set_json(json!({ "device": peer_bech32 }))
         .to_request();
@@ -740,7 +740,7 @@ async fn test_the_older_endpoints_seal_to_no_key_that_is_not_usable() {
     let body: serde_json::Value = test::read_body_json(resp).await;
     let group = body["channel_id"].as_str().unwrap().to_string();
     let real = NodeIdentity::generate().unwrap().public_key();
-    let add = post("/api/v1/devices/add", json!({ "device": named(&real) }));
+    let add = post("/api/v1/old-devices/add", json!({ "device": named(&real) }));
     assert_eq!(test::call_service(&app, add).await.status(), 200);
     {
         let db = state.db.lock().unwrap();

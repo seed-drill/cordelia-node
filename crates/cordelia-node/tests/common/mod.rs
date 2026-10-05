@@ -571,13 +571,13 @@ pub fn has_hot_peer(n: &Node) -> Option<()> {
 /// once `b` has joined it.
 pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> String {
     let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["add-device", &b_key, "--name", label]);
+    let added = a.cli(&["old-add-device", &b_key, "--name", label]);
     let a_key = added
         .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia accept "))
+        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
         .unwrap_or_else(|| panic!("add-device output lacks the accept line:\n{added}"))
         .to_string();
-    b.cli(&["accept", &a_key]);
+    b.cli(&["old-accept", &a_key]);
     let personal = groups(a)
         .into_iter()
         .next()
