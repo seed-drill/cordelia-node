@@ -12,7 +12,8 @@
 //! stream, and nothing of the eight is changed by them.
 
 use cordelia_core::protocol::{
-    PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL, PROTOCOL_ENTRY_PUSH, PROTOCOL_ENTRY_SHOW,
+    ENTRY_PAGE_MAX_ENTRIES, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL, PROTOCOL_ENTRY_PUSH,
+    PROTOCOL_ENTRY_SHOW,
 };
 use cordelia_storage::relay;
 use serde::{Deserialize, Serialize};
@@ -372,7 +373,44 @@ pub struct PairingResponse {
 // Decision 2026-10-04 §2.4. An entry travels as its bytes on the wire
 // (`cordelia_crypto::wire`), which whoever receives it reads strictly and
 // checks. A channel's ID is 32 bytes and a proof 64: a message that holds
-// one of another length is not read.
+// one of another length is not read. A push and a page hold at most a
+// page's worth of entries: one that holds more is not read.
+
+/// Read a list of entries, each as its bytes on the wire, that holds at
+/// most a page's worth of them (ENTRY_PAGE_MAX_ENTRIES). A longer list is
+/// refused where its first entry too many is met. Whoever receives a
+/// message checks two signatures for each entry in it: one message makes
+/// it do so for no more entries than a page holds.
+fn at_most_a_page<'de, D>(deserializer: D) -> Result<Vec<ByteBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AtMostAPage;
+
+    impl<'de> serde::de::Visitor<'de> for AtMostAPage {
+        type Value = Vec<ByteBuf>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {ENTRY_PAGE_MAX_ENTRIES} entries")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            while let Some(entry) = seq.next_element::<ByteBuf>()? {
+                if entries.len() >= ENTRY_PAGE_MAX_ENTRIES as usize {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(AtMostAPage)
+}
 
 /// Why an entry was not taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,7 +500,9 @@ pub struct EntryPull {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryPulled {
     /// The entries, each as its bytes on the wire, in the order the
-    /// sender stored them.
+    /// sender stored them. At most ENTRY_PAGE_MAX_ENTRIES: a page that
+    /// holds more is not read.
+    #[serde(deserialize_with = "at_most_a_page")]
     pub entries: Vec<ByteBuf>,
     /// The place to ask after next, in the channel's own order: that of
     /// the last entry here, or the place that was asked after where
@@ -473,7 +513,10 @@ pub struct EntryPulled {
 /// Entry-Push (0x13): entries to be stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryPush {
-    /// The entries, each as its bytes on the wire.
+    /// The entries, each as its bytes on the wire. At most a page's worth
+    /// of them, ENTRY_PAGE_MAX_ENTRIES: a push that holds more is not
+    /// read, and none of it is stored.
+    #[serde(deserialize_with = "at_most_a_page")]
     pub entries: Vec<ByteBuf>,
 }
 
@@ -1222,6 +1265,70 @@ mod tests {
                 "{answer}"
             );
         }
+    }
+
+    /// A push holds at most a page's worth of entries, and so does a
+    /// page: a message that holds one more is not read, whatever the
+    /// entries are.
+    #[test]
+    fn a_push_of_more_than_a_pages_worth_of_entries_is_not_read() {
+        assert_eq!(ENTRY_PAGE_MAX_ENTRIES, 100);
+        let of = |entries: usize| vec![ByteBuf::from(vec![0x5a; 3]); entries];
+        let push = |entries: usize| {
+            decode_message(
+                &encode_message(&WireMessage::EntryPush(EntryPush {
+                    entries: of(entries),
+                }))
+                .unwrap(),
+            )
+        };
+        let page = |entries: usize| {
+            decode_message(
+                &encode_message(&WireMessage::EntryPulled(EntryPulled {
+                    entries: of(entries),
+                    next: 7,
+                }))
+                .unwrap(),
+            )
+        };
+        // A page's worth, and fewer: read, every entry of it.
+        for entries in [0, 1, 99, 100] {
+            let Ok(WireMessage::EntryPush(read)) = push(entries) else {
+                panic!("a push of {entries} entries was not read");
+            };
+            assert_eq!(read.entries, of(entries));
+            let Ok(WireMessage::EntryPulled(read)) = page(entries) else {
+                panic!("a page of {entries} entries was not read");
+            };
+            assert_eq!((read.entries, read.next), (of(entries), 7));
+        }
+        // One more, and many more: not read at all.
+        for entries in [101, 102, 1000, 10_000] {
+            assert!(push(entries).is_err(), "{entries}");
+            assert!(page(entries).is_err(), "{entries}");
+        }
+        // The same by itself, outside the envelope.
+        let alone = |entries: usize| -> Result<EntryPush, _> {
+            ciborium::from_reader(
+                encode(&EntryPush {
+                    entries: of(entries),
+                })
+                .as_slice(),
+            )
+        };
+        assert_eq!(alone(100).unwrap().entries.len(), 100);
+        assert!(alone(101).is_err());
+
+        // The control: real entries, a page's worth of them, are read as
+        // they were sent.
+        let entry = made(1, 5, "what the file holds").to_wire();
+        let full = EntryPush {
+            entries: vec![ByteBuf::from(entry); 100],
+        };
+        let WireMessage::EntryPush(read) = through(&WireMessage::EntryPush(full.clone())) else {
+            panic!("not a push");
+        };
+        assert_eq!(read, full);
     }
 
     /// The answers as they are spelled on the wire: a change to one is a
