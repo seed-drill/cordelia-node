@@ -7,11 +7,18 @@
 //!
 //! ## Reading
 //!
-//! [`current`] reads the slot of a file in a name: its current version
-//! with every entry that is it, the versions that lost a tie, and the next
+//! [`read`] reads the slot of a file in a name: its current version with
+//! every entry that is it, the versions that lost a tie, and the next
 //! revision. It is read under the statement the device has applied, with
-//! its word on who counts. [`known_to_follow`] says whether that version
-//! is known to follow a text: only if each entry held of it shows so.
+//! its word on who counts, and that word is given back with the slot
+//! ([`Read`]): both are of one moment.
+//!
+//! Whether a version is known to follow a text is asked of what was read
+//! ([`Read::follows`], [`follows`]), and of nothing else: only if each
+//! entry held of the version shows so. A caller that asks, and then
+//! plans against the version it asked about, writes over that version or
+//! not at all. There is no way here to ask of whatever the slot holds by
+//! then.
 //!
 //! ## Publishing
 //!
@@ -175,38 +182,51 @@ pub fn publish(
     })
 }
 
-/// The slot of `file` in the name `name`, which this device holds, as it
-/// reads it: under the statement it has applied, with its word on who
-/// counts.
+/// What a device read in a slot, at one moment: the slot, and who counted
+/// for the device then. What a caller asks next, it asks of this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read {
+    /// The slot as it was read: its current version with every entry
+    /// that is it, the versions that lost a tie, and the next revision.
+    pub slot: Slot,
+    /// Who counted, as the device knew them at that read: what the slot
+    /// was read with.
+    pub counting: Counting,
+}
+
+impl Read {
+    /// Whether the current version that was read is known to follow the
+    /// value whose hash is `agreed` ([`value_hash`]): what a folder agreed
+    /// (decision 2026-10-04 §7.3).
+    ///
+    /// It is, where the hash is in the chain of every entry that the
+    /// device held of the version, and in each every newer link was
+    /// signed by a key that counted ([`follows`]). A slot that held no
+    /// version follows nothing.
+    pub fn follows(&self, agreed: &[u8; 32]) -> bool {
+        self.slot
+            .current
+            .as_ref()
+            .is_some_and(|version| follows(version, agreed, &self.counting))
+    }
+}
+
+/// Read the slot of `file` in the name `name`, which this device holds:
+/// under the statement it has applied, with its word on who counts. The
+/// slot and that word are read in one transaction, and given together.
 ///
 /// A device that has stopped reads what it holds as any device does: it
 /// takes nothing by reading.
-pub fn current(conn: &Connection, name: &str, file: &str) -> Result<Slot, PersonError> {
-    let standing = Standing::of(conn)?;
-    let channel = standing.name_secret(conn, name)?;
-    standing.slot(conn, &channel, file)
-}
-
-/// Whether the current version of `file` in the name `name` is known to
-/// follow the value whose hash is `agreed` ([`value_hash`]): what a
-/// folder agreed (decision 2026-10-04 §7.3).
-///
-/// It is, where the hash is in the chain of every entry that the device
-/// holds of the version, and in each every newer link was signed by a key
-/// that counts ([`follows`]). A slot that holds no version follows
-/// nothing.
-pub fn known_to_follow(
-    conn: &Connection,
-    name: &str,
-    file: &str,
-    agreed: &[u8; 32],
-) -> Result<bool, PersonError> {
-    let standing = Standing::of(conn)?;
-    let channel = standing.name_secret(conn, name)?;
-    let slot = standing.slot(conn, &channel, file)?;
-    Ok(slot
-        .current
-        .is_some_and(|version| follows(&version, agreed, &standing.counting)))
+pub fn read(conn: &Connection, name: &str, file: &str) -> Result<Read, PersonError> {
+    in_one(conn, || {
+        let standing = Standing::of(conn)?;
+        let channel = standing.name_secret(conn, name)?;
+        let slot = standing.slot(conn, &channel, file)?;
+        Ok(Read {
+            slot,
+            counting: standing.counting,
+        })
+    })
 }
 
 /// Whether `version` is known to follow the value whose hash is `agreed`,
@@ -481,7 +501,7 @@ mod tests {
             }
         );
         // The store holds it, and it is what the slot is read as.
-        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        let slot = read(&s[0].conn, "notes", "a.md").unwrap().slot;
         let version = slot.current.clone().unwrap();
         assert_eq!((version.value, version.rev), (text("one"), 1));
         assert_eq!(version.entries.len(), 1);
@@ -921,11 +941,7 @@ mod tests {
             Err(PersonError::FollowsNoPhrase)
         ));
         assert!(matches!(
-            current(&new.conn, "notes", "a.md"),
-            Err(PersonError::FollowsNoPhrase)
-        ));
-        assert!(matches!(
-            known_to_follow(&new.conn, "notes", "a.md", &hash("one")),
+            read(&new.conn, "notes", "a.md"),
             Err(PersonError::FollowsNoPhrase)
         ));
         assert!(new.stored().is_empty());
@@ -943,11 +959,7 @@ mod tests {
             Err(PersonError::NameNotHeld(name)) if name == "other"
         ));
         assert!(matches!(
-            current(&on.conn, "other", "a.md"),
-            Err(PersonError::NameNotHeld(_))
-        ));
-        assert!(matches!(
-            known_to_follow(&on.conn, "other", "a.md", &hash("one")),
+            read(&on.conn, "other", "a.md"),
             Err(PersonError::NameNotHeld(_))
         ));
 
@@ -988,10 +1000,57 @@ mod tests {
             Err(PersonError::Held(_))
         ));
         assert!(matches!(
-            current(&on.conn, "notes", "a.md"),
+            read(&on.conn, "notes", "a.md"),
             Err(PersonError::Held(_))
         ));
         assert_eq!(on.everything(), before);
+    }
+
+    /// What is read is the slot and who counted, of one moment. A caller
+    /// asks whether the version it was given follows a text, whatever has
+    /// arrived since: and what it plans against that version is not made
+    /// where another is current by then.
+    #[test]
+    fn test_what_is_read_is_the_slot_and_who_counted_at_one_moment() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        s.write(0, "notes", "a.md", "one");
+        s.write(0, "notes", "a.md", "two");
+        let was = read(&s[0].conn, "notes", "a.md").unwrap();
+        assert_eq!(was.slot.current.as_ref().unwrap().value, text("two"));
+        assert_eq!(was.counting, crate::person::who_counts(&s[0].conn).unwrap());
+        assert!(was.follows(&hash("one")) && !was.follows(&hash("another")));
+
+        // A version that was written apart arrives, and a key comes to
+        // count.
+        let channel = s[0].own("notes");
+        let apart = entry_by(&s[1].identity, &channel, 3, "a.md", text("apart"), &[]);
+        holds(&s, 0, &apart);
+        let on = &s[0];
+        let new = Machine::new(7);
+        crate::adding::add_device(&on.conn, &on.identity, &new.key(), "device 7", s.now).unwrap();
+        let is = read(&on.conn, "notes", "a.md").unwrap();
+        assert_eq!(is.slot.current.as_ref().unwrap().value, text("apart"));
+        assert!(!is.follows(&hash("one")));
+        assert!(is.counting.counts(&new.key()));
+        // What was read says what it said, of the version that was read
+        // and of who counted then.
+        assert_ne!(was.slot, is.slot);
+        assert!(!was.counting.counts(&new.key()));
+        assert!(was.follows(&hash("one")));
+        assert_eq!(was.slot.current.as_ref().unwrap().value, text("two"));
+        // An edit that is planned against it is not made.
+        let write = Write {
+            name: "notes",
+            file: "a.md",
+            value: text("over two"),
+            planned: PlannedAgainst::what_is_in(&was.slot),
+            merge: None,
+        };
+        assert_eq!(
+            publish(&on.conn, &on.identity, &write, s.now).unwrap(),
+            Published::Changed
+        );
     }
 
     /// A slot is read under the statement applied, with the device's word
@@ -1013,7 +1072,7 @@ mod tests {
             &[],
         );
         holds(&s, 0, &late);
-        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        let slot = read(&s[0].conn, "notes", "a.md").unwrap().slot;
         assert_eq!(slot.current.unwrap().value, text("by a device that counts"));
         assert_eq!((slot.highest, slot.next), (Some(1), Some(2)));
 
@@ -1027,7 +1086,7 @@ mod tests {
             &[],
         );
         holds(&s, 0, &tie);
-        let slot = current(&s[0].conn, "notes", "a.md").unwrap();
+        let slot = read(&s[0].conn, "notes", "a.md").unwrap().slot;
         let (won, lost) = (slot.current.unwrap(), slot.lost);
         assert_eq!(lost.len(), 1);
         assert_eq!((won.rev, lost[0].rev), (1, 1));
@@ -1051,8 +1110,11 @@ mod tests {
             holds(&s, 0, &entry);
         };
         let agreed = link("agreed", keys[0]);
-        let follows_agreed =
-            |file: &str| known_to_follow(&s[0].conn, "notes", file, &hash("agreed")).unwrap();
+        let follows_agreed = |file: &str| {
+            read(&s[0].conn, "notes", file)
+                .unwrap()
+                .follows(&hash("agreed"))
+        };
 
         // One entry, which shows it.
         put(1, "one.md", &[agreed]);
@@ -1078,7 +1140,8 @@ mod tests {
         // What a folder agreed can be a delete, which a chain names by
         // zeros.
         put(1, "deleted.md", &[Link::of(&Value::Delete, keys[0])]);
-        assert!(known_to_follow(&s[0].conn, "notes", "deleted.md", &[0u8; 32]).unwrap());
+        let deleted = read(&s[0].conn, "notes", "deleted.md").unwrap();
+        assert!(deleted.follows(&[0u8; 32]));
         assert!(!follows_agreed("deleted.md"));
 
         // An entry that lacks its chain shows nothing, and a version with

@@ -36,7 +36,7 @@ use crate::person::{
     Applied, Held, Shown, applied_name, applied_secret, first_statement, held, hold_name,
     kept_entry, latest_entry, shown, who_counts,
 };
-use crate::publish::{PlannedAgainst, Published, Write, current, publish};
+use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
 use crate::take::{Taken, take};
 
 pub(crate) const WORDS: &str =
@@ -167,7 +167,14 @@ impl Machine {
 
     /// The slot of `file` in the name `name`, as the device reads it.
     pub(crate) fn slot(&self, name: &str, file: &str) -> Slot {
-        current(&self.conn, name, file).unwrap()
+        read(&self.conn, name, file).unwrap().slot
+    }
+
+    /// Whether the current version of `file` in `name`, as the device
+    /// reads it, is known to follow the text `said`.
+    pub(crate) fn follows(&self, name: &str, file: &str, said: &str) -> bool {
+        let agreed = value_hash(&text(said));
+        read(&self.conn, name, file).unwrap().follows(&agreed)
     }
 
     /// The text that is the current version of `file` in `name`.
@@ -521,7 +528,6 @@ mod tests {
 
     use crate::change::make_settlement;
     use crate::person::PersonError;
-    use crate::publish::{known_to_follow, value_hash};
     use crate::take::NotTaken;
 
     /// An ordinary entry that the store took.
@@ -629,9 +635,8 @@ mod tests {
                 Some(vec![link("what device 1 wrote", s.key(1))])
             );
             // It is known to follow the text it was written over.
-            let on = &s[n].conn;
-            assert!(known_to_follow(on, "notes", "a.md", &hash("what device 1 wrote")).unwrap());
-            assert!(!known_to_follow(on, "notes", "a.md", &hash("another text")).unwrap());
+            assert!(s[n].follows("notes", "a.md", "what device 1 wrote"));
+            assert!(!s[n].follows("notes", "a.md", "another text"));
         }
     }
 
@@ -739,7 +744,6 @@ mod tests {
 
         s.pass(1, 0);
         for n in 0..2 {
-            let on = &s[n].conn;
             for said in [
                 "third of 0",
                 "third of 1",
@@ -747,12 +751,9 @@ mod tests {
                 "second of 1",
                 "first",
             ] {
-                assert!(
-                    known_to_follow(on, "notes", index, &hash(said)).unwrap(),
-                    "{n} {said}"
-                );
+                assert!(s[n].follows("notes", index, said), "{n} {said}");
             }
-            assert!(!known_to_follow(on, "notes", index, &hash("another")).unwrap());
+            assert!(!s[n].follows("notes", index, "another"));
         }
 
         // Where the other source's hash is in the channel's chain already,
@@ -982,7 +983,6 @@ mod tests {
 
         let (maker, removed) = (s.key(0), s.key(2));
         for n in [0, 1] {
-            let on = &s[n].conn;
             let version = s[n].slot("notes", "a.md").current.unwrap();
             assert_eq!(
                 (version.value, version.rev),
@@ -1002,16 +1002,16 @@ mod tests {
             );
             // This device's text is "a one": the edit is not known to
             // follow it, and the folder keeps its text.
-            assert!(!known_to_follow(on, "notes", "a.md", &hash("a one")).unwrap());
+            assert!(!s[n].follows("notes", "a.md", "a one"));
             // Known only for the text it was written over, which no
             // device under the statement has as its own.
-            assert!(known_to_follow(on, "notes", "a.md", &hash("a two, written late")).unwrap());
+            assert!(s[n].follows("notes", "a.md", "a two, written late"));
 
             // The control: the edit of a file that the removed device did
             // not touch is known to follow this device's text.
             let version = s[n].slot("notes", "b.md").current.unwrap();
             assert_eq!(version.value, text("b two, by device 3"));
-            assert!(known_to_follow(on, "notes", "b.md", &hash("b one")).unwrap());
+            assert!(s[n].follows("notes", "b.md", "b one"));
         }
     }
 
