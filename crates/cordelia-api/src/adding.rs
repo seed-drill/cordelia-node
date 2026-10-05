@@ -19,16 +19,18 @@
 //! long as both keys exist, whatever phrase either device follows, and a
 //! statement's number starts again under each phrase. So the hand-over's
 //! revision is the time it was made, by the clock of the device that
-//! adds: what is handed later takes the place of what was handed before.
+//! adds, or one above the one it made before for that key: what is
+//! handed later takes the place of what was handed before. The revision
+//! only orders them. When a hand-over was made, it says itself.
 //!
 //! ## The device that accepts
 //!
 //! [`accept`] is given the pair channel's entry, the key a person typed
 //! and when it was typed. It takes the entry only if that key signed it,
-//! it was typed within the last hour, and the hand-over was made within
-//! the hour before or after it was typed: an old hand-over is not taken,
-//! whoever shows it. What it then does goes by the state the device is
-//! in, as the table of §5.1 has it:
+//! it was typed within the last hour, and the hand-over says it was made
+//! within the hour before or after the key was typed: an old hand-over is
+//! not taken, whoever shows it. What it then does goes by the state the
+//! device is in, as the table of §5.1 has it:
 //!
 //! | This device | What it does |
 //! |---|---|
@@ -128,6 +130,7 @@ pub fn add_device(
         }
 
         let mut hand_over = HandOver {
+            made_at: at(now),
             statement: standing.held.statement.clone(),
             secret: standing.secret,
             statement_key: standing.held.following.statement_key,
@@ -238,6 +241,10 @@ fn own_addition(
 /// this device's store and at a relay. Where this device's own entry
 /// there is already at that time or above it (two made in one second, or
 /// a clock that was set back), it is one above that entry.
+///
+/// The revision orders the hand-overs, and says nothing else: it can run
+/// ahead of the clock for good. When the hand-over was made is in the
+/// hand-over.
 fn hand_over_written(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -301,9 +308,9 @@ pub enum NotAccepted {
     NotThePairChannel,
     /// Another key signed the entry than the one typed.
     SignedByAnotherKey,
-    /// The hand-over was not made within the hour before or after the key
-    /// was typed: it is an old one, or the clocks of the two devices are
-    /// more than an hour apart.
+    /// The hand-over says it was made an hour or more before the key was
+    /// typed, or after: it is an old one, or the clocks of the two devices
+    /// are more than an hour apart.
     NotMadeWithinTheHour,
     /// The entry is not the one under the name `hand-over`, does not
     /// open, or holds no bytes: nothing else in a pair channel is read.
@@ -351,9 +358,10 @@ pub enum NotAccepted {
 /// The entry is taken only if the key typed signed it, and it was typed
 /// within the last hour: at `typed_at` or after it, and less than an hour
 /// after. And only if the hand-over was made less than an hour before or
-/// after the key was typed: its revision is the time it was made, by the
-/// clock of the device that adds. What is then done goes by the state
-/// this device is in (see the module's documentation, and [`Accepted`]).
+/// after the key was typed: it says when it was made, by the clock of the
+/// device that adds, and the entry's revision is not asked. What is then
+/// done goes by the state this device is in (see the module's
+/// documentation, and [`Accepted`]).
 ///
 /// An error is this device's, and not the hand-over's: nothing changed.
 pub fn accept(
@@ -430,12 +438,6 @@ fn hand_over_in(
     if entry.author != *typed {
         return Ok(Err(NotAccepted::SignedByAnotherKey));
     }
-    // And only where it was made about when the key was typed: a pair
-    // channel outlives a phrase, and what was handed long ago is not what
-    // the person means now.
-    if !made_within_the_hour(entry.rev, typed_at) {
-        return Ok(Err(NotAccepted::NotMadeWithinTheHour));
-    }
     let Ok(inside) = entry.open(&pair) else {
         return Ok(Err(NotAccepted::NotAHandOver));
     };
@@ -449,6 +451,13 @@ fn hand_over_in(
         Ok(hand_over) => hand_over,
         Err(e) => return Ok(Err(NotAccepted::HandOver(e))),
     };
+    // And only where it was made about when the key was typed: a pair
+    // channel outlives a phrase, and what was handed long ago is not what
+    // the person means now. The time is the one the hand-over says, which
+    // its signer signed with the rest.
+    if !made_within_the_hour(hand_over.made_at, typed_at) {
+        return Ok(Err(NotAccepted::NotMadeWithinTheHour));
+    }
     if !hand_over.is_for(&identity.public_key()) {
         return Ok(Err(NotAccepted::NotForThisDevice));
     }
@@ -461,9 +470,8 @@ fn hand_over_in(
     Ok(Ok(hand_over))
 }
 
-/// Whether a hand-over whose revision is `made` was made less than an
-/// hour before or after the key was typed. A hand-over's revision is the
-/// time it was made, in seconds.
+/// Whether a hand-over that says it was made at `made`, in seconds, was
+/// made less than an hour before or after the key was typed.
 fn made_within_the_hour(made: u64, typed_at: i64) -> bool {
     let Ok(made) = i64::try_from(made) else {
         return false;
@@ -813,6 +821,7 @@ mod tests {
         assert_eq!(inside.name, HAND_OVER_NAME);
         assert_eq!(inside.chain, Some(Vec::new()));
         let hand_over = hand_over_of(&s, 0, &new.key(), entry);
+        assert_eq!(hand_over.made_at, made as u64);
         assert_eq!(hand_over.statement, statement);
         assert_eq!(hand_over.secret, adder.secret());
         assert_eq!(
@@ -855,6 +864,12 @@ mod tests {
         assert_eq!(same_second.hand_over.rev, made as u64 + 101);
         let set_back = add(made - 5000).unwrap();
         assert_eq!(set_back.hand_over.rev, made as u64 + 102);
+        // Each says the time it was made, whatever its revision.
+        let says = |added: &Added| hand_over_of(&s, 0, &new.key(), &added.hand_over).made_at;
+        assert_eq!(
+            [says(&again), says(&same_second), says(&set_back)],
+            [made as u64 + 100, made as u64 + 100, made as u64 - 5000]
+        );
         assert_eq!(
             adder.stored_in(&pair),
             std::slice::from_ref(&set_back.hand_over)
@@ -1205,31 +1220,38 @@ mod tests {
             NotAccepted::SignedByAnotherKey
         );
 
-        // The hand-over as the adder signed it, at another revision: made
+        // The hand-over as the adder signs it, saying another time: made
         // an hour before the key was typed, or longer before, or an hour
-        // after, or longer after.
-        let made_at = |rev: u64, name: &str, value: Value| {
-            entry_by(&adder.identity, &pair, rev, name, value, &[])
+        // after, or longer after. Its entry is at the revision of now.
+        let saying = |made_at: u64| {
+            let hand_over = HandOver {
+                made_at,
+                ..HandOver::from_bytes(&bytes).unwrap()
+            };
+            let value = Value::Other(hand_over.to_bytes().unwrap());
+            entry_by(&adder.identity, &pair, made, HAND_OVER_NAME, value, &[])
         };
         let hour = HOUR as u64;
-        for rev in [
+        for says in [
             made - hour,
             made - 2 * hour,
             1,
+            0,
             made + hour,
             made + 9 * hour,
+            u64::MAX,
         ] {
-            let entry = made_at(rev, HAND_OVER_NAME, Value::Other(bytes.clone()));
             assert_eq!(
-                refused(&adder_key, now, &entry),
+                refused(&adder_key, now, &saying(says)),
                 NotAccepted::NotMadeWithinTheHour,
-                "{rev}"
+                "{says}"
             );
         }
 
         // Nothing else in a pair channel is read: an entry under another
         // name, one that holds a text, and one that does not open.
-        let by_the_adder = |name: &str, value: Value| made_at(made, name, value);
+        let by_the_adder =
+            |name: &str, value: Value| entry_by(&adder.identity, &pair, made, name, value, &[]);
         let misnamed = by_the_adder("hand-over-2", Value::Other(bytes.clone()));
         assert_eq!(
             refused(&adder_key, now, &misnamed),
@@ -1261,7 +1283,7 @@ mod tests {
             NotAccepted::HandOver(_)
         ));
         let mut changed = bytes.clone();
-        let secret_at = 2 + adder.held().statement.to_bytes().unwrap().len();
+        let secret_at = 8 + 2 + adder.held().statement.to_bytes().unwrap().len();
         changed[secret_at] ^= 1;
         let does_not_hold = by_the_adder(HAND_OVER_NAME, Value::Other(changed));
         assert_eq!(
@@ -1349,6 +1371,92 @@ mod tests {
             );
             assert_eq!(taken.unwrap(), Accepted::Joined(first()), "{apart}");
         }
+        // The entry's revision is not asked: a hand-over that says it was
+        // made now is taken from an entry at the first revision, and from
+        // one nine hours ahead.
+        for (n, rev) in [(9, 1), (10, made + 9 * hour)] {
+            let (adder, new) = (&s[0], Machine::new(n));
+            let added = add_device(&adder.conn, &adder.identity, &new.key(), "new", now);
+            let pair = derive::pair_secret(&adder.identity, &new.key()).unwrap();
+            let entry = entry_by(
+                &adder.identity,
+                &pair,
+                rev,
+                HAND_OVER_NAME,
+                Value::Other(bytes_in(&added.unwrap().hand_over, &pair)),
+                &[],
+            );
+            let taken = accept(
+                &new.conn,
+                &new.identity,
+                &adder_key,
+                now,
+                false,
+                &entry,
+                now,
+            );
+            assert_eq!(taken.unwrap(), Accepted::Joined(first()), "{rev}");
+        }
+    }
+
+    /// The revision of a hand-over's entry only orders the hand-overs of
+    /// one device to another, and can run ahead of the clock for good.
+    /// When a hand-over was made is what it says itself, and that is what
+    /// is set beside the time the key was typed.
+    #[test]
+    fn test_a_hand_over_is_taken_by_the_time_it_says_whatever_its_revision() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        let now = s.now;
+        let adder = &s[0];
+        let add = |new: usize, at: i64| {
+            add_device(&adder.conn, &adder.identity, &s.key(new), "new", at)
+                .unwrap()
+                .hand_over
+        };
+        let typed = |new: usize, entry: &CheckedEntry, at: i64| {
+            let on = &s[new];
+            accept(&on.conn, &on.identity, &adder.key(), at, false, entry, at).unwrap()
+        };
+
+        // The adder's clock is three hours ahead. What it hands device 1
+        // says so, and is refused: it was made long after the key was
+        // typed.
+        let ahead = add(1, now + 3 * HOUR);
+        assert_eq!(ahead.rev, (now + 3 * HOUR) as u64);
+        assert_eq!(
+            typed(1, &ahead, now + 5),
+            Accepted::Refused(NotAccepted::NotMadeWithinTheHour)
+        );
+        // The clock is set right, and it hands over again. The entry is
+        // one above the one before, hours ahead of the clock: the
+        // hand-over says the time it was made, and is taken.
+        let right = add(1, now + 10);
+        assert_eq!(right.rev, ahead.rev + 1);
+        assert_eq!(
+            hand_over_of(&s, 0, &s.key(1), &right).made_at,
+            (now + 10) as u64
+        );
+        assert_eq!(typed(1, &right, now + 20), Accepted::Joined(first()));
+
+        // About 3,700 hand-overs to device 2 within an hour, each one
+        // above the one before: the last is at a revision more than an
+        // hour ahead of the clock, and is taken all the same.
+        let first_of_them = add(2, now);
+        let pair = derive::pair_secret(&adder.identity, &s.key(2)).unwrap();
+        let the_3699th = entry_by(
+            &adder.identity,
+            &pair,
+            first_of_them.rev + 3_698,
+            HAND_OVER_NAME,
+            text("as the 3,699th left it"),
+            &[],
+        );
+        entries::store(&adder.conn, &the_3699th, now).unwrap();
+        let last = add(2, now + 60);
+        assert_eq!(last.rev, now as u64 + 3_699);
+        assert!(last.rev - (now as u64 + 60) > HOUR as u64);
+        assert_eq!(typed(2, &last, now + 61), Accepted::Joined(first()));
     }
 
     /// A pair channel is one channel whatever phrase either device
@@ -1569,6 +1677,7 @@ mod tests {
             .sign(&on.identity)
             .unwrap();
         let hand_over = HandOver {
+            made_at: s.now as u64,
             statement,
             secret: on.secret(),
             statement_key: on.held().following.statement_key,
@@ -1966,6 +2075,7 @@ mod tests {
         let signed = statement.sign(&s.phrase.signing_key().unwrap()).unwrap();
         let entry = change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret)).unwrap();
         HandOver {
+            made_at: s.now as u64,
             statement: signed,
             secret,
             statement_key: s.phrase.statement_key().unwrap(),

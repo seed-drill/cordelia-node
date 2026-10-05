@@ -1124,10 +1124,12 @@ pub const MAX_HAND_OVER_RECORDS: usize = 2;
 /// number, and are not written twice.
 pub const HAND_OVER_CHANGE_ENTRY_BYTES: usize = 32 + 32 + 64 + 64 + CHANGE_ENTRY_BYTES;
 
-/// The most a hand-over takes (decision 2026-10-04 §6): the statement
-/// behind its length, the secret, the statement key, the change entry, a
-/// count of records, and each record behind its length.
-pub const MAX_HAND_OVER_BYTES: usize = 2
+/// The most a hand-over takes (decision 2026-10-04 §6): the time it was
+/// made, the statement behind its length, the secret, the statement key,
+/// the change entry, a count of records, and each record behind its
+/// length.
+pub const MAX_HAND_OVER_BYTES: usize = 8
+    + 2
     + MAX_STATEMENT_BYTES
     + 32
     + 32
@@ -1837,7 +1839,7 @@ mod tests {
     }
 
     /// The record of an addition, and the hand-over that carries it: at
-    /// every bound together a hand-over is 54,267 bytes, and with its name
+    /// every bound together a hand-over is 54,275 bytes, and with its name
     /// it is within the 61,440 that one entry may hold.
     #[test]
     fn test_adding_a_device_decision_2026_10_04_6() {
@@ -1850,14 +1852,14 @@ mod tests {
         assert_eq!(PAIR_KEY_TYPED_SECS, 3_600);
         assert_eq!(MAX_HAND_OVER_RECORDS, 2);
         assert_eq!(HAND_OVER_CHANGE_ENTRY_BYTES, 192 + 32_768);
-        assert_eq!(MAX_HAND_OVER_BYTES, 54_267);
+        assert_eq!(MAX_HAND_OVER_BYTES, 54_275);
         assert_eq!(
             MAX_HAND_OVER_BYTES,
-            2 + MAX_STATEMENT_BYTES + 64 + 192 + CHANGE_ENTRY_BYTES + 1 + 2 * 228
+            8 + 2 + MAX_STATEMENT_BYTES + 64 + 192 + CHANGE_ENTRY_BYTES + 1 + 2 * 228
         );
         assert_eq!(
             MAX_ENTRY_NAME_AND_VALUE_BYTES - HAND_OVER_NAME.len() - MAX_HAND_OVER_BYTES,
-            7_164
+            7_156
         );
         // A reader counts as many devices as a statement may list, and
         // keeps a bounded number of records that do not count.

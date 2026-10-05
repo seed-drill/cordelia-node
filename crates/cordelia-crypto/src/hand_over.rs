@@ -3,16 +3,18 @@
 //!
 //! The device that adds writes one entry in the pair channel it has with
 //! the new device, under the name `hand-over`. This module makes and reads
-//! that entry's value, and nothing else of it: the statement the adder has
-//! applied, the secret, the statement key, the change entry it holds, the
-//! record of the addition, and, where the adder was itself added since
-//! that statement, the record of its own addition.
+//! that entry's value, and nothing else of it: when it was made, the
+//! statement the adder has applied, the secret, the statement key, the
+//! change entry it holds, the record of the addition, and, where the adder
+//! was itself added since that statement, the record of its own addition.
 //!
 //! ## Form
 //!
-//! A length is two bytes, the higher first.
+//! A length is two bytes and a time is eight, the higher byte first.
 //!
 //! ```text
+//! made           8: when it was made, in seconds, in UTC, by the clock of
+//!                the device that adds
 //! statement      its length, then the signed statement
 //! secret         32
 //! statement key  32
@@ -27,6 +29,12 @@
 //! revision are the statement's phrase key and number, and are not written
 //! a second time. The first record is the record of the addition, and the
 //! second the record of the adder's own addition.
+//!
+//! The time a hand-over was made is part of what it says, and the entry
+//! that carries it signs it with the rest: whoever accepts it sets that
+//! time beside the time a key was typed. The revision of that entry only
+//! orders the hand-overs of one device to another, and can run ahead of
+//! any clock.
 //!
 //! ## What is refused
 //!
@@ -124,6 +132,10 @@ pub enum HandOverError {
 /// What a device is handed when it is added (decision 2026-10-04 §6).
 #[derive(Clone, PartialEq, Eq)]
 pub struct HandOver {
+    /// When the hand-over was made, by the clock of the device that adds:
+    /// seconds, in UTC. Any time is in the form: whether it is near
+    /// enough to now is for the device that accepts to say.
+    pub made_at: u64,
     /// The statement the adder has applied.
     pub statement: SignedStatement,
     /// The person secret of that statement.
@@ -229,6 +241,7 @@ impl HandOver {
     pub fn to_bytes(&self) -> Result<Vec<u8>, HandOverError> {
         self.validate()?;
         let mut out = Vec::new();
+        out.extend_from_slice(&self.made_at.to_be_bytes());
         let statement = self.statement.to_bytes()?;
         put_count(&mut out, statement.len());
         out.extend_from_slice(&statement);
@@ -257,6 +270,7 @@ impl HandOver {
         let short = || HandOverError::Truncated;
         let mut reader = Reader::new(bytes);
 
+        let made_at = reader.u64().ok_or_else(short)?;
         let length = reader.count().ok_or_else(short)?;
         let statement = SignedStatement::from_bytes(reader.take(length).ok_or_else(short)?)?;
         let secret = reader.array().ok_or_else(short)?;
@@ -293,6 +307,7 @@ impl HandOver {
 
         let mut records = records.into_iter();
         let hand_over = Self {
+            made_at,
             statement,
             secret,
             statement_key,
@@ -306,10 +321,12 @@ impl HandOver {
 }
 
 // A hand-over holds the person secret and the statement key. What is shown
-// for debugging is the statement's number and which records come with it.
+// for debugging is when it was made, the statement's number and which
+// records come with it.
 impl fmt::Debug for HandOver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HandOver")
+            .field("made_at", &self.made_at)
             .field("statement", &self.statement.statement.number)
             .field("addition", &self.addition.is_some())
             .field("adders_own", &self.adders_own.is_some())
@@ -329,6 +346,9 @@ mod tests {
     use cordelia_core::protocol::{
         HAND_OVER_NAME, MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_HAND_OVER_BYTES,
     };
+
+    /// When the hand-overs of these tests say they were made.
+    const MADE_AT: u64 = 1_800_000_000;
 
     /// Statement 2 of the phrase, which lists devices 0 and 1 and removes
     /// device 2. It commits to secret 2.
@@ -353,6 +373,7 @@ mod tests {
     fn sample(phrase: &Phrase) -> HandOver {
         let statement = second(phrase);
         HandOver {
+            made_at: MADE_AT,
             statement: signed(&statement, phrase),
             secret: secret(2),
             statement_key: phrase.statement_key().unwrap(),
@@ -373,9 +394,10 @@ mod tests {
     }
 
     /// Where the parts of [`sample`]'s bytes begin: the secret, the
-    /// statement key, the change entry, and the count of records.
+    /// statement key, the change entry, and the count of records. The
+    /// time is before them all, and the statement follows it.
     fn places(hand_over: &HandOver) -> (usize, usize, usize, usize) {
-        let secret = 2 + hand_over.statement.to_bytes().unwrap().len();
+        let secret = 8 + 2 + hand_over.statement.to_bytes().unwrap().len();
         (secret, secret + 32, secret + 64, secret + 64 + 192 + 32_768)
     }
 
@@ -387,8 +409,9 @@ mod tests {
 
         let statement = hand_over.statement.to_bytes().unwrap();
         let (secret_at, key_at, entry_at, records_at) = places(&hand_over);
-        assert_eq!(bytes[..2], (statement.len() as u16).to_be_bytes());
-        assert_eq!(bytes[2..secret_at], statement);
+        assert_eq!(bytes[..8], MADE_AT.to_be_bytes());
+        assert_eq!(bytes[8..10], (statement.len() as u16).to_be_bytes());
+        assert_eq!(bytes[10..secret_at], statement);
         assert_eq!(bytes[secret_at..key_at], secret(2));
         assert_eq!(bytes[key_at..entry_at], phrase.statement_key().unwrap());
 
@@ -409,6 +432,29 @@ mod tests {
             (record.len() as u16).to_be_bytes()
         );
         assert_eq!(bytes[records_at + 3..], record);
+    }
+
+    /// A hand-over says when it was made, in its first eight bytes, and
+    /// reads back with that time: any time is in the form.
+    #[test]
+    fn a_hand_over_says_when_it_was_made() {
+        let phrase = phrase();
+        let made = sample(&phrase);
+        let at = |made_at: u64| HandOver {
+            made_at,
+            ..made.clone()
+        };
+        let bytes = at(MADE_AT).to_bytes().unwrap();
+        for made_at in [0, 1, MADE_AT + 1, u64::MAX] {
+            let other = at(made_at).to_bytes().unwrap();
+            // Two that differ in their time differ in those bytes alone.
+            assert_eq!(other[..8], made_at.to_be_bytes());
+            assert!(other[8..] == bytes[8..], "{made_at}");
+            let read = HandOver::from_bytes(&other).unwrap();
+            assert_eq!(read.made_at, made_at);
+            assert_eq!(read, at(made_at));
+            assert_ne!(read, at(MADE_AT));
+        }
     }
 
     #[test]
@@ -446,7 +492,18 @@ mod tests {
             let (secret_at, key_at, entry_at, records_at) = places(&hand_over);
             // Cut within each part, at each part's end, and one byte short
             // of the whole.
-            let mut cuts = vec![0, 1, 2, secret_at - 1, secret_at, key_at, entry_at];
+            let mut cuts = vec![
+                0,
+                1,
+                7,
+                8,
+                9,
+                10,
+                secret_at - 1,
+                secret_at,
+                key_at,
+                entry_at,
+            ];
             cuts.extend([entry_at + 32, entry_at + 64, entry_at + 128, entry_at + 192]);
             cuts.extend([records_at - 1, records_at, records_at + 1, records_at + 2]);
             cuts.extend([records_at + 3, bytes.len() - 65, bytes.len() - 1]);
@@ -861,6 +918,7 @@ mod tests {
             .sign(&identity(100))
             .unwrap();
         let hand_over = HandOver {
+            made_at: u64::MAX,
             statement: signed(&statement, &phrase),
             secret: secret(9),
             statement_key: phrase.statement_key().unwrap(),
@@ -900,7 +958,7 @@ mod tests {
         let printed = format!("{hand_over:?}");
         assert_eq!(
             printed,
-            "HandOver { statement: 2, addition: true, adders_own: false, .. }"
+            "HandOver { made_at: 1800000000, statement: 2, addition: true, adders_own: false, .. }"
         );
         assert!(!printed.contains("156") && !printed.contains("157"));
     }
