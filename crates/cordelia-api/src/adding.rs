@@ -1213,6 +1213,16 @@ mod tests {
             adder.stored_in(&pair),
             std::slice::from_ref(&added.hand_over)
         );
+        // What the adder keeps of the hand-over is where it is, its very
+        // revision and the time it says: what is written over it, once it
+        // has gone, is one above that revision and no lower.
+        let kept = held_rows::handed_over(&adder.conn, &new.key())
+            .unwrap()
+            .expect("the hand-over is kept of");
+        assert_eq!(
+            (kept.channel, kept.rev, kept.made_at, kept.held),
+            (entry.channel, entry.rev, made, true)
+        );
 
         // Added again, later: a record above the first, for a key that
         // counts already, and a hand-over at the time it is made, which

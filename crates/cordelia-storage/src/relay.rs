@@ -1191,11 +1191,19 @@ fn used_then(
     if at.saturating_sub(held.used_at) <= USED_STEP_SECS {
         return Ok(Some(false));
     }
+    write_used(conn, channel, at).map(Some)
+}
+
+/// Write down that `channel` was last used at `at`, where that is later
+/// than the time kept: the write itself never puts down an earlier time,
+/// whoever calls it and whatever was read before. Returns whether it was
+/// written.
+fn write_used(conn: &Connection, channel: &[u8; 32], at: i64) -> Result<bool, CordeliaError> {
     conn.execute(
         "UPDATE relay_channels SET used_at = ?2 WHERE channel_id = ?1 AND used_at < ?2",
         params![channel.as_slice(), at],
     )
-    .map(|rows| Some(rows > 0))
+    .map(|rows| rows > 0)
     .map_err(storage)
 }
 
@@ -3071,6 +3079,12 @@ mod tests {
         // An earlier time, and the same one, are not kept.
         for earlier in [NOW + 2 * HOUR - 1, NOW, NOW - 365 * DAY, NOW + 2 * HOUR] {
             assert!(!listed_relay_used(&conn, &channel(1), earlier, clock).unwrap());
+            assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
+        }
+        // The write itself puts down no earlier time, and not the same
+        // one: whatever was read before it.
+        for earlier in [NOW + 2 * HOUR - 1, NOW, 1, NOW + 2 * HOUR] {
+            assert!(!write_used(&conn, &channel(1), earlier).unwrap());
             assert_eq!(used_at(&conn, 1), Some(NOW + 2 * HOUR));
         }
         // Nor is a later one that is within the hour of the one kept, to

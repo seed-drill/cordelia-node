@@ -1293,10 +1293,6 @@ mod tests {
         let now = s.tick();
         let on = &s[1];
         let notes = notes_of(on);
-        // The store cannot keep a place: the table is gone.
-        on.conn
-            .execute_batch("ALTER TABLE at_relays RENAME TO elsewhere")
-            .unwrap();
         let page = Page {
             relay: &RELAY,
             channel: &notes,
@@ -1304,10 +1300,28 @@ mod tests {
             mark: MARK,
             next: 2,
         };
+        // The store cannot keep a place: the table is gone, and the page
+        // fails before any of it is taken.
+        on.conn
+            .execute_batch("ALTER TABLE at_relays RENAME TO elsewhere")
+            .unwrap();
         assert!(take_page(&on.conn, &on.identity, &page, now).is_err());
         on.conn
             .execute_batch("ALTER TABLE elsewhere RENAME TO at_relays")
             .unwrap();
+        assert!(on.stored_in(&on.own("notes")).is_empty());
+        assert_eq!(place(&on.conn, &RELAY, &notes.id).unwrap(), (NO_MARK, 0));
+        // The store can read what it keeps of the relay, and cannot write
+        // the place: the page fails after its entries went through the
+        // one door, and none of them is kept.
+        on.conn
+            .execute_batch(
+                "CREATE TRIGGER no_place BEFORE INSERT ON at_relays
+                 BEGIN SELECT RAISE(ABORT, 'no place is written'); END",
+            )
+            .unwrap();
+        assert!(take_page(&on.conn, &on.identity, &page, now).is_err());
+        on.conn.execute_batch("DROP TRIGGER no_place").unwrap();
         assert!(on.stored_in(&on.own("notes")).is_empty());
         assert_eq!(place(&on.conn, &RELAY, &notes.id).unwrap(), (NO_MARK, 0));
         // The control.

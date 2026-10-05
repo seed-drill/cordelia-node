@@ -401,14 +401,15 @@ mod tests {
             carried_to: 5,
         };
         assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap(), all);
-        // Earlier, and the same: nothing changes.
+        // Earlier, and the same: nothing changes, after any one of them.
         for up_to in [0, 5, 11, 12] {
             sent(&conn, &RELAY, &channel(1), up_to).unwrap();
+            assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap(), all, "{up_to}");
         }
         for up_to in [0, 4, 5] {
             carried(&conn, &RELAY, &channel(1), up_to).unwrap();
+            assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap(), all, "{up_to}");
         }
-        assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap(), all);
         sent(&conn, &RELAY, &channel(1), 13).unwrap();
         carried(&conn, &RELAY, &channel(1), 6).unwrap();
         assert_eq!(
