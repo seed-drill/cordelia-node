@@ -1437,8 +1437,46 @@ pub const CHANNEL_PROOF_AGAIN_SECS: u64 = 24 * 60 * 60;
 /// not it syncs the name itself (§2.5).
 pub const PERSONAL_NAME_PREFIX: &str = "name/";
 
+/// The first part of the name, in the personal channel, of a device's word
+/// that it has left (decision 2026-10-04 §5.2). The device's key follows
+/// it, as a device's key is written: each device has a slot of its own,
+/// and only its own entry there is its word. A device writes it in the
+/// personal channel that it is leaving, by its own command, before it
+/// starts again under another phrase or with another key.
+pub const PERSONAL_LEFT_PREFIX: &str = "left/";
+
+/// The label that a key's fingerprint is hashed under (decision 2026-10-04
+/// §6): SHA-256 of this label and the key. The fingerprint is shown as
+/// words of the list that a recovery phrase uses, eleven bits to a word,
+/// from its first bit on.
+pub const LABEL_FINGERPRINT: &[u8] = b"cordelia v2 fingerprint";
+
+/// How many words of a key's fingerprint are shown beside a label,
+/// wherever a device is shown for a decision (decision 2026-10-04 §6):
+/// four, which is 44 bits. A label is whatever the device that added a key
+/// called it, and two keys can have one label.
+pub const FINGERPRINT_WORDS_SHOWN: usize = 4;
+
+/// How long the fetch may take that a command makes before it prepares a
+/// change (decision 2026-10-04 §7.1, step 1): two minutes at most. Nothing
+/// depends on its being whole: the command says what it could not fetch,
+/// and a removal is never held up by what another device goes on writing.
+pub const CHANGE_FETCH_MAX_SECS: u64 = 120;
+
+/// A command that makes a statement says how many more the phrase can
+/// make once fewer than this are left (decision 2026-10-04 §4.1).
+pub const STATEMENTS_LEFT_SAID_BELOW: u64 = 16;
+
+/// How long a device that is given a new key waits for its relays to be
+/// sent the word that it has left, and the deletes over what it handed
+/// (decision 2026-10-04 §5.2, §6), before it forgets the secret that they
+/// are written with. It says which relays were not sent them.
+/// Derived: the wait of a device that wakes, WAKE_WAIT_SECS, which is how
+/// long a relay that answers at all has had to answer.
+pub const LEAVING_SEND_WAIT_SECS: u64 = WAKE_WAIT_SECS;
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 22] = [
+pub const LABELS: [&[u8]; 23] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1461,6 +1499,7 @@ pub const LABELS: [&[u8]; 22] = [
     LABEL_ADDITION,
     LABEL_CHANNEL_PROOF,
     LABEL_SESSION_VALUE,
+    LABEL_FINGERPRINT,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2066,7 +2105,35 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 22);
+        assert_eq!(LABELS.len(), 23);
+    }
+
+    /// What the commands a person types go by: the place of a device's
+    /// word that it has left, a key's fingerprint and how much of it is
+    /// shown, the two minutes of the fetch before a change, when a command
+    /// says how many statements are left, and the wait of a device that is
+    /// given a new key.
+    #[test]
+    fn test_the_commands_a_person_types_decision_2026_10_04_5_to_8() {
+        assert_eq!(PERSONAL_LEFT_PREFIX, "left/");
+        for other in [
+            PERSONAL_APPLIED_PREFIX,
+            PERSONAL_ADDED_PREFIX,
+            PERSONAL_NAME_PREFIX,
+        ] {
+            assert!(!PERSONAL_LEFT_PREFIX.starts_with(other));
+            assert!(!other.starts_with(PERSONAL_LEFT_PREFIX));
+        }
+        assert_eq!(LABEL_FINGERPRINT, b"cordelia v2 fingerprint");
+        assert!(LABELS.contains(&LABEL_FINGERPRINT));
+        assert_eq!(FINGERPRINT_WORDS_SHOWN, 4);
+        // Four words of eleven bits are within the 256 of the hash.
+        const { assert!(FINGERPRINT_WORDS_SHOWN * 11 <= 256) };
+        assert_eq!(CHANGE_FETCH_MAX_SECS, 120);
+        assert_eq!(STATEMENTS_LEFT_SAID_BELOW, 16);
+        const { assert!(STATEMENTS_LEFT_SAID_BELOW < MAX_STATEMENT_NUMBER) };
+        assert_eq!(LEAVING_SEND_WAIT_SECS, 30);
+        assert_eq!(LEAVING_SEND_WAIT_SECS, WAKE_WAIT_SECS);
     }
 
     /// The value that a proof is made over is exported from a TLS session

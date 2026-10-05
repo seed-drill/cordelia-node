@@ -16,7 +16,8 @@
 //! how a slot's current version is read ([`version`]); and, for a device that is added, the record of its
 //! addition ([`addition`]) and what it is handed ([`hand_over`]). An entry
 //! travels in one form ([`wire`]), and a connection proves that it holds a
-//! channel's key with a signature of its own ([`proof`]).
+//! channel's key with a signature of its own ([`proof`]). A key is shown
+//! to a person beside the first words of its fingerprint ([`fingerprint`]).
 
 pub mod addition;
 pub mod aes_gcm;
@@ -27,6 +28,7 @@ pub mod channel_state;
 pub mod derive;
 pub mod ecies;
 pub mod entry;
+pub mod fingerprint;
 pub mod hand_over;
 pub mod identity;
 pub mod phrase;
