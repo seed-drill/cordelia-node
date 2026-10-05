@@ -7,6 +7,16 @@
 # verifies SHA-256 checksum, installs to ~/.cordelia/bin/, sets up
 # system service (launchctl on macOS, systemd on Linux).
 #
+# Run on a machine whose node is running as that service, it restarts the
+# node on the version it installed, and waits until the node says so.
+# CORDELIA_NO_RESTART=1 leaves the node as it is.
+#
+# The last line it prints is for a program to read:
+#   cordelia-install: installed=<version> running=<version|none|unknown> restart=<done|not-needed|needed|failed>
+# It exits 0 where the node that is running, if one is, is the version
+# installed, or was left as it is because that was asked; 3 where a node
+# is running another version when it ends; 1 where nothing was installed.
+#
 # Spec: seed-drill/specs/operations.md §1
 
 set -eu
@@ -15,6 +25,8 @@ REPO="seed-drill/cordelia-node"
 INSTALL_DIR="$HOME/.cordelia/bin"
 DATA_DIR="$HOME/.cordelia"
 VERSION="${CORDELIA_VERSION:-latest}"
+# How long to wait for a restarted node to say that it is the new version.
+RESTART_WAIT_SECS="${CORDELIA_RESTART_WAIT_SECS:-60}"
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -126,6 +138,113 @@ service_running() {
         linux)  systemctl --user is-active --quiet cordelia 2>/dev/null ;;
         darwin) launchctl list 2>/dev/null | grep -q ai.seeddrill.cordelia ;;
         *)      return 1 ;;
+    esac
+}
+
+# The version that the binary just installed says it is.
+installed_version() {
+    "${INSTALL_DIR}/cordelia" --version 2>/dev/null | awk '{print $2; exit}'
+}
+
+# What the command says of the node on this machine, on one line.
+node_status() {
+    "${INSTALL_DIR}/cordelia" status --json 2>/dev/null | tr -d ' \n\t' || true
+}
+
+# Whether a node answers on this machine, however it was started.
+node_answers() {
+    node_status | grep -q '"running":true'
+}
+
+# The version of the node that answers on this machine. Nothing where no
+# node answers, or where the node is from before nodes said their version.
+running_version() {
+    node_status | sed -n 's/.*"node_version":"\([^"]*\)".*/\1/p'
+}
+
+restart_service() {
+    case "$PLATFORM" in
+        linux)  systemctl --user daemon-reload && systemctl --user restart cordelia ;;
+        darwin) launchctl kickstart -k "gui/$(id -u)/ai.seeddrill.cordelia" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Wait until the node that answers is the version just installed.
+wait_for_installed() {
+    waited=0
+    while :; do
+        RUNNING=$(running_version)
+        if [ "$RUNNING" = "$INSTALLED" ]; then
+            return 0
+        fi
+        if [ "$waited" -ge "$RESTART_WAIT_SECS" ]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# Bring a node that is already running onto the version just installed,
+# and set INSTALLED, RUNNING and RESTART to what was found and done.
+settle_running_node() {
+    INSTALLED=$(installed_version)
+    RUNNING=""
+    RESTART="not-needed"
+    ANSWERS=""
+
+    if service_running; then
+        ANSWERS=yes
+        RUNNING=$(running_version)
+        if [ "$RUNNING" = "$INSTALLED" ]; then
+            return
+        fi
+        if [ -n "${CORDELIA_NO_RESTART:-}" ]; then
+            RESTART="needed"
+            echo "The node is still running the previous version. To switch to this one:"
+            echo "  ${RESTART_CMD}"
+            return
+        fi
+        echo "A node is running: restarting it on ${INSTALLED}..."
+        if restart_service && wait_for_installed; then
+            RESTART="done"
+            echo "The node was restarted and is running ${INSTALLED}."
+        else
+            RESTART="failed"
+            RUNNING=$(running_version)
+            echo "The node did not come up on ${INSTALLED} within ${RESTART_WAIT_SECS} seconds."
+            echo "  Restart it:  ${RESTART_CMD}"
+            echo "  Then check:  cordelia status"
+        fi
+        return
+    fi
+
+    if node_answers; then
+        # A node that was not started as the service this script sets up.
+        ANSWERS=yes
+        RUNNING=$(running_version)
+        if [ "$RUNNING" != "$INSTALLED" ]; then
+            RESTART="needed"
+            echo "A node is running here that was not started as the service, on the"
+            echo "previous version. Stop it and start it again to switch to this one."
+        fi
+    fi
+}
+
+# The line for a program, and the exit code that goes with it.
+finish() {
+    if [ -z "$ANSWERS" ]; then
+        SHOWN="none"
+    elif [ -z "$RUNNING" ]; then
+        SHOWN="unknown"
+    else
+        SHOWN="$RUNNING"
+    fi
+    echo "cordelia-install: installed=${INSTALLED} running=${SHOWN} restart=${RESTART}"
+    case "$RESTART" in
+        failed) exit 3 ;;
+        needed) [ -n "${CORDELIA_NO_RESTART:-}" ] || exit 3 ;;
     esac
 }
 
@@ -280,10 +399,10 @@ main() {
     echo ""
     echo "Cordelia installed successfully."
     echo ""
-    if service_running; then
-        echo "The node is running the previous version. To switch to this one:"
-        echo "  ${RESTART_CMD}"
+    settle_running_node
+    if [ -n "$ANSWERS" ]; then
         echo ""
+        finish
         return
     fi
     echo "Next steps:"
@@ -297,6 +416,7 @@ main() {
     echo ""
     echo "Open a new terminal first if 'cordelia' is not found."
     echo ""
+    finish
 }
 
 main "$@"

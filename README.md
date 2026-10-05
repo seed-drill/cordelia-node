@@ -21,6 +21,11 @@ and `v0.2.0-alpha.8` is the current pre-release, for macOS and Linux:
 curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.8 sh
 ```
 
+Running it again with a later version upgrades: it restarts a node that is
+running as the service it set up, waits until the node says that it is the
+new version, and ends with one line that a program can read
+(`cordelia-install: installed=... running=... restart=...`).
+
 It is an alpha: expect rough edges, and keep your own backup of anything you
 cannot afford to lose.
 
