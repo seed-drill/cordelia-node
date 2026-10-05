@@ -12,8 +12,11 @@
 //!
 //! ## A pass
 //!
-//! [`DeviceEntries::pass`] is run on the node's two timers, and one pass
-//! runs at a time:
+//! [`DeviceEntries::pass`] is run on the node's two timers. **Each relay
+//! has its turn in a pass, by itself, and one turn runs at a time at one
+//! relay:** a relay that is slow to answer, or does not answer at all,
+//! holds up its own turn and no other relay's (§16). What couples the
+//! relays is the rule for a device that wakes, below, and nothing else.
 //!
 //! - **The whole pass**, as often as the node fetches. The hand-overs
 //!   that this device made and that are two hours old go from its store,
@@ -43,7 +46,9 @@
 //!
 //! A device that wakes shows on every connection first, in either pass,
 //! and does nothing more until each relay it is set up with has answered
-//! or the wait has gone by.
+//! or the wait has gone by. While it wakes, one pass at a time asks the
+//! relays, and waits for all of them: that is the rule. Once it is
+//! awake, no relay waits for another.
 //!
 //! ## What it keeps
 //!
@@ -206,8 +211,10 @@ pub struct DeviceEntries {
     clock: Clock,
     leave: Leave,
     kept: Mutex<Kept>,
-    /// One pass at a time.
-    running: tokio::sync::Mutex<()>,
+    /// While the device wakes, one pass at a time asks every relay first.
+    waking: tokio::sync::Mutex<()>,
+    /// One turn at a time at each relay, by the relay's name.
+    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DeviceEntries {
@@ -218,7 +225,8 @@ impl DeviceEntries {
             leave: Leave::new(clock.clone()),
             clock,
             kept: Mutex::default(),
-            running: tokio::sync::Mutex::new(()),
+            waking: tokio::sync::Mutex::new(()),
+            turns: Mutex::default(),
         })
     }
 
@@ -238,12 +246,13 @@ impl DeviceEntries {
     }
 
     /// Make one pass over `relays`: every relay that the device is set up
-    /// with, each with its connection where there is one. A pass that
-    /// finds another running does nothing.
+    /// with, each with its connection where there is one.
+    ///
+    /// Each relay has its turn, and the turns run beside one another: it
+    /// comes back when each has ended. A relay at which a turn of an
+    /// earlier pass is still running is left out of this one, and no
+    /// other relay waits for it.
     pub async fn pass(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
-        let Ok(_running) = self.running.try_lock() else {
-            return;
-        };
         let links: Vec<&Link> = relays
             .iter()
             .filter_map(|relay| relay.link.as_ref())
@@ -284,36 +293,82 @@ impl DeviceEntries {
             return;
         }
 
-        // The show comes before everything. The whole pass shows on every
-        // connection, and a device that wakes asks every relay first.
-        let waking = self.leave.is_waking();
-        let mut shows = tokio::task::JoinSet::new();
-        for link in &links {
-            if whole || (waking && !self.leave.has_heard(link.name())) {
-                let (engine, link) = (Arc::clone(self), (*link).clone());
-                shows.spawn(async move { engine.show_at(&link).await });
-            }
-        }
-        while shows.join_next().await.is_some() {}
-
-        let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
-        if stands == Stands::Applied && !self.leave.is_waking() {
-            let mut passes = tokio::task::JoinSet::new();
+        // A device that wakes asks every relay first, in either pass, and
+        // does nothing more until each has answered or the wait has gone
+        // by (§4.6). That is the one thing that couples its relays: while
+        // it wakes, one pass asks them all, and waits for them all.
+        let mut shown: HashMap<LinkId, bool> = HashMap::new();
+        if self.leave.is_waking() {
+            let Ok(_waking) = self.waking.try_lock() else {
+                return;
+            };
+            let mut shows = tokio::task::JoinSet::new();
             for link in &links {
-                // The whole pass has just shown on every connection: one
-                // whose answer gave no leave is left for the next pass.
-                // The pass that sends has not, and shows where it finds
-                // something to send and no leave.
-                if whole && self.leave.has(&lock(&self.state.db), link).is_err() {
-                    continue;
+                if whole || !self.leave.has_heard(link.name()) {
+                    let (engine, link) = (Arc::clone(self), (*link).clone());
+                    shows.spawn(async move { (link.id(), engine.show_at(&link).await) });
                 }
-                let (engine, link) = (Arc::clone(self), (*link).clone());
-                passes.spawn(async move { engine.relay_pass(&link, kind).await });
             }
-            while passes.join_next().await.is_some() {}
+            while let Some(done) = shows.join_next().await {
+                if let Ok((link, gave_leave)) = done {
+                    shown.insert(link, gave_leave);
+                }
+            }
+            if self.leave.is_waking() {
+                self.say(relays, stands);
+                return;
+            }
         }
+
+        // Awake: each relay has its turn, and none waits for another.
+        let mut turns = tokio::task::JoinSet::new();
+        for link in &links {
+            let shown = shown.get(&link.id()).copied();
+            let (engine, link) = (Arc::clone(self), (*link).clone());
+            turns.spawn(async move { engine.turn(&link, kind, shown).await });
+        }
+        while turns.join_next().await.is_some() {}
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
+    }
+
+    /// One relay's turn in a pass: the show, where the pass makes one,
+    /// and then the relay's pass. `shown` says that this pass has shown
+    /// on the connection
+    /// already, while the device woke, and whether that show gave leave.
+    ///
+    /// One turn runs at a time at a relay. A turn that finds another
+    /// running there does nothing: that one is waiting for the relay,
+    /// and a second would wait with it.
+    ///
+    /// The whole pass shows on every connection. Where the answer to
+    /// this turn's show gave no leave, the relay is left for the next
+    /// pass: it is what the relay answered here and now that is asked,
+    /// and not how long ago another relay answered. The pass that sends
+    /// makes no show of its own, and shows where it finds something to
+    /// send and no leave.
+    async fn turn(&self, link: &Link, kind: Pass, shown: Option<bool>) {
+        let turn = {
+            let mut turns = lock(&self.turns);
+            Arc::clone(turns.entry(link.name().to_string()).or_default())
+        };
+        let Ok(_turn) = turn.try_lock() else {
+            return;
+        };
+        let whole = kind == Pass::Whole;
+        let gave_leave = match shown {
+            Some(gave_leave) => Some(gave_leave),
+            None if whole => Some(self.show_at(link).await),
+            None => None,
+        };
+        // (A device that has stopped, or is in a fork, has no channel
+        // that a pass goes through. And one that wakes while this turn
+        // runs has no leave from then on, anywhere: the one way in
+        // refuses what the turn asks.)
+        if whole && gave_leave != Some(true) {
+            return;
+        }
+        self.relay_pass(link, kind).await;
     }
 
     // ── What the adder of a device owes ─────────────────────────────
@@ -346,8 +401,9 @@ impl DeviceEntries {
 
     /// Show the change entry that the device keeps on `link`, and deal
     /// with what it is answered, until an answer leaves nothing more to
-    /// show (decision 2026-10-04 §2.4 item 5, §4.6).
-    async fn show_at(&self, link: &Link) {
+    /// show (decision 2026-10-04 §2.4 item 5, §4.6). Returns whether the
+    /// last answer gave leave to use the connection.
+    async fn show_at(&self, link: &Link) -> bool {
         // The entry is shown whole where it was not yet on this
         // connection, where the relay asks for it, and where the relay
         // tells of another that the device does not keep.
@@ -355,10 +411,10 @@ impl DeviceEntries {
         for _ in 0..SHOWS_IN_A_PASS {
             let shows = match at_relays::to_show(&lock(&self.state.db)) {
                 Ok(Some(shows)) => shows,
-                Ok(None) => return,
+                Ok(None) => return false,
                 Err(e) => {
                     tracing::debug!(error = %e, "could not read the change entry to show");
-                    return;
+                    return false;
                 }
             };
             let entry = &shows.entry;
@@ -377,7 +433,7 @@ impl DeviceEntries {
                 }
                 Err(e) => {
                     tracing::debug!(relay = link.name(), error = %e, "a show was not answered");
-                    return;
+                    return false;
                 }
             };
             self.shown(link, entry, short, answered.bytes);
@@ -385,7 +441,7 @@ impl DeviceEntries {
                 ShowAnswer::Held | ShowAnswer::Taken => {
                     self.holds(link, entry, true);
                     self.dealt_with(link);
-                    return;
+                    return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit) => {
                     // The relay holds none, or an earlier one, and would
@@ -395,18 +451,18 @@ impl DeviceEntries {
                     self.holds(link, entry, false);
                     self.no_room(link, over_allowance, true);
                     self.dealt_with(link);
-                    return;
+                    return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
                     tracing::warn!(
                         relay = link.name(),
                         "a relay says that the change entry this device keeps is not signed as it must be"
                     );
-                    return;
+                    return false;
                 }
                 ShowAnswer::Whole if short => whole = true,
                 // "Show it whole" is no answer to the whole entry.
-                ShowAnswer::Whole => return,
+                ShowAnswer::Whole => return false,
                 ShowAnswer::Other { id, .. } => {
                     // The relay holds another. One that the device keeps,
                     // made apart from its own, it asks no more about. For
@@ -414,7 +470,7 @@ impl DeviceEntries {
                     // with the entry.
                     self.holds(link, entry, false);
                     if !short || shows.apart == Some(id) {
-                        return;
+                        return false;
                     }
                     whole = true;
                 }
@@ -428,16 +484,17 @@ impl DeviceEntries {
                             relay = link.name(),
                             "a relay answered a show with what is no entry; nothing is done with it"
                         );
-                        return;
+                        return false;
                     };
                     if !self.answered_with(link, entry, &another) {
-                        return;
+                        return false;
                     }
                     // It applied the change: it shows what it keeps now.
                     whole = false;
                 }
             }
         }
+        false
     }
 
     /// The device was answered on `link` with `another`, where it showed

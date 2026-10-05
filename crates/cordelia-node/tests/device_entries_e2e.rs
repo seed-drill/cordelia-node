@@ -472,6 +472,9 @@ struct Script {
     seen: Vec<(Protocol, WireMessage)>,
     /// What the test does as each request arrives.
     hook: Option<Hook>,
+    /// Whether it answers nothing at all, to any request, and keeps each
+    /// stream open.
+    silent: bool,
 }
 
 impl Default for Script {
@@ -481,6 +484,7 @@ impl Default for Script {
             whole: Say::Answer(ShowAnswer::Held),
             seen: Vec::new(),
             hook: None,
+            silent: false,
         }
     }
 }
@@ -575,7 +579,10 @@ impl StandIn {
                 _ => Ok(None),
             };
             script.seen.push((protocol, request));
-            does
+            match script.silent {
+                true => Err(()),
+                false => does,
+            }
         };
         match does {
             Ok(Some(answer)) => {
@@ -594,6 +601,13 @@ impl StandIn {
     fn says(&self, short: Say, whole: Say) {
         let mut script = self.script.lock().unwrap();
         (script.short, script.whole) = (short, whole);
+    }
+
+    /// From now on it answers nothing, to any request, and keeps each
+    /// stream open: as a relay that has stopped, whose connection has
+    /// not yet been found dead.
+    fn goes_silent(&self) {
+        self.script.lock().unwrap().silent = true;
     }
 
     /// From now on `hook` is called as each request arrives, before it is
@@ -1793,6 +1807,120 @@ async fn what_comes_back_after_a_change_was_applied_is_not_taken() {
 }
 
 // ── A device that wakes ──────────────────────────────────────────────
+
+/// One relay never holds up another, once the device is awake. A relay
+/// that answered one show and then answers nothing keeps its own turn
+/// waiting, for as long as a stream waits. The device goes on pulling
+/// from its other relay and pushing to it at its usual pace, pass after
+/// pass, while the turn at the silent one is still waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_stops_answering_holds_up_no_other_relay() {
+    let real = relay_started("real", None);
+    let silent = StandIn::started().await;
+    let (mut writer, mut reader) = (Device::new("desktop"), Device::new("laptop"));
+    writer.makes_the_phrase(&phrase());
+    writer.adds(&reader);
+    // The reader is set up with the silent relay first: it is the first
+    // that each of its passes comes to.
+    reader.connects_to("silent", silent.port, silent.key).await;
+    for device in [&mut writer, &mut reader] {
+        device.holds("notes");
+        device.connects("real", &real).await;
+    }
+    all_pass(&[&writer, &reader], 3).await;
+    let notes = writer.channel("notes");
+    assert_eq!(reader.has_leave("real"), Ok(()));
+    assert_eq!(reader.has_leave("silent"), Ok(()));
+
+    // The one relay answers nothing from now on.
+    silent.goes_silent();
+    // The reader's passes, as the node makes them: each is started, and
+    // none is waited for. (The turn at the silent relay waits for as
+    // long as a stream does, which is longer than the leave lasts.)
+    let pass = |kind: Pass| {
+        let (engine, relays) = (reader.engine.clone(), reader.relays.clone());
+        tokio::spawn(async move { engine.pass(&relays, kind).await })
+    };
+    let within = |what: &str, check: &dyn Fn() -> bool| {
+        let began = std::time::Instant::now();
+        while !check() {
+            assert!(
+                began.elapsed() < Duration::from_secs(4),
+                "{what}: not within four seconds"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let began = std::time::Instant::now();
+    for round in 0..4 {
+        // What the writer writes, the reader pulls from the real relay.
+        let file = writer.writes("notes", &format!("w{round}.md"), "by the writer");
+        writer.passes().await;
+        let whole = pass(Pass::Whole);
+        within("the reader pulls from the relay that answers", &|| {
+            reader.holds_of(&notes).contains(&file.id())
+        });
+        // And what the reader writes, it pushes there.
+        let own = reader.writes("notes", &format!("r{round}.md"), "by the reader");
+        let sends = pass(Pass::Send);
+        within("the reader pushes to the relay that answers", &|| {
+            holds_at(&real, &notes, &own.id())
+        });
+        // The first round's turn at the silent relay is still waiting.
+        if round == 0 {
+            assert!(!whole.is_finished());
+        }
+        drop((whole, sends));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    // All four rounds went by while one stream's wait had not, twice
+    // over: nothing here waited for the silent relay.
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(took > Duration::from_secs(8), "{took:?}");
+    // The silent relay was asked, and answered nothing since.
+    assert!(!silent.seen().is_empty());
+
+    // One turn runs at a time at a relay. Once every turn above has
+    // ended, a pass is started: its turn at the silent relay waits. A
+    // second pass then finds that turn running, leaves the silent relay
+    // out, and comes back at once.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    silent.seen();
+    let waiting = pass(Pass::Whole);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let began = std::time::Instant::now();
+    reader.passes().await;
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(!waiting.is_finished());
+    assert_eq!(silent.seen(), [Seen::Short]);
+}
+
+/// While a device wakes, one pass at a time asks its relays. A second
+/// pass that finds the first still asking does nothing, and asks no relay
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_a_device_wakes_one_pass_at_a_time_asks_its_relays() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    relay.says(Say::Nothing, Say::Nothing);
+    let (engine, relays) = (device.engine.clone(), device.relays.clone());
+    let first = tokio::spawn(async move { engine.pass(&relays, Pass::Whole).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(relay.seen(), [Seen::Whole]);
+    // The second comes back at once, and has asked nothing.
+    let began = std::time::Instant::now();
+    device.passes().await;
+    device.sends().await;
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(relay.seen(), []);
+    assert!(!first.is_finished());
+    assert_eq!(device.has_leave("relay"), Err(NoLeave::Waking));
+}
 
 /// A device that wakes asks every relay first. With two relays, of which
 /// the first lacks a change and the second holds it: nothing is taken
