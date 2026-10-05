@@ -1355,15 +1355,16 @@ mod tests {
         assert_eq!(rows, 2);
 
         // A key and a channel's ID are 32 bytes, a revision is at least
-        // 1, and whether the store holds it is yes or no.
+        // 1, and whether the store holds it is yes or no: one row is not
+        // changed to say otherwise.
         assert!(note_hand_over(&conn, &[3; 32], &[0x73; 32], 0, NOW).is_err());
         for change in ["key = X'0102'", "channel = X'0102'", "rev = 0", "held = 2"] {
-            assert!(
-                conn.execute(&format!("UPDATE person_hand_overs SET {change}"), [])
-                    .is_err(),
-                "{change}"
-            );
+            let one_row = format!("UPDATE person_hand_overs SET {change} WHERE rev = 7");
+            assert!(conn.execute(&one_row, []).is_err(), "{change}");
         }
+        // The control: that row can be changed.
+        let one_row = "UPDATE person_hand_overs SET held = 0 WHERE rev = 7";
+        assert_eq!(conn.execute(one_row, []).unwrap(), 1);
         assert_eq!(handed_over(&conn, &[3; 32]).unwrap(), None);
     }
 

@@ -650,11 +650,20 @@ mod tests {
         // The control: at the next revision the store takes it, and the
         // record is read.
         assert_eq!(
-            given(&s, 1, &holding(2, good)),
+            given(&s, 1, &holding(2, good.clone())),
             Taken::Own {
                 stored: Outcome::Stored,
                 record: Some(Record::Seen(AdditionSeen::Counted)),
                 came_to_count: 1,
+            }
+        );
+        // An entry below the one that the store holds is not read at all.
+        assert_eq!(
+            given(&s, 1, &holding(1, good)),
+            Taken::Own {
+                stored: Outcome::OlderThanHeld,
+                record: None,
+                came_to_count: 0,
             }
         );
     }

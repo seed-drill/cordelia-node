@@ -1711,6 +1711,14 @@ mod tests {
         assert!(adder.stored_in(&pair(3)).is_empty());
         // The next is above it, hours ahead of the clock.
         assert_eq!(add(3, now + 8 * HOUR).rev, ahead.rev + 1);
+
+        // A clock that cannot be set beside the time a hand-over says:
+        // the hand-over goes. The two are further apart than a number
+        // of seconds can say, one way and then the other.
+        assert_eq!(drop_at(i64::MIN + now + 8 * HOUR), 1);
+        add(3, now + 8 * HOUR);
+        assert_eq!(drop_at(i64::MIN), 1);
+        assert!(adder.stored_in(&pair(3)).is_empty());
     }
 
     /// Every hand-over a device made goes from its store when it applies
@@ -1774,13 +1782,31 @@ mod tests {
     /// leaves. The next it makes for a key is above the last all the
     /// same.
     ///
-    /// A device that has added a key is not alone, and one that applies a
-    /// statement drops what it handed: nothing here leaves a device alone
-    /// with a hand-over in its store. This one is put there by hand, as
-    /// a device would be that had lost the record it made. Leaving does
-    /// not lean on the other two.
+    /// Two things keep this from being seen from outside. A device that
+    /// has added a key is not alone, and one that applies a statement
+    /// drops what it handed: nothing here leaves a device alone with a
+    /// hand-over in its store. Each device here is put in that state by
+    /// hand, as one would be that had lost the record it made. And a
+    /// device that leaves a phrase applies the statement it is handed in
+    /// the same step, which drops what it handed too. So the first device
+    /// here only leaves: leaving does not lean on the other two.
     #[test]
     fn test_a_hand_over_leaves_the_store_when_the_device_leaves_its_phrase() {
+        // A device that only leaves.
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let old = s.hand(0, 1).hand_over;
+        let on = &s[0];
+        held_rows::clear_additions(&on.conn).unwrap();
+        let pair = derive::pair_secret(&on.identity, &s.key(1)).unwrap();
+        assert_eq!(on.stored_in(&pair), std::slice::from_ref(&old));
+        leave(&on.conn, &on.held()).unwrap();
+        assert!(on.stored_in(&pair).is_empty());
+        let last = held_rows::handed_over(&on.conn, &s.key(1)).unwrap();
+        let last = last.unwrap();
+        assert_eq!((last.rev, last.held), (old.rev, false));
+
+        // A device that leaves, and applies what it is handed.
         let mut s = Several::new(3);
         s.make_phrase(0);
         let old = s.hand(0, 1).hand_over;
