@@ -27,7 +27,8 @@ use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn};
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
+    OUTBOX_REFUSED_RETRY_MAX_SECS, OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -951,7 +952,13 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     device.makes_the_phrase(&phrase());
     device.holds("notes");
     device.connects_to("relay", relay.port, relay.key).await;
-    let later = || device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    // Past the leave, and past the longest wait after a show that got
+    // none.
+    let later = || {
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS))
+    };
     let refused = |why: EntryRefused| Say::Answer(ShowAnswer::Refused(why));
     let held = Say::Answer(ShowAnswer::Held);
     let whole = Say::Answer(ShowAnswer::Whole);
@@ -961,6 +968,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     });
 
     // Held: leave, and the pass goes on to the device's channels.
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
     let seen = relay.seen();
@@ -972,6 +980,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     // "Show it whole", to the short show and then to the whole one,
     // which it is no answer to: no leave, and no stream of a channel.
     relay.says(whole.clone(), whole.clone());
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     assert_eq!(relay.seen(), [Seen::Short, Seen::Whole]);
@@ -992,6 +1001,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
         other.clone(),
         Say::Answer(ShowAnswer::Another(vec![1, 2, 3])),
     );
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     assert_eq!(relay.seen(), [Seen::Short, Seen::Whole]);
@@ -999,6 +1009,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     assert_eq!(device.at("relay").holds_latest, Some(false));
     // Word of another, to the whole show, which it is no answer to.
     relay.says(whole.clone(), other.clone());
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     assert_eq!(relay.seen(), [Seen::Short, Seen::Whole]);
@@ -1007,12 +1018,14 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     // whole one follows. That is reset too: no leave.
     let before = device.counts("relay");
     relay.says(Say::Reset, Say::Reset);
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     assert_eq!(relay.seen(), [Seen::Short, Seen::Whole]);
     assert_eq!(device.counts("relay"), before);
     // The short show is not answered, and the whole one that follows is:
-    // held.
+    // held. It is made at once: a show that was not answered at all
+    // starts no wait.
     relay.says(Say::Reset, held.clone());
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
@@ -1056,6 +1069,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
 
     // Taken: leave.
     relay.says(whole, Say::Answer(ShowAnswer::Taken));
+    later();
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
     assert_eq!(device.at("relay").holds_latest, Some(true));
@@ -1067,6 +1081,160 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
     assert_eq!(relay.seen()[0], Seen::Short);
+}
+
+/// A show that gets no leave is made again after a wait that doubles, as
+/// what a relay refuses for room is sent again: four seconds, eight,
+/// sixteen, up to ten minutes. Nothing is shown while a wait lasts, by
+/// either pass. The wait is for that relay and that entry: another relay
+/// is shown as before, an answer that gives leave ends it, and so does
+/// another entry to show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_show_that_gets_no_leave_is_made_again_after_a_wait_that_doubles() {
+    let (stuck, good) = (StandIn::started().await, StandIn::started().await);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes("notes", "a.md", "waiting to be sent");
+    device.connects_to("stuck", stuck.port, stuck.key).await;
+    device.connects_to("good", good.port, good.key).await;
+    device.passes().await;
+    stuck.seen();
+    good.seen();
+    let shows = |relay: &StandIn| -> Vec<Seen> {
+        let shown = |one: &Seen| matches!(one, Seen::Whole | Seen::Short);
+        relay.seen().into_iter().filter(shown).collect()
+    };
+    let secs = |secs: u64| device.clock.run_ahead(Duration::from_secs(secs));
+
+    // The one relay asks for the whole entry, each time it is shown it.
+    let whole = Say::Answer(ShowAnswer::Whole);
+    stuck.says(whole.clone(), whole.clone());
+    secs(SHOW_LEAVE_SECS);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Short, Seen::Whole]);
+    assert_eq!(shows(&good), [Seen::Short]);
+    // At once, and three seconds on: nothing is shown there, by either
+    // pass, though something waits to be sent. The other relay is shown
+    // as on any pass.
+    for _ in 0..2 {
+        device.passes().await;
+        device.sends().await;
+        assert_eq!(shows(&stuck), []);
+        assert_eq!(shows(&good), [Seen::Short]);
+        secs(3);
+    }
+    // Past four seconds it is shown again, and gets no leave again.
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Short, Seen::Whole]);
+    // Then after eight, and not after four more.
+    secs(4);
+    device.passes().await;
+    assert_eq!(shows(&stuck), []);
+    secs(4);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Short, Seen::Whole]);
+    // And so on: over an hour of passes every ten seconds, it is shown
+    // the whole entry a handful of times, where it would have been shown
+    // it 360 times.
+    let before = device.counts("stuck").whole_shows;
+    for _ in 0..360 {
+        secs(10);
+        device.passes().await;
+    }
+    let in_an_hour = device.counts("stuck").whole_shows - before;
+    assert!((5..=12).contains(&in_an_hour), "{in_an_hour}");
+    assert_eq!(device.has_leave("stuck"), Err(NoLeave::NotGiven));
+
+    // An answer that gives leave ends the wait: the next show that gets
+    // none starts again at four seconds.
+    let held = Say::Answer(ShowAnswer::Held);
+    stuck.says(held.clone(), held);
+    secs(OUTBOX_REFUSED_RETRY_MAX_SECS);
+    device.passes().await;
+    assert_eq!(device.has_leave("stuck"), Ok(()));
+    stuck.says(whole.clone(), whole.clone());
+    secs(SHOW_LEAVE_SECS);
+    shows(&stuck);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Short, Seen::Whole]);
+    secs(4);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Short, Seen::Whole]);
+
+    // Another entry to show is shown at once, whatever the wait: a
+    // change is made on the device.
+    device.passes().await;
+    assert_eq!(shows(&stuck), []);
+    device.changes(&phrase(), &[&device], &[]);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [Seen::Whole]);
+}
+
+/// A relay that holds, in the place of the device's change entry, one
+/// that the phrase signed and that the device does not take: here, a
+/// statement that undoes a removal. The device is answered with it,
+/// refuses it, and has no leave at that relay for as long as the relay
+/// holds it. What a status reads says so, for that relay, and no more
+/// once the relay gives leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
+    use cordelia_crypto::change_entry::{self, ForPhrase};
+    use cordelia_crypto::statement::{self, Statement};
+    let relay = StandIn::started().await;
+    let (mut device, gone) = (Device::new("laptop"), Device::new("tablet"));
+    device.makes_the_phrase(&phrase());
+    device.adds(&gone);
+    // The device removes the other: the statement it has applied lists
+    // that key as removed.
+    device.changes(&phrase(), &[&device], &[&gone]);
+    let applied = held(&device.db()).unwrap().unwrap().statement.statement;
+    assert_eq!(applied.removed, [gone.key()]);
+    // A statement that the phrase signed, made after that one, which
+    // lists nobody as removed.
+    let secret = statement::new_secret().unwrap();
+    let mut chain = applied.chain.clone();
+    chain.push(applied.link().unwrap());
+    let undoes = Statement {
+        number: applied.number + 1,
+        maker: device.key(),
+        chain,
+        commitment: statement::commitment(&secret),
+        devices: applied.devices.clone(),
+        removed: Vec::new(),
+        phrase_key: applied.phrase_key,
+    };
+    let signed = undoes.sign(&phrase().signing_key().unwrap()).unwrap();
+    let entry = change_entry::entry_of(&phrase(), &signed, &ForPhrase::first(secret)).unwrap();
+
+    device.connects_to("relay", relay.port, relay.key).await;
+    let other = Say::Answer(ShowAnswer::Other {
+        rev: entry.rev,
+        id: entry.id(),
+    });
+    relay.says(other, Say::Answer(ShowAnswer::Another(entry.to_wire())));
+    let kept = device.latest().id();
+    device.passes().await;
+    assert_eq!(device.latest().id(), kept);
+    assert_eq!(device.stands(), Stands::Applied);
+    assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
+    let said = device.at("relay").refuses.expect("the status says so");
+    assert!(
+        said.contains("lacks a key that the applied one removed"),
+        "{said}"
+    );
+    assert_eq!(device.status().cannot_go_on, None);
+
+    // The relay holds the device's own entry again: leave, and nothing
+    // more is said of it.
+    let held_it = Say::Answer(ShowAnswer::Held);
+    relay.says(held_it.clone(), held_it);
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+    device.passes().await;
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    assert_eq!(device.at("relay").refuses, None);
 }
 
 /// With leave, a device still asks only so much of a relay in a minute on
@@ -1511,25 +1679,34 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
     ];
     for (n, answer) in answers.into_iter().enumerate() {
         // A show in short is told of another, and the whole entry is
-        // answered with this one.
+        // answered with this one. (The wait after a show that got no
+        // leave has gone by.)
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
         relay.says(other.clone(), Say::Answer(ShowAnswer::Another(answer)));
         device.passes().await;
-        // The pass that sends has something to send. It finds no leave,
-        // shows again by itself, and is answered the same.
-        device.sends().await;
         let seen = relay.seen();
         assert!(!any_of_a_channel(&seen), "{n}: {seen:?}");
         assert_eq!(seen.last(), Some(&Seen::Whole), "{n}");
+        // The pass that sends has something to send, and finds no leave.
+        // The show that would give it was made a moment ago, and got
+        // none: it is not made again yet, and nothing is sent.
+        device.sends().await;
+        assert_eq!(relay.seen(), [], "{n}");
         assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven), "{n}");
         assert_eq!(device.latest().id(), second.id(), "{n}");
         assert_eq!(device.stands(), Stands::Applied, "{n}");
         assert_eq!(device.status().cannot_go_on, None, "{n}");
         assert_eq!(device.at("relay").holds_latest, Some(false), "{n}");
     }
-    // The control: a relay that holds the entry is shown it, and the
-    // device goes on.
+    // The control: a relay that holds the entry is shown it, once the
+    // wait has gone by, and the device goes on.
     let held = Say::Answer(ShowAnswer::Held);
     relay.says(held.clone(), held);
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
     assert!(any_of_a_channel(&relay.seen()));
@@ -1575,8 +1752,15 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     let forked = other.counts("relay");
     assert_eq!(forked.whole_shows, before.whole_shows + 1);
 
-    // Pass after pass: one short show each, answered with word of the
-    // entry that it keeps. Nothing whole, and no stream of a channel.
+    // Its whole show got no leave: the next is made after a wait, and
+    // nothing is shown while it lasts.
+    other.passes().await;
+    assert_eq!(other.counts("relay"), forked);
+    other.clock.run_ahead(Duration::from_secs(4));
+    // From then on, pass after pass: one short show each, answered with
+    // word of the entry that it keeps. Nothing whole, and no stream of a
+    // channel. (A show in short that gets no leave costs little, and
+    // starts no wait.)
     for _ in 0..4 {
         other.passes().await;
         other.sends().await;

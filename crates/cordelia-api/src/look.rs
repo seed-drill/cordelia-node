@@ -187,6 +187,9 @@ pub struct AtRelayLook {
     /// How many entries of this device's own the relay holds in another
     /// form.
     pub another_form: usize,
+    /// Why this device refuses the change that the relay holds, where it
+    /// does.
+    pub refuses: Option<String>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -766,6 +769,7 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                 )
             }),
             another_form: relay.another_form,
+            refuses: relay.refuses.clone(),
         })
         .collect()
 }
@@ -788,6 +792,13 @@ impl AtRelayLook {
             ));
         }
         says.extend(self.no_room.clone());
+        if let Some(why) = &self.refuses {
+            says.push(format!(
+                "{} holds a change that this device does not take ({why}): this device \
+                 neither sends there nor takes from there while it does",
+                self.relay
+            ));
+        }
         match self.another_form {
             0 => {}
             1 => says.push(format!(
@@ -1293,6 +1304,7 @@ mod tests {
             heard_since_woke: heard,
             no_room,
             another_form: 0,
+            refuses: None,
         };
         let full = NoRoom {
             at: 1_800_000_000,
@@ -1351,6 +1363,18 @@ mod tests {
         assert_eq!(look.relays[1].another_form, 3);
         at.relays[0].another_form = 0;
         at.relays[1].another_form = 0;
+        // And a relay that holds a change which the device refuses.
+        at.relays[0].refuses = Some("the statement undoes a removal".into());
+        let look = seen_at(&s, &at);
+        assert!(
+            look.says.contains(
+                &"one.example:1 holds a change that this device does not take (the statement \
+              undoes a removal): this device neither sends there nor takes from there while \
+              it does"
+                    .to_string()
+            )
+        );
+        at.relays[0].refuses = None;
 
         at.cannot_go_on = Some(CannotGoOn::NotApplied {
             relay: "one.example:1".into(),

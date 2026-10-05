@@ -50,6 +50,18 @@
 //! relays, and waits for all of them: that is the rule. Once it is
 //! awake, no relay waits for another.
 //!
+//! ## A show that gets no leave
+//!
+//! A relay that answers a show with "show it whole" to the whole entry,
+//! with word of another that it then does not hand, or with an entry
+//! that is behind or that the device refuses, gives no leave, and would
+//! be shown the whole entry again at every pass: 33 KB each time. Such a
+//! show is made again after a wait that doubles, as what a relay refuses
+//! for room is sent again ([`refused_wait`]), for that relay and that
+//! entry. An answer that gives leave ends the wait, and so does another
+//! entry to show. Where the entry that a relay answered with is one that
+//! the device refuses, what a status reads says so for that relay.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -180,14 +192,31 @@ struct OfRelay {
     /// How many entries of the device's own it said it holds in another
     /// form.
     another_form: usize,
+    /// The entry whose show last got no leave there, by what it is named
+    /// by, how often in a row, and when it is shown there again.
+    show_left: Option<([u8; 32], LeftFor)>,
+    /// Why the device refuses the entry that the relay last answered a
+    /// show with, where it does.
+    refuses: Option<String>,
     counts: Counts,
     /// What was pushed to it in the last minute: a device paces itself,
     /// so that it is never the one refused for going over.
     sent: Option<ByteCounter>,
 }
 
-/// A channel that found no room at a relay: how often in a row, and when
-/// it is sent there again.
+/// What became of the shows of one round at a relay.
+#[derive(Default)]
+struct Round {
+    /// What the entry that was shown last is named by.
+    entry: Option<[u8; 32]>,
+    /// Whether an entry was shown whole.
+    whole: bool,
+    /// Whether the relay answered any of them.
+    answered: bool,
+}
+
+/// A channel that found no room at a relay, or a show that got no leave
+/// there: how often in a row, and when it is sent or made there again.
 struct LeftFor {
     refusals: u32,
     until: Instant,
@@ -455,7 +484,46 @@ impl DeviceEntries {
     /// with what it is answered, until an answer leaves nothing more to
     /// show (decision 2026-10-04 §2.4 item 5, §4.6). Returns whether the
     /// last answer gave leave to use the connection.
+    ///
+    /// Where the relay answered, the entry was shown whole, and there is
+    /// no leave, the show is made again there only after a wait, a little
+    /// longer each time (§16): nothing is shown while it lasts. An answer
+    /// that gives leave ends it.
     async fn show_at(&self, link: &Link) -> bool {
+        let mut round = Round::default();
+        let gave_leave = self.show_round(link, &mut round).await;
+        let now = self.clock.now();
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        if gave_leave {
+            of.show_left = None;
+            of.refuses = None;
+        } else if let (true, true, Some(entry)) = (round.whole, round.answered, round.entry) {
+            let refusals = match &of.show_left {
+                Some((shown, left)) if *shown == entry => left.refusals.saturating_add(1),
+                _ => 1,
+            };
+            let until = now + refused_wait(refusals);
+            of.show_left = Some((entry, LeftFor { refusals, until }));
+        }
+        gave_leave
+    }
+
+    /// Whether a show of the entry named `entry` waits at the relay
+    /// called `relay`: its last show there got no leave, and the wait
+    /// since has not gone by.
+    fn show_waits(&self, relay: &str, entry: &[u8; 32]) -> bool {
+        let now = self.clock.now();
+        lock(&self.kept)
+            .relays
+            .get(relay)
+            .and_then(|of| of.show_left.as_ref())
+            .is_some_and(|(shown, left)| shown == entry && now < left.until)
+    }
+
+    /// [`Self::show_at`], for one round of shows, with what became of
+    /// them said in `round`.
+    async fn show_round(&self, link: &Link, round: &mut Round) -> bool {
         // The entry is shown whole where it was not yet on this
         // connection, where the relay asks for it, and where the relay
         // tells of another that the device does not keep.
@@ -470,11 +538,16 @@ impl DeviceEntries {
                 }
             };
             let entry = &shows.entry;
+            round.entry = Some(entry.id());
+            if self.show_waits(link.name(), &entry.id()) {
+                return false;
+            }
             let shown_whole = lock(&self.kept)
                 .links
                 .get(&link.id())
                 .and_then(|of| of.shown_whole);
             let short = !whole && shown_whole == Some(entry.id());
+            round.whole |= !short;
             let answered = match self.leave.show(link, entry, short).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
@@ -488,6 +561,7 @@ impl DeviceEntries {
                     return false;
                 }
             };
+            round.answered = true;
             self.shown(link, entry, short, answered.bytes);
             match answered.answer {
                 ShowAnswer::Held | ShowAnswer::Taken => {
@@ -592,6 +666,15 @@ impl DeviceEntries {
                     ?why,
                     "the entry that a relay answered a show with was refused"
                 );
+                // An entry that is no change entry this device takes, held
+                // by the relay in the place of its own: the relay gives
+                // no leave for as long as it holds it, and the status
+                // says so.
+                if let cordelia_api::person::Refused::NotAChangeEntry(why) = &why {
+                    let mut kept = lock(&self.kept);
+                    let of = kept.relays.entry(relay.to_string()).or_default();
+                    of.refuses = Some(why.to_string());
+                }
                 false
             }
             Ok(Answered::NotOfTheSlot | Answered::NotTaken) => {
@@ -1159,6 +1242,7 @@ impl DeviceEntries {
                     heard_since_woke: self.leave.has_heard(&relay.name),
                     no_room: of.and_then(|of| of.no_room),
                     another_form: of.map_or(0, |of| of.another_form),
+                    refuses: of.and_then(|of| of.refuses.clone()),
                 }
             })
             .collect();
@@ -1202,7 +1286,8 @@ fn pushed_as(answer: &PushAnswer) -> Pushed {
 }
 
 /// How long a channel is left after the `refusals`-th refusal for room in
-/// a row: the time between two sends, doubled each time, up to
+/// a row, and a show after the `refusals`-th in a row that got no leave:
+/// the time between two sends, doubled each time, up to
 /// OUTBOX_REFUSED_RETRY_MAX_SECS.
 fn refused_wait(refusals: u32) -> Duration {
     let secs = OUTBOX_FLUSH_INTERVAL_SECS

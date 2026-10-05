@@ -194,6 +194,13 @@ pub struct AtRelay {
     /// device in that slot at that revision. The device sends such an
     /// entry there no more, and the next edit goes above both.
     pub another_form: usize,
+    /// Why the device refuses the entry that the relay last answered a
+    /// show with, where it does: the relay holds, in the place of the
+    /// device's change entry, one that the phrase signed and that the
+    /// device does not take (it undoes a removal, or commits to the
+    /// secret already applied). It gives no leave for as long as it
+    /// does.
+    pub refuses: Option<String>,
 }
 
 /// A relay's refusal of something that it would have taken.
