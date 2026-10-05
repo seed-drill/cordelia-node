@@ -481,6 +481,59 @@ pub fn read_again(conn: &Connection) -> Result<(), PersonError> {
     Ok(())
 }
 
+// ── What is kept for nothing ─────────────────────────────────────────
+
+/// What [`forget_what_is_done`] forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Forgotten {
+    /// How many relays the device is no longer set up with.
+    pub relays: usize,
+    /// How many pair channels whose delete went everywhere.
+    pub pairs: usize,
+}
+
+/// Forget what the device keeps of its relays and has no more use for,
+/// since nothing else does (decision 2026-10-04 §6, §16):
+///
+/// - Everything kept of a relay that the device is no longer set up
+///   with. `set_up` is the node keys of the relays it is set up with,
+///   where every one of them is known: a relay's key is known while it
+///   is connected. With `None` nothing is forgotten of any relay.
+/// - Everything kept of a pair channel of which the store holds only
+///   this device's delete, once every relay that was sent anything of
+///   the channel was sent the delete. The delete itself stays in the
+///   store: a hand-over made later for that key goes above it.
+///
+/// It is one transaction.
+pub fn forget_what_is_done(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    set_up: Option<&[[u8; 32]]>,
+) -> Result<Forgotten, PersonError> {
+    in_one(conn, || {
+        let mut forgotten = Forgotten::default();
+        if let Some(set_up) = set_up {
+            forgotten.relays = kept_rows::forget_relays_but(conn, set_up)?;
+        }
+        for channel in channels(conn, identity)? {
+            if channel.kind != Kind::Pair || !kept_rows::keeps_any_anywhere(conn, &channel.id)? {
+                continue;
+            }
+            // Of a pair channel a device's store holds what the device
+            // wrote there, and nothing else.
+            let held = entries::channel_entries_after(conn, &channel.id, 0, 2)?;
+            let [only] = held.as_slice() else {
+                continue;
+            };
+            if only.entry.delete && kept_rows::sent_everywhere(conn, &channel.id, only.seq)? {
+                kept_rows::forget_channel(conn, &channel.id)?;
+                forgotten.pairs += 1;
+            }
+        }
+        Ok(forgotten)
+    })
+}
+
 // ── Sending ──────────────────────────────────────────────────────────
 
 /// Which part of what a device holds of a channel is sent.
@@ -2396,5 +2449,121 @@ mod tests {
         // nothing is kept of that.
         assert!(sends(on, &OTHER_RELAY, &pair, Which::Since).is_empty());
         assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &pair.id).unwrap());
+    }
+
+    /// What is kept of a pair channel at the relays is forgotten once
+    /// the delete over its hand-over went to every relay that was sent
+    /// anything of it, and not before. The delete stays in the store,
+    /// and goes to no relay after that. What is kept of a relay that the
+    /// device is no longer set up with is forgotten where every relay it
+    /// is set up with is known, and holds up nothing.
+    #[test]
+    fn test_what_is_kept_of_a_pair_channel_is_forgotten_once_its_delete_went_everywhere() {
+        const THIRD_RELAY: [u8; 32] = [0xa3; 32];
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let handed = s.hand(0, 1).hand_over;
+        let made = s.now;
+        let on = &s[0];
+        let pair = channel_of(on, Kind::Pair);
+        let forget = |set_up: Option<&[[u8; 32]]>| {
+            forget_what_is_done(&on.conn, &on.identity, set_up).unwrap()
+        };
+        let none = Forgotten::default();
+        // The hand-over goes to two relays, which hold it. While the
+        // store holds the hand-over, nothing is forgotten, though each
+        // relay was sent everything of the channel.
+        for relay in [&RELAY, &OTHER_RELAY] {
+            let batch = sends(on, relay, &pair, Which::Since);
+            opened_for(&on.conn, relay, &pair, &batch).unwrap();
+            assert_eq!(sends_all(on, relay, &pair, Which::Since), [handed.id()]);
+        }
+        assert_eq!(forget(None), none);
+        assert_eq!(forget(Some(&[RELAY, OTHER_RELAY])), none);
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &pair.id).unwrap());
+        // A push to a third is opened, and never answered.
+        let batch = sends(on, &THIRD_RELAY, &pair, Which::Since);
+        opened_for(&on.conn, &THIRD_RELAY, &pair, &batch).unwrap();
+        let later = made + 2 * 60 * 60;
+        drop_old_hand_overs(&on.conn, later).unwrap();
+        // Nor while it holds nothing of the channel: the delete is not
+        // written yet.
+        assert_eq!(forget(None), none);
+        assert_eq!(
+            write_over_dropped(&on.conn, &on.identity, later).unwrap(),
+            1
+        );
+        let over = on.stored_in(&derive::pair_secret(&on.identity, &s.key(1)).unwrap());
+        assert!(over[0].delete);
+        // Nor while the delete waits for any relay that was sent
+        // anything: for all three, then for two, then for the one whose
+        // answer to the hand-over was lost.
+        assert_eq!(forget(None), none);
+        assert_eq!(sends_all(on, &RELAY, &pair, Which::Since), [over[0].id()]);
+        assert_eq!(forget(None), none);
+        assert_eq!(
+            sends_all(on, &OTHER_RELAY, &pair, Which::Since),
+            [over[0].id()]
+        );
+        assert_eq!(forget(None), none);
+        assert_eq!(forget(Some(&[RELAY, OTHER_RELAY, THIRD_RELAY])), none);
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &pair.id).unwrap());
+        // The personal channel is kept for the third relay too.
+        let personal = channel_of(on, Kind::Personal);
+        sends_all(on, &THIRD_RELAY, &personal, Which::Since);
+        sends_all(on, &RELAY, &personal, Which::Since);
+
+        // The device is set up with the third relay no longer: what was
+        // kept of it goes, for every channel, and the delete has then
+        // gone everywhere it was to go. What is kept of the pair channel
+        // goes with it, at once.
+        assert_eq!(
+            forget(Some(&[RELAY, OTHER_RELAY])),
+            Forgotten {
+                relays: 1,
+                pairs: 1
+            }
+        );
+        for relay in [&RELAY, &OTHER_RELAY, &THIRD_RELAY] {
+            assert!(!kept_rows::keeps_any(&on.conn, relay, &pair.id).unwrap());
+        }
+        assert!(!kept_rows::keeps_any(&on.conn, &THIRD_RELAY, &personal.id).unwrap());
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &personal.id).unwrap());
+        assert_eq!(forget(Some(&[RELAY, OTHER_RELAY])), none);
+        // The delete stays in the store, is written no second time, and
+        // goes to no relay: nothing is kept of the channel again.
+        assert_eq!(
+            on.stored_in(&derive::pair_secret(&on.identity, &s.key(1)).unwrap()),
+            over
+        );
+        assert_eq!(
+            write_over_dropped(&on.conn, &on.identity, later + 1).unwrap(),
+            0
+        );
+        for relay in [&RELAY, &OTHER_RELAY, &THIRD_RELAY] {
+            assert!(sends(on, relay, &pair, Which::Since).is_empty());
+            assert!(!kept_rows::keeps_any(&on.conn, relay, &pair.id).unwrap());
+        }
+        // A channel of the device's own is never forgotten so: what the
+        // relays were sent of the personal channel is kept.
+        assert!(sends(on, &RELAY, &personal, Which::Since).is_empty());
+        // Nor is the channel of a name of which the store holds one
+        // entry, a delete of this device's, that went everywhere.
+        s.hold(&[0], "notes");
+        s.write(0, "notes", "a.md", "a text");
+        let delete = deleted(&mut s, 0, "notes", "a.md");
+        let on = &s[0];
+        let notes = notes_of(on);
+        assert_eq!(
+            on.stored_in(&on.own("notes")),
+            std::slice::from_ref(&delete)
+        );
+        for relay in [&RELAY, &OTHER_RELAY] {
+            assert_eq!(sends_all(on, relay, &notes, Which::Since), [delete.id()]);
+        }
+        let forgotten = forget_what_is_done(&on.conn, &on.identity, Some(&[RELAY, OTHER_RELAY]));
+        assert_eq!(forgotten.unwrap(), Forgotten::default());
+        assert!(kept_rows::keeps_any(&on.conn, &RELAY, &notes.id).unwrap());
+        assert!(sends(on, &RELAY, &notes, Which::Since).is_empty());
     }
 }

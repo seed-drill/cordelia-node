@@ -1016,6 +1016,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // Relays are configured by name, so the names are resolved again
         // while the node runs, not only at startup.
         let relay_addrs = p2p::RelayAddrs::default();
+        state.own_channels.set_up_with(relays.len());
         if !relays.is_empty() {
             tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone()));
         }

@@ -211,6 +211,59 @@ pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, Co
     .map_err(storage)
 }
 
+/// Keep nothing of any relay but those whose node keys are `set_up`: the
+/// device is set up with no other. Returns how many relays something
+/// was kept for, and is kept no more.
+pub fn forget_relays_but(conn: &Connection, set_up: &[[u8; 32]]) -> Result<usize, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT relay FROM at_relays
+             UNION SELECT relay FROM at_relays_refused",
+        )
+        .map_err(storage)?;
+    let kept: Vec<Vec<u8>> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(storage)?
+        .collect::<Result<_, _>>()
+        .map_err(storage)?;
+    let mut forgotten = 0;
+    for relay in kept {
+        if set_up.iter().any(|key| key.as_slice() == relay) {
+            continue;
+        }
+        for table in ["at_relays", "at_relays_refused"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE relay = ?1"),
+                params![relay],
+            )
+            .map_err(storage)?;
+        }
+        forgotten += 1;
+    }
+    Ok(forgotten)
+}
+
+/// Whether every relay that the device keeps anything of for `channel`
+/// was sent the channel up to the place `up_to` in the store's own
+/// order, and none of them has an entry of it waiting that it had no
+/// room for.
+pub fn sent_everywhere(
+    conn: &Connection,
+    channel: &[u8; 32],
+    up_to: i64,
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM at_relays WHERE channel = ?1 AND sent_to < ?2)
+            AND NOT EXISTS(SELECT 1 FROM at_relays_refused AS refused
+                           JOIN entries ON entries.channel_id = refused.channel
+                                       AND entries.seq = refused.seq
+                           WHERE refused.channel = ?1)",
+        params![channel.as_slice(), up_to],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
 /// The device is about to send `relay` something of `channel`: it keeps
 /// that it did, whatever comes back, and whether or not anything does.
 pub fn sending(
@@ -730,6 +783,67 @@ mod tests {
         );
         assert_eq!(waiting_refused(&conn, &RELAY, &channel(2)).unwrap(), [4]);
         assert_eq!(rows(), 1);
+    }
+
+    /// What is kept of a relay that the device is no longer set up with
+    /// is forgotten, for every channel, and what is kept of the others
+    /// stays. Whether a channel was sent everywhere is asked of the
+    /// relays that something is kept of.
+    #[test]
+    fn test_what_is_kept_of_a_relay_no_longer_set_up_is_forgotten() {
+        let conn = db::open_in_memory().unwrap();
+        const THIRD_RELAY: [u8; 32] = [0xa3; 32];
+        for name in ["a.md", "b.md"] {
+            entries::store(&conn, &made(1, 1, 5, name), 100).unwrap();
+        }
+        // Nothing is kept of the channel anywhere: it was sent to every
+        // relay that anything is kept of.
+        assert!(sent_everywhere(&conn, &channel(1), 2).unwrap());
+        sent(&conn, &RELAY, &channel(1), 2).unwrap();
+        sent(&conn, &RELAY, &channel(2), 7).unwrap();
+        sent(&conn, &OTHER_RELAY, &channel(1), 1).unwrap();
+        sending(&conn, &THIRD_RELAY, &channel(2)).unwrap();
+        // One relay was sent it up to an earlier place only.
+        assert!(sent_everywhere(&conn, &channel(1), 1).unwrap());
+        assert!(!sent_everywhere(&conn, &channel(1), 2).unwrap());
+        sent(&conn, &OTHER_RELAY, &channel(1), 2).unwrap();
+        assert!(sent_everywhere(&conn, &channel(1), 2).unwrap());
+        // One has an entry of it waiting that it had no room for, though
+        // no row says how far it was sent.
+        refused(&conn, &THIRD_RELAY, &channel(1), 2).unwrap();
+        assert!(!sent_everywhere(&conn, &channel(1), 2).unwrap());
+        // And one is about to be sent something of the other channel,
+        // and was sent nothing yet.
+        assert!(!sent_everywhere(&conn, &channel(2), 7).unwrap());
+
+        // Set up with all three: nothing is forgotten.
+        assert_eq!(
+            forget_relays_but(&conn, &[RELAY, OTHER_RELAY, THIRD_RELAY]).unwrap(),
+            0
+        );
+        assert!(keeps_any(&conn, &THIRD_RELAY, &channel(2)).unwrap());
+        // The third is set up no longer: what was kept of it goes, of
+        // both tables and for each channel, and nothing else does.
+        assert_eq!(forget_relays_but(&conn, &[RELAY, OTHER_RELAY]).unwrap(), 1);
+        assert!(!keeps_any(&conn, &THIRD_RELAY, &channel(2)).unwrap());
+        assert!(
+            waiting_refused(&conn, &THIRD_RELAY, &channel(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap().sent_to, 2);
+        assert_eq!(kept(&conn, &RELAY, &channel(2)).unwrap().sent_to, 7);
+        assert_eq!(kept(&conn, &OTHER_RELAY, &channel(1)).unwrap().sent_to, 2);
+        assert!(sent_everywhere(&conn, &channel(1), 2).unwrap());
+        assert!(sent_everywhere(&conn, &channel(2), 7).unwrap());
+        // A relay of which only a refusal is kept is forgotten too.
+        refused(&conn, &THIRD_RELAY, &channel(1), 1).unwrap();
+        assert_eq!(forget_relays_but(&conn, &[RELAY, OTHER_RELAY]).unwrap(), 1);
+        assert!(sent_everywhere(&conn, &channel(1), 2).unwrap());
+        // Set up with none: nothing is kept of any.
+        assert_eq!(forget_relays_but(&conn, &[]).unwrap(), 2);
+        assert!(!keeps_any_anywhere(&conn, &channel(1)).unwrap());
+        assert!(!keeps_any_anywhere(&conn, &channel(2)).unwrap());
     }
 
     /// What the device carried is everything the store had taken when it

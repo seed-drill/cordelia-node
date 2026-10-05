@@ -345,6 +345,7 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         if whole {
             self.hand_overs();
+            self.forget_done(relays);
         }
         // A device that was removed, is in no list, or could not open a
         // change shows nothing: it takes no change entry, and the way on
@@ -456,6 +457,54 @@ impl DeviceEntries {
             }
             Err(e) => tracing::debug!(error = %e, "could not write over the hand-overs"),
         }
+    }
+
+    // ── What is kept for nothing ────────────────────────────────────
+
+    /// Forget what is kept of the relays and has no more use, in the
+    /// store and in memory, since nothing else does (decision 2026-10-04
+    /// §6, §16): of a relay that the device is no longer set up with, of
+    /// a pair channel whose delete went everywhere, and of a channel that
+    /// is the device's no longer.
+    ///
+    /// Which relays the device is set up with is known by their keys
+    /// while every one of them is connected, and not otherwise: nothing
+    /// is forgotten of any relay then. `relays` may be fewer than the
+    /// node is configured with, since a relay whose name does not
+    /// resolve is not among them: every one is connected where each of
+    /// `relays` is, and they are as many as the node said it is
+    /// configured with.
+    fn forget_done(&self, relays: &[Relay]) {
+        let configured = self.state.own_channels.relays_set_up();
+        let set_up: Option<Vec<[u8; 32]>> = relays
+            .iter()
+            .map(|relay| {
+                let link = relay.link.as_ref().filter(|link| link.is_open())?;
+                Some(link.relay().0)
+            })
+            .collect();
+        let set_up = set_up.filter(|keys| Some(keys.len()) == configured);
+        let own = {
+            let db = lock(&self.state.db);
+            let own = &self.state.identity;
+            match at_relays::forget_what_is_done(&db, own, set_up.as_deref()) {
+                Ok(forgotten) if forgotten == Default::default() => {}
+                Ok(forgotten) => tracing::debug!(
+                    relays = forgotten.relays,
+                    pair_channels = forgotten.pairs,
+                    "what was kept of relays that are set up no longer, and of pair channels whose delete went everywhere, is forgotten"
+                ),
+                Err(e) => tracing::debug!(error = %e, "could not forget what is kept for nothing"),
+            }
+            at_relays::channels(&db, own)
+        };
+        let Ok(own) = own else {
+            return;
+        };
+        let own: Vec<[u8; 32]> = own.iter().map(|channel| channel.id).collect();
+        lock(&self.kept)
+            .left
+            .retain(|part, _| still_of_use(part, set_up.as_deref(), &own));
     }
 
     // ── A change that could not be applied ──────────────────────────
@@ -1436,6 +1485,15 @@ fn pushed_as(answer: &PushAnswer) -> Pushed {
     }
 }
 
+/// Whether what is kept in memory of `part` still has a use: its channel
+/// is among `own`, the channels of the device's own now, and its relay is
+/// among `set_up`, the relays that the device is set up with, where
+/// those are known.
+fn still_of_use(part: &Part, set_up: Option<&[[u8; 32]]>, own: &[[u8; 32]]) -> bool {
+    let (relay, channel, _) = part;
+    own.contains(channel) && set_up.is_none_or(|set_up| set_up.contains(relay))
+}
+
 /// How long a channel is left after the `refusals`-th refusal for room in
 /// a row, and a show after the `refusals`-th in a row that got no leave:
 /// the time between two sends, doubled each time, up to
@@ -1450,6 +1508,35 @@ fn refused_wait(refusals: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is kept in memory of a relay and a channel is kept while
+    /// the channel is the device's own and the relay is one it is set up
+    /// with: and, where the relays it is set up with are not all known,
+    /// whatever the relay.
+    #[test]
+    fn what_is_kept_of_a_part_is_of_use_while_its_channel_and_its_relay_are_the_devices() {
+        let (relay, other_relay) = ([1u8; 32], [2u8; 32]);
+        let (channel, other_channel) = ([3u8; 32], [4u8; 32]);
+        for which in [Which::Since, Which::Carried] {
+            let part = (relay, channel, which);
+            assert!(still_of_use(&part, Some(&[relay]), &[channel]));
+            assert!(still_of_use(
+                &part,
+                Some(&[other_relay, relay]),
+                &[other_channel, channel]
+            ));
+            // The channel is the device's no longer.
+            assert!(!still_of_use(&part, Some(&[relay]), &[other_channel]));
+            assert!(!still_of_use(&part, Some(&[relay]), &[]));
+            assert!(!still_of_use(&part, None, &[other_channel]));
+            // The relay is set up no longer.
+            assert!(!still_of_use(&part, Some(&[other_relay]), &[channel]));
+            assert!(!still_of_use(&part, Some(&[]), &[channel]));
+            // Which relays are set up is not known: nothing is forgotten
+            // of any.
+            assert!(still_of_use(&part, None, &[channel]));
+        }
+    }
 
     /// A channel that finds no room is left a little longer each time, up
     /// to ten minutes.

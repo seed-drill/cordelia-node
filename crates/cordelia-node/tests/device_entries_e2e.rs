@@ -45,7 +45,7 @@ use cordelia_node::device_entries::{
     Asked, Clock, Counts, DeviceEntries, Link, NoLeave, Pass, Refused, Relay,
 };
 use cordelia_storage::person::State;
-use cordelia_storage::{entries, person as held_rows};
+use cordelia_storage::{at_relays as kept_rows, entries, person as held_rows};
 
 use common::*;
 
@@ -145,6 +145,7 @@ impl Device {
                 link: None,
             });
         }
+        self.state.own_channels.set_up_with(self.relays.len());
     }
 
     /// The device connects to `relay`, which it calls `name`: on a new
@@ -167,6 +168,13 @@ impl Device {
         self.set_up_with(name);
         let link = Link::new(name, relay, conn);
         self.relay_mut(name).link = Some(link);
+    }
+
+    /// The device is set up no longer with the relay it calls `name`.
+    fn sets_up_no_longer(&mut self, name: &str) {
+        self.disconnects(name);
+        self.relays.retain(|relay| relay.name != name);
+        self.state.own_channels.set_up_with(self.relays.len());
     }
 
     /// The device's connection to the relay it calls `name` is closed. It
@@ -3389,6 +3397,107 @@ async fn a_hand_over_is_dropped_after_two_hours_and_the_relay_then_holds_a_delet
         adder.passes().await;
     }
     assert_eq!(adder.counts("relay").pushed, sent);
+    // It went to every relay that was sent the hand-over: nothing is
+    // kept of the pair channel at any relay after the next pass, and the
+    // delete stays in the store, above the hand-over.
+    let (relay_key, personal) = (key_of(&relay), adder.personal());
+    let db = adder.db();
+    assert!(!kept_rows::keeps_any_anywhere(&db, &pair).unwrap());
+    let stored = entries::channel_entries_after(&db, &pair, 0, 10).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].entry.delete);
+    // What is kept of the device's own channels there stays.
+    assert!(kept_rows::keeps_any(&db, &relay_key, &personal).unwrap());
+}
+
+/// What a device keeps of a relay that it is set up with no longer is
+/// forgotten at the next whole pass in which every relay it is set up
+/// with is connected, and not while one of them is out of reach: a
+/// relay's key is known while it is connected. What it keeps in memory
+/// goes with it: set up with that relay again, it is sent everything
+/// from the start, at once, and not after the wait that a refusal there
+/// had begun.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_is_kept_of_a_relay_that_is_set_up_no_longer_is_forgotten() {
+    let (stays, goes) = (StandIn::started().await, StandIn::started().await);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let written = device.writes("notes", "a.md", "one");
+    let (notes, personal) = (device.channel("notes"), device.personal());
+    // The relay that will go does not begin the name's channel: nothing
+    // of that channel is sent there until a wait has gone by.
+    let begins = Arc::new(AtomicBool::new(false));
+    let begun = begins.clone();
+    goes.pushes(
+        move |entry| match entry.channel == notes && !begun.load(Ordering::SeqCst) {
+            true => PushAnswer::Refused(EntryRefused::OverLimit),
+            false => PushAnswer::Stored,
+        },
+    );
+    // What was pushed of the name's channel to the relay that goes.
+    let pushed_of_notes = |goes: &StandIn| -> Vec<[u8; 32]> {
+        goes.requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|entry| Entry::from_wire(&entry).unwrap())
+            .filter(|entry| entry.channel == notes)
+            .map(|entry| entry.id())
+            .collect()
+    };
+    let keeps = |device: &Device, relay: &[u8; 32]| {
+        kept_rows::keeps_any(&device.db(), relay, &personal).unwrap()
+    };
+    device.connects_to("stays", stays.port, stays.key).await;
+    device.connects_to("goes", goes.port, goes.key).await;
+    device.passes().await;
+    assert!(keeps(&device, &stays.key) && keeps(&device, &goes.key));
+    assert_eq!(pushed_of_notes(&goes), [written.id()]);
+    // The wait lasts: nothing of the channel goes there.
+    device.passes().await;
+    assert!(pushed_of_notes(&goes).is_empty());
+
+    // A pass is given the relays whose names resolved, which may be
+    // fewer than the device is set up with. One that is not among them
+    // is not taken for one that went: nothing is forgotten.
+    let link = device.link("goes");
+    device.relays.retain(|relay| relay.name != "goes");
+    device.passes().await;
+    assert!(keeps(&device, &goes.key));
+    device.relays.push(Relay {
+        name: "goes".into(),
+        link: Some(link),
+    });
+
+    // Set up with it no longer, and the relay that stays is out of
+    // reach: nothing is forgotten, since which relays the device is set
+    // up with is not known by their keys.
+    device.sets_up_no_longer("goes");
+    device.disconnects("stays");
+    device.passes().await;
+    assert!(keeps(&device, &goes.key));
+    // The pass that sends forgets nothing either.
+    device.connects_to("stays", stays.port, stays.key).await;
+    device.sends().await;
+    assert!(keeps(&device, &goes.key));
+    // The whole pass, with every relay connected: what was kept of the
+    // one that went is forgotten, and of the one that stays, kept.
+    device.passes().await;
+    assert!(!keeps(&device, &goes.key));
+    assert!(keeps(&device, &stays.key));
+
+    // Set up with it again: it is sent everything from the start, and
+    // the name's channel at once. The wait that its refusal had begun
+    // went with the rest.
+    begins.store(true, Ordering::SeqCst);
+    device.connects_to("goes", goes.port, goes.key).await;
+    device.passes().await;
+    assert_eq!(pushed_of_notes(&goes), [written.id()]);
+    assert!(keeps(&device, &goes.key));
 }
 
 // ── The node, as a process ───────────────────────────────────────────

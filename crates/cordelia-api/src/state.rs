@@ -92,9 +92,18 @@ pub struct AppState {
 /// device show its change entry to each relay and fetch its channels
 /// first (decision 2026-10-04 §7.1, step 1), and waits for a pass that
 /// began after it asked ([`OwnChannels::whole_passes`]).
+///
+/// And it carries how many relays the node is configured with
+/// ([`OwnChannels::set_up_with`]). A pass is given the relays whose names
+/// resolved, which may be fewer: what a device keeps of a relay is
+/// forgotten as of one that it is set up with no longer only while every
+/// relay it is configured with is connected.
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
+    /// How many relays the node is configured with, and one more: 0
+    /// where it has not said.
+    set_up_with: AtomicU64,
     written: tokio::sync::Notify,
     asked: tokio::sync::Notify,
     /// How many whole passes the node has begun, and the number of the
@@ -112,6 +121,18 @@ impl OwnChannels {
     /// The node says where the device stands at its relays now.
     pub fn say(&self, now: AtRelays) {
         *self.said.lock().unwrap_or_else(|e| e.into_inner()) = now;
+    }
+
+    /// The node is configured with `relays` relays, whether or not it
+    /// reaches each.
+    pub fn set_up_with(&self, relays: usize) {
+        self.set_up_with.store(relays as u64 + 1, Ordering::SeqCst);
+    }
+
+    /// How many relays the node is configured with, where it has said.
+    pub fn relays_set_up(&self) -> Option<usize> {
+        let said = self.set_up_with.load(Ordering::SeqCst);
+        said.checked_sub(1).map(|relays| relays as usize)
     }
 
     /// Something was written in a channel of the device's own: the node
@@ -716,6 +737,21 @@ mod tests {
         // The number of the last pass ended never goes back.
         own.whole_pass_ended(first);
         assert_eq!(own.whole_passes(), (2, 2));
+    }
+
+    /// How many relays a node is configured with is not known until it
+    /// says, and is then what it last said.
+    #[test]
+    fn test_how_many_relays_a_node_is_configured_with_is_known_once_it_has_said() {
+        let own = OwnChannels::default();
+        assert_eq!(own.relays_set_up(), None);
+        // With none is something said, and is not "not said".
+        own.set_up_with(0);
+        assert_eq!(own.relays_set_up(), Some(0));
+        own.set_up_with(2);
+        assert_eq!(own.relays_set_up(), Some(2));
+        own.set_up_with(1);
+        assert_eq!(own.relays_set_up(), Some(1));
     }
 
     /// One asking for a whole pass is kept where nobody is waiting for
