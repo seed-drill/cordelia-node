@@ -2241,13 +2241,26 @@ fn node_version_note(config_path: &str) -> Option<String> {
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
+/// The command that restarts a node which runs as the service that the
+/// install script sets up, on the system named (`std::env::consts::OS`).
+fn restart_command(os: &str) -> &'static str {
+    match os {
+        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+        _ => "systemctl --user restart cordelia",
+    }
+}
+
 /// What to say when the running node is not the version this command is
 /// (`own`). A node from before it reported its version reports none.
 fn version_note(node: Option<&str>, own: &str) -> Option<String> {
     // Which of the two is the older is not judged: version strings are
     // not compared, only found to differ.
-    let after = "They should be the same: an upgrade leaves the old node running until it \
-                 is restarted.";
+    let after = format!(
+        "They should be the same: a node goes on running the version it was started as \
+         until it is restarted. Restart it with `{}`, or stop it and start it again \
+         where it does not run as a service.",
+        restart_command(std::env::consts::OS)
+    );
     match node {
         Some(node) if node == own => None,
         Some(node) => Some(format!(
@@ -3599,10 +3612,12 @@ mod tests {
     fn test_a_node_of_another_version_is_named() {
         assert_eq!(version_note(Some("0.2.0-alpha.6"), "0.2.0-alpha.6"), None);
         let other = version_note(Some("0.2.0-alpha.5"), "0.2.0-alpha.6").unwrap();
+        // It names the command that restarts the node on this system.
+        let restart = restart_command(std::env::consts::OS);
         assert!(
             other.contains("node is version 0.2.0-alpha.5")
                 && other.contains("command is version 0.2.0-alpha.6")
-                && other.contains("restarted"),
+                && other.contains(&format!("Restart it with `{restart}`")),
             "{other}"
         );
         // A node from before it said its version.
@@ -3610,8 +3625,22 @@ mod tests {
         assert!(
             older.contains("from before nodes said their version")
                 && older.contains("command is version 0.2.0-alpha.6")
-                && older.contains("restarted"),
+                && older.contains(&format!("Restart it with `{restart}`")),
             "{older}"
+        );
+    }
+
+    /// Each system's service is restarted by its own command, as the
+    /// install script restarts it.
+    #[test]
+    fn test_the_restart_command_is_the_systems_own() {
+        assert_eq!(
+            restart_command("linux"),
+            "systemctl --user restart cordelia"
+        );
+        assert_eq!(
+            restart_command("macos"),
+            "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
         );
     }
 
