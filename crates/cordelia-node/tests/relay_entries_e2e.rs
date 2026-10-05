@@ -68,6 +68,21 @@ async fn client_of(relay: &Node) -> Result<Client, String> {
 
 /// Connect a client with the key `identity` to `relay`.
 async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, String> {
+    client_to(identity, relay.p2p, key_of(relay)).await
+}
+
+/// The node key of `node`, as the node itself says it.
+fn key_of(node: &Node) -> [u8; 32] {
+    cordelia_crypto::bech32::decode_public_key(node.cli(&["id"]).trim())
+        .expect("a node prints its key")
+}
+
+/// Connect a client with the key `identity` to the node that listens at
+/// `at` on this machine and whose key is `key`. Whoever else answers
+/// there is not taken for it: the connection is closed, and nothing is
+/// sent on it. (A port that a test node was given can be another
+/// process's by the time a client dials it.)
+async fn client_to(identity: Arc<NodeIdentity>, at: u16, key: [u8; 32]) -> Result<Client, String> {
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager = connection::ConnectionManager::new(
@@ -78,9 +93,15 @@ async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, 
         port,
     );
     let relay_id = manager
-        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
+        .connect_to(format!("127.0.0.1:{at}").parse().unwrap())
         .await
         .map_err(|e| e.to_string())?;
+    if relay_id.0 != key {
+        manager.shutdown();
+        return Err(format!(
+            "another key answered at port {at} than the relay's: {relay_id}"
+        ));
+    }
     let conn = manager.get_connection(&relay_id).unwrap().clone();
     Ok(Client {
         identity,
@@ -1530,6 +1551,37 @@ async fn a_relay_drops_what_nobody_has_used_for_90_days() {
     assert_eq!(
         (page.entries.len(), page.next, page.mark),
         (1, 1, again.mark)
+    );
+}
+
+/// The tests' client takes no other node for the relay it means: it
+/// connects where the relay's own key answers, and refuses a connection
+/// where another key does, at the relay's port or at another's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_test_client_takes_no_other_key_for_its_relay() {
+    let relay = relay_started(None);
+    let identity = || Arc::new(NodeIdentity::generate().unwrap());
+    // The relay's key, at the relay's port.
+    let key = key_of(&relay);
+    let client = client_to(identity(), relay.p2p, key)
+        .await
+        .expect("the relay's own key answered, and was refused");
+    assert_eq!(transport::peer_key(&client.conn).unwrap(), key);
+
+    // Another key is meant than the one that answers at that port.
+    let other = NodeIdentity::generate().unwrap().public_key();
+    let refused = client_to(identity(), relay.p2p, other).await;
+    assert!(
+        refused.is_err_and(|why| why.contains("another key answered")),
+        "a node with another key was taken for the relay"
+    );
+    // And the relay is meant where something else listens: a stand-in
+    // with a key of its own.
+    let (port, _connection) = stand_in_for_a_relay().await;
+    let refused = client_to(identity(), port, key).await;
+    assert!(
+        refused.is_err_and(|why| why.contains("another key answered")),
+        "a stand-in was taken for the relay"
     );
 }
 
