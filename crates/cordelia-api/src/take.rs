@@ -53,9 +53,9 @@ use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, State};
 
 use crate::person::{
-    AdditionSeen, PersonError, Shown, added_name, held, in_one, see_addition, shown, who_counts,
+    AdditionSeen, Counting, PersonError, Shown, added_name, applied_secret, held, in_one,
+    see_addition, shown, who_counts,
 };
-use crate::publish::Standing;
 
 /// What became of an entry from outside.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,44 +149,73 @@ pub fn take(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Taken, PersonError> {
-    in_one(conn, || {
-        let Some(held) = held(conn)? else {
-            return Ok(Taken::Refused(NotTaken::FollowsNoPhrase));
-        };
-        if entry.channel == held.following.phrase_channel {
-            return shown(conn, identity, entry, now).map(Taken::Shown);
-        }
+    match in_one(conn, || taken_as_its_own(conn, identity, entry, now))? {
+        Some(taken) => Ok(taken),
+        // Of no channel that this device takes from: it is refused, and
+        // only then is the refusal given its name.
+        None => Ok(Taken::Refused(not_its_own(conn, entry)?)),
+    }
+}
 
-        let standing = Standing::of(conn)?;
-        let personal = derive::personal_secret(&standing.secret)?;
-        let is_personal = entry.channel == derive::channel_id(&personal)?;
-        if !is_personal && held_rows::name_of_channel(conn, &entry.channel)?.is_none() {
-            return Ok(Taken::Refused(if is_of_a_generation_left(conn, entry)? {
-                NotTaken::OldChannel
-            } else {
-                NotTaken::AnotherChannel
-            }));
-        }
-        if held.state != State::Applied {
-            return Ok(Taken::Refused(NotTaken::Stopped(held.state)));
-        }
-        if !standing.counting.counts(&entry.author) {
-            return Ok(Taken::Refused(NotTaken::SignerDoesNotCount));
-        }
-        if band(entry.rev) > standing.number() {
-            return Ok(Taken::Refused(NotTaken::BandAboveTheStatements));
-        }
+/// What becomes of `entry` where it is of the phrase's channel, or of a
+/// channel of this device's own in the generation it has applied, in one
+/// transaction. `None` where it is of neither: nothing was done with it,
+/// and nothing was derived to say which other channel it is of.
+fn taken_as_its_own(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<Option<Taken>, PersonError> {
+    let Some(held) = held(conn)? else {
+        return Ok(Some(Taken::Refused(NotTaken::FollowsNoPhrase)));
+    };
+    if entry.channel == held.following.phrase_channel {
+        let shown = shown(conn, identity, entry, now)?;
+        return Ok(Some(Taken::Shown(shown)));
+    }
 
-        let stored = entries::store(conn, entry, now)?;
-        let mut taken = (None, 0);
-        if is_personal && stored == Outcome::Stored {
-            taken = record_in(conn, entry, &personal, now)?;
-        }
-        Ok(Taken::Own {
-            stored,
-            record: taken.0,
-            came_to_count: taken.1,
-        })
+    let statement = &held.statement.statement;
+    let personal = derive::personal_secret(&applied_secret(conn, statement)?)?;
+    let is_personal = entry.channel == derive::channel_id(&personal)?;
+    if !is_personal && held_rows::name_of_channel(conn, &entry.channel)?.is_none() {
+        return Ok(None);
+    }
+    if held.state != State::Applied {
+        return Ok(Some(Taken::Refused(NotTaken::Stopped(held.state))));
+    }
+    let counting = Counting::of(statement, &held_rows::additions(conn)?);
+    if !counting.counts(&entry.author) {
+        return Ok(Some(Taken::Refused(NotTaken::SignerDoesNotCount)));
+    }
+    if band(entry.rev) > statement.number {
+        return Ok(Some(Taken::Refused(NotTaken::BandAboveTheStatements)));
+    }
+
+    let stored = entries::store(conn, entry, now)?;
+    let mut taken = (None, 0);
+    if is_personal && stored == Outcome::Stored {
+        taken = record_in(conn, entry, &personal, now)?;
+    }
+    Ok(Some(Taken::Own {
+        stored,
+        record: taken.0,
+        came_to_count: taken.1,
+    }))
+}
+
+/// Why an entry is refused that is of no channel this device takes from:
+/// it is of a channel of a generation that was left, or of any other.
+///
+/// Telling the two apart takes a derivation for each secret the device
+/// still holds and each name. It is made after the entry was refused, and
+/// outside the transaction that takes an entry: it gives the refusal a
+/// name, and decides nothing.
+fn not_its_own(conn: &Connection, entry: &CheckedEntry) -> Result<NotTaken, PersonError> {
+    Ok(if is_of_a_generation_left(conn, entry)? {
+        NotTaken::OldChannel
+    } else {
+        NotTaken::AnotherChannel
     })
 }
 
