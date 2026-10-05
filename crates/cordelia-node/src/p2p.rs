@@ -107,6 +107,11 @@ impl Rates {
 
     /// Count one stream of `protocol` opened by `peer` from `address`. A
     /// request that is refused counts against neither allowance.
+    ///
+    /// The streams of entries of channels from their secrets are counted
+    /// together, whichever of them a request is on (decision 2026-10-04
+    /// §16): a show, a proof, a pull, a push, and what is asked on the
+    /// stream between relays.
     pub fn request(
         &mut self,
         peer: &NodeId,
@@ -120,6 +125,11 @@ impl Rates {
                 Protocol::ItemPush => Some(&mut limiter.writes),
                 Protocol::ItemSync => Some(&mut limiter.syncs),
                 Protocol::PeerSharing => Some(&mut limiter.peer_shares),
+                Protocol::EntryShow
+                | Protocol::ChannelProve
+                | Protocol::EntryPull
+                | Protocol::EntryPush
+                | Protocol::RelayEntries => Some(&mut limiter.entry_requests),
                 _ => None,
             }
         }
@@ -5850,6 +5860,118 @@ mod tests {
                 .pushed(&peer(2), address, 4 * PUSH_BYTES_PER_PEER_PER_MINUTE)
                 .is_err(),
             "the address's share is five connections' worth"
+        );
+    }
+
+    /// Requests on the streams of entries of channels from their secrets
+    /// are counted, all of them together: a connection may make 3,000 in
+    /// a minute, whichever of the five streams each is on. One more is
+    /// refused, and is a breach, and as many breaches as cut a peer off
+    /// cut it off. The connections of one address share five times that.
+    /// The older kind's requests are counted apart, as they were.
+    #[test]
+    fn requests_on_the_streams_of_entries_are_counted_together() {
+        use cordelia_core::protocol::{
+            BAN_THRESHOLD, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, MAX_CONNECTIONS_PER_IP,
+            WRITES_PER_PEER_PER_MINUTE,
+        };
+        use cordelia_network::messages::Protocol;
+        const OF_ENTRIES: [Protocol; 5] = [
+            Protocol::EntryShow,
+            Protocol::ChannelProve,
+            Protocol::EntryPull,
+            Protocol::EntryPush,
+            Protocol::RelayEntries,
+        ];
+        assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
+        let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let mut rates = Rates::default();
+        let peer = |n: u8| NodeId([n; 32]);
+
+        // One connection: 3,000 requests, on the five streams in turn.
+        for n in 0..ENTRY_REQUESTS_PER_PEER_PER_MINUTE as usize {
+            assert_eq!(
+                rates.request(&peer(1), address, OF_ENTRIES[n % 5]),
+                Ok(()),
+                "request {n}"
+            );
+        }
+        // One more on any of them is refused, and is a breach: the last
+        // of as many as cut a peer off says so.
+        for breach in 1..=BAN_THRESHOLD {
+            let on = OF_ENTRIES[breach as usize % 5];
+            let over = rates.request(&peer(1), address, on).unwrap_err();
+            assert_eq!(over.cut_off, breach == BAN_THRESHOLD, "breach {breach}");
+        }
+        // A request that was refused was not counted: the count is as it
+        // was, and so is the address's.
+        assert!(rates.is_counting(&peer(1)));
+
+        // The older kind's requests are counted apart: the connection may
+        // still push items, as many as it could before.
+        for _ in 0..WRITES_PER_PEER_PER_MINUTE {
+            assert_eq!(rates.request(&peer(1), address, Protocol::ItemPush), Ok(()));
+        }
+        assert!(
+            rates
+                .request(&peer(1), address, Protocol::ItemPush)
+                .is_err()
+        );
+        // And a stream that is counted nowhere is not counted here.
+        for _ in 0..10 {
+            assert_eq!(
+                rates.request(&peer(1), address, Protocol::KeepAlive),
+                Ok(())
+            );
+        }
+
+        // The same address under new keys: each has its own count, until
+        // the address's share is used up, which is five connections'.
+        let mut rates = Rates::default();
+        let mut allowed = 0u64;
+        let mut key = 1u8;
+        'address: loop {
+            for n in 0..ENTRY_REQUESTS_PER_PEER_PER_MINUTE as usize {
+                if rates
+                    .request(&peer(key), address, OF_ENTRIES[n % 5])
+                    .is_err()
+                {
+                    break 'address;
+                }
+                allowed += 1;
+            }
+            key += 1;
+            assert!(key < 50, "the address is never refused");
+        }
+        assert_eq!(
+            allowed,
+            u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE) * MAX_CONNECTIONS_PER_IP as u64
+        );
+        // Another address is not affected, and nor are the older kind's
+        // requests from this one.
+        let elsewhere: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        assert_eq!(
+            rates.request(&peer(40), elsewhere, Protocol::EntryPull),
+            Ok(())
+        );
+        assert_eq!(
+            rates.request(&peer(41), address, Protocol::ItemSync),
+            Ok(())
+        );
+
+        // An address whose only count is of these requests is not
+        // forgotten while that count stands: its connections cannot close
+        // and come back to a new one.
+        let mut rates = Rates::default();
+        assert_eq!(
+            rates.request(&peer(1), address, Protocol::EntryShow),
+            Ok(())
+        );
+        rates.prune(&[], &[]);
+        assert!(!rates.is_counting(&peer(1)));
+        assert!(
+            rates.by_address.contains_key(&address),
+            "the address's count was forgotten when its connections closed"
         );
     }
 

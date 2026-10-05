@@ -1345,6 +1345,23 @@ pub const RELAY_ENTRY_PULL_INTERVAL_SECS: u64 = REALTIME_SYNC_INTERVAL_SECS;
 /// so that one long channel does not keep every other waiting.
 pub const RELAY_ENTRY_PULL_PAGES: usize = 10;
 
+/// How many requests one connection may make in a minute on the streams of
+/// entries of channels from their secrets, all of them counted together:
+/// 3,000 (decision 2026-10-04 §16). A request beyond it is refused, and is
+/// a breach, as a write or a sync of the older kind beyond its count is.
+/// All the connections from one address share MAX_CONNECTIONS_PER_IP
+/// times this.
+///
+/// Without it a connection could ask without end: every proof is a
+/// signature for the relay to check, and every pull a look at its store.
+///
+/// It is sized for a device with 256 names, which is what an address may
+/// make a relay take in an hour: a pull of each every ten seconds, and of
+/// the personal channel (1,542 a minute); its day's proofs in one burst,
+/// as many as a relay remembers for a connection (1,024); a show for each
+/// pass and each time it sends; and what it pushes.
+pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 22] = [
     LABEL_ENTRY_KEY,
@@ -2025,6 +2042,22 @@ mod tests {
         assert_eq!(ENTRY_OFFER_INTERVAL_SECS, REPUSH_INTERVAL_SECS);
         assert_eq!(RELAY_ENTRY_PULL_INTERVAL_SECS, REALTIME_SYNC_INTERVAL_SECS);
         assert_eq!(RELAY_ENTRY_PULL_PAGES, 10);
+    }
+
+    /// A connection may make 3,000 requests a minute on the streams of
+    /// entries. That is room for a device with 256 names: a pull of each,
+    /// and of its personal channel, every ten seconds; its day's proofs in
+    /// one burst; and a show and a push every two seconds besides.
+    #[test]
+    fn test_requests_on_the_streams_of_entries_decision_2026_10_04_16() {
+        assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
+        let passes = 60 / REALTIME_SYNC_INTERVAL_SECS;
+        let pulls = passes * (NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR as u64 + 1);
+        assert_eq!(pulls, 1_542);
+        let proofs = MAX_CHANNELS_PROVED_ON_A_CONNECTION as u64;
+        let sends = 2 * (60 / OUTBOX_FLUSH_INTERVAL_SECS);
+        assert_eq!(pulls + proofs + sends, 2_626);
+        assert!(pulls + proofs + sends <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
     }
 
     /// The four streams of entries have bytes of their own, each another,

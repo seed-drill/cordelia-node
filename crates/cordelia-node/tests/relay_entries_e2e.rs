@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordelia_core::protocol::{
-    BAN_THRESHOLD, ERR_RATE_LIMIT, MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES,
-    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
+    BAN_THRESHOLD, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, ERR_RATE_LIMIT,
+    MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR,
+    PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
@@ -939,6 +940,107 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
         client_of(&relay).await.is_err(),
         "the address was let back in"
     );
+}
+
+/// A relay counts the requests that a connection makes on the streams of
+/// entries, all of them together: 3,000 in a minute are answered,
+/// whichever stream each is on. One more is refused, and is a breach: as
+/// many breaches as cut a peer off today close the connection, and the
+/// relay says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_may_make_so_many_requests_a_minute_on_the_streams_of_entries() {
+    assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    let held = client.made(1, 5, "notes.md", "what the file holds");
+    assert_eq!(
+        client.push(vec![held.to_wire()]).await.unwrap(),
+        [PushAnswer::Stored]
+    );
+    assert!(client.prove(1).await);
+    let mut asked = 2;
+
+    // Requests that cost the relay little, on each of the streams: a
+    // pull of a channel that was not proved, a proof that fails, a push
+    // of nothing, and a pull of the channel that was proved, from its
+    // end. Some at a time, so that they are all made within the minute.
+    let began = std::time::Instant::now();
+    while asked < ENTRY_REQUESTS_PER_PEER_PER_MINUTE {
+        let mut some = tokio::task::JoinSet::new();
+        for n in 0..(ENTRY_REQUESTS_PER_PEER_PER_MINUTE - asked).min(24) {
+            let conn = client.conn.clone();
+            let (protocol, request) = match (asked + n) % 4 {
+                0 => (
+                    Protocol::EntryPull,
+                    WireMessage::EntryPull(EntryPull {
+                        channel: channel(9),
+                        mark: NO_MARK,
+                        after: 0,
+                        limit: 100,
+                    }),
+                ),
+                1 => (
+                    Protocol::ChannelProve,
+                    WireMessage::ChannelProve(ChannelProve {
+                        channel: channel(9),
+                        proof: [7; 64],
+                    }),
+                ),
+                2 => (
+                    Protocol::EntryPush,
+                    WireMessage::EntryPush(EntryPush {
+                        entries: Vec::new(),
+                    }),
+                ),
+                _ => (
+                    Protocol::EntryPull,
+                    WireMessage::EntryPull(EntryPull {
+                        channel: channel(1),
+                        mark: NO_MARK,
+                        after: 1,
+                        limit: 100,
+                    }),
+                ),
+            };
+            some.spawn(async move { ask_on(&conn, protocol, request).await });
+        }
+        while let Some(answer) = some.join_next().await {
+            let answer = answer.unwrap();
+            assert!(
+                answer.is_ok(),
+                "request {asked} of the minute was refused: {answer:?}"
+            );
+            asked += 1;
+        }
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(50),
+        "the requests took {:?}: they were not all made within one minute",
+        began.elapsed()
+    );
+
+    // One more, of any kind: refused. That is the first breach, and the
+    // third closes the connection.
+    assert_eq!(BAN_THRESHOLD, 3);
+    assert!(
+        client.pull_id(channel(1), NO_MARK, 0).await.is_err(),
+        "a request beyond the count was answered"
+    );
+    assert!(client.show(held.to_wire()).await.is_err());
+    assert!(client.push(vec![held.to_wire()]).await.is_err());
+    let closed = tokio::time::timeout(Duration::from_secs(10), client.conn.closed())
+        .await
+        .expect("the relay did not close the connection");
+    match closed {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(
+                close.error_code,
+                quinn::VarInt::from_u32(ERR_RATE_LIMIT),
+                "{close:?}"
+            );
+        }
+        other => panic!("closed for another reason: {other:?}"),
+    }
 }
 
 /// Two relays that their operator lists together pass the entries of a
