@@ -258,8 +258,9 @@ pub struct Page {
     /// The entries, in the order this relay stored them, as they are
     /// stored: whoever receives them checks them.
     pub entries: Vec<Entry>,
-    /// The place the next page starts after: the place of the last entry
-    /// here, or the place that was asked after where there is none.
+    /// The place the next page starts after, in the channel's own order:
+    /// the place of the last entry here, or the place that was asked
+    /// after where there is none.
     pub next: u64,
     /// What the entries are counted at together. It counts against the
     /// asker's limits.
@@ -652,6 +653,13 @@ pub fn prove(
 /// place `after`, at most `limit` of them (decision 2026-10-04 §2.4 item
 /// 3).
 ///
+/// A place is the channel's own: a count of the entries that the relay
+/// stored in this channel, from 1. It says nothing of what the relay
+/// stored in any other channel, so the places that a holder of one
+/// channel's key is given do not tell it how much the relay stored for
+/// anyone else in between. A channel that was dropped and is taken again
+/// counts from the start: a place from before means nothing in it.
+///
 /// `proved` is whether the channel's key was proved on the connection
 /// that asks ([`prove`]). Where it was not, the answer is the one for a
 /// channel that is not held: no entries, and the place that was asked
@@ -680,7 +688,7 @@ pub fn pull(
     let mut bytes = 0;
     while page.entries.len() < most {
         let ask = (most - page.entries.len()).min(PAGE_READ);
-        let read = entries::channel_entries_after(conn, channel, place, ask as u32)?;
+        let read = entries::channel_entries_after_place(conn, channel, place, ask as u32)?;
         let last = read.len() < ask;
         for held in read {
             let travels = ENTRY_WIRE_OVERHEAD_BYTES + held.entry.content.len();
@@ -688,8 +696,8 @@ pub fn pull(
                 return Ok(page);
             }
             bytes += travels;
-            place = held.seq;
-            page.next = held.seq.max(0) as u64;
+            place = held.channel_place;
+            page.next = held.channel_place.max(0) as u64;
             page.cost += entry_cost(held.entry.content.len());
             page.entries.push(held.entry);
         }
@@ -2527,16 +2535,97 @@ mod tests {
         }
 
         // A newer revision has a later place: a connection that has paged
-        // past the one it replaces is handed it next.
+        // past the one it replaces is handed it next. The place is the
+        // sixth of this channel's own, though the relay has stored an
+        // entry of another channel since the fifth.
         let newer = made(1, 2, 6, "2.md", "a newer text");
         take(&conn, &mut room, &newer, &from(1), NOW).unwrap();
         assert_eq!(
             page(5, 100),
             Page {
                 entries: vec![(*newer).clone()],
-                next: 7,
+                next: 6,
                 cost: SMALL,
             }
+        );
+    }
+
+    /// The places that a holder of one channel's key is given are that
+    /// channel's own count. They are the same whatever the relay stored
+    /// for anyone else in between, so they tell it nothing of that.
+    #[test]
+    fn test_a_pages_places_are_the_channels_own_and_say_nothing_of_other_channels() {
+        // Two relays take the same entries of one channel, in one order.
+        // The first stores nothing else. The second stores entries of
+        // other channels before them, between them and after them.
+        let (quiet, mut quiet_room) = relay();
+        let (busy, mut busy_room) = relay();
+        let own: Vec<CheckedEntry> = (1..=4u8)
+            .map(|d| made(1, d, 5, &format!("{d}.md"), "a small text"))
+            .collect();
+        let mut others = (2..).map(|c| small(c, 1, 5));
+        let mut elsewhere = |room: &mut Room, how_many: usize| {
+            for entry in others.by_ref().take(how_many) {
+                take(&busy, room, &entry, &from(2), NOW).unwrap();
+            }
+        };
+        elsewhere(&mut busy_room, 3);
+        for (n, entry) in own.iter().enumerate() {
+            take(&quiet, &mut quiet_room, entry, &from(1), NOW).unwrap();
+            take(&busy, &mut busy_room, entry, &from(1), NOW).unwrap();
+            elsewhere(&mut busy_room, 5 * (n + 1));
+        }
+        // And a newer revision of the second, at both.
+        let newer = made(1, 2, 6, "2.md", "a newer text");
+        take(&quiet, &mut quiet_room, &newer, &from(1), NOW).unwrap();
+        elsewhere(&mut busy_room, 7);
+        take(&busy, &mut busy_room, &newer, &from(1), NOW).unwrap();
+        // The busy relay has stored 65 entries, and the quiet one 5.
+        let stored = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT value FROM counters WHERE name = 'entry_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!((stored(&quiet), stored(&busy)), (5, 65));
+
+        // Paged in every step, the holder of the channel's key is handed
+        // the same entries at the same places by both.
+        for limit in [1, 2, 3, 100] {
+            let mut after = 0;
+            let mut places = Vec::new();
+            loop {
+                let page = pull(&quiet, &channel(1), true, after, limit).unwrap();
+                assert_eq!(page, pull(&busy, &channel(1), true, after, limit).unwrap());
+                if page.entries.is_empty() {
+                    break;
+                }
+                places.push(page.next);
+                after = page.next;
+            }
+            // The places are the channel's count: one to five, the second
+            // gone where its newer revision took the fifth.
+            let last: Vec<u64> = match limit {
+                1 => vec![1, 3, 4, 5],
+                2 => vec![3, 5],
+                3 => vec![4, 5],
+                _ => vec![5],
+            };
+            assert_eq!(places, last, "{limit}");
+        }
+
+        // A channel that was dropped and is taken again counts from the
+        // start: a place from before means nothing in it.
+        assert_eq!(make_room(&quiet, 0).unwrap(), [channel(1)]);
+        take(&quiet, &mut quiet_room, &own[0], &from(1), NOW).unwrap();
+        assert_eq!(pull(&quiet, &channel(1), true, 0, 100).unwrap().next, 1);
+        assert!(
+            pull(&quiet, &channel(1), true, 5, 100)
+                .unwrap()
+                .entries
+                .is_empty()
         );
     }
 

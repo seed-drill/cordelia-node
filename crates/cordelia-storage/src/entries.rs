@@ -21,6 +21,14 @@
 //! handed out as checked ([`slot_entries`]). What is read to be sent is
 //! handed out as it is stored ([`channel_entries_after`]): whoever
 //! receives it checks it.
+//!
+//! An entry has two places. One is in the order in which this node stored
+//! all of its entries, whatever their channel. The other is its channel's
+//! own: a count of the entries stored in that channel, which says nothing
+//! of any other channel. What is handed to a holder of one channel's key
+//! is paged by the channel's own ([`channel_entries_after_place`]), so
+//! that the places it is given do not tell it how much the node stored
+//! for anyone else in between.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -49,6 +57,9 @@ pub struct StoredEntry {
     pub entry: Entry,
     /// Its place in the order in which this node stored its entries.
     pub seq: i64,
+    /// Its place in the order in which this node stored the entries of
+    /// its channel: a count of the channel's own, from 1.
+    pub channel_place: i64,
     /// When this node stored it, in seconds, in UTC.
     pub stored_at: i64,
 }
@@ -59,7 +70,7 @@ fn storage(e: rusqlite::Error) -> CordeliaError {
 
 /// The columns that [`stored_entry_from_row`] reads, in its order.
 const ENTRY_COLUMNS: &str = "channel_id, slot, author, rev, is_delete, content,
-    author_sig, channel_sig, seq, stored_at";
+    author_sig, channel_sig, seq, stored_at, channel_place";
 
 /// Store an entry, by the store's rule, and say what became of it. `now`
 /// is this node's time, in seconds, in UTC.
@@ -67,6 +78,8 @@ const ENTRY_COLUMNS: &str = "channel_id, slot, author, rev, is_delete, content,
 /// An entry that is stored takes the next place in this node's order of
 /// storing, also where it replaces a lower revision: a peer that pages by
 /// that order is handed the newer entry after the place it has reached.
+/// It takes the next place in its channel's own order as well, in the
+/// same write.
 pub fn store(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, CordeliaError> {
     conn.execute_batch("SAVEPOINT store_entry")
         .map_err(storage)?;
@@ -85,18 +98,22 @@ fn stored(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, 
     // store's own rule: a row from that author in that slot is replaced
     // only by a higher revision. Nothing is read first and decided on, so
     // no other writer can come between the reading and the writing. The
-    // entry's place is the next in this node's order.
+    // entry's place is the next in this node's order, and the next in its
+    // channel's own: one above the highest that the channel has, the row
+    // that it replaces among them.
     let changed = conn
         .execute(
             "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
-                                  author_sig, channel_sig, seq, stored_at)
+                                  author_sig, channel_sig, seq, stored_at, channel_place)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                     (SELECT value + 1 FROM counters WHERE name = 'entry_seq'), ?9)
+                     (SELECT value + 1 FROM counters WHERE name = 'entry_seq'), ?9,
+                     (SELECT COALESCE(MAX(channel_place), 0) + 1 FROM entries
+                      WHERE channel_id = ?1))
              ON CONFLICT(channel_id, slot, author) DO UPDATE SET
                  rev = excluded.rev, is_delete = excluded.is_delete,
                  content = excluded.content, author_sig = excluded.author_sig,
                  channel_sig = excluded.channel_sig, seq = excluded.seq,
-                 stored_at = excluded.stored_at
+                 stored_at = excluded.stored_at, channel_place = excluded.channel_place
              WHERE excluded.rev > entries.rev",
             params![
                 entry.channel.as_slice(),
@@ -233,6 +250,39 @@ pub fn channel_entries_after(
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// The entries of a channel that this node stored after the place
+/// `after_place` in the channel's own order, in that order, and at most
+/// `limit` of them: one page of the channel, for a holder of its key. The
+/// place of the last one is where the next page starts, and 0 is before
+/// the first.
+///
+/// The places are the channel's own count, so they say nothing of what
+/// the node stored in any other channel. An entry that replaced a lower
+/// revision has a later place than the one it replaced. A channel whose
+/// entries were all removed counts from the start again.
+pub fn channel_entries_after_place(
+    conn: &Connection,
+    channel: &[u8; 32],
+    after_place: i64,
+    limit: u32,
+) -> Result<Vec<StoredEntry>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM entries
+             WHERE channel_id = ?1 AND channel_place > ?2
+             ORDER BY channel_place ASC
+             LIMIT ?3"
+        ))
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![channel.as_slice(), after_place, limit],
+            stored_entry_from_row,
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Remove every entry of a channel. Returns how many there were.
 pub fn remove_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
     conn.execute(
@@ -324,6 +374,7 @@ fn stored_entry_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredEntry> {
         },
         seq: row.get(8)?,
         stored_at: row.get(9)?,
+        channel_place: row.get(10)?,
     })
 }
 
@@ -793,6 +844,97 @@ mod tests {
         assert_eq!(page(0, 100), [(8, id(1))]);
     }
 
+    /// Each channel counts its own entries, in the order this node stored
+    /// them, and is paged by that count. The places of one channel say
+    /// nothing of what was stored in another between them.
+    #[test]
+    fn test_a_channel_counts_its_own_entries_and_is_paged_by_that_count() {
+        let conn = db::open_in_memory().unwrap();
+        // Each entry of a channel: its place in the channel's own order,
+        // and its place in this node's.
+        let places = |channel: &[u8; 32]| -> Vec<(i64, i64)> {
+            channel_entries_after_place(&conn, channel, 0, 1000)
+                .unwrap()
+                .iter()
+                .map(|held| (held.channel_place, held.seq))
+                .collect()
+        };
+        let others = |n: u8| {
+            made(
+                &OTHER_SECRET,
+                n,
+                5,
+                "a.md",
+                Value::Text("of another".into()),
+            )
+        };
+
+        // One entry of this channel, four of another, and two more of
+        // this one.
+        store(&conn, &text(1, 5, "a.md", "one"), NOW).unwrap();
+        for n in 1..=4 {
+            store(&conn, &others(n), NOW).unwrap();
+        }
+        store(&conn, &text(2, 5, "a.md", "two"), NOW).unwrap();
+        store(&conn, &text(1, 5, "b.md", "three"), NOW).unwrap();
+        // This channel's places are one, two, three: the four that the
+        // node stored between its first and its second are not in them.
+        assert_eq!(places(&channel()), [(1, 1), (2, 6), (3, 7)]);
+        assert_eq!(places(&other_channel()), [(1, 2), (2, 3), (3, 4), (4, 5)]);
+
+        // Paged by the channel's own places.
+        let page = |after: i64, limit: u32| -> Vec<i64> {
+            channel_entries_after_place(&conn, &channel(), after, limit)
+                .unwrap()
+                .iter()
+                .map(|held| held.channel_place)
+                .collect()
+        };
+        assert_eq!(page(0, 2), [1, 2]);
+        assert_eq!(page(2, 2), [3]);
+        assert!(page(3, 2).is_empty());
+        assert!(page(0, 0).is_empty());
+        assert!(page(i64::MAX, 100).is_empty());
+        // The same entries, paged by this node's order, are at its places.
+        let by_node: Vec<(i64, i64)> = channel_entries_after(&conn, &channel(), 1, 100)
+            .unwrap()
+            .iter()
+            .map(|held| (held.channel_place, held.seq))
+            .collect();
+        assert_eq!(by_node, [(2, 6), (3, 7)]);
+
+        // An entry that is not stored takes no place.
+        assert_eq!(
+            store(&conn, &text(1, 5, "a.md", "one again"), NOW).unwrap(),
+            Outcome::AlreadyHeld
+        );
+        assert_eq!(places(&channel()), [(1, 1), (2, 6), (3, 7)]);
+        // A newer revision takes the channel's next place, after every
+        // place handed out so far: whoever has paged past the one it
+        // replaces is handed it next.
+        store(&conn, &text(1, 6, "a.md", "one, newer"), NOW).unwrap();
+        assert_eq!(places(&channel()), [(2, 6), (3, 7), (4, 8)]);
+        assert_eq!(page(3, 100), [4]);
+        store(&conn, &text(2, 6, "a.md", "two, newer"), NOW).unwrap();
+        assert_eq!(places(&channel()), [(3, 7), (4, 8), (5, 9)]);
+        // The newest of all replaced: its place is the next again.
+        store(&conn, &text(2, 7, "a.md", "two, newer still"), NOW).unwrap();
+        assert_eq!(places(&channel()), [(3, 7), (4, 8), (6, 10)]);
+        // The other channel's count did not move, and goes on from its
+        // own.
+        store(&conn, &others(5), NOW).unwrap();
+        assert_eq!(
+            places(&other_channel()),
+            [(1, 2), (2, 3), (3, 4), (4, 5), (5, 11)]
+        );
+
+        // A channel whose entries were all removed counts from the start
+        // again, where this node's own order goes on.
+        remove_channel(&conn, &channel()).unwrap();
+        store(&conn, &text(1, 1, "a.md", "a first one"), NOW).unwrap();
+        assert_eq!(places(&channel()), [(1, 12)]);
+    }
+
     /// A channel's slots are each given once, in the order in which the
     /// first of their entries was stored, and no other channel's.
     #[test]
@@ -1023,32 +1165,42 @@ mod tests {
     fn test_the_table_refuses_a_row_that_is_no_entry() {
         let conn = db::open_in_memory().unwrap();
         // A row with a channel, an author, a revision, the two signatures
-        // and a place, and the rest as an entry has it.
-        type Row<'a> = (&'a [u8], &'a [u8], i64, &'a [u8], &'a [u8], i64);
-        let insert = |(channel, author, rev, by_author, by_channel, seq): Row| {
+        // and its two places, and the rest as an entry has it.
+        type Row<'a> = (&'a [u8], &'a [u8], i64, &'a [u8], &'a [u8], i64, i64);
+        let insert = |(channel, author, rev, by_author, by_channel, seq, place): Row| {
             conn.execute(
                 "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
-                                      author_sig, channel_sig, seq, stored_at)
+                                      author_sig, channel_sig, seq, stored_at, channel_place)
                  VALUES (?1, X'0202020202020202020202020202020202020202020202020202020202020202',
-                         ?2, ?3, 0, X'00', ?4, ?5, ?6, 0)",
-                params![channel, author, rev, by_author, by_channel, seq],
+                         ?2, ?3, 0, X'00', ?4, ?5, ?6, 0, ?7)",
+                params![channel, author, rev, by_author, by_channel, seq, place],
             )
         };
         let (key, other_key, signed) = ([1u8; 32], [3u8; 32], [4u8; 64]);
 
-        assert!(insert((&key[..31], &other_key, 1, &signed, &signed, 1)).is_err());
-        assert!(insert((&[1u8; 33], &other_key, 1, &signed, &signed, 1)).is_err());
-        assert!(insert((&key, &other_key[..31], 1, &signed, &signed, 1)).is_err());
-        assert!(insert((&key, &other_key, 0, &signed, &signed, 1)).is_err());
-        assert!(insert((&key, &other_key, 1, &signed[..63], &signed, 1)).is_err());
-        assert!(insert((&key, &other_key, 1, &signed, &signed[..63], 1)).is_err());
+        assert!(insert((&key[..31], &other_key, 1, &signed, &signed, 1, 1)).is_err());
+        assert!(insert((&[1u8; 33], &other_key, 1, &signed, &signed, 1, 1)).is_err());
+        assert!(insert((&key, &other_key[..31], 1, &signed, &signed, 1, 1)).is_err());
+        assert!(insert((&key, &other_key, 0, &signed, &signed, 1, 1)).is_err());
+        assert!(insert((&key, &other_key, 1, &signed[..63], &signed, 1, 1)).is_err());
+        assert!(insert((&key, &other_key, 1, &signed, &signed[..63], 1, 1)).is_err());
 
-        // The control. Then a second row for that author in that slot, and
-        // a second row at one place in that channel.
-        assert_eq!(insert((&key, &other_key, 1, &signed, &signed, 1)), Ok(1));
-        assert!(insert((&key, &other_key, 2, &signed, &signed, 2)).is_err());
-        assert!(insert((&key, &key, 2, &signed, &signed, 1)).is_err());
-        assert_eq!(insert((&key, &key, 2, &signed, &signed, 2)), Ok(1));
+        // The control. Then a second row for that author in that slot, a
+        // second row at one place in this node's order in that channel,
+        // and a second row at one place in the channel's own order.
+        assert_eq!(insert((&key, &other_key, 1, &signed, &signed, 1, 1)), Ok(1));
+        assert!(insert((&key, &other_key, 2, &signed, &signed, 2, 2)).is_err());
+        assert!(insert((&key, &key, 2, &signed, &signed, 1, 2)).is_err());
+        assert!(insert((&key, &key, 2, &signed, &signed, 2, 1)).is_err());
+        assert_eq!(insert((&key, &key, 2, &signed, &signed, 2, 2)), Ok(1));
+        // A channel's own places are its own: another channel has a row
+        // at the first of its own.
+        assert_eq!(insert((&other_key, &key, 1, &signed, &signed, 3, 1)), Ok(1));
+        conn.execute(
+            "DELETE FROM entries WHERE channel_id = ?1",
+            params![other_key],
+        )
+        .unwrap();
 
         // Whether a row is a delete is yes or no.
         assert!(

@@ -416,6 +416,12 @@ CREATE TABLE person_names (
 ///
 /// A channel that is dropped loses its row, and is new when it is taken
 /// again. Times are in seconds, in UTC.
+///
+/// And each entry is given its place in the order of its channel's own
+/// entries (`entries.channel_place`): a count for each channel, from 1,
+/// that says nothing of any other channel. A channel is handed to a
+/// holder of its key in pages by that count. The entries that are there
+/// are counted in the order in which this node stored them.
 const MIGRATION_V13: &str = r#"
 CREATE TABLE relay_channels (
     channel_id  BLOB PRIMARY KEY CHECK(length(channel_id) = 32),
@@ -426,6 +432,15 @@ CREATE TABLE relay_channels (
 
 CREATE INDEX idx_relay_channels_held ON relay_channels(held_since);
 CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
+
+ALTER TABLE entries ADD COLUMN channel_place INTEGER NOT NULL DEFAULT 0;
+
+UPDATE entries SET channel_place = (
+    SELECT COUNT(*) FROM entries AS stored
+    WHERE stored.channel_id = entries.channel_id AND stored.seq <= entries.seq
+);
+
+CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_place);
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -1025,13 +1040,14 @@ mod tests {
     /// Everything a database holds but the new table and its index: each
     /// table's definition, and each row of the tables an older binary
     /// wrote. What a later step adds is left out too: the tables of what
-    /// a device holds of its person, and the table of the channels a relay
-    /// holds.
+    /// a device holds of its person, the table of the channels a relay
+    /// holds, and the index of each channel's own order of entries.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
                 "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
-                 WHERE name NOT IN ('entries', 'idx_entries_channel_seq')
+                 WHERE name NOT IN ('entries', 'idx_entries_channel_seq',
+                                    'idx_entries_channel_place')
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
@@ -1206,12 +1222,14 @@ mod tests {
 
     /// Everything a database at version 11 holds: each table's definition
     /// but those of the step to version 12, and each row of every table an
-    /// older binary wrote, the entries of the new form among them.
+    /// older binary wrote, the entries of the new form among them. The
+    /// definition of the table of entries is left out, and read by itself
+    /// ([`definition_of`]): a later step adds a column to it.
     fn held_before_v12(conn: &Connection) -> Vec<String> {
         let mut held = held_before_v11(conn);
         for rows in [
             "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
-                 WHERE name IN ('entries', 'idx_entries_channel_seq')
+                 WHERE name = 'idx_entries_channel_seq'
                     OR name LIKE 'sqlite_autoindex_entries%' ORDER BY name",
             "SELECT hex(channel_id) || hex(slot) || hex(author) || rev || is_delete
                  || hex(content) || hex(author_sig) || hex(channel_sig) || seq || stored_at
@@ -1229,6 +1247,16 @@ mod tests {
             held.extend(rows);
         }
         held
+    }
+
+    /// How a table or an index is defined.
+    fn definition_of(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     /// What a database holds of the step to version 12, by name.
@@ -1293,7 +1321,12 @@ mod tests {
     fn test_a_database_at_v11_that_an_older_binary_wrote_is_taken_to_v12() {
         let conn = at_v11();
         let before = held_before_v12(&conn);
-        assert!(before.iter().any(|row| row.starts_with("entries: ")));
+        let entries_before = definition_of(&conn, "entries");
+        assert!(
+            before
+                .iter()
+                .any(|row| row.starts_with("idx_entries_channel_seq: "))
+        );
         assert!(before.iter().any(|row| row.starts_with("entry_seq9")));
         assert!(before.iter().any(|row| row.starts_with("ci_2grp_a")));
 
@@ -1308,6 +1341,7 @@ mod tests {
         migrate_in_one(&conn, MIGRATION_V12, 12).unwrap();
         assert_eq!(version(&conn), 12);
         assert_eq!(held_before_v12(&conn), before);
+        assert_eq!(definition_of(&conn, "entries"), entries_before);
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(held_before_v12(&conn), before);
@@ -1350,22 +1384,50 @@ mod tests {
              VALUES (1, 'applied', zeroblob(32), zeroblob(32), zeroblob(32), X'0D0E');
              INSERT INTO person_secrets (number, secret, left_at) VALUES (3, zeroblob(32), NULL);
              INSERT INTO person_names (name, channel, held_at)
-             VALUES ('team', zeroblob(32), 1800000000);",
+             VALUES ('team', zeroblob(32), 1800000000);
+             INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                  author_sig, channel_sig, seq, stored_at)
+             VALUES (zeroblob(32), zeroblob(32),
+                     X'0202020202020202020202020202020202020202020202020202020202020202',
+                     3, 0, X'0E', zeroblob(64), zeroblob(64), 4, 1800000000),
+                    (X'0707070707070707070707070707070707070707070707070707070707070707',
+                     zeroblob(32), zeroblob(32),
+                     5, 1, X'0F', zeroblob(64), zeroblob(64), 2, 1800000000),
+                    (X'0707070707070707070707070707070707070707070707070707070707070707',
+                     zeroblob(32),
+                     X'0202020202020202020202020202020202020202020202020202020202020202',
+                     6, 0, X'10', zeroblob(64), zeroblob(64), 7, 1800000000);",
         )
         .unwrap();
         conn
     }
 
     /// The table and the indexes that the step to version 13 adds.
-    const NEW_IN_V13: [&str; 3] = [
+    const NEW_IN_V13: [&str; 4] = [
+        "idx_entries_channel_place",
         "idx_relay_channels_held",
         "idx_relay_channels_used",
         "relay_channels",
     ];
 
+    /// Each entry's channel by its first byte, its place in this node's
+    /// order, and its place in its channel's own, or `None` where entries
+    /// have no place of their channel's own.
+    fn channel_places(conn: &Connection) -> Option<Vec<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT hex(substr(channel_id, 1, 1)) || ' ' || seq || ' ' || channel_place
+                 FROM entries ORDER BY channel_id, seq",
+            )
+            .ok()?;
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        Some(rows.collect::<Result<_, _>>().unwrap())
+    }
+
     /// Everything a database at version 12 holds: what one at version 11
     /// holds, each definition of the step to version 12, and each row of
-    /// what a device holds of its person.
+    /// what a device holds of its person. Of the table of entries, every
+    /// row as an older binary wrote it, and not its definition.
     fn held_before_v13(conn: &Connection) -> Vec<String> {
         let mut held = held_before_v12(conn);
         for rows in [
@@ -1393,7 +1455,8 @@ mod tests {
     fn new_in_v13(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
-             WHERE name LIKE '%relay_channels%' AND name NOT LIKE 'sqlite_autoindex%'
+             WHERE (name LIKE '%relay_channels%' OR name = 'idx_entries_channel_place')
+               AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
         .unwrap()
@@ -1403,9 +1466,10 @@ mod tests {
         .unwrap()
     }
 
-    /// The table of the channels a relay holds is made in one step with
-    /// its version, as the steps before it are: a failure between them
-    /// leaves none, and the step asked for twice is run once.
+    /// The table of the channels a relay holds, and each entry's place in
+    /// its channel's own order, are made in one step with their version,
+    /// as the steps before it are: a failure between them leaves none,
+    /// and the step asked for twice is run once.
     #[test]
     fn test_v13_adds_the_channels_a_relay_holds_and_its_version_as_one() {
         let conn = at_v12();
@@ -1415,6 +1479,8 @@ mod tests {
         };
         assert_eq!(version(&conn), 12);
         assert!(new_in_v13(&conn).is_empty());
+        assert_eq!(channel_places(&conn), None);
+        let entries_before = definition_of(&conn, "entries");
 
         let failing = format!("{MIGRATION_V13} SELECT no_such_function();");
         assert!(migrate_in_one(&conn, &failing, 13).is_err());
@@ -1423,12 +1489,15 @@ mod tests {
             new_in_v13(&conn).is_empty(),
             "the table goes with the version"
         );
+        assert_eq!(channel_places(&conn), None, "and so does the column");
+        assert_eq!(definition_of(&conn, "entries"), entries_before);
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), 13);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v13(&conn), NEW_IN_V13);
+        assert_eq!(channel_places(&conn).map(|places| places.len()), Some(4));
 
         // A start after that, and the step asked for again, change
         // nothing: what the relay holds stays.
@@ -1448,15 +1517,27 @@ mod tests {
 
     /// A database at version 12 that an older binary wrote is taken to
     /// version 13 with everything it held as it was: the step adds one
-    /// table and two indexes, with nothing in them, and touches nothing
-    /// else. The entries it held are in no channel that a relay holds.
+    /// table and two indexes, with nothing in them, and to each entry its
+    /// place in its channel's own order, with an index. It touches
+    /// nothing else. The entries it held are in no channel that a relay
+    /// holds.
     #[test]
     fn test_a_database_at_v12_that_an_older_binary_wrote_is_taken_to_v13() {
         let conn = at_v12();
         let before = held_before_v13(&conn);
+        let entries_before = definition_of(&conn, "entries");
         assert!(before.iter().any(|row| row.starts_with("person: ")));
-        assert!(before.iter().any(|row| row.starts_with("entries: ")));
+        assert!(
+            before
+                .iter()
+                .any(|row| row.starts_with("idx_entries_channel_seq: "))
+        );
         assert!(before.iter().any(|row| row.starts_with("ci_2grp_a")));
+        // Four entries, in two channels, as an older binary stored them.
+        let entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(entries, 4);
 
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
@@ -1479,6 +1560,27 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM relay_channels", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+
+        // And each entry's place in its channel's own order: the entries
+        // of each channel are counted from 1, in the order in which this
+        // node stored them, whatever it stored in other channels between.
+        assert_eq!(
+            channel_places(&conn).unwrap(),
+            ["00 4 1", "00 9 2", "07 2 1", "07 7 2"]
+        );
+        // The table of entries has that one column more, and is as it
+        // was otherwise.
+        let entries_after = definition_of(&conn, "entries");
+        assert!(!entries_before.contains("channel_place"));
+        assert_eq!(
+            entries_after.replace(", channel_place INTEGER NOT NULL DEFAULT 0", ""),
+            entries_before
+        );
+        // No two entries of a channel have one place in it.
+        assert!(
+            conn.execute("UPDATE entries SET channel_place = 1", [])
+                .is_err()
+        );
     }
 
     /// The table takes no row that cannot be a channel a relay holds: an

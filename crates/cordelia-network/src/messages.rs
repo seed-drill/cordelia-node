@@ -450,8 +450,9 @@ pub struct EntryPull {
     /// The channel's ID.
     #[serde(with = "serde_bytes")]
     pub channel: [u8; 32],
-    /// The place, in the receiver's order of storing, after which the
-    /// page starts. 0 is before the first.
+    /// The place after which the page starts, in the order in which the
+    /// receiver stored this channel's entries: a count of the channel's
+    /// own. 0 is before the first.
     pub after: u64,
     /// The most entries to hand.
     pub limit: u32,
@@ -463,8 +464,9 @@ pub struct EntryPulled {
     /// The entries, each as its bytes on the wire, in the order the
     /// sender stored them.
     pub entries: Vec<ByteBuf>,
-    /// The place to ask after next: that of the last entry here, or the
-    /// place that was asked after where there is none.
+    /// The place to ask after next, in the channel's own order: that of
+    /// the last entry here, or the place that was asked after where
+    /// there is none.
     pub next: u64,
 }
 
