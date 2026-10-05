@@ -40,6 +40,12 @@
 //! ends with the same entries, and the same answers, as one that was
 //! given the record first. A node does it by listing its channels to its
 //! relays again from the start (§16).
+//!
+//! A record that is not counted may go where the device keeps 256 of
+//! them ([`crate::person::see_addition`]). It is then as one never seen,
+//! and is judged when its entry is given again, though the store holds
+//! the entry already. Nothing here asks for it: it is given again when
+//! the caller next gives everything.
 
 use rusqlite::Connection;
 
@@ -67,6 +73,9 @@ pub enum Taken {
         stored: Outcome,
         /// What it was as a record of an addition, where it is in the
         /// personal channel under a record's name and the store took it.
+        /// And where the store held it already, and the device keeps
+        /// nothing of the record in it: one that went at the bound of
+        /// records not counted is judged when it is given again.
         record: Option<Record>,
         /// How many keys came to count by it: none for any entry but a
         /// record, and more than one where a record that was kept as not
@@ -194,8 +203,9 @@ fn taken_as_its_own(
 
     let stored = entries::store(conn, entry, now)?;
     let mut taken = (None, 0);
-    if is_personal && stored == Outcome::Stored {
-        taken = record_in(conn, entry, &personal, now)?;
+    if is_personal && stored != Outcome::OlderThanHeld {
+        let again = stored == Outcome::AlreadyHeld;
+        taken = record_in(conn, entry, &personal, again, now)?;
     }
     Ok(Some(Taken::Own {
         stored,
@@ -242,19 +252,29 @@ fn is_of_a_generation_left(conn: &Connection, entry: &CheckedEntry) -> Result<bo
     Ok(false)
 }
 
-/// What an entry of the personal channel, which the store has just taken,
-/// is as a record of an addition (decision 2026-10-04 §6), and how many
-/// keys came to count by it. `None` where it is no record: it does not
-/// open, or its name is not a record's.
+/// What an entry of the personal channel is as a record of an addition
+/// (decision 2026-10-04 §6), and how many keys came to count by it.
+/// `None` where it is no record: it does not open, or its name is not a
+/// record's.
 ///
 /// A record is the word of the device that adds, and is read only from
 /// that device's own entry, under the name of the key it adds: the
 /// record's adder is the entry's signer, and the entry's name is
 /// [`added_name`] of the record's key.
+///
+/// `again` says that the store did not take the entry now, and holds one
+/// from that signer there at that revision. An entry is read when the
+/// store takes it, and a record that the device keeps from it says no
+/// more when the entry is given again. But a record that is not counted
+/// goes where the device keeps too many, and is then as one never seen:
+/// the entry is read again where it is the very entry the store holds,
+/// and the device keeps nothing of its record. Whatever else an entry
+/// given again is, it was that when the store took it: `None`.
 fn record_in(
     conn: &Connection,
     entry: &CheckedEntry,
     personal: &[u8; 32],
+    again: bool,
     now: i64,
 ) -> Result<(Option<Record>, usize), PersonError> {
     let Ok(inside) = entry.open(personal) else {
@@ -263,7 +283,7 @@ fn record_in(
     if !inside.name.starts_with(PERSONAL_ADDED_PREFIX) {
         return Ok((None, 0));
     }
-    let not_read = |why: NotRead| Ok((Some(Record::NotRead(why)), 0));
+    let not_read = |why: NotRead| Ok(((!again).then_some(Record::NotRead(why)), 0));
     let Value::Other(bytes) = &inside.value else {
         return not_read(NotRead::NoBytes);
     };
@@ -274,6 +294,9 @@ fn record_in(
     let added = &record.addition;
     if added.adder != entry.author || inside.name != added_name(&added.device.key)? {
         return not_read(NotRead::NotItsSigners);
+    }
+    if again && (is_kept(conn, &record)? || !is_the_entry_held(conn, entry)?) {
+        return Ok((None, 0));
     }
 
     let before = who_counts(conn)?.devices();
@@ -289,12 +312,30 @@ fn record_in(
     Ok((Some(Record::Seen(seen)), came_to_count))
 }
 
+/// Whether the device keeps `record`, counted or not.
+fn is_kept(conn: &Connection, record: &SignedAddition) -> Result<bool, PersonError> {
+    let bytes = record.to_bytes()?;
+    let kept = held_rows::additions(conn)?;
+    Ok(kept.iter().any(|one| one.record == bytes))
+}
+
+/// Whether `entry` is the very entry that the store holds from its signer
+/// in its slot. The store answers that it holds one already for another
+/// entry too, which that signer signed at the same revision: what such a
+/// one says is not read.
+fn is_the_entry_held(conn: &Connection, entry: &CheckedEntry) -> Result<bool, PersonError> {
+    let held = entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)?;
+    Ok(held.is_some_and(|held| held.entry == **entry))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::person::{NotCounted, Refused};
-    use crate::several::{Machine, Several, entry_by, signed_in, text};
-    use cordelia_core::protocol::{HAND_OVER_NAME, REV_BAND_HALF, REV_BAND_SIZE, REV_COUNT_BITS};
+    use crate::several::{Machine, Several, entry_by, identity_of, listed_as, signed_in, text};
+    use cordelia_core::protocol::{
+        HAND_OVER_NAME, MAX_NOT_COUNTED_RECORDS, REV_BAND_HALF, REV_BAND_SIZE, REV_COUNT_BITS,
+    };
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::change_entry::{self, ChangeEntryError};
     use cordelia_crypto::statement::Link as StatementLink;
@@ -302,6 +343,13 @@ mod tests {
     /// An ordinary entry that the store took.
     const STORED: Taken = Taken::Own {
         stored: Outcome::Stored,
+        record: None,
+        came_to_count: 0,
+    };
+
+    /// An entry that the store held already, and that says no more.
+    const HELD: Taken = Taken::Own {
+        stored: Outcome::AlreadyHeld,
         record: None,
         came_to_count: 0,
     };
@@ -562,6 +610,174 @@ mod tests {
             }
         );
         assert!(s[1].counts(&new.key()));
+    }
+
+    /// An entry that is given again is read as a record only where it is
+    /// the very entry the store holds. The store answers that it holds
+    /// one already for another entry that its signer signed at that
+    /// revision: what that one says is not read.
+    #[test]
+    fn test_an_entry_given_again_is_read_only_where_it_is_the_one_the_store_holds() {
+        let s = Several::of_one_person(2);
+        let personal = s[1].personal();
+        let (listed, new) = (Machine::new(0), Machine::new(7));
+        let name = added_name(&new.key()).unwrap();
+        let good = Value::Other(record(&s, 1, &listed, &new).to_bytes().unwrap());
+        let holding =
+            |rev: u64, value: Value| entry_by(&listed.identity, &personal, rev, &name, value, &[]);
+
+        // Device 0 signs two entries at one revision, under the name of
+        // the key: a text, which the store takes, and a record.
+        let a_text = holding(1, text("no record"));
+        assert_eq!(
+            given(&s, 1, &a_text),
+            Taken::Own {
+                stored: Outcome::Stored,
+                record: Some(Record::NotRead(NotRead::NoBytes)),
+                came_to_count: 0,
+            }
+        );
+        // Given again, it is what it was when the store took it, and
+        // says no more.
+        assert_eq!(given(&s, 1, &a_text), HELD);
+        // The record at that revision: the store holds one there, which
+        // is not this entry. It is not read, though the device keeps
+        // nothing of the record.
+        assert_eq!(given(&s, 1, &holding(1, good.clone())), HELD);
+        assert!(!s[1].counts(&new.key()));
+        assert_eq!(held_rows::additions(&s[1].conn).unwrap().len(), 1);
+
+        // The control: at the next revision the store takes it, and the
+        // record is read.
+        assert_eq!(
+            given(&s, 1, &holding(2, good)),
+            Taken::Own {
+                stored: Outcome::Stored,
+                record: Some(Record::Seen(AdditionSeen::Counted)),
+                came_to_count: 1,
+            }
+        );
+    }
+
+    /// A device keeps at most 256 records that are not counted, and a
+    /// device that counts can sign any number of them. The record by
+    /// which a device of the statement lets a key add is not among those
+    /// that go: no flood takes from a key that it may add.
+    ///
+    /// A record that did go is as one never seen. It is judged when its
+    /// entry is given again, though the store holds the entry already.
+    #[test]
+    fn test_a_flood_of_records_drops_none_that_lets_a_key_add() {
+        const COUNTED: AdditionSeen = AdditionSeen::Counted;
+        const ALREADY: AdditionSeen = AdditionSeen::NotCounted(NotCounted::CountsAlready);
+        const MAY_NOT: AdditionSeen = AdditionSeen::NotCounted(NotCounted::MayNotAdd);
+
+        // Device 1 is given everything. The statement lists device 0,
+        // which added device 1.
+        let s = Several::of_one_person(2);
+        let on = &s[1];
+        let statement = on.held().statement.statement;
+        let personal = on.personal();
+        // The entry in which device `adder` adds device `new`.
+        let adds = |adder: u16, new: u16| {
+            let by = identity_of(adder);
+            let record = Addition::under(&statement, listed_as(new), by.public_key(), 1)
+                .unwrap()
+                .sign(&by)
+                .unwrap();
+            let name = added_name(&record.addition.device.key).unwrap();
+            let value = Value::Other(record.to_bytes().unwrap());
+            entry_by(&by, &personal, 1, &name, value, &[])
+        };
+        // What the store did with an entry that device 1 is given, what
+        // the record in it was, and how many keys came to count by it.
+        let taken = |entry: &CheckedEntry| match given(&s, 1, entry) {
+            Taken::Own {
+                stored,
+                record,
+                came_to_count,
+            } => (stored, record, came_to_count),
+            other => panic!("{other:?}"),
+        };
+        let stored =
+            |seen: AdditionSeen, came: usize| (Outcome::Stored, Some(Record::Seen(seen)), came);
+        let again = |seen: AdditionSeen, came: usize| {
+            (Outcome::AlreadyHeld, Some(Record::Seen(seen)), came)
+        };
+        let says_no_more = (Outcome::AlreadyHeld, None, 0);
+        let keeps = |entry: &CheckedEntry| {
+            let Value::Other(record) = entry.open(&personal).unwrap().value else {
+                panic!("a record is bytes");
+            };
+            let kept = held_rows::additions(&on.conn).unwrap();
+            kept.iter().any(|one| one.record == record)
+        };
+        let not_counted = || {
+            let kept = held_rows::additions(&on.conn).unwrap();
+            kept.iter().filter(|one| !one.counted).count()
+        };
+        let may_add = |n: u16| {
+            let counting = who_counts(&on.conn).unwrap();
+            counting.may_add(&identity_of(n).public_key())
+        };
+
+        // Device 1, which was added since the statement, adds device 8:
+        // it counts, and may not add. Device 0 adds it too: now it may.
+        assert_eq!(taken(&adds(1, 8)), stored(COUNTED, 1));
+        assert!(!may_add(8));
+        let lets_8_add = adds(0, 8);
+        assert_eq!(taken(&lets_8_add), stored(ALREADY, 0));
+        assert!(may_add(8));
+        // Device 8 adds devices 9 and 10, which count and may not add:
+        // what they sign is kept as not counted.
+        assert_eq!(taken(&adds(8, 9)), stored(COUNTED, 1));
+        assert_eq!(taken(&adds(8, 10)), stored(COUNTED, 1));
+
+        // A flood of 256 such records: one by device 9, and 255 by
+        // device 10. With the one that lets device 8 add, that is one
+        // more than the device keeps.
+        let by_9 = adds(9, 11);
+        assert_eq!(taken(&by_9), stored(MAY_NOT, 0));
+        let by_10: Vec<CheckedEntry> = (0..255).map(|n| adds(10, 1000 + n)).collect();
+        for entry in &by_10 {
+            assert_eq!(taken(entry), stored(MAY_NOT, 0));
+        }
+        assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
+        // The one that went is the oldest of the flood. The record that
+        // lets device 8 add is older, and stays.
+        assert!(keeps(&lets_8_add) && !keeps(&by_9));
+        assert!(by_10.iter().all(keeps));
+        assert!(may_add(8));
+        // What device 8 signs next counts.
+        assert_eq!(taken(&adds(8, 12)), stored(COUNTED, 1));
+
+        // Device 0 adds device 9 too: it may add from now on. The device
+        // keeps nothing that device 9 signed, so no key comes to count.
+        // This record stays as the other does, and the oldest of the
+        // others goes.
+        assert_eq!(taken(&adds(0, 9)), stored(ALREADY, 0));
+        assert!(may_add(9) && !keeps(&by_10[0]));
+        assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
+
+        // The record by device 9 that went is given again. The store
+        // holds its entry already, and it is judged as a record never
+        // seen: the key it adds counts.
+        assert_eq!(taken(&by_9), again(COUNTED, 1));
+        assert!(
+            who_counts(&on.conn)
+                .unwrap()
+                .counts(&identity_of(11).public_key())
+        );
+        // So is the one by device 10 that went: it does not count, is
+        // kept again, and the oldest of the others goes in its turn.
+        assert_eq!(taken(&by_10[0]), again(MAY_NOT, 0));
+        assert!(keeps(&by_10[0]) && !keeps(&by_10[1]));
+        assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
+        // A record that the device keeps says no more when its entry is
+        // given again: one that counts, and two that do not.
+        for kept in [&by_9, &lets_8_add, &by_10[2]] {
+            assert_eq!(taken(kept), says_no_more);
+        }
     }
 
     /// An entry of the phrase's channel is shown to the device, which
