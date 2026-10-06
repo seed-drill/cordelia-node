@@ -179,10 +179,30 @@ async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
     assert_eq!((status, &would["would"]), (200, &json!("add")), "{would}");
     assert_eq!(woken(&state).await, (false, false));
     assert_eq!(place(&state), Some((mark, 4)));
+    // The request says what the yes was for (decision 2026-10-04 §16).
+    // One that does not is refused; and one whose yes was for handing
+    // the last change again, where the key would be added, is a
+    // conflict. Nothing is written for either, and nothing is woken.
+    let (status, said) = asks!(app, "/api/v1/devices/add", body.clone());
+    assert_eq!(status, 400, "{said}");
+    let mut for_another = body.clone();
+    for_another["would"] = "hand_again".into();
+    let (status, said) = asks!(app, "/api/v1/devices/add", for_another);
+    assert_eq!(status, 409, "{said}");
+    assert_eq!(woken(&state).await, (false, false));
+    assert_eq!(place(&state), Some((mark, 4)));
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert!(seen["added"].as_array().unwrap().is_empty(), "{seen}");
     // The device is added: a record is made, the node is told that
     // something was written, and every channel is read again.
-    let (status, added) = asks!(app, "/api/v1/devices/add", body);
+    let mut body = body;
+    body["would"] = "add".into();
+    let (status, added) = asks!(app, "/api/v1/devices/add", body.clone());
     assert_eq!((status, &added["record"]), (200, &json!(true)), "{added}");
+    // The key counts now, by that record, and is still added by a
+    // record where it is added again: with the yes for that.
+    let (status, would) = asks!(app, "/api/v1/devices/add/look", body.clone());
+    assert_eq!((status, &would["would"]), (200, &json!("add")), "{would}");
     assert_eq!(woken(&state).await, (true, false));
     assert_eq!(place(&state), None);
 
@@ -279,7 +299,10 @@ fn routes() -> Vec<(&'static str, Value)> {
             json!({ "notice": hex::encode([1u8; 32]) }),
         ),
         ("/api/v1/devices/add/look", json!({ "device": key })),
-        ("/api/v1/devices/add", json!({ "device": key })),
+        (
+            "/api/v1/devices/add",
+            json!({ "device": key, "would": "add" }),
+        ),
         (
             "/api/v1/devices/accept",
             json!({ "key": key, "row": "no_phrase" }),

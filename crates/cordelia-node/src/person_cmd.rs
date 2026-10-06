@@ -383,7 +383,13 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     let body = json!({ "device": key, "label": name });
     let would = api_post(config_path, "/api/v1/devices/add/look", body.clone())?;
     names_this_device(&would, &own)?;
-    let agreed = match text(&would, "would") {
+    // What the yes is for goes with the request: the node refuses where
+    // adding the key would by then do the other (§16).
+    let yes_is_for = match text(&would, "would") {
+        "hand_again" => "hand_again",
+        _ => "add",
+    };
+    let agreed = match yes_is_for {
         "hand_again" => at.yes(&format!(
             "{} is one of your devices already: this hands it the last change again, and \
              adds nothing.",
@@ -411,6 +417,8 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
         println!("{NOT_A_YES}");
         return Ok(());
     }
+    let mut body = body;
+    body["would"] = yes_is_for.into();
     let added = api_post(config_path, "/api/v1/devices/add", body)?;
     names_this_device(&added, &own)?;
     let this_device = encode_public_key(&own)?;

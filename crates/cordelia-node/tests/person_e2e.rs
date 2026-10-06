@@ -567,7 +567,10 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         ("/api/v1/change/prepare", json!({})),
         ("/api/v1/change/prepare", json!({ "settle": true })),
         ("/api/v1/devices/add/look", json!({ "device": other })),
-        ("/api/v1/devices/add", json!({ "device": other })),
+        (
+            "/api/v1/devices/add",
+            json!({ "device": other, "would": "add" }),
+        ),
     ] {
         let (status, said) = asks(&laptop, path, body);
         assert_eq!(status, 400, "{path}: {said}");
@@ -2545,7 +2548,7 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
     let its_key = cordelia_crypto::bech32::encode_public_key(&its_own.public_key()).unwrap();
     laptop.post(
         "/api/v1/devices/add",
-        json!({ "device": its_key, "label": "laptop" }),
+        json!({ "device": its_key, "label": "laptop", "would": "add" }),
     );
     let named = its_key.clone();
     let stand_in = Answers::in_the_place_of(&laptop, move |_, answer| {

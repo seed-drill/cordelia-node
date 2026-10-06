@@ -323,6 +323,12 @@ pub struct AddRequest {
     /// keeps the statement's label.
     #[serde(default)]
     pub label: Option<String>,
+    /// What the yes was for, where the device is to be added: `add`, or
+    /// `hand_again` for a key that the statement lists already, which is
+    /// handed the last change again with no record. It is what the look
+    /// said adding would do, when the command asked its yes (§16).
+    #[serde(default)]
+    pub would: Option<String>,
 }
 
 /// The label a device is added under where a person gave none.
@@ -364,6 +370,11 @@ pub async fn add_look(
 /// ([`at_relays::read_again`]): what the new device wrote was refused
 /// where it arrived before the record. And the node is woken, to send the
 /// hand-over and the record.
+///
+/// **The request says what the yes was for** (§16): to add the device,
+/// or to hand a device that is listed already the last change again.
+/// Where adding the key would now do the other, nothing is done, and the
+/// answer is a conflict: the command asks again.
 pub async fn add(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -374,6 +385,27 @@ pub async fn add(
     let label = body.label.as_deref().unwrap_or(NO_LABEL);
     let record = {
         let conn = db(&state);
+        // What adding would do now, against what the yes was for.
+        let would = adding::would_add(&conn, &state.identity, &device, label).map_err(refused)?;
+        let would = match would {
+            WouldAdd::HandsAgain { .. } => "hand_again",
+            WouldAdd::Adds { .. } => "add",
+        };
+        match body.would.as_deref() {
+            Some(yes_was_for) if yes_was_for == would => {}
+            Some("add" | "hand_again") => {
+                return Err(ApiError::Conflict(
+                    "what adding that key would do changed while you were answering: nothing \
+                     was done."
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "would says what the yes was for, and is one of add and hand_again".into(),
+                ));
+            }
+        }
         let added =
             adding::add_device(&conn, &state.identity, &device, label, now()).map_err(refused)?;
         if added.record.is_some() {
