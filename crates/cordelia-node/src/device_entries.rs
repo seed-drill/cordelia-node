@@ -1337,13 +1337,19 @@ impl DeviceEntries {
                     return Step::Done(false);
                 }
             };
-            // Nothing of it is sent: what was passed over is said so.
+            // Nothing of it is sent: what was passed over is said so,
+            // under the change entry that this pass read its channels
+            // under and no other (§16). Where the device keeps another,
+            // a turn at another relay applied a change since: this
+            // channel is one that it has left, nothing is written of it,
+            // and the pass at this relay ends.
             if batch.entries.is_empty() {
                 let db = lock(&self.state.db);
-                if at_relays::sent(&db, &relay, channel, &batch, &[]).is_err() {
-                    return Step::Done(false);
+                match at_relays::passed_over(&db, &relay, channel, &batch, &at.under) {
+                    Ok(true) => continue,
+                    Ok(false) => return Step::Stop,
+                    Err(_) => return Step::Done(false),
                 }
-                continue;
             }
             let done = match self.push_batch(at, channel, &batch).await {
                 Ok(Some(done)) => done,

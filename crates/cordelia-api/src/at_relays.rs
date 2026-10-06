@@ -926,6 +926,33 @@ fn held_back(
     }))
 }
 
+/// Nothing of `batch` was sent to the relay: every entry in it was passed
+/// over. That is kept, so that the next batch goes on after them, only
+/// where the device still keeps the change entry named `under`, which is
+/// the one the batch was read under (decision 2026-10-04 §16). Where it
+/// keeps another, it applied a change since: the channel is one that the
+/// device has left, and nothing is written of it. Returns whether it was
+/// kept.
+///
+/// What a relay answered is taken through the one way in, which asks the
+/// same before it takes anything. This write is made with nothing asked
+/// of the relay, so it asks for itself.
+pub fn passed_over(
+    conn: &Connection,
+    relay: &[u8; 32],
+    channel: &Own,
+    batch: &Batch,
+    under: &[u8; 32],
+) -> Result<bool, PersonError> {
+    in_one(conn, || {
+        if kept_id(conn)? != Some(*under) {
+            return Ok(false);
+        }
+        sent(conn, relay, channel, batch, &[])?;
+        Ok(true)
+    })
+}
+
 /// A relay answered a batch: `answers` says what it answered for each
 /// entry that was sent, in their order. How far the relay was sent the
 /// channel moves on past each entry that it holds now or will not take,
@@ -2443,7 +2470,25 @@ mod tests {
         let held_back = sends(on, &RELAY, &notes, Which::Carried);
         assert!(held_back.entries.is_empty());
         assert!(!held_back.is_empty());
-        sent(&on.conn, &RELAY, &notes, &held_back, &[]).unwrap();
+        // That they were passed over is kept only under the change entry
+        // that the batch was read under (decision 2026-10-04 §16). Under
+        // another, the device has applied a change since: nothing is
+        // written, and the batch is as it was.
+        let kept_before = kept_rows::kept(&on.conn, &RELAY, &notes.id).unwrap();
+        let under_another = [9u8; 32];
+        assert!(!passed_over(&on.conn, &RELAY, &notes, &held_back, &under_another).unwrap());
+        assert_eq!(
+            kept_rows::kept(&on.conn, &RELAY, &notes.id).unwrap(),
+            kept_before
+        );
+        assert_eq!(sends(on, &RELAY, &notes, Which::Carried), held_back);
+        let under = kept_id(&on.conn).unwrap().unwrap();
+        assert_eq!(under, on.latest().id());
+        assert!(passed_over(&on.conn, &RELAY, &notes, &held_back, &under).unwrap());
+        assert_ne!(
+            kept_rows::kept(&on.conn, &RELAY, &notes.id).unwrap(),
+            kept_before
+        );
         assert!(sends(on, &RELAY, &notes, Which::Carried).is_empty());
 
         // At another relay nothing was fetched yet, and what came from
