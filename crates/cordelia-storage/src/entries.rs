@@ -250,6 +250,21 @@ pub fn channel_entries_after(
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// Whether the store still holds, of `channel`, the entry that it took at
+/// the place `seq` in its own order. An entry that was replaced by a
+/// higher revision has gone from that place: the one that replaced it has
+/// a later one.
+pub fn holds_at(conn: &Connection, channel: &[u8; 32], seq: i64) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT 1 FROM entries WHERE channel_id = ?1 AND seq = ?2",
+        params![channel.as_slice(), seq],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(storage)
+}
+
 /// The entries of a channel that this node stored after the place
 /// `after_place` in the channel's own order, in that order, and at most
 /// `limit` of them: one page of the channel, for a holder of its key. The

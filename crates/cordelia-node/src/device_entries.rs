@@ -73,7 +73,7 @@
 
 pub mod leave;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -96,7 +96,7 @@ use cordelia_network::messages::{
 };
 use cordelia_network::rate_limit::ByteCounter;
 use cordelia_storage::acts::TypedKey;
-use cordelia_storage::entries::Outcome;
+use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::State;
 use cordelia_storage::relay::{Mark, NO_MARK};
 use rusqlite::Connection;
@@ -194,9 +194,11 @@ struct OfRelay {
     holds: Option<([u8; 32], bool)>,
     /// Its last refusal for room.
     no_room: Option<NoRoom>,
-    /// How many entries of the device's own it said it holds in another
-    /// form.
-    another_form: usize,
+    /// The entries of the device's own that it said it holds in another
+    /// form, each by its channel and its place in the store's own order.
+    /// What a status says is how many of them the store still holds
+    /// (§16): one goes when the file's next edit is above both.
+    another_form: HashSet<([u8; 32], i64)>,
     /// The entry whose show last got no leave there, by what it is named
     /// by, how often in a row, and when it is shown there again.
     show_left: Option<([u8; 32], LeftFor)>,
@@ -747,7 +749,13 @@ impl DeviceEntries {
             };
             let entry = &shows.entry;
             round.entry = Some(entry.id());
-            if self.show_waits(link.name(), &entry.id()) {
+            // While the device wakes, a relay that it has not heard from
+            // since it woke is shown the entry whatever wait its last
+            // show there left (§16): the device goes on only once every
+            // relay has answered, and a relay that is not asked is one
+            // that every wake would wait its whole time for.
+            let must_be_heard = self.leave.is_waking() && !self.leave.has_heard(link.name());
+            if !must_be_heard && self.show_waits(link.name(), &entry.id()) {
                 return false;
             }
             let shown_whole = lock(&self.kept)
@@ -1371,7 +1379,8 @@ impl DeviceEntries {
                 );
                 let mut kept = lock(&self.kept);
                 let of = kept.relays.entry(link.name().to_string()).or_default();
-                of.another_form += done.another;
+                of.another_form
+                    .extend(done.another_at.iter().map(|seq| (channel.id, *seq)));
             }
             let stopped = done.refused.is_some();
             if stopped || done.no_room > 0 {
@@ -1528,8 +1537,32 @@ impl DeviceEntries {
 
     /// Say where the device stands at its relays, for a status.
     fn say(&self, relays: &[Relay], stands: Stands) {
-        let latest = at_relays::kept_id(&lock(&self.state.db)).ok().flatten();
-        let kept = lock(&self.kept);
+        // The entries that a relay holds in another form are counted
+        // from what the store holds (§16): one that the store holds no
+        // more at its place was replaced by the file's next edit, which
+        // is above both, and is counted no more. Each lock is held by
+        // itself.
+        let said: HashSet<([u8; 32], i64)> = {
+            let kept = lock(&self.kept);
+            let of_each = kept.relays.values();
+            of_each
+                .flat_map(|of| of.another_form.iter().copied())
+                .collect()
+        };
+        let (latest, gone) = {
+            let db = lock(&self.state.db);
+            let latest = at_relays::kept_id(&db).ok().flatten();
+            let gone: HashSet<([u8; 32], i64)> = said
+                .into_iter()
+                .filter(|(channel, seq)| matches!(entries::holds_at(&db, channel, *seq), Ok(false)))
+                .collect();
+            (latest, gone)
+        };
+        let mut kept = lock(&self.kept);
+        for of in kept.relays.values_mut() {
+            of.another_form.retain(|entry| !gone.contains(entry));
+        }
+        let kept = kept;
         let relays = relays
             .iter()
             .map(|relay| {
@@ -1544,7 +1577,7 @@ impl DeviceEntries {
                         .map(|(_, holds)| holds),
                     heard_since_woke: self.leave.has_heard(&relay.name),
                     no_room: of.and_then(|of| of.no_room),
-                    another_form: of.map_or(0, |of| of.another_form),
+                    another_form: of.map_or(0, |of| of.another_form.len()),
                     refuses: of.and_then(|of| of.refuses.clone()),
                 }
             })

@@ -708,13 +708,17 @@ pub enum Pushed {
 }
 
 /// What became of a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Sent {
     /// How many entries the relay holds now, or held.
     pub held: usize,
     /// How many it holds in another form: another entry from that author
     /// in that slot at that revision. They are sent no more.
     pub another: usize,
+    /// The place, in the store's own order, of each entry that it holds
+    /// in another form: for as long as the store holds an entry at that
+    /// place, the file's next edit has not gone above both (§16).
+    pub another_at: Vec<i64>,
     /// How many it refused as not signed as they must be.
     pub do_not_check: usize,
     /// How many it had no room for, and are kept to be sent again after
@@ -998,7 +1002,10 @@ pub fn sent(
             };
             match answers.next() {
                 Some(Pushed::Holds) => done.held += 1,
-                Some(Pushed::HoldsAnother) => done.another += 1,
+                Some(Pushed::HoldsAnother) => {
+                    done.another += 1;
+                    done.another_at.push(seq);
+                }
                 Some(Pushed::DoesNotCheck) => done.do_not_check += 1,
                 Some(Pushed::NoRoom) if batch.which == Which::Since => {
                     done.no_room += 1;
@@ -2054,6 +2061,7 @@ mod tests {
             Sent {
                 held: 1,
                 another: 0,
+                another_at: Vec::new(),
                 do_not_check: 1,
                 no_room: 0,
                 refused: Some(Pushed::OverAllowance),
@@ -2078,6 +2086,7 @@ mod tests {
             Sent {
                 held: 0,
                 another: 0,
+                another_at: Vec::new(),
                 do_not_check: 0,
                 no_room: 0,
                 refused: Some(Pushed::OverAllowance),
@@ -2108,16 +2117,22 @@ mod tests {
                 Pushed::HoldsAnother,
             ],
         );
+        // With its place in the store's order: the store holds it there
+        // until the file's next edit takes its place (§16).
+        let last = entries::channel_entries_after(&s[0].conn, &notes.id, 0, 100).unwrap();
+        let place_of_the_last = last.last().unwrap().seq;
         assert_eq!(
             done,
             Sent {
                 held: 3,
                 another: 1,
+                another_at: vec![place_of_the_last],
                 do_not_check: 0,
                 no_room: 0,
                 refused: None,
             }
         );
+        assert!(entries::holds_at(&s[0].conn, &notes.id, place_of_the_last).unwrap());
         assert!(send(&OTHER_RELAY, MOST).is_empty());
         // And what is written next is sent to both.
         let next = s.write(0, "notes", "e.md", "a text");
@@ -2170,6 +2185,7 @@ mod tests {
             Sent {
                 held: 2,
                 another: 0,
+                another_at: Vec::new(),
                 do_not_check: 0,
                 no_room: 2,
                 refused: None,
@@ -2318,6 +2334,7 @@ mod tests {
             Sent {
                 held: 1,
                 another: 0,
+                another_at: Vec::new(),
                 do_not_check: 0,
                 no_room: 0,
                 refused: Some(Pushed::NoRoom),

@@ -3611,8 +3611,11 @@ fn relays_with_links(
 }
 
 /// Start a pass of a device's side of its relays, where this node has
-/// one: off the select loop, since it waits on the relays. A pass that
-/// finds another running does nothing.
+/// one: off the select loop, since it waits on the relays. Each relay has
+/// its turn in a pass by itself: at a relay where an earlier pass is
+/// still at its turn, this one does nothing, and it goes on at every
+/// other relay. Only while the device wakes does one pass ask every
+/// relay, and a second that finds it doing so does nothing.
 fn device_pass(
     device: &Option<std::sync::Arc<cordelia_node::device_entries::DeviceEntries>>,
     set_up: &[cordelia_network::bootstrap::Relay],

@@ -1251,6 +1251,75 @@ async fn a_show_that_gets_no_leave_is_made_again_after_a_wait_that_doubles() {
     assert_eq!(shows(&stuck), [Seen::Whole]);
 }
 
+/// While a device wakes, every relay is shown the change entry, also one
+/// whose last show got no leave and is waiting out its wait (decision
+/// 2026-10-04 §16). Otherwise that relay would not be heard from, and
+/// the device would wait its whole half minute at every wake. It is
+/// shown once, is heard, and the device is awake at the other relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_wakes_shows_also_a_relay_whose_show_is_waiting() {
+    let (stuck, good) = (StandIn::started().await, StandIn::started().await);
+    let slow = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("stuck", stuck.port, stuck.key).await;
+    device.connects_to("good", good.port, good.key).await;
+    device.connects_to("slow", slow.port, slow.key).await;
+    device.passes().await;
+    let shows = |relay: &StandIn| -> Vec<Seen> {
+        let shown = |one: &Seen| matches!(one, Seen::Whole | Seen::Short);
+        relay.seen().into_iter().filter(shown).collect()
+    };
+    let secs = |secs: u64| device.clock.run_ahead(Duration::from_secs(secs));
+
+    // The one relay gives no leave, time after time: its wait grows to
+    // minutes.
+    let whole = Say::Answer(ShowAnswer::Whole);
+    stuck.says(whole.clone(), whole);
+    for _ in 0..8 {
+        secs(OUTBOX_REFUSED_RETRY_MAX_SECS);
+        device.passes().await;
+    }
+    shows(&stuck);
+    device.passes().await;
+    assert_eq!(shows(&stuck), [], "its show waits");
+    assert_eq!(device.has_leave("good"), Ok(()));
+
+    // The machine sleeps, and wakes: it reaches no relay, and then all
+    // three again. The third does not answer yet.
+    for name in ["stuck", "good", "slow"] {
+        device.disconnects(name);
+    }
+    device.passes().await;
+    slow.says(Say::Reset, Say::Reset);
+    device.connects_to("stuck", stuck.port, stuck.key).await;
+    device.connects_to("good", good.port, good.key).await;
+    device.connects_to("slow", slow.port, slow.key).await;
+    assert_eq!(device.has_leave("good"), Err(NoLeave::Waking));
+    shows(&stuck);
+    device.passes().await;
+    // Each was shown, the one whose show was waiting among them, and it
+    // was heard. The device still wakes: the third has not answered.
+    assert_eq!(shows(&stuck), [Seen::Whole]);
+    assert!(device.at("stuck").heard_since_woke);
+    assert!(!device.at("slow").heard_since_woke);
+    assert_eq!(device.has_leave("good"), Err(NoLeave::Waking));
+    // Once heard, it is shown no more while its wait lasts, though the
+    // device still wakes.
+    device.passes().await;
+    assert_eq!(shows(&stuck), []);
+    assert_eq!(device.has_leave("good"), Err(NoLeave::Waking));
+
+    // The third answers: every relay has, and the device is awake. The
+    // one that gives no leave did not hold it up.
+    let held = Say::Answer(ShowAnswer::Held);
+    slow.says(held.clone(), held);
+    device.passes().await;
+    assert_eq!(device.has_leave("good"), Ok(()));
+    assert_eq!(device.has_leave("stuck"), Err(NoLeave::NotGiven));
+    assert_eq!(shows(&stuck), []);
+}
+
 /// A request is written only under the change entry that it was built
 /// under (decision 2026-10-04 §16). The one way in asks which entry the
 /// device keeps before it opens a stream, and a relay can hold the
@@ -3420,6 +3489,12 @@ async fn a_relay_that_holds_another_entry_at_that_revision_says_so_and_is_sent_i
     device.sends().await;
     assert!(holds_at(&relay, &notes, &next.id()));
     assert!(!holds_at(&relay, &notes, &other.id()));
+    // And nothing of the device's own is at the relay in another form
+    // any more: what a status says is counted from what the store
+    // holds, and the entry that was there in another form is replaced
+    // (decision 2026-10-04 §16).
+    device.passes().await;
+    assert_eq!(device.at("relay").another_form, 0);
 }
 
 /// A device proves the key of each channel of its own once on a
