@@ -1251,6 +1251,86 @@ async fn a_show_that_gets_no_leave_is_made_again_after_a_wait_that_doubles() {
     assert_eq!(shows(&stuck), [Seen::Whole]);
 }
 
+/// An answer to a show that gives no leave ends, at once, what leave
+/// there was: the leave that an earlier answer gave does not last out
+/// its ten seconds beside it. A show that is not answered at all changes
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_gives_no_leave_ends_the_leave_there_was() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    let (link, shown) = (device.link("relay"), device.latest());
+    let leave = device.engine.leave();
+
+    // Within the ten seconds, the relay answers the next show with one
+    // that gives none.
+    let whole = Say::Answer(ShowAnswer::Whole);
+    relay.says(whole.clone(), whole);
+    let answered = leave.show(&link, &shown, false).await.unwrap();
+    assert_eq!(answered.answer, ShowAnswer::Whole);
+    assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
+
+    // The control: an answer that gives leave gives it again, and a
+    // show that the relay resets, which is no answer, leaves it.
+    let held = Say::Answer(ShowAnswer::Held);
+    relay.says(held.clone(), held);
+    leave.show(&link, &shown, false).await.unwrap();
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    relay.says(Say::Reset, Say::Reset);
+    assert!(leave.show(&link, &shown, false).await.is_err());
+    assert_eq!(device.has_leave("relay"), Ok(()));
+}
+
+/// A relay that answers the proof of a channel with no does not hold it.
+/// Whatever the device kept of having sent the channel there is
+/// forgotten, and the relay is sent everything of it again, from the
+/// start. A relay that answers yes is sent nothing a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_answers_a_proof_with_no_is_sent_the_channel_again() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let notes = device.channel("notes");
+    let written = device.writes("notes", "a.md", "what the file holds");
+    let pushed_of_notes = |relay: &StandIn| -> Vec<[u8; 32]> {
+        relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|entry| Entry::from_wire(&entry).unwrap())
+            .filter(|entry| entry.channel == notes)
+            .map(|entry| entry.id())
+            .collect()
+    };
+    // The relay holds what a proof is of, and is sent the file.
+    relay.holds_what_is_proved(true);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(pushed_of_notes(&relay), [written.id()]);
+    // On a new connection the channel is proved again. The relay still
+    // holds it: nothing is sent a second time.
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    device.sends().await;
+    assert!(pushed_of_notes(&relay).is_empty());
+
+    // The relay holds it no more, and says so to the next proof: it is
+    // sent the file again.
+    relay.holds_what_is_proved(false);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(pushed_of_notes(&relay), [written.id()]);
+}
+
 /// While a device wakes, every relay is shown the change entry, also one
 /// whose last show got no leave and is waiting out its wait (decision
 /// 2026-10-04 §16). Otherwise that relay would not be heard from, and
