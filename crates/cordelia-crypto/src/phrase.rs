@@ -16,6 +16,11 @@
 //! that was given them, for as long as it signs and seals. It is
 //! overwritten when it is dropped, and nothing prints it but
 //! [`Phrase::words`].
+//!
+//! **Everything that comes from the phrase is overwritten with it**
+//! (decision 2026-10-04 §16): each of the secrets below is given back in
+//! memory that is overwritten when it is dropped, and so is the signing
+//! key, with its seed and the form of it that the signing code is given.
 
 use std::fmt;
 
@@ -28,7 +33,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::CryptoError;
-use crate::ecies::hkdf_sha256_of;
+use crate::ecies::hkdf_sha256_wiped;
 use crate::identity::NodeIdentity;
 
 /// Why what was typed is not a recovery phrase. It says which word, by its
@@ -119,9 +124,10 @@ impl Phrase {
     }
 
     /// The phrase's signing key: an Ed25519 key pair. It signs statements,
-    /// and the change entry as its author.
+    /// and the change entry as its author. It is overwritten when it is
+    /// dropped, as every key pair is ([`NodeIdentity`]).
     pub fn signing_key(&self) -> Result<NodeIdentity, CryptoError> {
-        NodeIdentity::from_seed(self.derived(LABEL_PHRASE_SIGN)?)
+        NodeIdentity::from_wiped_seed(&self.derived(LABEL_PHRASE_SIGN)?)
     }
 
     /// The public half of the phrase's signing key: the key a device
@@ -133,25 +139,26 @@ impl Phrase {
     /// The secret of the phrase's channel (decision 2026-10-04 §2.2). Its
     /// keys and its ID are derived from it as any channel's are
     /// ([`crate::derive`]).
-    pub fn channel_secret(&self) -> Result<[u8; 32], CryptoError> {
+    pub fn channel_secret(&self) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         self.derived(LABEL_RECOVERY)
     }
 
     /// The statement key (decision 2026-10-04 §4.6). It never changes, and
     /// every device that follows the phrase is given it.
-    pub fn statement_key(&self) -> Result<[u8; 32], CryptoError> {
+    pub fn statement_key(&self) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         self.derived(LABEL_PHRASE_STATEMENT)
     }
 
     /// The key that seals the part of a change entry that is for the
     /// phrase (decision 2026-10-04 §4.6). No device is given it.
-    pub fn seal_key(&self) -> Result<[u8; 32], CryptoError> {
+    pub fn seal_key(&self) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         self.derived(LABEL_PHRASE_SEAL)
     }
 
-    /// What the phrase gives under `label`.
-    fn derived(&self, label: &[u8]) -> Result<[u8; 32], CryptoError> {
-        hkdf_sha256_of(&self.bytes, &[], label)
+    /// What the phrase gives under `label`, in memory that is overwritten
+    /// when it is dropped.
+    fn derived(&self, label: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+        hkdf_sha256_wiped(&self.bytes, &[], label)
     }
 }
 
@@ -329,21 +336,21 @@ mod tests {
     #[test]
     fn each_thing_from_a_phrase_is_derived_under_its_own_label() {
         let phrase = Phrase::parse(LEGAL).unwrap();
-        let under = |label: &[u8]| hkdf_sha256_of(&[0x7f; 16], &[], label).unwrap();
+        let under = |label: &[u8]| crate::hkdf_sha256_of(&[0x7f; 16], &[], label).unwrap();
         assert_eq!(
             phrase.signing_key().unwrap().seed(),
             &under(b"cordelia v2 phrase sign")
         );
         assert_eq!(
-            phrase.channel_secret().unwrap(),
+            *phrase.channel_secret().unwrap(),
             under(b"cordelia v2 recovery")
         );
         assert_eq!(
-            phrase.statement_key().unwrap(),
+            *phrase.statement_key().unwrap(),
             under(b"cordelia v2 phrase statement")
         );
         assert_eq!(
-            phrase.seal_key().unwrap(),
+            *phrase.seal_key().unwrap(),
             under(b"cordelia v2 phrase seal")
         );
         assert_eq!(
@@ -355,9 +362,9 @@ mod tests {
         let of = |phrase: &Phrase| {
             [
                 *phrase.signing_key().unwrap().seed(),
-                phrase.channel_secret().unwrap(),
-                phrase.statement_key().unwrap(),
-                phrase.seal_key().unwrap(),
+                *phrase.channel_secret().unwrap(),
+                *phrase.statement_key().unwrap(),
+                *phrase.seal_key().unwrap(),
             ]
         };
         let mut all = HashSet::new();
@@ -390,26 +397,62 @@ mod tests {
         assert!(!printed.contains("7f") && !printed.contains("127"));
     }
 
+    /// What is left where a value was, once it has been dropped.
+    fn left_by<T>(value: T) -> Vec<u8> {
+        use std::mem::MaybeUninit;
+        let mut place = MaybeUninit::new(value);
+        let at = place.as_mut_ptr();
+        // SAFETY: `place` holds a value, which is dropped here once and
+        // never used again. `place` is as large as the value and outlives
+        // the read, and it is read as bytes: each type this is called
+        // with is made of bytes alone, with no padding.
+        unsafe {
+            std::ptr::drop_in_place(at);
+            std::slice::from_raw_parts(at.cast::<u8>(), size_of::<T>()).to_vec()
+        }
+    }
+
+    /// Everything that comes from a phrase is overwritten when it is
+    /// dropped (decision 2026-10-04 §16): the secret of its channel, the
+    /// statement key, the key that seals the part for the phrase, and the
+    /// signing key, with its seed and the key pair made of it.
+    #[test]
+    fn what_comes_from_a_phrase_is_overwritten_when_it_is_dropped() {
+        let phrase = Phrase::parse(LEGAL).unwrap();
+        for (what, secret) in [
+            ("the channel's secret", phrase.channel_secret().unwrap()),
+            ("the statement key", phrase.statement_key().unwrap()),
+            ("the seal key", phrase.seal_key().unwrap()),
+        ] {
+            assert_ne!(*secret, [0u8; 32], "{what}");
+            assert_eq!(left_by(secret), [0u8; 32], "{what}");
+        }
+
+        // The signing key: 32 bytes of seed, and a key pair of three
+        // times 32 bytes, which holds the secret scalar that the seed
+        // gives.
+        let key = phrase.signing_key().unwrap();
+        let seed = *key.seed();
+        assert_eq!(size_of::<NodeIdentity>(), 4 * 32);
+        let has = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).any(|at| at == what);
+        // SAFETY: the key is alive, as large as its type, and made of
+        // bytes alone.
+        let alive = unsafe {
+            std::slice::from_raw_parts((&raw const key).cast::<u8>(), size_of::<NodeIdentity>())
+        }
+        .to_vec();
+        assert!(has(&alive, &seed), "the seed is in a key that is alive");
+        assert!(alive.iter().filter(|byte| **byte != 0).count() > 64);
+        assert_eq!(left_by(key), [0u8; 4 * 32]);
+        // The control: the same bytes with nothing to overwrite them are
+        // still there after a drop.
+        assert_eq!(left_by(seed), seed);
+    }
+
     /// The bytes of a phrase are overwritten when it is dropped: where the
     /// phrase was, nothing of it is left.
     #[test]
     fn a_phrase_is_overwritten_when_it_is_dropped() {
-        use std::mem::MaybeUninit;
-
-        /// What is left where a value was, once it has been dropped.
-        fn left_by<T>(value: T) -> Vec<u8> {
-            let mut place = MaybeUninit::new(value);
-            let at = place.as_mut_ptr();
-            // SAFETY: `place` holds a value, which is dropped here once and
-            // never used again. `place` is as large as the value and
-            // outlives the read, and it is read as bytes: the two types
-            // this is called with are 16 bytes with no padding.
-            unsafe {
-                std::ptr::drop_in_place(at);
-                std::slice::from_raw_parts(at.cast::<u8>(), size_of::<T>()).to_vec()
-            }
-        }
-
         assert_eq!(size_of::<Phrase>(), PHRASE_BYTES);
         let phrase = Phrase::parse(LEGAL).unwrap();
         assert_eq!(bytes_of(&phrase), [0x7f; PHRASE_BYTES]);

@@ -272,11 +272,11 @@ fn opened(
     entry: &CheckedEntry,
 ) -> Result<(SignedStatement, ForPhrase), PersonError> {
     let phrase_key = phrase.public_key()?;
-    let channel = derive::channel_id(&phrase.channel_secret()?)?;
+    let channel = derive::channel_id(&*phrase.channel_secret()?)?;
     let statement =
-        change_entry::open_statement(entry, &phrase_key, &channel, &phrase.statement_key()?)?;
+        change_entry::open_statement(entry, &phrase_key, &channel, &*phrase.statement_key()?)?;
     let for_phrase =
-        change_entry::open_for_phrase(entry, &phrase_key, &channel, &phrase.seal_key()?)?;
+        change_entry::open_for_phrase(entry, &phrase_key, &channel, &*phrase.seal_key()?)?;
     Ok((statement, for_phrase))
 }
 

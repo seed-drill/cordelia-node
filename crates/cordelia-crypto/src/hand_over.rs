@@ -376,7 +376,7 @@ mod tests {
             made_at: MADE_AT,
             statement: signed(&statement, phrase),
             secret: secret(2),
-            statement_key: phrase.statement_key().unwrap(),
+            statement_key: *phrase.statement_key().unwrap(),
             change_entry: change_entry(phrase, &statement, secret(2)),
             addition: Some(added(&statement, 0, 7)),
             adders_own: None,
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(bytes[8..10], (statement.len() as u16).to_be_bytes());
         assert_eq!(bytes[10..secret_at], statement);
         assert_eq!(bytes[secret_at..key_at], secret(2));
-        assert_eq!(bytes[key_at..entry_at], phrase.statement_key().unwrap());
+        assert_eq!(bytes[key_at..entry_at], *phrase.statement_key().unwrap());
 
         let entry = &hand_over.change_entry;
         assert_eq!(bytes[entry_at..entry_at + 32], entry.channel);
@@ -921,7 +921,7 @@ mod tests {
             made_at: u64::MAX,
             statement: signed(&statement, &phrase),
             secret: secret(9),
-            statement_key: phrase.statement_key().unwrap(),
+            statement_key: *phrase.statement_key().unwrap(),
             change_entry: change_entry(&phrase, &statement, secret(9)),
             addition: Some(addition),
             adders_own: Some(own),

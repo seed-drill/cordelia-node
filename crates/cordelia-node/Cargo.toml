@@ -38,7 +38,11 @@ zeroize = { workspace = true }
 # The terminal that a command asks at: echo off while the recovery phrase
 # is typed, and the machine's name for a device's label.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["termios", "stdio", "system"] }
+rustix = { version = "1", features = ["termios", "stdio", "system", "process"] }
+
+# A process that holds a recovery phrase denies that it be attached to.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

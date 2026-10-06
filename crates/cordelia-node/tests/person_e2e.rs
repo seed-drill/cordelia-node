@@ -1884,8 +1884,8 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
         let phrase = Phrase::parse(&words).unwrap();
         vec![
             *phrase.signing_key().unwrap().seed(),
-            phrase.channel_secret().unwrap(),
-            phrase.seal_key().unwrap(),
+            *phrase.channel_secret().unwrap(),
+            *phrase.seal_key().unwrap(),
         ]
     };
     let mut searched: Vec<(String, Vec<u8>)> = vec![
@@ -1927,6 +1927,121 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
         .filter(|(what, _)| what.contains("cordelia.db"))
         .any(|(_, bytes)| words_in(bytes).contains("laptop"));
     assert!(in_files, "the search reads the node's database");
+}
+
+// ── The process that holds the phrase ────────────────────────────────
+
+/// The command line that the system says process `pid` runs.
+fn command_line(pid: u32) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Whether the system says that process `pid` cannot be dumped or traced
+/// by its user, and the most that it may leave as a core file. What the
+/// system keeps of a process that can be dumped belongs to its user, as
+/// what it keeps of this test does; of one that cannot, it does not.
+#[cfg(target_os = "linux")]
+fn guarded(pid: u32) -> (bool, String) {
+    use std::os::unix::fs::MetadataExt;
+    let owner = |pid: &str| {
+        std::fs::metadata(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .uid()
+    };
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let core = limits
+        .lines()
+        .find(|line| line.starts_with("Max core file size"))
+        .unwrap_or_default();
+    let core: Vec<&str> = core.split_whitespace().skip(4).take(2).collect();
+    (owner(&pid.to_string()) != owner("self"), core.join(" "))
+}
+
+/// A process that makes or reads a recovery phrase cannot be dumped or
+/// traced, from before it reads anything, and the wait that follows a
+/// change runs in a new image of the program, which never held the phrase
+/// (decision 2026-10-04 §16). Read back from the system: the flag and the
+/// size of a core file, for `cordelia phrase` and `cordelia renew`, and
+/// not for a command that reads no phrase; and the command line of the
+/// process that waits, which is another than the one that signed, in the
+/// same process.
+#[test]
+fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_image() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+
+    // The control: a command that reads no phrase is as any process is.
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let mut at = laptop.at_terminal(&["accept", &other]);
+    at.says("Type yes to go on");
+    #[cfg(target_os = "linux")]
+    assert!(!guarded(at.pid()).0, "a command that reads no phrase");
+    drop(at);
+
+    // `cordelia phrase`, while the words are on the screen.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    #[cfg(target_os = "linux")]
+    assert_eq!(guarded(at.pid()), (true, "0 0".to_string()));
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&words);
+    at.done();
+
+    // `cordelia renew`, from before its yes.
+    let mut at = laptop.at_terminal(&["renew"]);
+    at.says("Make this change?").says("Type yes to go on");
+    let pid = at.pid();
+    let signs = command_line(pid);
+    assert!(signs.ends_with(" renew"), "{signs}");
+    #[cfg(target_os = "linux")]
+    assert_eq!(guarded(pid), (true, "0 0".to_string()));
+    at.types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 2).");
+
+    // The wait: the same process, and another image of the program in
+    // it, which was given the change's number and nothing else.
+    let began = std::time::Instant::now();
+    let waits = loop {
+        let line = command_line(pid);
+        if line.contains("change-made") || began.elapsed() > std::time::Duration::from_secs(20) {
+            break line;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        waits.ends_with(" change-made 2"),
+        "{waits:?} after {signs:?}"
+    );
+    assert!(!waits.contains("renew"), "{waits}");
+    // A new image can be dumped as any process can: it holds no phrase.
+    // (It may have ended by now: then there is nothing to read.)
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new(&format!("/proc/{pid}/stat")).exists() {
+        let unguarded = !guarded(pid).0;
+        if command_line(pid).contains("change-made") {
+            assert!(unguarded, "the image that waits");
+        }
+    }
+    at.says("This machine may be closed only when");
+    let said = at.done();
+    assert!(said.contains("this machine may be closed."), "{said}");
+    for word in words.split(' ') {
+        let after = said
+            .split("The recovery phrase, twelve words")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !words_in(after.as_bytes()).contains(word),
+            "{word} in:\n{after}"
+        );
+    }
 }
 
 // ── What answers at the node's address ───────────────────────────────

@@ -650,6 +650,11 @@ impl AtTerminal {
         }
     }
 
+    /// The process that the command runs in, as the system numbers it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Take in what the command has said since, waiting up to `wait` for
     /// more. Says whether anything came.
     fn hears(&mut self, wait: Duration) -> bool {

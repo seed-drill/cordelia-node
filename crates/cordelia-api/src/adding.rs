@@ -3352,7 +3352,7 @@ mod tests {
             made_at: s.now as u64,
             statement: signed,
             secret,
-            statement_key: s.phrase.statement_key().unwrap(),
+            statement_key: *s.phrase.statement_key().unwrap(),
             change_entry: entry,
             addition: None,
             adders_own: None,

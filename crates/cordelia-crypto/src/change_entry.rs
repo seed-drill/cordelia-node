@@ -92,6 +92,7 @@ use crate::entry::CheckedEntry;
 use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
 use crate::slots::slot_id;
 use crate::statement::{Reader, SignedStatement, StatementError, put_count};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Why a change entry's content was not made, or not opened.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -149,15 +150,24 @@ pub enum ChangeEntryError {
 
 /// The secret of a generation before the entry's own, with the number of
 /// its statement. Two generations have one number where two changes were
-/// made apart.
+/// made apart. The secret is overwritten when this is dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Earlier {
     pub number: u64,
     pub secret: [u8; 32],
 }
 
+impl Drop for Earlier {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
 /// What the part of a change entry for the phrase says (decision
 /// 2026-10-04 §4.6, §9).
+///
+/// It is opened only with the phrase, and **is overwritten when it is
+/// dropped** (§16): its secret, and each of the secrets before it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForPhrase {
     /// The statement's secret.
@@ -166,6 +176,13 @@ pub struct ForPhrase {
     /// newest first. They are for what the relays hold in a generation
     /// that was left and that nobody carried.
     pub earlier: Vec<Earlier>,
+}
+
+impl Drop for ForPhrase {
+    fn drop(&mut self) {
+        // Each secret before it overwrites itself as the list is dropped.
+        self.secret.zeroize();
+    }
 }
 
 /// What a device reads in a change entry: the statement, which the phrase
@@ -246,9 +263,11 @@ impl ForPhrase {
         Ok(())
     }
 
-    /// What the part says, as bytes.
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// What the part says, as bytes: they hold the secrets, and are
+    /// overwritten when they are dropped. They have their whole size from
+    /// the start, so that they are never moved as they grow.
+    fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(32 + 2 + self.earlier.len() * 40));
         out.extend_from_slice(&self.secret);
         put_count(&mut out, self.earlier.len());
         for earlier in &self.earlier {
@@ -367,8 +386,8 @@ pub fn entry_of(
     let content = build(
         statement,
         for_phrase,
-        &phrase.statement_key().map_err(crypto)?,
-        &phrase.seal_key().map_err(crypto)?,
+        &*phrase.statement_key().map_err(crypto)?,
+        &*phrase.seal_key().map_err(crypto)?,
     )?;
     let channel = phrase.channel_secret().map_err(crypto)?;
     let channel_key = crate::derive::signing_key(&channel).map_err(crypto)?;
@@ -499,11 +518,13 @@ pub fn open_for_phrase(
 ) -> Result<ForPhrase, ChangeEntryError> {
     the_phrases(entry, phrase_key, phrase_channel)?;
     let (_, part) = parts(&entry.content)?;
-    let said = open_part(
+    // What the part says holds the secrets: it is overwritten when it
+    // has been read.
+    let said = Zeroizing::new(open_part(
         part,
         seal_key,
         &bound_to(LABEL_CHANGE_PHRASE, entry.rev, phrase_key),
-    )?;
+    )?);
     let for_phrase = ForPhrase::from_bytes(&said)?;
     for_phrase.validate(entry.rev)?;
     Ok(for_phrase)
@@ -629,7 +650,10 @@ fn sealed_part(
             room,
         });
     }
-    let mut filled = said.to_vec();
+    // What a part says may hold secrets: the copy that is filled up is
+    // overwritten when it has been sealed, and is made at its whole size.
+    let mut filled = Zeroizing::new(Vec::with_capacity(room));
+    filled.extend_from_slice(said);
     filled.resize(room, 0);
     item_encrypt(key, &filled, bound_to).map_err(crypto)
 }
@@ -714,8 +738,8 @@ mod tests {
         Keys {
             phrase_key: phrase.public_key().unwrap(),
             channel: derive::channel_id(&phrase.channel_secret().unwrap()).unwrap(),
-            statement_key: phrase.statement_key().unwrap(),
-            seal_key: phrase.seal_key().unwrap(),
+            statement_key: *phrase.statement_key().unwrap(),
+            seal_key: *phrase.seal_key().unwrap(),
         }
     }
 
@@ -1025,7 +1049,7 @@ mod tests {
         expected.extend_from_slice(&secret(1));
         assert_eq!(said[..expected.len()], expected);
         assert!(only_zeros(&said[expected.len()..]));
-        assert_eq!(for_phrase_of(2).to_bytes(), expected);
+        assert_eq!(*for_phrase_of(2).to_bytes(), expected);
     }
 
     // ── Opening for a device ─────────────────────────────────────────
@@ -1672,7 +1696,7 @@ mod tests {
 
         // What a relay holds of the phrase's channel, what a device holds,
         // and what another phrase gives.
-        let channel = phrase.channel_secret().unwrap();
+        let channel = *phrase.channel_secret().unwrap();
         let not_the_statement_key = [
             keys.seal_key,
             keys.phrase_key,
@@ -1680,7 +1704,7 @@ mod tests {
             derive::entry_key(&channel).unwrap(),
             derive::slot_key(&channel).unwrap(),
             derive::channel_id(&channel).unwrap(),
-            other.statement_key().unwrap(),
+            *other.statement_key().unwrap(),
             secret(2),
             [0u8; 32],
         ];
@@ -1703,7 +1727,7 @@ mod tests {
             keys.phrase_key,
             channel,
             derive::entry_key(&channel).unwrap(),
-            other.seal_key().unwrap(),
+            *other.seal_key().unwrap(),
             secret(2),
             identity(0).x25519_private_key(),
             [0u8; 32],
@@ -1942,10 +1966,8 @@ mod tests {
         assert!(make(&two, &for_phrase_of(2)).is_ok());
 
         // Another secret than the statement commits to.
-        let other_secret = ForPhrase {
-            secret: secret(7),
-            ..for_phrase_of(2)
-        };
+        let mut other_secret = for_phrase_of(2);
+        other_secret.secret = secret(7);
         assert_eq!(
             make(&two, &other_secret),
             Err(ChangeEntryError::SecretNotCommitted)
@@ -2123,6 +2145,45 @@ mod tests {
     /// The command that has the phrase opens the part of the entry before,
     /// and copies its secrets forward: the newest first, and as many as
     /// eight. A maker that never held a generation's secret passes it on.
+    /// What the part for the phrase says is overwritten when it is
+    /// dropped (decision 2026-10-04 §16): its secret, and each secret of
+    /// a generation before.
+    #[test]
+    fn the_part_for_the_phrase_is_overwritten_when_it_is_dropped() {
+        /// What is left where a value was, once it has been dropped.
+        fn left_by<T>(value: T) -> Vec<u8> {
+            let mut place = std::mem::MaybeUninit::new(value);
+            let at = place.as_mut_ptr();
+            // SAFETY: `place` holds a value, which is dropped here once
+            // and never used again. `place` is as large as the value and
+            // outlives the read, and it is read as bytes: the fields of
+            // the types this is called with fill them, with no padding.
+            unsafe {
+                std::ptr::drop_in_place(at);
+                std::slice::from_raw_parts(at.cast::<u8>(), size_of::<T>()).to_vec()
+            }
+        }
+        let has = |bytes: &[u8], what: &[u8; 32]| bytes.windows(32).any(|at| at == what);
+
+        let earlier = Earlier {
+            number: 3,
+            secret: secret(3),
+        };
+        let left = left_by(earlier);
+        assert_eq!(left.len(), 40);
+        assert!(!has(&left, &secret(3)));
+        assert_eq!(left.iter().filter(|byte| **byte != 0).count(), 1);
+
+        // The part itself: its own secret, where it lay. (The secrets
+        // before it are in a list, each of which overwrites itself as
+        // the list is dropped.)
+        let left = left_by(for_phrase_of(2));
+        assert!(!has(&left, &secret(2)));
+        // The control: the same bytes with nothing to overwrite them are
+        // still there after a drop.
+        assert!(has(&left_by(secret(2)), &secret(2)));
+    }
+
     #[test]
     fn the_earlier_secrets_are_copied_forward_from_the_entry_before() {
         assert!(ForPhrase::first(secret(1)).earlier.is_empty());

@@ -1061,7 +1061,7 @@ pub fn first_entry(
     for_phrase.secret.zeroize();
     Ok(FirstMade {
         entry: entry?.check()?,
-        statement_key: phrase.statement_key()?,
+        statement_key: *phrase.statement_key()?,
     })
 }
 
@@ -1838,7 +1838,7 @@ mod tests {
     fn following(phrase: &Phrase) -> Following {
         Following {
             phrase_key: phrase.public_key().unwrap(),
-            statement_key: phrase.statement_key().unwrap(),
+            statement_key: *phrase.statement_key().unwrap(),
             phrase_channel: derive::channel_id(&phrase.channel_secret().unwrap()).unwrap(),
         }
     }
@@ -5479,7 +5479,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let phrase = phrase();
         let made = first_entry(&phrase, &key(0), "laptop").unwrap();
-        assert_eq!(made.statement_key, phrase.statement_key().unwrap());
+        assert_eq!(made.statement_key, *phrase.statement_key().unwrap());
         assert_eq!(made.entry.author, phrase.public_key().unwrap());
         assert_eq!(made.entry.rev, 1);
         // Made again, it is another secret, and another entry.

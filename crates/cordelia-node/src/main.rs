@@ -129,6 +129,14 @@ enum Commands {
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
     Settle,
+    /// After a change is made: say what is still missing, until this
+    /// machine may be closed. It is what `remove-device`, `renew` and
+    /// `settle` go on to, in a process that never held the phrase.
+    #[command(hide = true)]
+    ChangeMade {
+        /// The change's number
+        number: u64,
+    },
     /// List your devices, what each has applied, and what each relay
     /// holds
     Devices {
@@ -297,6 +305,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
+        Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::History {

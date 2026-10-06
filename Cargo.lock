@@ -756,6 +756,7 @@ dependencies = [
  "cordelia-storage",
  "cordelia-sync",
  "hex",
+ "libc",
  "quinn",
  "rusqlite",
  "rustix",

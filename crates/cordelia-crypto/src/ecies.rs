@@ -112,6 +112,17 @@ pub fn hkdf_sha256_of(
     salt: &[u8],
     info: &[u8],
 ) -> Result<[u8; 32], CryptoError> {
+    Ok(*hkdf_sha256_wiped(key_material, salt, info)?)
+}
+
+/// [`hkdf_sha256_of`], given back in memory that is overwritten when it is
+/// dropped, and filled where it lies: for what comes from a recovery
+/// phrase (decision 2026-10-04 §16).
+pub fn hkdf_sha256_wiped(
+    key_material: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
     let effective_salt = if salt.is_empty() {
         &[0u8; 32][..]
     } else {
@@ -123,9 +134,9 @@ pub fn hkdf_sha256_of(
     let okm_material = prk
         .expand(&info_refs, WrapKeyLen)
         .map_err(|_| CryptoError::KeyDerivationFailed("HKDF expand failed".into()))?;
-    let mut okm = [0u8; 32];
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
     okm_material
-        .fill(&mut okm)
+        .fill(&mut *okm)
         .map_err(|_| CryptoError::KeyDerivationFailed("HKDF fill failed".into()))?;
     Ok(okm)
 }

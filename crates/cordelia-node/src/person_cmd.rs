@@ -213,7 +213,7 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// before anything is made. The node is handed the first statement's
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
-    let at = Terminal::at()?;
+    let at = Terminal::for_a_phrase()?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
     let seen = look(config_path)?;
@@ -801,26 +801,37 @@ enum Which {
 
 /// `cordelia remove-device <key>` (decision 2026-10-04 §7.1).
 pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
-    let at = Terminal::at()?;
-    let device = decode_public_key(key).map_err(|e| {
-        anyhow::anyhow!("that is no device's key, as `cordelia devices` lists one: {e}")
-    })?;
-    change(config_path, &at, &Which::Remove(device))
+    made_at_a_terminal(config_path, || {
+        let device = decode_public_key(key).map_err(|e| {
+            anyhow::anyhow!("that is no device's key, as `cordelia devices` lists one: {e}")
+        })?;
+        Ok(Which::Remove(device))
+    })
+}
+
+/// Make the change that `which` says, at the terminal of a command that
+/// reads a recovery phrase: it is asked for first, before anything is
+/// read, in a process that cannot be dumped or traced from then on
+/// (decision 2026-10-04 §16).
+fn made_at_a_terminal(
+    config_path: &str,
+    which: impl FnOnce() -> anyhow::Result<Which>,
+) -> anyhow::Result<()> {
+    let at = Terminal::for_a_phrase()?;
+    change(config_path, &at, &which()?)
 }
 
 /// `cordelia renew`: a new secret for the devices that stay, with no
 /// device removed but those added since that a person says go (decision
 /// 2026-10-04 §6, §7.1).
 pub fn renew(config_path: &str) -> anyhow::Result<()> {
-    let at = Terminal::at()?;
-    change(config_path, &at, &Which::Renew)
+    made_at_a_terminal(config_path, || Ok(Which::Renew))
 }
 
 /// `cordelia settle`: settle two changes that were made apart, on a
 /// device that has seen both (decision 2026-10-04 §4.5).
 pub fn settle(config_path: &str) -> anyhow::Result<()> {
-    let at = Terminal::at()?;
-    change(config_path, &at, &Which::Settle)
+    made_at_a_terminal(config_path, || Ok(Which::Settle))
 }
 
 /// What the node hands a command that makes a change: read from the
@@ -1114,7 +1125,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                      another device, even if this command is stopped now: two changes made \
                      apart have to be settled with the phrase."
                 );
-                return stays(config_path, number);
+                return stays_in_a_new_process(config_path, number);
             }
             // A statement arrived between the prompt and the phrase:
             // nothing was made, and it asks again.
@@ -1390,6 +1401,52 @@ fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<
         ),
         Err(e) => anyhow::bail!("{e}: nothing was made."),
     }
+}
+
+/// The command that a change goes on to when it is made: [`stays`], in a
+/// process of its own.
+pub const STAYS_COMMAND: &str = "change-made";
+
+/// Go on to the wait that follows a change ([`stays`]) in a new image of
+/// this program, which takes the place of this one (decision 2026-10-04
+/// §16): the memory that held the phrase, and signed with it, is gone
+/// when the wait begins, and the process that waits never held it.
+///
+/// What this process has said is written out first. Where the program
+/// cannot be run again (it was replaced where it lay, say), nothing waits
+/// in this process: the command says where to look, and ends.
+fn stays_in_a_new_process(config_path: &str, number: u64) -> anyhow::Result<()> {
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    #[cfg(unix)]
+    let failed = {
+        use std::os::unix::process::CommandExt;
+        match std::env::current_exe() {
+            Ok(program) => std::process::Command::new(program)
+                .arg("--config")
+                .arg(config_path)
+                .arg(STAYS_COMMAND)
+                .arg(number.to_string())
+                .exec(),
+            Err(e) => e,
+        }
+    };
+    #[cfg(not(unix))]
+    let failed = "it runs on a Unix system";
+    println!(
+        "This command could not go on to say what is still missing ({failed}). The node goes on \
+         by itself: `cordelia devices` shows whether each relay holds the change, and what this \
+         device has still to send. Keep this machine on until every relay holds the change and \
+         nothing is left to send."
+    );
+    Ok(())
+}
+
+/// `cordelia change-made <number>`: what `remove-device`, `renew` and
+/// `settle` go on to once the change numbered so is made ([`stays`]). It
+/// asks nothing, and holds no phrase.
+pub fn change_made(config_path: &str, number: u64) -> anyhow::Result<()> {
+    stays(config_path, number)
 }
 
 /// After a change: stay, and show as they come whether each relay holds
@@ -1902,6 +1959,27 @@ mod tests {
             shown[5],
             format!("    ({})", fingerprint::shown(&f.removed))
         );
+    }
+
+    /// The command that a change goes on to is one that this program
+    /// runs, with the change's number and nothing else (decision
+    /// 2026-10-04 §16).
+    #[test]
+    fn the_wait_that_follows_a_change_is_a_command_of_this_program() {
+        use clap::Parser;
+        let read = crate::Cli::try_parse_from(["cordelia", STAYS_COMMAND, "3"]);
+        let Ok(read) = read else {
+            panic!("`cordelia {STAYS_COMMAND} 3` is no command");
+        };
+        assert!(matches!(
+            read.command,
+            Some(crate::Commands::ChangeMade { number: 3 })
+        ));
+        // It is not among the commands that the help lists.
+        use clap::CommandFactory;
+        let help = crate::Cli::command().render_long_help().to_string();
+        assert!(!help.contains(STAYS_COMMAND), "{help}");
+        assert!(help.contains("remove-device"), "{help}");
     }
 
     /// What `cordelia status` says of a device and its person in a few

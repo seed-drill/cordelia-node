@@ -16,6 +16,14 @@
 //! through the buffer that the program's standard input otherwise has:
 //! what a person types at one prompt is not read ahead into memory that
 //! nothing overwrites, where the next prompt is for the phrase.
+//!
+//! **A process that is to hold a recovery phrase cannot be dumped or
+//! traced** (decision 2026-10-04 §16): a command that makes or reads one
+//! asks for its terminal through [`Terminal::for_a_phrase`], which sees
+//! to that first, before anything is read ([`cannot_be_dumped`]). And a
+//! phrase that is shown is written straight to the terminal, never
+//! through the buffer that the program's standard output has, which
+//! nothing overwrites.
 
 use std::io::{IsTerminal, Write};
 
@@ -39,6 +47,79 @@ fn say(asks: &str) -> anyhow::Result<()> {
     write!(out, "{asks}")?;
     out.flush()?;
     Ok(())
+}
+
+/// Write `shown` straight to where the command writes, and through no
+/// buffer of the program's own: what is written this way is in no memory
+/// here but the caller's, which the caller overwrites.
+#[cfg(unix)]
+fn say_unbuffered(shown: &str) -> anyhow::Result<()> {
+    // What was said before it comes first.
+    std::io::stdout().flush()?;
+    let mut left = shown.as_bytes();
+    while !left.is_empty() {
+        match rustix::io::write(rustix::stdio::stdout(), left) {
+            Ok(written) => left = &left[written..],
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => anyhow::bail!("could not write to the terminal: {e}"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn say_unbuffered(_shown: &str) -> anyhow::Result<()> {
+    anyhow::bail!("this command asks at the terminal of a Unix system");
+}
+
+/// Make this process one that cannot be dumped or traced (decision
+/// 2026-10-04 §16), for as long as it runs this program: it is to hold a
+/// recovery phrase, and what comes from one.
+///
+/// - On Linux its dumpable flag is cleared: it leaves no core file, and
+///   no other process of the same user can attach to it or read its
+///   memory.
+/// - On macOS it denies that it be attached to.
+/// - On both, the size of a core file it may leave is set to nothing.
+///
+/// A process that could not be made so reads no phrase: this fails, and
+/// the command ends before anything is read.
+#[cfg(unix)]
+pub fn cannot_be_dumped() -> anyhow::Result<()> {
+    let not = |what: &str, e: std::io::Error| {
+        anyhow::anyhow!(
+            "could not {what} ({e}), and a recovery phrase is read only by a process that \
+             cannot be dumped or traced. Nothing was read."
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| not("stop this process being dumped or traced", e.into()))?;
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the request takes no address and no data, and is about
+        // this process alone.
+        let denied = unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+        if denied == -1 {
+            return Err(not(
+                "stop this process being attached to",
+                std::io::Error::last_os_error(),
+            ));
+        }
+    }
+    use rustix::process::{Resource, Rlimit, setrlimit};
+    let none = Rlimit {
+        current: Some(0),
+        maximum: Some(0),
+    };
+    setrlimit(Resource::Core, none)
+        .map_err(|e| not("set the size of a core file to nothing", e.into()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn cannot_be_dumped() -> anyhow::Result<()> {
+    anyhow::bail!("a recovery phrase is read at the terminal of a Unix system");
 }
 
 /// Read one line from the terminal, without its end, into memory that is
@@ -99,6 +180,17 @@ impl Terminal {
         Ok(Self(()))
     }
 
+    /// The terminal of a command that makes or reads a recovery phrase
+    /// (decision 2026-10-04 §16): [`Terminal::at`], in a process that
+    /// cannot be dumped or traced from here on ([`cannot_be_dumped`]).
+    /// It is asked for before anything is read, the node's answers
+    /// included.
+    pub fn for_a_phrase() -> anyhow::Result<Self> {
+        let at = Self::at()?;
+        cannot_be_dumped()?;
+        Ok(at)
+    }
+
     /// Ask a yes: `says` is what will happen. Only the word `yes` is one.
     pub fn yes(&self, says: &str) -> anyhow::Result<bool> {
         say(&format!(
@@ -122,11 +214,14 @@ impl Terminal {
     /// knows how. It is shown on the terminal's other screen, which is put
     /// away when the person is done, and keeps no lines above what is typed
     /// next. A terminal that has no other screen shows it where it is.
+    ///
+    /// `shown` is written straight to the terminal: the buffer of the
+    /// program's standard output never holds it.
     pub fn once(&self, says: &str, shown: &str, asks: &str) -> anyhow::Result<()> {
         say("\x1b[?1049h\x1b[H\x1b[2J")?;
         say(says)?;
         say("\n\n    ")?;
-        say(shown)?;
+        say_unbuffered(shown)?;
         say("\n\n")?;
         say(asks)?;
         let read = line();
