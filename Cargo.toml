@@ -96,3 +96,24 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Testing
 tempfile = "3"
+
+# The arithmetic of the curve, and the hashing under it, are optimised in
+# every build. An entry carries two signatures (decision 2026-10-04 §2.3),
+# and a device checks both each time it reads one. Unoptimised, one check
+# takes milliseconds: a test build would then hold the store for most of
+# a second at a time, and a command that asks its node would not be
+# answered within its second.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.x25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.subtle]
+opt-level = 3
