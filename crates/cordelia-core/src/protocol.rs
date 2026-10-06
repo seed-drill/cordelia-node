@@ -499,6 +499,18 @@ pub const WRITES_PER_PEER_PER_MINUTE: u32 =
 /// message. Rationale: parameter-rationale.md §4.
 pub const PUSH_BYTES_PER_PEER_PER_MINUTE: u64 = 2 * 1024 * 1024;
 
+/// The room that a pull leaves for the answer to a show, in the bytes
+/// that a key and its address may be handed in a minute: what one entry
+/// of the largest size is counted at (decision 2026-10-04 §16). A relay
+/// sizes a page of a channel so that this much is left in both
+/// allowances, and only the entry that answers a show may use it: a
+/// device that pulls at its full rate, or shares its address with one
+/// that does, is still told of a removal.
+/// Derived: entry_cost(MAX_ITEM_BYTES).
+pub const SHOW_ANSWER_ROOM_BYTES: u64 = entry_cost(MAX_ITEM_BYTES);
+// A whole page can still be handed beside it.
+const _: () = assert!(SHOW_ANSWER_ROOM_BYTES < PUSH_BYTES_PER_PEER_PER_MINUTE / 2);
+
 /// How many bytes of entries a device pushes to one relay in a minute, at
 /// most: 1.5 MB, which leaves a quarter of a relay's allowance spare. A
 /// device with a lot to send paces itself, so that it is never the one
@@ -2353,5 +2365,9 @@ mod tests {
         );
         // One entry of the largest size is within what a channel may hold.
         assert!(entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        // And is what a pull leaves room for, in what a key may be handed
+        // in a minute, for the answer to a show (§16).
+        assert_eq!(SHOW_ANSWER_ROOM_BYTES, 65_536 + 1024);
+        assert_eq!(SHOW_ANSWER_ROOM_BYTES, entry_cost(MAX_ITEM_BYTES));
     }
 }

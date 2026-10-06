@@ -1244,6 +1244,47 @@ async fn a_show_that_gets_no_leave_is_made_again_after_a_wait_that_doubles() {
     assert_eq!(shows(&stuck), [Seen::Whole]);
 }
 
+/// Only an answer starts the wait that doubles (decision 2026-10-04
+/// §16). A whole show whose stream is reset was not answered: that is how
+/// a relay says "not now" to an asker that is over its bytes for the
+/// minute. It is made again at the next pass, and at the one after. An
+/// answer to the whole entry that gives no leave starts the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_show_that_is_reset_is_made_again_at_the_next_pass() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    relay.seen();
+    let shows = |relay: &StandIn| -> Vec<Seen> {
+        let shown = |one: &Seen| matches!(one, Seen::Whole | Seen::Short);
+        relay.seen().into_iter().filter(shown).collect()
+    };
+    let secs = |secs: u64| device.clock.run_ahead(Duration::from_secs(secs));
+
+    // The relay asks for the whole entry, and resets the stream that
+    // brings it.
+    relay.says(Say::Answer(ShowAnswer::Whole), Say::Reset);
+    secs(SHOW_LEAVE_SECS);
+    for pass in 0..3 {
+        device.passes().await;
+        assert_eq!(shows(&relay), [Seen::Short, Seen::Whole], "pass {pass}");
+        assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
+    }
+    // The control: the whole entry is answered, with no leave. The show
+    // is made once, and then waits.
+    let whole = Say::Answer(ShowAnswer::Whole);
+    relay.says(whole.clone(), whole);
+    device.passes().await;
+    assert_eq!(shows(&relay), [Seen::Short, Seen::Whole]);
+    device.passes().await;
+    assert_eq!(shows(&relay), []);
+    secs(4);
+    device.passes().await;
+    assert_eq!(shows(&relay), [Seen::Short, Seen::Whole]);
+}
+
 /// A relay that holds, in the place of the device's change entry, one
 /// that the phrase signed and that the device does not take: here, a
 /// statement that undoes a removal. The device is answered with it,

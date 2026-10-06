@@ -217,10 +217,9 @@ struct OfRelay {
 struct Round {
     /// What the entry that was shown last is named by.
     entry: Option<[u8; 32]>,
-    /// Whether an entry was shown whole.
-    whole: bool,
-    /// Whether the relay answered any of them.
-    answered: bool,
+    /// Whether the relay answered a show of the whole entry. A whole
+    /// show whose stream was reset, or that timed out, was not answered.
+    whole_answered: bool,
 }
 
 /// A channel that found no room at a relay, or a show that got no leave
@@ -691,10 +690,13 @@ impl DeviceEntries {
     /// show (decision 2026-10-04 §2.4 item 5, §4.6). Returns whether the
     /// last answer gave leave to use the connection.
     ///
-    /// Where the relay answered, the entry was shown whole, and there is
-    /// no leave, the show is made again there only after a wait, a little
+    /// Where the relay answered the entry shown whole, and there is no
+    /// leave, the show is made again there only after a wait, a little
     /// longer each time (§16): nothing is shown while it lasts. An answer
-    /// that gives leave ends it.
+    /// that gives leave ends it. **Only an answer starts the wait:** a
+    /// whole show whose stream is reset, which is how a relay says "not
+    /// now" to an asker that is over its bytes for the minute, is made
+    /// again at the next pass.
     async fn show_at(&self, link: &Link) -> bool {
         let mut round = Round::default();
         let gave_leave = self.show_round(link, &mut round).await;
@@ -704,7 +706,7 @@ impl DeviceEntries {
         if gave_leave {
             of.show_left = None;
             of.refuses = None;
-        } else if let (true, true, Some(entry)) = (round.whole, round.answered, round.entry) {
+        } else if let (true, Some(entry)) = (round.whole_answered, round.entry) {
             let refusals = match &of.show_left {
                 Some((shown, left)) if *shown == entry => left.refusals.saturating_add(1),
                 _ => 1,
@@ -753,7 +755,6 @@ impl DeviceEntries {
                 .get(&link.id())
                 .and_then(|of| of.shown_whole);
             let short = !whole && shown_whole == Some(entry.id());
-            round.whole |= !short;
             let answered = match self.leave.show(link, entry, short).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
@@ -767,7 +768,7 @@ impl DeviceEntries {
                     return false;
                 }
             };
-            round.answered = true;
+            round.whole_answered |= !short;
             self.shown(link, entry, short, answered.bytes);
             match answered.answer {
                 ShowAnswer::Held | ShowAnswer::Taken => {

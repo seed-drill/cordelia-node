@@ -246,6 +246,17 @@ impl Rates {
             .unwrap_or(0)
     }
 
+    /// How many bytes of a page of a channel from its secret `peer` at
+    /// `address` may still be handed in this window (decision 2026-10-04
+    /// §16): what [`Self::fetch_room`] says, less the room that is left
+    /// in both allowances for the answer to a show
+    /// (SHOW_ANSWER_ROOM_BYTES). A pull never uses that room: only the
+    /// entry that answers a show does.
+    pub fn pull_room(&mut self, peer: &NodeId, address: std::net::IpAddr) -> u64 {
+        self.fetch_room(peer, address)
+            .saturating_sub(cordelia_core::protocol::SHOW_ANSWER_ROOM_BYTES)
+    }
+
     /// Count `bytes` of entries a relay fetched from `peer`. It is the
     /// relay that asked, so going over is no breach by the peer.
     ///
@@ -269,22 +280,19 @@ impl Rates {
     /// two kinds of channel are bounded by it together.
     ///
     /// Returns whether the page may be handed. Where either allowance has
-    /// no room for it, nothing is counted, and the caller hands nothing.
-    /// That is no breach (§16): the relay sized the page, and the asker
-    /// cannot know its room. Nothing is kept of a request that hands
-    /// nothing.
+    /// no room for it beside the room that is left for the answer to a
+    /// show ([`Self::pull_room`]), nothing is counted, and the caller
+    /// hands nothing. That is no breach (§16): the relay sized the page,
+    /// and the asker cannot know its room. Nothing is kept of a request
+    /// that hands nothing.
     pub fn handed(&mut self, peer: &NodeId, address: std::net::IpAddr, bytes: u64) -> bool {
         if bytes == 0 {
             return true;
         }
-        let mut limiters = self.both(peer, address);
-        if limiters
-            .iter_mut()
-            .any(|limiter| limiter.fetch_bytes.room() < bytes)
-        {
+        if self.pull_room(peer, address) < bytes {
             return false;
         }
-        for limiter in &mut limiters {
+        for limiter in self.both(peer, address) {
             limiter.fetch_bytes.record(bytes);
         }
         true
@@ -6114,31 +6122,38 @@ mod tests {
     /// what a relay fetches from the peer counts against, for the
     /// connection and for its address. A page that either has no room for
     /// is not handed, and nothing is counted for it: no breach either,
-    /// however often it is asked for. The entry that answers a show is
-    /// always counted, and takes the allowance over. What a peer pushes is
-    /// counted apart.
+    /// however often it is asked for. A page leaves room in both for the
+    /// answer to a show, and only that answer uses it (decision
+    /// 2026-10-04 §16). The entry that answers a show is always counted,
+    /// and takes the allowance over. What a peer pushes is counted apart.
     #[test]
     fn what_a_peer_is_handed_counts_with_what_a_relay_fetches_from_it() {
         use cordelia_core::protocol::{
             BAN_THRESHOLD, MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE,
         };
         const MINUTE: u64 = PUSH_BYTES_PER_PEER_PER_MINUTE;
+        // The room that a page leaves for the answer to a show.
+        const SHOW: u64 = cordelia_core::protocol::SHOW_ANSWER_ROOM_BYTES;
         let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
         let peer = |n: u8| NodeId([n; 32]);
         let mut rates = Rates::default();
+        assert_eq!(rates.pull_room(&peer(1), address), MINUTE - SHOW);
 
         // Handed, and fetched, and handed: one count.
         assert!(rates.handed(&peer(1), address, MINUTE / 2));
         assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 2);
+        assert_eq!(rates.pull_room(&peer(1), address), MINUTE / 2 - SHOW);
         rates.fetched(&peer(1), address, MINUTE / 4);
         assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 4);
-        // A byte more than there is room for: it is not handed, and
-        // nothing is counted for it.
-        assert!(!rates.handed(&peer(1), address, MINUTE / 4 + 1));
+        // A byte more than there is room for beside the answer to a
+        // show: it is not handed, and nothing is counted for it.
+        assert!(!rates.handed(&peer(1), address, MINUTE / 4 - SHOW + 1));
         assert_eq!(rates.fetch_room(&peer(1), address), MINUTE / 4);
-        // What fits to the byte is handed.
-        assert!(rates.handed(&peer(1), address, MINUTE / 4));
-        assert_eq!(rates.fetch_room(&peer(1), address), 0);
+        // What fits to the byte is handed, and the room for the answer
+        // to a show is what is left.
+        assert!(rates.handed(&peer(1), address, MINUTE / 4 - SHOW));
+        assert_eq!(rates.fetch_room(&peer(1), address), SHOW);
+        assert_eq!(rates.pull_room(&peer(1), address), 0);
         // A page that is not handed is no breach, asked for many more
         // times than cut a peer off: the next request of another kind
         // that goes over is the first breach.
@@ -6158,7 +6173,10 @@ mod tests {
         // connection over by that entry: nothing is handed it in a page
         // until the minute has let all of it go.
         let mut rates = Rates::default();
-        assert!(rates.handed(&peer(1), address, MINUTE - 1000));
+        assert!(rates.handed(&peer(1), address, MINUTE - SHOW));
+        assert!(!rates.handed(&peer(1), address, 1));
+        rates.answered(&peer(1), address, SHOW - 1000);
+        assert_eq!(rates.fetch_room(&peer(1), address), 1000);
         rates.answered(&peer(1), address, 5000);
         assert_eq!(rates.fetch_room(&peer(1), address), 0);
         assert_eq!(
@@ -6183,16 +6201,24 @@ mod tests {
         );
         assert_eq!(rates.by_peer[&peer(1)].breach_count, 0);
 
-        // The address: its connections are handed, between them, what
-        // five may be. A sixth key at it has a connection's allowance of
-        // its own, and is handed nothing.
+        // The address: its connections are handed in pages, between
+        // them, what five may be, less the room for one answer to a show.
+        // Five keys at it are each handed all that a key may be in pages;
+        // a sixth, which has a connection's allowance of its own, is
+        // handed what the address has left for pages, and then nothing.
         let home: std::net::IpAddr = "192.0.2.8".parse().unwrap();
         for n in 10..10 + MAX_CONNECTIONS_PER_IP as u8 {
-            assert!(rates.handed(&peer(n), home, MINUTE), "{n}");
+            assert!(!rates.handed(&peer(n), home, MINUTE - SHOW + 1), "{n}");
+            assert!(rates.handed(&peer(n), home, MINUTE - SHOW), "{n}");
         }
+        let left = u64::from(MAX_CONNECTIONS_PER_IP as u32 - 1) * SHOW;
+        assert_eq!(rates.pull_room(&peer(20), home), left);
+        assert!(rates.handed(&peer(20), home, left));
         assert!(!rates.handed(&peer(20), home, 1));
-        // And a relay fetches nothing more from that address either.
-        assert_eq!(rates.fetch_room(&peer(21), home), 0);
+        // The room that is left at that address is the one for the
+        // answer to a show, under whichever key.
+        assert_eq!(rates.fetch_room(&peer(21), home), SHOW);
+        assert_eq!(rates.pull_room(&peer(21), home), 0);
 
         // A request that hands nothing counts for nothing, also where
         // there is no room, and leaves nothing kept for an address.

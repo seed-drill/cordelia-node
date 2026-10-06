@@ -835,6 +835,13 @@ impl RelayEntries {
     /// allowance has not room for the smallest thing an entry is counted
     /// at, nothing could be handed: the pull is refused before the
     /// database is waited for, and the store is not read.
+    ///
+    /// **A page leaves room for the answer to a show** (§16): it is sized
+    /// to what the key's allowance and the address's have room for beside
+    /// one entry of the largest size, and is refused where it would use
+    /// that room. So a device that pulls all it may in a minute, or
+    /// shares its address with one that does, is still handed the entry
+    /// that tells it of a removal.
     fn pulling(
         &self,
         db: &Mutex<Connection>,
@@ -852,9 +859,10 @@ impl RelayEntries {
             }));
         }
         // What the peer's allowance has room for, where it is handed
-        // anything: a relay the operator lists is not limited, and a
-        // channel that was not proved is not handed.
-        let room = (proved && !who.listed).then(|| lock(rates).fetch_room(who.peer, who.address));
+        // anything, beside the room that is left for the answer to a
+        // show: a relay the operator lists is not limited, and a channel
+        // that was not proved is not handed.
+        let room = (proved && !who.listed).then(|| lock(rates).pull_room(who.peer, who.address));
         // With no room for even the smallest entry, the answer is known
         // before the store is asked.
         if room.is_some_and(|room| room < entry_cost(MIN_ENTRY_CONTENT_BYTES)) {
@@ -2955,17 +2963,22 @@ mod tests {
                 answered.ok()
             })
         };
-        // No room at all, and room for less than the smallest entry.
+        // No room at all; room for the answer to a show and nothing
+        // beside it; and room, beside that, for less than the smallest
+        // entry.
         lock(&at.rates).fetched(&peer(1), address(1), MINUTE);
         assert_eq!(at.fetch_room(1), 0);
         assert_eq!(while_held(1), Some(true));
-        lock(&at.rates).fetched(&peer(2), address(2), MINUTE - (SMALL - 1));
+        lock(&at.rates).fetched(&peer(5), address(5), MINUTE - LARGEST);
+        assert_eq!(at.fetch_room(5), LARGEST);
+        assert_eq!(while_held(5), Some(true));
+        lock(&at.rates).fetched(&peer(2), address(2), MINUTE - LARGEST - (SMALL - 1));
         assert_eq!(while_held(2), Some(true));
         assert_eq!(breaches(&at, 1), (0, 0));
-        // Room for the smallest: the store is asked, and the entry
-        // handed.
+        // Room for the smallest beside it: the store is asked, and the
+        // entry handed.
         for n in [3, 4] {
-            lock(&at.rates).fetched(&peer(n), address(n), MINUTE - SMALL);
+            lock(&at.rates).fetched(&peer(n), address(n), MINUTE - LARGEST - SMALL);
         }
         assert_eq!(while_held(3), None);
         let handed = page(at.pull(4, 1, &proved, relay::NO_MARK, 0));
@@ -2984,9 +2997,10 @@ mod tests {
     }
 
     /// What a peer is handed in a minute is bounded, as what a relay may
-    /// fetch from it is. A page is sized to the room there is, an entry
-    /// that fits is still handed, and a pull whose first entry does not
-    /// fit is refused, and is no breach.
+    /// fetch from it is. A page is sized to the room there is beside the
+    /// room for the answer to a show, an entry that fits is still handed,
+    /// and a pull whose first entry does not fit is refused, and is no
+    /// breach.
     #[test]
     fn a_peer_is_handed_only_what_may_be_fetched_in_a_minute() {
         let at = relay();
@@ -3003,21 +3017,24 @@ mod tests {
         let mut handed = Vec::new();
         // Whole pages while there is room for the most a page can be
         // counted at: 13 of the largest are what one message holds.
-        // Then as many as fit.
+        // Then as many as fit beside the room that is left for the
+        // answer to a show, which is one entry of the largest size.
         for _ in 0..3 {
             let page = page(at.pull(1, 1, &proved, mark, after));
             handed.push(page.entries.len());
             (mark, after) = (page.mark, page.next);
         }
-        assert_eq!(handed, [13, 13, 5]);
-        assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST);
-        assert!(at.fetch_room(1) < LARGEST);
+        assert_eq!(handed, [13, 13, 4]);
+        assert_eq!(at.fetch_room(1), MINUTE - 30 * LARGEST);
+        assert!(at.fetch_room(1) >= LARGEST);
+        assert!(at.fetch_room(1) < 2 * LARGEST);
 
-        // The next entry of the largest size does not fit: the pull is
-        // refused, and nothing is counted for it. It is no breach: the
-        // relay sized the page, and the asker cannot know its room.
+        // The next entry of the largest size does not fit beside that
+        // room: the pull is refused, and nothing is counted for it. It is
+        // no breach: the relay sized the page, and the asker cannot know
+        // its room.
         not_now(at.pull(1, 1, &proved, mark, after));
-        assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST);
+        assert_eq!(at.fetch_room(1), MINUTE - 30 * LARGEST);
         assert_eq!(breaches(&at, 1), (0, 0));
         // A page with nothing in it is still answered: the end of the
         // channel, and a channel that is not held.
@@ -3027,7 +3044,7 @@ mod tests {
         // And an entry that fits is still handed, one at a time.
         let one = page(at.pull(1, 2, &proved, relay::NO_MARK, 0));
         assert_eq!((one.entries.len(), one.next), (1, 1));
-        assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST - SMALL);
+        assert_eq!(at.fetch_room(1), MINUTE - 30 * LARGEST - SMALL);
 
         // Asked for many more times than cut a peer off, it is refused
         // each time, and never a breach.
@@ -3035,11 +3052,111 @@ mod tests {
             not_now(at.pull(1, 1, &proved, mark, after));
         }
         assert_eq!(breaches(&at, 1), (0, 0));
-        assert_eq!(at.fetch_room(1), MINUTE - 31 * LARGEST - SMALL);
+        assert_eq!(at.fetch_room(1), MINUTE - 30 * LARGEST - SMALL);
 
         // Another connection, at another address, has an allowance of its
         // own.
-        assert_eq!(page(at.pull(2, 1, &proved, mark, after)).entries.len(), 9);
+        assert_eq!(page(at.pull(2, 1, &proved, mark, after)).entries.len(), 10);
+    }
+
+    /// A pull leaves room for the answer to a show (decision 2026-10-04
+    /// §16). A key that has pulled all it may in the minute is still
+    /// handed the entry when it shows an earlier one, though that entry
+    /// is of the largest size. And where the keys at one address have
+    /// between them pulled all that the address may be handed in pages,
+    /// another key there is refused a page, and is still handed the
+    /// entry: a device that pulls at its full rate, or shares its address
+    /// with those that do, is still told of a removal.
+    #[test]
+    fn a_key_that_has_pulled_all_it_may_is_still_handed_the_answer_to_a_show() {
+        let at = relay();
+        for d in 1..=40 {
+            at.hold(&largest(1, d), NOW);
+        }
+        // What the relay holds where a device will show an earlier entry.
+        let later = largest(2, 1);
+        at.hold(&later, NOW);
+        let earlier = made(2, 1, 4, "n", "a small earlier one");
+        let proved = having_proved(&[1]);
+
+        // It pulls until it is refused.
+        let (mut mark, mut after, mut pages) = (relay::NO_MARK, 0, 0);
+        loop {
+            match at.pull(1, 1, &proved, mark, after) {
+                Answer::NotNow => break,
+                answer => {
+                    let page = page(answer);
+                    assert!(!page.entries.is_empty());
+                    (mark, after, pages) = (page.mark, page.next, pages + 1);
+                    assert!(pages <= 40, "it is handed without bound");
+                }
+            }
+        }
+        let left = at.fetch_room(1);
+        assert!((LARGEST..2 * LARGEST).contains(&left), "{left}");
+        assert!(lock(&at.rates).pull_room(&peer(1), address(1)) < LARGEST);
+        // It shows an earlier entry, and is handed the one that the relay
+        // holds: the room was left for this.
+        assert_eq!(
+            shown(at.show(1, earlier.to_wire())),
+            ShowAnswer::Another(later.to_wire())
+        );
+        assert_eq!(at.fetch_room(1), left - LARGEST);
+        not_now(at.pull(1, 1, &proved, mark, after));
+        assert_eq!(breaches(&at, 1), (0, 0));
+
+        // An address. Five keys at it are each handed all that a key may
+        // be in pages, and a sixth what is left to pages there.
+        let home = address(50);
+        let at_home = |n: u8| Who {
+            peer: Box::leak(Box::new(peer(n))),
+            address: home,
+            listed: false,
+        };
+        assert_eq!(MAX_CONNECTIONS_PER_IP, 5);
+        for n in 10..15 {
+            assert!(lock(&at.rates).handed(&peer(n), home, MINUTE - LARGEST));
+        }
+        assert!(lock(&at.rates).handed(&peer(15), home, 4 * LARGEST));
+        // A seventh key there is refused a page of a channel it proved.
+        let seventh = at_home(16);
+        let pull = EntryPull {
+            channel: channel(1),
+            mark: relay::NO_MARK,
+            after: 0,
+            limit: 100,
+        };
+        not_now(
+            at.entries
+                .pulling(&at.db, &at.rates, &seventh, &proved, &pull),
+        );
+        // It shows an earlier entry, and is handed the one that is held.
+        let show = |who: &Who| {
+            at.entries.answer(
+                Protocol::EntryShow,
+                &WireMessage::EntryShow(EntryShow {
+                    entry: earlier.to_wire(),
+                }),
+                who,
+                None,
+                &mut Proved::default(),
+                &mut ShownWhole::default(),
+                &at.db,
+                &at.rates,
+                NOW,
+            )
+        };
+        assert_eq!(shown(show(&seventh)), ShowAnswer::Another(later.to_wire()));
+        // That was the address's room for one answer. Whoever shows from
+        // that address after it is told "not now", for the minute: that
+        // room can be used up from the address itself (§2.5).
+        assert!(matches!(show(&at_home(17)), Answer::NotNow));
+        assert_eq!(
+            lock(&at.rates)
+                .breaches_of_address(home)
+                .map(|limiter| limiter.breach_count),
+            Some(0)
+        );
     }
 
     /// The bytes that may be fetched in a minute are one allowance for
@@ -3057,23 +3174,26 @@ mod tests {
         let proved = having_proved(&[1, 2]);
 
         // The relay has fetched from this peer, of the older kind, all
-        // but 2000 bytes of what may be fetched in a minute.
-        lock(&at.rates).fetched(&peer(1), address(1), MINUTE - 2000);
+        // but 2000 bytes of what may be handed in pages in a minute:
+        // what may be fetched, less the room for the answer to a show.
+        lock(&at.rates).fetched(&peer(1), address(1), MINUTE - LARGEST - 2000);
         // One small entry fits, and is handed. The next does not.
         let one = page(at.pull(1, 1, &proved, relay::NO_MARK, 0));
         assert_eq!(one.entries.len(), 1);
-        assert_eq!(at.fetch_room(1), 2000 - SMALL);
+        assert_eq!(at.fetch_room(1), LARGEST + 2000 - SMALL);
         not_now(at.pull(1, 1, &proved, one.mark, one.next));
         // And what was handed counts where the older kind looks: it is
         // one count.
         assert_eq!(
             lock(&at.rates).fetch_room(&peer(1), address(1)),
-            2000 - SMALL
+            LARGEST + 2000 - SMALL
         );
 
-        // An address: its connections are handed, between them, five
-        // times what one may be. Five peers at one address are each
-        // handed all that a connection may be.
+        // An address: its connections are handed in pages, between them,
+        // five times what one may be, less the room for one answer to a
+        // show. Five peers at one address are each handed all that a
+        // connection may be in pages, and a sixth what the address has
+        // left for them.
         let home = address(50);
         let at_home = |n: u8| Who {
             peer: Box::leak(Box::new(peer(n))),
@@ -3082,10 +3202,12 @@ mod tests {
         };
         assert_eq!(MAX_CONNECTIONS_PER_IP, 5);
         for n in 10..15 {
-            assert!(lock(&at.rates).handed(&peer(n), home, MINUTE));
+            assert!(lock(&at.rates).handed(&peer(n), home, MINUTE - LARGEST));
         }
-        // A sixth key at that address has a connection's allowance of its
-        // own, and the address has none left: nothing is handed.
+        assert!(lock(&at.rates).handed(&peer(15), home, 4 * LARGEST));
+        // Another key at that address has a connection's allowance of its
+        // own, and the address has none left for a page: nothing is
+        // handed.
         let pull = |who: &Who, c: u16| {
             at.entries.pulling(
                 &at.db,

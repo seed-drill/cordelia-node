@@ -1349,7 +1349,8 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
 
     // The first connection proves the channel and pulls it. It is handed
     // whole pages while its allowance has room for the most a page can
-    // be counted at, then as many entries as fit: 31 in all.
+    // be counted at, then as many entries as fit beside the room that a
+    // pull leaves for the answer to a show: 30 in all.
     assert!(client.prove(1).await);
     let (mut mark, mut after) = (NO_MARK, 0);
     let mut handed = Vec::new();
@@ -1358,7 +1359,7 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
         handed.push(page.entries.len());
         (mark, after) = (page.mark, page.next);
     }
-    assert_eq!(handed, [13, 13, 5]);
+    assert_eq!(handed, [13, 13, 4]);
     // A page with nothing in it is still answered.
     assert!(client.pull(1, mark, 35).await.entries.is_empty());
 
@@ -1383,9 +1384,16 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
     assert!(client.pull(1, mark, 35).await.entries.is_empty());
 
     // It shows an entry, in a slot where the relay holds a later one of
-    // the largest size. It has not the room left to be handed that, and
-    // is not over yet: it is answered with the entry all the same.
+    // the largest size. Its pulls left the room for that (decision
+    // 2026-10-04 §16): it is answered with the entry, though no page is
+    // handed it.
     let earlier = client.made(1, 4, "0000.md", "an earlier one");
+    match client.show(earlier.to_wire()).await {
+        Ok(ShowAnswer::Another(bytes)) => assert_eq!(bytes, entries[0]),
+        other => panic!("a connection that pulled its fill was not answered: {other:?}"),
+    }
+    // Once more: it has not the room left to be handed that, and is not
+    // over yet, so it is answered with the entry all the same.
     match client.show(earlier.to_wire()).await {
         Ok(ShowAnswer::Another(bytes)) => assert_eq!(bytes, entries[0]),
         other => panic!("a connection near its bytes was not answered with the entry: {other:?}"),
