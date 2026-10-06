@@ -1806,9 +1806,17 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
                  without having told them?",
             )?;
             if !goes_on {
+                // It leaves nobody: its word that it left is taken back,
+                // by a delete over it (§16). Where no relay was sent the
+                // word, none is sent it.
+                let back = api_post(config_path, "/api/v1/devices/leave/back", json!({}))?;
+                let word = match back["taken_back"] == true {
+                    true => ", and has taken back its word that it left",
+                    false => "",
+                };
                 println!(
-                    "Stopped. This device has said that it left, and keeps its key and what \
-                     it holds: run `cordelia init --new-key` again when a relay is reached."
+                    "Stopped. This device keeps its key and what it holds{word}: run `cordelia \
+                     init --new-key` again when a relay is reached."
                 );
                 return Ok(());
             }
@@ -1818,12 +1826,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
 
     // The new key, in the place of the old one.
     let identity = NodeIdentity::generate()?;
-    std::fs::write(&key_path, identity.seed())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    replace_key_file(&key_path, identity.seed())?;
     let key = encode_public_key(&identity.public_key())?;
     let was = written.identity.entity_id.clone();
     let name = was.rsplit_once('_').map_or(was.as_str(), |(name, _)| name);
@@ -1839,6 +1842,50 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
          start`) before anything else. Then make a phrase here (`cordelia phrase`), or add \
          this device from one that has one."
     );
+    Ok(())
+}
+
+/// Put `seed` in the place of the key file at `path` (decision 2026-10-04
+/// §16): it is written to a file beside it, flushed, and renamed over it,
+/// so that the key file holds the old key or the new one, whole, whatever
+/// stops the command between. The file is the device's alone to read from
+/// the moment it is made. Where it cannot be written, the device keeps
+/// the key it had.
+fn replace_key_file(path: &std::path::Path, seed: &[u8; 32]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = std::path::PathBuf::from(beside);
+    // Made anew each time: never written through whatever was left under
+    // that name.
+    let _ = std::fs::remove_file(&beside);
+    let mut made = std::fs::OpenOptions::new();
+    made.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        made.mode(0o600);
+    }
+    let written = made
+        .open(&beside)
+        .and_then(|mut file| {
+            file.write_all(seed)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&beside, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&beside);
+        anyhow::bail!(
+            "could not write the new key ({e}): the key file is as it was, and this device \
+             keeps the key it had."
+        );
+    }
+    // The name is flushed too, as far as the volume can.
+    if let Some(folder) = path.parent()
+        && let Ok(folder) = std::fs::File::open(folder)
+    {
+        let _ = folder.sync_all();
+    }
     Ok(())
 }
 
@@ -2288,6 +2335,48 @@ mod tests {
             shown[5],
             format!("    ({})", fingerprint::shown(&f.removed))
         );
+    }
+
+    /// A new key takes the place of the old one whole (decision
+    /// 2026-10-04 §16): it is written beside the key file and renamed
+    /// over it, is the device's alone to read, and leaves nothing beside
+    /// it. Where it cannot be written, the key file is as it was.
+    #[test]
+    fn a_new_key_is_written_beside_the_key_file_and_renamed_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let beside = dir.path().join("identity.key.new");
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        // What an earlier run left beside it is not written through.
+        std::fs::write(&beside, b"left by a run that was stopped").unwrap();
+        replace_key_file(&path, &[2u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32]);
+        assert!(!beside.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // It is another file than the one that was there: the old one was
+        // not written into.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let before = std::fs::metadata(&path).unwrap().ino();
+            let kept_open = std::fs::File::open(&path).unwrap();
+            replace_key_file(&path, &[3u8; 32]).unwrap();
+            assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
+            let mut still = Vec::new();
+            std::io::Read::read_to_end(&mut &kept_open, &mut still).unwrap();
+            assert_eq!(still, [2u8; 32], "the old file was written into");
+        }
+        // Where the folder is gone, nothing is written, and it says so.
+        let nowhere = dir.path().join("no-such-folder").join("identity.key");
+        let refused = replace_key_file(&nowhere, &[4u8; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("keeps the key it had"), "{refused}");
     }
 
     /// The command that a change goes on to is one that this program

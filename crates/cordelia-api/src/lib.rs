@@ -117,6 +117,7 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/accept", web::post().to(commands::accept))
             .route("/leave", web::post().to(commands::leave))
             .route("/leave/sent", web::post().to(commands::leave_sent))
+            .route("/leave/back", web::post().to(commands::leave_back))
             .route("/forget", web::post().to(commands::forget)),
     );
     cfg.route("/api/v1/phrase/make", web::post().to(commands::phrase_make));

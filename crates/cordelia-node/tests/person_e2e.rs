@@ -2020,6 +2020,85 @@ fn a_phrase_is_shown_only_on_a_terminal_and_is_cleared_from_it() {
     assert!(said[..shown].contains("\x1b[?1049h"), "{said:?}");
 }
 
+// ── A new key that is stopped ────────────────────────────────────────
+
+/// `cordelia init --new-key` on a device that is one of several, with no
+/// relay in reach (decision 2026-10-04 §5.2, §16). It says that it has
+/// left, cannot send that, and asks whether to go on without having told
+/// the others. Stopped there, the device keeps its key and leaves nobody:
+/// its word that it left is taken back, by a delete in its place, so that
+/// no relay is sent the word. Gone on with, the new key takes the place
+/// of the old one whole: the key file is another file, the device's alone
+/// to read, and nothing is left beside it.
+#[test]
+fn a_new_key_that_is_stopped_takes_back_the_word_that_the_device_left() {
+    let mut relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let tablet = device_started("tablet", &relay);
+    makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &tablet, "tablet");
+    has_applied(&tablet, 1, &[&relay, &laptop, &tablet]);
+    relay.stop();
+
+    let key_file = tablet.data_dir().join("identity.key");
+    let key_before = std::fs::read(&key_file).unwrap();
+    let own = cordelia_crypto::bech32::decode_public_key(&key_of(&tablet)).unwrap();
+    // The entries of its own in its store: how many stand, and how many
+    // are deletes.
+    let own_entries = || -> (i64, i64) {
+        store_of(&tablet)
+            .query_row(
+                "SELECT COALESCE(SUM(is_delete = 0), 0), COALESCE(SUM(is_delete = 1), 0)
+                 FROM entries WHERE author = ?1",
+                [own.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (stood, deleted) = own_entries();
+    assert_eq!(deleted, 0);
+
+    // Stopped at the second yes.
+    let mut at = tablet.at_terminal(&["init", "--new-key"]);
+    at.says("This gives this device a new key")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("Telling the relays what this device leaves behind");
+    assert_eq!(own_entries(), (stood + 1, 0), "its word that it left");
+    at.says("Go on without having told them?")
+        .says("Type yes to go on")
+        .types("no");
+    at.says("Stopped. This device keeps its key and what it holds, and has taken back its word");
+    at.done();
+    assert_eq!(std::fs::read(&key_file).unwrap(), key_before);
+    assert_eq!(
+        own_entries(),
+        (stood, 1),
+        "a delete stands in the word's place"
+    );
+    assert_eq!(text(&look(&tablet), "state"), "applied");
+    assert_eq!(key_of(&tablet), text(&look(&tablet), "this_device"));
+
+    // Gone on with: the key file is replaced whole.
+    let mut at = tablet.at_terminal(&["init", "--new-key"]);
+    at.says("Type yes to go on").types("yes");
+    at.says("Go on without having told them?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("This device has a new key");
+    at.done();
+    let key_after = std::fs::read(&key_file).unwrap();
+    assert_eq!(key_after.len(), 32);
+    assert_ne!(key_after, key_before);
+    assert!(!tablet.data_dir().join("identity.key.new").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
 // ── Keys at a prompt ─────────────────────────────────────────────────
 
 /// Ctrl-C at a prompt that hides what is typed, or while the other screen

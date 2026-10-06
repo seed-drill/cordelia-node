@@ -565,6 +565,21 @@ pub async fn leave_sent(
     Ok(HttpResponse::Ok().json(json!({ "waiting": waiting(&state)? })))
 }
 
+/// The device takes back its word that it has left
+/// ([`leaving::take_back`]): for `cordelia init --new-key` that a person
+/// stops at its second yes, on a device that then keeps its key and
+/// leaves nobody (decision 2026-10-04 §16). The node is woken, to send
+/// the delete wherever the word went.
+pub async fn leave_back(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    asked(&req, &state)?;
+    let back = leaving::take_back(&db(&state), &state.identity, now()).map_err(refused)?;
+    state.own_channels.written();
+    Ok(HttpResponse::Ok().json(json!({ "taken_back": back.is_some() })))
+}
+
 /// The device forgets what it holds of its person, and keeps no word of
 /// its own to send ([`leaving::forget`]): for a device that is given a new
 /// key. It then follows no phrase.

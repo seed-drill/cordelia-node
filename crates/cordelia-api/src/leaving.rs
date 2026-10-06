@@ -154,6 +154,40 @@ fn say_left(
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<CheckedEntry, PersonError> {
+    write_word(conn, identity, Value::Text(now.to_string()), now)
+}
+
+/// Take back this device's word that it has left (decision 2026-10-04
+/// §16): a delete over it, one revision above, in the personal channel of
+/// the generation it has applied. It is for a device that said it would
+/// leave and then did not: `cordelia init --new-key`, stopped at its
+/// second yes. Where the word was not yet sent to a relay, the delete
+/// takes its place in the store, and the word is sent nowhere. Where a
+/// relay holds it, the delete goes after it, and each device that was
+/// told shows it no more.
+///
+/// Returns the delete, or `None` where no word of this device's stands:
+/// it wrote none, or took it back already. What it wrote over the
+/// hand-overs it made stays written ([`begin`]).
+pub fn take_back(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<Option<CheckedEntry>, PersonError> {
+    in_one(conn, || match own_word(conn, identity)? {
+        Some(word) if !word.delete => write_word(conn, identity, Value::Delete, now).map(Some),
+        _ => Ok(None),
+    })
+}
+
+/// Write `value` under this device's own name for its word that it has
+/// left, one revision above what it wrote there before.
+fn write_word(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    value: Value,
+    now: i64,
+) -> Result<CheckedEntry, PersonError> {
     let standing = Standing::to_write(conn)?;
     let own = identity.public_key();
     let personal = derive::personal_secret(&standing.secret)?;
@@ -169,7 +203,7 @@ fn say_left(
     })?;
     let inside = Inside {
         name,
-        value: Value::Text(now.to_string()),
+        value,
         chain: Some(Vec::new()),
     };
     let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
@@ -487,6 +521,52 @@ mod tests {
         assert!(again.rev > word.rev);
         give(&mut s, 0, &again);
         assert_eq!(word_on(&s, 0, 2), Some(Value::Text(later.to_string())));
+    }
+
+    /// A device that said it left, and then did not leave, takes its word
+    /// back (decision 2026-10-04 §16): a delete over it, one revision
+    /// above. The store holds the delete in the word's place, so a word
+    /// that no relay was sent is sent to none; and a device that had read
+    /// the word shows that it left no more. With no word standing,
+    /// nothing is written.
+    #[test]
+    fn test_a_device_that_did_not_leave_takes_back_its_word() {
+        let mut s = Several::of_one_person(2);
+        s.change(0, &[0, 1], &[]);
+        s.meet(&[0, 1]);
+        let now = s.tick();
+        let on = &s[1];
+        // No word stands: nothing is taken back.
+        assert_eq!(take_back(&on.conn, &on.identity, now).unwrap(), None);
+        let word = begin(&on.conn, &on.identity, now).unwrap().word.unwrap();
+        give(&mut s, 0, &word);
+        assert_eq!(word_on(&s, 0, 1), Some(Value::Text(now.to_string())));
+
+        let later = s.tick();
+        let on = &s[1];
+        let back = take_back(&on.conn, &on.identity, later).unwrap().unwrap();
+        assert!(back.delete);
+        assert_eq!((back.channel, back.slot), (word.channel, word.slot));
+        assert_eq!(back.rev, word.rev + 1);
+        // The store holds the delete in the word's place: the word itself
+        // waits to be sent nowhere.
+        let held = on.stored_in(&on.personal());
+        assert!(held.iter().any(|entry| entry.id() == back.id()));
+        assert!(held.iter().all(|entry| entry.id() != word.id()));
+        // Taken back once: there is no word to take back again.
+        assert_eq!(take_back(&on.conn, &on.identity, later).unwrap(), None);
+        // The device that had read the word is given the delete, and
+        // reads that it left no more.
+        give(&mut s, 0, &back);
+        assert_eq!(word_on(&s, 0, 1), Some(Value::Delete));
+        // It may say so again, and that word stands.
+        let now = s.tick();
+        let on = &s[1];
+        let again = begin(&on.conn, &on.identity, now).unwrap().word.unwrap();
+        assert_eq!(again.rev, back.rev + 1);
+        // A device that follows no phrase has no word.
+        let alone = crate::several::Machine::new(7);
+        assert_eq!(take_back(&alone.conn, &alone.identity, now).unwrap(), None);
     }
 
     /// A device that is alone has nobody to tell, one that has stopped
