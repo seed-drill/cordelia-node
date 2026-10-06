@@ -15,7 +15,9 @@
 //!   that this device counted as a device before a statement it applied,
 //!   and that is in neither of that statement's lists (§8). Such a device
 //!   holds the secret before, and may not know. It is shown, by its label,
-//!   until a person clears it here or a later statement lists it.
+//!   until a person clears it here or a later statement lists it. Cleared,
+//!   it is shown no more and is still kept: adding that key still says
+//!   that it was not in the last change (§16).
 //! - **The notices a person cleared** (`person_cleared`), each by what it
 //!   is named by. A device added since the last change, and a device that
 //!   has left, are shown on every device until a person clears them
@@ -197,13 +199,20 @@ pub struct LeftOut {
     pub number: u64,
     /// When this device applied that statement.
     pub noted_at: i64,
+    /// When a person cleared the notice of it here. `None` while it is
+    /// shown.
+    pub cleared_at: Option<i64>,
 }
 
-/// Every key that a statement left out and that is still shown, in order
-/// of key.
+/// Every key that a statement left out and that no later statement
+/// lists, in order of key: those that are still shown, and those whose
+/// notice a person cleared.
 pub fn left_out(conn: &Connection) -> Result<Vec<LeftOut>, CordeliaError> {
     let mut stmt = conn
-        .prepare("SELECT key, label, number, noted_at FROM person_left_out ORDER BY key ASC")
+        .prepare(
+            "SELECT key, label, number, noted_at, cleared_at FROM person_left_out
+             ORDER BY key ASC",
+        )
         .map_err(storage)?;
     let rows = stmt
         .query_map([], |row| {
@@ -212,6 +221,7 @@ pub fn left_out(conn: &Connection) -> Result<Vec<LeftOut>, CordeliaError> {
                 label: row.get(1)?,
                 number: row.get::<_, i64>(2)?.max(0) as u64,
                 noted_at: row.get(3)?,
+                cleared_at: row.get(4)?,
             })
         })
         .map_err(storage)?;
@@ -244,9 +254,22 @@ pub fn note_left_out(
     Ok(())
 }
 
-/// Show `key` no longer as left out: a person cleared it, or a statement
-/// lists it. Returns whether it was shown.
-pub fn clear_left_out(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
+/// Show `key` no longer as left out: a person cleared its notice, at
+/// `now`. The row is kept, cleared (decision 2026-10-04 §16): the key is
+/// still one that was not in the last change, and adding it says so.
+/// Returns whether it was shown.
+pub fn clear_left_out(conn: &Connection, key: &[u8; 32], now: i64) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "UPDATE person_left_out SET cleared_at = ?2 WHERE key = ?1 AND cleared_at IS NULL",
+        params![key.as_slice(), now],
+    )
+    .map(|rows| rows > 0)
+    .map_err(storage)
+}
+
+/// Keep nothing of `key` as left out: a statement lists it, in either
+/// list. Returns whether anything was kept.
+pub fn drop_left_out(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
     conn.execute(
         "DELETE FROM person_left_out WHERE key = ?1",
         params![key.as_slice()],
@@ -485,12 +508,24 @@ mod tests {
                 key: one,
                 label: "laptop".into(),
                 number: 2,
-                noted_at: 100
+                noted_at: 100,
+                cleared_at: None
             }
         );
         assert_eq!(shown[0].key, other);
-        assert!(clear_left_out(&conn, &one).unwrap());
-        assert!(!clear_left_out(&conn, &one).unwrap());
+        // Cleared, it is kept, with when: and is cleared once.
+        assert!(clear_left_out(&conn, &one, 300).unwrap());
+        assert!(!clear_left_out(&conn, &one, 400).unwrap());
+        let kept = left_out(&conn).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!((kept[1].key, kept[1].cleared_at), (one, Some(300)));
+        assert_eq!(kept[0].cleared_at, None);
+        // Noted again by a later statement, it stays cleared.
+        note_left_out(&conn, &one, "laptop", 3, 500).unwrap();
+        assert_eq!(left_out(&conn).unwrap()[1].cleared_at, Some(300));
+        // Once a statement lists it, nothing is kept of it.
+        assert!(drop_left_out(&conn, &one).unwrap());
+        assert!(!drop_left_out(&conn, &one).unwrap());
         assert_eq!(left_out(&conn).unwrap().len(), 1);
     }
 

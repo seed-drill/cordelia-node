@@ -457,6 +457,10 @@ fn of_its_person(
     }
 
     for shown in acts::left_out(conn)? {
+        // One whose notice a person cleared is shown no more.
+        if shown.cleared_at.is_some() {
+            continue;
+        }
         look.left_out.push(LeftOutKey {
             label: shown.label,
             words: fingerprint::shown(&shown.key),
@@ -904,8 +908,12 @@ fn told(
         told.kept_left = Some(word.key);
         all.push(told);
     }
-    // Each key that is not in the last change (§8).
-    for shown in acts::left_out(conn)? {
+    // Each key that is not in the last change (§8), but those whose
+    // notice a person cleared.
+    let shown_left_out = acts::left_out(conn)?
+        .into_iter()
+        .filter(|shown| shown.cleared_at.is_none());
+    for shown in shown_left_out {
         let says = format!(
             "{} is not in the last change: add it again, or it was meant to go",
             Shown::of(&shown.key, &shown.label)?.named()
@@ -967,7 +975,7 @@ pub fn clear(
         }
         match (told.left_out, told.kept_left) {
             (Some(key), _) => {
-                acts::clear_left_out(conn, &key)?;
+                acts::clear_left_out(conn, &key, now)?;
             }
             (None, Some(key)) => {
                 acts::clear_left(conn, &key)?;
@@ -1520,13 +1528,34 @@ mod tests {
         );
         assert!(seen(&s, 1).left_out.is_empty() && seen(&s, 1).notices.is_empty());
         assert_eq!(seen(&s, 0).left_out.len(), 1);
+        // It is kept, cleared (decision 2026-10-04 §16): adding that key
+        // on device 1 still says that it was not in the last change, and
+        // under which label this device knew it.
+        let kept = acts::left_out(&s[1].conn).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].key, kept[0].cleared_at), (s.key(2), Some(now)));
+        let would =
+            crate::adding::would_add(&s[1].conn, &s[1].identity, &s.key(2), "device 2").unwrap();
+        assert_eq!(
+            would,
+            crate::adding::WouldAdd::Adds {
+                counts_already: false,
+                left_out_as: Some("device 2".into()),
+            }
+        );
+        // Cleared once: there is no such notice to clear again.
+        assert_eq!(clear(&s[1].conn, &s[1].identity, &id, now).unwrap(), None);
 
         // A later statement that lists it ends it on device 0: here, as
         // removed.
-        s.change(0, &[0, 1], &[2]);
+        let removal = s.change(0, &[0, 1], &[2]);
         let look = seen(&s, 0);
         assert!(look.left_out.is_empty() && look.notices.is_empty());
         assert_eq!(look.removed.len(), 1);
+        // And on device 1, where it was kept cleared: nothing is kept of
+        // a key that a statement lists.
+        give(&mut s, 1, &removal);
+        assert!(acts::left_out(&s[1].conn).unwrap().is_empty());
     }
 
     /// A device that has said it left is shown as that on each device it

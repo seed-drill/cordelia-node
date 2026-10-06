@@ -1339,7 +1339,7 @@ fn come_to(
     // its personal channel.
     for shown in acts::left_out(conn)? {
         if statement.lists(&shown.key) || statement.removes(&shown.key) {
-            acts::clear_left_out(conn, &shown.key)?;
+            acts::drop_left_out(conn, &shown.key)?;
         }
     }
     acts::forget_cleared(conn)?;
