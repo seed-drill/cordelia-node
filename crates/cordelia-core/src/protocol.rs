@@ -1475,6 +1475,34 @@ pub const STATEMENTS_LEFT_SAID_BELOW: u64 = 16;
 /// long a relay that answers at all has had to answer.
 pub const LEAVING_SEND_WAIT_SECS: u64 = WAKE_WAIT_SECS;
 
+/// How long a folder's first cycle in a channel waits, once one relay has
+/// handed the whole of the name's channel, for each other relay that the
+/// device is set up with to hand it too (decision 2026-10-04 §6). A
+/// folder with no record in a channel yet waits for a relay, and never
+/// for a device: so a file that another device has already sent meets the
+/// folder's as on any first sync, and is not published a second time.
+/// Derived: the wait of a device that wakes, WAKE_WAIT_SECS, which is how
+/// long a relay that answers at all has had to answer.
+pub const FIRST_FETCH_WAIT_SECS: u64 = WAKE_WAIT_SECS;
+
+/// What follows the statement's number in a device's word that it has
+/// applied a statement, once it has sent what it carried (decision
+/// 2026-10-04 §8). The word is the number alone until then. A device
+/// writes it under its own key, in the personal channel of the statement's
+/// generation, so it cannot be claimed for it.
+pub const PERSONAL_APPLIED_SENT: &str = " sent";
+
+/// The two spans of time, in seconds, over which a command that removes a
+/// device says how much that device wrote that this one received
+/// (decision 2026-10-04 §7.1): the last day, and the last week. Both are
+/// read from local history, which is kept for HISTORY_DAYS.
+pub const RECEIVED_LAST_DAY_SECS: i64 = 24 * 60 * 60;
+pub const RECEIVED_LAST_WEEK_SECS: i64 = 7 * RECEIVED_LAST_DAY_SECS;
+
+// Checked at compile time: a week of what was received is within what
+// local history keeps by default.
+const _: () = assert!(RECEIVED_LAST_WEEK_SECS <= HISTORY_DAYS as i64 * 24 * 60 * 60);
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 23] = [
     LABEL_ENTRY_KEY,
@@ -2134,6 +2162,25 @@ mod tests {
         const { assert!(STATEMENTS_LEFT_SAID_BELOW < MAX_STATEMENT_NUMBER) };
         assert_eq!(LEAVING_SEND_WAIT_SECS, 30);
         assert_eq!(LEAVING_SEND_WAIT_SECS, WAKE_WAIT_SECS);
+    }
+
+    /// What the sync adapter goes by in a channel from its secret: how
+    /// long a folder's first cycle waits for the relays after the first
+    /// has handed its channel, what a device adds to its word once it has
+    /// sent what it carried, and the spans over which a removal says what
+    /// was received.
+    #[test]
+    fn test_the_adapter_in_a_channel_from_its_secret_decision_2026_10_04_6_to_8() {
+        assert_eq!(FIRST_FETCH_WAIT_SECS, 30);
+        assert_eq!(FIRST_FETCH_WAIT_SECS, WAKE_WAIT_SECS);
+        assert_eq!(PERSONAL_APPLIED_SENT, " sent");
+        // A statement's number is digits alone: what follows it in the
+        // word is told from it.
+        assert!(!PERSONAL_APPLIED_SENT.starts_with(|c: char| c.is_ascii_digit()));
+        assert_eq!(RECEIVED_LAST_DAY_SECS, 86_400);
+        assert_eq!(RECEIVED_LAST_WEEK_SECS, 604_800);
+        // A file's text and its name are bounded by the one constant.
+        assert_eq!(MAX_ENTRY_NAME_AND_VALUE_BYTES, 61_440);
     }
 
     /// The value that a proof is made over is exported from a TLS session
