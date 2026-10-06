@@ -2510,7 +2510,12 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
 /// node's address could say to a command.
 struct Answers {
     port: u16,
+    /// Each request that a command made here, in their order.
+    asked: std::sync::Arc<std::sync::Mutex<Vec<Asked>>>,
 }
+
+/// A request that a command made: its path, and its body.
+type Asked = (String, Vec<u8>);
 
 impl Answers {
     fn in_the_place_of(
@@ -2536,10 +2541,12 @@ impl Answers {
         let (node_port, token) = (node.http, node.token());
         let changed = std::sync::Arc::new(changed);
         let lost = std::sync::Arc::new(lost);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = asked.clone();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 let (changed, token) = (changed.clone(), token.clone());
-                let lost = lost.clone();
+                let (lost, kept) = (lost.clone(), kept.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
@@ -2566,6 +2573,7 @@ impl Answers {
                     if reader.read_exact(&mut body).is_err() {
                         return;
                     }
+                    kept.lock().unwrap().push((path.clone(), body.clone()));
                     let loses = lost(&path);
                     if loses == Some(false) {
                         return;
@@ -2604,8 +2612,127 @@ impl Answers {
                 });
             }
         });
-        Self { port: at }
+        Self { port: at, asked }
     }
+
+    /// Every request that a command has made here: its path, and its
+    /// body.
+    fn asked(&self) -> Vec<Asked> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// No word of a new phrase reaches the node (decision 2026-10-04 §5).
+/// `cordelia phrase` makes the words in its own process, and hands the
+/// node the change entry of the first statement, the statement key, and
+/// where the device stood: those three, and nothing else. Nothing that
+/// only the phrase gives is in what the node was asked, in its log, or
+/// in any file of its directory afterwards, and nor are three of the
+/// words in a row. (One word of a new phrase may be a word that the
+/// program says anyway: the words are from a list of common ones.)
+#[test]
+fn no_word_of_a_new_phrase_reaches_the_node() {
+    use cordelia_crypto::entry::Entry;
+    use cordelia_crypto::phrase::Phrase;
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+
+    let through = Answers::in_the_place_of(&laptop, |_, _| {});
+    let mut at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&words);
+    at.done();
+    assert_eq!(look(&laptop)["change"], 1);
+    let phrase = Phrase::parse(&words).unwrap();
+
+    // What the command asked of the node to make the phrase: three
+    // things, each of a form that holds no word.
+    let asked = through.asked();
+    let made: Vec<&Asked> = asked
+        .iter()
+        .filter(|(path, _)| path == "/api/v1/phrase/make")
+        .collect();
+    assert_eq!(
+        made.len(),
+        1,
+        "{:?}",
+        asked.iter().map(|a| &a.0).collect::<Vec<_>>()
+    );
+    let body: Value = serde_json::from_slice(&made[0].1).unwrap();
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["entry", "from", "statement_key"]);
+    assert_eq!(body["from"], "no_phrase");
+    // The statement key, which every device that follows the phrase is
+    // given.
+    assert_eq!(
+        body["statement_key"],
+        hex::encode(*phrase.statement_key().unwrap())
+    );
+    // The change entry: what every relay is shown. Its author is the
+    // phrase's public key, and its content is sealed.
+    let entry = Entry::from_wire(&hex::decode(text(&body, "entry")).unwrap())
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(entry.author, phrase.public_key().unwrap());
+
+    // What only the phrase gives, and no device is given.
+    let only_the_phrases: Vec<[u8; 32]> = vec![
+        *phrase.signing_key().unwrap().seed(),
+        *phrase.channel_secret().unwrap(),
+        *phrase.seal_key().unwrap(),
+    ];
+    let mut searched: Vec<(String, Vec<u8>)> = asked
+        .iter()
+        .map(|(path, body)| (format!("what the node was asked at {path}"), body.clone()))
+        .collect();
+    searched.push((
+        "the node's log".into(),
+        std::fs::read(laptop.log()).unwrap(),
+    ));
+    for (path, bytes) in files_under(&laptop.data_dir()) {
+        searched.push((path.display().to_string(), bytes));
+    }
+    let in_a_row: Vec<&str> = words.split(' ').collect();
+    for (what, bytes) in &searched {
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+        for secret in &only_the_phrases {
+            assert!(!has(secret), "what only the phrase gives is in {what}");
+            assert!(
+                !has(hex::encode(secret).as_bytes()),
+                "what only the phrase gives is in {what}, in hex"
+            );
+        }
+        // Every run of letters, in its order.
+        let said: Vec<String> = bytes
+            .split(|byte| !byte.is_ascii_alphabetic())
+            .filter(|word| !word.is_empty())
+            .map(|word| String::from_utf8_lossy(word).to_lowercase())
+            .collect();
+        for three in in_a_row.windows(3) {
+            assert!(
+                !said.windows(3).any(|run| run == three),
+                "three words of the phrase are in {what}"
+            );
+        }
+    }
+    // The search reads what is there: the device's label, which the
+    // phrase's first statement lists, is in the node's database.
+    assert!(searched.len() > 4, "{}", searched.len());
+    let in_the_database = searched
+        .iter()
+        .filter(|(what, _)| what.contains("cordelia.db"))
+        .any(|(_, bytes)| words_in(bytes).contains("laptop"));
+    assert!(in_the_database, "the search reads the node's database");
 }
 
 /// What a command shows as this device, signs for and prints is its own

@@ -25,16 +25,17 @@ const TOKEN: &str = "test-token-secret";
 const WORDS: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
 /// A node's state, with a database of its own in memory, and its
-/// directory. `network` says whether it has a network: a node that has
-/// none makes no pass, and nothing waits for one.
-fn state_of(network: bool) -> (web::Data<AppState>, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap().keep();
+/// directory, which goes when whoever holds it lets it go. `network` says
+/// whether it has a network: a node that has none makes no pass, and
+/// nothing waits for one.
+fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
     let push_tx = network.then(|| tokio::sync::mpsc::unbounded_channel().0);
     let state = web::Data::new(AppState {
         db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
         identity: NodeIdentity::generate().unwrap(),
         bearer_token: TOKEN.into(),
-        home_dir: dir.clone(),
+        home_dir: dir.path().to_path_buf(),
         started_at: std::time::Instant::now(),
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
@@ -104,7 +105,7 @@ macro_rules! makes_the_phrase {
 /// over in its whole pass, and not when its timer next comes round.
 #[actix_web::test]
 async fn test_a_typed_key_is_kept_and_the_node_is_asked_for_a_whole_pass() {
-    let (state, _) = state_of(false);
+    let (state, _dir) = state_of(false);
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -152,7 +153,7 @@ async fn test_a_typed_key_is_kept_and_the_node_is_asked_for_a_whole_pass() {
 /// again: no place in one is kept.
 #[actix_web::test]
 async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
-    let (state, _) = state_of(false);
+    let (state, _dir) = state_of(false);
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -249,7 +250,7 @@ async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
 /// fetched (decision 2026-10-04 §7.1, step 1).
 #[actix_web::test]
 async fn test_a_change_is_prepared_after_a_whole_pass_that_the_node_was_asked_for() {
-    let (state, _) = state_of(true);
+    let (state, _dir) = state_of(true);
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -336,7 +337,7 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
             .configure(cordelia_api::configure_routes),
     )
     .await;
-    let key_file = dir.join(cordelia_api::commands::KEY_FILE);
+    let key_file = dir.path().join(cordelia_api::commands::KEY_FILE);
 
     // Without the token: nothing, whatever the key.
     for (path, body) in routes() {
