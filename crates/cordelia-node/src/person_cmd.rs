@@ -154,22 +154,29 @@ fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
     )
 }
 
-/// A device as it is shown for a decision: its label, and the first four
-/// words of its key's fingerprint (decision 2026-10-04 §6).
+/// A device as it is shown for a decision: the first four words of its
+/// key's fingerprint, and its label (decision 2026-10-04 §6, §16).
+///
+/// **The words come first, and the label after them, quoted.** A label
+/// is whatever the device that added a key called it: it may hold
+/// brackets, and words of the list. Shown first it could put counterfeit
+/// words where a person looks for the real ones. Quoted, with whatever
+/// would end the quotes marked, it cannot pass for anything that this
+/// command says itself.
 fn named(label: &str, key: &[u8; 32]) -> String {
-    let words = fingerprint::shown(key);
-    match label.is_empty() {
-        true => format!("the device ({words})"),
-        false => format!("{label} ({words})"),
-    }
+    words_then(&fingerprint::shown(key), label)
 }
 
 /// A device that the node shows, as [`named`] says it.
 fn shown(device: &Value) -> String {
-    let (label, words) = (text(device, "label"), text(device, "words"));
+    words_then(text(device, "words"), text(device, "label"))
+}
+
+/// The words of a key's fingerprint, and then its label, quoted.
+fn words_then(words: &str, label: &str) -> String {
     match label.is_empty() {
         true => format!("the device ({words})"),
-        false => format!("{label} ({words})"),
+        false => format!("({words}) {label:?}"),
     }
 }
 
@@ -386,8 +393,8 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
             let label = name.as_deref().unwrap_or("the new device");
             if let Some(was) = would["left_out_as"].as_str() {
                 println!(
-                    "This key was not in the last change. This device knew it as {was}, and it \
-                     holds what your devices held before that change."
+                    "This key was not in the last change. This device knew it as {was:?}, and \
+                     it holds what your devices held before that change."
                 );
             }
             if would["counts_already"] == true {
@@ -647,10 +654,9 @@ fn devices_lines(seen: &Value) -> Vec<String> {
     }
     for device in left_out {
         out.push(format!(
-            "  {} ({}): add it again, or it was meant to go. Its key is the one it prints \
+            "  {}: add it again, or it was meant to go. Its key is the one it prints \
              (`cordelia id`).",
-            text(device, "label"),
-            text(device, "words")
+            shown(device)
         ));
     }
     if let Some(apart) = seen["apart"].as_object() {
@@ -1517,7 +1523,7 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
     for key in newly {
         let known = match handed.label(key) {
             label if label.is_empty() => String::new(),
-            label => format!(", known here as {label}"),
+            label => format!(", known here as {label:?}"),
         };
         out.push(format!("    ({}){known}", fingerprint::shown(key)));
     }
@@ -2252,11 +2258,14 @@ mod tests {
         assert_eq!(
             shown,
             [
-                format!("  made on laptop ({})", fingerprint::shown(&own)),
+                format!("  made on ({}) \"laptop\"", fingerprint::shown(&own)),
                 "  devices (3):".to_string(),
-                format!("    laptop ({})  (this device)", fingerprint::shown(&own)),
-                format!("    phone ({})", fingerprint::shown(&f.listed)),
-                format!("    desktop ({})", fingerprint::shown(&key(5))),
+                format!(
+                    "    ({}) \"laptop\"  (this device)",
+                    fingerprint::shown(&own)
+                ),
+                format!("    ({}) \"phone\"", fingerprint::shown(&f.listed)),
+                format!("    ({}) \"desktop\"", fingerprint::shown(&key(5))),
                 "  removed keys (1):".to_string(),
                 format!("    ({})", fingerprint::shown(&key(6))),
                 "  and the 1 key that earlier changes removed".to_string(),
@@ -2292,6 +2301,31 @@ mod tests {
         let help = crate::Cli::command().render_long_help().to_string();
         assert!(!help.contains(STAYS_COMMAND), "{help}");
         assert!(help.contains("remove-device"), "{help}");
+    }
+
+    /// Wherever a device is shown, the words of its key's fingerprint
+    /// come first and its label after them, quoted (decision 2026-10-04
+    /// §16). A label that holds brackets, words of the list and a quote
+    /// shows no counterfeit words ahead of the real ones, and does not
+    /// end its own quotes.
+    #[test]
+    fn the_words_of_a_fingerprint_come_first_and_the_label_after_them_quoted() {
+        let key = NodeIdentity::from_seed([9; 32]).unwrap().public_key();
+        let words = fingerprint::shown(&key);
+        assert_eq!(named("laptop", &key), format!("({words}) \"laptop\""));
+        assert_eq!(named("", &key), format!("the device ({words})"));
+        let forged = "laptop (acid acid acid acid)\" (zoo";
+        assert_eq!(
+            named(forged, &key),
+            format!("({words}) \"laptop (acid acid acid acid)\\\" (zoo\"")
+        );
+        // A device that the node shows is shown likewise.
+        let from_the_node = json!({ "label": forged, "words": words });
+        assert_eq!(shown(&from_the_node), named(forged, &key));
+        assert_eq!(
+            shown(&json!({ "label": "", "words": words })),
+            named("", &key)
+        );
     }
 
     /// What `cordelia status` says of a device and its person in a few
@@ -2396,19 +2430,21 @@ mod tests {
             "not_carried": [{ "name": "lab", "file": "ghost.md" }],
         });
         let lines = devices_lines(&seen).join("\n");
-        assert!(lines.contains("desktop (w): this device"), "{lines}");
+        assert!(lines.contains("(w) \"desktop\": this device"), "{lines}");
         assert!(
-            lines.contains("laptop (w): has applied change 2, and has sent what it held"),
+            lines.contains("(w) \"laptop\": has applied change 2, and has sent what it held"),
             "{lines}"
         );
         assert!(
-            lines.contains("tablet (w): has applied change 2, and is still sending what it held"),
+            lines.contains(
+                "(w) \"tablet\": has applied change 2, and is still sending what it held"
+            ),
             "{lines}"
         );
         // A device that has not applied the change is not said to have
         // sent anything, whatever its word of an earlier one says.
         assert!(
-            lines.contains("phone (w): has not applied change 2 yet"),
+            lines.contains("(w) \"phone\": has not applied change 2 yet"),
             "{lines}"
         );
         assert!(
@@ -2418,7 +2454,7 @@ mod tests {
         assert!(
             lines.contains(
                 "Names that no device lists yet since the last change:\n  old-notes: synced \
-                 before by laptop (w w w w); what the relays hold of it can be brought in for \
+                 before by (w w w w) \"laptop\"; what the relays hold of it can be brought in for \
                  89 more days"
             ),
             "{lines}"

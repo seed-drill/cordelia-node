@@ -140,7 +140,7 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
         "from the list that a wallet's seed phrase uses",
         "never\r\ntype these into a wallet, and never type a wallet's words here",
         "Without the phrase a device can be added, and none can ever be removed or recovered.",
-        "It is listed as laptop (",
+        "It is listed as (",
     ] {
         assert!(
             said.contains(says),
@@ -349,7 +349,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     // label, its yes, and what to run on the other device.
     let mut at = laptop.at_terminal(&["add-device", &desktop_key, "--name", "desktop"]);
     at.says(&format!(
-        "This gives desktop ({}) every name's memory, and the means to read what your devices \
+        "This gives ({}) \"desktop\" every name's memory, and the means to read what your devices \
          write from now on.",
         words_of(&desktop_key)
     ));
@@ -405,8 +405,8 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
         let listed = device.cli(&["devices"]);
         println!("{listed}");
         for says in [
-            format!("laptop ({})", words_of(&laptop_key)),
-            format!("desktop ({}), added from laptop", words_of(&desktop_key)),
+            format!("({}) \"laptop\"", words_of(&laptop_key)),
+            format!("({}) \"desktop\", added from (", words_of(&desktop_key)),
             laptop_key.clone(),
             desktop_key.clone(),
             "holds the latest change".to_string(),
@@ -420,14 +420,14 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     }
     let listed = laptop.cli(&["devices"]);
     assert!(
-        listed.contains("added from laptop") && listed.contains("has applied change 1"),
+        listed.contains("\"desktop\", added from (") && listed.contains("has applied change 1"),
         "{listed}"
     );
 
     // The notice, on each device, in its status too, until a person
     // clears it there.
     let told = format!(
-        "new device: desktop ({}), added from laptop ({})",
+        "new device: ({}) \"desktop\", added from ({}) \"laptop\"",
         words_of(&desktop_key),
         words_of(&laptop_key)
     );
@@ -435,7 +435,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     assert_eq!(
         notices(&desktop),
         [format!(
-            "this device was added from laptop ({})",
+            "this device was added from ({}) \"laptop\"",
             words_of(&laptop_key)
         )]
     );
@@ -876,14 +876,14 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let removes = |phrases: &[&str]| {
         let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
         at.says(&format!(
-            "To be removed: desktop ({}).",
+            "To be removed: ({}) \"desktop\".",
             words_of(&desktop_key)
         ));
         // The tablet was added by the device that is being removed: it
         // is shown as that. No answer is suggested for it, or for any
         // device added since: pressing Enter answers nothing.
         at.says(&format!(
-            "tablet ({}), added since the last change, from desktop ({})",
+            "({}) \"tablet\", added since the last change, from ({}) \"desktop\"",
             words_of(&tablet_key),
             words_of(&desktop_key)
         ));
@@ -893,16 +893,16 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         at.says("Type `stays` or `removed`").types("stays");
         // The lists, from the bytes that will be signed.
         at.says("The change that the recovery phrase will sign (change 2):");
-        at.says(&format!("made on laptop ({})", words_of(&laptop_key)));
+        at.says(&format!("made on ({}) \"laptop\"", words_of(&laptop_key)));
         at.says("devices (2):");
         at.says(&format!(
-            "laptop ({})  (this device)",
+            "({}) \"laptop\"  (this device)",
             words_of(&laptop_key)
         ));
-        at.says(&format!("tablet ({})", words_of(&tablet_key)));
+        at.says(&format!("({}) \"tablet\"", words_of(&tablet_key)));
         at.says("removed keys (1):");
         at.says(&format!(
-            "({}), known here as desktop",
+            "({}), known here as \"desktop\"",
             words_of(&desktop_key)
         ));
         at.says("Make this change?")
@@ -1001,7 +1001,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     println!("{listed}");
     assert!(
         listed.contains(&format!(
-            "tablet ({}): has applied change 2",
+            "({}) \"tablet\": has applied change 2",
             words_of(&tablet_key)
         )),
         "{listed}"
@@ -1108,7 +1108,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // answer is suggested for it. The lists are then shown.
     let mut at = laptop.at_terminal(&["renew"]);
     at.says(&format!(
-        "desktop ({}), added since the last change, from laptop ({})",
+        "({}) \"desktop\", added since the last change, from ({}) \"laptop\"",
         words_of(&desktop_key),
         words_of(&laptop_key)
     ));
@@ -1156,7 +1156,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     let status = tablet.cli(&["status"]);
     assert!(
         status.contains(&format!(
-            "this device is not in a change made on laptop ({}): if it is yours, add it again \
+            "this device is not in a change made on ({}) \"laptop\": if it is yours, add it again \
              from a device that is",
             words_of(&laptop_key)
         )),
@@ -1171,7 +1171,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // The laptop counted it before the change: it shows it as not in
     // the last change, by its label and its words and never by its key.
     let not_in = format!(
-        "tablet ({}) is not in the last change: add it again, or it was meant to go",
+        "({}) \"tablet\" is not in the last change: add it again, or it was meant to go",
         words_of(&tablet_key)
     );
     assert_eq!(notices(&laptop), std::slice::from_ref(&not_in));
@@ -1182,7 +1182,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // It is added again, by the same two commands. `add-device` shows
     // the key as not in the last change before its yes.
     let mut at = laptop.at_terminal(&["add-device", &tablet_key, "--name", "tablet"]);
-    at.says("This key was not in the last change. This device knew it as tablet");
+    at.says("This key was not in the last change. This device knew it as \"tablet\"");
     at.says("Type yes to go on").types("yes");
     at.done();
     let mut at = tablet.at_terminal(&["accept", &laptop_key]);
@@ -1208,7 +1208,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     assert_eq!(
         notices(&tablet),
         [format!(
-            "this device was added from laptop ({})",
+            "this device was added from ({}) \"laptop\"",
             words_of(&laptop_key)
         )]
     );
@@ -1231,7 +1231,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // of the change, which the lists show before the yes, and it stops.
     let mut at = laptop.at_terminal(&["renew"]);
     at.says(&format!(
-        "tablet ({}), added since the last change",
+        "({}) \"tablet\", added since the last change",
         words_of(&tablet_key)
     ));
     at.says("Type `stays` or `removed`").types("removed");
@@ -1239,7 +1239,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     at.says("devices (2):");
     at.says("removed keys (1):");
     at.says(&format!(
-        "({}), known here as tablet",
+        "({}), known here as \"tablet\"",
         words_of(&tablet_key)
     ));
     at.says("Make this change?")
@@ -1346,7 +1346,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     // the change: what it is handed brings none, and nothing is done.
     let mut at = laptop.at_terminal(&["add-device", &key_of(&desktop), "--name", "another"]);
     at.says(&format!(
-        "desktop ({}) is one of your devices already: this hands it the last change again, and \
+        "({}) \"desktop\" is one of your devices already: this hands it the last change again, and \
          adds nothing.",
         words_of(&key_of(&desktop))
     ));
@@ -1454,7 +1454,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // Each device it left shows that it left, until a person clears it
     // there.
     let left = format!(
-        "desktop ({}) left, and started again under another phrase. It still holds the secret \
+        "({}) \"desktop\" left, and started again under another phrase. It still holds the secret \
          it had, and is still listed: removing it, with the phrase, is what cuts it off \
          (`cordelia remove-device`)",
         words_of(&desktop_key)
@@ -1474,10 +1474,12 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // person clears the last there, and it is shown there no more.
     assert_eq!(notices(&laptop).len(), 3);
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says("new device: desktop")
+    at.says("new device: (")
+        .says(") \"desktop\", added from")
         .says("Type yes to go on")
         .types("no");
-    at.says("new device: tablet")
+    at.says("new device: (")
+        .says(") \"tablet\", added from")
         .says("Type yes to go on")
         .types("no");
     at.says("left, and started again")
@@ -1591,7 +1593,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     assert_eq!(sync_after["mappings"], sync_before["mappings"]);
     // The devices it left show that it left, under the key they knew.
     let left = format!(
-        "tablet ({}) left, and started again under another phrase.",
+        "({}) \"tablet\" left, and started again under another phrase.",
         words_of(&tablet_key)
     );
     wait_for(
@@ -1714,9 +1716,9 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     at.says("Change 3 (made apart):");
     at.says("It undoes no removal");
     at.says(&format!(
-        "{} ({}), a device of both changes:",
-        other.name,
-        words_of(&key_of(other))
+        "({}) {:?}, a device of both changes:",
+        words_of(&key_of(other)),
+        other.name
     ));
     at.says(
         "Type `stays` or `removed`, or `neither` (it is in no list, and is added again by hand)",

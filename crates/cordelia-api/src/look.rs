@@ -89,12 +89,15 @@ impl Shown {
         })
     }
 
-    /// The device in a sentence: its label and its words, or its words
-    /// alone where it has no label.
+    /// The device in a sentence: its words and then its label, quoted, or
+    /// its words alone where it has no label (decision 2026-10-04 §16).
+    /// The label is whatever the device that added the key called it, and
+    /// may hold brackets and words of the list: after the words, and in
+    /// quotes, it cannot pass for the words of a fingerprint.
     pub fn named(&self) -> String {
         match self.label.is_empty() {
             true => format!("the device ({})", self.words),
-            false => format!("{} ({})", self.label, self.words),
+            false => format!("({}) {:?}", self.words, self.label),
         }
     }
 }
@@ -904,9 +907,8 @@ fn told(
     // Each key that is not in the last change (§8).
     for shown in acts::left_out(conn)? {
         let says = format!(
-            "{} ({}) is not in the last change: add it again, or it was meant to go",
-            shown.label,
-            fingerprint::shown(&shown.key)
+            "{} is not in the last change: add it again, or it was meant to go",
+            Shown::of(&shown.key, &shown.label)?.named()
         );
         all.push(tell(
             left_out_notice(&shown.key),
@@ -1192,6 +1194,22 @@ mod tests {
         look.notices.iter().map(|notice| notice.kind).collect()
     }
 
+    /// A device is named by the words of its key's fingerprint first, and
+    /// its label after them, quoted (decision 2026-10-04 §16): a label
+    /// that holds brackets and words puts none ahead of the real ones.
+    #[test]
+    fn test_a_device_is_named_by_its_words_first_and_its_label_quoted() {
+        let key = crate::several::Machine::new(3).key();
+        let words = fingerprint::shown(&key);
+        let named = |label: &str| Shown::of(&key, label).unwrap().named();
+        assert_eq!(named("laptop"), format!("({words}) \"laptop\""));
+        assert_eq!(named(""), format!("the device ({words})"));
+        assert_eq!(
+            named("laptop (acid acid acid acid)\" (zoo"),
+            format!("({words}) \"laptop (acid acid acid acid)\\\" (zoo\"")
+        );
+    }
+
     /// A device that follows no phrase says so, in the words of the
     /// decision, and in two words for a line.
     #[test]
@@ -1296,7 +1314,7 @@ mod tests {
         assert_eq!(
             seen(&s, 0).notices[0].says,
             format!(
-                "new device: device 1 ({}), added from device 0 ({})",
+                "new device: ({}) \"device 1\", added from ({}) \"device 0\"",
                 words(1),
                 words(0)
             )
@@ -1304,7 +1322,7 @@ mod tests {
         // The new device says it of itself.
         assert_eq!(
             seen(&s, 1).notices[0].says,
-            format!("this device was added from device 0 ({})", words(0))
+            format!("this device was added from ({}) \"device 0\"", words(0))
         );
         assert!(seen(&s, 2).says.contains(&seen(&s, 2).notices[1].says));
 
@@ -1402,7 +1420,8 @@ mod tests {
         assert!(
             look.notices
                 .iter()
-                .any(|n| n.says.starts_with("new device: device 10"))
+                .any(|n| n.says.starts_with("new device: (")
+                    && n.says.contains(") \"device 10\", added from"))
         );
         // Device 9 counts, and may add nothing: its own look says so.
         // Device 0, which the statement lists, may.
@@ -1471,7 +1490,7 @@ mod tests {
         assert_eq!(
             look.notices[0].says,
             format!(
-                "device 2 ({}) is not in the last change: add it again, or it was meant to go",
+                "({}) \"device 2\" is not in the last change: add it again, or it was meant to go",
                 fingerprint::shown(&s.key(2))
             )
         );
@@ -1534,7 +1553,7 @@ mod tests {
             assert_eq!(
                 look.notices[0].says,
                 format!(
-                    "device 2 ({}) left, and started again under another phrase. It still \
+                    "({}) \"device 2\" left, and started again under another phrase. It still \
                      holds the secret it had, and is still listed: removing it, with the \
                      phrase, is what cuts it off (`cordelia remove-device`)",
                     fingerprint::shown(&s.key(2))
@@ -1706,7 +1725,7 @@ mod tests {
         assert_eq!(
             left_out.cannot_go_on,
             Some(format!(
-                "this device is not in a change made on device 0 ({}): if it is yours, add it \
+                "this device is not in a change made on ({}) \"device 0\": if it is yours, add it \
                  again from a device that is",
                 fingerprint::shown(&s.key(0))
             ))
