@@ -1,20 +1,19 @@
-// Not built for now. These tests set devices up as the older kind of
-// channel did, which a device carries no longer (decision 2026-10-04
-// §10): the file is built again once its tests set them up under a
-// recovery phrase.
-#![cfg(any())]
-
-//! End to end, with real processes: a relay and two personal nodes on
-//! localhost, talking QUIC. Device A runs `add-device B`, B runs
-//! `accept A`, B joins A's personal channel through the relay, and an item
-//! A then publishes in that channel reaches B, decrypted with the key B
-//! received (decision 2026-09-30-agent-memory-sync §3, §4.1).
+//! End to end, with real processes: relays and personal nodes on
+//! localhost, talking QUIC. One device makes a recovery phrase and runs
+//! `add-device` for another, which runs `accept`: the two are then one
+//! person's devices, and what one publishes under a name that both hold
+//! reaches the other through the relay, in the name's channel, which comes
+//! from the person's secret (decision 2026-10-04 §2.2, §5.2, §6, and
+//! decision 2026-09-30-agent-memory-sync §4.3 to §4.6).
 //!
-//! Uses only the CLI and the local HTTP API, as a person would.
+//! A device is driven only through the CLI and the local HTTP API, as a
+//! person would drive it. A relay carries the older kind of channel as it
+//! did, and no device holds one (decision 2026-10-04 §10): what a relay
+//! does for that kind is shown with a stand-in that speaks its streams.
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,6 +27,145 @@ use common::*;
 /// where it shows, and not only here, where it would pass.
 const A_STARTED_NODE_LOGS: [&str; 3] = ["Cordelia v", "P2P endpoint", "relays configured"];
 
+fn path(p: &Path) -> String {
+    p.to_str().unwrap().to_string()
+}
+
+fn read(p: &Path) -> Option<String> {
+    std::fs::read_to_string(p).ok()
+}
+
+/// What `cordelia status --json` says of a node.
+fn state(n: &Node) -> serde_json::Value {
+    serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+}
+
+/// Turn memory sync on for `n`, for the Claude Code directory in its home.
+/// Returns what the command said.
+fn sync_on(n: &Node) -> String {
+    n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))])
+}
+
+/// The name that the tests of what a device holds and sends publish
+/// under.
+const NAME: &str = "lab";
+
+/// `n` comes to hold the name [`NAME`]: its folder `notes` is mapped to
+/// the name, with sync on, as a mapping is made. A device holds a name for
+/// as long as a folder of its own is mapped to it, and its local API then
+/// publishes and lists under that name (decision 2026-10-04 §2.2, §16).
+/// Nothing is made or joined: the name's channel is from the person's
+/// secret.
+///
+/// Sync is then turned off again. The folder stays mapped and the name
+/// held, and the device goes on sending and fetching the name's channel.
+/// What is turned off is the adapter, which takes no part in what these
+/// tests show: they publish through the local API, and what they publish
+/// there is no memory file.
+fn holds_the_name(n: &Node) {
+    let notes = n.home().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let out = sync_on(n);
+    assert!(out.starts_with("Sync turned on.\n"), "{out}");
+    let out = n.cli(&["sync", "map", &path(&notes), NAME]);
+    assert!(out.contains(&format!("Mapped ~/notes to {NAME}.")), "{out}");
+    n.cli(&["sync", "off"]);
+}
+
+/// Publish `content` under `key` in the name [`NAME`], through the local
+/// API of `n`. Returns the answer.
+fn publishes(n: &Node, key: &str, content: serde_json::Value) -> serde_json::Value {
+    n.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": NAME, "key": key, "content": content }),
+    )
+}
+
+/// What `n` holds under the name [`NAME`]: the current version under each
+/// key, as its local API lists them.
+fn held(n: &Node) -> Vec<serde_json::Value> {
+    let answer = n.post(
+        "/api/v1/channels/entries",
+        serde_json::json!({ "channel": NAME }),
+    );
+    answer["entries"].as_array().cloned().unwrap_or_default()
+}
+
+/// Whether `n` holds `text` under `key` in the name [`NAME`].
+fn reads(n: &Node, key: &str, text: &str) -> Option<()> {
+    held(n)
+        .iter()
+        .any(|e| e["key"] == key && e["content"]["text"] == text)
+        .then_some(())
+}
+
+/// A node's database, opened for reading while the node runs.
+fn store_of(node: &Node) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open_with_flags(
+        node.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db
+}
+
+/// How many entries of channels from their secrets a relay holds, read
+/// from its database.
+fn entries_at(relay: &Node) -> u64 {
+    let held: i64 = store_of(relay)
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .unwrap();
+    held as u64
+}
+
+/// The ID of the channel that `n` holds the name [`NAME`] with, read from
+/// its database.
+fn channel_of_the_name(n: &Node) -> [u8; 32] {
+    cordelia_storage::person::channel_of_name(&store_of(n), NAME)
+        .unwrap()
+        .expect("the device holds the name")
+}
+
+/// Whether a relay holds the channel whose ID is `channel`, read from its
+/// database.
+fn holds_the_channel(relay: &Node, channel: &[u8; 32]) -> bool {
+    let held: i64 = store_of(relay)
+        .query_row(
+            "SELECT COUNT(*) FROM relay_channels WHERE channel_id = ?1",
+            [channel.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    held > 0
+}
+
+/// What a device tells its relay of: `n` makes a recovery phrase, comes to
+/// hold the name [`NAME`] and publishes an entry under it, and this comes
+/// back once `relay` holds the name's channel and the device has nothing
+/// left to send. Returns the channel's ID, which the relay was told.
+fn tells_its_relay_of_its_name(n: &Node, relay: &Node) -> [u8; 32] {
+    let all = [relay, n];
+    makes_a_phrase(n, "desktop");
+    holds_the_name(n);
+    publishes(n, "notes.md", serde_json::json!({ "text": "an entry" }));
+    let channel = channel_of_the_name(n);
+    wait_for("the relay holds the name's channel", &all, 90, || {
+        holds_the_channel(relay, &channel).then_some(())
+    });
+    wait_for("the device has sent what it holds", &all, 90, || {
+        (n.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
+    });
+    channel
+}
+
+/// Two of a person's devices and the relay between them, end to end
+/// (decision 2026-10-04 §5.2, §6, §16): what a running node says of its
+/// connections; the relay's counts of who it has seen; the documented
+/// flow that makes the second device one of the person's; and then what
+/// one device publishes under a name that both hold reaches the other,
+/// with an edit back, a delete, and more entries than one page of a
+/// channel's list holds.
 #[test]
 fn add_device_accept_and_sync_through_a_relay() {
     let mut relay = node("relay", "relay", None);
@@ -98,128 +236,129 @@ fn add_device_accept_and_sync_through_a_relay() {
         "metrics carry counts, not keys"
     );
 
-    // The documented flow: one key copied in each direction.
-    let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["old-add-device", &b_key, "--name", "b"]);
-    let a_key = added
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
-        .unwrap_or_else(|| panic!("add-device output lacks the accept line:\n{added}"))
-        .to_string();
-    assert_eq!(a_key, a.cli(&["id"]).trim());
-    b.cli(&["old-accept", &a_key, "--name", "a"]);
-
-    let personal = groups(&a)
-        .into_iter()
-        .next()
-        .expect("a has a personal channel");
-    wait_for("b joins a's personal channel", &all, 90, || {
-        groups(&b).contains(&personal).then_some(())
-    });
-
-    let devices = b.post("/api/v1/old-devices/list", serde_json::json!({}));
+    // The documented flow: a recovery phrase is made on the first device,
+    // and then one key is copied in each direction, `add-device` on the
+    // device that is in and `accept` on the new one, each at a terminal
+    // with its yes.
+    let [a_key, b_key] = &device_keys;
+    makes_a_phrase(&a, "desktop");
+    let (added, _) = adds(&a, &b, "laptop");
+    let accept = format!("cordelia accept {a_key}");
     assert!(
-        devices["devices"]
+        added.lines().any(|line| line.trim() == accept),
+        "add-device output lacks the accept line:\n{added}"
+    );
+    has_applied(&b, 1, &all);
+
+    // The new device lists the first as a device of the change, and
+    // itself as added since, by the first.
+    let seen = person_of(&b);
+    assert_eq!(seen["among"], "several", "{seen}");
+    assert!(
+        seen["devices"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|d| d["key"] == a_key.as_str() && d["in_personal_channel"] == true),
-        "b lists a as a device: {devices}"
+            .any(|d| d["key"] == a_key.as_str() && d["maker"] == true),
+        "b lists a as a device: {seen}"
+    );
+    assert!(
+        seen["added"].as_array().unwrap().iter().any(|d| {
+            d["key"] == b_key.as_str()
+                && d["this_device"] == true
+                && d["counted"] == true
+                && d["by"]["key"] == a_key.as_str()
+        }),
+        "b lists itself as added by a: {seen}"
+    );
+    // Nothing is waiting: what the key typed at `accept` was to bring was
+    // taken, and the node asks for it no more.
+    let typed = seen["accepting"].as_array().unwrap();
+    assert_eq!(typed.len(), 1, "{seen}");
+    assert_eq!(
+        (&typed[0]["key"], &typed[0]["taken"], &typed[0]["asking"]),
+        (
+            &serde_json::json!(a_key),
+            &serde_json::json!(true),
+            &serde_json::json!(false)
+        ),
+        "{seen}"
     );
 
-    // Data now flows with the shared key: A publishes, B reads it.
-    a.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "content": { "text": "hello from a" } }),
-    );
-    wait_for("b receives a's item", &all, 90, || {
-        let listened = b.post(
-            "/api/v1/channels/listen",
-            serde_json::json!({ "channel": personal, "limit": 10 }),
-        );
-        listened["items"]
-            .as_array()?
+    // Both hold a name: its channel is from the secret that the second
+    // device was handed. Data now flows: A publishes, B reads it, as an
+    // entry that A signed.
+    holds_the_name(&a);
+    holds_the_name(&b);
+    publishes(&a, "hello", serde_json::json!({ "text": "hello from a" }));
+    wait_for("b receives a's entry", &all, 90, || {
+        held(&b)
             .iter()
-            .any(|i| i["content"]["text"] == "hello from a" && i["signature_valid"] == true)
+            .any(|e| {
+                e["content"]["text"] == "hello from a" && e["authors"] == serde_json::json!([a_key])
+            })
             .then_some(())
     });
 
-    // Nothing is waiting: every invite was applied.
-    let invites = b.cli(&["old-invites"]);
-    assert!(invites.contains("No invites waiting"), "{invites}");
-
-    // Keyed items (§4.3): A writes a key, B reads it; B edits, A sees it.
+    // Keyed entries (§4.3): A writes a key, B reads it; B edits, A sees it.
     let entry = |n: &Node, key: &str| -> Option<(String, u64)> {
-        let resp = n.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        );
-        resp["entries"]
-            .as_array()?
-            .iter()
-            .find(|e| e["key"] == key)
-            .map(|e| {
-                (
-                    e["content"]["text"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    e["rev"].as_u64().unwrap_or(0),
-                )
-            })
+        held(n).iter().find(|e| e["key"] == key).map(|e| {
+            (
+                e["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                e["rev"].as_u64().unwrap_or(0),
+            )
+        })
     };
-    let written = a.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "key": "notes.md", "content": { "text": "v1" } }),
-    );
+    let written = publishes(&a, "notes.md", serde_json::json!({ "text": "v1" }));
     assert_eq!(written["rev"], 1, "{written}");
+    // It was published over no version.
+    assert!(written["over"].is_null(), "{written}");
     wait_for("b reads a's key", &all, 90, || {
         (entry(&b, "notes.md")? == ("v1".to_string(), 1)).then_some(())
     });
-    b.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "key": "notes.md", "content": { "text": "v2 from b" } }),
+    let edited = publishes(&b, "notes.md", serde_json::json!({ "text": "v2 from b" }));
+    // And the edit over the version that B had read: A's entry.
+    assert_eq!(edited["over"]["rev"], 1, "{edited}");
+    assert_eq!(
+        edited["over"]["entries"],
+        serde_json::json!([written["entry"]]),
+        "{edited}"
     );
     wait_for("a reads b's edit", &all, 90, || {
         (entry(&a, "notes.md")? == ("v2 from b".to_string(), 2)).then_some(())
     });
 
-    // Deleting a key replicates as a tombstone revision (§4.4).
+    // Deleting a key replicates as a delete at the next revision (§4.4).
     let deleted = a.post(
         "/api/v1/channels/delete-key",
-        serde_json::json!({ "channel": personal, "key": "notes.md" }),
+        serde_json::json!({ "channel": NAME, "key": "notes.md" }),
     );
     assert_eq!(deleted["rev"], 3, "{deleted}");
     wait_for("b sees the key deleted", &all, 90, || {
-        let resp = b.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        );
-        resp["entries"]
-            .as_array()?
+        held(&b)
             .iter()
             .any(|e| e["key"] == "notes.md" && e["deleted"] == true && e["rev"] == 3)
             .then_some(())
     });
 
-    // Paging (§4.4a): more items than one sync page, all arrive.
+    // Paging (§4.4a): more entries than one page of a channel's list, all
+    // arrive.
     const BULK: usize = 150;
     for i in 0..BULK {
-        a.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "content": { "text": format!("bulk {i}") } }),
+        publishes(
+            &a,
+            &format!("bulk-{i:03}"),
+            serde_json::json!({ "text": format!("bulk {i}") }),
         );
     }
-    wait_for("b receives every bulk item", &all, 120, || {
-        let listened = b.post(
-            "/api/v1/channels/listen",
-            serde_json::json!({ "channel": personal, "limit": 500 }),
-        );
-        let got = listened["items"]
-            .as_array()?
+    wait_for("b receives every bulk entry", &all, 120, || {
+        let got = held(&b)
             .iter()
-            .filter(|i| {
-                i["content"]["text"]
+            .filter(|e| {
+                e["content"]["text"]
                     .as_str()
                     .is_some_and(|t| t.starts_with("bulk "))
             })
@@ -273,9 +412,8 @@ fn peer_keys(n: &Node) -> Vec<String> {
 fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     // The topology we run: two relays that list each other, a device that
     // reaches both, and a device that reaches only one. Everything is
-    // judged by items arriving, not by what the nodes say about themselves.
+    // judged by entries arriving, not by what the nodes say about themselves.
     let mut r1 = node("relay1", "relay", None);
-    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
     let mut r2 = node_with_relays(
         "relay2",
         "relay",
@@ -286,10 +424,7 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
     wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
     r2.start();
     wait_for("relay2 healthy", &[&r1, &r2], 30, || healthy(&r2));
-    let (r1_key, r2_key) = (
-        r1.cli(&["id"]).trim().to_string(),
-        r2.cli(&["id"]).trim().to_string(),
-    );
+    let (r1_key, r2_key) = (key_of(&r1), key_of(&r2));
     wait_for("the relays mesh", &[&r1, &r2], 60, || {
         (peer_keys(&r1).contains(&r2_key) && peer_keys(&r2).contains(&r1_key)).then_some(())
     });
@@ -314,42 +449,22 @@ fn two_relays_and_two_devices_keep_delivering_through_restarts() {
         });
     }
 
-    let b_key = b.cli(&["id"]).trim().to_string();
-    let a_key = a.cli(&["id"]).trim().to_string();
-    a.cli(&["old-add-device", &b_key, "--name", "b"]);
-    b.cli(&["old-accept", &a_key, "--name", "a"]);
-    let personal = groups(&a)
-        .into_iter()
-        .next()
-        .expect("a has a personal channel");
-    wait_for(
-        "b joins a's personal channel",
-        &[&r1, &r2, &a, &b],
-        90,
-        || groups(&b).contains(&personal).then_some(()),
-    );
+    // The two are one person's devices, and both hold a name.
+    pair(&a, &b, "b", &[&r1, &r2, &a, &b]);
+    holds_the_name(&a);
+    holds_the_name(&b);
 
-    // `from` publishes `text`; it must arrive at `to`.
+    // `from` publishes `text`, under a key of its own; it must arrive at
+    // `to`.
+    let sent = std::cell::Cell::new(0);
     let deliver = |from: &Node, to: &Node, text: &str, all: &[&Node]| {
-        from.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "content": { "text": text } }),
-        );
+        let key = format!("sent-{:02}", sent.replace(sent.get() + 1));
+        publishes(from, &key, serde_json::json!({ "text": text }));
         wait_for(
             &format!("{} receives {text:?} from {}", to.name, from.name),
             all,
             150,
-            || {
-                let listened = to.post(
-                    "/api/v1/channels/listen",
-                    serde_json::json!({ "channel": personal, "limit": 100 }),
-                );
-                listened["items"]
-                    .as_array()?
-                    .iter()
-                    .any(|i| i["content"]["text"] == text)
-                    .then_some(())
-            },
+            || reads(to, &key, text),
         );
     };
     deliver(&a, &b, "first", &[&r1, &r2, &a, &b]);
@@ -524,14 +639,22 @@ fn a_relay_that_is_down_is_shown_and_found_when_it_comes_up() {
 /// - What a device writes afterwards still reaches the other one through
 ///   that relay. A device keeps its place in each channel's list at a
 ///   relay; the rebuilt relay starts its list again, so a place kept from
-///   before would skip everything it stores from then on. The place lasts
-///   only as long as the connection.
-/// - What was written before is put back. A relay is a cache: it asks the
-///   devices that connect to it which channels they hold, and fetches what
-///   it lacks. So a device added afterwards, which has only the relay to
-///   fetch from, gets all of it.
-#[test]
-fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
+///   before would skip everything it stores from then on. The place is
+///   kept with the mark that the relay gives its holding of the channel,
+///   and a new holding is read from the start.
+/// - What was written before is put back. A relay is a cache, and its
+///   devices are where the entries are: a device that proves a channel of
+///   its own to a relay which holds nothing of it sends that relay what it
+///   holds (decision 2026-10-04 §2.4, §4.6). So a device added afterwards,
+///   which has only the relay to fetch from, gets all of it.
+/// - The same holds of the older kind of channel, which a relay carries as
+///   it did (decision 2026-10-04 §10) and which no device of this version
+///   holds: there it is the relay that asks whoever connects which
+///   channels it holds, and fetches what it lacks. A stand-in for a device
+///   of that kind shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
+    const OLDER: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -545,23 +668,11 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
             has_hot_peer(n)
         });
     }
-    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
-    let publish = |n: &Node, key: &str, text: &str| {
-        n.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
-        )
-    };
-    let reads = |n: &Node, key: &str, text: &str| {
-        n.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        )["entries"]
-            .as_array()?
-            .iter()
-            .any(|e| e["key"] == key && e["content"]["text"] == text)
-            .then_some(())
-    };
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    holds_the_name(&a);
+    holds_the_name(&b);
+    let publish =
+        |n: &Node, key: &str, text: &str| publishes(n, key, serde_json::json!({ "text": text }));
 
     // Enough goes through the relay for B's place in the channel's list to
     // be well past where the rebuilt relay will start again.
@@ -571,6 +682,12 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     wait_for("b reads what a wrote", &[&relay, &a, &b], 90, || {
         reads(&b, "before-4.md", "before")
     });
+    // And an entry of the older kind, from what stands in for a device
+    // that holds one.
+    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let before = entry_in(&older, OLDER, vec![7; 40]);
+    let ack = push_to(&relay, older.clone(), std::slice::from_ref(&before)).await;
+    assert_eq!(ack.stored, 1, "{ack:?}");
 
     // The relay comes back with nothing. Both devices find it again.
     relay.stop();
@@ -592,8 +709,8 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
         || reads(&b, "after.md", "after"),
     );
 
-    // A relay is a cache. It fetches again from its devices what it lost:
-    // a device added now, which has only the relay to fetch from, gets all
+    // A relay is a cache. Its devices send it again what it lost: a
+    // device added now, which has only the relay to fetch from, gets all
     // of it.
     let mut d = node("d", "personal", Some(relay.p2p));
     d.start();
@@ -601,6 +718,7 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     wait_for("d healthy", &all, 30, || healthy(&d));
     wait_for("d connected to the relay", &all, 60, || has_hot_peer(&d));
     pair(&a, &d, "d", &all);
+    holds_the_name(&d);
     wait_for(
         "the new device reads what was written before the relay lost its database",
         &all,
@@ -612,17 +730,35 @@ fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
         },
     );
 
+    // Of the older kind the relay fetches again what it lost, from what
+    // stands in for a device that holds it: it asks whoever connects
+    // which channels it holds.
+    let stored = |relay: &Node| -> u64 {
+        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
+            ["items_stored"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(stored(&relay), 0);
+    let (_manager, conn) = client_of(&relay, older).await;
+    serves_the_older_kind(&conn, vec![before]);
+    wait_for(
+        "the relay fetches the entry of the older kind again",
+        &[&relay],
+        90,
+        || (stored(&relay) == 1).then_some(()),
+    );
     // The relay says that it fetched, and says from which channel only for
     // debugging.
     let log = std::fs::read_to_string(relay.log()).unwrap();
     assert!(log.contains("pull-sync page complete"), "{log}");
-    assert_names_channels_only_for_debugging(&relay, &[&personal]);
+    assert_names_channels_only_for_debugging(&relay, &[OLDER]);
 }
 
 /// A device with a great many small entries to send is never the one its
-/// relay refuses. A relay counts each entry as its ciphertext and what an
+/// relay refuses. A relay counts each entry as its content and what an
 /// entry takes beyond it, and a device paces itself by the same count: if
-/// it counted ciphertext alone, it would send several times what the relay
+/// it counted content alone, it would send several times what the relay
 /// allows a connection, and be refused and then cut off.
 #[test]
 fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
@@ -640,28 +776,41 @@ fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
             has_hot_peer(n)
         });
     }
-    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
-    let relay_holds = |relay: &Node| -> u64 {
-        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"]))
-            .unwrap()["items_stored"]
-            .as_u64()
-            .unwrap()
-    };
-    let before = relay_holds(&relay);
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    holds_the_name(&a);
+    wait_for("a has sent what it holds so far", &[&relay, &a], 90, || {
+        (a.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
+    });
+    let before = entries_at(&relay);
 
-    // About a kilobyte each: a megabyte of content, which costs two.
+    // About a kilobyte each as an entry holds it: a megabyte of content,
+    // which costs two.
     let text = "x".repeat(900);
     for n in 0..ENTRIES {
-        a.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "content": { "n": n, "text": text } }),
+        publishes(
+            &a,
+            &format!("small-{n:04}"),
+            serde_json::json!({ "n": n, "text": text }),
         );
     }
     wait_for("the relay holds every entry", &[&relay, &a], 240, || {
-        (relay_holds(&relay) >= before + ENTRIES).then_some(())
+        (entries_at(&relay) >= before + ENTRIES).then_some(())
     });
+    // Each is held as what was meant: a kilobyte of content.
+    let of_a_kilobyte: i64 = store_of(&relay)
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE length(content) = 1024",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(of_a_kilobyte as u64, ENTRIES);
     let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
-    for refusal in ["push over the byte allowance", "rate limit exceeded"] {
+    for refusal in [
+        "over the byte allowance",
+        "rate limit exceeded",
+        "over its rate limits",
+    ] {
         assert!(
             !log.contains(refusal),
             "the relay refused its device: {refusal}"
@@ -673,15 +822,21 @@ fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
 /// other as its hot peer, so the devices are warm at both. Both relays lose
 /// their databases while the devices are away.
 ///
-/// A relay is a cache, and its devices are where the entries are: it asks
-/// each device that connects which channels it holds, and fetches what it
-/// lacks, whether or not it counts that device among its hot peers. A device
-/// added afterwards, which has only the relays to fetch from, gets what was
-/// written before.
-#[test]
-fn relays_that_list_each_other_are_filled_again_by_their_devices() {
+/// A relay is a cache, and its devices are where the entries are: each
+/// device that connects sends a relay which holds nothing of a channel of
+/// its own what it holds, whether or not the relay counts that device
+/// among its hot peers. A device added afterwards, which has only the
+/// relays to fetch from, gets what was written before.
+///
+/// Of the older kind of channel, which a relay carries as it did (decision
+/// 2026-10-04 §10), it is the relay that asks each peer that connects
+/// which channels it holds, and fetches what it lacks, whether or not it
+/// counts that peer among its hot ones: a stand-in for a device of that
+/// kind shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_that_list_each_other_are_filled_again_by_their_devices() {
+    const OLDER: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
     let mut r1 = node("relay1", "relay", None);
-    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
     let mut r2 = node_with_relays(
         "relay2",
         "relay",
@@ -713,29 +868,25 @@ fn relays_that_list_each_other_are_filled_again_by_their_devices() {
             (peer_keys(n).len() == 2).then_some(())
         });
     }
-    let personal = pair(&a, &b, "b", &[&r1, &r2, &a, &b]);
-    let publish = |n: &Node, key: &str, text: &str| {
-        n.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
-        )
-    };
-    let reads = |n: &Node, key: &str, text: &str| {
-        n.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        )["entries"]
-            .as_array()?
-            .iter()
-            .any(|e| e["key"] == key && e["content"]["text"] == text)
-            .then_some(())
-    };
+    pair(&a, &b, "b", &[&r1, &r2, &a, &b]);
+    holds_the_name(&a);
+    holds_the_name(&b);
     for n in 0..5 {
-        publish(&a, &format!("before-{n}.md"), "before");
+        publishes(
+            &a,
+            &format!("before-{n}.md"),
+            serde_json::json!({ "text": "before" }),
+        );
     }
     wait_for("b reads what a wrote", &[&r1, &r2, &a, &b], 90, || {
         reads(&b, "before-4.md", "before")
     });
+    // And an entry of the older kind, from what stands in for a device
+    // that holds one.
+    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let before = entry_in(&older, OLDER, vec![7; 40]);
+    let ack = push_to(&r1, older.clone(), std::slice::from_ref(&before)).await;
+    assert_eq!(ack.stored, 1, "{ack:?}");
 
     // The devices are away, and both relays come back with nothing. They
     // find each other first, so each has its hot peer before a device
@@ -756,6 +907,38 @@ fn relays_that_list_each_other_are_filled_again_by_their_devices() {
     wait_for("the relays mesh again", &[&r1, &r2], 120, || {
         meshed(&r1, &r2)
     });
+
+    // Of the older kind, a relay asks whoever connects, hot or not: what
+    // stands in for a device connects to the first relay, is no hot peer
+    // of it, and is asked for what the relay lacks.
+    let stored = |relay: &Node| -> u64 {
+        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
+            ["items_stored"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(stored(&r1), 0);
+    {
+        let older_key = cordelia_crypto::bech32::encode_public_key(&older.public_key()).unwrap();
+        let (_manager, conn) = client_of(&r1, older).await;
+        serves_the_older_kind(&conn, vec![before]);
+        wait_for(
+            "the relay fetches the entry of the older kind again",
+            &[&r1, &r2],
+            90,
+            || (stored(&r1) == 1).then_some(()),
+        );
+        let listed = r1.get("/api/v1/peers").unwrap();
+        let as_a_peer = listed["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["key"] == older_key.as_str())
+            .unwrap_or_else(|| panic!("the relay does not list what stands in: {listed}"));
+        assert_ne!(as_a_peer["state"], "hot", "{listed}");
+        conn.close(0u32.into(), b"done");
+    }
+
     a.start();
     b.start();
     for n in [&a, &b] {
@@ -793,6 +976,7 @@ fn relays_that_list_each_other_are_filled_again_by_their_devices() {
         (peer_keys(&d).len() == 2).then_some(())
     });
     pair(&a, &d, "d", &all);
+    holds_the_name(&d);
     wait_for(
         "the new device reads what was written before the relays lost their databases",
         &all,
@@ -806,8 +990,8 @@ fn relays_that_list_each_other_are_filled_again_by_their_devices() {
 }
 
 /// A channel holds more than fits in one message. A device that fetches it
-/// still gets all of it: when a relay cannot answer a request for a whole
-/// page of entries in one message, the device asks for fewer at a time.
+/// still gets all of it: a relay answers a request for a page of entries
+/// with as many as one message holds, and the device asks on from there.
 #[test]
 fn a_channel_larger_than_one_message_still_syncs() {
     let mut relay = node("relay", "relay", None);
@@ -823,16 +1007,19 @@ fn a_channel_larger_than_one_message_still_syncs() {
             has_hot_peer(n)
         });
     }
-    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    holds_the_name(&a);
+    holds_the_name(&b);
 
     // B is away while A writes twenty entries of 60 KB: 1.2 MB, more than
     // one message holds, and all within one page of the channel's list.
     b.stop();
     let text = "x".repeat(60_000);
     for n in 0..20 {
-        a.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "key": format!("big-{n:02}.md"), "content": { "text": text } }),
+        publishes(
+            &a,
+            &format!("big-{n:02}.md"),
+            serde_json::json!({ "text": text }),
         );
     }
     wait_for("a's entries reached the relay", &[&relay, &a], 120, || {
@@ -843,11 +1030,7 @@ fn a_channel_larger_than_one_message_still_syncs() {
     let all = [&relay, &a, &b];
     wait_for("b healthy again", &all, 30, || healthy(&b));
     wait_for("b holds all twenty entries", &all, 180, || {
-        let held = b.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        )["entries"]
-            .as_array()?
+        let held = held(&b)
             .iter()
             .filter(|e| e["key"].as_str().is_some_and(|k| k.starts_with("big-")))
             .count();
@@ -1265,7 +1448,7 @@ fn a_command_asks_its_own_node_and_no_proxy() {
         command.output().unwrap()
     };
     // One that reads, one that posts, and the one that does both.
-    for args in [&["peers", "--json"][..], &["old-devices"], &["status"]] {
+    for args in [&["peers", "--json"][..], &["devices"], &["status"]] {
         let out = run(args);
         assert!(
             out.status.success(),
@@ -1278,8 +1461,9 @@ fn a_command_asks_its_own_node_and_no_proxy() {
     // The answers came from the node: its own key is in what it lists,
     // and `status`, which succeeds whether or not it reached a node, says
     // that it did.
-    let listed = String::from_utf8_lossy(&run(&["old-devices"]).stdout).into_owned();
-    assert!(listed.contains("this device"), "{listed}");
+    let listed = String::from_utf8_lossy(&run(&["devices"]).stdout).into_owned();
+    let own = format!("This device: {}", key_of(&n));
+    assert!(listed.contains(&own), "{listed}");
     let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
     assert!(status.contains("Running:   yes"), "{status}");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1304,7 +1488,7 @@ fn a_command_asks_no_address_but_the_nodes_own() {
     for other in ["127.0.0.2", "localhost"] {
         let given = [("CORDELIA_BIND_ADDRESS", other)];
         let named = format!("'{other}'");
-        for args in [&["peers", "--json"][..], &["old-devices"]] {
+        for args in [&["peers", "--json"][..], &["devices"]] {
             let out = n.command_given(&given, args);
             let said = String::from_utf8_lossy(&out.stderr);
             assert!(!out.status.success(), "cordelia {args:?}");
@@ -1399,12 +1583,10 @@ fn a_node_at_the_ipv6_address_is_reached_there() {
         said.contains("Running:   yes").then_some(())
     };
     wait_for("the node to answer at ::1", &[&n], 30, running);
-    let out = n.command_given(&given, &["old-devices"]);
+    let out = n.command_given(&given, &["devices"]);
     let listed = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && listed.contains("this device"),
-        "{listed}"
-    );
+    let own = format!("This device: {}", key_of(&n));
+    assert!(out.status.success() && listed.contains(&own), "{listed}");
 
     // There, as the node says when it starts.
     let log = std::fs::read_to_string(n.log()).unwrap();
@@ -1484,7 +1666,7 @@ fn a_command_follows_no_redirect() {
     assert!(said.contains("Running:   no (start it"), "{said}");
     // One that reads, and one that posts: each fails, says that what
     // answered is not the node, and repeats nothing of what it said.
-    for args in [&["peers", "--json"][..], &["old-devices"]] {
+    for args in [&["peers", "--json"][..], &["devices"]] {
         let out = n.command(args);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "cordelia {args:?}: {said}");
@@ -1499,7 +1681,7 @@ fn a_command_follows_no_redirect() {
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
-    let stderr = n.refused(&["old-devices"]);
+    let stderr = n.refused(&["devices"]);
     assert!(stderr.contains("cordelia start"), "{stderr}");
 
     // `status` still works, and says the node is not running.
@@ -1530,8 +1712,8 @@ fn cli_reports_when_the_node_is_not_running() {
     );
 }
 
-/// Claude Code's folder under `home` for `dir`, named as Claude Code names
-/// it: every character that is not a letter or a digit becomes `-`.
+/// A clone of this repository at `rel` under `home`: a git repository
+/// whose remote is this project's. Returns where it is.
 fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
     let repo = home.join(rel);
     std::fs::create_dir_all(&repo).unwrap();
@@ -1579,9 +1761,10 @@ fn mapped_names(snapshot: &serde_json::Value) -> Vec<String> {
 
 /// The product, end to end: two machines, each with its own home, Claude
 /// Code folder, and clone of the same repository at a different path.
-/// After pairing, `cordelia sync claude` and mapping the same names on
-/// both, memory Claude writes on one machine appears on the other. Until a
-/// folder is mapped, nothing of it leaves the machine.
+/// Once the two are one person's devices, with `cordelia sync claude` and
+/// the same names mapped on both, memory Claude writes on one machine
+/// appears on the other. Until a folder is mapped, nothing of it leaves
+/// the machine.
 #[test]
 fn claude_memory_syncs_between_two_machines() {
     const PROJECT: &str = "github.com/seed-drill/cordelia-node";
@@ -1598,11 +1781,6 @@ fn claude_memory_syncs_between_two_machines() {
         wait_for("node healthy", &all, 30, || healthy(n));
         wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
     }
-    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
-    let state = |n: &Node| -> serde_json::Value {
-        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
-    };
 
     // Each machine: home memory and a clone at a different path. A also has
     // a folder that is not a repository.
@@ -1616,17 +1794,10 @@ fn claude_memory_syncs_between_two_machines() {
     std::fs::create_dir_all(&a_notes).unwrap();
     let a_notes_mem = claude_folder(&a.home(), &a_notes);
 
-    // Pair, then switch sync on.
-    let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["old-add-device", &b_key]);
-    let a_key = added
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
-        .unwrap()
-        .to_string();
-    b.cli(&["old-accept", &a_key]);
+    // The two become one person's devices, and then sync is switched on.
+    pair(&a, &b, "b", &all);
     for n in [&a, &b] {
-        let out = n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        let out = sync_on(n);
         assert!(out.starts_with("Sync turned on.\n"), "{out}");
     }
 
@@ -1834,11 +2005,9 @@ fn claude_memory_syncs_between_two_machines() {
     // each synced folder with its name and where it is.
     let snapshot = state(&a);
     assert_eq!(snapshot["peers"]["list"][0]["role"], "relay", "{snapshot}");
-    assert_eq!(
-        snapshot["devices"].as_array().unwrap().len(),
-        2,
-        "{snapshot}"
-    );
+    let person = &snapshot["person"];
+    let listed = |which: &str| person[which].as_array().map_or(0, Vec::len);
+    assert_eq!(listed("devices") + listed("added"), 2, "{snapshot}");
     let project = snapshot["sync"]["projects"]
         .as_array()
         .unwrap()
@@ -1848,7 +2017,10 @@ fn claude_memory_syncs_between_two_machines() {
     assert_eq!(project["mapped"], true, "{snapshot}");
     assert_eq!(project["cwd"], path(&a_repo), "{snapshot}");
     assert!(
-        project["channel"].as_str().unwrap().starts_with("grp_"),
+        project["channel"]
+            .as_str()
+            .unwrap()
+            .starts_with("cordelia_ch1"),
         "{snapshot}"
     );
     assert!(project["last_published_at"].is_string(), "{snapshot}");
@@ -2010,11 +2182,6 @@ fn home_memory_syncs_under_any_name() {
         wait_for("node healthy", &all, 30, || healthy(n));
         wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
     }
-    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
-    let state = |n: &Node| -> serde_json::Value {
-        serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
-    };
 
     // A's agent starts in its home directory, B's in a folder. Beside
     // them, a second folder on each, which syncs throughout: without it,
@@ -2034,7 +2201,7 @@ fn home_memory_syncs_under_any_name() {
 
     pair(&a, &b, "b", &all);
     for n in [&a, &b] {
-        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        sync_on(n);
     }
     // The node says what version it is, beside the command's own.
     let s = state(&a);
@@ -2335,11 +2502,11 @@ fn home_memory_syncs_under_any_name() {
 }
 
 /// One edit on one machine against two on the other, made while the two
-/// cannot reach each other (#79). The second of the two is at a higher
-/// revision than the one, and its entry does not say that it was written
-/// after it. Both machines end with the later text in the file, as they
-/// always did, and with the one edit in a conflict file beside it, where
-/// it used to be in no file on either.
+/// cannot reach each other. The second of the two is at a higher revision
+/// than the one, and its chain does not hold the one: it descends from
+/// the first of the two, and from the text that both machines had
+/// (decision 2026-10-04 §7.3). Both machines end with the later text in
+/// the file, and with the one edit in a conflict file beside it.
 #[test]
 fn an_edit_overtaken_while_apart_is_kept_on_both_machines() {
     let mut relay = node("relay", "relay", None);
@@ -2355,14 +2522,12 @@ fn an_edit_overtaken_while_apart_is_kept_on_both_machines() {
             has_hot_peer(n)
         });
     }
-    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
     let a_mem = claude_folder(&a.home(), &a.home());
     let b_mem = claude_folder(&b.home(), &b.home());
 
     pair(&a, &b, "b", &[&relay, &a, &b]);
     for n in [&a, &b] {
-        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        sync_on(n);
         n.cli(&["sync", "map", &path(&n.home()), "--home"]);
     }
     std::fs::write(a_mem.join("notes.md"), "base\n").unwrap();
@@ -2450,14 +2615,12 @@ fn what_sync_replaced_or_removed_is_put_back_from_either_machine() {
             has_hot_peer(n)
         });
     }
-    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
     let a_mem = claude_folder(&a.home(), &a.home());
     let b_mem = claude_folder(&b.home(), &b.home());
 
     pair(&a, &b, "b", &[&relay, &a, &b]);
     for n in [&a, &b] {
-        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        sync_on(n);
         n.cli(&["sync", "map", &path(&n.home()), "--home"]);
     }
     // Both machines hold `name` with `text`, or neither holds it.
@@ -2676,14 +2839,12 @@ fn a_memory_deleted_with_its_line_comes_back_listed(restart: bool) {
             has_hot_peer(n)
         });
     }
-    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
-    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
     let a_mem = claude_folder(&a.home(), &a.home());
     let b_mem = claude_folder(&b.home(), &b.home());
 
     pair(&a, &b, "b", &[&relay, &a, &b]);
     for n in [&a, &b] {
-        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        sync_on(n);
         n.cli(&["sync", "map", &path(&n.home()), "--home"]);
     }
     let line = "- [Notes](notes.md) what was noted\n";
@@ -2779,8 +2940,9 @@ fn the_line_of_a_memory_that_comes_back_is_put_back_after_a_restart() {
 
 /// The files under a node's directory that contain `needle`, as raw
 /// bytes: its database and the write-ahead log beside it, where SQLite
-/// keeps text as it was written, and its log.
-fn files_holding(n: &Node, needle: &str) -> Vec<PathBuf> {
+/// keeps text and bytes as they were written, and its log.
+fn files_holding(n: &Node, needle: impl AsRef<[u8]>) -> Vec<PathBuf> {
+    let needle = needle.as_ref();
     let mut found = Vec::new();
     let mut dirs = vec![n.dir.path().to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -2789,7 +2951,7 @@ fn files_holding(n: &Node, needle: &str) -> Vec<PathBuf> {
             if path.is_dir() {
                 dirs.push(path);
             } else if let Ok(bytes) = std::fs::read(&path)
-                && bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+                && bytes.windows(needle.len()).any(|w| w == needle)
             {
                 found.push(path);
             }
@@ -2816,49 +2978,12 @@ fn without_colour(log: &str) -> String {
     plain
 }
 
-/// Whether a log has a line with every one of `words`, and after it a
-/// line with `then`.
-fn says_after(log: &str, words: &[&str], then: &str) -> bool {
-    let mut lines = log.lines();
-    lines.any(|line| words.iter().all(|word| line.contains(word)))
-        && lines.any(|line| line.contains(then))
-}
-
-/// Whether a relay has heard all that a node had to say of its channels
-/// when it told the relay of `channel`. The relay logs, for debugging,
-/// each channel a peer announces and each channel a peer asks it for. A
-/// node announces its channels together, and asks for them in one pass.
-/// So once the relay's log has the announcement of `channel` and the end
-/// of the announcements after it, and a request for `channel` and the end
-/// of that pass after it, the node has said whatever it would say of any
-/// other channel it held at the time.
-fn heard_all_with(relay: &Node, channel: &str) -> Option<()> {
-    let log = std::fs::read_to_string(relay.log()).ok()?;
-    (says_after(
-        &log,
-        &["peer announced channel", channel],
-        "peer announced channels",
-    ) && says_after(
-        &log,
-        &["served sync request", channel],
-        "inbound sync stream complete",
-    ))
-    .then_some(())
-}
-
 /// A node's entity ID, from its configuration.
 fn entity_id(n: &Node) -> String {
     cordelia_core::config::Config::load(&n.config())
         .unwrap()
         .identity
         .entity_id
-}
-
-/// A node's key, and its inbox, which it has from its first start and
-/// tells its relay of.
-fn key_and_inbox(n: &Node) -> ([u8; 32], String) {
-    let key = cordelia_crypto::bech32::decode_public_key(n.cli(&["id"]).trim()).unwrap();
-    (key, cordelia_storage::naming::inbox_channel_id(&key))
 }
 
 /// The key files a node keeps for swarm channels.
@@ -2879,7 +3004,7 @@ fn swarm_key_files(n: &Node) -> Vec<String> {
 /// holds the node's entity ID. Returns the ID.
 fn swarm_channel_as_an_earlier_version_made_it(n: &Node) -> String {
     let id = cordelia_storage::naming::swarm_channel_id(&entity_id(n));
-    let (pk, _) = key_and_inbox(n);
+    let pk = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
     let psk = cordelia_crypto::generate_psk().unwrap();
     let now = "2026-10-01T00:00:00+00:00";
     let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
@@ -2897,6 +3022,39 @@ fn swarm_channel_as_an_earlier_version_made_it(n: &Node) -> String {
     .unwrap();
     cordelia_storage::psk::write_psk(&n.data_dir(), &id, &psk).unwrap();
     id
+}
+
+/// Put in a node's database an entry of the channel `channel` of the
+/// older kind, as the node of an earlier version wrote one there: signed
+/// with the node's own key, and sent to no relay yet. Returns its ID.
+fn entry_as_an_earlier_version_wrote_it(n: &Node, channel: &str) -> String {
+    let own =
+        cordelia_crypto::identity::NodeIdentity::from_file(&n.data_dir().join("identity.key"))
+            .unwrap();
+    let entry = entry_in(&own, channel, vec![9; 40]);
+    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let stored = cordelia_storage::items::insert_item(
+        &db,
+        &cordelia_storage::items::NewItem {
+            item_id: &entry.item_id,
+            channel_id: channel,
+            author_id: &own.public_key(),
+            item_type: &entry.item_type,
+            published_at: &entry.published_at,
+            parent_id: None,
+            key_version: 1,
+            content_hash: &entry.content_hash,
+            signature: &entry.signature,
+            encrypted_blob: &entry.encrypted_blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
+        },
+    )
+    .unwrap();
+    assert!(stored, "the entry was not stored");
+    entry.item_id
 }
 
 /// A relay names a channel in its log only for debugging. Its log does
@@ -2920,13 +3078,13 @@ fn assert_names_channels_only_for_debugging(relay: &Node, channels: &[&str]) {
 
 /// What a relay must never be told: a swarm channel's ID, which holds an
 /// entity ID, and the entity ID of the node it serves. Nothing the relay
-/// has written to disk holds either: not its log, where it notes each
-/// channel it is told of, and not its database, where it keeps what it is
-/// sent. What it was told is there: `told` is.
-fn assert_told_no_id_that_holds_a_name(relay: &Node, of: &Node, told: &str) {
+/// has written to disk holds either: not its log, and not its database,
+/// where it keeps what it is sent. What it was told is there: `told`, the
+/// ID of a channel of the node's own, is.
+fn assert_told_no_id_that_holds_a_name(relay: &Node, of: &Node, told: &[u8; 32]) {
     assert!(
         !files_holding(relay, told).is_empty(),
-        "the relay was told of {told}, so that should be on its disk"
+        "the relay was told of a channel, so its ID should be on its disk"
     );
     let entity = entity_id(of);
     for needle in [cordelia_storage::naming::SWARM_CHANNEL_PREFIX, &entity] {
@@ -2942,8 +3100,10 @@ fn assert_told_no_id_that_holds_a_name(relay: &Node, of: &Node, told: &str) {
 /// personal node made a swarm channel for itself each time it started,
 /// whose ID holds its entity ID, and told its relay of it. A node that
 /// starts and reaches its relay now holds no such channel and no key for
-/// one, and its relay is told no channel ID that begins as a swarm
-/// channel's does, and none that holds the node's entity ID.
+/// one. What it tells its relay of is the channels of its own, from a
+/// secret, once it follows a recovery phrase: its relay is told no channel
+/// ID that begins as a swarm channel's does, and none that holds the
+/// node's entity ID.
 #[test]
 fn a_node_makes_no_swarm_channel_and_tells_its_relay_of_none() {
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
@@ -2956,11 +3116,8 @@ fn a_node_makes_no_swarm_channel_and_tells_its_relay_of_none() {
     wait_for("node healthy", &all, 30, || healthy(&a));
     wait_for("connected to the relay", &all, 60, || has_hot_peer(&a));
 
-    let (_, inbox) = key_and_inbox(&a);
-    wait_for("the relay hears of the node's channels", &all, 90, || {
-        heard_all_with(&relay, &inbox)
-    });
-    assert_told_no_id_that_holds_a_name(&relay, &a, &inbox);
+    let told = tells_its_relay_of_its_name(&a, &relay);
+    assert_told_no_id_that_holds_a_name(&relay, &a, &told);
 
     // The node holds none, and so had none to remove.
     let channels = a.cli(&["channels"]);
@@ -2994,11 +3151,8 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     let all = [&relay, &b];
     wait_for("node healthy", &all, 30, || healthy(&b));
     wait_for("connected to the relay", &all, 60, || has_hot_peer(&b));
-    let (_, inbox) = key_and_inbox(&b);
-    wait_for("the relay hears of the node's channels", &all, 90, || {
-        heard_all_with(&relay, &inbox)
-    });
-    assert_told_no_id_that_holds_a_name(&relay, &b, &inbox);
+    let told = tells_its_relay_of_its_name(&b, &relay);
+    assert_told_no_id_that_holds_a_name(&relay, &b, &told);
 
     // The channel is gone from the node, and its key with it.
     let channels = b.cli(&["channels"]);
@@ -3021,12 +3175,23 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
 /// node holds the channel. No command puts a swarm channel in a node that
 /// is running, and a node removes one when it starts, so the test puts it
 /// there: in the database of a running node, as an earlier version made
-/// it. The node then writes to it, and to a group it makes afterwards.
-/// The relay is told of the group in every way a node tells a relay of a
-/// channel (an announcement, a request for its entries, and an entry
-/// pushed to it) and in none of them of the swarm channel.
-#[test]
-fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
+/// it, with an entry in it that the node wrote and that no relay was
+/// sent. The node goes on writing under a name it holds, and its relay is
+/// sent that: what a device tells a relay of is the channels of its own,
+/// from a secret, and nothing of a channel of the older kind (decision
+/// 2026-10-04 §10). Nothing that the relay has written to disk holds the
+/// swarm channel's ID, the node's entity ID, or the entry.
+///
+/// A relay carries the older kind of channel as it did, and of the
+/// channels of that kind that it is told of it says how many as a matter
+/// of course, and which only for debugging. A stand-in for a node that
+/// holds a group shows it: it tells the relay of the group in every way a
+/// node of that kind tells a relay of a channel (an announcement, a
+/// request for its entries, and an entry pushed to it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
+    use cordelia_network::channel_announce::{announcement, send_channel_joined};
+    use cordelia_network::messages::Protocol;
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
     let mut relay = node("relay", "relay", None);
     relay.start();
@@ -3036,46 +3201,28 @@ fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     let all = [&relay, &c];
     wait_for("node healthy", &all, 30, || healthy(&c));
     wait_for("connected to the relay", &all, 60, || has_hot_peer(&c));
+    let told = tells_its_relay_of_its_name(&c, &relay);
 
+    // Written before the entry under the name, so that it is first among
+    // what the node holds and has not sent.
     let swarm = swarm_channel_as_an_earlier_version_made_it(&c);
-    let publish = |channel: &str| -> String {
-        let published = c.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": channel, "content": { "text": "an entry" } }),
-        );
-        published["item_id"].as_str().unwrap().to_string()
-    };
-    // Written first, so that it is first among what waits to be sent.
-    let held = publish(&swarm);
-    let group = c.post(
-        "/api/v1/channels/group",
-        serde_json::json!({ "mode": "realtime" }),
-    )["channel_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let sent = publish(&group);
-
-    wait_for("the relay holds the group's entry", &all, 90, || {
-        (!files_holding(&relay, &sent).is_empty()).then_some(())
-    });
-    wait_for("the relay hears of the node's channels", &all, 90, || {
-        heard_all_with(&relay, &group)
-    });
-    assert_told_no_id_that_holds_a_name(&relay, &c, &group);
-    assert_eq!(files_holding(&relay, &held), Vec::<PathBuf>::new());
-    // Of the channels it was told of, the relay says how many as a matter
-    // of course, and which only for debugging.
-    let log = without_colour(&std::fs::read_to_string(relay.log()).unwrap());
-    assert!(
-        log.lines().any(|line| {
-            line.contains("peer announced channels")
-                && line.split_whitespace().nth(1) == Some("INFO")
-        }),
-        "{log}"
+    let held = entry_as_an_earlier_version_wrote_it(&c, &swarm);
+    let before = entries_at(&relay);
+    publishes(
+        &c,
+        "later.md",
+        serde_json::json!({ "text": "a later entry" }),
     );
-    let (_, inbox) = key_and_inbox(&c);
-    assert_names_channels_only_for_debugging(&relay, &[&group, &inbox]);
+    wait_for("the relay holds the later entry", &all, 90, || {
+        (entries_at(&relay) > before).then_some(())
+    });
+    // And a pass or two of the node's own go by, in which it sends what
+    // it has to send.
+    std::thread::sleep(Duration::from_secs(
+        2 * cordelia_core::protocol::REALTIME_SYNC_INTERVAL_SECS,
+    ));
+    assert_told_no_id_that_holds_a_name(&relay, &c, &told);
+    assert_eq!(files_holding(&relay, &held), Vec::<PathBuf>::new());
 
     // The node holds the channel and its entry all the while: the relay
     // was not told because such an ID is not told, not for want of one.
@@ -3086,6 +3233,53 @@ fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     wait_for("nothing is left waiting to be sent", &all, 60, || {
         (c.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
     });
+
+    // The relay, of the older kind: what stands in for a node that holds
+    // a group tells the relay of it in each of the three ways.
+    const GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let (_manager, conn) = client_of(&relay, older.clone()).await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
+        .await
+        .unwrap();
+    send_channel_joined(&mut send, GROUP, &announcement(&older, GROUP))
+        .await
+        .unwrap();
+    let _ = send.finish();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+        .await
+        .unwrap();
+    cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, GROUP, 0, 100)
+        .await
+        .expect("the relay answers a request for a channel's entries");
+    let _ = send.finish();
+    let sent = entry_in(&older, GROUP, vec![8; 40]);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let ack = cordelia_network::item_sync::send_push(&mut stream, std::slice::from_ref(&sent))
+        .await
+        .expect("the relay answers the push");
+    assert_eq!(ack.stored, 1, "{ack:?}");
+    // Of the channels it was told of, the relay says how many as a matter
+    // of course, and which only for debugging. (It notes the announcement
+    // and the request a moment after it has answered each.)
+    wait_for("the relay notes what it was told of", &all, 60, || {
+        let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
+        let names = |told_by: &str| {
+            log.lines()
+                .any(|line| line.contains(told_by) && line.contains(GROUP))
+        };
+        let counts = log.lines().any(|line| {
+            line.contains("peer announced channels")
+                && line.split_whitespace().nth(1) == Some("INFO")
+        });
+        (counts && names("peer announced channel") && names("served sync request")).then_some(())
+    });
+    assert_names_channels_only_for_debugging(&relay, &[GROUP]);
+    // The relay has still been told nothing that holds a name.
+    assert_told_no_id_that_holds_a_name(&relay, &c, &told);
 }
 
 /// A key file that cannot be removed does not stop the node. A node that
@@ -3178,6 +3372,94 @@ async fn client_of(
         .expect("the client connects, as any node may");
     let conn = manager.get_connection(&relay_id).unwrap().clone();
     (manager, conn)
+}
+
+/// Hold `items` as a device of the older kind held its channels, and
+/// answer the relay at the other end of `conn` when it asks: which
+/// channels are held, what each lists, and the entries. For as long as
+/// the connection lasts.
+///
+/// A relay carries the older kind of channel as it did, and a device of
+/// this version holds none of it (decision 2026-10-04 §10): what a relay
+/// does for that kind is shown with this, and with [`push_to`].
+fn serves_the_older_kind(conn: &quinn::Connection, items: Vec<cordelia_network::messages::Item>) {
+    use cordelia_network::codec;
+    use cordelia_network::messages::{
+        FetchResponse, ItemHeader, Protocol, SyncChannelListResponse, SyncResponse, WireMessage,
+    };
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            if !matches!(
+                codec::read_protocol_byte(&mut recv).await,
+                Ok(Protocol::ItemSync)
+            ) {
+                continue;
+            }
+            while let Ok(asked) = codec::read_frame(&mut recv).await {
+                let answer = match asked {
+                    WireMessage::SyncChannelListRequest(_) => {
+                        let mut channel_ids: Vec<String> =
+                            items.iter().map(|i| i.channel_id.clone()).collect();
+                        channel_ids.sort();
+                        channel_ids.dedup();
+                        WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                            channel_ids,
+                        })
+                    }
+                    // An entry's place in its channel's list is its place
+                    // among the entries held, from 1.
+                    WireMessage::SyncRequest(req) => {
+                        let after = req.after_seq.unwrap_or(0);
+                        let of: Vec<(u64, &cordelia_network::messages::Item)> = items
+                            .iter()
+                            .filter(|i| i.channel_id == req.channel_id)
+                            .zip(1u64..)
+                            .map(|(i, seq)| (seq, i))
+                            .collect();
+                        let page: Vec<&(u64, &cordelia_network::messages::Item)> = of
+                            .iter()
+                            .filter(|(seq, _)| *seq > after)
+                            .take(req.limit as usize)
+                            .collect();
+                        let last = page.last().map_or(after, |(seq, _)| *seq);
+                        WireMessage::SyncResponse(SyncResponse {
+                            items: page
+                                .iter()
+                                .map(|(_, i)| ItemHeader {
+                                    item_id: i.item_id.clone(),
+                                    channel_id: i.channel_id.clone(),
+                                    item_type: i.item_type.clone(),
+                                    content_hash: i.content_hash.clone(),
+                                    author_id: i.author_id.clone(),
+                                    signature: i.signature.clone(),
+                                    key_version: i.key_version,
+                                    published_at: i.published_at.clone(),
+                                    is_tombstone: i.is_tombstone,
+                                    parent_id: i.parent_id.clone(),
+                                    slot: i.slot.clone(),
+                                    rev: i.rev,
+                                })
+                                .collect(),
+                            has_more: of.last().is_some_and(|(seq, _)| *seq > last),
+                            last_seq: Some(last),
+                        })
+                    }
+                    WireMessage::FetchRequest(req) => WireMessage::FetchResponse(FetchResponse {
+                        items: items
+                            .iter()
+                            .filter(|i| req.item_ids.contains(&i.item_id))
+                            .cloned()
+                            .collect(),
+                    }),
+                    _ => break,
+                };
+                if codec::write_frame(&mut send, &answer).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Push `items` to `relay` in one push, as a client under `author`'s key.
@@ -3328,14 +3610,19 @@ async fn ask_as_its_relay(
 
 /// A device answers its relay with nothing of a channel whose ID may not
 /// be told to a peer, though it holds the channel and an entry in it (put
-/// there as in the test of what a running node tells its relay). The test
-/// is the relay: it asks the device which channels it holds, and then for
-/// the swarm channel's entries by its ID, and reads both answers off the
-/// stream. The list has the group and not the swarm channel, and the page
-/// for the swarm channel is empty, where the page for the group has its
-/// entry.
+/// there as in the test of what a running node tells its relay). It
+/// answers its relay with nothing of any channel of the older kind: a
+/// device of this version carries none (decision 2026-10-04 §10). The
+/// test is the relay. It asks the device which channels it holds, and for
+/// the swarm channel's entries by its ID; it pushes the device an entry
+/// of that channel; and it announces the channel to it. Each of the three
+/// streams is refused at once, and for that reason; nothing of what was
+/// pushed is stored. On the same connection the device does answer its
+/// relay on a stream that it serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
+    use cordelia_network::channel_announce::{announcement, send_channel_joined};
+    use cordelia_network::messages::Protocol;
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
     let (port, connections) = relay_that_asks();
     let mut a = node("asked-canary", "personal", Some(port));
@@ -3344,35 +3631,28 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
 
     let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
-    let publish = |channel: &str| -> String {
-        let published = a.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": channel, "content": { "text": "an entry" } }),
-        );
-        published["item_id"].as_str().unwrap().to_string()
-    };
-    let held = publish(&swarm);
-    let group = a.post(
-        "/api/v1/channels/group",
-        serde_json::json!({ "mode": "realtime" }),
-    )["channel_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let sent = publish(&group);
+    let held = entry_as_an_earlier_version_wrote_it(&a, &swarm);
 
+    // The control: the device answers its relay on a stream that it does
+    // serve.
     let mut conn = connections
         .recv_timeout(Duration::from_secs(30))
         .expect("the device connected to its relay");
-    let (listed, pages) = wait_for("the device answers its relay", &[&a], 60, || {
+    wait_for("the device answers its relay", &[&a], 60, || {
         // The latest connection, if the device has made another.
         while let Ok(newer) = connections.try_recv() {
             conn = newer;
         }
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let both = [swarm.as_str(), group.as_str()];
-                tokio::time::timeout(Duration::from_secs(5), ask_as_its_relay(&conn, &both))
+                let asked = async {
+                    let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                    let mut stream = tokio::io::join(&mut recv, &mut send);
+                    cordelia_network::peer_sharing::request_peers(&mut stream, 8)
+                        .await
+                        .ok()
+                };
+                tokio::time::timeout(Duration::from_secs(5), asked)
                     .await
                     .ok()
                     .flatten()
@@ -3380,22 +3660,50 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
         })
     });
 
-    // The list: the group, which holds an entry, and not the swarm channel,
-    // which holds one too.
-    assert!(listed.contains(&group), "{listed:?}");
+    // Asked which channels it holds, and for the swarm channel's entries
+    // by its ID: nothing comes back, and at once.
+    let at_once = Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS / 2);
+    let asked = tokio::time::timeout(at_once, ask_as_its_relay(&conn, &[swarm.as_str()])).await;
     assert!(
-        !listed.iter().any(|id| id.starts_with(SWARM_CHANNEL_PREFIX)),
-        "the device listed a swarm channel to its relay: {listed:?}"
+        matches!(asked, Ok(None)),
+        "the device answered its relay: {asked:?}"
     );
-    // The pages: nothing for the swarm channel, and the group's entry.
-    let entries = |page: &cordelia_network::messages::SyncResponse| -> Vec<String> {
-        page.items.iter().map(|h| h.item_id.clone()).collect()
-    };
-    assert_eq!(entries(&pages[0]), Vec::<String>::new());
-    assert!(!pages[0].has_more);
-    assert_eq!(entries(&pages[1]), vec![sent]);
+    // Pushed an entry of the channel: it is not taken.
+    let stranger = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let pushed = entry_in(&stranger, &swarm, vec![7; 40]);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let push = cordelia_network::item_sync::send_push(&mut stream, std::slice::from_ref(&pushed));
+    let ack = tokio::time::timeout(at_once, push).await;
+    assert!(
+        matches!(ack, Ok(Err(_))),
+        "the device answered a push: {ack:?}"
+    );
+    // Told of the channel: the device stops the stream.
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
+        .await
+        .unwrap();
+    let _ = send_channel_joined(&mut send, &swarm, &announcement(&stranger, &swarm)).await;
+    let stopped = tokio::time::timeout(at_once, send.stopped()).await;
+    assert!(
+        matches!(stopped, Ok(Ok(Some(_)))),
+        "the device heard an announcement out: {stopped:?}"
+    );
+    // Each was refused because a device carries no channel of that kind,
+    // and the device says so, for debugging.
+    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
+    for stream in ["item_sync", "item_push", "channel_announce"] {
+        let refused = log.lines().any(|line| {
+            line.contains("a personal node carries no channel of the older kind")
+                && line.contains(&format!("protocol=\"{stream}\""))
+        });
+        assert!(refused, "{stream}: {log}");
+    }
 
-    // The device holds the channel and its entry all the while.
+    // Nothing of what was pushed is stored, and the device holds the
+    // channel and its own entry all the while.
+    assert_eq!(files_holding(&a, &pushed.item_id), Vec::<PathBuf>::new());
     let channels = a.cli(&["channels"]);
     assert!(channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
     assert!(!files_holding(&a, &held).is_empty());
