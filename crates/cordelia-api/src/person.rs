@@ -57,11 +57,12 @@ use zeroize::{Zeroize, Zeroizing};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
+    PERSONAL_APPLIED_SENT,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
 use cordelia_crypto::addition::{AdditionError, SignedAddition};
-use cordelia_crypto::bech32::encode_public_key;
+use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
 use cordelia_crypto::chain;
 use cordelia_crypto::change_entry::{self, ChangeEntryError, DeviceSecret, ForPhrase};
 use cordelia_crypto::derive::{self, DeriveError};
@@ -78,6 +79,7 @@ use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
+use cordelia_storage::sync_state;
 
 /// Why something was not done with what a device holds of its person.
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +236,18 @@ impl Counting {
         }
     }
 
+    /// Who counts where `devices` are the devices of the statement, with
+    /// no key removed and none added since: what a reader counts that is
+    /// handed the list alone.
+    pub fn of_devices(devices: &[[u8; 32]]) -> Self {
+        Self {
+            listed: devices.to_vec(),
+            removed: Vec::new(),
+            added: Vec::new(),
+            added_by_a_listed: Vec::new(),
+        }
+    }
+
     /// Whether `key` counts: the statement lists it as a device, or a
     /// record that counts adds it. A key that the statement lists as
     /// removed never counts.
@@ -334,6 +348,40 @@ pub fn who_counts(conn: &Connection) -> Result<Counting, PersonError> {
         &held.statement.statement,
         &held_rows::additions(conn)?,
     ))
+}
+
+/// The key that a chain names by `signer`, its first 16 bytes (decision
+/// 2026-10-04 §2.3), where this device knows of exactly one such key: a
+/// device of the statement it has applied, a key that a record it keeps
+/// adds, a key that the statement lists as removed, or a key that it
+/// shows as not in the last change. `None` where it knows of none, or of
+/// more than one: a name of 16 bytes is then no key's.
+///
+/// It is for what a person is shown, and decides nothing: whether a link
+/// counts is asked of the keys that count ([`Counting::signer_counts`]).
+pub fn key_signed_as(
+    conn: &Connection,
+    signer: &[u8; 16],
+) -> Result<Option<[u8; 32]>, PersonError> {
+    let Some(held) = held(conn)? else {
+        return Ok(None);
+    };
+    let statement = &held.statement.statement;
+    let mut known: Vec<[u8; 32]> = statement
+        .devices
+        .iter()
+        .map(|device| device.key)
+        .chain(statement.removed.iter().copied())
+        .chain(held_rows::additions(conn)?.iter().map(|record| record.key))
+        .chain(acts::left_out(conn)?.iter().map(|shown| shown.key))
+        .filter(|key| Link::signer_of(key) == *signer)
+        .collect();
+    known.sort_unstable();
+    known.dedup();
+    Ok(match known.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    })
 }
 
 /// What became of a record of an addition that a device saw.
@@ -530,6 +578,30 @@ pub fn applied_name(device: &[u8; 32]) -> Result<String, PersonError> {
     ))
 }
 
+/// What a device's word that it has applied a statement holds (decision
+/// 2026-10-04 §8): the statement's number, and, once the device has sent
+/// what it carried, PERSONAL_APPLIED_SENT after it.
+pub fn applied_word(number: u64, sent: bool) -> String {
+    match sent {
+        true => format!("{number}{PERSONAL_APPLIED_SENT}"),
+        false => number.to_string(),
+    }
+}
+
+/// What a word that a statement is applied says: the statement's number,
+/// and whether the device has sent what it carried. `None` for a text
+/// that is no such word: a number is digits and nothing else, as a device
+/// writes one.
+pub fn read_applied_word(word: &str) -> Option<(u64, bool)> {
+    let (number, sent) = match word.strip_suffix(PERSONAL_APPLIED_SENT) {
+        Some(number) => (number, true),
+        None => (word, false),
+    };
+    let digits = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    let number: u64 = digits.then(|| number.parse().ok()).flatten()?;
+    Some((number, sent))
+}
+
 /// The name, in the personal channel, of a record that adds the device
 /// whose key is `device` (decision 2026-10-04 §6): `added/` and that
 /// device's key, as a device's key is written. Each device that adds the
@@ -611,6 +683,13 @@ pub struct Applied {
     /// among them. Those entries are not read: for this device the slot
     /// held nothing, and there is nothing to say of it.
     pub no_version: Vec<String>,
+    /// The files whose record in a folder was dropped, each as the name
+    /// it syncs under and the file's own name: in its slot the device's
+    /// store held no version at all (decision 2026-10-04 §4.2). Such a
+    /// file meets the new channel as a new file does: it is published as
+    /// this device's own, or, where the channel has a version of that
+    /// name, its text is kept beside it.
+    pub not_carried: Vec<(String, String)>,
 }
 
 /// Decide what a change entry that this device was shown is to it, and
@@ -1146,6 +1225,7 @@ fn come_to(
         left: None,
         carried: 0,
         no_version: Vec::new(),
+        not_carried: Vec::new(),
     };
     if let Some(before) = before {
         let leaving = &before.statement.statement;
@@ -1173,6 +1253,10 @@ fn come_to(
             statement: from.number,
             now,
         };
+        // What the personal channel that is left lists, as this device
+        // held it, is noted before the store drops it: a name that no
+        // device comes to list in the new one is shown (§7.3, §8).
+        crate::names::note_listed_before(conn, &from.secret, from.number, &counting, now)?;
         // From the personal channel, its own entry in each slot: what
         // another key wrote there is not looked at.
         let (carried, _) = carry.channel(
@@ -1187,6 +1271,14 @@ fn come_to(
         for name in &names {
             let old = derive::own_secret(&from.secret, &name.name)?;
             let new = derive::own_secret(&to.secret, &name.name)?;
+            // Each folder's records, which are kept by channel, go to the
+            // name's new channel with each revision renumbered (§4.2). A
+            // record in whose slot the store holds no version is dropped
+            // first: nothing is carried there.
+            let dropped = move_records(conn, &carry, &counting, &old, &new)?;
+            applied
+                .not_carried
+                .extend(dropped.into_iter().map(|file| (name.name.clone(), file)));
             let (carried, no_version) =
                 carry.channel(conn, &old, &new, |key| counting.counts(key), |_| true)?;
             applied.carried += carried;
@@ -1233,7 +1325,56 @@ fn come_to(
     drop_hand_overs(conn, |_| false)?;
 
     write_applied(conn, identity, statement, &to.secret, now)?;
+    // What a name's folders had agreed in a slot that held no version is
+    // noted, for `cordelia devices` to say which files (§4.2).
+    crate::look::note_not_carried(conn, &applied.not_carried)?;
+    // A name that a device lists in the generation it has come to, or
+    // that it left 90 days ago, is noted no more.
+    held_rows::forget_names_before(conn, Some(now))?;
     Ok(applied)
+}
+
+/// Move what the folders of this device had agreed in the channel whose
+/// secret is `from` to the channel whose secret is `to` (decision
+/// 2026-10-04 §4.2): each record of a file, and each record of an index
+/// line, with every revision in them renumbered as a version's is at a
+/// move ([`lifted`]). So a record means in the new channel what it meant
+/// in the old, and the ordinary cycle goes on from where it was.
+///
+/// A record of a file in whose slot the store holds no version at all is
+/// dropped first, and not moved: nothing is carried there, and a record
+/// of a version that the new channel does not hold would have the file
+/// taken for one that was deleted there. Returns the files whose record
+/// was dropped, each once, in order.
+///
+/// It is called before the carry, which drops what the store holds of the
+/// channel that is left.
+fn move_records(
+    conn: &Connection,
+    carry: &Carry,
+    counting: &Counting,
+    from: &[u8; 32],
+    to: &[u8; 32],
+) -> Result<Vec<String>, PersonError> {
+    let written = |secret: &[u8; 32]| -> Result<String, PersonError> {
+        Ok(encode_channel_id(&derive::channel_id(secret)?)?)
+    };
+    let (old, new) = (written(from)?, written(to)?);
+    let channel = derive::channel_id(from)?;
+    let slot_key = derive::slot_key(from)?;
+    let mut dropped: Vec<String> = Vec::new();
+    for (folder, file) in sync_state::files(conn, &old)? {
+        let held = entries::slot_entries(conn, &channel, &slot_id(&slot_key, &file))?;
+        let read = version::current(&held, from, carry.statement, |key| counting.counts(key))?;
+        if read.current.is_none() {
+            sync_state::forget_file(conn, &folder, &old, &file)?;
+            dropped.push(file);
+        }
+    }
+    dropped.sort();
+    dropped.dedup();
+    sync_state::move_channel(conn, &old, &new, lifted)?;
+    Ok(dropped)
 }
 
 /// Note each key that this device counted under the statement `leaving`
@@ -1541,6 +1682,40 @@ impl Drop for Begun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device's word that it has applied a statement holds the
+    /// statement's number, and, once it has sent what it carried, says so
+    /// after it (decision 2026-10-04 §8). A text that is neither is no
+    /// such word.
+    #[test]
+    fn test_a_word_that_a_statement_is_applied_says_its_number_and_whether_all_is_sent() {
+        assert_eq!(applied_word(3, false), "3");
+        assert_eq!(applied_word(3, true), "3 sent");
+        assert_eq!(applied_word(256, true), "256 sent");
+        for (word, says) in [
+            ("3", Some((3, false))),
+            ("3 sent", Some((3, true))),
+            ("256 sent", Some((256, true))),
+            ("0", Some((0, false))),
+            ("", None),
+            (" sent", None),
+            ("sent", None),
+            ("3 sent ", None),
+            ("3  sent", None),
+            ("3 sent sent", None),
+            ("+3", None),
+            ("3.0", None),
+            ("three", None),
+            ("99999999999999999999999", None),
+        ] {
+            assert_eq!(read_applied_word(word), says, "{word:?}");
+        }
+        // What is written is what is read.
+        for (number, sent) in [(1, false), (1, true), (77, true)] {
+            let word = applied_word(number, sent);
+            assert_eq!(read_applied_word(&word), Some((number, sent)));
+        }
+    }
     use std::collections::{BTreeMap, BTreeSet};
 
     use cordelia_core::protocol::{
@@ -3042,6 +3217,7 @@ mod tests {
                 left: Some(2),
                 carried: 1,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
 
@@ -3129,6 +3305,7 @@ mod tests {
                     left: Some(1),
                     carried: 4,
                     no_version: Vec::new(),
+                    not_carried: Vec::new(),
                 }),
                 "{behind}"
             );
@@ -3549,6 +3726,7 @@ mod tests {
                 left: Some(3),
                 carried: 1,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         assert_eq!(state(&conn), State::Applied);
@@ -4124,6 +4302,7 @@ mod tests {
                 left: Some(2),
                 carried: 6,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
     }
@@ -4481,6 +4660,7 @@ mod tests {
                 left: Some(2),
                 carried: 3,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         let new = own(3, "team");
@@ -4550,6 +4730,7 @@ mod tests {
                 left: Some(2),
                 carried: 2,
                 no_version: vec!["both".to_string(), "team".to_string()],
+                not_carried: Vec::new(),
             })
         );
         assert_eq!(applied_number(&conn), 3);
@@ -4898,6 +5079,7 @@ mod tests {
                 left: Some(2),
                 carried: 4,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         let new = personal(3);
@@ -5194,6 +5376,7 @@ mod tests {
                 left: None,
                 carried: 0,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             }
         );
         let counting = who_counts(&conn).unwrap();
@@ -5408,6 +5591,7 @@ mod tests {
                 left: None,
                 carried: 0,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             }
         );
 

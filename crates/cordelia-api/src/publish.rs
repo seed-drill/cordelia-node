@@ -2,8 +2,10 @@
 //! 2026-10-04 §2.3, §7.3).
 //!
 //! Plain functions over the node's database and the device's own key, as
-//! [`crate::person`] is. Nothing here sends or fetches anything, and no
-//! command, handler or adapter calls it yet.
+//! [`crate::person`] is. Nothing here sends or fetches anything. The sync
+//! adapter reads and publishes its memory files through these, and so
+//! does the local API: one path for every entry that a node writes in a
+//! name.
 //!
 //! ## Reading
 //!
@@ -43,7 +45,8 @@
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::ENTRY_LINK_HASH_BYTES;
+use cordelia_core::protocol::{ENTRY_LINK_HASH_BYTES, MAX_ENTRY_NAME_AND_VALUE_BYTES};
+use cordelia_core::revision::band;
 use cordelia_crypto::chain;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Link, Value};
@@ -284,6 +287,88 @@ pub fn read(conn: &Connection, name: &str, file: &str) -> Result<Read, PersonErr
     })
 }
 
+/// What a device read of a whole name, at one moment: every slot of its
+/// channel that holds a version, and who counted for the device then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameRead {
+    /// The ID of the name's channel in the generation applied.
+    pub channel: [u8; 32],
+    /// Each slot that holds a version, in the order in which the store
+    /// took each slot's oldest entry. A slot that holds no version has no
+    /// name that could be read, and is not among them: it is read by the
+    /// name of a file ([`read`]).
+    pub slots: Vec<Slot>,
+    /// Who counted, as the device knew them at that read.
+    pub counting: Counting,
+}
+
+/// Read every slot of the name `name`, which this device holds: under the
+/// statement it has applied, with its word on who counts. The slots and
+/// that word are read in one transaction, and given together.
+pub fn read_name(conn: &Connection, name: &str) -> Result<NameRead, PersonError> {
+    in_one(conn, || {
+        let standing = Standing::of(conn)?;
+        let secret = standing.name_secret(conn, name)?;
+        let channel = derive::channel_id(&secret)?;
+        let mut slots = Vec::new();
+        for slot in entries::channel_slots(conn, &channel)? {
+            let held = entries::slot_entries(conn, &channel, &slot)?;
+            let read = standing.read_slot(&held, &secret)?;
+            if read.current.is_some() {
+                slots.push(read);
+            }
+        }
+        let Standing { counting, .. } = standing;
+        Ok(NameRead {
+            channel,
+            slots,
+            counting,
+        })
+    })
+}
+
+/// How many entries the slot of `file` in the name `name` holds, of keys
+/// that count and in a band that the statement has, that are no version
+/// and stand at the current version's revision or above it: entries that
+/// this device cannot read (decision 2026-10-04 §2.3). Where the slot
+/// holds no version, every such entry is one.
+///
+/// The slot's current version says nothing of them, and the next
+/// revision is above them all the same. Whoever is about to publish over
+/// that version unasked looks here first: what it writes would go above
+/// an entry that it has not read.
+pub fn not_read(conn: &Connection, name: &str, file: &str) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let standing = Standing::of(conn)?;
+        let secret = standing.name_secret(conn, name)?;
+        let channel = derive::channel_id(&secret)?;
+        let slot = slot_id(&derive::slot_key(&secret)?, file);
+        let held = entries::slot_entries(conn, &channel, &slot)?;
+        let read = standing.read_slot(&held, &secret)?;
+        let from = read.current.as_ref().map_or(0, |version| version.rev);
+        let stand = held
+            .iter()
+            .filter(|entry| standing.counting.counts(&entry.author))
+            .filter(|entry| band(entry.rev) <= standing.number() && entry.rev >= from)
+            .count();
+        let versions = read
+            .current
+            .iter()
+            .chain(read.lost.iter())
+            .map(|version| version.entries.len())
+            .sum::<usize>();
+        Ok(stand.saturating_sub(versions))
+    })
+}
+
+/// Whether a value can be published under the file's name `file` at all:
+/// whether the name and the value are within their bound together
+/// (decision 2026-10-04 §2.3). [`publish`] refuses what is over it, and
+/// never cuts it.
+pub fn fits(file: &str, value: &Value) -> bool {
+    file.len() + value.bytes().len() <= MAX_ENTRY_NAME_AND_VALUE_BYTES
+}
+
 /// Whether `version` is known to follow the value whose hash is `agreed`,
 /// where `counting` says who counts.
 ///
@@ -363,6 +448,14 @@ impl Standing {
             )));
         }
         Ok(secret)
+    }
+
+    /// What `held`, every entry that the store holds in one slot of the
+    /// channel whose secret is `channel`, is read as: under the statement
+    /// applied, with the device's word on who counts.
+    fn read_slot(&self, held: &[CheckedEntry], channel: &[u8; 32]) -> Result<Slot, PersonError> {
+        let counts = |key: &[u8; 32]| self.counting.counts(key);
+        Ok(version::current(held, channel, self.number(), counts)?)
     }
 
     /// The slot of `file` in the channel whose secret is `channel`, as
@@ -457,7 +550,7 @@ fn chain_over(
 /// 2026-10-04 §2.3): its own where it holds one, and otherwise the one
 /// whose signer has the lowest key. A version's entries are in order of
 /// their signers' keys.
-fn the_one_entry<'a>(
+pub fn the_one_entry<'a>(
     version: &'a Version,
     own: &[u8; 32],
 ) -> Result<&'a VersionEntry, PersonError> {
@@ -1309,5 +1402,138 @@ mod tests {
         assert!(!follows(&version, &hash("agreed"), &counting));
         version.entries.clear();
         assert!(!follows(&version, &hash("agreed"), &counting));
+    }
+
+    /// A whole name is read as a slot is: every slot that holds a
+    /// version, and who counted, of one moment. A slot that holds no
+    /// version has no name that could be read, and is not among them.
+    #[test]
+    fn test_a_whole_name_is_read_with_who_counted_at_that_moment() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        made(published(&mut s, 0, "a.md", text("one")));
+        made(published(&mut s, 0, "b.md", text("two")));
+        made(published(&mut s, 0, "b.md", Value::Delete));
+        // An entry that does not open: its slot holds no version.
+        let channel = s[0].own("notes");
+        let elsewhere = entry_by(&s[1].identity, &[0xee; 32], 1, "c.md", text("x"), &[]);
+        let slot = slot_id(&derive::slot_key(&channel).unwrap(), "c.md");
+        let sealed = signed_in(&channel, &s[1].identity, slot, 1, elsewhere.content.clone());
+        holds(&s, 0, &sealed);
+
+        let read = read_name(&s[0].conn, "notes").unwrap();
+        assert_eq!(read.channel, derive::channel_id(&channel).unwrap());
+        let mut held: Vec<(String, u64, Kind)> = read
+            .slots
+            .iter()
+            .map(|slot| {
+                let version = slot.current.as_ref().unwrap();
+                (version.name.clone(), version.rev, Kind::of(&version.value))
+            })
+            .collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            held,
+            [
+                ("a.md".to_string(), 1, Kind::Text),
+                ("b.md".to_string(), 2, Kind::Delete)
+            ]
+        );
+        assert!(read.counting.counts(&s.key(0)) && read.counting.counts(&s.key(1)));
+        // Each slot is what a read of that one file gives.
+        for slot in &read.slots {
+            let name = &slot.current.as_ref().unwrap().name;
+            assert_eq!(*slot, s[0].slot("notes", name));
+        }
+        // A name that the device does not hold, and a device with no
+        // phrase.
+        assert!(matches!(
+            read_name(&s[0].conn, "another"),
+            Err(PersonError::NameNotHeld(_))
+        ));
+        let none = Machine::new(9);
+        assert!(matches!(
+            read_name(&none.conn, "notes"),
+            Err(PersonError::FollowsNoPhrase)
+        ));
+    }
+
+    /// The entries of a slot that this device cannot read: those of keys
+    /// that count, at the current version's revision or above it, that
+    /// are no version. What is below the current version, or by a key
+    /// that does not count, is none of them.
+    #[test]
+    fn test_the_entries_a_device_cannot_read_are_counted_from_the_current_revision_up() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        let channel = s[0].own("notes");
+        let slot = slot_id(&derive::slot_key(&channel).unwrap(), "a.md");
+        let unreadable = |s: &Several, n: usize, rev: u64| {
+            let elsewhere = entry_by(&s[n].identity, &[0xee; 32], rev, "a.md", text("x"), &[]);
+            signed_in(
+                &channel,
+                &s[n].identity,
+                slot,
+                rev,
+                elsewhere.content.clone(),
+            )
+        };
+        let not_read = |s: &Several| not_read(&s[0].conn, "notes", "a.md").unwrap();
+        assert_eq!(not_read(&s), 0);
+
+        // With no version in the slot, each such entry is one.
+        holds(&s, 0, &unreadable(&s, 1, 1));
+        assert_eq!(not_read(&s), 1);
+        // The device publishes: the entry below its version is passed.
+        made(published(&mut s, 0, "a.md", text("one")));
+        assert_eq!(s[0].slot("notes", "a.md").current.unwrap().rev, 2);
+        assert_eq!(not_read(&s), 0);
+        // One at the current revision, and one above it.
+        holds(&s, 0, &unreadable(&s, 2, 2));
+        assert_eq!(not_read(&s), 1);
+        holds(&s, 0, &unreadable(&s, 1, 7));
+        assert_eq!(not_read(&s), 2);
+        // An entry of a key that does not count is none, wherever it is.
+        let stranger = Machine::new(9);
+        let elsewhere = entry_by(&stranger.identity, &[0xee; 32], 9, "a.md", text("x"), &[]);
+        let theirs = signed_in(
+            &channel,
+            &stranger.identity,
+            slot,
+            9,
+            elsewhere.content.clone(),
+        );
+        holds(&s, 0, &theirs);
+        assert_eq!(not_read(&s), 2);
+        // Another file's slot is another matter.
+        assert_eq!(super::not_read(&s[0].conn, "notes", "b.md").unwrap(), 0);
+    }
+
+    /// Whether a value can be published under a name at all is one bound
+    /// (decision 2026-10-04 §2.3): the name and the value together.
+    #[test]
+    fn test_a_name_and_a_value_fit_within_their_one_bound_together() {
+        let name = "notes.md";
+        let most = MAX_ENTRY_NAME_AND_VALUE_BYTES - name.len();
+        assert!(fits(name, &Value::Text("x".repeat(most))));
+        assert!(!fits(name, &Value::Text("x".repeat(most + 1))));
+        assert!(fits(name, &Value::Other(vec![0; most])));
+        assert!(!fits(name, &Value::Other(vec![0; most + 1])));
+        // A longer name leaves less room, byte for byte.
+        assert!(!fits("notes2.md", &Value::Text("x".repeat(most))));
+        assert!(fits(name, &Value::Delete));
+        // What fits is what a publish takes, and what does not is what
+        // it refuses.
+        let mut s = alone();
+        made(published(&mut s, 0, name, Value::Text("x".repeat(most))));
+        let now = s.tick();
+        let over = Write {
+            name: "notes",
+            file: "other.md",
+            value: Value::Text("x".repeat(most + 1)),
+            planned: PlannedAgainst::NoVersion,
+            merge: None,
+        };
+        assert!(publish(&s[0].conn, &s[0].identity, &over, now).is_err());
     }
 }

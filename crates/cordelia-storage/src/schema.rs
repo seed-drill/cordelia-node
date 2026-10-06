@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -599,6 +599,35 @@ CREATE TABLE at_relays_refused (
 CREATE INDEX idx_at_relays_refused_channel ON at_relays_refused(channel);
 "#;
 
+/// Migration v17: what the sync adapter keeps in a channel from its
+/// secret (decision 2026-10-04 §2.3, §7.3, §16).
+///
+/// - `sync_files.chain`: the chain of the entry that a folder agreed, as
+///   its links one after another, each the start of a hash and the start
+///   of a key. NULL where that entry lacked what it should say, and in a
+///   row from before. With it `sync_files.author` is the key that signed
+///   that entry: a folder's record keeps the signer and the chain of the
+///   one entry it agreed.
+/// - `person_names_before`: one row for each name and key, where that key
+///   had said, in the personal channel of a generation that the device
+///   left, that it syncs the name, with when the device left it, in
+///   seconds. It is written in the transaction that applies a statement,
+///   from what the device's own store held, and is what a device shows of
+///   the names that no device lists yet in the new generation. It is one
+///   of the tables of what a device holds of its person.
+///
+/// A relay keeps nothing in either.
+const MIGRATION_V17: &str = r#"
+ALTER TABLE sync_files ADD COLUMN chain BLOB;
+
+CREATE TABLE person_names_before (
+    name     TEXT NOT NULL CHECK(length(name) >= 1),
+    said_by  BLOB NOT NULL CHECK(length(said_by) = 32),
+    left_at  INTEGER NOT NULL,
+    PRIMARY KEY (name, said_by)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -741,6 +770,13 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 16 {
         tracing::info!("applying migration v16 (what a relay refused for room, to send again)");
         migrate_in_one(conn, MIGRATION_V16, 16)?;
+    }
+
+    if current < 17 {
+        tracing::info!(
+            "applying migration v17 (the chain of what a folder agreed, and names before)"
+        );
+        migrate_in_one(conn, MIGRATION_V17, 17)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1221,13 +1257,15 @@ mod tests {
     /// a device holds of its person, the table of the channels a relay
     /// holds, the index of each channel's own order of entries, the
     /// counts of what `items` holds with the triggers that keep them, and
-    /// what a device keeps of each relay.
+    /// what a device keeps of each relay. The definition of the table of
+    /// what a folder agreed is left out, and read by itself
+    /// ([`definition_of`]): a later step adds a column to it.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
                 "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
                  WHERE name NOT IN ('entries', 'idx_entries_channel_seq',
-                                    'idx_entries_channel_place')
+                                    'idx_entries_channel_place', 'sync_files')
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
@@ -1443,7 +1481,7 @@ mod tests {
         .unwrap()
     }
 
-    /// What a database holds of the step to version 12, by name. Two
+    /// What a database holds of the step to version 12, by name. Other
     /// tables of what a device holds of its person are of later steps.
     fn new_in_v12(conn: &Connection) -> Vec<String> {
         conn.prepare(
@@ -1453,6 +1491,7 @@ mod tests {
                AND name NOT LIKE '%person_typed_keys%'
                AND name NOT LIKE '%person_left_out%'
                AND name NOT LIKE '%person_cleared%'
+               AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1659,6 +1698,7 @@ mod tests {
                    AND name NOT LIKE '%person_typed_keys%'
                    AND name NOT LIKE '%person_left_out%'
                    AND name NOT LIKE '%person_cleared%'
+                   AND name NOT LIKE '%person_names_before%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -2225,7 +2265,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 16);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v16(&conn), NEW_IN_V16);
         assert_eq!(held_before_v16(&conn), before);
@@ -2270,6 +2309,123 @@ mod tests {
         );
     }
 
+    /// A database as a binary from before the chain of what a folder
+    /// agreed was kept leaves it: what [`at_v15`] holds, an entry that a
+    /// relay refused, and a row of what a folder agreed.
+    fn at_v16() -> Connection {
+        let conn = at_v15();
+        migrate_in_one(&conn, MIGRATION_V16, 16).unwrap();
+        conn.execute_batch(
+            "INSERT INTO at_relays_refused (relay, channel, seq)
+             VALUES (zeroblob(32), zeroblob(32), 7);
+             INSERT INTO sync_files (folder, channel_id, key, hash, rev, author)
+             VALUES ('/memory', 'grp_before', 'notes.md', X'0A', 3, zeroblob(32));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// What the step to version 17 adds: a column, and a table.
+    const NEW_IN_V17: [&str; 2] = ["person_names_before", "sync_files.chain"];
+
+    /// What a database holds of the step to version 17, by name.
+    fn new_in_v17(conn: &Connection) -> Vec<String> {
+        let mut held: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE name = 'person_names_before'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if conn.prepare("SELECT chain FROM sync_files").is_ok() {
+            held.push("sync_files.chain".into());
+        }
+        held
+    }
+
+    /// The chain of what a folder agreed, and the table of the names
+    /// that were listed before a statement, are made in one step with
+    /// their version: a failure between them leaves neither, and the step
+    /// asked for twice is run once. A row that a folder agreed before
+    /// stays as it was, with no chain.
+    #[test]
+    fn test_v17_adds_the_chain_a_folder_agreed_and_the_names_before_as_one() {
+        let conn = at_v16();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = held_before_v16(&conn);
+        let agreed_before = definition_of(&conn, "sync_files");
+        assert_eq!(version(&conn), 16);
+        assert!(new_in_v17(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V17} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 17).is_err());
+        assert_eq!(version(&conn), 16);
+        assert!(
+            new_in_v17(&conn).is_empty(),
+            "the column and the table go with the version"
+        );
+        assert_eq!(definition_of(&conn, "sync_files"), agreed_before);
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 17);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v17(&conn), NEW_IN_V17);
+        assert_eq!(held_before_v16(&conn), before);
+        // The table of what a folder agreed has one column more, and is
+        // otherwise as it was.
+        let agreed_after = definition_of(&conn, "sync_files");
+        assert_eq!(
+            agreed_after.replace(", chain BLOB", ""),
+            agreed_before,
+            "{agreed_after}"
+        );
+        assert_ne!(agreed_after, agreed_before);
+        let row: (i64, Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT rev, author, chain FROM sync_files WHERE folder = '/memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (3, Some(vec![0u8; 32]), None));
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        conn.execute_batch(
+            "UPDATE sync_files SET chain = zeroblob(64);
+             INSERT INTO person_names_before (name, said_by, left_at)
+             VALUES ('notes', zeroblob(32), 9);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V17, 17).unwrap();
+        let kept: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT length(chain) FROM sync_files),
+                        (SELECT COUNT(*) FROM person_names_before)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version(&conn), kept), (SCHEMA_VERSION, (64, 1)));
+        // A row that names no name, or a key of another length, is
+        // refused, and so is one name said twice by one key.
+        for refused in [
+            "INSERT INTO person_names_before (name, said_by, left_at) VALUES ('', zeroblob(32), 9)",
+            "INSERT INTO person_names_before (name, said_by, left_at)
+                 VALUES ('notes', zeroblob(31), 9)",
+            "INSERT INTO person_names_before (name, said_by, left_at)
+                 VALUES ('notes', zeroblob(32), 9)",
+            "INSERT INTO person_names_before (name, said_by) VALUES ('other', zeroblob(32))",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -2290,7 +2446,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 8] = [
+        let from: [(u32, Connection); 9] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -2299,6 +2455,7 @@ mod tests {
             (13, at_v13()),
             (14, at_v14()),
             (15, at_v15()),
+            (16, at_v16()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -2318,6 +2475,7 @@ mod tests {
             assert_eq!(new_in_v14(&conn), NEW_IN_V14, "from version {at}");
             assert_eq!(new_in_v15(&conn), NEW_IN_V15, "from version {at}");
             assert_eq!(new_in_v16(&conn), NEW_IN_V16, "from version {at}");
+            assert_eq!(new_in_v17(&conn), NEW_IN_V17, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }

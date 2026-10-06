@@ -342,89 +342,6 @@ fn default_limit() -> u32 {
     50
 }
 
-// ── Devices and invites (decision 2026-09-30-agent-memory-sync §4.1) ──
-
-#[derive(Deserialize)]
-pub struct AddDeviceRequest {
-    /// Bech32 Ed25519 key of the device being added.
-    pub device: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct AddDeviceResponse {
-    pub device: String,
-    /// This node's key: the other device runs `cordelia accept <this_device>`.
-    pub this_device: String,
-    pub personal_channel_id: String,
-    pub channels: Vec<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AcceptRequest {
-    /// Bech32 Ed25519 key of the device that ran `add-device` for this node.
-    pub key: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct InboxSummaryResponse {
-    pub applied: Vec<String>,
-    pub pending: usize,
-    pub superseded: usize,
-    pub invalid: usize,
-    /// States kept because they name a key that is not yet known as one of
-    /// this person's devices.
-    pub held: usize,
-    /// What the person should be told.
-    pub notes: Vec<String>,
-}
-
-#[derive(Deserialize)]
-pub struct RemoveDeviceRequest {
-    pub device: String,
-}
-
-#[derive(Serialize)]
-pub struct RemoveDeviceResponse {
-    pub device: String,
-    pub channels_rotated: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub struct DeviceEntry {
-    pub key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub this_device: bool,
-    pub in_personal_channel: bool,
-    pub explicitly_trusted: bool,
-    /// When this device sent the oldest change that the other device has
-    /// not confirmed yet (RFC 3339). Absent when it has confirmed them all.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unconfirmed_since: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ListDevicesResponse {
-    pub devices: Vec<DeviceEntry>,
-}
-
-#[derive(Serialize)]
-pub struct PendingInviteEntry {
-    pub item_id: String,
-    pub from: String,
-    pub channel_id: String,
-    pub received_at: String,
-}
-
-#[derive(Serialize)]
-pub struct ListInvitesResponse {
-    pub pending: Vec<PendingInviteEntry>,
-}
-
 // ── Keyed entries (decision 2026-09-30-agent-memory-sync §4.3) ──
 
 #[derive(Deserialize)]
@@ -551,4 +468,9 @@ pub struct SyncStatusResponse {
     /// When a cycle last sent or received a memory (RFC 3339).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<String>,
+    /// Where the device stands under a recovery phrase (decision
+    /// 2026-10-04 §5.2): `no_phrase`, `applied`, or why it has stopped
+    /// (`fork`, `removed`, `not_listed`, `not_opened`). Only a device
+    /// that has applied a statement publishes anything.
+    pub stands: &'static str,
 }

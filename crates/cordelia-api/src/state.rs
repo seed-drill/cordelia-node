@@ -8,6 +8,8 @@ use std::time::Instant;
 use cordelia_crypto::identity::NodeIdentity;
 use rusqlite::Connection;
 
+use crate::publish::PlannedAgainst;
+
 /// An item to be pushed to hot peers via P2P.
 #[derive(Debug, Clone)]
 pub struct PushItem {
@@ -65,9 +67,6 @@ pub struct AppState {
     pub relist: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
-    /// Which keys have been found usable, and which not, while this node
-    /// has run.
-    pub usable_keys: UsableKeys,
     /// Local history, and the turn its users take.
     pub history: History,
     /// Where this device stands at its relays for the channels of its
@@ -99,6 +98,12 @@ pub struct AppState {
 /// or not its name resolves. What a device keeps of a relay is forgotten
 /// as of one that it is set up with no longer only while every relay it
 /// is configured with is connected.
+///
+/// And it carries which relays have handed the whole of each name's
+/// channel since the node started ([`OwnChannels::fetched_from`]): a
+/// folder with no record in a channel yet waits for that before its
+/// first cycle there ([`OwnChannels::first_fetch_done`], decision
+/// 2026-10-04 §6).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -111,7 +116,23 @@ pub struct OwnChannels {
     /// last that it ended.
     begun: AtomicU64,
     ended: AtomicU64,
+    /// For each channel of a name, by its ID: the relays that have handed
+    /// the whole of it, and when the first of them had.
+    fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
 }
+
+/// Which relays have handed the whole of one channel, by name, and when
+/// the first of them had.
+#[derive(Debug, Clone)]
+struct FirstFetch {
+    first: Instant,
+    from: std::collections::BTreeSet<String>,
+}
+
+/// How long a folder's first cycle waits for the other relays once one
+/// has handed its channel.
+const FIRST_FETCH_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(cordelia_core::protocol::FIRST_FETCH_WAIT_SECS);
 
 impl OwnChannels {
     /// Where the device stands at its relays, as the node last said it.
@@ -182,6 +203,51 @@ impl OwnChannels {
             self.begun.load(Ordering::SeqCst),
             self.ended.load(Ordering::SeqCst),
         )
+    }
+
+    /// The relay called `relay` has handed the whole of the channel whose
+    /// ID is `channel`, at `now`: the device pulled it there to its end,
+    /// or the relay answered that it holds none of it.
+    pub fn fetched_from(&self, channel: &[u8; 32], relay: &str, now: Instant) {
+        let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        let of = fetched.entry(*channel).or_insert_with(|| FirstFetch {
+            first: now,
+            from: Default::default(),
+        });
+        of.from.insert(relay.to_string());
+    }
+
+    /// Whether a folder with no record in the channel whose ID is
+    /// `channel` may have its first cycle there at `now` (decision
+    /// 2026-10-04 §6): the channel was fetched from at least one relay,
+    /// and from each other relay that the device is set up with, or the
+    /// wait for those has gone by since the first had handed it. It waits
+    /// for a relay, and never for a device.
+    ///
+    /// Where the node has not said how many relays it is set up with,
+    /// only the wait says that the others had their time. A node that is
+    /// set up with no relay has none to wait for, and nobody to publish
+    /// to: its folders do not wait.
+    pub fn first_fetch_done(&self, channel: &[u8; 32], now: Instant) -> bool {
+        if self.relays_set_up() == Some(0) {
+            return true;
+        }
+        let fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(of) = fetched.get(channel) else {
+            return false;
+        };
+        let from_each = self
+            .relays_set_up()
+            .is_some_and(|set_up| of.from.len() >= set_up);
+        from_each || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
+    }
+
+    /// Keep nothing of which relays have handed the channel whose ID is
+    /// `channel`: the device holds it no more. Held again, it is fetched
+    /// again before a folder's first cycle there.
+    pub fn forget_fetched(&self, channel: &[u8; 32]) {
+        let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        fetched.remove(channel);
     }
 }
 
@@ -256,71 +322,6 @@ pub enum CannotGoOn {
     NotApplied { relay: String, why: String },
 }
 
-/// Whether a key is a usable public key
-/// ([`cordelia_crypto::identity::is_usable_public_key`]), as this node has
-/// found so far.
-///
-/// The answer for a key never changes, and finding it costs a
-/// multiplication on the curve. A channel state that waits is looked at
-/// again every few seconds, with up to 1,024 keys in it. So the answer is
-/// kept, in memory, for as long as the node runs.
-///
-/// Nothing depends on what is kept: a key that is not here is checked, and
-/// what is kept for a key is what the check gave. Each node has its own.
-///
-/// It saves the checks only while the keys the node looks at fit in it.
-/// Once they do not, a look at a state checks its keys again, at most a
-/// multiplication for each: what is kept is dropped before the keys kept
-/// from the last look are come to. (A key that several states list can
-/// still be answered from what is kept.) Never more checks than with
-/// nothing kept.
-pub struct UsableKeys {
-    known: Mutex<std::collections::HashMap<[u8; 32], bool>>,
-    most: usize,
-}
-
-impl UsableKeys {
-    /// The most answers kept: those of 64 states that each list as many
-    /// members as a state may (1,024).
-    pub const MOST: usize = 65_536;
-
-    /// One that keeps at most `most` answers (one, if `most` is nought).
-    /// When one more is to be kept, all are dropped first.
-    pub fn keeping(most: usize) -> Self {
-        Self {
-            known: Mutex::default(),
-            most,
-        }
-    }
-
-    /// Whether `key` is a usable public key.
-    pub fn is_usable(&self, key: &[u8; 32]) -> bool {
-        // A lock that a panic left poisoned still guards answers that are
-        // each right, so it is used as it is.
-        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(usable) = known.get(key) {
-            return *usable;
-        }
-        let usable = cordelia_crypto::identity::is_usable_public_key(key);
-        if known.len() >= self.most {
-            known.clear();
-        }
-        known.insert(*key, usable);
-        usable
-    }
-
-    /// How many answers are kept now.
-    pub fn kept(&self) -> usize {
-        self.known.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-}
-
-impl Default for UsableKeys {
-    fn default() -> Self {
-        Self::keeping(Self::MOST)
-    }
-}
-
 /// An item of this node's that a relay refused, for status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedSnapshot {
@@ -337,18 +338,19 @@ pub struct RefusedSnapshot {
 /// written down may go sooner (decision 2026-09-30 §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
-    /// The channel's version that the file is to take (its item ID), as
-    /// the plan read it. `None` where the plan read no version: a record
-    /// made against none matches only a plan that read none.
-    pub version: Option<String>,
+    /// What the channel held under the file's name, as the plan read it:
+    /// the version that the file is to take, with every entry held of
+    /// it, or no version. A record made against one matches only a plan
+    /// that read the same.
+    pub version: PlannedAgainst,
     /// The name of the conflict file the text is kept in.
     pub copy: String,
     /// The hash of the text.
     pub hash: [u8; 32],
-    /// The channel's entry under the conflict file's name (its item ID),
-    /// if there is one: the entry that was there when the name was taken,
-    /// and then the entry that the folder published the copy as.
-    pub under: Option<String>,
+    /// What the channel holds under the conflict file's name: what was
+    /// there when the name was taken, and then the entry that the folder
+    /// published the copy as.
+    pub under: PlannedAgainst,
 }
 
 /// What is kept, for each (memory folder, channel, file).
@@ -403,6 +405,10 @@ pub struct SyncControl {
     /// The time the adapter reads for those records, where a test has set
     /// one. Otherwise it is the system's clock.
     clock: Mutex<Option<i64>>,
+    /// How many cycles the node has begun, and the number of the last
+    /// that it ended.
+    cycles_begun: AtomicU64,
+    cycles_ended: AtomicU64,
 }
 
 impl SyncControl {
@@ -519,15 +525,15 @@ impl SyncControl {
     }
 
     /// `folder` has published the conflict file `copy` itself, with the
-    /// text of `hash`, as the entry `under`: a text it has kept in that
-    /// file is under that entry now.
+    /// text of `hash`, as the entry that is all of `under`: a text it has
+    /// kept in that file is under that entry now.
     pub fn kept_published(
         &self,
         folder: &str,
         channel: &str,
         copy: &str,
         hash: &[u8; 32],
-        under: &str,
+        under: &PlannedAgainst,
     ) {
         for ((in_folder, in_channel, _), kept) in self.kept().iter_mut() {
             if in_folder == folder
@@ -535,7 +541,7 @@ impl SyncControl {
                 && kept.copy == copy
                 && kept.hash == *hash
             {
-                kept.under = Some(under.to_string());
+                kept.under = under.clone();
             }
         }
     }
@@ -564,9 +570,38 @@ impl SyncControl {
         self.generation()
     }
 
-    /// Resolves when a setting has changed.
+    /// Resolves when a setting has changed, or a cycle was asked for.
     pub async fn woken(&self) {
         self.wake.notified().await;
+    }
+
+    /// Ask for a cycle now, with no setting changed: a command that
+    /// prepares a change has the folders made as current as they can be
+    /// first (decision 2026-10-04 §7.1, step 1). Whoever asks waits for a
+    /// cycle that began after it asked ([`Self::cycles`]).
+    pub fn ask_cycle(&self) {
+        self.wake.notify_one();
+    }
+
+    /// The node begins a cycle. Returns the cycle's number, which it
+    /// gives back when the cycle ends.
+    pub fn cycle_begins(&self) -> u64 {
+        self.cycles_begun.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The node has ended the cycle numbered `cycle`.
+    pub fn cycle_ended(&self, cycle: u64) {
+        self.cycles_ended.fetch_max(cycle, Ordering::SeqCst);
+    }
+
+    /// How many cycles the node has begun, and the number of the last
+    /// that it ended. A cycle that began after a moment has a number
+    /// above the count at that moment.
+    pub fn cycles(&self) -> (u64, u64) {
+        (
+            self.cycles_begun.load(Ordering::SeqCst),
+            self.cycles_ended.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -696,6 +731,32 @@ pub struct RelaySnapshot {
 }
 
 impl AppState {
+    /// Do `work` as what may change which channels are the device's own
+    /// is done: applying a statement, following a phrase, or leaving one
+    /// (decision 2026-10-04 §4.2). It is given the database, locked.
+    ///
+    /// - **It waits for a sync cycle that is running to stop.** The
+    ///   change is counted first, so that the cycle stops at its next
+    ///   look at the count and not at its end, and the turn that a cycle
+    ///   holds is then taken.
+    /// - **It counts as a change of settings,** under the hold of the
+    ///   database's lock that the work is done under: no cycle that began
+    ///   before it publishes or records anything after it, and the
+    ///   adapter's notes of the copies it has kept beside files are
+    ///   cleared with it.
+    ///
+    /// It is counted whether or not the work then changes anything, as a
+    /// settings command is.
+    pub fn as_a_change<T>(&self, work: impl FnOnce(&Connection) -> T) -> T {
+        let locked = || self.db.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_control.changed(&locked());
+        let _turn = self.history.turn();
+        let db = locked();
+        let done = work(&db);
+        self.sync_control.changed(&db);
+        done
+    }
+
     /// Uptime in seconds since node start.
     pub fn uptime_secs(&self) -> f64 {
         self.started_at.elapsed().as_secs_f64()
@@ -715,7 +776,29 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordelia_crypto::identity::{is_usable_public_key, key_checks};
+
+    /// A node's state over a database in memory, with no network.
+    fn test_state() -> AppState {
+        AppState {
+            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            identity: NodeIdentity::generate().unwrap(),
+            bearer_token: "t".into(),
+            home_dir: std::env::temp_dir().join("cordelia-state-test-no-such-directory"),
+            started_at: Instant::now(),
+            sync_errors: Default::default(),
+            peers_hot: Default::default(),
+            peers_warm: Default::default(),
+            push_tx: None,
+            announce_tx: None,
+            peers: Default::default(),
+            relays: Default::default(),
+            outbox_refused: Default::default(),
+            relist: Default::default(),
+            sync_control: Default::default(),
+            own_channels: Default::default(),
+            history: Default::default(),
+        }
+    }
 
     /// A whole pass has a number, which is above the count of passes
     /// begun at any moment before it began: whoever asked at that moment
@@ -775,107 +858,127 @@ mod tests {
         assert_eq!(waited, (true, false));
     }
 
-    /// `n` keys that are usable and `n` that are not, each different.
-    fn keys(n: usize) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
-        let usable: Vec<[u8; 32]> = (0..n)
-            .map(|_| NodeIdentity::generate().unwrap().public_key())
-            .collect();
-        let not: Vec<[u8; 32]> = (0..4096u32)
-            .map(|i| {
-                let mut key = [0x42; 32];
-                key[..4].copy_from_slice(&i.to_le_bytes());
-                key
-            })
-            .filter(|key| !is_usable_public_key(key))
-            .take(n)
-            .collect();
-        assert_eq!(not.len(), n);
-        (usable, not)
+    /// A folder's first cycle in a channel waits for the channel to be
+    /// fetched: from one relay at least, and from each other relay that
+    /// the device is set up with, or until the wait for those has gone by
+    /// since the first had handed it. One relay handing the channel twice
+    /// is one relay. A channel that is held no more is fetched again.
+    #[test]
+    fn test_a_first_cycle_waits_for_one_relay_and_for_the_others_so_long() {
+        let own = OwnChannels::default();
+        let (channel, other) = ([1u8; 32], [2u8; 32]);
+        let start = Instant::now();
+        let later = |secs: u64| start + std::time::Duration::from_secs(secs);
+        own.set_up_with(2);
+        // Not fetched from any relay: it waits, however long.
+        assert!(!own.first_fetch_done(&channel, later(0)));
+        assert!(!own.first_fetch_done(&channel, later(3600)));
+
+        // One of two relays has handed it: the other has 30 seconds.
+        own.fetched_from(&channel, "one", later(10));
+        own.fetched_from(&channel, "one", later(12));
+        assert!(!own.first_fetch_done(&channel, later(12)));
+        assert!(!own.first_fetch_done(&channel, later(39)));
+        assert!(own.first_fetch_done(&channel, later(40)));
+        // Another channel is another matter.
+        assert!(!own.first_fetch_done(&other, later(40)));
+
+        // Both have handed it: nothing more is waited for.
+        own.fetched_from(&channel, "two", later(13));
+        assert!(own.first_fetch_done(&channel, later(13)));
+
+        // Held no more, it is fetched again before a first cycle there.
+        own.forget_fetched(&channel);
+        assert!(!own.first_fetch_done(&channel, later(3600)));
+
+        // A device set up with one relay waits for that one, and no longer.
+        own.set_up_with(1);
+        own.fetched_from(&other, "one", later(50));
+        assert!(own.first_fetch_done(&other, later(50)));
+
+        // A node that has not said how many relays it is set up with
+        // cannot tell that each has handed the channel: the wait says so.
+        let unsaid = OwnChannels::default();
+        unsaid.fetched_from(&channel, "one", later(0));
+        unsaid.fetched_from(&channel, "two", later(0));
+        assert!(!unsaid.first_fetch_done(&channel, later(29)));
+        assert!(unsaid.first_fetch_done(&channel, later(30)));
     }
 
-    /// What is remembered for a key is what the check gives, for a key
-    /// that is usable and for one that is not, the first time it is asked
-    /// and every time after. A key is checked once.
+    /// What may change which channels are the device's own is done as a
+    /// change of settings is (decision 2026-10-04 §4.2): it is counted
+    /// before it waits, so that a cycle that is running stops, it waits
+    /// for that cycle's turn to end, and it is counted again under the
+    /// hold of the database's lock that the work was done under. The
+    /// adapter's notes of the copies it has kept are cleared with it.
     #[test]
-    fn test_what_is_remembered_of_a_key_is_what_the_check_gives() {
-        let (usable, not) = keys(3);
-        let known = UsableKeys::default();
-        for _ in 0..3 {
-            for key in &usable {
-                assert!(known.is_usable(key));
-            }
-            for key in &not {
-                assert!(!known.is_usable(key));
-            }
+    fn test_what_changes_a_devices_channels_waits_for_a_cycle_and_counts_as_a_change() {
+        let state = std::sync::Arc::new(test_state());
+        let before = state.sync_control.generation();
+        {
+            let db = state.db.lock().unwrap();
+            let kept = Kept {
+                version: PlannedAgainst::NoVersion,
+                copy: "a.conflict-x.md".into(),
+                hash: [1; 32],
+                under: PlannedAgainst::NoVersion,
+            };
+            state.sync_control.keep(&db, "/m", "channel", "a.md", kept);
         }
-        assert_eq!(known.kept(), 6);
-        let before = key_checks();
-        for key in usable.iter().chain(&not) {
-            known.is_usable(key);
+
+        // A cycle holds the turn. It sees the count move while it still
+        // holds it, and only when it gives the turn up is the work done.
+        let turn = state.history.turn();
+        let other = std::sync::Arc::clone(&state);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let did = std::sync::Arc::clone(&done);
+        let change = std::thread::spawn(move || {
+            other.as_a_change(|_db| {
+                did.store(true, Ordering::SeqCst);
+                other.sync_control.generation()
+            })
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while state.sync_control.generation() == before {
+            assert!(Instant::now() < deadline, "the change was not counted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(
-            key_checks(),
-            before,
-            "a key that is kept is not checked again"
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the work did not wait for the cycle"
+        );
+        assert_eq!(state.sync_control.generation(), before + 1);
+        drop(turn);
+        let during = change.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        // Counted before the work, and again after it.
+        assert_eq!(during, before + 1);
+        assert_eq!(state.sync_control.generation(), before + 2);
+        assert!(
+            state
+                .sync_control
+                .kept_beside("/m", "channel", "a.md")
+                .is_none()
         );
     }
 
-    /// Each node has its own: what one has found costs another the same
-    /// to find.
+    /// A cycle has a number, which is above the count of cycles begun at
+    /// any moment before it began: whoever asked for one at that moment
+    /// knows a cycle that began after by its number, once it has ended.
     #[test]
-    fn test_each_node_remembers_for_itself() {
-        let (usable, not) = keys(2);
-        let (one, other) = (UsableKeys::default(), UsableKeys::default());
-        for known in [&one, &other] {
-            let before = key_checks();
-            for key in usable.iter().chain(&not) {
-                known.is_usable(key);
-            }
-            assert_eq!(key_checks() - before, 4);
-        }
-        assert_eq!((one.kept(), other.kept()), (4, 4));
-    }
-
-    /// No more than so many are kept. When one more is to be kept, all are
-    /// dropped first, and nothing depends on that: a key that was dropped
-    /// is checked again, with the same answer.
-    #[test]
-    fn test_what_is_remembered_is_bounded_and_dropping_it_changes_no_answer() {
-        let (usable, not) = keys(3);
-        let known = UsableKeys::keeping(4);
-        let all: Vec<([u8; 32], bool)> = usable
-            .iter()
-            .map(|key| (*key, true))
-            .chain(not.iter().map(|key| (*key, false)))
-            .collect();
-        for (i, (key, want)) in all.iter().enumerate() {
-            assert_eq!(known.is_usable(key), *want);
-            // Four are kept; the fifth empties them and is kept alone.
-            assert_eq!(known.kept(), i % 4 + 1, "after {}", i + 1);
-        }
-        // Round again. Six keys do not fit in four, so nothing is saved:
-        // the two that were kept are dropped before they are come to,
-        // and every key is checked again. The answers are the same.
-        let before = key_checks();
-        for (key, want) in &all {
-            assert_eq!(known.is_usable(key), *want);
-        }
-        assert_eq!(key_checks() - before, 6);
-        assert_eq!(known.kept(), 4);
-        // Four keys do fit: the second time round costs nothing.
-        let known = UsableKeys::keeping(4);
-        for _ in 0..2 {
-            for (key, want) in &all[..4] {
-                assert_eq!(known.is_usable(key), *want);
-            }
-        }
-        let before = key_checks();
-        for (key, want) in &all[..4] {
-            assert_eq!(known.is_usable(key), *want);
-        }
-        assert_eq!(key_checks(), before);
-        assert_eq!(UsableKeys::MOST, 65_536);
-        assert_eq!(UsableKeys::default().most, UsableKeys::MOST);
+    fn test_a_cycle_that_began_after_a_moment_is_known_by_its_number() {
+        let control = SyncControl::default();
+        assert_eq!(control.cycles(), (0, 0));
+        let first = control.cycle_begins();
+        let (begun, _) = control.cycles();
+        control.cycle_ended(first);
+        assert!(control.cycles().1 <= begun);
+        let second = control.cycle_begins();
+        control.cycle_ended(second);
+        assert!(control.cycles().1 > begun);
+        control.cycle_ended(first);
+        assert_eq!(control.cycles(), (2, 2));
     }
 
     /// The sweep of local history takes its turn with a sync cycle and a
@@ -924,12 +1027,23 @@ mod tests {
         assert_eq!(kept_now(), 0);
     }
 
+    /// What a plan reads where the slot holds one text at revision 3, in
+    /// the one entry named `entry`.
+    fn version(entry: u8) -> PlannedAgainst {
+        PlannedAgainst::Version {
+            rev: 3,
+            kind: crate::publish::Kind::Text,
+            hash: [9; 32],
+            entries: vec![[entry; 32]],
+        }
+    }
+
     fn kept(copy: &str, hash: u8) -> Kept {
         Kept {
-            version: Some("ci_version".into()),
+            version: version(1),
             copy: copy.into(),
             hash: [hash; 32],
-            under: None,
+            under: PlannedAgainst::NoVersion,
         }
     }
 
@@ -961,18 +1075,19 @@ mod tests {
         control.keep(&db, "/m", "grp_b", "notes.md", kept("second", 8));
         let under = |folder: &str, channel: &str| {
             let kept = control.kept_beside(folder, channel, "notes.md");
-            kept.and_then(|kept| kept.under)
+            kept.map(|kept| kept.under)
         };
+        let none = Some(PlannedAgainst::NoVersion);
         let published = |copy: &str, hash: u8| {
-            control.kept_published("/m", "grp_a", copy, &[hash; 32], "ci_published");
+            control.kept_published("/m", "grp_a", copy, &[hash; 32], &version(2));
             under("/m", "grp_a")
         };
-        assert_eq!(published("first", 8), None);
-        assert_eq!(published("second", 7), None);
-        assert_eq!(published("notes.md", 8), None);
-        assert_eq!(published("second", 8).as_deref(), Some("ci_published"));
-        assert_eq!(under("/n", "grp_a"), None);
-        assert_eq!(under("/m", "grp_b"), None);
+        assert_eq!(published("first", 8), none);
+        assert_eq!(published("second", 7), none);
+        assert_eq!(published("notes.md", 8), none);
+        assert_eq!(published("second", 8), Some(version(2)));
+        assert_eq!(under("/n", "grp_a"), none);
+        assert_eq!(under("/m", "grp_b"), none);
 
         control.unkeep("/m", "grp_a", "notes.md");
         assert_eq!(control.kept_beside("/m", "grp_a", "notes.md"), None);

@@ -1,6 +1,16 @@
 //! Switching sync adapters on and off, and reporting on them (decision
 //! 2026-09-30-agent-memory-sync §4.5). The adapter itself runs in the node
 //! (cordelia-sync); these handlers only set and read its settings.
+//!
+//! A mapped folder syncs a name, whose channel comes from the person's
+//! secret (decision 2026-10-04 §2.2). So a handler that changes which
+//! names this device syncs also says so in the personal channel, under
+//! the hold of the database's lock that it changed the setting under
+//! ([`names_follow`]): it holds a name and says that it syncs it when it
+//! maps the name, and says so no longer, and holds the name no more, when
+//! it unmaps it. Turning sync off takes back what it said of every name.
+//! A device that follows no phrase says nothing: what is in its folders
+//! stays on the machine (§5.2).
 
 use actix_web::{HttpRequest, HttpResponse, web};
 
@@ -15,7 +25,7 @@ use crate::types::*;
 /// folder may take it: every device shows it as home memory.
 const HOME_NAME: &str = "~";
 
-fn mappings(db: &rusqlite::Connection) -> Result<Vec<SyncMapping>, ApiError> {
+pub(crate) fn mappings(db: &rusqlite::Connection) -> Result<Vec<SyncMapping>, ApiError> {
     Ok(meta::get(db, meta::SYNC_CLAUDE_MAPPINGS)?
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default())
@@ -57,6 +67,16 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
     let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
     let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
+    use cordelia_storage::person::State;
+    let stands = match crate::at_relays::stands(&db) {
+        Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
+        Ok(crate::at_relays::Stands::Applied) => "applied",
+        Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
+        Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
+        Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
+        Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    };
     Ok(SyncStatusResponse {
         enabled: dir.is_some(),
         dir,
@@ -68,6 +88,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         generation: state.sync_control.generation(),
         report,
         last_change_at,
+        stands,
     })
 }
 
@@ -344,6 +365,53 @@ pub fn set_claude(
     Ok(())
 }
 
+/// The names that this device's folders are mapped to.
+fn mapped_names(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
+    Ok(mappings(db)?.into_iter().map(|m| m.name).collect())
+}
+
+/// What this device says of the names it syncs follows a change of
+/// settings (decision 2026-10-04 §2.2, §16), under the hold of the
+/// database's lock that the change was made under. `before` is the names
+/// its folders were mapped to before the change.
+///
+/// - A name that was mapped and is mapped no longer: the device says no
+///   longer that it syncs it, and holds it no more
+///   ([`crate::names::stop`]). What it kept of which relays had handed
+///   the name's channel goes too: mapped again, the channel is fetched
+///   before the folder's first cycle there (§6).
+/// - With sync on, it holds each name that is mapped, and says that it
+///   syncs it ([`crate::names::hold_mapped`]).
+/// - With sync off, it says of no name that it syncs it
+///   ([`crate::names::unsay_all`]). It goes on holding the names its
+///   folders are mapped to.
+///
+/// A device that follows no phrase, or has stopped, has nothing to say
+/// and no name to hold: nothing is done, and nothing is refused. Where
+/// something was written, the node is woken to send it.
+pub fn names_follow(state: &AppState, db: &rusqlite::Connection, before: &[String]) {
+    let now = chrono::Utc::now().timestamp();
+    let done = || -> Result<(), crate::person::PersonError> {
+        let mapped = mapped_names(db).unwrap_or_default();
+        for name in before.iter().filter(|name| !mapped.contains(name)) {
+            if let Some(channel) = crate::names::stop(db, &state.identity, name, now)? {
+                state.own_channels.forget_fetched(&channel);
+            }
+        }
+        match meta::get(db, meta::SYNC_CLAUDE_DIR)?.is_some() {
+            true => crate::names::hold_mapped(db, &state.identity, now)?,
+            false => crate::names::unsay_all(db, &state.identity, now)?,
+        };
+        Ok(())
+    };
+    // The setting stands whatever becomes of this: the next cycle says
+    // what is still to be said, and takes back what is not.
+    if let Err(error) = done() {
+        tracing::warn!(%error, "sync: could not say which names this device syncs");
+    }
+    state.own_channels.written();
+}
+
 /// Turn the adapter on or off, and set what it syncs (see [`set_claude`]).
 pub async fn claude(
     req: HttpRequest,
@@ -357,7 +425,9 @@ pub async fn claude(
             .db
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let before = mapped_names(&db)?;
         set_claude(&state.sync_control, &db, &body, home.as_deref())?;
+        names_follow(&state, &db, &before);
     }
     Ok(HttpResponse::Ok().json(status(&state)?))
 }
@@ -418,6 +488,14 @@ pub fn check_mapping(
         return Err(format!(
             "{name:?} is not a usable name: use lower-case letters, digits and . _ - / ~ + % @, \
              and do not start it with - or ~"
+        ));
+    }
+    // A name has its channel by its one spelling (decision 2026-10-04
+    // §2.2): another spelling would be another channel, and has none.
+    let tidy = cordelia_core::sync_name::tidy(name);
+    if tidy != name {
+        return Err(format!(
+            "{name:?} is not a name in its one spelling: map the folder as {tidy:?}"
         ));
     }
     if name == HOME_NAME && !is_home {
@@ -536,7 +614,9 @@ pub async fn map(
             .db
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let before = mapped_names(&db)?;
         add_mapping(&state.sync_control, &db, &body, &home_dir)?;
+        names_follow(&state, &db, &before);
     }
     Ok(HttpResponse::Ok().json(status(&state)?))
 }
@@ -600,7 +680,9 @@ pub async fn unmap(
             .db
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let before = mapped_names(&db)?;
         remove_mapping(&state.sync_control, &db, &body)?;
+        names_follow(&state, &db, &before);
     }
     Ok(HttpResponse::Ok().json(status(&state)?))
 }
@@ -758,6 +840,11 @@ mod tests {
             (request("/home/sam", "-team", true), "not a usable name"),
             (request("/home/sam/Work", "~x", false), "not a usable name"),
             (request("/home/sam/Work", "~/x", false), "not a usable name"),
+            // A name has its channel by its one spelling.
+            (
+                request("/home/sam/Work", "github.com/sam/work.git", false),
+                "in its one spelling: map the folder as \"github.com/sam/work\"",
+            ),
             // Nothing outside the home directory.
             (request("/srv/code/app", "app", false), "outside the home"),
             (
@@ -982,7 +1069,12 @@ mod tests {
                 &memory,
                 "grp_x",
                 "notes.md",
-                (Some([7; 32]), 1, sync_state::Writer::NotRecorded),
+                &sync_state::Agreed {
+                    hash: Some([7; 32]),
+                    rev: 1,
+                    signer: None,
+                    chain: None,
+                },
             )
             .unwrap();
         }
@@ -1119,7 +1211,12 @@ mod tests {
             &there,
             "grp_x",
             "notes.md",
-            (Some([7; 32]), 1, sync_state::Writer::NotRecorded),
+            &sync_state::Agreed {
+                hash: Some([7; 32]),
+                rev: 1,
+                signer: None,
+                chain: None,
+            },
         )
         .unwrap();
         s.claude(serde_json::json!({ "dir": other }));
@@ -1385,5 +1482,104 @@ mod tests {
         counted(&s, "an unmapping");
         s.claude(serde_json::json!({ "enabled": false }));
         counted(&s, "sync off");
+    }
+
+    /// What a device says of the names it syncs follows its settings
+    /// (decision 2026-10-04 §2.2, §16): it holds a name and says that it
+    /// syncs it when it maps the name, says so no longer and holds it no
+    /// more when it unmaps it, and takes every word back when sync is
+    /// turned off. A device that follows no phrase says nothing, and its
+    /// settings are set all the same.
+    #[test]
+    fn test_what_a_device_says_of_its_names_follows_its_settings() {
+        use crate::several::{Machine, Several, state_of};
+        use cordelia_storage::person as held_rows;
+
+        let home = std::path::Path::new("/home/sam");
+        let on = |on: bool| -> SyncClaudeRequest {
+            serde_json::from_value(serde_json::json!({ "enabled": on, "dir": DIR })).unwrap()
+        };
+        let held = |db: &rusqlite::Connection| -> Vec<String> {
+            let names = held_rows::names(db).unwrap();
+            names.into_iter().map(|name| name.name).collect()
+        };
+        let said = |state: &AppState, db: &rusqlite::Connection| -> Vec<String> {
+            let said = crate::names::said_here(db, &state.identity).unwrap();
+            said.into_iter().collect()
+        };
+        // One settings command, as its handler runs it.
+        let does = |state: &AppState, command: &dyn Fn(&rusqlite::Connection)| {
+            let db = state.db.lock().unwrap();
+            let before = mapped_names(&db).unwrap();
+            command(&db);
+            names_follow(state, &db, &before);
+        };
+        let turns = |state: &AppState, to: bool| {
+            does(state, &|db| {
+                set_claude(&state.sync_control, db, &on(to), Some(home)).unwrap()
+            })
+        };
+        let maps = |state: &AppState, folder: &str, name: &str| {
+            does(state, &|db| {
+                let body = request(folder, name, false);
+                add_mapping(&state.sync_control, db, &body, home).unwrap()
+            })
+        };
+        let unmaps = |state: &AppState, name: &str| {
+            does(state, &|db| {
+                let body = SyncUnmapRequest {
+                    folder: name.to_string(),
+                };
+                remove_mapping(&state.sync_control, db, &body).unwrap()
+            })
+        };
+
+        let mut s = Several::of_one_person(1);
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        turns(&state, true);
+        maps(&state, "/home/sam/notes", "lab");
+        maps(&state, "/home/sam/work", "team");
+        let lab = {
+            let db = state.db.lock().unwrap();
+            assert_eq!(held(&db), ["lab", "team"]);
+            assert_eq!(said(&state, &db), ["lab", "team"]);
+            held_rows::channel_of_name(&db, "lab").unwrap().unwrap()
+        };
+        // Its channel was fetched from the relay.
+        let now = std::time::Instant::now();
+        state.own_channels.fetched_from(&lab, "relay", now);
+        assert!(state.own_channels.first_fetch_done(&lab, now));
+
+        // Unmapped: said no longer, held no more, and fetched again
+        // before a folder's first cycle there.
+        unmaps(&state, "lab");
+        {
+            let db = state.db.lock().unwrap();
+            assert_eq!(held(&db), ["team"]);
+            assert_eq!(said(&state, &db), ["team"]);
+        }
+        assert!(!state.own_channels.first_fetch_done(&lab, now));
+
+        // Sync is turned off: every word is taken back, and the name is
+        // held still. Turned on again, it is said again.
+        turns(&state, false);
+        {
+            let db = state.db.lock().unwrap();
+            assert_eq!(held(&db), ["team"]);
+            assert!(said(&state, &db).is_empty());
+        }
+        turns(&state, true);
+        assert_eq!(said(&state, &state.db.lock().unwrap()), ["team"]);
+
+        // A device that follows no phrase: its settings are set, and it
+        // holds no name and says nothing.
+        let alone = state_of(Machine::new(7));
+        turns(&alone, true);
+        maps(&alone, "/home/sam/notes", "lab");
+        let db = alone.db.lock().unwrap();
+        assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
+        assert!(held(&db).is_empty());
+        assert!(said(&alone, &db).is_empty());
     }
 }

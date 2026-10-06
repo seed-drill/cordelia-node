@@ -81,13 +81,13 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted};
 use cordelia_api::at_relays::{self, Stands};
+use cordelia_api::state::AppState;
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_ENTRIES, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
     WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
-use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
     ChannelProve, EntryPull, EntryRefused, EntryShow, EntryShowShort, Protocol, ShowAnswer,
@@ -656,14 +656,21 @@ impl Leave {
     ///   is dropped.
     ///
     /// `sync_on` says whether sync is on here, as the database says it.
+    ///
+    /// A hand-over that is taken has the device apply a statement, so
+    /// each is given to [`adding::accept_typed`] as what may change which
+    /// channels are the device's own is done
+    /// ([`AppState::as_a_change`], decision 2026-10-04 §4.2): it waits
+    /// for a sync cycle that is running to stop, and counts as a change
+    /// of settings.
     pub async fn pair(
         &self,
-        db: &Mutex<Connection>,
-        identity: &NodeIdentity,
+        state: &AppState,
         link: &Link,
         typed: &TypedKey,
         sync_on: impl Fn(&Connection) -> bool,
     ) -> Result<PairRead, Refused> {
+        let (db, identity) = (&state.db, &state.identity);
         let reads = |conn: &Connection, now: i64| {
             adding::keys_that_read(conn, now).is_ok_and(|keys| {
                 keys.iter()
@@ -710,9 +717,11 @@ impl Leave {
             .collect();
         let mut read = Vec::new();
         for entry in &handed {
-            let conn = lock(db);
             let now = self.clock.unix();
-            match adding::accept_typed(&conn, identity, typed, sync_on(&conn), entry, now) {
+            let accepted = state.as_a_change(|conn| {
+                adding::accept_typed(conn, identity, typed, sync_on(conn), entry, now)
+            });
+            match accepted {
                 Ok(Some(accepted)) => read.push(accepted),
                 // The key reads nothing more: it was spent, or typed
                 // again, or its hour went by.

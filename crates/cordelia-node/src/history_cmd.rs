@@ -450,8 +450,9 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
                 out.push_str("  It goes to your other devices at the next sync, as an edit.\n")
             }
             "too_large" => out.push_str(
-                "  This text is too large to sync (an entry holds 64 KB as it travels), so the \
-                 file stays on this device, and your other devices keep the version they have.\n",
+                "  This text is too large to sync (a file's name and its text may together be \
+                 60 KB), so the file stays on this device, and your other devices keep the \
+                 version they have.\n",
             ),
             "no" => out.push_str(&format!(
                 "  This folder does not sync now, so the file stays on this device. When the \
@@ -459,8 +460,8 @@ fn restored(answer: &Value, marker: &str, terminal: bool) -> (String, usize) {
                  folder, then restore again.\n"
             )),
             "waits" => out.push_str(&format!(
-                "  This folder is waiting to join its channel, so the file stays on this device \
-                 for now. When it has joined, {WHEN_IT_SYNCS}.\n"
+                "  This folder is waiting for its channel to be fetched from a relay, so the \
+                 file stays on this device for now. When it has been, {WHEN_IT_SYNCS}.\n"
             )),
             _ => out.push_str(&format!(
                 "  Whether this folder syncs cannot be told from the last sync cycle: \
@@ -874,7 +875,10 @@ mod tests {
             "{no}"
         );
         let waits = said(json!("waits"));
-        assert!(waits.contains("waiting to join its channel"), "{waits}");
+        assert!(
+            waits.contains("waiting for its channel to be fetched from a relay"),
+            "{waits}"
+        );
         assert!(!waits.contains("restore again"), "{waits}");
         // Not told, or told in a word this version does not know: both
         // outcomes are said.

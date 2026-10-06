@@ -382,10 +382,7 @@ impl DeviceEntries {
         let sync_on = |db: &Connection| cordelia_api::commands::sync_is_on(db).unwrap_or(true);
         let mut taken = false;
         for key in typed {
-            let read = self
-                .leave
-                .pair(&self.state.db, &self.state.identity, link, key, sync_on)
-                .await;
+            let read = self.leave.pair(&self.state, link, key, sync_on).await;
             match read {
                 Ok(PairRead::Read(each)) => {
                     for accepted in &each {
@@ -477,8 +474,36 @@ impl DeviceEntries {
             turns.spawn(async move { engine.turn(&link, kind, shown).await });
         }
         while turns.join_next().await.is_some() {}
+        if whole {
+            self.say_sent(relays);
+        }
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
+    }
+
+    /// Write that this device has sent what it carried, once it has
+    /// (decision 2026-10-04 §8): where nothing that it carried waits at
+    /// any relay it is set up with. Which relays those are is known by
+    /// their keys while every one of them is connected, and not
+    /// otherwise: nothing is said then, as nothing is forgotten
+    /// ([`Self::forget_done`]). The word waits in the store, and the pass
+    /// that sends is woken for it.
+    fn say_sent(&self, relays: &[Relay]) {
+        let Some(set_up) = self.set_up_by_key(relays) else {
+            return;
+        };
+        let said = {
+            let db = lock(&self.state.db);
+            at_relays::say_sent(&db, &self.state.identity, &set_up, self.clock.unix())
+        };
+        match said {
+            Ok(true) => {
+                tracing::info!("this device has sent what it carried, and says so");
+                self.state.own_channels.written();
+            }
+            Ok(false) => {}
+            Err(e) => tracing::debug!(error = %e, "could not say that what was carried is sent"),
+        }
     }
 
     /// One relay's turn in a pass: the show, where the pass makes one,
@@ -548,21 +573,14 @@ impl DeviceEntries {
 
     // ── What is kept for nothing ────────────────────────────────────
 
-    /// Forget what is kept of the relays and has no more use, in the
-    /// store and in memory, since nothing else does (decision 2026-10-04
-    /// §6, §16): of a relay that the device is no longer set up with, of
-    /// a pair channel whose delete went everywhere, and of a channel that
-    /// is the device's no longer.
-    ///
-    /// Which relays the device is set up with is known by their keys
-    /// while every one of them is connected, and not otherwise: nothing
-    /// is forgotten of any relay then. `relays` is every relay that the
-    /// node is configured with, a relay whose name does not resolve
-    /// among them, with no connection. Whoever gives a pass fewer than
-    /// that is not believed: every one is connected only where each of
-    /// `relays` is, and they are as many as the node said it is
-    /// configured with.
-    fn forget_done(&self, relays: &[Relay]) {
+    /// The relays that the device is set up with, by their keys: known
+    /// while every one of them is connected, and not otherwise. `relays`
+    /// is every relay that the node is configured with, a relay whose
+    /// name does not resolve among them, with no connection. Whoever
+    /// gives a pass fewer than that is not believed: every one is
+    /// connected only where each of `relays` is, and they are as many as
+    /// the node said it is configured with.
+    fn set_up_by_key(&self, relays: &[Relay]) -> Option<Vec<[u8; 32]>> {
         let configured = self.state.own_channels.relays_set_up();
         let set_up: Option<Vec<[u8; 32]>> = relays
             .iter()
@@ -571,7 +589,21 @@ impl DeviceEntries {
                 Some(link.relay().0)
             })
             .collect();
-        let set_up = set_up.filter(|keys| Some(keys.len()) == configured);
+        set_up.filter(|keys| Some(keys.len()) == configured)
+    }
+
+    /// Forget what is kept of the relays and has no more use, in the
+    /// store and in memory, since nothing else does (decision 2026-10-04
+    /// §6, §16): of a relay that the device is no longer set up with, of
+    /// a pair channel whose delete went everywhere, and of a channel that
+    /// is the device's no longer.
+    ///
+    /// Which relays the device is set up with is known by their keys
+    /// while every one of them is connected, and not otherwise
+    /// ([`Self::set_up_by_key`]): nothing is forgotten of any relay
+    /// then.
+    fn forget_done(&self, relays: &[Relay]) {
+        let set_up = self.set_up_by_key(relays);
         let own = {
             let db = lock(&self.state.db);
             let own = &self.state.identity;
@@ -610,15 +642,17 @@ impl DeviceEntries {
             return;
         };
         let now = self.clock.unix();
-        let outcome = {
-            let db = lock(&self.state.db);
-            at_relays::answered(&db, &self.state.identity, &shown, &answer, now)
-        };
+        let outcome = self
+            .state
+            .as_a_change(|db| at_relays::answered(db, &self.state.identity, &shown, &answer, now));
         match outcome {
             // The entry went through the one door, and the device did
             // with it what a change entry has it do: nothing waits now.
             Ok(done) => {
                 tracing::info!(?done, "a change that could not be applied was dealt with");
+                if let Answered::Shown(Shown::Applied(applied)) = &done {
+                    self.not_carried(applied);
+                }
                 self.applied();
             }
             Err(e) => {
@@ -626,6 +660,20 @@ impl DeviceEntries {
                     kept.why = e.to_string();
                 }
             }
+        }
+    }
+
+    /// Say in the log each file whose record could not be carried when
+    /// the device applied a statement (decision 2026-10-04 §4.2): what
+    /// its store held in that slot no longer opens. `cordelia devices`
+    /// says the same.
+    fn not_carried(&self, applied: &cordelia_api::person::Applied) {
+        for (name, file) in &applied.not_carried {
+            tracing::warn!(
+                name,
+                file,
+                "what this device held of a file could not be read, and was not carried: it meets its channel as a new file does"
+            );
         }
     }
 
@@ -784,10 +832,13 @@ impl DeviceEntries {
     /// device applied a change by it, and so keeps another entry now.
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
         let now = self.clock.unix();
-        let outcome = {
-            let db = lock(&self.state.db);
-            at_relays::answered(&db, &self.state.identity, shown, another, now)
-        };
+        // Applying a statement waits for a sync cycle that is running to
+        // stop, and counts as a change of settings (decision 2026-10-04
+        // §4.2): no file is written, and nothing is published, in an old
+        // channel after it.
+        let outcome = self
+            .state
+            .as_a_change(|db| at_relays::answered(db, &self.state.identity, shown, another, now));
         let relay = link.name();
         match outcome {
             Ok(Answered::Shown(Shown::Applied(applied))) => {
@@ -797,6 +848,7 @@ impl DeviceEntries {
                     carried = applied.carried,
                     "applied a change that a relay held"
                 );
+                self.not_carried(&applied);
                 self.applied();
                 true
             }
@@ -948,6 +1000,15 @@ impl DeviceEntries {
                 match self.pull(&at, channel).await {
                     Step::Done(caught_up) => read_to_its_end = caught_up,
                     Step::Stop => return,
+                }
+                // The relay has handed the whole of a name's channel: a
+                // folder with no record there yet waits for that before
+                // its first cycle (decision 2026-10-04 §6).
+                if read_to_its_end && matches!(channel.kind, Kind::Name(_)) {
+                    let now = self.clock.now();
+                    self.state
+                        .own_channels
+                        .fetched_from(&channel.id, link.name(), now);
                 }
             }
             let sent = match self.push(&at, channel, Which::Since).await {

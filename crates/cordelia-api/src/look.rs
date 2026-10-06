@@ -30,9 +30,12 @@
 //! fingerprint are shown beside its label: a label is whatever the device
 //! that added a key called it, and two keys can have one label (§6).
 //!
-//! What is not here is the adapter's: the names that no device lists yet
-//! in the new generation, how much a device has written, and whether a
-//! device has sent what it carried.
+//! The names that no device lists yet in the generation applied are here
+//! too ([`crate::names::not_listed_yet`]), with whether each device says
+//! that it has sent what it carried, and the files whose record a change
+//! could not carry (§4.2, §7.3). What a device has still to send, by
+//! name, is asked of what it keeps of each relay it reaches, and is the
+//! caller's to add ([`crate::leaving::names_to_go`]).
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -52,13 +55,15 @@ use cordelia_crypto::statement::Statement;
 use cordelia_crypto::version;
 use cordelia_storage::acts;
 use cordelia_storage::entries;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
 
 use crate::adding::within_its_hour;
 use crate::leaving::{Among, among, left_name};
+use crate::names;
 use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
-    kept_entry, latest_entry,
+    kept_entry, latest_entry, read_applied_word,
 };
 use crate::state::{AtRelays, CannotGoOn};
 
@@ -106,6 +111,9 @@ pub struct Listed {
     /// personal channel of that statement's generation. `None` where this
     /// device holds no such word of it.
     pub applied: Option<u64>,
+    /// Whether it says that it has sent what it carried when it applied
+    /// the statement that this device has applied.
+    pub sent: bool,
     /// Whether it has said that it left.
     pub left: bool,
 }
@@ -125,7 +133,35 @@ pub struct AddedSince {
     /// Why it does not, where it does not.
     pub why_not: Option<String>,
     pub applied: Option<u64>,
+    /// As [`Listed::sent`].
+    pub sent: bool,
     pub left: bool,
+}
+
+/// A name that a device had listed in a generation this device left, and
+/// that no device lists yet in the one it has applied (decision
+/// 2026-10-04 §7.3, §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NameNotListed {
+    pub name: String,
+    /// The devices that had listed it and that count now.
+    pub by: Vec<Shown>,
+    /// The keys that had listed it and that count no longer. A name that
+    /// only such keys had listed is shown apart, as that.
+    pub by_gone: Vec<Shown>,
+    /// How many days it can still be brought in for: the secret of the
+    /// generation that listed it is kept for 90 days from when the device
+    /// left it.
+    pub days_left: i64,
+}
+
+/// A file whose record in a folder was dropped when the device applied
+/// the statement (decision 2026-10-04 §4.2): the name it syncs under, and
+/// the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct NotCarried {
+    pub name: String,
+    pub file: String,
 }
 
 /// A key that the device counted before the statement and that is in
@@ -222,6 +258,12 @@ pub struct Look {
     pub relays: Vec<AtRelayLook>,
     pub accepting: Vec<Accepting>,
     pub notices: Vec<Notice>,
+    /// The names that no device lists yet in the generation applied, in
+    /// order of name.
+    pub names_not_listed: Vec<NameNotListed>,
+    /// The files whose record could not be carried when the device
+    /// applied the statement, as it noted them then.
+    pub not_carried: Vec<NotCarried>,
     /// Why the device cannot go on, where it cannot.
     pub cannot_go_on: Option<String>,
     /// A few words for a line of status, where there is something to
@@ -267,6 +309,8 @@ pub fn look(
             relays: relays(at_relays),
             accepting: accepting(conn, now)?,
             notices: Vec::new(),
+            names_not_listed: Vec::new(),
+            not_carried: Vec::new(),
             cannot_go_on: None,
             short: None,
             says: Vec::new(),
@@ -276,7 +320,10 @@ pub fn look(
                 look.short = Some(NOT_ADDED_YET.into());
                 look.says.push(NO_PHRASE.into());
             }
-            Some(held) => of_its_person(conn, identity, &held, at_relays, &mut look)?,
+            Some(held) => {
+                of_its_person(conn, identity, &held, at_relays, &mut look)?;
+                of_its_names(conn, &held, now, &mut look)?;
+            }
         }
         for notice in &look.notices {
             look.says.push(notice.says.clone());
@@ -332,6 +379,7 @@ fn of_its_person(
             this_device: device.key == own,
             maker: device.key == statement.maker,
             applied: reader.applied(conn, &device.key)?,
+            sent: reader.sent(conn, &device.key)?,
             left: reader.left(conn, &device.key)?.is_some(),
         });
     }
@@ -367,6 +415,7 @@ fn of_its_person(
             counted: shown.counted,
             why_not,
             applied: reader.applied(conn, &shown.key)?,
+            sent: reader.sent(conn, &shown.key)?,
             left: reader.left(conn, &shown.key)?.is_some(),
         });
     }
@@ -427,6 +476,130 @@ fn of_its_person(
         look.says.push(why.clone());
     }
     look.cannot_go_on = why;
+    Ok(())
+}
+
+/// What a device that follows a phrase holds of the names of its person
+/// that are not all in the generation it has applied (decision 2026-10-04
+/// §4.2, §7.3, §8): the names that no device lists there yet, and the
+/// files whose record could not be carried. A device that has stopped
+/// says nothing of either: it is in no generation to bring a name into.
+fn of_its_names(
+    conn: &Connection,
+    held: &Held,
+    now: i64,
+    look: &mut Look,
+) -> Result<(), PersonError> {
+    if held.state != State::Applied {
+        return Ok(());
+    }
+    let statement = &held.statement.statement;
+    let kept = held_rows::additions(conn)?;
+    let reader = Reader::of(conn, statement, &kept)?;
+    let shown = |keys: &[[u8; 32]]| -> Result<Vec<Shown>, PersonError> {
+        keys.iter()
+            .map(|key| Shown::of(key, &reader.label(key)))
+            .collect()
+    };
+    for name in names::not_listed_yet(conn)? {
+        look.names_not_listed.push(NameNotListed {
+            by: shown(&name.by)?,
+            by_gone: shown(&name.by_gone)?,
+            days_left: (name.until.saturating_sub(now) / (24 * 60 * 60)).max(0),
+            name: name.name,
+        });
+    }
+    look.not_carried = not_carried(conn)?;
+
+    let (ours, gone): (Vec<&NameNotListed>, Vec<&NameNotListed>) = look
+        .names_not_listed
+        .iter()
+        .partition(|name| !name.by.is_empty());
+    let named = |names: &[&NameNotListed]| {
+        let each: Vec<&str> = names.iter().map(|name| name.name.as_str()).collect();
+        each.join(", ")
+    };
+    let days = |names: &[&NameNotListed]| names.iter().map(|name| name.days_left).min();
+    if let Some(days) = days(&ours) {
+        look.says.push(format!(
+            "{} that your devices synced before the last change {} listed by no device yet: \
+             {}. What the relays hold of {} can still be brought in for {days} day{}",
+            counted(ours.len(), "name"),
+            if ours.len() == 1 { "is" } else { "are" },
+            named(&ours),
+            if ours.len() == 1 { "it" } else { "them" },
+            if days == 1 { "" } else { "s" },
+        ));
+    }
+    if let Some(days) = days(&gone) {
+        look.says.push(format!(
+            "{} that only a device which no longer counts had synced {} listed by no device: \
+             {}. {} behind, and can still be brought in for {days} day{}",
+            counted(gone.len(), "name"),
+            if gone.len() == 1 { "is" } else { "are" },
+            named(&gone),
+            if gone.len() == 1 {
+                "It stays"
+            } else {
+                "They stay"
+            },
+            if days == 1 { "" } else { "s" },
+        ));
+    }
+    if !look.not_carried.is_empty() {
+        let each: Vec<String> = look
+            .not_carried
+            .iter()
+            .map(|file| format!("{} in {}", file.file, file.name))
+            .collect();
+        look.says.push(format!(
+            "what this device held of {} could not be read at the last change, and was not \
+             carried: {}. Each meets its channel as a new file does",
+            counted(each.len(), "file"),
+            each.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// A count with its noun: `1 name`, `3 names`.
+fn counted(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
+}
+
+/// The files whose record could not be carried when this device applied
+/// its statement, as it noted them then ([`note_not_carried`]).
+fn not_carried(conn: &Connection) -> Result<Vec<NotCarried>, PersonError> {
+    Ok(meta::get(conn, meta::PERSON_NOT_CARRIED)?
+        .and_then(|noted| serde_json::from_str(&noted).ok())
+        .unwrap_or_default())
+}
+
+/// Note the files whose record could not be carried at the statement
+/// that this device has just applied, for `cordelia devices` to say
+/// (decision 2026-10-04 §4.2). What was noted at the statement before is
+/// replaced: those files have met their channels since.
+pub(crate) fn note_not_carried(
+    conn: &Connection,
+    files: &[(String, String)],
+) -> Result<(), PersonError> {
+    if files.is_empty() {
+        meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
+        return Ok(());
+    }
+    let noted: Vec<NotCarried> = files
+        .iter()
+        .map(|(name, file)| NotCarried {
+            name: name.clone(),
+            file: file.clone(),
+        })
+        .collect();
+    let noted = serde_json::to_string(&noted)
+        .map_err(|e| PersonError::Held(format!("the files that were not carried: {e}")))?;
+    meta::set(conn, meta::PERSON_NOT_CARRIED, &noted)?;
     Ok(())
 }
 
@@ -496,8 +669,26 @@ impl Reader {
 
     /// The number of the statement that the device says it has applied.
     fn applied(&self, conn: &Connection, key: &[u8; 32]) -> Result<Option<u64>, PersonError> {
+        Ok(self.applied_word(conn, key)?.map(|(number, _)| number))
+    }
+
+    /// Whether the device says that it has sent what it carried when it
+    /// applied the statement that this device has applied (decision
+    /// 2026-10-04 §8). A word of another statement says nothing of this
+    /// one.
+    fn sent(&self, conn: &Connection, key: &[u8; 32]) -> Result<bool, PersonError> {
+        Ok(self.applied_word(conn, key)? == Some((self.number, true)))
+    }
+
+    /// The device's word that it has applied a statement: the number, and
+    /// whether it has sent what it carried.
+    fn applied_word(
+        &self,
+        conn: &Connection,
+        key: &[u8; 32],
+    ) -> Result<Option<(u64, bool)>, PersonError> {
         Ok(match self.word(conn, key, &applied_name(key)?)? {
-            Some((_, Value::Text(number))) => number.parse().ok(),
+            Some((_, Value::Text(word))) => read_applied_word(&word),
             _ => None,
         })
     }

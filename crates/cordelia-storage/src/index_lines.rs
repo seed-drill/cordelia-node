@@ -567,13 +567,18 @@ mod tests {
     /// folder that has nothing agreed too.
     #[test]
     fn test_a_folder_that_forgets_loses_its_records() {
-        use crate::sync_state::{self, Writer};
+        use crate::sync_state::{self, Agreed};
         let conn = db::open_in_memory().unwrap();
         let fill = || {
             let agreed = [("/m", "grp_a"), ("/m", "grp_b"), ("/other", "grp_a")];
             for (folder, channel) in agreed {
-                let nobody = (None, 1, Writer::Nobody);
-                sync_state::save(&conn, folder, channel, "a.md", nobody).unwrap();
+                let deleted = Agreed {
+                    hash: None,
+                    rev: 1,
+                    signer: Some([1; 32]),
+                    chain: Some(Vec::new()),
+                };
+                sync_state::save(&conn, folder, channel, "a.md", &deleted).unwrap();
             }
             // And a folder that has nothing agreed.
             for (folder, channel) in agreed.into_iter().chain([("/bare", "grp_a")]) {

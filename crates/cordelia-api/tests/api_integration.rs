@@ -34,7 +34,6 @@ fn test_state() -> web::Data<AppState> {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
-        usable_keys: Default::default(),
         own_channels: Default::default(),
         history: Default::default(),
     })
@@ -42,6 +41,23 @@ fn test_state() -> web::Data<AppState> {
 
 fn auth_header() -> (&'static str, String) {
     ("Authorization", format!("Bearer {TEST_TOKEN}"))
+}
+
+/// Record a personal channel for this node directly in storage: a group
+/// channel of its own, noted under the key where a node keeps the ID of
+/// its personal channel, with `members` beside the node itself. The
+/// invite endpoint hands a channel only to a key that is a member there.
+fn record_personal_channel(state: &AppState, members: &[[u8; 32]]) {
+    use cordelia_storage::{channels, meta};
+    let db = state.db.lock().unwrap();
+    let own = state.identity.public_key();
+    let personal = channels::create_group(&db, &own, "realtime", None, None)
+        .unwrap()
+        .channel_id;
+    meta::set(&db, meta::PERSONAL_CHANNEL_ID, &personal).unwrap();
+    for key in members {
+        channels::add_member(&db, &personal, key, "owner").unwrap();
+    }
 }
 
 #[actix_web::test]
@@ -656,14 +672,9 @@ async fn test_group_lifecycle() {
         "{body}"
     );
 
-    // Once the key is one of this person's devices, it can be invited.
-    let req = test::TestRequest::post()
-        .uri("/api/v1/old-devices/add")
-        .insert_header(auth_header())
-        .set_json(json!({ "device": peer_bech32 }))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200);
+    // Once the key is a member of this node's personal channel, it can be
+    // invited.
+    record_personal_channel(&state, &[peer.public_key()]);
     let resp = test::call_service(&app, invite()).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = test::read_body_json(resp).await;
@@ -730,8 +741,8 @@ async fn test_the_older_endpoints_seal_to_no_key_that_is_not_usable() {
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(body["dms"].as_array().unwrap().len(), 0, "{body}");
 
-    // A group: such a key is not invited, even where an older version had
-    // stored it as one of this person's devices.
+    // A group: such a key is not invited, even where it is stored as a
+    // member of this node's personal channel, beside a key that is usable.
     let resp = test::call_service(
         &app,
         post("/api/v1/channels/group", json!({ "mode": "realtime" })),
@@ -740,25 +751,8 @@ async fn test_the_older_endpoints_seal_to_no_key_that_is_not_usable() {
     let body: serde_json::Value = test::read_body_json(resp).await;
     let group = body["channel_id"].as_str().unwrap().to_string();
     let real = NodeIdentity::generate().unwrap().public_key();
-    let add = post("/api/v1/old-devices/add", json!({ "device": named(&real) }));
-    assert_eq!(test::call_service(&app, add).await.status(), 200);
-    {
-        let db = state.db.lock().unwrap();
-        let personal =
-            cordelia_storage::meta::get(&db, cordelia_storage::meta::PERSONAL_CHANNEL_ID)
-                .unwrap()
-                .unwrap();
-        for key in &unusable {
-            cordelia_storage::trust::trust(
-                &db,
-                key,
-                cordelia_storage::trust::TrustKind::Device,
-                None,
-            )
-            .unwrap();
-            cordelia_storage::channels::add_member(&db, &personal, key, "owner").unwrap();
-        }
-    }
+    let stored: Vec<[u8; 32]> = std::iter::once(real).chain(unusable.clone()).collect();
+    record_personal_channel(&state, &stored);
     for key in &unusable {
         let invite = json!({ "channel_id": group, "member": named(key) });
         let resp = test::call_service(&app, post("/api/v1/channels/group/invite", invite)).await;

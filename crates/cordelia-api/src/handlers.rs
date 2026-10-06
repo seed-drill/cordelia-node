@@ -1455,6 +1455,18 @@ pub async fn status(
     state: web::Data<crate::state::AppState>,
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, crate::error::ApiError> {
+    status_with(state, req, true).await
+}
+
+/// The status of a node. `older_kind` says whether the node carries
+/// channels of the older kind: a personal node carries none (decision
+/// 2026-10-04 §10), and what its database may still hold of one is no
+/// part of what waits to be sent.
+pub(crate) async fn status_with(
+    state: web::Data<crate::state::AppState>,
+    req: actix_web::HttpRequest,
+    older_kind: bool,
+) -> Result<HttpResponse, crate::error::ApiError> {
     crate::auth::check_bearer(&req, &state)?;
 
     let uptime = state.uptime_secs();
@@ -1462,12 +1474,20 @@ pub async fn status(
     let peers_warm = state.peers_warm.load(std::sync::atomic::Ordering::Relaxed);
     let sync_errors = state.sync_error_count();
 
+    // What waits in a channel of the device's own, from its secret
+    // (decision 2026-10-04 §8): counted with what waits of the older
+    // kind, which a personal node writes none of.
+    let own_waiting = crate::commands::channels_waiting(&state);
     let db = state.db.lock().unwrap();
     let pk = state.identity.public_key();
     let channels = cordelia_storage::channels::list_for_entity(&db, &pk)
         .map(|c| c.len())
         .unwrap_or(0);
-    let outbox_waiting = cordelia_storage::items::outbox_len(&db, &pk).unwrap_or(0);
+    let older_waiting = match older_kind {
+        true => cordelia_storage::items::outbox_len(&db, &pk).unwrap_or(0),
+        false => 0,
+    };
+    let outbox_waiting = older_waiting + own_waiting;
     // Of those, the ones a relay refused: they wait, and are offered again.
     let outbox_refused: Vec<serde_json::Value> = state
         .outbox_refused

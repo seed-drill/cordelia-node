@@ -795,35 +795,140 @@ pub fn has_hot_peer(n: &Node) -> Option<()> {
     (status["peers_hot"].as_u64()? >= 1).then_some(())
 }
 
-/// Pair `b` with `a` as the documented flow does, one key copied in each
-/// direction; `a` labels `b` with `label`. Returns the personal channel,
-/// once `b` has joined it.
-pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> String {
-    let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["old-add-device", &b_key, "--name", label]);
-    let a_key = added
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia old-accept "))
-        .unwrap_or_else(|| panic!("add-device output lacks the accept line:\n{added}"))
-        .to_string();
-    b.cli(&["old-accept", &a_key]);
-    let personal = groups(a)
-        .into_iter()
-        .next()
-        .expect("a has a personal channel");
-    wait_for("b joins a's personal channel", all, 90, || {
-        groups(b).contains(&personal).then_some(())
-    });
-    personal
+/// A relay of the test's own, started.
+pub fn relay_started() -> Node {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    relay
 }
 
-pub fn groups(n: &Node) -> Vec<String> {
-    n.post("/api/v1/channels/list-groups", serde_json::json!({}))["groups"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|g| g["channel_id"].as_str().map(String::from))
-        .collect()
+/// A device whose one relay is `relay`, started, and connected to it.
+pub fn device_started(name: &'static str, relay: &Node) -> Node {
+    let mut device = node(name, "personal", Some(relay.p2p));
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("device reaches its relay", &[&device, relay], 60, || {
+        has_hot_peer(&device)
+    });
+    device
+}
+
+pub fn key_of(node: &Node) -> String {
+    node.cli(&["id"]).trim().to_string()
+}
+
+// ── Commands, as a person runs them ──────────────────────────────────
+
+/// The twelve words that `cordelia phrase` showed, read off its
+/// terminal.
+pub fn words_shown(said: &str) -> String {
+    let after = said
+        .split("shown once:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no phrase was shown:\n{said}"));
+    let words = after
+        .lines()
+        .map(str::trim)
+        .find(|line| line.split_whitespace().count() == 12)
+        .unwrap_or_else(|| panic!("no twelve words were shown:\n{said}"));
+    words.to_string()
+}
+
+/// `cordelia phrase` on a device that follows none: the words are read
+/// off the terminal, as a person writes them down, and typed back.
+/// Returns the words.
+pub fn makes_a_phrase(device: &Node, label: &str) -> String {
+    let mut at = device.at_terminal(&["phrase", "--name", label]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back");
+    at.types(&words);
+    let said = at.done();
+    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    words
+}
+
+/// `cordelia add-device` on `adder`, for `new` under `label`, and
+/// `cordelia accept` on `new`, each with its yes. Returns what each said.
+pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
+    let mut at = adder.at_terminal(&["add-device", &key_of(new), "--name", label]);
+    at.says("Type yes to go on").types("yes");
+    let added = at.done();
+    let accept = added
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("cordelia accept "))
+        .unwrap_or_else(|| panic!("add-device printed no accept line:\n{added}"))
+        .trim()
+        .to_string();
+    assert_eq!(accept, key_of(adder));
+    let mut at = new.at_terminal(&["accept", &accept]);
+    at.says("Type yes to go on").types("yes");
+    let accepted = at.done();
+    (added, accepted)
+}
+
+/// `cordelia remove-device` on `device`, for the device whose key is
+/// `key`, at a terminal: of each other device added since the last
+/// change, in the order it is asked, the answer in `answers` (`stays` or
+/// `removed`); then the yes, and the recovery phrase `words`. Returns the
+/// command, still running, after the phrase was typed: whoever calls this
+/// reads on (it says that the change is made, and then stays and says
+/// what is still missing), or drops the terminal.
+pub fn removes(device: &Node, key: &str, answers: &[&str], words: &str) -> AtTerminal {
+    let mut at = device.at_terminal(&["remove-device", key]);
+    changes(&mut at, answers, words);
+    at
+}
+
+/// `cordelia renew` on `device`, at a terminal, as [`removes`] is.
+pub fn renews(device: &Node, answers: &[&str], words: &str) -> AtTerminal {
+    let mut at = device.at_terminal(&["renew"]);
+    changes(&mut at, answers, words);
+    at
+}
+
+/// Answer a command that makes a change: of each device it asks about,
+/// then its yes, then the phrase.
+fn changes(at: &mut AtTerminal, answers: &[&str], words: &str) {
+    for answer in answers {
+        at.says("Type `stays` or `removed`").types(answer);
+    }
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(words);
+}
+
+/// What the node says of its device and its person
+/// (`POST /api/v1/devices/list`).
+pub fn person_of(node: &Node) -> serde_json::Value {
+    node.post("/api/v1/devices/list", serde_json::json!({}))
+}
+
+/// Wait until `device` has applied change `number`.
+pub fn has_applied(device: &Node, number: u64, all: &[&Node]) {
+    wait_for("the device applies the change", all, 90, || {
+        (person_of(device)["change"].as_u64() == Some(number)).then_some(())
+    });
+}
+
+/// Make `a` and `b` two devices of one person, as the documented flow
+/// does (decision 2026-10-04 §5.2, §6): `a` makes a recovery phrase where
+/// it follows none yet, `cordelia add-device` on `a` and `cordelia accept`
+/// on `b`, each at a terminal with its yes; `a` labels `b` with `label`.
+/// It comes back once `b` has joined: it follows `a`'s phrase and has
+/// applied its change. Returns the twelve words where `a` made a phrase
+/// here.
+pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> Option<String> {
+    let words = (person_of(a)["state"] == "no_phrase").then(|| makes_a_phrase(a, "desktop"));
+    adds(a, b, label);
+    let change = person_of(a)["change"]
+        .as_u64()
+        .expect("a has applied a change");
+    has_applied(b, change, all);
+    words
 }
 
 /// The folder Claude Code keeps for a session started in `dir`.

@@ -70,17 +70,21 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{ENTRY_WIRE_OVERHEAD_BYTES, PERSONAL_NAME_PREFIX};
+use cordelia_core::revision::next_under;
 use cordelia_crypto::derive;
-use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::proof;
+use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::version;
 use cordelia_storage::at_relays::{self as kept_rows};
 use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Kept, State};
 use cordelia_storage::relay::{Mark, NO_MARK};
 
-use crate::person::{PersonError, Shown, in_one, kept_entry, latest_entry};
+use crate::person::{
+    PersonError, Shown, applied_name, applied_word, in_one, kept_entry, latest_entry,
+};
 use crate::publish::Standing;
 use crate::take::{Taken, take};
 
@@ -531,6 +535,93 @@ pub fn forget_what_is_done(
             }
         }
         Ok(forgotten)
+    })
+}
+
+// ── What was carried, and whether it was sent ────────────────────────
+
+/// Whether something that this device carried when it applied its
+/// statement still waits to be sent to the relay whose node key is
+/// `relay` (decision 2026-10-04 §7.3, §8): its own words in the personal
+/// channel, and in the channel of each name it holds what it carried
+/// there, which has a turn of its own.
+pub fn carried_waits_at(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relay: &[u8; 32],
+) -> Result<bool, PersonError> {
+    let carried_up_to = kept_rows::carried_up_to(conn)?;
+    for channel in channels(conn, identity)? {
+        let kept = kept_rows::kept(conn, relay, &channel.id)?;
+        let from = match channel.kind {
+            Kind::Personal => kept.sent_to,
+            Kind::Name(_) => kept.carried_to,
+            Kind::Pair => continue,
+        };
+        let next = entries::channel_entries_after(conn, &channel.id, from, 1)?;
+        if next.first().is_some_and(|held| held.seq <= carried_up_to) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// This device writes that it has sent what it carried, once it has
+/// (decision 2026-10-04 §8): its word that it has applied the statement,
+/// in the personal channel, then says so beside the statement's number
+/// ([`crate::person::applied_word`]). Returns whether the word was
+/// written: it waits in the store, and is sent as anything is.
+///
+/// `relays` are the relays that the device is set up with, every one, by
+/// their node keys. It has sent what it carried where nothing of that
+/// waits at any of them ([`carried_waits_at`]). With no relay nothing is
+/// sent, and nothing is said. Nor is anything said twice, or by a device
+/// that has stopped.
+pub fn say_sent(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[[u8; 32]],
+    now: i64,
+) -> Result<bool, PersonError> {
+    in_one(conn, || {
+        if relays.is_empty() || stands(conn)? != Stands::Applied {
+            return Ok(false);
+        }
+        let standing = Standing::to_write(conn)?;
+        let own = identity.public_key();
+        let personal = derive::personal_secret(&standing.secret)?;
+        let channel = derive::channel_id(&personal)?;
+        let name = applied_name(&own)?;
+        let slot = slot_id(&derive::slot_key(&personal)?, &name);
+        // Its own word there, as it stands: the statement's number alone.
+        let Some(held) = entries::author_entry(conn, &channel, &slot, &own)? else {
+            return Ok(false);
+        };
+        let before = held.entry.rev;
+        let said = held.entry.check()?.open(&personal)?.value;
+        let number = standing.number();
+        if said != Value::Text(applied_word(number, false)) {
+            return Ok(false);
+        }
+        for relay in relays {
+            if carried_waits_at(conn, identity, relay)? {
+                return Ok(false);
+            }
+        }
+        let rev = next_under(Some(before), number).ok_or_else(|| {
+            PersonError::Held(
+                "this device's own word in that slot is at the last revision under the statement"
+                    .into(),
+            )
+        })?;
+        let inside = Inside {
+            name,
+            value: Value::Text(applied_word(number, true)),
+            chain: Some(Vec::new()),
+        };
+        let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
+        entries::store(conn, &entry, now)?;
+        Ok(true)
     })
 }
 

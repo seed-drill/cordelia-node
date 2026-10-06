@@ -48,7 +48,7 @@ use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, Kept, State};
 
 use crate::adding::{is_alone, leave, write_over_dropped};
-use crate::at_relays::Kind;
+use crate::at_relays::{Kind, Own};
 use crate::person::{
     Applied, PersonError, applied_secret, drop_hand_overs, follow_first, held, in_one,
 };
@@ -208,7 +208,9 @@ fn own_word(
 /// Returns whether it followed one.
 ///
 /// It keeps the names it holds: they are its folders' names, and each
-/// has its channel again under the statement it next applies.
+/// has its channel again under the statement it next applies. Its folders
+/// forget what they had agreed ([`leave`]): each meets that channel as on
+/// any first sync.
 ///
 /// `keep_word` says that the device goes on under its key: its word that
 /// it has left, where it wrote one ([`begin`]), then stays in the store,
@@ -289,7 +291,13 @@ pub fn start_again(
             begin(conn, identity, now)?;
             forget(conn, identity, true, now)?;
         }
-        follow_first(conn, identity, entry, statement_key, now)
+        let applied = follow_first(conn, identity, entry, statement_key, now)?;
+        // It then publishes its folders (§5.2): it holds a name for each
+        // folder it maps, and the next sync cycle publishes what is in
+        // them. The change entry goes to each relay ahead of that, as it
+        // goes ahead of everything a device sends.
+        crate::names::hold_mapped(conn, identity, now)?;
+        Ok(applied)
     })
 }
 
@@ -308,38 +316,78 @@ pub fn waits_at(
     identity: &NodeIdentity,
     relay: &[u8; 32],
 ) -> Result<usize, PersonError> {
-    let own = identity.public_key();
     let mut waiting = 0;
-    let carried_up_to = kept_rows::carried_up_to(conn)?;
     for channel in crate::at_relays::channels(conn, identity)? {
-        let kept = kept_rows::kept(conn, relay, &channel.id)?;
-        // The place of the first entry that the store holds of the
-        // channel after `place`, in the store's own order.
-        let first_after = |place: i64| -> Result<Option<i64>, PersonError> {
-            let next = entries::channel_entries_after(conn, &channel.id, place, 1)?;
-            Ok(next.first().map(|held| held.seq))
-        };
-        let waits = match channel.kind {
-            Kind::Personal => first_after(kept.sent_to)?.is_some(),
-            // What came since the statement was applied, and what was
-            // carried then, each from where it was sent to.
-            Kind::Name(_) => {
-                first_after(kept.sent_to.max(carried_up_to))?.is_some()
-                    || first_after(kept.carried_to)?.is_some_and(|seq| seq <= carried_up_to)
-            }
-            // Only what the device wrote itself, and a delete only for a
-            // relay that was sent what it is written over.
-            Kind::Pair => {
-                let was_sent = kept_rows::keeps_any(conn, relay, &channel.id)?;
-                entries::channel_entries_after(conn, &channel.id, kept.sent_to, 8)?
-                    .iter()
-                    .any(|held| held.entry.author == own && (was_sent || !held.entry.delete))
-            }
-        };
+        let waits = waits_in(conn, identity, relay, &channel)?;
         let refused = !kept_rows::waiting_refused(conn, relay, &channel.id)?.is_empty();
         waiting += usize::from(waits || refused);
     }
     Ok(waiting)
+}
+
+/// Whether something of `channel`, a channel of this device's own, waits
+/// to be sent to the relay whose node key is `relay`, as the device keeps
+/// of that relay how far it was sent the channel. What the relay had no
+/// room for is not asked here.
+fn waits_in(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relay: &[u8; 32],
+    channel: &Own,
+) -> Result<bool, PersonError> {
+    let own = identity.public_key();
+    let carried_up_to = kept_rows::carried_up_to(conn)?;
+    let kept = kept_rows::kept(conn, relay, &channel.id)?;
+    // The place of the first entry that the store holds of the
+    // channel after `place`, in the store's own order.
+    let first_after = |place: i64| -> Result<Option<i64>, PersonError> {
+        let next = entries::channel_entries_after(conn, &channel.id, place, 1)?;
+        Ok(next.first().map(|held| held.seq))
+    };
+    Ok(match channel.kind {
+        Kind::Personal => first_after(kept.sent_to)?.is_some(),
+        // What came since the statement was applied, and what was
+        // carried then, each from where it was sent to.
+        Kind::Name(_) => {
+            first_after(kept.sent_to.max(carried_up_to))?.is_some()
+                || first_after(kept.carried_to)?.is_some_and(|seq| seq <= carried_up_to)
+        }
+        // Only what the device wrote itself, and a delete only for a
+        // relay that was sent what it is written over.
+        Kind::Pair => {
+            let was_sent = kept_rows::keeps_any(conn, relay, &channel.id)?;
+            entries::channel_entries_after(conn, &channel.id, kept.sent_to, 8)?
+                .iter()
+                .any(|held| held.entry.author == own && (was_sent || !held.entry.delete))
+        }
+    })
+}
+
+/// The names that this device holds, in order, each with whether
+/// something of its channel still waits to be sent to any of `relays`,
+/// by their node keys (decision 2026-10-04 §7.1, §8): what a device has
+/// still to send, by name. What a relay had no room for waits too.
+///
+/// None on a device that follows no phrase, or has stopped: it sends
+/// nothing in a channel of its own.
+pub fn names_to_go(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[[u8; 32]],
+) -> Result<Vec<(String, bool)>, PersonError> {
+    let mut names = Vec::new();
+    for channel in crate::at_relays::channels(conn, identity)? {
+        let Kind::Name(name) = &channel.kind else {
+            continue;
+        };
+        let mut to_go = false;
+        for relay in relays {
+            to_go |= waits_in(conn, identity, relay, &channel)?
+                || !kept_rows::waiting_refused(conn, relay, &channel.id)?.is_empty();
+        }
+        names.push((name.clone(), to_go));
+    }
+    Ok(names)
 }
 
 #[cfg(test)]

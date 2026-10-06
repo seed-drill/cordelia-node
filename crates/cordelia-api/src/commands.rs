@@ -32,7 +32,9 @@ use actix_web::{HttpRequest, HttpResponse, web};
 use serde::Deserialize;
 use serde_json::json;
 
-use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, PAIR_KEY_TYPED_SECS};
+use cordelia_core::protocol::{
+    CHANGE_FETCH_MAX_SECS, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS, RECEIVED_LAST_WEEK_SECS,
+};
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -47,6 +49,7 @@ use crate::auth;
 use crate::error::ApiError;
 use crate::leaving::{self, Among};
 use crate::look;
+use crate::names;
 use crate::person::{self, PersonError};
 use crate::state::AppState;
 
@@ -204,6 +207,48 @@ fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
         .collect()
 }
 
+/// How many of this device's own channels have something that waits to
+/// be sent to a relay the node is connected to: the most that wait at
+/// any one of them. None on a node that follows no phrase, and none
+/// where no relay is connected: what waits then is not known by relay.
+pub fn channels_waiting(state: &AppState) -> u64 {
+    let relays = relays_reached(state);
+    let conn = db(state);
+    relays
+        .iter()
+        .filter_map(|(_, key)| leaving::waits_at(&conn, &state.identity, key).ok())
+        .max()
+        .unwrap_or(0) as u64
+}
+
+/// What this device has still to send, by name (decision 2026-10-04
+/// §7.1, §8): the names it holds whose channel has nothing waiting at any
+/// relay the node is connected to, and those of which something waits at
+/// one of them. A relay that is not connected is not asked here: whether
+/// it holds the change is said of it apart.
+fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
+    let relays: Vec<[u8; 32]> = relays_reached(state)
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    let names = leaving::names_to_go(&db(state), &state.identity, &relays).map_err(refused)?;
+    let (to_go, sent): (Vec<_>, Vec<_>) = names.into_iter().partition(|(_, to_go)| *to_go);
+    let named = |names: Vec<(String, bool)>| -> Vec<String> {
+        names.into_iter().map(|(name, _)| name).collect()
+    };
+    Ok(json!({ "sent": named(sent), "to_go": named(to_go) }))
+}
+
+/// The files whose record a change could not carry, as an answer lists
+/// them: each as the name it syncs under and the file.
+fn not_carried(applied: &person::Applied) -> Vec<serde_json::Value> {
+    applied
+        .not_carried
+        .iter()
+        .map(|(name, file)| json!({ "name": name, "file": file }))
+        .collect()
+}
+
 // ── POST /api/v1/devices/list ───────────────────────────────────────
 
 /// Everything `cordelia devices` and `cordelia status` say of this device
@@ -221,6 +266,26 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
     answer["waiting"] = waiting(&state)?.into();
+    // What it has still to send, by name: a status says it in a line.
+    let names = names_sent(&state)?;
+    let to_go: Vec<&str> = names["to_go"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str())
+        .collect();
+    if !to_go.is_empty() {
+        let says = format!(
+            "this device has still to send {} name{}: {}",
+            to_go.len(),
+            if to_go.len() == 1 { "" } else { "s" },
+            to_go.join(", ")
+        );
+        if let Some(lines) = answer["says"].as_array_mut() {
+            lines.push(says.into());
+        }
+    }
+    answer["names"] = names;
     Ok(HttpResponse::Ok().json(answer))
 }
 
@@ -411,17 +476,19 @@ pub async fn phrase_make(
             )));
         }
     };
-    let applied = leaving::start_again(
-        &db(&state),
-        &state.identity,
-        shown,
-        &entry,
-        &statement_key,
-        now(),
-    )
-    .map_err(refused)?;
+    // It counts as a change of settings, and waits for a sync cycle that
+    // is running to stop: the device's folders forget what they had
+    // agreed where a phrase is replaced, and nothing of a cycle that
+    // began before is published or recorded after (§4.2, §5.2).
+    let applied = state
+        .as_a_change(|conn| {
+            leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
+        })
+        .map_err(refused)?;
     state.own_channels.written();
     state.own_channels.ask_whole();
+    // The device's folders are published by the next cycle: now.
+    state.sync_control.ask_cycle();
     Ok(HttpResponse::Ok().json(json!({ "change": applied.number })))
 }
 
@@ -473,7 +540,11 @@ pub async fn forget(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
-    let forgot = leaving::forget(&db(&state), &state.identity, false, now()).map_err(refused)?;
+    // As a change of settings: its folders forget what they had agreed,
+    // and no cycle that began before records anything after.
+    let forgot = state
+        .as_a_change(|conn| leaving::forget(conn, &state.identity, false, now()))
+        .map_err(refused)?;
     Ok(HttpResponse::Ok().json(json!({ "forgot": forgot })))
 }
 
@@ -513,6 +584,74 @@ async fn fetch(state: &AppState) -> bool {
     }
 }
 
+/// Have the node run a sync cycle that began after this was asked, and
+/// wait for it until `deadline`: the folders here are then as current as
+/// they can be made (decision 2026-10-04 §7.1, step 1). Says whether one
+/// ended in that time.
+///
+/// A node with no network runs no cycle of its own, and nothing is
+/// waited for; nor where sync is off, since no folder syncs.
+async fn cycle(state: &AppState, deadline: Instant) -> bool {
+    let off = !sync_is_on(&db(state)).unwrap_or(false);
+    if state.push_tx.is_none() || off {
+        return true;
+    }
+    let (begun, _) = state.sync_control.cycles();
+    state.sync_control.ask_cycle();
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if state.sync_control.cycles().1 > begun {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// How much each device has written that this device received in the
+/// last day and in the last week (decision 2026-10-04 §7.1, step 2), from
+/// local history: for each device's key, as a key is written, how many
+/// versions of a file arrived here that it had signed. `None` with
+/// history off: nothing was kept to count.
+///
+/// A version that a device carried is counted for the key that signed
+/// the entry it was carried from: that is the key a record names.
+fn received(state: &AppState, now: i64) -> Option<serde_json::Value> {
+    use cordelia_storage::history::{Change, Replacement};
+    let store = state.history.store()?;
+    let listing = store.list().ok()?;
+    let mut by_device: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for record in listing.records {
+        let arrived = matches!(
+            record.about.change,
+            Change::Pulled | Change::Removed | Change::Arrived
+        );
+        let Replacement::Entry(entry) = record.about.replaced_by else {
+            continue;
+        };
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&record.about.at) else {
+            continue;
+        };
+        let ago = now.saturating_sub(at.timestamp());
+        if !arrived || ago >= RECEIVED_LAST_WEEK_SECS {
+            continue;
+        }
+        let of = by_device.entry(entry.device).or_default();
+        of.1 += 1;
+        if ago < RECEIVED_LAST_DAY_SECS {
+            of.0 += 1;
+        }
+    }
+    Some(
+        by_device
+            .into_iter()
+            .map(|(device, (day, week))| (device, json!({ "day": day, "week": week })))
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+    )
+}
+
 /// What a command that makes a statement is handed before it asks
 /// anything (decision 2026-10-04 §5, §7.1): the statement that the device
 /// has applied, as its signed bytes; the change entry it keeps; the
@@ -521,8 +660,15 @@ async fn fetch(state: &AppState) -> bool {
 /// entry. The command reads what it shows from those bytes.
 ///
 /// Before that the device shows its change entry to each relay and
-/// fetches, for two minutes at most, and what it could not fetch is said
-/// ([`fetch`]).
+/// fetches, for two minutes at most, and then runs a sync cycle, within
+/// the same two minutes: what it could not fetch is said ([`fetch`],
+/// [`cycle`]).
+///
+/// With those it is handed what the command shows of names: each name
+/// that the personal channel lists, with the keys that list it, so that
+/// the names which only a device being removed syncs can be shown; and
+/// how much each device wrote that this one received in the last day and
+/// the last week ([`received`]).
 ///
 /// Refused on a device that makes no statement (§4.3): one that follows
 /// no phrase, was removed, is in no list or could not open a change. A
@@ -551,12 +697,21 @@ pub async fn change_prepare(
 
     // A device in a fork has no leave anywhere: it goes on showing each
     // relay the entry it had applied, and fetches nothing.
+    let deadline = Instant::now() + Duration::from_secs(CHANGE_FETCH_MAX_SECS);
     let fetched = fetch(&state).await;
+    // Then a sync cycle, so that what was fetched is in the folders.
+    let cycled = cycle(&state, deadline).await;
     let at = state.own_channels.read();
     let mut could_not_fetch: Vec<String> = Vec::new();
     if !fetched {
         could_not_fetch.push(format!(
             "the fetch did not end within {CHANGE_FETCH_MAX_SECS} seconds"
+        ));
+    }
+    if !cycled {
+        could_not_fetch.push(format!(
+            "no sync cycle ended within {CHANGE_FETCH_MAX_SECS} seconds: the folders here may \
+             not hold what was fetched"
         ));
     }
     for relay in &at.relays {
@@ -597,6 +752,13 @@ pub async fn change_prepare(
         .map(|kept| hex::encode(&kept.record))
         .collect();
     let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
+    // The names that the personal channel lists, each with the keys that
+    // list it, as this device holds that channel now.
+    let mut names: Vec<serde_json::Value> = Vec::new();
+    for listed in names::listed(&conn).map_err(refused)? {
+        let by: Vec<String> = listed.by.iter().map(written).collect::<Result<_, _>>()?;
+        names.push(json!({ "name": listed.name, "by": by }));
+    }
     Ok(HttpResponse::Ok().json(json!({
         "this_device": written(&state.identity.public_key())?,
         "statement": hex::encode(statement),
@@ -607,6 +769,8 @@ pub async fn change_prepare(
         "apart_statement": apart_statement,
         "additions": additions,
         "could_not_fetch": could_not_fetch,
+        "names": names,
+        "received": received(&state, now()),
         "look": seen,
     })))
 }
@@ -668,21 +832,28 @@ pub async fn change_make(
         .as_deref()
         .map(|apart| id_of("apart", apart))
         .transpose()?;
-    let applied = person::apply_made(
-        &db(&state),
-        &state.identity,
-        &entry,
-        &over,
-        apart.as_ref(),
-        now(),
-    )
-    .map_err(refused)?;
+    // The node stops its sync cycle, and makes the change in one
+    // transaction (§7.2): it counts as a change of settings, and waits
+    // for a cycle that is running to stop.
+    let applied = state
+        .as_a_change(|conn| {
+            person::apply_made(conn, &state.identity, &entry, &over, apart.as_ref(), now())
+        })
+        .map_err(refused)?;
+    for (name, file) in &applied.not_carried {
+        tracing::warn!(
+            name,
+            file,
+            "what this device held of a file could not be read, and was not carried: it meets its channel as a new file does"
+        );
+    }
     state.own_channels.written();
     state.own_channels.ask_whole();
     Ok(HttpResponse::Ok().json(json!({
         "change": applied.number,
         "carried": applied.carried,
         "no_version": applied.no_version,
+        "not_carried": not_carried(&applied),
     })))
 }
 
@@ -743,5 +914,186 @@ mod tests {
         once.dedup();
         assert_eq!(once.len(), asked.len());
         assert!(asked_about(&[]).is_empty());
+    }
+
+    use cordelia_storage::at_relays as kept_rows;
+    use cordelia_storage::history::{About, Change, Entry as Named, Replacement, Store};
+
+    use crate::several::state_of;
+    use crate::state::PeerSnapshot;
+
+    /// A relay that the node is connected to, as the node says it.
+    fn connected(state: &AppState, relay: &[u8; 32], address: &str) {
+        let mut peers = state.peers.write().unwrap();
+        peers.push(PeerSnapshot {
+            key: encode_public_key(relay).unwrap(),
+            role: "relay".into(),
+            state: "hot".into(),
+            address: address.into(),
+            connected_secs: 1,
+            idle_secs: 0,
+        });
+    }
+
+    /// What a device has still to send is said by name, of the relays it
+    /// is connected to (decision 2026-10-04 §7.1, §8); and a status counts
+    /// how many of its own channels wait at one of them.
+    #[test]
+    fn test_what_a_device_has_still_to_send_is_said_by_name_of_the_relays_it_reaches() {
+        let mut s = Several::of_one_person(1);
+        s.hold(&[0], "lab");
+        s.hold(&[0], "team");
+        s.write(0, "lab", "notes.md", "one");
+        s.write(0, "team", "notes.md", "one");
+        let state = state_of(s.machines.remove(0));
+        // No relay is connected: nothing is known to wait anywhere.
+        assert_eq!(channels_waiting(&state), 0);
+        assert_eq!(
+            names_sent(&state).unwrap(),
+            json!({ "sent": ["lab", "team"], "to_go": [] })
+        );
+
+        let relay = [7u8; 32];
+        connected(&state, &relay, "relay.example:9474");
+        // The personal channel and both names wait there.
+        assert_eq!(channels_waiting(&state), 3);
+        assert_eq!(
+            names_sent(&state).unwrap(),
+            json!({ "sent": [], "to_go": ["lab", "team"] })
+        );
+        {
+            let conn = db(&state);
+            let lab = held_rows::channel_of_name(&conn, "lab").unwrap().unwrap();
+            kept_rows::sent(&conn, &relay, &lab, i64::MAX / 2).unwrap();
+        }
+        assert_eq!(channels_waiting(&state), 2);
+        assert_eq!(
+            names_sent(&state).unwrap(),
+            json!({ "sent": ["lab"], "to_go": ["team"] })
+        );
+        // With a second relay, at which more waits: what is counted is
+        // the most that wait at any one of them.
+        connected(&state, &[8u8; 32], "other.example:9474");
+        assert_eq!(channels_waiting(&state), 3);
+        assert_eq!(
+            names_sent(&state).unwrap(),
+            json!({ "sent": [], "to_go": ["lab", "team"] })
+        );
+        // A peer that is no relay is not asked about.
+        let mut peers = state.peers.write().unwrap();
+        peers[0].role = "node".into();
+        peers[1].role = "node".into();
+        drop(peers);
+        assert_eq!(channels_waiting(&state), 0);
+    }
+
+    /// How much each device wrote that this device received in the last
+    /// day and in the last week is counted from local history (decision
+    /// 2026-10-04 §7.1, step 2): each version that arrived here, a text
+    /// or a delete, by the key that its record names. With history off
+    /// nothing was kept to count.
+    #[test]
+    fn test_what_a_device_wrote_that_arrived_here_is_counted_for_a_day_and_a_week() {
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z").unwrap();
+        let now = at.with_timezone(&chrono::Utc);
+        assert_eq!(received(&state, now.timestamp()), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path(), 30, 1 << 20).unwrap();
+        store.prepare().unwrap();
+        let keep = |change: Change, by: Option<&str>, ago: chrono::Duration| {
+            let about = About {
+                at: String::new(),
+                agent: "lab".into(),
+                folder: "/home/sam/memory".into(),
+                file: "notes.md".into(),
+                change,
+                kept: None,
+                replaced_by: match by {
+                    Some(device) => Replacement::Entry(Named {
+                        device: device.into(),
+                        rev: 2,
+                    }),
+                    None => Replacement::Nothing,
+                },
+                behind: false,
+            };
+            let pending = store.keep(about, None, now - ago).unwrap();
+            store.settle(pending).unwrap();
+        };
+        let (hours, days) = (chrono::Duration::hours, chrono::Duration::days);
+        keep(Change::Pulled, Some("laptop"), hours(1));
+        keep(Change::Removed, Some("laptop"), hours(23));
+        keep(Change::Arrived, Some("laptop"), days(2));
+        keep(Change::Pulled, Some("tablet"), days(6));
+        // Out of the week.
+        keep(Change::Pulled, Some("laptop"), days(8));
+        // No arrival: this device's own edit, and its own merge.
+        keep(Change::EditedHere, Some("laptop"), hours(1));
+        keep(Change::Merged, Some("laptop"), hours(1));
+        // An arrival that names no entry.
+        keep(Change::Pulled, None, hours(1));
+        state.history.open(Some(store));
+
+        assert_eq!(
+            received(&state, now.timestamp()),
+            Some(json!({
+                "laptop": { "day": 2, "week": 3 },
+                "tablet": { "day": 0, "week": 1 },
+            }))
+        );
+    }
+
+    /// A command that prepares a change has the node run a sync cycle
+    /// that began after it asked, and waits for it only so long (decision
+    /// 2026-10-04 §7.1, step 1). A node with no network runs none, and
+    /// with sync off no folder syncs: nothing is waited for.
+    #[actix_web::test]
+    async fn test_a_command_waits_for_a_cycle_that_began_after_it_asked() {
+        let soon = || Instant::now() + Duration::from_millis(400);
+        let with_network = |sync_on: bool| {
+            let mut state = state_of(Machine::new(1));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            state.push_tx = Some(tx);
+            if sync_on {
+                meta::set(&db(&state), meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+            }
+            std::sync::Arc::new(state)
+        };
+        // No network, and sync off: nothing is waited for.
+        let mut no_network = state_of(Machine::new(1));
+        meta::set(&db(&no_network), meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        no_network.push_tx = None;
+        assert!(cycle(&no_network, soon()).await);
+        assert!(cycle(&with_network(false), soon()).await);
+
+        // Sync on, and no cycle runs: it waits until the time is up.
+        let state = with_network(true);
+        let began = Instant::now();
+        assert!(!cycle(&state, soon()).await);
+        assert!(began.elapsed() >= Duration::from_millis(400));
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "it waited past its time"
+        );
+
+        // A cycle that was running when it asked does not count: one
+        // that began after does.
+        let state = with_network(true);
+        let running = state.sync_control.cycle_begins();
+        let node = std::sync::Arc::clone(&state);
+        let ran = tokio::spawn(async move {
+            node.sync_control.woken().await;
+            node.sync_control.cycle_ended(running);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let next = node.sync_control.cycle_begins();
+            node.sync_control.cycle_ended(next);
+        });
+        let began = Instant::now();
+        assert!(cycle(&state, Instant::now() + Duration::from_secs(20)).await);
+        assert!(began.elapsed() >= Duration::from_millis(150));
+        ran.await.unwrap();
     }
 }

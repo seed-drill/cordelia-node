@@ -80,7 +80,9 @@ use cordelia_crypto::statement::{Device, Judgement, Statement, StatementError, j
 use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, State};
+use cordelia_storage::sync_state;
 
 use crate::person::{
     AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Shown, added_name,
@@ -572,9 +574,17 @@ pub fn accept(
             Err(why) => return Ok(Accepted::Refused(why)),
         };
         let brought = Brought::of(&hand_over)?;
+        // A device that comes to follow a phrase holds a name for each
+        // folder it maps (§5.2, §6): its folders then meet the person's
+        // channels as on any first sync.
+        let joined = |applied: Applied| -> Result<Applied, PersonError> {
+            crate::names::hold_mapped(conn, identity, now)?;
+            Ok(applied)
+        };
         let Some(held) = held(conn)? else {
             return brought
                 .applied_on(conn, identity, None, &brought.following, now)
+                .and_then(joined)
                 .map(Accepted::Joined);
         };
         let under_the_same = held.following.phrase_key == brought.following.phrase_key;
@@ -594,6 +604,7 @@ pub fn accept(
                 held_rows::forget_hand_overs(conn)?;
                 brought
                     .applied_on(conn, identity, None, &brought.following, now)
+                    .and_then(joined)
                     .map(Accepted::Moved)
             }
             _ => Ok(Accepted::Refused(NotAccepted::AnotherPhrase)),
@@ -1039,6 +1050,12 @@ pub(crate) fn is_alone(
 /// secret of the phrase it leaves. What it kept of each relay for a
 /// channel that it leaves goes with the channel.
 ///
+/// **Its folders forget what they had agreed** (decision 2026-10-04
+/// §5.2), with what they wrote down of index lines: each then meets the
+/// channel it comes to as on any first sync, and nothing it lacks is
+/// taken for a delete. And it keeps no note of the names that a personal
+/// channel it left had listed: they were another phrase's.
+///
 /// Whoever calls this then writes a delete over each hand-over that
 /// went ([`write_over_dropped`]) and empties the table of hand-overs
 /// (decision 2026-10-04 §6): a device that has left keeps nothing of the
@@ -1060,6 +1077,9 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
         }
     }
     held_rows::forget_secrets(conn)?;
+    sync_state::forget_folders_except(conn, &[])?;
+    held_rows::forget_names_before(conn, None)?;
+    meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
     Ok(())
 }
 
@@ -1085,6 +1105,7 @@ mod tests {
             left: None,
             carried: 0,
             no_version: Vec::new(),
+            not_carried: Vec::new(),
         }
     }
 
@@ -3154,6 +3175,7 @@ mod tests {
                 left: Some(1),
                 carried: 1,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         assert_eq!(s[1].secret(), s[0].secret());
@@ -3235,6 +3257,7 @@ mod tests {
                 left: Some(1),
                 carried: 1,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         let back = &s[2];
@@ -3298,6 +3321,7 @@ mod tests {
                 left: Some(1),
                 carried: 1,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             })
         );
         assert_eq!((s[1].state(), s[1].secret()), (State::Applied, secret));

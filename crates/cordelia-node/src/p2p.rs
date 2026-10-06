@@ -1881,6 +1881,17 @@ fn flush_outbox(
     });
 }
 
+/// Whether a node of this role carries channels of the older kind
+/// (decision 2026-10-04 §10): a relay does, for the one version that
+/// carries both kinds, and so does a bootnode or a keeper. **A personal
+/// node carries none.** Its channels are those of its own, from a secret
+/// (`device_entries`): it pushes no item of the older kind, fetches no
+/// channel of it, announces none, serves none, and takes none from a
+/// peer.
+fn carries_older_kind(node_role: &str) -> bool {
+    node_role != "personal"
+}
+
 /// Canonical post-connection sequence (connection-lifecycle.md §1.2).
 /// ALL connection paths MUST call this after successful connection.
 #[allow(clippy::too_many_arguments)]
@@ -1993,13 +2004,15 @@ pub fn post_connect(
     }
 
     // Step 7: Send channel announcements if peer promoted to Hot and we're not a relay
-    // (relays are receive-only for channel-announce per §4.4)
+    // (relays are receive-only for channel-announce per §4.4). A personal
+    // node has no channel of the older kind to announce ([`carries_older_kind`]).
     let peer_is_hot = governor
         .peer_info(node_id)
         .map(|p| p.state == cordelia_network::governor::PeerState::Hot)
         .unwrap_or(false);
     if peer_is_hot
         && node_role != "relay"
+        && carries_older_kind(node_role)
         && let Some(conn) = conn_mgr.get_connection(node_id)
     {
         let conn = conn.clone();
@@ -2762,21 +2775,19 @@ pub async fn p2p_loop(
             // until a relay acknowledges them, and go out as one batched
             // push per flush: at most one flush per OUTBOX_FLUSH_INTERVAL_SECS,
             // so a burst of writes cannot trip a relay's per-peer write limit.
+            // A personal node writes no item of the older kind, and
+            // flushes none.
             Some(_) = push_rx.recv() => {
                 while push_rx.try_recv().is_ok() {}
-                if last_outbox_flush.elapsed() >= outbox_interval_dur {
+                if carries_older_kind(&node_role) && last_outbox_flush.elapsed() >= outbox_interval_dur {
                     last_outbox_flush = std::time::Instant::now();
                     flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
                 }
             }
 
-            _ = outbox_interval.tick() => {
-                if node_role == "personal" && last_outbox_flush.elapsed() >= outbox_interval_dur {
-                    last_outbox_flush = std::time::Instant::now();
-                    flush_outbox(&state, &governor, &conn_mgr, &outbox_in_flight, &mut outbox_rotation, &outbox_refusals);
-                }
-                // What waits in a channel of the device's own is sent on
-                // the same timer, through the leave that a show gives.
+            // What waits in a channel of the device's own is sent on this
+            // timer, through the leave that a show gives.
+            _ = outbox_interval.tick(), if device_entries.is_some() => {
                 device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
             }
 
@@ -2823,12 +2834,12 @@ pub async fn p2p_loop(
             }
 
             // ── Keyed tombstone GC (§4.4) ─────────────────────────────
-            _ = gc_interval.tick() => {
+            // Of the older kind's items, on the nodes that carry them. No
+            // such node holds a channel's member list, so it sweeps a key
+            // only when every author has deleted it.
+            _ = gc_interval.tick(), if carries_older_kind(&node_role) => {
                 let gc_state = state.clone();
-                // Only a personal node holds its channels' member lists.
-                // Any other node sweeps a key only when every author has
-                // deleted it.
-                let members_known = node_role == "personal";
+                let members_known = false;
                 tokio::task::spawn_blocking(move || {
                     let Ok(db) = gc_state.db.lock() else { return };
                     match cordelia_storage::items::gc_keyed_tombstones(
@@ -3016,7 +3027,7 @@ pub async fn p2p_loop(
                 while announce_rx.try_recv().is_ok() {}
                 // Send full channel list to all hot peers (simpler than
                 // incremental per-channel -- reconnect-safe too)
-                if node_role != "relay" {
+                if node_role != "relay" && carries_older_kind(&node_role) {
                     for peer_id in governor.hot_peers() {
                         if let Some(conn) = conn_mgr.get_connection(&peer_id) {
                             let conn = conn.clone();
@@ -3043,30 +3054,10 @@ pub async fn p2p_loop(
                 // and pushes where the answer gives it leave.
                 device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
 
-                // Apply channel states that arrived in our inbox since the last
-                // cycle (decision 2026-09-30 §4.1). Off the select loop: it does
-                // crypto and SQLite work under the db lock.
-                if node_role == "personal" {
-                    let inbox_state = state.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = cordelia_api::membership::process_inbox(&inbox_state) {
-                            tracing::warn!(error = %e, "inbox processing failed");
-                        }
-                        // Add this person's other devices to projects they have
-                        // found locally (decision 2026-09-30 §4.5).
-                        if let Err(e) = cordelia_api::membership::process_join_requests(&inbox_state) {
-                            tracing::warn!(error = %e, "join request processing failed");
-                        }
-                        // Offer again the channel states that a member has
-                        // not confirmed (decision 2026-09-30 §4.1).
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs() as i64);
-                        if let Err(e) = cordelia_api::membership::offer_again(&inbox_state, now) {
-                            tracing::warn!(error = %e, "offering channel states again failed");
-                        }
-                    });
-                }
+                // That is all a personal node fetches: it holds no channel
+                // of the older kind, and asks no peer for one.
+                if !carries_older_kind(&node_role) { continue; }
+
                 // Channels whose members changed since the last pass are listed
                 // again from the start, from every peer: this device may have
                 // refused entries by a member it had not heard of yet.
@@ -3238,6 +3229,7 @@ pub async fn p2p_loop(
                         if from == "warm"
                             && to == "hot"
                             && node_role != "relay"
+                            && carries_older_kind(&node_role)
                             && let Some(conn) = conn_mgr.get_connection(node_id)
                         {
                             let conn = conn.clone();
@@ -3939,6 +3931,19 @@ pub async fn handle_peer_streams(
         };
 
         match protocol {
+            // A personal node carries no channel of the older kind: it
+            // takes no push of one, serves no sync of one, and hears no
+            // announcement of one. Each is refused at once, so that the
+            // peer does not wait for an answer that is not coming.
+            cordelia_network::messages::Protocol::ItemPush
+            | cordelia_network::messages::Protocol::ItemSync
+            | cordelia_network::messages::Protocol::ChannelAnnounce
+                if !carries_older_kind(&node_role) =>
+            {
+                tracing::debug!(peer = %peer_id, protocol = proto_name, "refused: a personal node carries no channel of the older kind");
+                refuse_stream(&mut send, &mut recv);
+                continue;
+            }
             cordelia_network::messages::Protocol::ItemPush
             | cordelia_network::messages::Protocol::ItemSync
             | cordelia_network::messages::Protocol::ChannelAnnounce
@@ -4602,6 +4607,17 @@ async fn send_channel_announcements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A personal node carries no channel of the older kind (decision
+    /// 2026-10-04 §10): it pushes none, fetches none, announces none and
+    /// takes none. A node of any other role carries both kinds.
+    #[test]
+    fn only_a_personal_node_carries_no_channel_of_the_older_kind() {
+        assert!(!carries_older_kind("personal"));
+        for role in ["relay", "bootnode", "keeper"] {
+            assert!(carries_older_kind(role), "{role}");
+        }
+    }
 
     /// A relay that keeps failing is dialled less and less often: up to a
     /// quarter of an hour apart while another relay is connected, and at

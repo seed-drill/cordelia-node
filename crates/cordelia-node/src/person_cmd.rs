@@ -465,7 +465,15 @@ fn devices_lines(seen: &Value) -> Vec<String> {
     }
     let applied = |device: &Value| match device["applied"].as_u64() {
         _ if device["this_device"] == true => "this device".to_string(),
-        Some(number) if number == change => format!("has applied change {change}"),
+        // Whether it has sent what it held when it applied the change
+        // (§8): it says so itself, once it has.
+        Some(number) if number == change => match device["sent"] == true {
+            true => format!("has applied change {change}, and has sent what it held"),
+            false => format!(
+                "has applied change {change}, and is still sending what it held (if it is \
+                 lost now, what it had not sent is lost with it)"
+            ),
+        },
         _ => format!(
             "has not applied change {change} yet, as far as this device has heard: adding it \
              again from a device that has (`cordelia add-device`) hands it the change"
@@ -599,6 +607,7 @@ fn devices_lines(seen: &Value) -> Vec<String> {
             ));
         }
     }
+    out.extend(names_lines(seen));
     let accepting: Vec<&Value> = list(seen, "accepting").collect();
     if !accepting.is_empty() {
         out.push(String::new());
@@ -625,6 +634,88 @@ fn devices_lines(seen: &Value) -> Vec<String> {
         out.push(format!("  - {}", text(notice, "says")));
     }
     out
+}
+
+/// What `cordelia devices` says of names (decision 2026-10-04 §7.3, §8):
+/// what this device has still to send, by name; each name that a device
+/// had listed before the last change and that no device lists yet, with
+/// those that only a key which no longer counts had listed shown apart;
+/// and the files whose record the last change could not carry.
+fn names_lines(seen: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let to_go: Vec<&str> = list(&seen["names"], "to_go")
+        .filter_map(|name| name.as_str())
+        .collect();
+    let sent = list(&seen["names"], "sent").count();
+    if !to_go.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "Still to send from this device ({} sent, {} to go):",
+            counted(sent, "name"),
+            to_go.len()
+        ));
+        out.extend(to_go.iter().map(|name| format!("  {name}")));
+    }
+    let not_listed: Vec<&Value> = list(seen, "names_not_listed").collect();
+    let by = |name: &Value, field: &str| -> Vec<String> { list(name, field).map(shown).collect() };
+    let days = |name: &Value| {
+        let days = name["days_left"].as_i64().unwrap_or(0);
+        format!("{days} more day{}", if days == 1 { "" } else { "s" })
+    };
+    let (ours, gone): (Vec<&Value>, Vec<&Value>) = not_listed
+        .into_iter()
+        .partition(|name| list(name, "by").next().is_some());
+    if !ours.is_empty() {
+        out.push(String::new());
+        out.push("Names that no device lists yet since the last change:".into());
+    }
+    for name in ours {
+        out.push(format!(
+            "  {}: synced before by {}; what the relays hold of it can be brought in for {}",
+            text(name, "name"),
+            by(name, "by").join(", "),
+            days(name)
+        ));
+    }
+    if !gone.is_empty() {
+        out.push(String::new());
+        out.push(
+            "Names that only a device which no longer counts had synced (they stay behind):".into(),
+        );
+    }
+    for name in gone {
+        out.push(format!(
+            "  {}: synced before by {}; it can be brought in for {}",
+            text(name, "name"),
+            by(name, "by_gone").join(", "),
+            days(name)
+        ));
+    }
+    let not_carried: Vec<&Value> = list(seen, "not_carried").collect();
+    if !not_carried.is_empty() {
+        out.push(String::new());
+        out.push(
+            "Not carried at the last change (what this device held of each could not be read; \
+             each meets its channel as a new file does):"
+                .into(),
+        );
+    }
+    for file in not_carried {
+        out.push(format!(
+            "  {} in {}",
+            text(file, "file"),
+            text(file, "name")
+        ));
+    }
+    out
+}
+
+/// A count with its noun: `1 name`, `3 names`.
+fn counted(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
 }
 
 /// Ask of each notice whether it is cleared on this device, and clear
@@ -706,6 +797,12 @@ struct Handed {
     /// the statement lists in neither list: what the node says a person
     /// is asked about.
     added: Vec<SignedAddition>,
+    /// Each name that the personal channel lists, with the keys that
+    /// list it, as this device holds that channel.
+    names: Vec<(String, Vec<[u8; 32]>)>,
+    /// How many versions each key wrote that this device received, in
+    /// the last day and in the last week. `None` with local history off.
+    received: Option<Vec<([u8; 32], u64, u64)>>,
 }
 
 impl Handed {
@@ -734,6 +831,22 @@ impl Handed {
                 added.push(record);
             }
         }
+        let mut names = Vec::new();
+        for listed in list(handed, "names") {
+            let by: Vec<[u8; 32]> = list(listed, "by")
+                .filter_map(|key| decode_public_key(key.as_str()?).ok())
+                .collect();
+            names.push((text(listed, "name").to_string(), by));
+        }
+        let received = handed["received"].as_object().map(|by_device| {
+            by_device
+                .iter()
+                .filter_map(|(key, n)| {
+                    let key = decode_public_key(key).ok()?;
+                    Some((key, n["day"].as_u64()?, n["week"].as_u64()?))
+                })
+                .collect()
+        });
         Ok(Self {
             this_device: decode_public_key(text(handed, "this_device"))?,
             applied,
@@ -741,7 +854,40 @@ impl Handed {
             over: text(handed, "over").to_string(),
             apart,
             added,
+            names,
+            received,
         })
+    }
+
+    /// How much the device whose key is `key` has written that this
+    /// device received, in the last day and in the last week, in words
+    /// (decision 2026-10-04 §7.1, step 2).
+    fn received_from(&self, key: &[u8; 32]) -> String {
+        let Some(received) = &self.received else {
+            return "Local history is off on this device, so it cannot say how much that device \
+                    wrote that arrived here."
+                .into();
+        };
+        let (day, week) = received
+            .iter()
+            .find(|(device, _, _)| device == key)
+            .map_or((0, 0), |(_, day, week)| (*day, *week));
+        format!(
+            "Of what it wrote, this device received {} in the last day, and {} in the last week.",
+            counted(day as usize, "version"),
+            counted(week as usize, "version")
+        )
+    }
+
+    /// The names that only keys which `removed` says go have listed
+    /// (decision 2026-10-04 §7.1, step 2): each stays behind, with what
+    /// was written in it.
+    fn names_only_of(&self, removed: impl Fn(&[u8; 32]) -> bool) -> Vec<&str> {
+        self.names
+            .iter()
+            .filter(|(_, by)| !by.is_empty() && by.iter().all(&removed))
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     /// The label that this device knows `key` by: the statement's, the
@@ -841,6 +987,16 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         for line in lists_shown(&signs, &handed)? {
             println!("{line}");
         }
+        // Each name that only a device being removed syncs.
+        let stay_behind = handed.names_only_of(|key| signs.removes(key));
+        if !stay_behind.is_empty() {
+            println!(
+                "\nThese names stay behind, with what was written in them: {}.\nMap one on \
+                 another device first if you want it; after the removal it is brought in only \
+                 with the phrase.",
+                stay_behind.join(", ")
+            );
+        }
         if !at.yes("\nMake this change?")? {
             println!("{NOT_A_YES}");
             return Ok(());
@@ -861,6 +1017,14 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         match made {
             Told::Yes(made) => {
                 let number = made["change"].as_u64().unwrap_or(signs.number);
+                for file in list(&made, "not_carried") {
+                    println!(
+                        "  What this device held of {} in {} could not be read, and was not \
+                         carried: it meets its channel as a new file does.",
+                        text(file, "file"),
+                        text(file, "name")
+                    );
+                }
                 println!(
                     "\nThe change is made (change {number}). It must not be made again on \
                      another device, even if this command is stopped now: two changes made \
@@ -976,6 +1140,7 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
             );
         }
         println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
+        println!("  {}", handed.received_from(&goes));
         removed.push(goes);
     }
     for device in &applied.devices {
@@ -1146,10 +1311,31 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
                 ));
             }
         }
+        // What this device has still to send: what it carried, as names
+        // sent and names to go. (What waits is counted above, for each
+        // relay it waits at.)
+        let to_go = list(&seen["names"], "to_go").count();
+        let sent = list(&seen["names"], "sent").count();
+        if to_go > 0 {
+            now.push(format!(
+                "keep this machine on: {} still to send ({sent} sent)",
+                counted(to_go, "name")
+            ));
+        } else if sent > 0 {
+            now.push(format!("{} sent", counted(sent, "name")));
+        }
         for device in list(&seen, "devices").filter(|device| device["this_device"] != true) {
-            now.push(match device["applied"].as_u64() == Some(number) {
-                true => format!("{} has applied the change", shown(device)),
-                false => format!("{} has not applied the change yet", shown(device)),
+            let applied = device["applied"].as_u64() == Some(number);
+            now.push(match (applied, device["sent"] == true) {
+                (true, true) => format!(
+                    "{} has applied the change, and has sent what it held",
+                    shown(device)
+                ),
+                (true, false) => format!(
+                    "{} has applied the change, and is still sending what it held",
+                    shown(device)
+                ),
+                (false, _) => format!("{} has not applied the change yet", shown(device)),
             });
         }
         for line in &now {
@@ -1485,5 +1671,122 @@ mod tests {
             "added": [{ "counted": true }, { "counted": false }],
         }));
         assert_eq!(short, "3 devices under a recovery phrase (change 4)");
+    }
+
+    /// What a removal shows of names and of the device that goes
+    /// (decision 2026-10-04 §7.1, step 2): each name that only the keys
+    /// which the change removes sync, and how much that device wrote that
+    /// this one received in the last day and the last week.
+    #[test]
+    fn a_removal_shows_the_names_only_that_device_syncs_and_what_arrived_from_it() {
+        let f = Fixture::new();
+        let own = f.own.public_key();
+        let key = |key: &[u8; 32]| encode_public_key(key).unwrap();
+        let mut handed = f.handed(&f.statement, &[]);
+        handed["names"] = json!([
+            { "name": "both", "by": [key(&own), key(&f.listed)] },
+            { "name": "only-its", "by": [key(&f.listed)] },
+            { "name": "mine", "by": [key(&own)] },
+            { "name": "nobodys", "by": [] },
+        ]);
+        handed["received"] = json!({ key(&f.listed): { "day": 1, "week": 12 } });
+        let read = Handed::of(&handed).unwrap();
+
+        // The names that stay behind where the other device is removed.
+        let goes = f.listed;
+        assert_eq!(read.names_only_of(|key| *key == goes), ["only-its"]);
+        // Where nobody is removed, none does: a renewal.
+        assert!(read.names_only_of(|_| false).is_empty());
+        // Where both keys that list a name go, it stays behind too.
+        assert_eq!(read.names_only_of(|_| true), ["both", "only-its", "mine"]);
+
+        assert_eq!(
+            read.received_from(&goes),
+            "Of what it wrote, this device received 1 version in the last day, and 12 versions \
+             in the last week."
+        );
+        // A device from which nothing arrived.
+        assert_eq!(
+            read.received_from(&f.removed),
+            "Of what it wrote, this device received 0 versions in the last day, and 0 versions \
+             in the last week."
+        );
+        // With local history off, it cannot be said, and that is said.
+        handed["received"] = Value::Null;
+        let read = Handed::of(&handed).unwrap();
+        assert!(
+            read.received_from(&goes)
+                .starts_with("Local history is off")
+        );
+    }
+
+    /// `cordelia devices` says of each device whether it has sent what it
+    /// held when it applied the change, what this device has still to
+    /// send by name, each name that no device lists yet, with those of a
+    /// key that no longer counts apart, and the files that the change
+    /// could not carry (decision 2026-10-04 §4.2, §7.3, §8).
+    #[test]
+    fn devices_says_what_was_sent_and_which_names_are_not_yet_listed() {
+        let shown = |label: &str| json!({ "key": "k", "label": label, "words": "w w w w" });
+        let seen = json!({
+            "this_device": "cordelia_pk1this",
+            "change": 2,
+            "devices": [
+                { "key": "a", "label": "desktop", "words": "w", "this_device": true,
+                  "applied": 2, "sent": false },
+                { "key": "b", "label": "laptop", "words": "w", "applied": 2, "sent": true },
+                { "key": "c", "label": "tablet", "words": "w", "applied": 2, "sent": false },
+                { "key": "d", "label": "phone", "words": "w", "applied": 1, "sent": true },
+            ],
+            "names": { "sent": ["lab"], "to_go": ["team", "~"] },
+            "names_not_listed": [
+                { "name": "old-notes", "by": [shown("laptop")], "by_gone": [], "days_left": 89 },
+                { "name": "its-own", "by": [], "by_gone": [shown("")], "days_left": 1 },
+            ],
+            "not_carried": [{ "name": "lab", "file": "ghost.md" }],
+        });
+        let lines = devices_lines(&seen).join("\n");
+        assert!(lines.contains("desktop (w): this device"), "{lines}");
+        assert!(
+            lines.contains("laptop (w): has applied change 2, and has sent what it held"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("tablet (w): has applied change 2, and is still sending what it held"),
+            "{lines}"
+        );
+        // A device that has not applied the change is not said to have
+        // sent anything, whatever its word of an earlier one says.
+        assert!(
+            lines.contains("phone (w): has not applied change 2 yet"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("Still to send from this device (1 name sent, 2 to go):\n  team\n  ~"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(
+                "Names that no device lists yet since the last change:\n  old-notes: synced \
+                 before by laptop (w w w w); what the relays hold of it can be brought in for \
+                 89 more days"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(
+                "Names that only a device which no longer counts had synced (they stay \
+                 behind):\n  its-own: synced before by the device (w w w w); it can be brought \
+                 in for 1 more day"
+            ),
+            "{lines}"
+        );
+        assert!(lines.contains("Not carried at the last change"), "{lines}");
+        assert!(lines.contains("  ghost.md in lab"), "{lines}");
+
+        // With nothing to say of names, nothing is said of them.
+        let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
+            "names": { "sent": ["lab"], "to_go": [] } });
+        assert!(names_lines(&quiet).is_empty());
     }
 }

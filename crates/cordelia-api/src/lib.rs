@@ -14,23 +14,28 @@
 //! asks when it has leave to use a connection.
 //!
 //! The commands a person types reach those through the routes of
-//! [`commands`]. The sync adapter does not yet: it still syncs the older
-//! kind of channel, whose devices and invites have the routes of
-//! [`devices`], under names that begin `old-`.
+//! [`commands`]. The sync adapter reads and publishes through [`publish`],
+//! says which names a device syncs through [`names`], and a device's
+//! local API for the names it holds is [`local`], through the same path.
+//!
+//! A personal node serves [`configure_device_routes`]: it carries no
+//! channel of the older kind (decision 2026-10-04 §10). A node of any
+//! other role serves [`configure_routes`], with the Channels API of the
+//! older kind as it was.
 
 pub mod adding;
 pub mod at_relays;
 pub mod auth;
 pub mod change;
 pub mod commands;
-pub mod devices;
 pub mod entries;
 pub mod error;
 pub mod handlers;
 pub mod history;
 pub mod leaving;
+pub mod local;
 pub mod look;
-pub mod membership;
+pub mod names;
 pub mod person;
 pub mod publish;
 #[cfg(test)]
@@ -73,22 +78,33 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/identity", web::post().to(handlers::identity)),
     );
 
-    // The devices and invites of the older kind of channel (decision
-    // 2026-09-30-agent-memory-sync §4.1), which the sync adapter still
-    // syncs.
-    cfg.service(
-        web::scope("/api/v1/old-devices")
-            .route("/add", web::post().to(devices::add))
-            .route("/accept", web::post().to(devices::accept))
-            .route("/remove", web::post().to(devices::remove))
-            .route("/list", web::post().to(devices::list)),
-    );
-    cfg.service(
-        web::scope("/api/v1/old-invites")
-            .route("/list", web::post().to(devices::list_invites))
-            .route("/process", web::post().to(devices::process)),
-    );
+    // Status (GET, authenticated, operations.md §8)
+    cfg.route("/api/v1/status", web::get().to(handlers::status));
+    shared_routes(cfg);
+}
 
+/// Configure the routes of a personal node (decision 2026-10-04 §10,
+/// §16). It carries no channel of the older kind, so none of the Channels
+/// API of that kind is served: no subscribing, no groups, no direct
+/// channels, no keys to rotate. What it serves under the same paths is
+/// the local API for the names it holds ([`local`]), whose publish goes
+/// through the path that the sync adapter's goes through and says what
+/// it was published over.
+pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/api/v1/channels")
+            .route("/publish", web::post().to(local::publish))
+            .route("/entries", web::post().to(local::entries))
+            .route("/delete-key", web::post().to(local::delete_key))
+            .route("/identity", web::post().to(handlers::identity)),
+    );
+    // Status (GET, authenticated): of the device's own channels.
+    cfg.route("/api/v1/status", web::get().to(local::status));
+    shared_routes(cfg);
+}
+
+/// The routes that a node of any role serves.
+fn shared_routes(cfg: &mut web::ServiceConfig) {
     // A person's devices, under a recovery phrase (decision 2026-10-04 §5
     // to §8). No route takes a phrase, and none asks a yes: the command
     // does both, at a terminal.
@@ -132,9 +148,6 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 
     // Connected peers (GET, authenticated)
     cfg.route("/api/v1/peers", web::get().to(handlers::peers));
-
-    // Status (GET, authenticated, operations.md §8)
-    cfg.route("/api/v1/status", web::get().to(handlers::status));
 
     // Prometheus metrics (GET, outside /channels scope per spec §3.15)
     cfg.route("/api/v1/metrics", web::get().to(handlers::metrics));

@@ -24,7 +24,8 @@ pub struct Facts {
     pub not_asked: bool,
     pub role: String,
     pub peers_hot: u64,
-    /// Items written here that no relay has stored yet.
+    /// What was written here and a relay has not been sent yet: how many
+    /// of the device's own channels have something waiting.
     pub outbox_waiting: u64,
     /// Of those, the ones relays keep refusing ([`REFUSALS_BEFORE_ATTENTION`]
     /// times in a row or more). They are still offered, now and then.
@@ -38,8 +39,14 @@ pub struct Facts {
     pub conflicts: Vec<String>,
     /// Memory files that are too large to sync (full paths).
     pub too_large: Vec<String>,
-    /// Projects this device is waiting to be added to.
+    /// Folders that wait for their channel to be fetched from a relay
+    /// before their first cycle there (decision 2026-10-04 §6).
     pub projects_waiting: usize,
+    /// Where the device stands under a recovery phrase, as the node says
+    /// it: `no_phrase`, `applied`, or why it has stopped (`fork`,
+    /// `removed`, `not_listed`, `not_opened`). Empty where the node did
+    /// not say.
+    pub stands: String,
     /// Folders the last cycle synced or is waiting to sync.
     pub folders: usize,
     /// Everything found syncs (`--all`), not only mapped folders.
@@ -104,6 +111,38 @@ pub fn derive(f: &Facts) -> (State, String) {
     if !f.sync_enabled {
         return (Off, "memory sync off".into());
     }
+    // Only a device that has applied a statement publishes anything
+    // (decision 2026-10-04 §5.2). One that follows no phrase yet syncs
+    // nothing, and one that has stopped needs the person: neither is said
+    // to be synced, whatever its last cycle listed.
+    match f.stands.as_str() {
+        "no_phrase" => return (Off, "memory stays here: no recovery phrase yet".into()),
+        "fork" => {
+            return (
+                Attention,
+                "memory not syncing: two changes made apart".into(),
+            );
+        }
+        "removed" => {
+            return (
+                Attention,
+                "memory not syncing: this device was removed".into(),
+            );
+        }
+        "not_listed" => {
+            return (
+                Attention,
+                "memory not syncing: not in the last change".into(),
+            );
+        }
+        "not_opened" => {
+            return (
+                Attention,
+                "memory not syncing: a change could not be opened".into(),
+            );
+        }
+        _ => {}
+    }
     if !f.errors.is_empty() {
         return (Attention, "memory sync error".into());
     }
@@ -150,7 +189,7 @@ pub fn derive(f: &Facts) -> (State, String) {
         let n = f.projects_waiting as u64;
         return (
             Syncing,
-            format!("memory joining {n} {}", plural(n, "project")),
+            format!("memory fetching {n} {}", plural(n, "folder")),
         );
     }
     (Synced, "memory synced".into())
@@ -339,8 +378,48 @@ mod tests {
         );
         assert_eq!(
             with(&|f| f.projects_waiting = 1),
-            (State::Syncing, "memory joining 1 project".into())
+            (State::Syncing, "memory fetching 1 folder".into())
         );
+    }
+
+    /// Only a device that has applied a statement publishes anything
+    /// (decision 2026-10-04 §5.2). One that follows no phrase, or has
+    /// stopped, is never said to be synced, whatever its last cycle
+    /// listed and however many relays it reaches: the one is off, and the
+    /// other needs the person.
+    #[test]
+    fn a_device_that_publishes_nothing_is_not_said_to_be_synced() {
+        let stands = |stands: &str| {
+            let mut f = synced();
+            f.stands = stands.into();
+            state(&f)
+        };
+        assert_eq!(stands("applied"), (State::Synced, "memory synced".into()));
+        // A node that did not say where it stands is read as before.
+        assert_eq!(stands(""), (State::Synced, "memory synced".into()));
+        assert_eq!(
+            stands("no_phrase"),
+            (
+                State::Off,
+                "memory stays here: no recovery phrase yet".into()
+            )
+        );
+        for (stopped, says) in [
+            ("fork", "two changes made apart"),
+            ("removed", "this device was removed"),
+            ("not_listed", "not in the last change"),
+            ("not_opened", "a change could not be opened"),
+        ] {
+            assert_eq!(
+                stands(stopped),
+                (State::Attention, format!("memory not syncing: {says}"))
+            );
+        }
+        // With sync off, that is what is said.
+        let mut f = synced();
+        f.stands = "no_phrase".into();
+        f.sync_enabled = false;
+        assert_eq!(state(&f), (State::Off, "memory sync off".into()));
     }
 
     #[test]

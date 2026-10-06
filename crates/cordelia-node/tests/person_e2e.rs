@@ -15,29 +15,6 @@ use common::*;
 
 // ── Nodes ────────────────────────────────────────────────────────────
 
-/// A relay of the test's own, started.
-fn relay_started() -> Node {
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    relay
-}
-
-/// A device whose one relay is `relay`, started, and connected to it.
-fn device_started(name: &'static str, relay: &Node) -> Node {
-    let mut device = node(name, "personal", Some(relay.p2p));
-    device.start();
-    wait_for("device healthy", &[&device], 30, || healthy(&device));
-    wait_for("device reaches its relay", &[&device, relay], 60, || {
-        has_hot_peer(&device)
-    });
-    device
-}
-
-fn key_of(node: &Node) -> String {
-    node.cli(&["id"]).trim().to_string()
-}
-
 /// What the node says of its device and its person.
 fn look(node: &Node) -> Value {
     node.post("/api/v1/devices/list", json!({}))
@@ -72,6 +49,24 @@ fn holds(node: &Node) -> Value {
     seen
 }
 
+/// Wait until `node` shows every device of the last change as having
+/// sent what it carried. Each device says so by itself, a pass or two
+/// after it applies a change (decision 2026-10-04 §8): what a device
+/// shows is set against what it showed before only once that is said.
+fn all_have_sent(node: &Node, all: &[&Node]) {
+    wait_for(
+        "every device says that it has sent what it carried",
+        all,
+        60,
+        || {
+            let seen = look(node);
+            let devices = seen["devices"].as_array()?;
+            (!devices.is_empty() && devices.iter().all(|device| device["sent"] == true))
+                .then_some(())
+        },
+    );
+}
+
 fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field].as_str().unwrap_or_default()
 }
@@ -82,57 +77,6 @@ fn relay_holds_latest(node: &Node) -> Option<()> {
     let seen = look(node);
     let relays = seen["relays"].as_array()?;
     (!relays.is_empty() && relays.iter().all(|relay| relay["holds_latest"] == true)).then_some(())
-}
-
-// ── Commands, as a person runs them ──────────────────────────────────
-
-/// The twelve words that `cordelia phrase` showed, read off its
-/// terminal.
-fn words_shown(said: &str) -> String {
-    let after = said
-        .split("shown once:")
-        .nth(1)
-        .unwrap_or_else(|| panic!("no phrase was shown:\n{said}"));
-    let words = after
-        .lines()
-        .map(str::trim)
-        .find(|line| line.split_whitespace().count() == 12)
-        .unwrap_or_else(|| panic!("no twelve words were shown:\n{said}"));
-    words.to_string()
-}
-
-/// `cordelia phrase` on a device that follows none: the words are read
-/// off the terminal, as a person writes them down, and typed back.
-/// Returns the words.
-fn makes_a_phrase(device: &Node, label: &str) -> String {
-    let mut at = device.at_terminal(&["phrase", "--name", label]);
-    at.says("Press Enter when they are written down");
-    let words = words_shown(&at.said);
-    at.types("");
-    at.says("Type the twelve words back");
-    at.types(&words);
-    let said = at.done();
-    assert!(said.contains("follows the new recovery phrase"), "{said}");
-    words
-}
-
-/// `cordelia add-device` on `adder`, for `new` under `label`, and
-/// `cordelia accept` on `new`, each with its yes. Returns what each said.
-fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
-    let mut at = adder.at_terminal(&["add-device", &key_of(new), "--name", label]);
-    at.says("Type yes to go on").types("yes");
-    let added = at.done();
-    let accept = added
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("cordelia accept "))
-        .unwrap_or_else(|| panic!("add-device printed no accept line:\n{added}"))
-        .trim()
-        .to_string();
-    assert_eq!(accept, key_of(adder));
-    let mut at = new.at_terminal(&["accept", &accept]);
-    at.says("Type yes to go on").types("yes");
-    let accepted = at.done();
-    (added, accepted)
 }
 
 // ── cordelia phrase ──────────────────────────────────────────────────
@@ -559,8 +503,9 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // What only reads asks nothing, and is not refused.
     laptop.cli(&["devices"]);
     laptop.cli(&["status"]);
-    // The commands are in the help, and those of the older kind of
-    // device, which go on working for now, are not.
+    // The commands are in the help. Those of the older kind of device
+    // are gone with it (decision 2026-10-04 §10): no command has their
+    // names.
     let help = laptop.cli(&["--help"]);
     for command in [
         "phrase",
@@ -576,7 +521,16 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         );
     }
     assert!(!help.contains("old-"), "{help}");
-    assert!(laptop.cli(&["old-devices"]).contains("this device"));
+    for gone in [
+        "old-devices",
+        "old-add-device",
+        "old-accept",
+        "old-remove-device",
+        "old-invites",
+    ] {
+        let said = laptop.refused(&[gone]);
+        assert!(said.contains("unrecognized subcommand"), "{gone}: {said}");
+    }
 
     // On a device that follows no phrase, nothing can be added: the
     // refusal says the way on.
@@ -699,6 +653,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // A phrase is made, and then: a yes that is not given replaces
     // nothing.
     let words = makes_a_phrase(&laptop, "laptop");
+    all_have_sent(&laptop, &[&relay, &laptop]);
     let made = look(&laptop);
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
     at.says(
@@ -779,6 +734,52 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": other }));
     assert_eq!(status, 200, "{said}");
     assert_eq!(look(&laptop)["accepting"].as_array().unwrap().len(), 1);
+}
+
+// ── What a device serves ─────────────────────────────────────────────
+
+/// A device serves none of the Channels API of the older kind (decision
+/// 2026-10-04 §10): it carries no channel of that kind, so there is
+/// nothing to subscribe to, no group, no direct channel and no key to
+/// rotate, before it follows a phrase and after. A relay serves each of
+/// those paths as it did. What a device serves under the same scope is
+/// the local API for the names it holds.
+#[test]
+fn a_device_serves_none_of_the_channels_api_of_the_older_kind() {
+    const OLDER: [&str; 14] = [
+        "subscribe",
+        "listen",
+        "list",
+        "info",
+        "unsubscribe",
+        "dm",
+        "list-dms",
+        "group",
+        "group/invite",
+        "group/remove",
+        "list-groups",
+        "rotate-psk",
+        "delete-item",
+        "search",
+    ];
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    // An empty request: a path that is served answers it, if only to
+    // refuse it, and a path that is not served is not found.
+    let served = |node: &Node, path: &str| {
+        asks(node, &format!("/api/v1/channels/{path}"), json!({})).0 != 404
+    };
+    for path in OLDER {
+        assert!(!served(&laptop, path), "{path}, with no phrase");
+        assert!(served(&relay, path), "{path}, on the relay");
+    }
+    makes_a_phrase(&laptop, "laptop");
+    for path in OLDER {
+        assert!(!served(&laptop, path), "{path}, with a phrase");
+    }
+    for path in ["publish", "entries", "delete-key", "identity"] {
+        assert!(served(&laptop, path), "{path}");
+    }
 }
 
 // ── cordelia remove-device ───────────────────────────────────────────
@@ -1059,21 +1060,6 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
 
 // ── cordelia renew ───────────────────────────────────────────────────
 
-/// `cordelia renew` on `device`, with `answers` typed where it asks of
-/// a device added since whether it stays, then its yes and the phrase.
-/// Returns the command, still running: after the phrase was typed.
-fn renews(device: &Node, answers: &[&str], words: &str) -> AtTerminal {
-    let mut at = device.at_terminal(&["renew"]);
-    for answer in answers {
-        at.says("Type `stays` or `removed`").types(answer);
-    }
-    at.says("Make this change?")
-        .says("Type yes to go on")
-        .types("yes");
-    at.says("The recovery phrase, twelve words").types(words);
-    at
-}
-
 /// A renewal: of each device added since the last change the person
 /// says whether it stays, and one that stays is among the devices of the
 /// next. A record of an addition that arrives after the prompt never has
@@ -1332,6 +1318,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     // of several: its yes says that it takes only a change under the
     // phrase it follows, and nothing moves.
     makes_a_phrase(&other, "other");
+    all_have_sent(&desktop, &all);
     let before = holds(&desktop);
     let mut at = other.at_terminal(&["add-device", &key_of(&desktop), "--name", "desktop"]);
     at.says("Type yes to go on").types("yes");

@@ -1,8 +1,11 @@
-//! Keyed items across devices (decision 2026-09-30-agent-memory-sync §4.3).
+//! Keyed items between the members of a channel of the older kind
+//! (decision 2026-09-30-agent-memory-sync §4.3).
 //!
-//! In-process nodes, paired through the membership protocol; a stand-in
-//! relay copies a channel's items between databases through the same
-//! storage rule the network path uses.
+//! In-process nodes, made members of one group channel directly in
+//! storage, as the Channels API leaves a channel and its members; a
+//! stand-in relay copies a channel's items between databases through the
+//! same storage rule the network path uses. A personal node carries no
+//! channel of this kind (decision 2026-10-04 §10).
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -10,12 +13,11 @@ use std::sync::atomic::AtomicU64;
 use serde_json::json;
 
 use cordelia_api::entries::{self, Write};
-use cordelia_api::membership;
 use cordelia_api::state::AppState;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::signing::ItemMetadata;
 use cordelia_crypto::slots::{item_aad, slot_id};
-use cordelia_storage::{items, naming, psk};
+use cordelia_storage::{channels, items, psk};
 
 struct Node {
     state: AppState,
@@ -40,11 +42,9 @@ fn node() -> Node {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
-        usable_keys: Default::default(),
         own_channels: Default::default(),
         history: Default::default(),
     };
-    membership::ensure_own_inbox(&state).unwrap();
     Node { state, _dir: dir }
 }
 
@@ -93,7 +93,7 @@ impl Node {
     }
 }
 
-/// Copy every item `from` holds in `channel` (or an inbox) into `to`.
+/// Copy every item `from` holds in `channel` into `to`.
 fn relay(from: &Node, to: &Node, channel: &str) {
     let stored = {
         let db = from.state.db.lock().unwrap();
@@ -124,16 +124,88 @@ fn relay(from: &Node, to: &Node, channel: &str) {
     }
 }
 
-/// Two devices sharing a personal channel.
+/// A group channel of `owner`'s, made as the Channels API makes one: its
+/// row with `owner` as its one member, a key and a slot key.
+fn group(owner: &Node) -> String {
+    let key = cordelia_crypto::generate_psk().unwrap();
+    let slot_key = cordelia_crypto::generate_psk().unwrap();
+    let db = owner.state.db.lock().unwrap();
+    let channel = channels::create_group(&db, &owner.pk(), "realtime", None, Some(&key))
+        .unwrap()
+        .channel_id;
+    psk::write_psk(&owner.state.home_dir, &channel, &key).unwrap();
+    psk::write_slot_key(&owner.state.home_dir, &channel, &slot_key).unwrap();
+    channel
+}
+
+/// Give `to` the channel as `from` holds it: its row, its members, its
+/// key of every version and its slot key.
+fn hand(from: &Node, to: &Node, channel: &str) {
+    let (home, theirs) = (&from.state.home_dir, &to.state.home_dir);
+    let key = psk::read_psk(home, channel).unwrap();
+    psk::write_psk(theirs, channel, &key).unwrap();
+    psk::write_ring(theirs, &psk::read_ring(home, channel).unwrap()).unwrap();
+    psk::write_slot_key(theirs, channel, &psk::read_slot_key(home, channel).unwrap()).unwrap();
+
+    let (row, members) = {
+        let db = from.state.db.lock().unwrap();
+        (
+            channels::get_by_id(&db, channel).unwrap(),
+            channels::list_active_members(&db, channel).unwrap(),
+        )
+    };
+    let db = to.state.db.lock().unwrap();
+    channels::ensure_group(&db, channel, None, &row.mode, &row.creator_id).unwrap();
+    channels::set_state(
+        &db,
+        channel,
+        0,
+        &row.creator_id,
+        u32::try_from(row.key_version).unwrap(),
+        &cordelia_crypto::sha256(&key),
+    )
+    .unwrap();
+    for held in channels::list_active_member_keys(&db, channel).unwrap() {
+        if !members.iter().any(|(member, _)| *member == held) {
+            channels::remove_member(&db, channel, &held).unwrap();
+        }
+    }
+    for (member, role) in &members {
+        channels::add_member(&db, channel, member, role).unwrap();
+    }
+}
+
+/// Make `new` a member of `channel` on `owner`, which holds it, and give
+/// `new` the channel as `owner` then holds it.
+fn join(owner: &Node, new: &Node, channel: &str) {
+    channels::add_member(
+        &owner.state.db.lock().unwrap(),
+        channel,
+        &new.pk(),
+        "member",
+    )
+    .unwrap();
+    hand(owner, new, channel);
+}
+
+/// Take `gone` out of `channel` on `owner`, as the Channels API does when
+/// a channel's owner removes a member: it is a member no longer, and the
+/// channel's key changes. The key before stays in `owner`'s ring.
+fn remove(owner: &Node, channel: &str, gone: &[u8; 32]) {
+    let key = cordelia_crypto::generate_psk().unwrap();
+    let db = owner.state.db.lock().unwrap();
+    channels::remove_member(&db, channel, gone).unwrap();
+    psk::rotate_psk(&owner.state.home_dir, channel, &key, "2026-09-30T00:00:00Z").unwrap();
+    channels::increment_key_version(&db, channel, &cordelia_crypto::sha256(&key)).unwrap();
+}
+
+/// Two nodes that are members of one group channel.
 fn paired() -> (Node, Node, String) {
     let a = node();
     let b = node();
-    let personal = membership::add_device(&a.state, &b.pk(), None)
-        .unwrap()
-        .personal_channel_id;
-    relay(&a, &b, &naming::inbox_channel_id(&b.pk()));
-    membership::accept(&b.state, &a.pk(), None).unwrap();
-    (a, b, personal)
+    let channel = group(&a);
+    join(&a, &b, &channel);
+    (a, b, channel)
 }
 
 #[test]
@@ -328,7 +400,7 @@ fn a_removed_device_can_no_longer_write() {
     a.write(&ch, "notes.md", "before");
     relay(&a, &b, &ch);
 
-    membership::remove_device(&a.state, &b.pk()).unwrap();
+    remove(&a, &ch, &b.pk());
     // B, not yet aware, keeps writing with the keys it held.
     b.write(&ch, "notes.md", "after removal");
     relay(&b, &a, &ch);
@@ -422,26 +494,12 @@ fn holds(n: &Node, channel: &str) -> Vec<(String, Option<String>, u64, [u8; 32])
         .collect()
 }
 
-/// Make `new` another device of `owner`'s, and tell `others` (devices
-/// already there) about it.
-fn join(owner: &Node, new: &Node, others: &[&Node]) {
-    membership::add_device(&owner.state, &new.pk(), None).unwrap();
-    relay(owner, new, &naming::inbox_channel_id(&new.pk()));
-    membership::accept(&new.state, &owner.pk(), None).unwrap();
-    for other in others {
-        relay(owner, other, &naming::inbox_channel_id(&other.pk()));
-        membership::process_inbox(&other.state).unwrap();
-    }
-}
-
 /// What an entry says it was written after is a member of its sealed
 /// content, beside the text. It is there only when the writer puts it
 /// there, for a delete as for a text, and it is read back as written. An
 /// entry with it has the `key`, `content` and `metadata` members it would
 /// have without it, and those are the members that a version which knows
-/// nothing of it takes, by name. And an entry published again when a
-/// device is removed says nothing, whatever the one it takes the place of
-/// said.
+/// nothing of it takes, by name.
 #[test]
 fn what_an_entry_was_written_after_is_carried_only_when_said() {
     let (a, b, ch) = paired();
@@ -501,60 +559,6 @@ fn what_an_entry_was_written_after_is_carried_only_when_said() {
     relay(&b, &a, &ch);
     assert_eq!(said(&a, "said.md"), Some(after.clone()));
     assert_eq!(holds(&a, &ch)[2], ("said.md".to_string(), None, 2, b.pk()));
-
-    // B is removed. What it wrote is published again as A's, and says
-    // nothing.
-    membership::remove_device(&a.state, &b.pk()).unwrap();
-    assert_eq!(holds(&a, &ch)[2], ("said.md".to_string(), None, 2, a.pk()));
-    assert_eq!(said(&a, "said.md"), None);
-    assert!(sealed(&a, "said.md", &a.pk()).get("after").is_none());
-}
-
-/// T16. The channel keeps what a removed device last wrote: the device
-/// that removes it publishes those entries again under its own name, at
-/// the same revisions. A file the removed device edited last keeps its
-/// edit, a file only it wrote is still there, and a file it deleted stays
-/// deleted, for the devices that remain and for one added later.
-#[test]
-fn t16_what_a_removed_device_last_wrote_is_kept() {
-    let (a, b, ch) = paired();
-    a.write(&ch, "edited.md", "by a");
-    a.write(&ch, "deleted.md", "by a");
-    a.write(&ch, "untouched.md", "by a");
-    relay(&a, &b, &ch);
-    assert_eq!(b.write(&ch, "edited.md", "by b"), 2);
-    assert_eq!(delete(&b, &ch, "deleted.md"), 2);
-    assert_eq!(b.write(&ch, "created.md", "by b"), 1);
-    relay(&b, &a, &ch);
-
-    membership::remove_device(&a.state, &b.pk()).unwrap();
-
-    let expect = vec![
-        (
-            "created.md".to_string(),
-            Some("by b".to_string()),
-            1,
-            a.pk(),
-        ),
-        ("deleted.md".to_string(), None, 2, a.pk()),
-        ("edited.md".to_string(), Some("by b".to_string()), 2, a.pk()),
-        (
-            "untouched.md".to_string(),
-            Some("by a".to_string()),
-            1,
-            a.pk(),
-        ),
-    ];
-    assert_eq!(holds(&a, &ch), expect);
-
-    // A device added afterwards gets the same.
-    let c = node();
-    join(&a, &c, &[]);
-    relay(&a, &c, &ch);
-    assert_eq!(holds(&c, &ch), expect);
-
-    // And the next edit is the next revision.
-    assert_eq!(a.write(&ch, "edited.md", "by a again"), 3);
 }
 
 /// T16. A removed device stores the highest revision there is under a
@@ -568,7 +572,7 @@ fn t16_a_removed_device_cannot_put_a_name_out_of_reach() {
     let slot_key = psk::read_slot_key(&a.state.home_dir, &ch).unwrap();
     let old_key = psk::read_psk(&a.state.home_dir, &ch).unwrap();
 
-    membership::remove_device(&a.state, &b.pk()).unwrap();
+    remove(&a, &ch, &b.pk());
     inject(
         &a,
         &b.state.identity,
@@ -584,9 +588,11 @@ fn t16_a_removed_device_cannot_put_a_name_out_of_reach() {
     assert_eq!(a.read(&ch), vec![("notes.md".into(), "two".into(), 2, 0)]);
 }
 
-/// T16. A device, while still a member, gives a name a revision that
-/// editing never reaches, to use the numbers up. When it is removed, what
-/// it wrote is kept at an ordinary revision, and the name stays writable.
+/// T16. A member gives a name a revision that editing never reaches, to
+/// use the numbers up. While it is a member, that is the channel's value
+/// and the name has no next revision. Once it is removed, what it wrote
+/// counts for nothing: the name has the value and the revision that the
+/// member that remains gave it, and is written again.
 #[test]
 fn t16_a_revision_meant_to_use_the_numbers_up_is_not_kept() {
     use cordelia_core::protocol::MAX_REV;
@@ -619,56 +625,11 @@ fn t16_a_revision_meant_to_use_the_numbers_up_is_not_kept() {
         assert_eq!(next("other.md").unwrap(), 1);
     }
 
-    membership::remove_device(&a.state, &b.pk()).unwrap();
-    assert_eq!(a.read(&ch), vec![("notes.md".into(), "by b".into(), 2, 0)]);
-    assert_eq!(a.write(&ch, "notes.md", "three"), 3);
-}
-
-/// T16. Only the device that removes takes over what the removed device
-/// wrote, with what it holds at that moment. A device that learns of the
-/// removal later holds something newer from the removed device: it cannot
-/// tell whether that was written before the removal or after it, so it
-/// does not make it the channel's value.
-#[test]
-fn t16_what_a_removed_device_writes_afterwards_is_not_adopted_later() {
-    let (a, b, ch) = paired();
-    let r = node();
-    join(&a, &r, &[&b]);
-    relay(&a, &r, &ch);
-    assert_eq!(r.write(&ch, "notes.md", "before"), 1);
-    relay(&r, &a, &ch);
-    relay(&r, &b, &ch);
-
-    membership::remove_device(&a.state, &r.pk()).unwrap();
-    // R writes on. B has not heard of the removal yet, so it reads that.
-    assert_eq!(r.write(&ch, "notes.md", "after"), 2);
-    relay(&r, &b, &ch);
-    assert_eq!(b.read(&ch), vec![("notes.md".into(), "after".into(), 2, 0)]);
-
-    // B hears of the removal, and receives what A published again.
-    relay(&a, &b, &naming::inbox_channel_id(&b.pk()));
-    relay(&a, &b, &ch);
-    membership::process_inbox(&b.state).unwrap();
-    assert_eq!(
-        holds(&b, &ch),
-        vec![(
-            "notes.md".to_string(),
-            Some("before".to_string()),
-            1,
-            a.pk()
-        )]
-    );
-    // B publishes nothing of R's.
-    relay(&b, &a, &ch);
-    assert_eq!(
-        holds(&a, &ch),
-        vec![(
-            "notes.md".to_string(),
-            Some("before".to_string()),
-            1,
-            a.pk()
-        )]
-    );
+    // B is removed. What it wrote counts no longer, so the name is where
+    // the member that remains left it, and has a next revision.
+    remove(&a, &ch, &b.pk());
+    assert_eq!(a.read(&ch), vec![("notes.md".into(), "one".into(), 1, 0)]);
+    assert_eq!(a.write(&ch, "notes.md", "two"), 2);
 }
 
 #[test]
@@ -676,11 +637,17 @@ fn items_from_before_a_key_rotation_still_read() {
     let (a, b, ch) = paired();
     a.write(&ch, "old.md", "written under key 1");
 
-    // Rotating (by removing a third device) moves the channel to key 2.
+    // Rotating (by removing a third member) moves the channel to key 2.
     let c = node();
-    membership::add_device(&a.state, &c.pk(), None).unwrap();
-    membership::remove_device(&a.state, &c.pk()).unwrap();
+    join(&a, &c, &ch);
+    remove(&a, &ch, &c.pk());
     a.write(&ch, "new.md", "written under key 2");
+    let versions: Vec<i64> = {
+        let db = a.state.db.lock().unwrap();
+        let stored = items::slotted_items(&db, &ch).unwrap();
+        stored.iter().map(|it| it.key_version).collect()
+    };
+    assert_eq!(versions, [1, 2]);
 
     let read = a.read(&ch);
     assert_eq!(read.len(), 2);
@@ -689,9 +656,9 @@ fn items_from_before_a_key_rotation_still_read() {
             .any(|(k, t, _, _)| k == "old.md" && t == "written under key 1")
     );
 
-    // B, given the whole ring in the new state, reads both.
-    relay(&a, &b, &naming::inbox_channel_id(&b.pk()));
-    membership::process_inbox(&b.state).unwrap();
+    // B, given the channel as A now holds it, with the whole ring, reads
+    // both.
+    hand(&a, &b, &ch);
     relay(&a, &b, &ch);
     assert_eq!(b.read(&ch).len(), 2);
 }
@@ -741,9 +708,9 @@ fn deleting_a_key_replicates_and_a_later_write_revives_it() {
 }
 
 /// One name's value is read as the channel's values are: by the same
-/// rules, from that name's slot and no other. The sync adapter plans from
-/// the one and checks against the other before it publishes, so the two
-/// must agree on every name.
+/// rules, from that name's slot and no other. A reader that plans from
+/// the one and checks against the other before it publishes needs the two
+/// to agree on every name.
 #[test]
 fn one_names_value_is_read_as_the_channels_are() {
     let (a, b, ch) = paired();

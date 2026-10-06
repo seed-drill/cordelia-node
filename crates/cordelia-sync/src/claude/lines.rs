@@ -22,23 +22,23 @@
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
-use serde_json::Value;
 
-use cordelia_api::entries::{self, Write};
-use cordelia_api::state::{AppState, LineFound, Look};
+use cordelia_api::publish::{self, PlannedAgainst};
+use cordelia_api::state::{LineFound, Look};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{INDEX_LINE_LOOK_GAP_SECS, INDEX_LINE_LOOK_SECS};
+use cordelia_crypto::entry::Value;
+use cordelia_crypto::version::Slot;
 use cordelia_storage::atomic::write_atomic;
 use cordelia_storage::{history, index_lines};
 
 use super::{
-    Ctx, Failure, FolderReport, ITEM_TYPE, as_seen, current_hash, entry_of, forget_kept, is_a_text,
-    keep_here, lock, of_a_publish, record_agreed, revision_ahead, settle, taken_as_a_version,
-    written_after,
+    Ctx, Failure, FolderReport, as_seen, current_hash, entry_of, forget_kept, keep_here, lock,
+    of_a_publish, of_person, publish_over, record_agreed, revision_ahead, settle,
 };
 use crate::memory_md::{self, INDEX_FILE};
 use crate::names;
-use crate::plan::{Agreed, Content, Remote, Writer};
+use crate::plan::{Agreed, Content, Remote};
 
 /// The file that `line` of an index is a line for, if it is one: its first
 /// link is the name of a memory file and nothing more, and that name is
@@ -55,10 +55,14 @@ fn has_line_for(index: &str, file: &str) -> bool {
     index.lines().any(|line| line_for(line) == Some(file))
 }
 
-/// A version of the index that stands beside the channel's: another entry
-/// at the same revision, which lost the tie.
+/// A version of the index that stands beside the channel's: another
+/// version at the same revision, which lost the tie.
 pub(super) struct Beside {
-    pub item_id: String,
+    /// What the version is known by: each entry that the device holds of
+    /// it, by what the entry is named by, in the order of their signers'
+    /// keys.
+    pub id: String,
+    /// The lowest key that signed an entry of it.
     pub author: [u8; 32],
     pub text: String,
 }
@@ -69,22 +73,32 @@ pub(super) struct IndexRead {
     /// The versions that stand beside the channel's, in the order of
     /// their writers' keys.
     pub beside: Vec<Beside>,
-    /// The entries there that this device cannot read.
-    pub unread: Vec<entries::Unread>,
+    /// How many entries there, at the revision read or above it, this
+    /// device cannot read ([`publish::not_read`]).
+    pub unread: usize,
 }
 
-/// The texts that stand beside `entry`'s, in the order of their writers'
-/// keys. A delete beside it, or what is no text, has no lines.
-pub(super) fn beside(entry: &entries::Entry) -> Vec<Beside> {
-    let mut beside: Vec<Beside> = entry
-        .conflicts
+/// The texts that stand beside the current version of `slot`, in the
+/// order of their writers' keys. A delete beside it, or what is no text,
+/// has no lines.
+pub(super) fn beside(slot: &Slot) -> Vec<Beside> {
+    let mut beside: Vec<Beside> = slot
+        .lost
         .iter()
-        .filter(|version| is_a_text(version))
         .filter_map(|version| {
+            let Value::Text(text) = &version.value else {
+                return None;
+            };
+            let ids: Vec<String> = version
+                .entries
+                .iter()
+                .map(|entry| hex::encode(entry.id))
+                .collect();
             Some(Beside {
-                item_id: version.item_id.clone(),
-                author: version.author,
-                text: version.content.as_str()?.to_string(),
+                id: ids.join("+"),
+                // A version's entries are in order of their signers' keys.
+                author: version.entries.first()?.author,
+                text: text.clone(),
             })
         })
         .collect();
@@ -92,19 +106,17 @@ pub(super) fn beside(entry: &entries::Entry) -> Vec<Beside> {
     beside
 }
 
-/// What a cycle reads of the index's slot beyond its current entry: what
-/// stands `beside` that entry, and what this device holds there and
-/// cannot read. Called under the hold of the lock that the cycle reads
-/// the channel under.
+/// What a cycle reads of the index's slot beyond its current version:
+/// what stands `beside` that version, and how many entries this device
+/// holds there and cannot read. Called under the hold of the lock that
+/// the cycle reads the channel under. `name` is the name the folder
+/// syncs.
 pub(super) fn read_index(
-    state: &AppState,
     db: &Connection,
-    channel: &str,
-    prefix: &str,
+    name: &str,
     beside: Vec<Beside>,
 ) -> Result<IndexRead, CordeliaError> {
-    let full_key = format!("{prefix}{INDEX_FILE}");
-    let unread = entries::unread_of(state, db, channel, &full_key)?;
+    let unread = publish::not_read(db, name, INDEX_FILE).map_err(of_person)?;
     Ok(IndexRead { beside, unread })
 }
 
@@ -170,8 +182,8 @@ pub(super) struct Cycle<'a> {
     pub remote: &'a HashMap<String, Remote>,
     /// What the folder had agreed when the cycle began.
     pub agreed: &'a HashMap<String, Agreed>,
-    /// The entry each file was planned against.
-    pub taken: &'a HashMap<String, String>,
+    /// What each file was planned against.
+    pub taken: &'a HashMap<String, PlannedAgainst>,
     /// The files for which nothing was planned.
     pub quiet: &'a HashSet<String>,
     pub index: &'a IndexRead,
@@ -241,7 +253,7 @@ pub(super) fn look(ctx: &Ctx, cycle: &Cycle, report: &mut FolderReport) -> Resul
         .index
         .beside
         .iter()
-        .map(|version| version.item_id.clone())
+        .map(|version| version.id.clone())
         .collect();
     let stood = control.stood_beside(folder, channel);
     let same_beside = stood.as_ref() == Some(&stands);
@@ -251,15 +263,10 @@ pub(super) fn look(ctx: &Ctx, cycle: &Cycle, report: &mut FolderReport) -> Resul
     }
 
     let index = cycle.at_rest(INDEX_FILE);
-    // An entry of the index that this device cannot read (it waits for a
-    // key) is passed over when the channel's version is worked out, and
-    // may be above it. A put-back published now would go above it too.
-    let read_at = cycle.remote.get(INDEX_FILE).map(|r| r.rev);
-    let unread = cycle
-        .index
-        .unread
-        .iter()
-        .any(|entry| read_at.is_some_and(|rev| entry.rev >= rev));
+    // An entry of the index that this device cannot read is passed over
+    // when the channel's version is worked out, and may be above it. A
+    // put-back published now would go above it too.
+    let unread = cycle.index.unread > 0;
 
     let mut due = Vec::new();
     let mut stayed = Vec::new();
@@ -371,12 +378,10 @@ fn with_lines(
 /// entry that this device cannot read at the revision read or above it.
 /// The next looks decide again.
 ///
-/// The entry is published only if it fits with all that it says it was
-/// written after, and is tried once. One that said less would make the
-/// other devices keep copies they need not, and one that said nothing
-/// would be taken by its revision with nothing kept: neither is wanted
-/// for an entry that nobody typed. If it does not fit, nothing is
-/// published and the records that were due are dropped.
+/// The entry is published through the path every entry of the folder's
+/// is ([`publish_over`]), as an edit of the index's version. If the text
+/// does not fit beside its name, nothing is published and the records
+/// that were due are dropped.
 fn put_back(
     ctx: &Ctx,
     cycle: &Cycle,
@@ -388,8 +393,8 @@ fn put_back(
         state,
         dir,
         channel,
-        prefix,
         folder,
+        agent,
         generation,
         planned,
         ..
@@ -415,9 +420,8 @@ fn put_back(
 
     // The index as it is here is kept in history first, in a record that
     // names the revision the new entry is to have.
-    let full_key = format!("{prefix}{INDEX_FILE}");
     let me = state.identity.public_key();
-    let at = revision_ahead(ctx, &full_key)?;
+    let at = revision_ahead(ctx, INDEX_FILE)?;
     let ahead = match at {
         Some(rev) => {
             let replaced_by = history::Replacement::Entry(entry_of(&me, rev));
@@ -433,21 +437,17 @@ fn put_back(
     (cycle.before_hold)();
 
     let files: Vec<&str> = due.iter().map(|record| record.file.as_str()).collect();
-    let (text, entry) = {
+    let (text, made) = {
         let db = lock(state)?;
         if control.generation_under(&db) != generation {
             return not_now("the settings changed");
         }
-        let now = entries::current_of(state, &db, channel, &full_key)?;
-        let Some(now) = now.filter(|entry| taken_as_a_version(entry) == planned) else {
+        let read = |file: &str| publish::read(&db, agent, file).map_err(of_a_publish);
+        let now = read(INDEX_FILE)?.slot;
+        if PlannedAgainst::what_is_in(&now) != *planned {
             return not_now("the index's entry changed");
-        };
-        let Some(there) = now
-            .current
-            .content
-            .as_str()
-            .filter(|_| is_a_text(&now.current))
-        else {
+        }
+        let Some(Value::Text(there)) = now.current.as_ref().map(|version| &version.value) else {
             return not_now("the index's entry is no text");
         };
         // The lines taken are those of the versions that are overtaken.
@@ -456,81 +456,68 @@ fn put_back(
             && stands
                 .iter()
                 .zip(&cycle.index.beside)
-                .all(|(now, read)| now.item_id == read.item_id);
+                .all(|(now, read)| now.id == read.id);
         if !same {
             return not_now("what stands beside the index's entry changed");
         }
+        let no_version = PlannedAgainst::NoVersion;
         for file in &files {
-            let entry = entries::current_of(state, &db, channel, &format!("{prefix}{file}"))?;
-            let now = entry.as_ref().and_then(taken_as_a_version);
-            if now != cycle.taken.get(*file).map(String::as_str) {
+            let now = PlannedAgainst::what_is_in(&read(file)?.slot);
+            if now != *cycle.taken.get(*file).unwrap_or(&no_version) {
                 return not_now("a file's entry changed");
             }
         }
-        let unread = entries::unread_of(state, &db, channel, &full_key)?;
-        if unread.iter().any(|entry| entry.rev >= now.current.rev) {
+        if publish::not_read(&db, agent, INDEX_FILE).map_err(of_a_publish)? > 0 {
             return not_now("the index's slot holds an entry that cannot be read");
         }
-        if let Some(at) = at
-            && entries::next_rev(state, &db, channel, &full_key).map_err(of_a_publish)? != at
-        {
-            return not_now("an entry arrived under the index's name");
-        }
-        // A line from a version beside is left out where its file's entry
-        // is a delete now.
+        // A line from a version beside is left out where its file's
+        // version is a delete now.
         let mut asked: HashMap<String, bool> = HashMap::new();
         let mut is_deleted = |file: &str| -> Result<bool, CordeliaError> {
             if let Some(known) = asked.get(file) {
                 return Ok(*known);
             }
-            let entry = entries::current_of(state, &db, channel, &format!("{prefix}{file}"))?;
-            let deleted = entry.is_some_and(|entry| entry.current.deleted);
+            let slot = publish::read(&db, agent, file).map_err(of_person)?.slot;
+            let deleted = slot
+                .current
+                .is_some_and(|version| version.value == Value::Delete);
             asked.insert(file.to_string(), deleted);
             Ok(deleted)
         };
         let text = with_lines(there, &stands, due, &mut is_deleted)?;
-        let content = Value::String(text.clone());
-        let after = written_after(Some(&now.current)).to_value();
-        let write = Write {
-            key: &full_key,
-            content: &content,
-            metadata: None,
-            item_type: ITEM_TYPE,
-            deleted: false,
-            after: Some(&after),
-        };
-        match entries::publish(state, &db, channel, &write) {
-            Ok(entry) => {
-                // The count goes up of each record that was due in it,
-                // whether its own line went in or a version beside had
-                // one for its file. The entry is published by now: a
-                // count that cannot be written is said, and the file is
-                // still written and the publish still reported.
-                if let Err(error) = index_lines::put_back(&db, folder, channel, &files) {
-                    tracing::warn!(
-                        folder,
-                        channel,
-                        %error,
-                        "lines were put back, and that could not be counted"
-                    );
-                }
-                (text, entry)
+        if !publish::fits(INDEX_FILE, &Value::Text(text.clone())) {
+            for file in &files {
+                index_lines::drop_record(&db, folder, channel, file)?;
             }
-            Err(CordeliaError::TooLarge { .. }) => {
-                for file in &files {
-                    index_lines::drop_record(&db, folder, channel, file)?;
-                }
-                tracing::warn!(
-                    folder,
-                    channel,
-                    ?files,
-                    "the index is too large to take back the lines of memories that came back; \
-                     they are not listed"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(of_a_publish(e)),
+            tracing::warn!(
+                folder,
+                channel,
+                ?files,
+                "the index is too large to take back the lines of memories that came back; \
+                 they are not listed"
+            );
+            return Ok(());
         }
+        // An edit of the index's version, as the cycle read it: where
+        // the slot holds another by now, or its next revision is not the
+        // one that the kept text names, nothing is published.
+        let Some(made) = publish_over(ctx, &db, INDEX_FILE, Some(&text), at, None)? else {
+            return not_now("the index's entry changed, or an entry arrived under its name");
+        };
+        // The count goes up of each record that was due in it, whether
+        // its own line went in or a version beside had one for its file.
+        // The entry is published by now: a count that cannot be written
+        // is said, and the file is still written and the publish still
+        // reported.
+        if let Err(error) = index_lines::put_back(&db, folder, channel, &files) {
+            tracing::warn!(
+                folder,
+                channel,
+                %error,
+                "lines were put back, and that could not be counted"
+            );
+        }
+        (text, made)
     };
     // A minute of looking starts again for every record of the folder: an
     // action was applied to the index.
@@ -556,7 +543,7 @@ fn put_back(
     }
     settle(ctx, ahead);
     forget_kept(ctx, INDEX_FILE);
-    let agreed = (Some(Content::new(text).hash), entry.rev, Writer::Device(me));
-    record_agreed(state, generation, folder, channel, INDEX_FILE, agreed)?;
+    let agreed = made.agreed(Some(Content::new(text).hash), me);
+    record_agreed(state, generation, folder, channel, INDEX_FILE, &agreed)?;
     Ok(())
 }

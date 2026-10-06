@@ -106,7 +106,6 @@ impl Device {
             outbox_refused: Default::default(),
             relist: Default::default(),
             sync_control: Default::default(),
-            usable_keys: Default::default(),
             own_channels: Default::default(),
             history: Default::default(),
         });
@@ -930,6 +929,10 @@ async fn the_timer_that_sends_and_a_publish_show_again_where_they_find_no_leave(
     device.holds("notes");
     device.connects("relay", &relay).await;
     device.passes().await;
+    // Its word that it has sent what it carried is written by that pass
+    // (decision 2026-10-04 §8), and goes now: what is counted below is
+    // of the notes alone.
+    device.sends().await;
     let notes = device.channel("notes");
     let before = device.counts("relay");
     assert_eq!((before.whole_shows, before.short_shows), (1, 0));
@@ -3003,6 +3006,10 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
     let no_room = status.no_room.expect("the refusal is kept for the status");
     assert!(!no_room.of_the_change && !no_room.over_allowance);
     assert!((at..at + 5).contains(&no_room.at));
+    // Its word that it has sent what it carried is written by that pass
+    // (decision 2026-10-04 §8), over its word in the personal channel,
+    // and goes now: what is counted below is of the notes alone.
+    device.sends().await;
     let first = device.counts("relay");
 
     // It is left for a while: nothing is sent at once, by either pass.
@@ -3065,6 +3072,10 @@ async fn a_delete_behind_an_entry_that_found_no_room_reaches_the_relay_and_the_e
     assert!(holds_at(&relay, &notes, &large.id()));
     assert!(!holds_at(&relay, &notes, &refused.id()));
     assert!(device.at("relay").no_room.is_some());
+    // Its word that it has sent what it carried is written by that pass
+    // (decision 2026-10-04 §8), over its word in the personal channel,
+    // and goes now: what is counted below is of the notes alone.
+    device.sends().await;
     let first = device.counts("relay");
 
     // What is written behind the refused entry is offered at once, and
@@ -3242,6 +3253,10 @@ async fn a_relay_that_holds_another_entry_at_that_revision_says_so_and_is_sent_i
     device.holds("notes");
     device.connects("relay", &relay).await;
     device.passes().await;
+    // Its word that it has sent what it carried is written by that pass
+    // (decision 2026-10-04 §8), and goes now: what is counted below is
+    // of the notes alone.
+    device.sends().await;
     assert_eq!(device.at("relay").another_form, 0);
 
     // The device writes a file. Before it is sent, the relay comes to
@@ -3529,15 +3544,7 @@ async fn asks_for_hand_over(
 ) -> Result<PairRead, Refused> {
     let link = device.link(relay);
     let leave = device.engine.leave();
-    leave
-        .pair(
-            &device.state.db,
-            &device.state.identity,
-            &link,
-            typed,
-            |_| false,
-        )
-        .await
+    leave.pair(&device.state, &link, typed, |_| false).await
 }
 
 /// One channel is read without leave: the pair channel of a key typed at

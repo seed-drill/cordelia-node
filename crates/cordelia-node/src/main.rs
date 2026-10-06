@@ -137,25 +137,6 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
-    /// The devices of the older kind of channel, which sync still uses.
-    #[command(name = "old-add-device", hide = true)]
-    OldAddDevice {
-        key: String,
-        #[arg(long)]
-        name: Option<String>,
-    },
-    #[command(name = "old-accept", hide = true)]
-    OldAccept {
-        key: String,
-        #[arg(long)]
-        name: Option<String>,
-    },
-    #[command(name = "old-remove-device", hide = true)]
-    OldRemoveDevice { key: String },
-    #[command(name = "old-devices", hide = true)]
-    OldDevices,
-    #[command(name = "old-invites", hide = true)]
-    OldInvites,
     /// Sync an agent's memory across your devices
     Sync {
         #[command(subcommand)]
@@ -317,11 +298,6 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
-        Some(Commands::OldAddDevice { key, name }) => cmd_add_device(&cli.config, &key, name),
-        Some(Commands::OldAccept { key, name }) => cmd_accept(&cli.config, &key, name),
-        Some(Commands::OldRemoveDevice { key }) => cmd_remove_device(&cli.config, &key),
-        Some(Commands::OldDevices) => cmd_devices(&cli.config),
-        Some(Commands::OldInvites) => cmd_invites(&cli.config),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::History {
             of,
@@ -435,9 +411,10 @@ fn cmd_init(
         }
     }
 
-    // The personal channel is created on first use (`add-device`), as a
-    // group channel shared by all of a person's devices (decision
-    // 2026-09-30-agent-memory-sync §4.1).
+    // No channel is made here. A device's channels are made from its
+    // person's secret, once it follows a recovery phrase: `cordelia
+    // phrase` on the first device, `add-device` there and `accept` here
+    // on each one after (decision 2026-10-04 §5, §6).
 
     // 6. Write config
     config.identity.entity_id = entity_id.clone();
@@ -623,6 +600,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 "projects": projects,
                 "projects_waiting": status.facts.projects_waiting,
                 "conflicts": status.facts.conflicts,
+                // Why nothing is published from this device, where
+                // nothing is, and where it stands under a phrase.
+                "publishes_nothing": report["publishes_nothing"],
+                "stands": sync["stands"],
                 "unsynced": report["unsynced"],
                 "excluded": report["excluded"],
                 "errors": status.facts.errors,
@@ -639,9 +620,6 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             if let Ok(peers) = local_api(&config, false, "/api/v1/peers", timeout) {
                 out["peers"]["list"] = peers["peers"].clone();
                 out["peers"]["relays"] = peers["relays"].clone();
-            }
-            if let Ok(devices) = local_api(&config, true, "/api/v1/old-devices/list", timeout) {
-                out["devices"] = devices["devices"].clone();
             }
             // What this device holds of its person, under a recovery
             // phrase (decision 2026-10-04 §8): where it stands, what it
@@ -680,12 +658,20 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     let db_path = data_dir.join("cordelia.db");
     if db_path.exists() {
         let conn = cordelia_storage::db::open(&db_path)?;
-        let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         println!();
         println!("Storage:");
-        println!("  Channels:  {}", channels.len());
+        // A personal node holds names, each with its channel from the
+        // person's secret. A node of another role holds channels of the
+        // older kind.
+        if config.network.role == "personal" {
+            let names = cordelia_storage::person::names(&conn)?;
+            println!("  Names:     {}", names.len());
+        } else {
+            let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
+            println!("  Channels:  {}", channels.len());
+        }
         println!("  DB size:   {} KB", db_size / 1024);
     }
 
@@ -807,6 +793,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         let report = &sync["report"];
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
         out.facts.sync_all = sync["all"].as_bool().unwrap_or(false);
+        out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
         out.facts.report_age_secs = report["at"]
             .as_str()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
@@ -969,20 +956,14 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         outbox_refused: Default::default(),
         relist: Default::default(),
         sync_control: Default::default(),
-        usable_keys: Default::default(),
         own_channels: Default::default(),
         history: Default::default(),
     });
 
-    // Personal nodes receive invites and channel states in an inbox channel
-    // derived from their key (decision 2026-09-30 §4.1).
+    // A personal node keeps local history of what sync replaces. It holds
+    // no channel of the older kind: no inbox is made for it, and nothing
+    // of that kind is read (decision 2026-10-04 §10).
     if config.network.role == "personal" {
-        let inbox = cordelia_api::membership::ensure_own_inbox(&state)?;
-        tracing::info!(%inbox, "inbox ready");
-        // Keys that are no device's are no longer taken. One that was
-        // stored before is taken off now, and the log says so. No
-        // channel's key is changed by that.
-        cordelia_api::membership::drop_unusable_keys(&state)?;
         start_history(&state, &config.history);
     }
 
@@ -1094,10 +1075,16 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         });
 
         // ── HTTP API ───────────────────────────────────────────────
+        // A personal node serves the local API of a device, and no
+        // Channels API of the older kind (decision 2026-10-04 §10).
+        let serves_a_device = config.network.role == "personal";
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(state.clone())
-                .configure(cordelia_api::configure_routes)
+                .configure(match serves_a_device {
+                    true => cordelia_api::configure_device_routes,
+                    false => cordelia_api::configure_routes,
+                })
         })
         .bind(&listen_addr)?
         // Only this node handles the signals that stop it, and it tells
@@ -1394,6 +1381,12 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         let state = state.clone();
         let adapter = adapter.clone();
         let sweep = sweep.is_due(std::time::Instant::now());
+        // Each turn of the loop is counted as it begins and as it ends,
+        // whether or not sync is on: a command that asks for a cycle
+        // waits for one that began after it asked (decision 2026-10-04
+        // §7.1, step 1).
+        let cycle = state.sync_control.cycle_begins();
+        let counted = state.clone();
         let _ = tokio::task::spawn_blocking(move || {
             // In its own turn, whether or not sync is on: history ages
             // either way.
@@ -1459,6 +1452,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             }
         })
         .await;
+        counted.sync_control.cycle_ended(cycle);
     }
 }
 
@@ -2439,150 +2433,6 @@ fn mapping_meant<'a>(
     }
 }
 
-fn cmd_add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
-    let resp = api_post(
-        config_path,
-        "/api/v1/old-devices/add",
-        serde_json::json!({ "device": key, "name": name }),
-    )?;
-    let channels = resp["channels"].as_array().map(Vec::len).unwrap_or(0);
-    let this_device = resp["this_device"].as_str().unwrap_or_default();
-    println!(
-        "Added {} to {channels} channel{}.",
-        name.as_deref().unwrap_or(key),
-        if channels == 1 { "" } else { "s" }
-    );
-    println!();
-    println!("On the other device, run:");
-    println!("  cordelia old-accept {this_device}");
-    Ok(())
-}
-
-fn cmd_accept(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
-    let resp = api_post(
-        config_path,
-        "/api/v1/old-devices/accept",
-        serde_json::json!({ "key": key, "name": name }),
-    )?;
-    let joined = resp["applied"].as_array().map(Vec::len).unwrap_or(0);
-    let notes: Vec<&str> = resp["notes"]
-        .as_array()
-        .map(|notes| notes.iter().filter_map(|n| n.as_str()).collect())
-        .unwrap_or_default();
-    println!("Trusted {}.", name.as_deref().unwrap_or(key));
-    if joined > 0 {
-        println!(
-            "Joined {joined} channel{}.",
-            if joined == 1 { "" } else { "s" }
-        );
-    } else if notes.is_empty() {
-        println!(
-            "Its invites have not arrived yet. They will be applied when they do, within the next hour."
-        );
-    }
-    for note in notes {
-        println!("{note}");
-    }
-    Ok(())
-}
-
-fn cmd_remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
-    let resp = api_post(
-        config_path,
-        "/api/v1/old-devices/remove",
-        serde_json::json!({ "device": key }),
-    )?;
-    let rotated = resp["channels_rotated"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or(0);
-    println!(
-        "Removed {key} from {rotated} channel{} and rotated {}.",
-        if rotated == 1 { "" } else { "s" },
-        if rotated == 1 {
-            "its key"
-        } else {
-            "their keys"
-        }
-    );
-    if rotated > 0 {
-        println!(
-            "Your other devices are told through the relays, and the change is offered again \
-             until each of them confirms it. `cordelia devices` shows any that has not."
-        );
-    }
-    Ok(())
-}
-
-fn cmd_devices(config_path: &str) -> anyhow::Result<()> {
-    let resp = api_post(
-        config_path,
-        "/api/v1/old-devices/list",
-        serde_json::json!({}),
-    )?;
-    for d in resp["devices"].as_array().into_iter().flatten() {
-        let key = d["key"].as_str().unwrap_or_default();
-        let name = d["name"].as_str().unwrap_or("");
-        let marker = if d["this_device"].as_bool() == Some(true) {
-            "  (this device)".to_string()
-        } else if d["in_personal_channel"].as_bool() != Some(true) {
-            "  (waiting to join)".to_string()
-        } else {
-            // A change this device made (a device added or removed) that
-            // the other has not confirmed. It is offered again until it
-            // does; a few minutes are normal, since it goes through a relay.
-            match unconfirmed_for(&d["unconfirmed_since"]) {
-                Some(secs) if secs >= UNCONFIRMED_SHOWN_AFTER_SECS => format!(
-                    "  (has not confirmed a change sent {})",
-                    indicator::ago(secs)
-                ),
-                _ => String::new(),
-            }
-        };
-        println!("{key}  {name}{marker}");
-    }
-    Ok(())
-}
-
-/// How long a change may go unconfirmed before `cordelia devices` says so.
-/// It travels through a relay, and the other device looks every ten
-/// seconds, so a minute or two means nothing.
-const UNCONFIRMED_SHOWN_AFTER_SECS: i64 = 600;
-
-/// Seconds since the time in a device's `unconfirmed_since`, if it has one.
-fn unconfirmed_for(since: &serde_json::Value) -> Option<i64> {
-    let at = chrono::DateTime::parse_from_rfc3339(since.as_str()?).ok()?;
-    Some((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds())
-}
-
-fn cmd_invites(config_path: &str) -> anyhow::Result<()> {
-    let resp = api_post(
-        config_path,
-        "/api/v1/old-invites/list",
-        serde_json::json!({}),
-    )?;
-    let pending = resp["pending"].as_array().cloned().unwrap_or_default();
-    if pending.is_empty() {
-        println!("No invites waiting.");
-        return Ok(());
-    }
-    for p in &pending {
-        println!(
-            "{}  from {}  ({})",
-            p["channel_id"].as_str().unwrap_or_default(),
-            p["from"].as_str().unwrap_or_default(),
-            p["received_at"].as_str().unwrap_or_default()
-        );
-    }
-    println!();
-    println!("These are from keys this device has not accepted.");
-    println!(
-        "Accept one only if it is another of your own devices, and you added this device \
-         from it: cordelia old-accept <from>"
-    );
-    Ok(())
-}
-
 fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
@@ -3212,6 +3062,12 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         return Ok(());
     }
 
+    // A device that follows no recovery phrase, or has stopped, publishes
+    // nothing: its folders are listed, and what is in them stays here.
+    let stays_here = report["publishes_nothing"].as_str();
+    if let Some(why) = stays_here {
+        println!("  Nothing is sent from this device: {why}");
+    }
     let folders = list(&report["folders"]);
     if folders.is_empty() {
         println!("  Nothing syncs yet.");
@@ -3225,7 +3081,10 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         rows.push(vec![
             place,
             sync_label(&text(&f["project"])),
-            folder_state(f),
+            match stays_here {
+                Some(_) => "stays on this machine".to_string(),
+                None => folder_state(f),
+            },
             folder_activity(f),
         ]);
     }
@@ -3240,7 +3099,8 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         }
         for s in list(&f["too_large"]) {
             println!(
-                "  not synced (too large: an entry carries at most 64 KB): {}/memory/{}",
+                "  not synced (too large: a file's name and its text may together be 60 KB): \
+                 {}/memory/{}",
                 short_path(&text(&f["folder"])),
                 text(&s)
             );
@@ -3376,7 +3236,7 @@ fn folder_state(folder: &serde_json::Value) -> String {
         return format!("error: {error}");
     }
     if folder["waiting"].as_bool() == Some(true) {
-        return "waiting for one of your other devices to let this one in".to_string();
+        return "waiting for its channel to be fetched from a relay".to_string();
     }
     let listed = folder["failed"].as_array().map_or(0, Vec::len) as u64;
     match listed + folder["failed_more"].as_u64().unwrap_or(0) {
@@ -3456,7 +3316,7 @@ mod tests {
         );
         assert_eq!(
             state(json!({ "waiting": true })),
-            "waiting for one of your other devices to let this one in"
+            "waiting for its channel to be fetched from a relay"
         );
     }
 

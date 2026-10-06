@@ -426,6 +426,30 @@ impl Several {
     }
 }
 
+/// A node's state over the database and the key of `machine`, with no
+/// network: what a handler is given.
+pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
+    crate::state::AppState {
+        db: std::sync::Mutex::new(machine.conn),
+        identity: machine.identity,
+        bearer_token: "t".into(),
+        home_dir: std::env::temp_dir().join("cordelia-several-test-no-such-directory"),
+        started_at: std::time::Instant::now(),
+        sync_errors: Default::default(),
+        peers_hot: Default::default(),
+        peers_warm: Default::default(),
+        push_tx: None,
+        announce_tx: None,
+        peers: Default::default(),
+        relays: Default::default(),
+        outbox_refused: Default::default(),
+        relist: Default::default(),
+        sync_control: Default::default(),
+        own_channels: Default::default(),
+        history: Default::default(),
+    }
+}
+
 pub(crate) fn text(said: &str) -> Value {
     Value::Text(said.to_string())
 }
@@ -558,6 +582,7 @@ mod tests {
                 left: None,
                 carried: 0,
                 no_version: Vec::new(),
+                not_carried: Vec::new(),
             }
         );
         // Until it is added, a device follows no phrase.
@@ -571,6 +596,7 @@ mod tests {
                     left: None,
                     carried: 0,
                     no_version: Vec::new(),
+                    not_carried: Vec::new(),
                 })
             );
         }
@@ -824,6 +850,7 @@ mod tests {
                     left: Some(1),
                     carried: 3,
                     no_version: Vec::new(),
+                    not_carried: Vec::new(),
                 })),
                 "{n}"
             );
@@ -1387,5 +1414,433 @@ mod tests {
         let secrets: Vec<[u8; 32]> = for_phrase.earlier.iter().map(|one| one.secret).collect();
         assert!(secrets[..2].contains(&branches[0]) && secrets[..2].contains(&branches[1]));
         assert_eq!(secrets[2], first);
+    }
+
+    // ── A folder's records, names, and what was carried ─────────────
+
+    use cordelia_core::protocol::REV_BAND_HALF;
+    use cordelia_core::revision::lifted;
+    use cordelia_crypto::bech32::encode_channel_id;
+    use cordelia_storage::at_relays as kept_rows;
+    use cordelia_storage::sync_state::{self, Agreed};
+    use cordelia_storage::{index_lines, meta};
+
+    use crate::at_relays::{carried_waits_at, channels, say_sent};
+    use crate::leaving::names_to_go;
+    use crate::look::{NotCarried, look};
+    use crate::names;
+    use crate::person::key_signed_as;
+    use crate::state::AtRelays;
+
+    /// The ID of the channel of `name` on `on`, as it is written: what a
+    /// folder's records are kept by.
+    fn written(on: &Machine, name: &str) -> String {
+        encode_channel_id(&derive::channel_id(&on.own(name)).unwrap()).unwrap()
+    }
+
+    fn agreed(on: &Machine, rev: u64, said: &str) -> Agreed {
+        Agreed {
+            hash: Some(hash(said)),
+            rev,
+            signer: Some(on.key()),
+            chain: Some(Vec::new()),
+        }
+    }
+
+    /// How many records of index lines the store holds for a channel.
+    fn index_records(conn: &Connection, channel: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM index_lines WHERE channel_id = ?1",
+            [channel],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// When a device applies a statement, each folder's records, which
+    /// are kept by channel, are moved to the name's new channel, with its
+    /// records of index lines, and each revision in them is renumbered as
+    /// a version's is (decision 2026-10-04 §4.2). A record in whose slot
+    /// the store holds no version at all is dropped, so that its file
+    /// meets the new channel as a new file does, and the device says
+    /// which files.
+    #[test]
+    fn test_a_folders_records_move_with_the_name_and_one_with_no_version_is_dropped() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        let kept = s.write(0, "lab", "kept.md", "one");
+        // A version at a revision in the top half of its band: a device
+        // jumped there. It crosses the statement to the next band.
+        let high = (1u64 << 44) + REV_BAND_HALF + 5;
+        assert_ne!(lifted(high), high);
+        let now = s.tick();
+        let up = entry_by(
+            &s[0].identity,
+            &s[0].own("lab"),
+            high,
+            "high.md",
+            text("up"),
+            &[],
+        );
+        assert_eq!(take(&s[0].conn, &s[0].identity, &up, now).unwrap(), STORED);
+
+        let old = written(&s[0], "lab");
+        let conn = &s[0].conn;
+        let folder = "/home/sam/memory";
+        for (file, record) in [
+            ("kept.md", agreed(&s[0], kept.rev, "one")),
+            ("high.md", agreed(&s[0], high, "up")),
+            // The store holds nothing in this file's slot.
+            ("ghost.md", agreed(&s[0], 3, "gone")),
+        ] {
+            sync_state::save(conn, folder, &old, file, &record).unwrap();
+        }
+        index_lines::line_removed(conn, folder, &old, "kept.md", "- [k](kept.md)", now).unwrap();
+        // Another channel's records are another matter.
+        let other = agreed(&s[0], 9, "elsewhere");
+        sync_state::save(conn, folder, "another-channel", "x.md", &other).unwrap();
+
+        // A renewal: the device applies statement 2.
+        s.change(0, &[0, 1], &[]);
+        let new = written(&s[0], "lab");
+        assert_ne!(new, old);
+        let conn = &s[0].conn;
+        assert!(sync_state::load(conn, folder, &old).unwrap().is_empty());
+        let moved = sync_state::load(conn, folder, &new).unwrap();
+        let mut files: Vec<&String> = moved.keys().collect();
+        files.sort();
+        assert_eq!(files, ["high.md", "kept.md"]);
+        assert_eq!(moved["kept.md"], agreed(&s[0], kept.rev, "one"));
+        assert_eq!(moved["high.md"], agreed(&s[0], lifted(high), "up"));
+        // The version itself is where its record says, in the new channel.
+        assert_eq!(
+            s[0].slot("lab", "high.md").current.unwrap().rev,
+            lifted(high)
+        );
+        assert_eq!(
+            (index_records(conn, &old), index_records(conn, &new)),
+            (0, 1)
+        );
+        let elsewhere = sync_state::load(conn, folder, "another-channel").unwrap();
+        assert_eq!(elsewhere["x.md"], other);
+
+        // The file whose record was dropped is said, until the next
+        // statement.
+        let now = s.tick();
+        let seen = look(&s[0].conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+        let ghost = NotCarried {
+            name: "lab".into(),
+            file: "ghost.md".into(),
+        };
+        assert_eq!(seen.not_carried, [ghost]);
+        assert!(
+            seen.says.iter().any(|line| line.contains("ghost.md in lab")
+                && line.contains("meets its channel as a new file does")),
+            "{:?}",
+            seen.says
+        );
+        s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        let seen = look(&s[0].conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+        assert!(seen.not_carried.is_empty());
+        assert_eq!(
+            meta::get(&s[0].conn, meta::PERSON_NOT_CARRIED).unwrap(),
+            None
+        );
+    }
+
+    /// Each device that applies a statement writes so in the new personal
+    /// channel, and, once it has, that it has sent what it carried
+    /// (decision 2026-10-04 §8): where nothing that it carried waits at
+    /// any relay it is set up with. It says so once, and a look shows it
+    /// of each device whose word of the statement applied says so.
+    #[test]
+    fn test_a_device_writes_that_it_has_sent_what_it_carried_once_it_has() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        s.write(0, "lab", "notes.md", "one");
+        s.meet(&[0, 1]);
+        let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
+        let said = |s: &Several, n: usize| match s[n].word_of(&s.key(n)) {
+            Some(Value::Text(word)) => word,
+            other => panic!("{other:?}"),
+        };
+
+        // Under the first statement nothing was carried. With no relay
+        // nothing is sent, and nothing is said.
+        let now = s.tick();
+        assert_eq!(said(&s, 0), "1");
+        assert!(!say_sent(&s[0].conn, &s[0].identity, &[], now).unwrap());
+        assert!(!carried_waits_at(&s[0].conn, &s[0].identity, &relay).unwrap());
+        assert!(say_sent(&s[0].conn, &s[0].identity, &[relay], now).unwrap());
+        assert_eq!(said(&s, 0), "1 sent");
+        // Said once.
+        assert!(!say_sent(&s[0].conn, &s[0].identity, &[relay], now).unwrap());
+
+        // A change: device 0 carries the file, and its own words.
+        let change = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        assert_eq!(said(&s, 0), "2");
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        assert!(carried_waits_at(conn, identity, &relay).unwrap());
+        assert!(!say_sent(conn, identity, &[relay], now).unwrap());
+
+        // It is sent to one relay of the two it is set up with: not yet.
+        let far = i64::MAX / 2;
+        for channel in channels(conn, identity).unwrap() {
+            kept_rows::sent(conn, &relay, &channel.id, far).unwrap();
+            kept_rows::carried(conn, &relay, &channel.id, far).unwrap();
+        }
+        assert!(!carried_waits_at(conn, identity, &relay).unwrap());
+        assert!(carried_waits_at(conn, identity, &other_relay).unwrap());
+        assert!(!say_sent(conn, identity, &[relay, other_relay], now).unwrap());
+        assert_eq!(said(&s, 0), "2");
+        // To each of them: it says so, in an entry above its word.
+        for channel in channels(conn, identity).unwrap() {
+            kept_rows::sent(conn, &other_relay, &channel.id, far).unwrap();
+            kept_rows::carried(conn, &other_relay, &channel.id, far).unwrap();
+        }
+        assert!(say_sent(conn, identity, &[relay, other_relay], now).unwrap());
+        assert_eq!(said(&s, 0), "2 sent");
+        assert!(!say_sent(conn, identity, &[relay, other_relay], now).unwrap());
+
+        // The other device applies the change and is given the word: it
+        // shows device 0 as having sent what it held, and itself not.
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        s.pass(0, 1);
+        let now = s.tick();
+        let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
+        let sent: Vec<(Option<u64>, bool)> = seen
+            .devices
+            .iter()
+            .map(|device| (device.applied, device.sent))
+            .collect();
+        assert_eq!(sent, [(Some(2), true), (Some(2), false)]);
+
+        // A word that says so of another statement says nothing of this
+        // one: the device is shown as still sending.
+        s.change(1, &[0, 1], &[]);
+        s.pass(0, 1);
+        let now = s.tick();
+        let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
+        assert!(seen.devices.iter().all(|device| !device.sent));
+    }
+
+    /// A look shows each name that a device had listed before the last
+    /// change and that no device lists yet, with who had listed it and
+    /// for how long it can still be brought in; a name that only a key
+    /// which no longer counts had listed is said apart (decision
+    /// 2026-10-04 §7.3, §8).
+    #[test]
+    fn test_a_look_shows_the_names_that_no_device_lists_yet() {
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        for (n, name) in [(0, "lab"), (1, "team"), (2, "only-the-tablets")] {
+            s.hold(&[n], name);
+            names::say(&s[n].conn, &s[n].identity, name, now).unwrap();
+        }
+        s.meet(&[0, 1, 2]);
+        let change = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let seen = look(&s[0].conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+        let shown: Vec<(&str, usize, usize, i64)> = seen
+            .names_not_listed
+            .iter()
+            .map(|name| {
+                (
+                    name.name.as_str(),
+                    name.by.len(),
+                    name.by_gone.len(),
+                    name.days_left,
+                )
+            })
+            .collect();
+        assert_eq!(shown, [("only-the-tablets", 0, 1, 89), ("team", 1, 0, 89)]);
+        assert_eq!(seen.names_not_listed[1].by[0].label, "device 1");
+        let says = seen.says.join("\n");
+        assert!(
+            says.contains(
+                "1 name that your devices synced before the last change is listed by no device \
+                 yet: team."
+            ),
+            "{says}"
+        );
+        assert!(
+            says.contains(
+                "1 name that only a device which no longer counts had synced is listed by no \
+                 device: only-the-tablets. It stays behind"
+            ),
+            "{says}"
+        );
+        // A day short of ninety days later it can be brought in for one
+        // more day, and then no more.
+        let day = 24 * 60 * 60;
+        let late = look(
+            &s[0].conn,
+            &s[0].identity,
+            &AtRelays::default(),
+            now + 88 * day,
+        )
+        .unwrap();
+        assert_eq!(late.names_not_listed[0].days_left, 1);
+        let past = look(
+            &s[0].conn,
+            &s[0].identity,
+            &AtRelays::default(),
+            now + 200 * day,
+        )
+        .unwrap();
+        assert_eq!(past.names_not_listed[0].days_left, 0);
+        // A device that has stopped says nothing of names.
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        s.change(1, &[1], &[0]);
+        s.pass(1, 0);
+        assert_eq!(s[0].state(), State::Removed);
+        let seen = look(&s[0].conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+        assert!(seen.names_not_listed.is_empty());
+    }
+
+    /// What a device has still to send, by name (decision 2026-10-04
+    /// §7.1): a name of whose channel something waits at any relay asked
+    /// about is one to go, and the others are sent.
+    #[test]
+    fn test_what_is_still_to_send_is_said_by_name() {
+        let mut s = Several::of_one_person(1);
+        s.hold(&[0], "lab");
+        s.hold(&[0], "team");
+        s.write(0, "lab", "notes.md", "one");
+        s.write(0, "team", "notes.md", "one");
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
+        let to_go = |relays: &[[u8; 32]]| names_to_go(conn, identity, relays).unwrap();
+        let both =
+            |lab: bool, team: bool| vec![("lab".to_string(), lab), ("team".to_string(), team)];
+
+        assert_eq!(to_go(&[relay]), both(true, true));
+        // No relay is asked about: nothing is known to wait.
+        assert_eq!(to_go(&[]), both(false, false));
+        let lab = held_rows::channel_of_name(conn, "lab").unwrap().unwrap();
+        kept_rows::sent(conn, &relay, &lab, i64::MAX / 2).unwrap();
+        assert_eq!(to_go(&[relay]), both(false, true));
+        // It waits at another relay still.
+        assert_eq!(to_go(&[relay, other_relay]), both(true, true));
+        // What a relay had no room for waits too.
+        let held = entries::channel_entries_after(conn, &lab, 0, 1).unwrap();
+        kept_rows::refused(conn, &relay, &lab, held[0].seq).unwrap();
+        assert_eq!(to_go(&[relay]), both(true, true));
+        // A device that follows no phrase sends nothing, and holds none.
+        let alone = Machine::new(7);
+        assert!(
+            names_to_go(&alone.conn, &alone.identity, &[relay])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn maps(on: &Machine, name: &str, sync_on: bool) {
+        let mappings = serde_json::json!([{ "folder": "/home/sam/notes", "name": name }]);
+        meta::set(&on.conn, meta::SYNC_CLAUDE_MAPPINGS, &mappings.to_string()).unwrap();
+        if sync_on {
+            meta::set(&on.conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        }
+    }
+
+    /// A device that comes to follow a phrase holds a name for each
+    /// folder it maps (decision 2026-10-04 §5.2, §6): by making a phrase,
+    /// and by accepting a device that follows one. With sync on it says
+    /// that it syncs them. And where a phrase is replaced, or a device
+    /// leaves, its folders forget what they had agreed.
+    #[test]
+    fn test_a_device_that_comes_to_follow_a_phrase_holds_its_folders_names() {
+        let mut s = Several::new(3);
+        maps(&s[0], "lab", true);
+        maps(&s[1], "lab", true);
+        maps(&s[2], "notes", false);
+        let holds = |s: &Several, n: usize| -> Vec<String> {
+            let names = held_rows::names(&s[n].conn).unwrap();
+            names.into_iter().map(|name| name.name).collect()
+        };
+        let says = |s: &Several, n: usize| -> Vec<String> {
+            let said = names::said_here(&s[n].conn, &s[n].identity).unwrap();
+            said.into_iter().collect()
+        };
+
+        // `cordelia phrase`: the node's half is `start_again`.
+        let now = s.tick();
+        let made = crate::person::first_entry(&s.phrase, &s.key(0), "device 0").unwrap();
+        crate::leaving::start_again(
+            &s[0].conn,
+            &s[0].identity,
+            crate::leaving::Among::NoPhrase,
+            &made.entry,
+            &made.statement_key,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            (holds(&s, 0), says(&s, 0)),
+            (vec!["lab".into()], vec!["lab".into()])
+        );
+
+        // `cordelia accept`: a device that followed no phrase joins.
+        assert!(matches!(s.add(0, 1), Accepted::Joined(_)));
+        assert_eq!(
+            (holds(&s, 1), says(&s, 1)),
+            (vec!["lab".into()], vec!["lab".into()])
+        );
+        // With sync off it holds the name, and says nothing.
+        assert!(matches!(s.add(0, 2), Accepted::Joined(_)));
+        assert_eq!(
+            (holds(&s, 2), says(&s, 2)),
+            (vec!["notes".to_string()], vec![])
+        );
+
+        // Its folders have agreed something, and a name was listed before
+        // a change. Then the device leaves: both are forgotten, and it
+        // keeps the names it held.
+        let channel = written(&s[1], "lab");
+        let record = agreed(&s[1], 1, "one");
+        sync_state::save(&s[1].conn, "/home/sam/memory", &channel, "a.md", &record).unwrap();
+        held_rows::note_name_before(&s[1].conn, "old", &s.key(0), now).unwrap();
+        let noted = serde_json::json!([{ "name": "lab", "file": "x.md" }]).to_string();
+        meta::set(&s[1].conn, meta::PERSON_NOT_CARRIED, &noted).unwrap();
+        let now = s.tick();
+        assert!(crate::leaving::forget(&s[1].conn, &s[1].identity, false, now).unwrap());
+        assert!(!sync_state::any(&s[1].conn, "/home/sam/memory", &channel).unwrap());
+        assert!(held_rows::names_before(&s[1].conn).unwrap().is_empty());
+        assert_eq!(
+            meta::get(&s[1].conn, meta::PERSON_NOT_CARRIED).unwrap(),
+            None
+        );
+        assert_eq!(holds(&s, 1), ["lab"]);
+    }
+
+    /// The key that a chain names by its first 16 bytes is one that the
+    /// device knows of with those bytes: a device of the statement, a key
+    /// it removed, a key added since. It is no key where the device
+    /// knows of none.
+    #[test]
+    fn test_a_links_signer_is_the_one_key_the_device_knows_of_with_those_bytes() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let nine = Machine::new(9);
+        s.machines.push(nine);
+        s.hand(0, 3);
+        let conn = &s[0].conn;
+        for known in [0, 1, 2, 3] {
+            let key = s.key(known);
+            let signer = Link::signer_of(&key);
+            assert_eq!(
+                key_signed_as(conn, &signer).unwrap(),
+                Some(key),
+                "device {known}"
+            );
+        }
+        assert_eq!(key_signed_as(conn, &[0xee; 16]).unwrap(), None);
+        // A device that follows no phrase knows of none.
+        let alone = Machine::new(7);
+        let signer = Link::signer_of(&s.key(0));
+        assert_eq!(key_signed_as(&alone.conn, &signer).unwrap(), None);
     }
 }

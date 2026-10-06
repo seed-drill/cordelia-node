@@ -1,6 +1,6 @@
 //! What a device holds of its person (decision 2026-10-04 §3 to §6).
 //!
-//! Six tables, in the node's database, so that everything here changes in
+//! Seven tables, in the node's database, so that everything here changes in
 //! one transaction with a statement (§3):
 //!
 //! - **What it follows, and where it stands** (`person`, one row). The
@@ -20,6 +20,11 @@
 //!   (§6).
 //! - **The names it holds** in the current generation (`person_names`),
 //!   each with its channel's ID, so that either is found from the other.
+//! - **The names that were listed before** (`person_names_before`): each
+//!   name that a key had said it syncs, in the personal channel of a
+//!   generation the device left, with when it left it. A device shows the
+//!   names among them that no device lists yet in the generation it has
+//!   applied (§7.3, §8).
 //! - **The last hand-over it made for each key** (`person_hand_overs`):
 //!   its revision, so that the next is above it, when it says it was
 //!   made, and whether the store still holds it. Never the hand-over,
@@ -590,6 +595,84 @@ pub fn name_of_channel(
         |row| row.get(0),
     )
     .optional()
+    .map_err(storage)
+}
+
+// ── The names that were listed before a statement ────────────────────
+
+/// A name that a key had said it syncs, in the personal channel of a
+/// generation that the device left (decision 2026-10-04 §7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameBefore {
+    pub name: String,
+    /// The key that had said so.
+    pub key: [u8; 32],
+    /// When the device left that generation, in seconds, by its own
+    /// clock.
+    pub left_at: i64,
+}
+
+/// Every name that was listed in a generation the device left, with each
+/// key that had listed it, in order of name and then of key.
+pub fn names_before(conn: &Connection) -> Result<Vec<NameBefore>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT name, said_by, left_at FROM person_names_before ORDER BY name, said_by")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(NameBefore {
+                name: row.get(0)?,
+                key: row.get(1)?,
+                left_at: row.get(2)?,
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Note that the key `key` had said it syncs `name`, in the personal
+/// channel of the generation that the device leaves at `now`. A name and
+/// key that are noted already are noted as of now: the generation that
+/// is left is the newest that listed them.
+pub fn note_name_before(
+    conn: &Connection,
+    name: &str,
+    key: &[u8; 32],
+    now: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_names_before (name, said_by, left_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(name, said_by) DO UPDATE SET left_at = excluded.left_at",
+        params![name, key.as_slice(), now],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Note `name` no longer as listed before, whichever keys had listed it:
+/// a device lists it in the generation applied. Returns how many rows
+/// went.
+pub fn forget_name_before(conn: &Connection, name: &str) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM person_names_before WHERE name = ?1",
+        params![name],
+    )
+    .map_err(storage)
+}
+
+/// Forget each name that was listed in a generation which the device left
+/// 90 days ago or longer, by its own clock: that generation's secret is
+/// forgotten then ([`forget_left_secrets`]), and the name can be brought
+/// in no more. With `None`, forget them all: the device leaves its
+/// phrase. Returns how many rows went.
+pub fn forget_names_before(conn: &Connection, now: Option<i64>) -> Result<usize, CordeliaError> {
+    match now {
+        Some(now) => conn.execute(
+            "DELETE FROM person_names_before WHERE left_at + ?1 <= ?2",
+            params![KEPT_SECS, now],
+        ),
+        None => conn.execute("DELETE FROM person_names_before", []),
+    }
     .map_err(storage)
 }
 
@@ -1435,6 +1518,66 @@ mod tests {
         assert_eq!(handed_over(&conn, &[2; 32]).unwrap(), None);
         assert!(hand_overs_held(&conn).unwrap().is_empty());
         assert_eq!(forget_hand_overs(&conn).unwrap(), 0);
+    }
+
+    /// The names that were listed before a statement are kept by name
+    /// and by the key that had listed each, with when the generation was
+    /// left: noted again, a name and key are noted as of the later time.
+    /// A name that a device lists again is noted no more, whoever had
+    /// listed it; each goes 90 days after its generation was left; and
+    /// all go when the device leaves its phrase.
+    #[test]
+    fn test_the_names_that_were_listed_before_are_kept_until_listed_or_ninety_days() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(names_before(&conn).unwrap().is_empty());
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        note_name_before(&conn, "notes", &b, NOW).unwrap();
+        note_name_before(&conn, "notes", &a, NOW).unwrap();
+        note_name_before(&conn, "app", &a, NOW).unwrap();
+        let before = |name: &str, key: [u8; 32], left_at: i64| NameBefore {
+            name: name.into(),
+            key,
+            left_at,
+        };
+        assert_eq!(
+            names_before(&conn).unwrap(),
+            [
+                before("app", a, NOW),
+                before("notes", a, NOW),
+                before("notes", b, NOW)
+            ]
+        );
+        // Noted again as of a later generation: one row still, of that
+        // time.
+        note_name_before(&conn, "notes", &a, NOW + DAY).unwrap();
+        assert_eq!(
+            names_before(&conn).unwrap()[1],
+            before("notes", a, NOW + DAY)
+        );
+        assert_eq!(names_before(&conn).unwrap().len(), 3);
+
+        // Ninety days after its generation was left, and not before.
+        assert_eq!(
+            forget_names_before(&conn, Some(NOW + 90 * DAY - 1)).unwrap(),
+            0
+        );
+        assert_eq!(forget_names_before(&conn, Some(NOW + 90 * DAY)).unwrap(), 2);
+        assert_eq!(
+            names_before(&conn).unwrap(),
+            [before("notes", a, NOW + DAY)]
+        );
+
+        // A name that is listed again goes, with every key that had
+        // listed it, and no other name with it.
+        note_name_before(&conn, "notes", &b, NOW).unwrap();
+        note_name_before(&conn, "app", &b, NOW).unwrap();
+        assert_eq!(forget_name_before(&conn, "notes").unwrap(), 2);
+        assert_eq!(forget_name_before(&conn, "notes").unwrap(), 0);
+        assert_eq!(names_before(&conn).unwrap(), [before("app", b, NOW)]);
+
+        // All of them, where the device leaves its phrase.
+        assert_eq!(forget_names_before(&conn, None).unwrap(), 1);
+        assert!(names_before(&conn).unwrap().is_empty());
     }
 
     #[test]
