@@ -1255,7 +1255,37 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     at.says("The recovery phrase, twelve words");
 
     // Meanwhile the desktop makes a change, and the laptop applies it.
-    renews(&desktop, &[], &words).done();
+    // The desktop was added since the last change. Before a change lists
+    // it, the command shows it as an addition, from the record of its
+    // own addition, and its listing is confirmed by a typed answer
+    // (decision 2026-10-04 §16).
+    let mut not_confirmed = desktop.at_terminal(&["renew"]);
+    not_confirmed
+        .says("Type `stays` to list this device")
+        .types("yes");
+    let said = not_confirmed.refused();
+    assert!(
+        said.contains("That was not `stays`. Nothing was done."),
+        "{said}"
+    );
+    assert!(!said.contains("Make this change?"), "{said}");
+    let mut on_desktop = desktop.at_terminal(&["renew"]);
+    on_desktop
+        .says("This device is not in the last change: it was added since, as ")
+        .says("desktop")
+        .says("from ")
+        .says("laptop")
+        .says("this change lists it under that label")
+        .says("Type `stays` to list this device")
+        .types("stays");
+    on_desktop
+        .says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    on_desktop
+        .says("The recovery phrase, twelve words")
+        .types(&words);
+    on_desktop.done();
     assert_eq!(look(&desktop)["change"], 2);
     applies(&laptop, 2, &all);
 
@@ -1897,6 +1927,190 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
         .filter(|(what, _)| what.contains("cordelia.db"))
         .any(|(_, bytes)| words_in(bytes).contains("laptop"));
     assert!(in_files, "the search reads the node's database");
+}
+
+// ── What answers at the node's address ───────────────────────────────
+
+/// A stand-in at a port of this machine for the node at `port`: each
+/// request is passed on to the node, and the node's answer is handed back
+/// as `changed` leaves it. It is what a program that answers at the
+/// node's address could say to a command.
+struct Answers {
+    port: u16,
+}
+
+impl Answers {
+    fn in_the_place_of(
+        node: &Node,
+        changed: impl Fn(&str, &mut Value) + Send + Sync + 'static,
+    ) -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap().port();
+        let (node_port, token) = (node.http, node.token());
+        let changed = std::sync::Arc::new(changed);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let (changed, token) = (changed.clone(), token.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let mut length = 0usize;
+                    loop {
+                        let mut header = String::new();
+                        let read = reader.read_line(&mut header).unwrap_or(0);
+                        if read == 0 || header == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = header.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    if reader.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let url = format!("http://127.0.0.1:{node_port}{path}");
+                    let agent: ureq::Agent = ureq::Agent::config_builder()
+                        .proxy(None)
+                        .http_status_as_error(false)
+                        .build()
+                        .into();
+                    let auth = format!("Bearer {token}");
+                    let answered = match method.as_str() {
+                        "GET" => agent.get(&url).header("Authorization", &auth).call(),
+                        _ => agent
+                            .post(&url)
+                            .header("Authorization", &auth)
+                            .header("Content-Type", "application/json")
+                            .send(&body[..]),
+                    };
+                    let Ok(mut answered) = answered else {
+                        return;
+                    };
+                    let status = answered.status().as_u16();
+                    let mut answer: Value = answered.body_mut().read_json().unwrap_or(Value::Null);
+                    changed(&path, &mut answer);
+                    let out = answer.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                        out.len()
+                    );
+                });
+            }
+        });
+        Self { port: at }
+    }
+}
+
+/// What a command shows as this device, signs for and prints is its own
+/// reading of the key file, never the node's word (decision 2026-10-04
+/// §16). Whatever answers at the node's address names a key of its own
+/// as this device, with a record of an addition for it, which the node
+/// itself signed: any program that holds the node's token can have it
+/// sign one. `cordelia renew` refuses before it asks anything, and the
+/// phrase is never asked for; `cordelia phrase` shows no word; and
+/// `cordelia add-device` asks no yes and prints no key to type.
+#[test]
+fn a_command_refuses_what_names_another_key_as_this_device() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    makes_a_phrase(&laptop, "laptop");
+
+    // A key of the stand-in's own, and the record that adds it.
+    let its_own = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let its_key = cordelia_crypto::bech32::encode_public_key(&its_own.public_key()).unwrap();
+    laptop.post(
+        "/api/v1/devices/add",
+        json!({ "device": its_key, "label": "laptop" }),
+    );
+    let named = its_key.clone();
+    let stand_in = Answers::in_the_place_of(&laptop, move |_, answer| {
+        if answer.get("this_device").is_some() {
+            answer["this_device"] = named.clone().into();
+        }
+    });
+    // The control: a stand-in that changes nothing is a way to the node,
+    // and through it the record is among what a change asks about.
+    let passes_on = Answers::in_the_place_of(&laptop, |_, _| {});
+    let said = laptop
+        .at_terminal_through(passes_on.port, &["devices"])
+        .done();
+    assert!(said.contains("Added since:"), "{said}");
+    let mut at = laptop.at_terminal_through(passes_on.port, &["renew"]);
+    at.says("added since the last change")
+        .says("Type `stays` or `removed`");
+    drop(at);
+
+    // A command that is refused here asks nothing first: it ends by
+    // itself, and is not waited for where it asks.
+    let soon = std::time::Duration::from_secs(60);
+    let refusal = "does not name this device's key";
+    let said = laptop
+        .at_terminal_through(stand_in.port, &["renew"])
+        .refused_within(soon);
+    assert!(said.contains(refusal), "{said}");
+    for never in [
+        "The recovery phrase, twelve words",
+        "Make this change?",
+        "Type `stays`",
+        "(this device)",
+    ] {
+        assert!(!said.contains(never), "{never:?} in:\n{said}");
+    }
+
+    let said = laptop
+        .at_terminal_through(stand_in.port, &["phrase", "--name", "laptop"])
+        .refused_within(soon);
+    assert!(said.contains(refusal), "{said}");
+    assert!(!said.contains("shown once"), "{said}");
+
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let said = laptop
+        .at_terminal_through(stand_in.port, &["add-device", &other, "--name", "desktop"])
+        .refused_within(soon);
+    assert!(said.contains(refusal), "{said}");
+    assert!(!said.contains("Type yes to go on"), "{said}");
+    assert!(!said.contains("cordelia accept"), "{said}");
+    // And `cordelia devices`, which only shows.
+    let said = laptop
+        .at_terminal_through(stand_in.port, &["devices"])
+        .refused_within(soon);
+    assert!(said.contains(refusal), "{said}");
+
+    // Where only the answer to the adding itself names another key, the
+    // yes was asked by then: the command prints no key to type on the
+    // other device, neither that one nor its own.
+    let named = its_key.clone();
+    let at_the_add = Answers::in_the_place_of(&laptop, move |path, answer| {
+        if path == "/api/v1/devices/add" && answer.get("this_device").is_some() {
+            answer["this_device"] = named.clone().into();
+        }
+    });
+    let mut at = laptop.at_terminal_through(
+        at_the_add.port,
+        &["add-device", &other, "--name", "desktop"],
+    );
+    at.says("Type yes to go on").types("yes");
+    let said = at.refused_within(soon);
+    assert!(said.contains(refusal), "{said}");
+    assert!(!said.contains("cordelia accept"), "{said}");
+
+    // Nothing was made of any of it: the device is where it was.
+    let seen = look(&laptop);
+    assert_eq!(seen["change"], 1, "{seen}");
+    assert_eq!(seen["this_device"], key_of(&laptop), "{seen}");
 }
 
 // ── A change made while a pass is in flight ──────────────────────────

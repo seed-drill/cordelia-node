@@ -709,8 +709,13 @@ impl AtTerminal {
     /// Wait for the command to end: whether it succeeded, and everything
     /// that its terminal showed. Fails where it does not end in five
     /// minutes.
-    pub fn ends(mut self) -> (bool, String) {
-        let deadline = Instant::now() + Duration::from_secs(300);
+    pub fn ends(self) -> (bool, String) {
+        self.ends_within(Duration::from_secs(300))
+    }
+
+    /// [`Self::ends`], for a command that must end within `long`.
+    pub fn ends_within(mut self, long: Duration) -> (bool, String) {
+        let deadline = Instant::now() + long;
         let status = loop {
             self.hears(Duration::from_millis(100));
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -738,8 +743,15 @@ impl AtTerminal {
 
     /// [`Self::ends`], for a command that must be refused: what it said.
     pub fn refused(self) -> String {
+        self.refused_within(Duration::from_secs(300))
+    }
+
+    /// [`Self::refused`], for a command that must be refused with nothing
+    /// typed: it ends within `long`. One that asks something would wait
+    /// for an answer, and is not waited for longer.
+    pub fn refused_within(self, long: Duration) -> String {
         let (name, args) = (self.name, self.args.clone());
-        let (success, said) = self.ends();
+        let (success, said) = self.ends_within(long);
         assert!(
             !success,
             "{name}: cordelia {args} should have been refused:\n{said}"

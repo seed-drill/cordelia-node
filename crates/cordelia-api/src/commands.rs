@@ -39,6 +39,7 @@ use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::fingerprint;
+use cordelia_crypto::statement::Statement;
 use cordelia_storage::acts;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
@@ -341,9 +342,13 @@ pub async fn add_look(
     let label = body.label.as_deref().unwrap_or(NO_LABEL);
     let would = adding::would_add(&db(&state), &state.identity, &device, label).map_err(refused)?;
     let words = fingerprint::shown(&device);
+    // The key that the node runs under: the command refuses where it is
+    // another than the one in the device's key file (§16).
+    let this_device = written(&state.identity.public_key())?;
     Ok(HttpResponse::Ok().json(match would {
         WouldAdd::HandsAgain { label } => json!({
             "would": "hand_again", "label": label, "words": words,
+            "this_device": this_device,
         }),
         WouldAdd::Adds {
             counts_already,
@@ -351,6 +356,7 @@ pub async fn add_look(
         } => json!({
             "would": "add", "label": label, "words": words,
             "counts_already": counts_already, "left_out_as": left_out_as,
+            "this_device": this_device,
         }),
     }))
 }
@@ -747,7 +753,12 @@ pub async fn change_prepare(
             Some(hex::encode(read.to_bytes().map_err(|e| refused(e.into()))?))
         }
     };
-    let additions: Vec<String> = asked_about(&held_rows::additions(&conn)?)
+    let kept = held_rows::additions(&conn)?;
+    let additions: Vec<String> = asked_about(&kept)
+        .into_iter()
+        .map(|kept| hex::encode(&kept.record))
+        .collect();
+    let standing: Vec<String> = standing(&held.statement.statement, &kept)
         .into_iter()
         .map(|kept| hex::encode(&kept.record))
         .collect();
@@ -768,6 +779,7 @@ pub async fn change_prepare(
         "apart_entry": apart.map(hex_of),
         "apart_statement": apart_statement,
         "additions": additions,
+        "standing": standing,
         "could_not_fetch": could_not_fetch,
         "names": names,
         "received": received(&state, now()),
@@ -783,6 +795,21 @@ pub async fn change_prepare(
 /// it.
 fn asked_about(kept: &[KeptAddition]) -> Vec<&KeptAddition> {
     kept.iter().filter(|record| record.counted).collect()
+}
+
+/// The records that give a device added since its standing to add, where
+/// the record it counts by does not (decision 2026-10-04 §6, §16): a key
+/// that counts may add where any record kept for it was signed by a
+/// device of the statement. The command checks, of each record it asks
+/// about, that its adder is a device of the statement or was added by
+/// one, and reads that from these and from the records it asks about. It
+/// asks about none of these: each is of a key that counts by another
+/// record.
+fn standing<'a>(statement: &Statement, kept: &'a [KeptAddition]) -> Vec<&'a KeptAddition> {
+    let adds = |key: &[u8; 32]| asked_about(kept).iter().any(|record| record.adder == *key);
+    kept.iter()
+        .filter(|record| !record.counted && statement.lists(&record.adder) && adds(&record.key))
+        .collect()
 }
 
 /// A change entry that the device keeps, checked as it is read.
@@ -914,6 +941,60 @@ mod tests {
         once.dedup();
         assert_eq!(once.len(), asked.len());
         assert!(asked_about(&[]).is_empty());
+    }
+
+    /// A command is handed, beside the records it asks about, each record
+    /// that gives the adder of one of them its standing to add where the
+    /// record that adder counts by does not (decision 2026-10-04 §6, §16):
+    /// a key that counts may add where any record kept for it was signed
+    /// by a device of the statement.
+    #[test]
+    fn test_a_change_hands_the_record_that_gives_an_adder_its_standing() {
+        let mut s = Several::of_one_person(3);
+        let statement = s[0].held().statement.statement;
+        // With every device added by the one that the statement lists,
+        // every adder has its standing by the record it counts by.
+        let kept = held_rows::additions(&s[0].conn).unwrap();
+        assert_eq!(asked_about(&kept).len(), 2);
+        assert!(standing(&statement, &kept).is_empty());
+
+        // Device 1, which device 0 added, adds device 9: it counts, and
+        // may not add. Then device 0 adds it too: it counts already, by
+        // the first record, and by this one it may add. It adds device 10.
+        let now = s.tick();
+        let (nine, ten) = (Machine::new(9), Machine::new(10));
+        let by_one = add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now).unwrap();
+        take(&s[0].conn, &s[0].identity, &by_one.record.unwrap(), now).unwrap();
+        add_device(&s[0].conn, &s[0].identity, &nine.key(), "device 9", now).unwrap();
+        // Device 2, which the statement does not list, adds it as well:
+        // that record gives nobody a standing.
+        let by_two = add_device(&s[2].conn, &s[2].identity, &nine.key(), "device 9", now).unwrap();
+        take(&s[0].conn, &s[0].identity, &by_two.record.unwrap(), now).unwrap();
+        let record = Addition::under(
+            &statement,
+            Device::new(ten.key(), "device 10").unwrap(),
+            nine.key(),
+            now as u64,
+        )
+        .unwrap()
+        .sign(&nine.identity)
+        .unwrap();
+        crate::person::see_addition(&s[0].conn, &record, now).unwrap();
+
+        let kept = held_rows::additions(&s[0].conn).unwrap();
+        let asked: Vec<([u8; 32], [u8; 32])> = asked_about(&kept)
+            .iter()
+            .map(|record| (record.key, record.adder))
+            .collect();
+        assert!(asked.contains(&(nine.key(), s.key(1))), "{asked:?}");
+        assert!(asked.contains(&(ten.key(), nine.key())), "{asked:?}");
+        let gives: Vec<([u8; 32], [u8; 32])> = standing(&statement, &kept)
+            .iter()
+            .map(|record| (record.key, record.adder))
+            .collect();
+        assert_eq!(gives, [(nine.key(), s.key(0))]);
+        let kept_of_nine = kept.iter().filter(|record| record.key == nine.key());
+        assert_eq!(kept_of_nine.count(), 3);
     }
 
     use cordelia_storage::at_relays as kept_rows;

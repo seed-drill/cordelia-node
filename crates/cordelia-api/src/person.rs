@@ -117,6 +117,9 @@ pub enum PersonError {
     #[error("what this device holds of its person changed since the prompt: nothing was made")]
     ChangedSincePrompt,
 
+    #[error("the statement was made on another device than this one: nothing was made")]
+    MadeOnAnotherDevice,
+
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
 
@@ -979,8 +982,9 @@ pub fn first_statement(
 /// and never does that: its key is in neither of the statement's lists,
 /// and is shown as not in the last change (§6, §8).
 ///
-/// Refused besides, with nothing changed: whatever [`apply`] refuses, and
-/// an entry that seals no secret to this device.
+/// Refused besides, with nothing changed: whatever [`apply`] refuses, an
+/// entry that seals no secret to this device, and a statement whose
+/// maker is another key than the one this node runs under (§16).
 pub fn apply_made(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1012,6 +1016,13 @@ pub fn apply_made(
         let DeviceSecret::Opened(secret) = opened.secret else {
             return Err(PersonError::SecretNotCommitted);
         };
+        // A command makes a statement for the key in its device's key
+        // file, which is the key this node runs under (§16): a statement
+        // that says it was made on another device was not made by a
+        // command of this one.
+        if opened.statement.statement.maker != identity.public_key() {
+            return Err(PersonError::MadeOnAnotherDevice);
+        }
         apply(conn, identity, &opened.statement, &secret, entry, now)
     })
 }

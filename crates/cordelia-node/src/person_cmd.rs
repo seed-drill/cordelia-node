@@ -92,6 +92,36 @@ fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
     value[field].as_array().into_iter().flatten()
 }
 
+/// This device's key, read from its key file as `cordelia id` reads it
+/// (decision 2026-10-04 §16). What a command shows as this device, signs
+/// for and prints is this, and never the node's word of it: whatever
+/// answers at the node's address could otherwise name a key of its own.
+fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
+    let mut config = Config::load(&config::expand_tilde(config_path))?;
+    config.apply_env_overrides();
+    let key_path = config.data_dir().join(cordelia_api::commands::KEY_FILE);
+    if !key_path.exists() {
+        anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
+    }
+    Ok(NodeIdentity::from_file(&key_path)?.public_key())
+}
+
+/// Refuse where `answer`, which the node gave, names another key as this
+/// device than `own`, the key in this device's key file (decision
+/// 2026-10-04 §16). An answer that names none is refused likewise.
+fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
+    if decode_public_key(text(answer, "this_device")).ok() == Some(*own) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "what answered at the node's address does not name this device's key, which is the \
+         one in its key file ({}). Nothing was done. A node goes on under the key it was \
+         started with: if this device was given a new key, stop the node and start it again \
+         (`cordelia start`).",
+        fingerprint::shown(own)
+    )
+}
+
 /// A device as it is shown for a decision: its label, and the first four
 /// words of its key's fingerprint (decision 2026-10-04 §6).
 fn named(label: &str, key: &[u8; 32]) -> String {
@@ -184,7 +214,10 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::at()?;
+    // The first statement is made for the key in this device's key file.
+    let this_device = own_key(config_path)?;
     let seen = look(config_path)?;
+    names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
     println!("{WHOSE_WORDS}\n");
     let agreed = match among.as_str() {
@@ -215,7 +248,6 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         println!("{NOT_A_YES}");
         return Ok(());
     }
-    let this_device = decode_public_key(text(&seen, "this_device"))?;
     let label = name.unwrap_or_else(default_label);
     // A label that a statement would refuse is refused before any word
     // is shown.
@@ -288,8 +320,12 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     let device = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
+    // The key that the other device is told to type is the one in this
+    // device's key file.
+    let own = own_key(config_path)?;
     let body = json!({ "device": key, "label": name });
     let would = api_post(config_path, "/api/v1/devices/add/look", body.clone())?;
+    names_this_device(&would, &own)?;
     let agreed = match text(&would, "would") {
         "hand_again" => at.yes(&format!(
             "{} is one of your devices already: this hands it the last change again, and \
@@ -319,8 +355,8 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
         return Ok(());
     }
     let added = api_post(config_path, "/api/v1/devices/add", body)?;
-    let this_device = text(&added, "this_device");
-    let own = decode_public_key(this_device)?;
+    names_this_device(&added, &own)?;
+    let this_device = encode_public_key(&own)?;
     match added["record"] == true {
         true => println!(
             "\nAdded. Every device of yours shows the addition until a person clears it there."
@@ -346,7 +382,9 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
     let typed = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
+    let own = own_key(config_path)?;
     let seen = look(config_path)?;
+    names_this_device(&seen, &own)?;
     let from = named("", &typed);
     let says = match (text(&seen, "state"), text(&seen, "among")) {
         ("no_phrase", _) => {
@@ -433,11 +471,15 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
 /// `clear`, each notice is asked about at the terminal, and what a person
 /// says yes to is shown on this device no more.
 pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
+    let own = own_key(config_path)?;
     if clear {
         let at = Terminal::at()?;
-        return clear_notices(config_path, &at, &look(config_path)?);
+        let seen = look(config_path)?;
+        names_this_device(&seen, &own)?;
+        return clear_notices(config_path, &at, &seen);
     }
     let seen = look(config_path)?;
+    names_this_device(&seen, &own)?;
     for line in devices_lines(&seen) {
         println!("{line}");
     }
@@ -784,6 +826,7 @@ pub fn settle(config_path: &str) -> anyhow::Result<()> {
 /// What the node hands a command that makes a change: read from the
 /// signed bytes of each thing, and checked here.
 struct Handed {
+    /// This device's key, from its key file: never the node's word of it.
     this_device: [u8; 32],
     /// The statement the device has applied, and the change entry of it.
     applied: SignedStatement,
@@ -806,7 +849,16 @@ struct Handed {
 }
 
 impl Handed {
-    fn of(handed: &Value) -> anyhow::Result<Self> {
+    /// Read what the node handed, on a device whose key file holds `own`.
+    ///
+    /// Refused where the node names another key as this device. And a
+    /// record of an addition is one that a person is asked about only
+    /// where it names the statement applied, and its adder is a device of
+    /// that statement or was added by one, by a record that names it too
+    /// (decision 2026-10-04 §6, §16): a node hands no other, and one that
+    /// is handed is refused, with nothing shown.
+    fn of(handed: &Value, own: &[u8; 32]) -> anyhow::Result<Self> {
+        names_this_device(handed, own)?;
         let applied = SignedStatement::from_bytes(&hex::decode(text(handed, "statement"))?)?;
         applied.verify()?;
         let apart = match handed["apart_statement"].as_str() {
@@ -818,11 +870,43 @@ impl Handed {
                 Some((statement, entry, text(handed, "apart").to_string()))
             }
         };
-        let mut added: Vec<SignedAddition> = Vec::new();
-        for kept in list(handed, "additions") {
+        // Each record, read from its signed bytes: its adder signed it,
+        // and it names the statement that the device has applied.
+        let under = applied.statement.link()?;
+        let record_of = |kept: &Value| -> anyhow::Result<SignedAddition> {
             let record =
                 SignedAddition::from_bytes(&hex::decode(kept.as_str().unwrap_or_default())?)?;
             record.verify()?;
+            if record.addition.under != under {
+                anyhow::bail!(
+                    "the node handed a record of an addition that is made under another change \
+                     than the one this device has applied. Nothing was done."
+                );
+            }
+            Ok(record)
+        };
+        let asked_about: Vec<SignedAddition> = list(handed, "additions")
+            .map(record_of)
+            .collect::<anyhow::Result<_>>()?;
+        let standing: Vec<SignedAddition> = list(handed, "standing")
+            .map(record_of)
+            .collect::<anyhow::Result<_>>()?;
+        // The keys that a device of the statement added, by any of them.
+        let added_by_a_listed: Vec<[u8; 32]> = asked_about
+            .iter()
+            .chain(&standing)
+            .filter(|record| applied.statement.lists(&record.addition.adder))
+            .map(|record| record.addition.device.key)
+            .collect();
+        let mut added: Vec<SignedAddition> = Vec::new();
+        for record in asked_about {
+            let adder = record.addition.adder;
+            if !applied.statement.lists(&adder) && !added_by_a_listed.contains(&adder) {
+                anyhow::bail!(
+                    "the node handed a record of an addition whose adder is no device of the \
+                     last change, and was added by none. Nothing was done."
+                );
+            }
             let key = record.addition.device.key;
             let known = applied.statement.lists(&key)
                 || applied.statement.removes(&key)
@@ -848,7 +932,7 @@ impl Handed {
                 .collect()
         });
         Ok(Self {
-            this_device: decode_public_key(text(handed, "this_device"))?,
+            this_device: *own,
             applied,
             held: entry_of(text(handed, "entry"))?,
             over: text(handed, "over").to_string(),
@@ -975,7 +1059,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         for line in list(&handed, "could_not_fetch") {
             println!("  Could not fetch: {}.", line.as_str().unwrap_or_default());
         }
-        let handed = Handed::of(&handed)?;
+        let handed = Handed::of(&handed, &own_key(config_path)?)?;
         let prepared = asked(at, &handed, which)?;
 
         // The lists, from the bytes that the phrase will sign.
@@ -1104,7 +1188,7 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
             }
         }
         if !stay.iter().any(|device| device.key == own) {
-            stay.insert(0, Device::new(own, &handed.label(&own))?);
+            stay.insert(0, own_listing(at, handed)?);
         }
         let (apart, _, _) = handed.apart.as_ref().expect("checked above");
         return Ok(prepare_settlement(
@@ -1151,7 +1235,7 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
     if !applied.lists(&own) {
         // This device was added since: the device that makes a statement
         // is always among its devices, whoever added it.
-        stay.push(Device::new(own, &handed.label(&own))?);
+        stay.push(own_listing(at, handed)?);
     }
     for record in &handed.added {
         let added = &record.addition;
@@ -1178,6 +1262,51 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         }
     }
     Ok(prepare_change(&handed.applied, &own, stay, &removed)?)
+}
+
+/// This device as a change will list it, where the statement applied
+/// does not: it was added since (decision 2026-10-04 §6, §16). It is
+/// shown as an addition is, from the record of its own addition, with who
+/// added it and when, and a person confirms its listing by a typed
+/// answer. The label it is listed under is the one in that record.
+///
+/// Refused where no record of its addition was handed: a device that is
+/// in no list and was added by nobody makes no change.
+fn own_listing(at: &Terminal, handed: &Handed) -> anyhow::Result<Device> {
+    let (says, device) = own_addition(handed)?;
+    let typed = at.answer(&format!(
+        "{says}\n  Type `stays` to list this device, or anything else to stop: "
+    ))?;
+    if typed != "stays" {
+        anyhow::bail!("That was not `stays`. Nothing was done.");
+    }
+    Ok(device)
+}
+
+/// What [`own_listing`] shows of this device, and the device as the
+/// record of its addition has it.
+fn own_addition(handed: &Handed) -> anyhow::Result<(String, Device)> {
+    let own = handed.this_device;
+    let Some(record) = handed
+        .added
+        .iter()
+        .find(|record| record.addition.device.key == own)
+    else {
+        anyhow::bail!(
+            "this device is not in the last change, and no record of its addition counts \
+             here: it makes no change. Add it again from a device that is in the last change."
+        );
+    };
+    let added = &record.addition;
+    let says = format!(
+        "\nThis device is not in the last change: it was added since, as {}, from {} at {}.\n\
+         The device that makes a change is always among its devices: this change lists it \
+         under that label.",
+        named(&added.device.label, &own),
+        named(&handed.label(&added.adder), &added.adder),
+        time_of(added.at)
+    );
+    Ok((says, added.device.clone()))
 }
 
 /// A statement's lists, a line each, read from the statement: each key
@@ -1375,6 +1504,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
     }
     let seen = look(config_path)?;
+    names_this_device(&seen, &NodeIdentity::from_file(&key_path)?.public_key())?;
     let leaves = match (text(&seen, "among"), seen["others"].as_u64().unwrap_or(0)) {
         ("several", others) => format!(
             "It leaves the {others} device{} it is with, and says so to {} first. It still \
@@ -1528,11 +1658,23 @@ mod tests {
 
         /// The record in which this device adds `key` under `label`.
         fn adds(&self, key: [u8; 32], label: &str) -> SignedAddition {
+            self.added_by(&self.own, key, label)
+        }
+
+        /// The record in which the device `adder` adds `key` under
+        /// `label`, under the statement that this device has applied.
+        fn added_by(&self, adder: &NodeIdentity, key: [u8; 32], label: &str) -> SignedAddition {
             let device = Device::new(key, label).unwrap();
-            Addition::under(&self.statement.statement, device, self.own.public_key(), 7)
+            Addition::under(&self.statement.statement, device, adder.public_key(), 7)
                 .unwrap()
-                .sign(&self.own)
+                .sign(adder)
                 .unwrap()
+        }
+
+        /// What a node hands, read on this device: its key is the one in
+        /// its key file.
+        fn read(&self, handed: &Value) -> anyhow::Result<Handed> {
+            Handed::of(handed, &self.own.public_key())
         }
 
         fn handed(&self, statement: &SignedStatement, additions: &[SignedAddition]) -> Value {
@@ -1567,7 +1709,7 @@ mod tests {
             tablet.clone(),
             f.adds(key(5), "the desktop again"),
         ];
-        let handed = Handed::of(&f.handed(&f.statement, &records)).unwrap();
+        let handed = f.read(&f.handed(&f.statement, &records)).unwrap();
         assert_eq!(handed.this_device, f.own.public_key());
         assert_eq!(handed.applied, f.statement);
         assert_eq!(handed.held, f.entry);
@@ -1582,26 +1724,142 @@ mod tests {
         // A statement that its phrase did not sign.
         let mut forged = f.statement.clone();
         forged.signature[0] ^= 1;
-        assert!(Handed::of(&f.handed(&forged, &[])).is_err());
+        assert!(f.read(&f.handed(&forged, &[])).is_err());
         // A record that its adder did not sign.
         let mut forged = desktop.clone();
         forged.signature[0] ^= 1;
-        assert!(Handed::of(&f.handed(&f.statement, &[forged])).is_err());
+        assert!(f.read(&f.handed(&f.statement, &[forged])).is_err());
         // The statement made apart, where there is one, likewise.
         let mut with_apart = f.handed(&f.statement, &[]);
         with_apart["apart_statement"] = with_apart["statement"].clone();
         with_apart["apart_entry"] = with_apart["entry"].clone();
         with_apart["apart"] = with_apart["over"].clone();
-        let handed = Handed::of(&with_apart).unwrap();
+        let handed = f.read(&with_apart).unwrap();
         assert_eq!(handed.apart.unwrap().0, f.statement);
         let mut forged = f.statement.clone();
         forged.signature[0] ^= 1;
         with_apart["apart_statement"] = hex::encode(forged.to_bytes().unwrap()).into();
-        assert!(Handed::of(&with_apart).is_err());
+        assert!(f.read(&with_apart).is_err());
         // And what is no entry at all.
         let mut no_entry = f.handed(&f.statement, &[]);
         no_entry["entry"] = "00".into();
-        assert!(Handed::of(&no_entry).is_err());
+        assert!(f.read(&no_entry).is_err());
+    }
+
+    /// What a command shows as this device is its own reading of the key
+    /// file (decision 2026-10-04 §16): where the node names another key
+    /// as this device, or none, nothing that it handed is read, whatever
+    /// record it hands for that key.
+    #[test]
+    fn a_node_that_names_another_key_as_this_device_is_refused() {
+        let f = Fixture::new();
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let own = f.own.public_key();
+        // Another key as this device, with a record that adds it.
+        let mut handed = f.handed(&f.statement, &[f.adds(key(5), "laptop")]);
+        handed["this_device"] = encode_public_key(&key(5)).unwrap().into();
+        let refused = Handed::of(&handed, &own).err().unwrap().to_string();
+        assert!(
+            refused.contains("does not name this device's key"),
+            "{refused}"
+        );
+        assert!(refused.contains(&fingerprint::shown(&own)), "{refused}");
+        // The control: the device whose key that is reads the same answer.
+        assert!(Handed::of(&handed, &key(5)).is_ok());
+        // An answer that names no key at all.
+        handed["this_device"] = Value::Null;
+        assert!(Handed::of(&handed, &own).is_err());
+        assert!(names_this_device(&json!({}), &own).is_err());
+        let named = json!({ "this_device": encode_public_key(&own).unwrap() });
+        assert!(names_this_device(&named, &own).is_ok());
+        assert!(names_this_device(&named, &key(5)).is_err());
+    }
+
+    /// A record of an addition is asked about only where it names the
+    /// statement that the device has applied, and its adder is a device
+    /// of that statement or was added by one (decision 2026-10-04 §6,
+    /// §16). A record that is handed and is neither is refused, with
+    /// nothing shown.
+    #[test]
+    fn a_record_is_asked_about_only_under_the_applied_statement_and_from_one_that_may_add() {
+        let f = Fixture::new();
+        let id = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap();
+        let key = |n: u8| id(n).public_key();
+        // A chain of two: this device adds one, and that one adds another.
+        let five = f.adds(key(5), "desktop");
+        let six = f.added_by(&id(5), key(6), "tablet");
+        let handed = f
+            .read(&f.handed(&f.statement, &[five.clone(), six.clone()]))
+            .unwrap();
+        assert_eq!(handed.added, [five.clone(), six.clone()]);
+        // In whichever order the node hands them.
+        let handed = f
+            .read(&f.handed(&f.statement, &[six.clone(), five.clone()]))
+            .unwrap();
+        assert_eq!(handed.added, [six.clone(), five.clone()]);
+
+        // An adder that no device of the statement added.
+        assert!(
+            f.read(&f.handed(&f.statement, std::slice::from_ref(&six)))
+                .is_err()
+        );
+        // A chain of three.
+        let seven = f.added_by(&id(6), key(7), "phone two");
+        let chain = [five.clone(), six.clone(), seven];
+        assert!(f.read(&f.handed(&f.statement, &chain)).is_err());
+        // The adder's standing may come by a record that nothing is asked
+        // about: it counts by another.
+        let mut with_standing = f.handed(&f.statement, std::slice::from_ref(&six));
+        with_standing["standing"] = json!([hex::encode(five.to_bytes().unwrap())]);
+        assert_eq!(
+            f.read(&with_standing).unwrap().added,
+            std::slice::from_ref(&six)
+        );
+        // Such a record is checked as any other is.
+        let mut forged = five.clone();
+        forged.signature[0] ^= 1;
+        with_standing["standing"] = json!([hex::encode(forged.to_bytes().unwrap())]);
+        assert!(f.read(&with_standing).is_err());
+
+        // A record made under another statement than the one applied.
+        let mut under_another = five.addition.clone();
+        under_another.under.number += 1;
+        let under_another = under_another.sign(&f.own).unwrap();
+        let refused = f
+            .read(&f.handed(&f.statement, &[under_another]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refused.contains("under another change"), "{refused}");
+    }
+
+    /// A device that the applied statement does not list was added since.
+    /// Before a change lists it, it is shown as an addition is, from the
+    /// record of its own addition: who added it, when, and the words of
+    /// its key (decision 2026-10-04 §16). With no such record it makes no
+    /// change.
+    #[test]
+    fn a_device_added_since_is_shown_its_own_addition_before_a_change_lists_it() {
+        let f = Fixture::new();
+        let five = NodeIdentity::from_seed([5; 32]).unwrap().public_key();
+        let mut handed = f.handed(&f.statement, &[f.adds(five, "desktop")]);
+        handed["this_device"] = encode_public_key(&five).unwrap().into();
+        let read = Handed::of(&handed, &five).unwrap();
+        let (says, device) = own_addition(&read).unwrap();
+        assert_eq!(device, Device::new(five, "desktop").unwrap());
+        let shown = format!(
+            "it was added since, as {}, from {} at {}.",
+            named("desktop", &five),
+            named("laptop", &f.own.public_key()),
+            time_of(7)
+        );
+        assert!(says.contains(&shown), "{says}");
+
+        let mut handed = f.handed(&f.statement, &[]);
+        handed["this_device"] = encode_public_key(&five).unwrap().into();
+        let read = Handed::of(&handed, &five).unwrap();
+        let refused = own_addition(&read).err().unwrap().to_string();
+        assert!(refused.contains("it makes no change"), "{refused}");
     }
 
     /// A statement's lists are shown from the statement: each device by
@@ -1612,7 +1870,9 @@ mod tests {
     fn the_lists_that_are_shown_are_read_from_the_statement() {
         let f = Fixture::new();
         let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
-        let handed = Handed::of(&f.handed(&f.statement, &[f.adds(key(5), "desktop")])).unwrap();
+        let handed = f
+            .read(&f.handed(&f.statement, &[f.adds(key(5), "desktop")]))
+            .unwrap();
         let own = f.own.public_key();
         // The next statement: the desktop stays, and a key is removed.
         let mut stay = f.statement.statement.devices.clone();
@@ -1690,7 +1950,7 @@ mod tests {
             { "name": "nobodys", "by": [] },
         ]);
         handed["received"] = json!({ key(&f.listed): { "day": 1, "week": 12 } });
-        let read = Handed::of(&handed).unwrap();
+        let read = f.read(&handed).unwrap();
 
         // The names that stay behind where the other device is removed.
         let goes = f.listed;
@@ -1713,7 +1973,7 @@ mod tests {
         );
         // With local history off, it cannot be said, and that is said.
         handed["received"] = Value::Null;
-        let read = Handed::of(&handed).unwrap();
+        let read = f.read(&handed).unwrap();
         assert!(
             read.received_from(&goes)
                 .starts_with("Local history is off")

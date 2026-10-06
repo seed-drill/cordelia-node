@@ -542,6 +542,38 @@ mod tests {
         ));
     }
 
+    /// The node's half is for a change that a command of this device
+    /// made (decision 2026-10-04 §16): a statement whose maker is another
+    /// key than the one the node runs under is refused, with nothing
+    /// changed, though the device would apply it were it shown it.
+    #[test]
+    fn test_a_change_made_on_another_device_is_not_made_through_this_ones_node() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let (applied, held) = (s[0].held().statement, s[0].latest());
+        let over = held.id();
+        // The statement says that it was made on device 1.
+        let entry = prepare_change(&applied, &s.key(1), s.listed(&[0, 1]), &[s.key(2)])
+            .unwrap()
+            .sign(&s.phrase, &held, None)
+            .unwrap();
+        let now = s.tick();
+        let on = &s[0];
+        let before = on.everything();
+        assert!(matches!(
+            apply_made(&on.conn, &on.identity, &entry, &over, None, now),
+            Err(PersonError::MadeOnAnotherDevice)
+        ));
+        assert_eq!(on.everything(), before);
+        assert_eq!(on.number(), 2);
+        // The control: through the node of the device that it says it
+        // was made on, it is made.
+        let on = &s[1];
+        let made = apply_made(&on.conn, &on.identity, &entry, &over, None, now).unwrap();
+        assert_eq!(made.number, 3);
+    }
+
     /// The node's half: a change that a command made is applied only
     /// over what the prompt showed. A statement that arrived between the
     /// prompt and the phrase, one that the device applied or one that
