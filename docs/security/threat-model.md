@@ -48,7 +48,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/src/verify.rs`: `a_revision_over_the_limit_does_not_verify`
 - `crates/cordelia-api/tests/entries.rs`: `a_strangers_revision_does_not_stop_a_member_writing`
 - `crates/cordelia-node/src/p2p.rs`: `a_device_stores_only_what_members_of_its_channels_wrote`
-- `crates/cordelia-api/tests/membership.rs`: `a_channel_is_listed_again_when_its_members_change`
+- `crates/cordelia-api/src/take.rs`: `test_an_entry_of_a_name_held_is_stored_only_if_its_signer_counts`
 
 ### T3
 - `crates/cordelia-node/tests/threat_model.rs`: `t03_a_relay_refuses_an_entry_over_the_size_limit`
@@ -94,41 +94,41 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/src/p2p.rs`: `a_device_stores_only_what_members_of_its_channels_wrote`
 
 ### T10
-- `crates/cordelia-api/tests/membership.rs`: `t10_a_channels_keys_are_sealed_only_to_your_own_devices`
-- `crates/cordelia-api/tests/membership.rs`: `t10_a_state_that_names_a_strangers_key_is_held_until_it_is_a_device`
 - `crates/cordelia-api/tests/api_integration.rs`: `test_group_lifecycle`
+- `crates/cordelia-api/src/person.rs`: `test_a_statement_is_applied_only_on_a_device_it_lists_with_its_secret`
+- `crates/cordelia-api/src/take.rs`: `test_an_entry_of_a_name_held_is_stored_only_if_its_signer_counts`
+- `crates/cordelia-api/src/person.rs`: `test_a_record_that_does_not_verify_or_whose_signer_does_not_count_is_not_kept`
 
 ### T13
-- `crates/cordelia-api/tests/membership.rs`: `stranger_cannot_join_or_change_channels`
-- `crates/cordelia-api/tests/membership.rs`: `tampered_or_misaddressed_invites_are_invalid`
-- `crates/cordelia-api/tests/membership.rs`: `t13_a_device_that_is_syncing_keeps_its_personal_channel`
-- `crates/cordelia-api/tests/membership.rs`: `t13_a_device_with_other_devices_keeps_its_personal_channel`
-- `crates/cordelia-api/tests/membership.rs`: `t13_trust_in_a_person_does_not_make_a_key_a_device`
-- `crates/cordelia-api/tests/membership.rs`: `t13_turning_sync_on_after_accepting_does_not_stop_the_join`
-- `crates/cordelia-api/tests/membership.rs`: `t13_an_offer_long_after_the_accept_waits`
-- `crates/cordelia-api/tests/membership.rs`: `t13_invitations_from_strangers_do_not_push_out_what_your_own_devices_sent`
+- `crates/cordelia-api/src/adding.rs`: `test_a_hand_over_is_taken_only_from_the_key_typed_within_the_last_hour`
+- `crates/cordelia-api/src/adding.rs`: `test_a_hand_over_made_long_before_the_key_was_typed_is_refused_in_each_row`
+- `crates/cordelia-api/src/adding.rs`: `test_a_refused_hand_over_spends_no_key_and_an_old_typing_reads_nothing`
+- `crates/cordelia-api/src/adding.rs`: `test_one_of_several_takes_only_a_change_it_can_apply_under_its_phrase`
+- `crates/cordelia-api/src/adding.rs`: `test_a_device_alone_under_a_phrase_leaves_it_only_with_sync_off`
+- `crates/cordelia-api/src/take.rs`: `test_a_device_that_follows_no_phrase_takes_nothing`
+- `crates/cordelia-api/src/person.rs`: `test_a_device_that_follows_no_phrase_takes_no_change_entry`
+- `crates/cordelia-node/tests/person_e2e.rs`: `a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleared`
 
 ### T16
-- `crates/cordelia-api/tests/membership.rs`: `remove_device_rotates_the_key_and_informs_only_remaining_members`
 - `crates/cordelia-api/tests/entries.rs`: `a_removed_device_can_no_longer_write`
 - `crates/cordelia-node/tests/threat_model.rs`: `t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not`
-- `crates/cordelia-api/tests/entries.rs`: `t16_what_a_removed_device_last_wrote_is_kept`
 - `crates/cordelia-api/tests/entries.rs`: `t16_a_removed_device_cannot_put_a_name_out_of_reach`
 - `crates/cordelia-api/tests/entries.rs`: `t16_a_revision_meant_to_use_the_numbers_up_is_not_kept`
-- `crates/cordelia-api/tests/entries.rs`: `t16_what_a_removed_device_writes_afterwards_is_not_adopted_later`
 - `crates/cordelia-sync/src/plan.rs`: `a_channel_that_has_gone_back_keeps_this_devices_version`
 - `crates/cordelia-node/tests/threat_model.rs`: `t16_a_relays_refusal_is_not_taken_for_delivery`
 - `crates/cordelia-node/src/p2p.rs`: `a_relays_refusal_is_not_delivery`
 - `crates/cordelia-node/src/p2p.rs`: `an_answer_that_does_not_add_up_delivers_nothing`
 - `crates/cordelia-node/tests/threat_model.rs`: `t16_a_removal_is_offered_again_when_the_relay_loses_it`
-- `crates/cordelia-api/tests/membership.rs`: `t16_a_removal_is_offered_again_until_the_others_hold_it`
-- `crates/cordelia-api/tests/membership.rs`: `a_change_waits_until_each_member_confirms_it`
-- `crates/cordelia-api/tests/membership.rs`: `t16_a_state_cannot_carry_the_key_a_removal_will_make`
-- `crates/cordelia-api/tests/membership.rs`: `t16_a_key_waiting_for_the_next_version_is_not_used_by_a_removal`
 - `crates/cordelia-crypto/src/channel_state.rs`: `a_key_above_the_current_version_is_not_a_valid_state`
 - `crates/cordelia-storage/src/psk.rs`: `a_key_above_the_current_version_is_never_kept`
 - `crates/cordelia-storage/src/psk.rs`: `a_key_that_was_waiting_is_not_kept_when_its_version_is_passed`
 - `crates/cordelia-storage/src/psk.rs`: `a_key_that_was_waiting_does_not_survive_the_older_rotation`
+- `crates/cordelia-api/src/several.rs`: `test_a_device_is_removed_and_the_others_apply_carry_and_take_nothing_it_signs`
+- `crates/cordelia-api/src/several.rs`: `test_an_edit_of_what_a_removed_device_wrote_late_is_known_to_follow_no_other_text`
+- `crates/cordelia-api/src/person.rs`: `test_a_version_another_key_signed_is_carried_with_that_key_in_a_first_link`
+- `crates/cordelia-api/src/change.rs`: `test_a_change_brings_no_removed_key_back`
+- `crates/cordelia-node/tests/person_e2e.rs`: `a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply`
+- `crates/cordelia-node/tests/memory_e2e.rs`: `a_removed_devices_later_edit_reaches_nobody_and_the_others_go_on_syncing`
 
 ### T18
 - `crates/cordelia-network/src/item_sync.rs`: `test_verify_item_signature`
@@ -145,31 +145,17 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/threat_model.rs`: `t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one`
 
 ### T20
-- `crates/cordelia-api/tests/membership.rs`: `t10_a_state_that_names_a_strangers_key_is_held_until_it_is_a_device`
-- `crates/cordelia-api/tests/membership.rs`: `t20_no_state_can_put_a_channels_members_beyond_change`
 - `crates/cordelia-crypto/src/channel_state.rs`: `an_epoch_over_the_limit_is_not_a_valid_state`
 - `crates/cordelia-storage/src/channels.rs`: `an_epoch_over_the_limit_is_neither_stored_nor_read`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_full_key_ring_does_not_stop_a_removal`
-- `crates/cordelia-api/tests/membership.rs`: `t20_no_state_can_run_the_key_version_out`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_is_not_usable_is_never_a_device`
 - `crates/cordelia-crypto/src/identity.rs`: `a_key_that_is_not_a_point_or_is_of_small_order_is_no_key`
 - `crates/cordelia-crypto/src/ecies.rs`: `a_secret_anyone_can_work_out_seals_and_opens_nothing`
 - `crates/cordelia-crypto/src/channel_state.rs`: `a_state_is_sealed_to_no_key_that_is_not_usable`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_was_stored_before_blocks_nothing`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_was_stored_before_is_taken_off_and_no_key_is_changed`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_state_that_is_held_has_its_keys_checked_once`
-- `crates/cordelia-api/tests/membership.rs`: `t20_past_what_is_remembered_a_state_costs_a_check_a_key_and_ends_the_same`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_state_is_taken_however_many_keys_of_nobodys_it_lists`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_state_held_for_a_device_not_yet_known_is_taken_when_it_is`
-- `crates/cordelia-api/tests/membership.rs`: `t20_what_was_written_under_a_key_anyone_can_sign_with_stops_counting`
-- `crates/cordelia-api/src/state.rs`: `test_what_is_remembered_of_a_key_is_what_the_check_gives`
-- `crates/cordelia-api/src/state.rs`: `test_each_node_remembers_for_itself`
-- `crates/cordelia-api/src/state.rs`: `test_what_is_remembered_is_bounded_and_dropping_it_changes_no_answer`
-- `crates/cordelia-api/tests/membership.rs`: `t20_nothing_is_taken_from_a_sender_whose_key_is_not_usable`
-- `crates/cordelia-api/tests/membership.rs`: `t20_a_key_that_is_not_usable_is_left_out_of_every_state_that_is_applied`
-- `crates/cordelia-api/tests/membership.rs`: `t20_what_a_stranger_sends_is_not_checked_key_by_key`
 - `crates/cordelia-api/tests/api_integration.rs`: `test_the_older_endpoints_seal_to_no_key_that_is_not_usable`
-- `crates/cordelia-node/tests/threat_model.rs`: `t20_a_key_that_is_no_devices_goes_when_the_node_starts`
+- `crates/cordelia-node/tests/threat_model.rs`: `t20_a_key_that_is_no_devices_is_not_added_accepted_or_removed`
+- `crates/cordelia-crypto/src/entry.rs`: `an_entry_under_a_key_that_anyone_can_sign_for_is_refused`
+- `crates/cordelia-api/src/adding.rs`: `test_adding_is_refused_on_a_device_or_for_a_key_that_may_not`
+- `crates/cordelia-api/src/person.rs`: `test_a_removed_key_added_again_by_a_record_does_not_count`
+- `crates/cordelia-api/src/person.rs`: `test_the_sixty_fifth_device_is_kept_as_not_counted`
 
 ### T21
 - `crates/cordelia-sync/src/claude.rs`: `what_another_devices_change_replaces_here_is_kept_in_history`
