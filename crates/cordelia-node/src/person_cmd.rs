@@ -3,6 +3,12 @@
 //! `accept`, `devices`, `remove-device`, `renew`, `settle` and `init
 //! --new-key`.
 //!
+//! **Each of these commands refuses a node of another version than its
+//! own** (§16; §10.1, rule 6), with the note that says how to restart
+//! it: a route of the same name may mean another thing there. `cordelia
+//! devices`, which only shows, is answered beside such a node, with the
+//! note.
+//!
 //! **Every yes is asked here, at a terminal** ([`crate::terminal`]), and
 //! each command that asks refuses, before anything else, where its input
 //! is not one. What a command then asks of the node is a call that any
@@ -49,7 +55,7 @@ use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
 use crate::terminal::Terminal;
-use crate::{Told, api_post, api_post_told};
+use crate::{Told, api_post, api_post_told, note_another_version, refuse_another_version};
 
 /// Whose words a recovery phrase is, and what it is for: said wherever
 /// one is made (decision 2026-10-04 §5).
@@ -84,8 +90,20 @@ const ASKS_AGAIN: usize = 10;
 
 /// Everything the node says of this device and its person
 /// (`cordelia_api::look::Look`, with what waits to be sent).
+///
+/// Refused where what answered says nothing of where the device stands
+/// (it has no `state`): that is no look of a node of this version, and
+/// nothing is read from it (decision 2026-10-04 §16).
 fn look(config_path: &str) -> anyhow::Result<Value> {
-    api_post(config_path, "/api/v1/devices/list", json!({}))
+    let seen = api_post(config_path, "/api/v1/devices/list", json!({}))?;
+    if seen["state"].as_str().is_none() {
+        anyhow::bail!(
+            "what answered at the node's address says nothing of where this device stands: it \
+             is no node of this command's version. Nothing was done. Stop the node and start \
+             it again (`cordelia start`)."
+        );
+    }
+    Ok(seen)
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -253,6 +271,7 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
+    refuse_another_version(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
     let seen = look(config_path)?;
@@ -374,6 +393,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 /// add: a device that is in vouches for the new one.
 pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
     let device = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
@@ -444,6 +464,7 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
 /// device is in, and its yes says which.
 pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
     let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
     let typed = decode_public_key(key).map_err(|e| {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
@@ -550,10 +571,15 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
     let own = own_key(config_path)?;
     if clear {
         let at = Terminal::at()?;
+        // Clearing is an act: it is not sent to a node of another
+        // version. Without one, `devices` only shows, and is answered
+        // beside such a node, with the note (§10.1, rule 6).
+        refuse_another_version(config_path)?;
         let seen = look(config_path)?;
         names_this_device(&seen, &own)?;
         return clear_notices(config_path, &at, &seen);
     }
+    note_another_version(config_path);
     let seen = look(config_path)?;
     names_this_device(&seen, &own)?;
     for line in devices_lines(&seen) {
@@ -896,6 +922,7 @@ fn made_at_a_terminal(
     which: impl FnOnce() -> anyhow::Result<Which>,
 ) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
+    refuse_another_version(config_path)?;
     change(config_path, &at, &which()?)
 }
 
@@ -1733,6 +1760,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
 /// phrase.
 pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     // The configuration as its file has it, to write back with the new

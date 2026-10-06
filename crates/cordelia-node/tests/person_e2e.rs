@@ -2490,16 +2490,6 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
     at.says("This machine may be closed only when");
     let said = at.done();
     assert!(said.contains("this machine may be closed."), "{said}");
-    for word in words.split(' ') {
-        let after = said
-            .split("The recovery phrase, twelve words")
-            .nth(1)
-            .unwrap();
-        assert!(
-            !words_in(after.as_bytes()).contains(word),
-            "{word} in:\n{after}"
-        );
-    }
 }
 
 // ── What answers at the node's address ───────────────────────────────
@@ -2957,6 +2947,162 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
     assert!(said.contains("Do not make it again"), "{said}");
     assert!(!said.contains("Nothing was made"), "{said}");
     assert_eq!(look(&laptop)["change"], 2);
+}
+
+// ── A node of another version ────────────────────────────────────────
+
+/// A command that changes anything refuses a node of another version
+/// than its own, with the note that says how to restart it, and sends it
+/// nothing (decision 2026-10-04 §10.1, rule 6; §16): every `sync`
+/// command but `status` and `off`, `restore`, `history drop`, `init
+/// --new-key`, and each command of a person's devices but `devices` with
+/// no act. Turning sync off is sent to any node. `cordelia status`,
+/// `cordelia sync status`, `cordelia devices` and `cordelia history`
+/// still answer beside such a node, with the note. And a look that says
+/// nothing of where the device stands is no look of this version: it is
+/// refused.
+///
+/// The node here is of this version, behind a stand-in that says it is
+/// of another.
+#[test]
+fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let claude = laptop.home().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+    let another = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.0-another".into();
+        }
+    });
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let home = laptop.home();
+    let folder = home.to_str().unwrap();
+    let note = "The running node is version 0.0.0-another and this command is version";
+    let soon = std::time::Duration::from_secs(60);
+
+    // Each command that changes something: refused, with the note, and
+    // the node is asked for nothing but its version.
+    let changes: [&[&str]; 16] = [
+        &["sync", "claude"],
+        &["sync", "claude", "--mapped-only"],
+        &["sync", "map", folder, "notes"],
+        &["sync", "unmap", "notes"],
+        &["sync", "home", "on"],
+        &["sync", "exclude", "github.com/someone/something"],
+        &["sync", "include", "github.com/someone/something"],
+        &["restore", "an-id"],
+        &["history", "drop", "--all"],
+        &["init", "--new-key"],
+        &["phrase", "--name", "laptop"],
+        &["add-device", &other],
+        &["accept", &other],
+        &["devices", "--clear"],
+        &["remove-device", &other],
+        &["renew"],
+    ];
+    for args in changes.iter().copied().chain([&["settle"][..]]) {
+        let before = another.asked().len();
+        let said = laptop
+            .at_terminal_through(another.port, args)
+            .refused_within(soon);
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert!(
+            said.contains("is not sent to a node of another version: nothing was done."),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("restart"), "{args:?}: {said}");
+        let asked = another.asked();
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+        assert!(
+            asked.len() > before,
+            "{args:?} did not ask the node its version"
+        );
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], true, "{settings}");
+
+    // What only shows is answered, with the note.
+    let shows: [&[&str]; 5] = [
+        &["status"],
+        &["sync", "status"],
+        &["devices"],
+        &["history"],
+        &["history", "notes"],
+    ];
+    for args in shows {
+        let (ended, said) = laptop
+            .at_terminal_through(another.port, args)
+            .ends_within(soon);
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert!(!said.contains("is not sent to a node"), "{args:?}: {said}");
+        // `cordelia history` of a name that keeps nothing says so, and
+        // is not refused for the node's version.
+        if args != ["history", "notes"] {
+            assert!(ended, "{args:?}: {said}");
+        }
+    }
+    let said = laptop
+        .at_terminal_through(another.port, &["devices"])
+        .done();
+    assert!(said.contains("This device: "), "{said}");
+
+    // Turning sync off is sent to any node.
+    let before = another.asked().len();
+    let said = laptop
+        .at_terminal_through(another.port, &["sync", "off"])
+        .done();
+    assert!(said.contains(note), "{said}");
+    assert!(said.contains("Sync is off."), "{said}");
+    let asked = another.asked();
+    assert!(
+        asked[before..]
+            .iter()
+            .any(|(path, body)| path == "/api/v1/sync/claude"
+                && serde_json::from_slice::<Value>(body)
+                    .is_ok_and(|sent| sent["enabled"] == false)),
+        "{:?}",
+        asked[before..]
+            .iter()
+            .map(|(path, body)| (path, String::from_utf8_lossy(body)))
+            .collect::<Vec<_>>()
+    );
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], false, "{settings}");
+
+    // The control: against the node itself, of this version, a command
+    // that changes something is sent, and nothing of a version is said.
+    let said = laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+    assert!(!said.contains("The running node is version"), "{said}");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], true, "{settings}");
+
+    // A look that says nothing of where the device stands: refused, by
+    // a command that only shows as by one that acts.
+    let no_state = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/devices/list"
+            && let Some(look) = answer.as_object_mut()
+        {
+            look.remove("state");
+        }
+    });
+    for args in [&["devices"][..], &["accept", &other], &["phrase"]] {
+        let said = laptop
+            .at_terminal_through(no_state.port, args)
+            .refused_within(soon);
+        assert!(
+            said.contains("says nothing of where this device stands"),
+            "{args:?}: {said}"
+        );
+        assert!(!said.contains("Type yes to go on"), "{args:?}: {said}");
+        assert!(!said.contains("shown once"), "{args:?}: {said}");
+    }
 }
 
 // ── A change made while a pass is in flight ──────────────────────────

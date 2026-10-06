@@ -2384,6 +2384,46 @@ fn node_version_note(config_path: &str) -> Option<String> {
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
+/// What a command that changes anything says of a node of another
+/// version, after the note that says how to restart it.
+const NOT_SENT_TO_ANOTHER_VERSION: &str = "This command changes something, and is not sent to a \
+                                           node of another version: nothing was done.";
+
+/// Refuse a running node of another version than this command (decision
+/// 2026-10-04 §10.1, rule 6; §16). A command that changes anything is
+/// sent only to a node of its own version: a route of the same name may
+/// mean another thing in another. The refusal is the note that says how
+/// to restart the node.
+///
+/// The commands that change something are every `sync` command but
+/// `status` and `off`, `restore`, `history drop`, `init --new-key`, and
+/// each command of a person's devices but `devices` with no act. Turning
+/// sync off is sent to any node, and what only shows is answered beside
+/// one, with the note ([`note_another_version`]).
+///
+/// A node that does not answer is not refused here: the command's own
+/// request then says that it is not reached.
+pub(crate) fn refuse_another_version(config_path: &str) -> anyhow::Result<()> {
+    match node_version_note(config_path) {
+        None => Ok(()),
+        Some(note) => {
+            VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("{note}\n{NOT_SENT_TO_ANOTHER_VERSION}")
+        }
+    }
+}
+
+/// Say, where the running node is another version than this command, that
+/// it is, and how to restart it: for a command that only shows, or that
+/// turns sync off, which is answered beside such a node all the same
+/// (decision 2026-10-04 §10.1, rule 6).
+pub(crate) fn note_another_version(config_path: &str) {
+    if let Some(note) = node_version_note(config_path) {
+        eprintln!("{note}\n");
+        VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The command that restarts a node which runs as the service that the
 /// install script sets up, on the system named (`std::env::consts::OS`).
 /// The script prints the same one.
@@ -2447,12 +2487,14 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::discover::{self, Project};
 
     // A node goes on running the version it was started as until it is
-    // restarted. Said first, and whether or not the command then works: a
-    // node of another version may take a request and mean something else
-    // by it.
-    if let Some(note) = node_version_note(config_path) {
-        eprintln!("{note}\n");
-        VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // restarted, and a node of another version may take a request and
+    // mean something else by it. So a command that changes anything is
+    // not sent to one (decision 2026-10-04 §10.1, rule 6). Turning sync
+    // off is sent to any node, and what only shows is answered beside
+    // one: each with the note, said first.
+    match &what {
+        SyncCommand::Off | SyncCommand::Status => note_another_version(config_path),
+        _ => refuse_another_version(config_path)?,
     }
     let set = |body: serde_json::Value| api_post(config_path, "/api/v1/sync/claude", body);
     // The settings generation a change left behind: the scope printed at

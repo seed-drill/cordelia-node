@@ -18,6 +18,9 @@ pub fn list(
     removed: bool,
     since: Option<&str>,
 ) -> anyhow::Result<()> {
+    // What only shows is answered beside a node of another version, with
+    // the note (decision 2026-10-04 §10.1, rule 6).
+    crate::note_another_version(config_path);
     if of.is_none() && (removed || since.is_some()) {
         anyhow::bail!("say whose history: cordelia history <name|folder> --removed");
     }
@@ -34,6 +37,7 @@ pub fn list(
 
 /// `cordelia history show <id>`.
 pub fn show(config_path: &str, id: &str) -> anyhow::Result<()> {
+    crate::note_another_version(config_path);
     let answer = api_post(config_path, "/api/v1/history/show", json!({ "id": id }))?;
     print!("{}", shown(&answer, &marker(), to_a_terminal()));
     Ok(())
@@ -58,6 +62,8 @@ pub fn restore(config_path: &str, ids: &[String]) -> anyhow::Result<()> {
     // Waited for however long it takes: the node finishes what it has
     // begun, and this says what became of each id.
     let body = json!({ "ids": ids });
+    // It changes files: it is not sent to a node of another version.
+    crate::refuse_another_version(config_path)?;
     let answer = api_post_within(config_path, "/api/v1/history/restore", body, None)?;
     let (text, failed) = restored(&answer, &marker(), to_a_terminal());
     print!("{text}");
@@ -79,6 +85,9 @@ pub fn drop(
     }
     let body = json!({ "of": of, "folder": of.and_then(folder_named), "file": file,
         "all": all });
+    // It removes what is kept: it is not sent to a node of another
+    // version.
+    crate::refuse_another_version(config_path)?;
     let answer = api_post_within(config_path, "/api/v1/history/drop", body, None)?;
     print!("{}", dropped(&answer, all));
     match answer["left"].as_u64().unwrap_or(0) {
