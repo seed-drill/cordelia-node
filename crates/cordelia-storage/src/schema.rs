@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Migration v1: Phase 1 initial schema.
 ///
@@ -628,6 +628,40 @@ CREATE TABLE person_names_before (
 );
 "#;
 
+/// Migration v18: what a device keeps of a person's acts across a
+/// statement, and of the row a typed key was typed in (decision
+/// 2026-10-04 §5.1, §7.1, §8, §16).
+///
+/// - `person_typed_keys.stood`: where the device stood, of the rows of
+///   §5.1, when a person typed the key and said yes: `no_phrase`, `alone`,
+///   `several` or `not_listed`. A hand-over is taken with the key only
+///   while the device stands there. Empty in a row from before, which
+///   reads nothing.
+/// - `person_left_out.cleared_at`: when a person cleared the notice of a
+///   key that is not in the last change. The row stays, so that adding
+///   that key still says what it is; it is shown no more. NULL while it
+///   is shown.
+/// - `person_left`: a device's word that it left, kept when a statement
+///   is applied that still lists its key, where nobody had cleared it:
+///   the key, what the notice is named by, the number of the statement
+///   under which it said so, and when this device noted it. It is shown
+///   until a person clears it here, or a statement lists the key no
+///   more.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V18: &str = r#"
+ALTER TABLE person_typed_keys ADD COLUMN stood TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE person_left_out ADD COLUMN cleared_at INTEGER;
+
+CREATE TABLE person_left (
+    key       BLOB PRIMARY KEY CHECK(length(key) = 32),
+    notice    BLOB NOT NULL CHECK(length(notice) = 32),
+    number    INTEGER NOT NULL CHECK(number >= 1),
+    noted_at  INTEGER NOT NULL
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -777,6 +811,13 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
             "applying migration v17 (the chain of what a folder agreed, and names before)"
         );
         migrate_in_one(conn, MIGRATION_V17, 17)?;
+    }
+
+    if current < 18 {
+        tracing::info!(
+            "applying migration v18 (the row a key was typed in, and a word that outlives a change)"
+        );
+        migrate_in_one(conn, MIGRATION_V18, 18)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1492,6 +1533,7 @@ mod tests {
                AND name NOT LIKE '%person_left_out%'
                AND name NOT LIKE '%person_cleared%'
                AND name NOT LIKE '%person_names_before%'
+               AND name NOT LIKE '%person_left%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1699,6 +1741,7 @@ mod tests {
                    AND name NOT LIKE '%person_left_out%'
                    AND name NOT LIKE '%person_cleared%'
                    AND name NOT LIKE '%person_names_before%'
+                   AND name NOT LIKE '%person_left%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -2221,8 +2264,12 @@ mod tests {
     /// its tables.
     fn held_before_v16(conn: &Connection) -> Vec<String> {
         let mut held = held_before_v15(conn);
+        // Two of the tables have a column more from the step to version
+        // 18: each definition is read without it.
         for rows in [
-            "SELECT name || ': ' || COALESCE(sql, '') FROM sqlite_master
+            "SELECT name || ': ' || replace(replace(COALESCE(sql, ''),
+                        ', stood TEXT NOT NULL DEFAULT ''''', ''), ', cleared_at INTEGER', '')
+                 FROM sqlite_master
                  WHERE name IN ('person_cleared', 'person_left_out', 'person_typed_keys')
                  ORDER BY name",
             "SELECT hex(key) || typed_at FROM person_typed_keys",
@@ -2371,7 +2418,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 17);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v17(&conn), NEW_IN_V17);
         assert_eq!(held_before_v16(&conn), before);
@@ -2426,6 +2472,139 @@ mod tests {
         }
     }
 
+    /// A database as a binary from before the row of a typed key was kept
+    /// leaves it: what [`at_v16`] holds, a name that was listed before,
+    /// and a key that a statement left out.
+    fn at_v17() -> Connection {
+        let conn = at_v16();
+        migrate_in_one(&conn, MIGRATION_V17, 17).unwrap();
+        conn.execute_batch(
+            "INSERT INTO person_names_before (name, said_by, left_at)
+             VALUES ('notes', zeroblob(32), 9);
+             INSERT INTO person_left_out (key, label, number, noted_at)
+             VALUES (zeroblob(32), 'laptop', 2, 9);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// What the step to version 18 adds: two columns, and a table.
+    const NEW_IN_V18: [&str; 3] = [
+        "person_left",
+        "person_left_out.cleared_at",
+        "person_typed_keys.stood",
+    ];
+
+    /// What a database holds of the step to version 18, by name.
+    fn new_in_v18(conn: &Connection) -> Vec<String> {
+        let mut held: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE name = 'person_left'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if conn
+            .prepare("SELECT cleared_at FROM person_left_out")
+            .is_ok()
+        {
+            held.push("person_left_out.cleared_at".into());
+        }
+        if conn.prepare("SELECT stood FROM person_typed_keys").is_ok() {
+            held.push("person_typed_keys.stood".into());
+        }
+        held
+    }
+
+    /// The row that a key was typed in, the time a key that was left out
+    /// was cleared, and the table of the words that outlive a change are
+    /// made in one step with their version: a failure between them leaves
+    /// none, and the step asked for twice is run once. A key that was
+    /// typed before stands in no row, and a key that was left out before
+    /// is still shown.
+    #[test]
+    fn test_v18_adds_the_row_of_a_typed_key_and_the_words_that_outlive_a_change_as_one() {
+        let conn = at_v17();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = held_before_v16(&conn);
+        assert_eq!(version(&conn), 17);
+        assert!(new_in_v18(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V18} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 18).is_err());
+        assert_eq!(version(&conn), 17);
+        assert!(
+            new_in_v18(&conn).is_empty(),
+            "the columns and the table go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 18);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v18(&conn), NEW_IN_V18);
+        // Everything it held is as it was, but for the two columns.
+        assert_eq!(held_before_v16(&conn), before);
+        assert_eq!(new_in_v17(&conn), NEW_IN_V17);
+        let typed: (i64, String) = conn
+            .query_row("SELECT typed_at, stood FROM person_typed_keys", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(typed, (7, String::new()));
+        let left_out: (String, Option<i64>) = conn
+            .query_row("SELECT label, cleared_at FROM person_left_out", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(left_out, ("laptop".to_string(), None));
+
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        conn.execute_batch(
+            "UPDATE person_typed_keys SET stood = 'alone';
+             UPDATE person_left_out SET cleared_at = 11;
+             INSERT INTO person_left (key, notice, number, noted_at)
+             VALUES (zeroblob(32), zeroblob(32), 2, 9);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V18, 18).unwrap();
+        let kept: (String, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT stood FROM person_typed_keys),
+                        (SELECT cleared_at FROM person_left_out),
+                        (SELECT COUNT(*) FROM person_left)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (version(&conn), kept),
+            (SCHEMA_VERSION, ("alone".to_string(), 11, 1))
+        );
+        // A word of a key of another length, a notice that is named by
+        // other than 32 bytes, a statement numbered below 1, a second
+        // word of one key, and a word with no time are refused.
+        for refused in [
+            "INSERT INTO person_left (key, notice, number, noted_at)
+                 VALUES (zeroblob(31), zeroblob(32), 2, 9)",
+            "INSERT INTO person_left (key, notice, number, noted_at)
+                 VALUES (X'01' || zeroblob(31), zeroblob(31), 2, 9)",
+            "INSERT INTO person_left (key, notice, number, noted_at)
+                 VALUES (X'01' || zeroblob(31), zeroblob(32), 0, 9)",
+            "INSERT INTO person_left (key, notice, number, noted_at)
+                 VALUES (zeroblob(32), zeroblob(32), 3, 9)",
+            "INSERT INTO person_left (key, notice, number)
+                 VALUES (X'01' || zeroblob(31), zeroblob(32), 2)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -2446,7 +2625,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 9] = [
+        let from: [(u32, Connection); 10] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -2456,6 +2635,7 @@ mod tests {
             (14, at_v14()),
             (15, at_v15()),
             (16, at_v16()),
+            (17, at_v17()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -2476,6 +2656,7 @@ mod tests {
             assert_eq!(new_in_v15(&conn), NEW_IN_V15, "from version {at}");
             assert_eq!(new_in_v16(&conn), NEW_IN_V16, "from version {at}");
             assert_eq!(new_in_v17(&conn), NEW_IN_V17, "from version {at}");
+            assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }
