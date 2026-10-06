@@ -2433,14 +2433,29 @@ impl Answers {
         node: &Node,
         changed: impl Fn(&str, &mut Value) + Send + Sync + 'static,
     ) -> Self {
+        Self::losing(node, changed, |_| None)
+    }
+
+    /// [`Self::in_the_place_of`], where the answer to some requests is
+    /// lost: `lost` says of a request's path whether its answer is lost
+    /// once the node has done what was asked (`Some(true)`), or the
+    /// request is lost before it reaches the node (`Some(false)`). The
+    /// command is then answered nothing, and its connection is closed.
+    fn losing(
+        node: &Node,
+        changed: impl Fn(&str, &mut Value) + Send + Sync + 'static,
+        lost: impl Fn(&str) -> Option<bool> + Send + Sync + 'static,
+    ) -> Self {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let at = listener.local_addr().unwrap().port();
         let (node_port, token) = (node.http, node.token());
         let changed = std::sync::Arc::new(changed);
+        let lost = std::sync::Arc::new(lost);
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 let (changed, token) = (changed.clone(), token.clone());
+                let lost = lost.clone();
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
@@ -2467,6 +2482,10 @@ impl Answers {
                     if reader.read_exact(&mut body).is_err() {
                         return;
                     }
+                    let loses = lost(&path);
+                    if loses == Some(false) {
+                        return;
+                    }
                     let url = format!("http://127.0.0.1:{node_port}{path}");
                     let agent: ureq::Agent = ureq::Agent::config_builder()
                         .proxy(None)
@@ -2485,6 +2504,9 @@ impl Answers {
                     let Ok(mut answered) = answered else {
                         return;
                     };
+                    if loses == Some(true) {
+                        return;
+                    }
                     let status = answered.status().as_u16();
                     let mut answer: Value = answered.body_mut().read_json().unwrap_or(Value::Null);
                     changed(&path, &mut answer);
@@ -2600,6 +2622,130 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
     let seen = look(&laptop);
     assert_eq!(seen["change"], 1, "{seen}");
     assert_eq!(seen["this_device"], key_of(&laptop), "{seen}");
+}
+
+/// Where a command cannot learn whether the node made what it was
+/// handed, because the answer was lost, it asks the node again before it
+/// says anything (decision 2026-10-04 §16). A phrase whose answer was
+/// lost after the node made it is said to be made; so is a change. Where
+/// the node still does not say that it made a new phrase, the command
+/// says that it is not known, and that the words are to be KEPT until
+/// `cordelia devices` shows which phrase the device follows: it does not
+/// say that nothing was made.
+#[test]
+fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let phrase_words = |node: &Node| text(&look(node), "phrase_words").to_string();
+
+    // The request for a new phrase never reaches the node: the node
+    // does not follow it, and the command cannot know that it never
+    // will.
+    let never = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/phrase/make").then_some(false),
+    );
+    let mut at = laptop.at_terminal_through(never.port, &["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&words);
+    at.says("The node's answer was lost. Asking it again...");
+    let said = at.refused();
+    assert!(
+        said.contains("it is not known whether the node made the new phrase"),
+        "{said}"
+    );
+    assert!(
+        said.contains("KEEP the twelve words until `cordelia devices` shows"),
+        "{said}"
+    );
+    assert!(!said.contains("do not keep them"), "{said}");
+    assert!(!said.contains("Nothing was made"), "{said}");
+    // It names the words that the new phrase's key is told by.
+    let key = cordelia_crypto::phrase::Phrase::parse(&words)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let told_by = cordelia_crypto::fingerprint::shown(&key);
+    assert!(
+        said.contains(&format!("shown there as ({told_by})")),
+        "{said}"
+    );
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // The answer is lost once the node has made the phrase: the command
+    // asks again, and says that it is made.
+    let after = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/phrase/make").then_some(true),
+    );
+    let mut at = laptop.at_terminal_through(after.port, &["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&words);
+    at.says("The node's answer was lost. Asking it again...");
+    let said = at.done();
+    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(!said.contains("it is not known"), "{said}");
+    let key = cordelia_crypto::phrase::Phrase::parse(&words)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    assert_eq!(
+        phrase_words(&laptop),
+        cordelia_crypto::fingerprint::shown(&key)
+    );
+    // `cordelia devices` shows which phrase it is.
+    let listed = laptop.cli(&["devices"]);
+    assert!(
+        listed.contains(&format!(
+            "The recovery phrase it follows: ({}).",
+            phrase_words(&laptop)
+        )),
+        "{listed}"
+    );
+
+    // A change whose answer is lost once the node has made it.
+    let after = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/change/make").then_some(true),
+    );
+    let mut at = laptop.at_terminal_through(after.port, &["renew"]);
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The node's answer was lost. Asking it again...");
+    at.says("The change is made (change 2).");
+    drop(at);
+    assert_eq!(look(&laptop)["change"], 2);
+
+    // And one whose request never reached the node: it is not known,
+    // and it is not to be made again until `cordelia devices` shows.
+    let never = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/change/make").then_some(false),
+    );
+    let mut at = laptop.at_terminal_through(never.port, &["renew"]);
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The node's answer was lost. Asking it again...");
+    let said = at.refused();
+    assert!(
+        said.contains("it is not known whether the node made the change"),
+        "{said}"
+    );
+    assert!(said.contains("Do not make it again"), "{said}");
+    assert!(!said.contains("Nothing was made"), "{said}");
+    assert_eq!(look(&laptop)["change"], 2);
 }
 
 // ── A change made while a pass is in flight ──────────────────────────

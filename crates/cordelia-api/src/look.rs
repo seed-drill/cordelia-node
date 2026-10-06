@@ -245,6 +245,15 @@ pub struct Look {
     pub may_add: bool,
     /// The number of the statement applied.
     pub change: Option<u64>,
+    /// What the change entry of that statement is named by, in hex: the
+    /// latest that the device keeps. A command that made a change, and
+    /// lost the node's answer, learns by it whether the node made it
+    /// (§16).
+    pub latest: Option<String>,
+    /// The first words of the fingerprint of the key of the phrase that
+    /// the device follows: what a person tells one phrase from another
+    /// by.
+    pub phrase_words: Option<String>,
     /// How many more statements the phrase can make, once fewer than 16
     /// are left.
     pub statements_left: Option<u64>,
@@ -314,6 +323,8 @@ pub fn look(
             others: 0,
             may_add: false,
             change: None,
+            latest: None,
+            phrase_words: None,
             statements_left: None,
             devices: Vec::new(),
             added: Vec::new(),
@@ -385,6 +396,8 @@ fn of_its_person(
     };
     look.may_add = held.state == State::Applied && counting.may_add(&own);
     look.change = Some(statement.number);
+    look.latest = Some(hex::encode(latest_entry(conn)?.id()));
+    look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
 
     // A word "left" that was kept across a statement counts as the word
@@ -1185,6 +1198,7 @@ mod tests {
     fn test_a_device_that_follows_no_phrase_says_so() {
         let s = Several::new(1);
         let look = seen(&s, 0);
+        assert_eq!((&look.latest, &look.phrase_words), (&None, &None));
         assert_eq!(look.state, "no_phrase");
         assert_eq!(look.among, "no_phrase");
         assert_eq!(look.short.as_deref(), Some("not added yet"));
@@ -1215,6 +1229,14 @@ mod tests {
         );
         assert_eq!(look.change, Some(2));
         assert_eq!(look.statements_left, None);
+        // What the change entry of that statement is named by, and the
+        // words that the phrase's key is told by.
+        assert_eq!(look.latest, Some(hex::encode(s[0].latest().id())));
+        assert_ne!(look.latest, seen(&s, 1).latest);
+        assert_eq!(
+            look.phrase_words,
+            Some(fingerprint::shown(&s.phrase.public_key().unwrap()))
+        );
         let said: Vec<(String, bool, bool, Option<u64>)> = look
             .devices
             .iter()

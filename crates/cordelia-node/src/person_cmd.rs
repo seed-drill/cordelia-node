@@ -76,6 +76,10 @@ const ACCEPT_STAYS: Duration = Duration::from_secs(60);
 /// How often a mistyped phrase may be typed again at one prompt.
 const PHRASE_TRIES: usize = 3;
 
+/// How often the node is asked again whether it made what a command
+/// handed it, where its answer was lost: once every [`ASK_EVERY`].
+const ASKS_AGAIN: usize = 10;
+
 // ── What the node says ──────────────────────────────────────────────
 
 /// Everything the node says of this device and its person
@@ -86,6 +90,34 @@ fn look(config_path: &str) -> anyhow::Result<Value> {
 
 fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field].as_str().unwrap_or_default()
+}
+
+/// Whether the node made what a command handed it, where the node's
+/// answer was lost (decision 2026-10-04 §16): the node is asked again,
+/// before anything is said. `made` is what the change entry that the
+/// command made is named by, and the node made it where that is the
+/// latest change entry it keeps.
+///
+/// `false` says that this could not be learned, and not that nothing was
+/// made: the node did not answer, or it keeps another entry so far, and
+/// may still be at work on what it was handed.
+fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
+    let made = hex::encode(made);
+    for _ in 0..ASKS_AGAIN {
+        std::thread::sleep(ASK_EVERY);
+        let asked = api_post_told(
+            config_path,
+            "/api/v1/devices/list",
+            json!({}),
+            Some(Duration::from_secs(3)),
+        );
+        if let Ok(Told::Yes(seen)) = asked
+            && seen["latest"] == made.as_str()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
@@ -283,7 +315,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // overwritten, before the node is asked anything.
     drop(phrase);
 
-    let asked = api_post(
+    let asked = api_post_told(
         config_path,
         "/api/v1/phrase/make",
         json!({
@@ -291,12 +323,30 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             "statement_key": hex::encode(made.statement_key),
             "from": among,
         }),
+        Some(Duration::from_secs(30)),
     );
-    if let Err(e) = asked {
-        anyhow::bail!(
-            "{e}\nNothing was made, and the words that were shown are no phrase of anything: \
-             do not keep them."
-        );
+    match asked {
+        Ok(Told::Yes(_)) => {}
+        // The node refused: it said so, and made nothing.
+        Ok(Told::No { message, .. }) => anyhow::bail!(
+            "{message}\nNothing was made, and the words that were shown are no phrase of \
+             anything: do not keep them."
+        ),
+        // The answer was lost, and the node may have made the phrase all
+        // the same: it is asked again before anything is said of it.
+        Err(lost) => {
+            println!("\n{lost}\nThe node's answer was lost. Asking it again...");
+            if !made_all_the_same(config_path, &made.entry.id()) {
+                anyhow::bail!(
+                    "it is not known whether the node made the new phrase: it does not say \
+                     that it follows it so far, and it may still. KEEP the twelve words until \
+                     `cordelia devices` shows which recovery phrase this device follows: the \
+                     new one is shown there as ({}). If it shows another, or none, the words \
+                     are no phrase of anything.",
+                    fingerprint::shown(&made.entry.author)
+                );
+            }
+        }
     }
     println!(
         "\nThis device follows the new recovery phrase, alone. It is listed as {} (change 1).",
@@ -507,6 +557,9 @@ fn devices_lines(seen: &Value) -> Vec<String> {
         return out;
     };
     out.push(format!("The last change it has applied: change {change}."));
+    if let Some(words) = seen["phrase_words"].as_str() {
+        out.push(format!("The recovery phrase it follows: ({words})."));
+    }
     if let Some(why) = seen["cannot_go_on"].as_str() {
         out.push(format!("This device cannot go on: {why}."));
     }
@@ -853,10 +906,10 @@ struct Handed {
     /// The statement the device has applied, and the change entry of it.
     applied: SignedStatement,
     held: CheckedEntry,
-    /// What that entry is named by, in hex, as the node gave it.
+    /// What that entry is named by, in hex: worked out from the entry.
     over: String,
     /// The statement made apart, its entry, and what the entry is named
-    /// by, where the device is in a fork.
+    /// by, worked out from it, where the device is in a fork.
     apart: Option<(SignedStatement, CheckedEntry, String)>,
     /// The record of each device added since that counts, of a key that
     /// the statement lists in neither list: what the node says a person
@@ -892,7 +945,9 @@ impl Handed {
                 let statement = SignedStatement::from_bytes(&hex::decode(statement)?)?;
                 statement.verify()?;
                 let entry = entry_of(text(handed, "apart_entry"))?;
-                Some((statement, entry, text(handed, "apart").to_string()))
+                // What it is named by is worked out here, from the entry.
+                let named = hex::encode(entry.id());
+                Some((statement, entry, named))
             }
         };
         // Each record, read from its signed bytes: its adder signed it,
@@ -959,11 +1014,15 @@ impl Handed {
                 })
                 .collect()
         });
+        // What the prompt is shown over is worked out here, from the
+        // entry that was handed, and is not the node's word of it (§16).
+        let held = entry_of(text(handed, "entry"))?;
+        let over = hex::encode(held.id());
         Ok(Self {
             this_device: *own,
             applied,
-            held: entry_of(text(handed, "entry"))?,
-            over: text(handed, "over").to_string(),
+            held,
+            over,
             apart,
             added,
             left,
@@ -1208,7 +1267,27 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                 "apart": handed.apart.as_ref().map(|(_, _, id)| id.clone()),
             }),
             Some(Duration::from_secs(60)),
-        )?;
+        );
+        // Where the answer was lost, the node may have made the change
+        // all the same: it is asked again before anything is said of it
+        // (§16).
+        let made = match made {
+            Ok(told) => told,
+            Err(lost) => {
+                println!("\n{lost}\nThe node's answer was lost. Asking it again...");
+                match made_all_the_same(config_path, &entry.id()) {
+                    true => Told::Yes(json!({ "change": signs.number })),
+                    false => anyhow::bail!(
+                        "it is not known whether the node made the change: it does not say \
+                         that it has applied change {} so far, and it may still. Do not make \
+                         it again, here or on another device, until `cordelia devices` shows \
+                         the last change that this device has applied: two changes made apart \
+                         have to be settled with the phrase.",
+                        signs.number
+                    ),
+                }
+            }
+        };
         match made {
             Told::Yes(made) => {
                 let number = made["change"].as_u64().unwrap_or(signs.number);
@@ -1860,6 +1939,20 @@ mod tests {
         assert_eq!(handed.this_device, f.own.public_key());
         assert_eq!(handed.applied, f.statement);
         assert_eq!(handed.held, f.entry);
+        // What the prompt is shown over is worked out from the entry
+        // that was handed, whatever the node says it is named by.
+        assert_eq!(handed.over, hex::encode(f.entry.id()));
+        let mut says_another = f.handed(&f.statement, &records);
+        says_another["over"] = hex::encode([7u8; 32]).into();
+        assert_eq!(
+            f.read(&says_another).unwrap().over,
+            hex::encode(f.entry.id())
+        );
+        says_another["over"] = Value::Null;
+        assert_eq!(
+            f.read(&says_another).unwrap().over,
+            hex::encode(f.entry.id())
+        );
         assert!(handed.apart.is_none());
         assert_eq!(handed.added, [desktop.clone(), tablet]);
         // The labels that the device knows a key by.
@@ -1880,9 +1973,11 @@ mod tests {
         let mut with_apart = f.handed(&f.statement, &[]);
         with_apart["apart_statement"] = with_apart["statement"].clone();
         with_apart["apart_entry"] = with_apart["entry"].clone();
-        with_apart["apart"] = with_apart["over"].clone();
+        with_apart["apart"] = hex::encode([7u8; 32]).into();
         let handed = f.read(&with_apart).unwrap();
-        assert_eq!(handed.apart.unwrap().0, f.statement);
+        let (statement, _, named) = handed.apart.unwrap();
+        assert_eq!(statement, f.statement);
+        assert_eq!(named, hex::encode(f.entry.id()));
         let mut forged = f.statement.clone();
         forged.signature[0] ^= 1;
         with_apart["apart_statement"] = hex::encode(forged.to_bytes().unwrap()).into();
