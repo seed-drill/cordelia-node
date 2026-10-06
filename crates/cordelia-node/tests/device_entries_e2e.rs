@@ -3529,9 +3529,19 @@ async fn what_is_kept_of_a_relay_that_is_set_up_no_longer_is_forgotten() {
 
 // ── The pair channel of a key typed at `accept` ──────────────────────
 
-/// The key of `of`, as `on` keeps it typed now.
+/// The row of §5.1 that `on` stands in, by its name.
+fn row_of(on: &Device) -> &'static str {
+    let stands = cordelia_api::leaving::among(&on.db(), &on.state.identity).unwrap();
+    cordelia_api::adding::Row::of(stands)
+        .expect("a device that takes a key")
+        .name()
+}
+
+/// The key of `of`, as `on` keeps it typed now, in the row it stands in.
 fn types(on: &Device, of: &Device) -> TypedKey {
-    acts::type_key(&on.db(), &of.key(), on.now()).unwrap();
+    // The row is read first: the database is held for one thing at a time.
+    let row = row_of(on);
+    acts::type_key(&on.db(), &of.key(), row, on.now()).unwrap();
     acts::typed_key(&on.db(), &of.key()).unwrap().unwrap()
 }
 
@@ -3647,6 +3657,7 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
         typed_at: new.now(),
         taken_at: None,
         said: None,
+        stood: "no_phrase".into(),
     };
     assert_eq!(
         asks_for_hand_over(&new, "relay", &not_typed).await,
@@ -3655,7 +3666,8 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
     // A key that was typed an hour ago, and one typed at another time
     // than the device keeps it: nothing either.
     let an_hour = cordelia_core::protocol::PAIR_KEY_TYPED_SECS;
-    acts::type_key(&new.db(), &adder.key(), new.now() - an_hour).unwrap();
+    let row = row_of(&new);
+    acts::type_key(&new.db(), &adder.key(), row, new.now() - an_hour).unwrap();
     let old = acts::typed_key(&new.db(), &adder.key()).unwrap().unwrap();
     assert_eq!(
         asks_for_hand_over(&new, "relay", &old).await,

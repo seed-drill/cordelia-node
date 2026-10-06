@@ -66,7 +66,8 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{
-    HAND_OVER_KEPT_SECS, HAND_OVER_NAME, MAX_COUNTED_DEVICES, PAIR_KEY_TYPED_SECS,
+    HAND_OVER_KEPT_SECS, HAND_OVER_NAME, MAX_COUNTED_DEVICES, MAX_TYPED_KEYS, PAIR_KEY_TYPED_SECS,
+    TYPED_KEY_KEPT_SECS,
 };
 use cordelia_core::revision::next_under;
 use cordelia_crypto::addition::{Addition, SignedAddition};
@@ -84,6 +85,7 @@ use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, State};
 use cordelia_storage::sync_state;
 
+use crate::leaving::Among;
 use crate::person::{
     AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Shown, added_name,
     applied_secret, apply_added, apply_judged, drop_hand_overs, held, in_one, its_own_entry,
@@ -457,6 +459,122 @@ pub fn write_over_dropped(
 
 // ── The device that accepts ──────────────────────────────────────────
 
+/// The rows of §5.1 in which `cordelia accept` takes a key: where a
+/// device stands when a person types a key and says yes. The yes names
+/// what will happen in that row, and in no other (decision 2026-10-04
+/// §5.1, §16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    /// It follows no phrase.
+    NoPhrase,
+    /// It is alone under a phrase.
+    Alone,
+    /// It is one of several.
+    Several,
+    /// It is in no list of a statement under the phrase it follows, or is
+    /// listed in a change that it could not open.
+    NotListed,
+}
+
+impl Row {
+    /// The row's name, as a request names it and as it is kept.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoPhrase => "no_phrase",
+            Self::Alone => "alone",
+            Self::Several => "several",
+            Self::NotListed => "not_listed",
+        }
+    }
+
+    /// The row that is named so.
+    pub fn named(name: &str) -> Option<Self> {
+        [Self::NoPhrase, Self::Alone, Self::Several, Self::NotListed]
+            .into_iter()
+            .find(|row| row.name() == name)
+    }
+
+    /// The row of a device that stands so among the devices of its
+    /// person. `None` for one that was removed or is in a fork: no key is
+    /// taken there.
+    pub fn of(stands: Among) -> Option<Self> {
+        match stands {
+            Among::NoPhrase => Some(Self::NoPhrase),
+            Among::Alone => Some(Self::Alone),
+            Among::Several(_) => Some(Self::Several),
+            Among::Stopped(State::NotListed | State::NotOpened) => Some(Self::NotListed),
+            Among::Stopped(_) => None,
+        }
+    }
+
+    /// Where a device in this row stood, in words.
+    fn stood(self) -> &'static str {
+        match self {
+            Self::NoPhrase => "followed no recovery phrase",
+            Self::Alone => "was alone under a recovery phrase",
+            Self::Several => "was one of several devices",
+            Self::NotListed => "was in no list of the last change",
+        }
+    }
+
+    /// Where a device in this row stands, in words.
+    fn stands(self) -> &'static str {
+        match self {
+            Self::NoPhrase => "follows no recovery phrase",
+            Self::Alone => "is alone under a recovery phrase",
+            Self::Several => "is one of several devices",
+            Self::NotListed => "is in no list of the last change",
+        }
+    }
+}
+
+/// A person typed `key` at `cordelia accept`, at `now`, and said yes to
+/// what the command showed for the row `stood` (decision 2026-10-04
+/// §5.1, §16). The key is kept with that row and its time, and reads its
+/// pair channel for an hour. `sync_on` is whether sync is on here.
+///
+/// Refused, with nothing kept:
+///
+/// - a key that has no pair channel with this device: its own, or no
+///   usable public key;
+/// - on a device that was removed, or is in a fork;
+/// - on a device that is alone under a phrase with sync on;
+/// - where the device stands in another row now than the yes was for:
+///   the command asks again ([`PersonError::ChangedSincePrompt`]);
+/// - a ninth key, where the device keeps eight. A key that it keeps
+///   already is typed again in its place. What was typed more than a day
+///   ago is forgotten first.
+pub fn type_key(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    key: &[u8; 32],
+    stood: Row,
+    sync_on: bool,
+    now: i64,
+) -> Result<(), PersonError> {
+    in_one(conn, || {
+        derive::pair_secret(identity, key)?;
+        let stands = match crate::leaving::among(conn, identity)? {
+            Among::Stopped(state @ (State::Removed | State::Fork)) => {
+                return Err(PersonError::Stopped(state));
+            }
+            Among::Alone if sync_on => return Err(PersonError::SyncIsOn),
+            stands => Row::of(stands),
+        };
+        if stands != Some(stood) {
+            return Err(PersonError::ChangedSincePrompt);
+        }
+        // What became of a key typed long ago is kept no longer.
+        acts::forget_typed_keys(conn, now - TYPED_KEY_KEPT_SECS)?;
+        let kept = acts::typed_keys(conn)?;
+        if kept.len() >= MAX_TYPED_KEYS && !kept.iter().any(|typed| typed.key == *key) {
+            return Err(PersonError::TooManyTypedKeys);
+        }
+        acts::type_key(conn, key, stood.name(), now)?;
+        Ok(())
+    })
+}
+
 /// What became of a hand-over that a device was given to accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accepted {
@@ -528,6 +646,14 @@ pub enum NotAccepted {
     Removed,
     /// This device is in a fork: the fork is settled first.
     InAFork,
+    /// The key was typed, and its yes said, where the device stood in
+    /// another row of §5.1 than it stands in now. `typed` is that row,
+    /// and `None` for a key typed before rows were kept; `now` is the row
+    /// it stands in, and `None` where it was removed or is in a fork.
+    StoodElsewhere {
+        typed: Option<Row>,
+        now: Option<Row>,
+    },
 }
 
 /// Accept the hand-over in `entry`, an entry of the pair channel of this
@@ -649,6 +775,14 @@ pub fn keys_that_read(conn: &Connection, now: i64) -> Result<Vec<TypedKey>, Pers
 /// [`Accepted::Applied`]), and where it showed a fork: no later entry is
 /// given to [`accept`] with it, until a person types it again.
 ///
+/// **A key is spent only in the row its yes named** (§5.1, §16). Where
+/// the device stands in another row now than when the key was typed,
+/// nothing is given to [`accept`]: the hand-over is refused
+/// ([`NotAccepted::StoodElsewhere`]), and why is kept with the key. And
+/// **a device that comes to follow a phrase by a hand-over forgets every
+/// other key that was typed**: none of them is spent under what the
+/// device has become.
+///
 /// `None` where the key reads nothing now: a person typed it again since,
 /// it is spent, or its hour has gone. Nothing was given to [`accept`].
 pub fn accept_typed(
@@ -660,13 +794,24 @@ pub fn accept_typed(
     now: i64,
 ) -> Result<Option<Accepted>, PersonError> {
     in_one(conn, || {
-        let reads = acts::typed_key(conn, &typed.key)?.is_some_and(|kept| {
+        let kept = acts::typed_key(conn, &typed.key)?.filter(|kept| {
             kept.typed_at == typed.typed_at
                 && kept.taken_at.is_none()
                 && within_its_hour(kept.typed_at, now)
         });
-        if !reads {
+        let Some(kept) = kept else {
             return Ok(None);
+        };
+        // The yes was for the row that the device stood in then.
+        let typed_in = Row::named(&kept.stood);
+        let stands = Row::of(crate::leaving::among(conn, identity)?);
+        if typed_in.is_none() || typed_in != stands {
+            let refused = Accepted::Refused(NotAccepted::StoodElsewhere {
+                typed: typed_in,
+                now: stands,
+            });
+            acts::say_of_typed_key(conn, &typed.key, typed.typed_at, &refused.says())?;
+            return Ok(Some(refused));
         }
         let accepted = accept(
             conn,
@@ -685,6 +830,11 @@ pub fn accept_typed(
             Accepted::Refused(_) => {
                 acts::say_of_typed_key(conn, &typed.key, typed.typed_at, &said)?;
             }
+        }
+        // The device follows a phrase that it did not follow: every other
+        // key that was typed is forgotten.
+        if matches!(&accepted, Accepted::Joined(_) | Accepted::Moved(_)) {
+            acts::forget_other_typed_keys(conn, &typed.key)?;
         }
         Ok(Some(accepted))
     })
@@ -777,6 +927,19 @@ impl NotAccepted {
             Self::InAFork => "this device has seen two changes made apart: the fork is settled \
                               first (`cordelia settle`)"
                 .into(),
+            Self::StoodElsewhere { typed, now } => format!(
+                "that key was typed {}, and its yes was for that. This device {} now: what the \
+                 key handed over was not taken. Run `cordelia accept` again, and read what its \
+                 yes says",
+                match typed {
+                    Some(row) => format!("while this device {}", row.stood()),
+                    None => "before this device kept what a yes was for".to_string(),
+                },
+                match now {
+                    Some(row) => row.stands(),
+                    None => "has stopped",
+                }
+            ),
         }
     }
 }
@@ -1693,7 +1856,7 @@ mod tests {
         let now = s.tick();
         let (on, adder) = (&s[1], s.key(0));
         assert!(keys_that_read(&on.conn, now).unwrap().is_empty());
-        acts::type_key(&on.conn, &adder, now).unwrap();
+        acts::type_key(&on.conn, &adder, "no_phrase", now).unwrap();
         let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
         assert_eq!(
             keys_that_read(&on.conn, now).unwrap(),
@@ -1732,7 +1895,7 @@ mod tests {
         assert_eq!(on.everything(), before);
         assert!(!on.follows_a_phrase());
         // A person who means it types the key again.
-        acts::type_key(&on.conn, &adder, now + 3).unwrap();
+        acts::type_key(&on.conn, &adder, "no_phrase", now + 3).unwrap();
         let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
         let again = accept_typed(
             &on.conn,
@@ -1744,6 +1907,274 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(again, Some(Accepted::Joined(_))));
+    }
+
+    /// A key typed at `cordelia accept` is kept with the row of §5.1 that
+    /// its yes named, and only where the device stands in that row
+    /// (decision 2026-10-04 §5.1, §16). Refused, with nothing kept: where
+    /// the device stands in another row; a key that is the device's own;
+    /// on a device that was removed; and alone under a phrase with sync
+    /// on.
+    #[test]
+    fn test_a_typed_key_is_kept_with_the_row_that_its_yes_named() {
+        let stood = |on: &Machine, key: &[u8; 32]| {
+            acts::typed_key(&on.conn, key)
+                .unwrap()
+                .map(|typed| typed.stood)
+        };
+        let mut s = Several::new(3);
+        let now = s.tick();
+        // A device that follows no phrase.
+        let (on, key) = (&s[1], s.key(0));
+        for other in [Row::Alone, Row::Several, Row::NotListed] {
+            assert!(matches!(
+                type_key(&on.conn, &on.identity, &key, other, false, now),
+                Err(PersonError::ChangedSincePrompt)
+            ));
+        }
+        assert!(matches!(
+            type_key(&on.conn, &on.identity, &on.key(), Row::NoPhrase, false, now),
+            Err(PersonError::Derive(_))
+        ));
+        assert!(acts::typed_keys(&on.conn).unwrap().is_empty());
+        type_key(&on.conn, &on.identity, &key, Row::NoPhrase, true, now).unwrap();
+        assert_eq!(stood(on, &key).as_deref(), Some("no_phrase"));
+
+        // Alone under a phrase: with sync off, and in that row.
+        s.make_phrase(0);
+        let (on, key) = (&s[0], s.key(1));
+        assert!(matches!(
+            type_key(&on.conn, &on.identity, &key, Row::NoPhrase, false, now),
+            Err(PersonError::ChangedSincePrompt)
+        ));
+        assert!(matches!(
+            type_key(&on.conn, &on.identity, &key, Row::Alone, true, now),
+            Err(PersonError::SyncIsOn)
+        ));
+        assert_eq!(stood(on, &key), None);
+        type_key(&on.conn, &on.identity, &key, Row::Alone, false, now).unwrap();
+        assert_eq!(stood(on, &key).as_deref(), Some("alone"));
+
+        // One of several, with sync on or off: typed again, the key is
+        // kept in the row it was typed in this time.
+        assert!(matches!(s.add(0, 1), Accepted::Joined(_)));
+        let (on, key) = (&s[0], s.key(1));
+        assert!(matches!(
+            type_key(&on.conn, &on.identity, &key, Row::Alone, false, now),
+            Err(PersonError::ChangedSincePrompt)
+        ));
+        assert_eq!(stood(on, &key).as_deref(), Some("alone"));
+        type_key(&on.conn, &on.identity, &key, Row::Several, true, now).unwrap();
+        assert_eq!(stood(on, &key).as_deref(), Some("several"));
+
+        // A device that was removed keeps no key, whatever the yes named.
+        s.change(0, &[0], &[1]);
+        s.pass(0, 1);
+        let (on, key) = (&s[1], s.key(0));
+        assert_eq!(on.state(), State::Removed);
+        for row in [Row::NoPhrase, Row::Alone, Row::Several, Row::NotListed] {
+            assert!(matches!(
+                type_key(&on.conn, &on.identity, &key, row, false, now),
+                Err(PersonError::Stopped(State::Removed))
+            ));
+        }
+
+        // Each row has its name, and a device that has stopped stands in
+        // the fourth, or in none.
+        for row in [Row::NoPhrase, Row::Alone, Row::Several, Row::NotListed] {
+            assert_eq!(Row::named(row.name()), Some(row));
+        }
+        assert_eq!(Row::named(""), None);
+        assert_eq!(Row::named("removed"), None);
+        assert_eq!(Row::of(Among::NoPhrase), Some(Row::NoPhrase));
+        assert_eq!(Row::of(Among::Alone), Some(Row::Alone));
+        assert_eq!(Row::of(Among::Several(3)), Some(Row::Several));
+        for stopped in [State::NotListed, State::NotOpened] {
+            assert_eq!(Row::of(Among::Stopped(stopped)), Some(Row::NotListed));
+        }
+        for stopped in [State::Removed, State::Fork] {
+            assert_eq!(Row::of(Among::Stopped(stopped)), None);
+        }
+    }
+
+    /// A key typed under one row's yes is not spent under another row's
+    /// act (decision 2026-10-04 §16). A new device types a key, and
+    /// nothing arrives. It comes to be alone under a phrase of its own,
+    /// with sync off, and the hand-over arrives within the hour: taken,
+    /// it would have the device leave the phrase it has just made. It is
+    /// not taken, and why is kept with the key.
+    #[test]
+    fn test_a_key_is_spent_only_in_the_row_that_its_yes_named() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        let now = s.tick();
+        let (on, adder) = (&s[1], s.key(0));
+        type_key(&on.conn, &on.identity, &adder, Row::NoPhrase, false, now).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        // It comes to follow a phrase of its own, with the key still
+        // kept as it was typed.
+        let its_own = Phrase::parse(OTHER_WORDS).unwrap();
+        first_statement(&on.conn, &on.identity, &its_own, "device 1", now).unwrap();
+        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 1);
+
+        let given = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 5,
+        )
+        .unwrap();
+        let refused = Accepted::Refused(NotAccepted::StoodElsewhere {
+            typed: Some(Row::NoPhrase),
+            now: Some(Row::Alone),
+        });
+        assert_eq!(given, Some(refused.clone()));
+        assert_eq!(
+            on.held().following.phrase_key,
+            its_own.public_key().unwrap()
+        );
+        let kept = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        assert_eq!((kept.taken_at, kept.said), (None, Some(refused.says())));
+        assert_eq!(
+            refused.says(),
+            "that key was typed while this device followed no recovery phrase, and its yes was \
+             for that. This device is alone under a recovery phrase now: what the key handed \
+             over was not taken. Run `cordelia accept` again, and read what its yes says"
+        );
+
+        // The control: typed again where the device stands, with its yes
+        // for that, the same hand-over is taken, and the device moves.
+        type_key(&on.conn, &on.identity, &adder, Row::Alone, false, now + 6).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        let given = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            now + 6,
+        )
+        .unwrap();
+        assert!(matches!(given, Some(Accepted::Moved(_))), "{given:?}");
+
+        // A key that was typed before rows were kept stands in none: it
+        // is typed again.
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let added = s.hand(0, 1);
+        let now = s.tick();
+        let (on, adder) = (&s[1], s.key(0));
+        acts::type_key(&on.conn, &adder, "", now).unwrap();
+        let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
+        let given =
+            accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now).unwrap();
+        let refused = Accepted::Refused(NotAccepted::StoodElsewhere {
+            typed: None,
+            now: Some(Row::NoPhrase),
+        });
+        assert_eq!(given, Some(refused.clone()));
+        assert!(!on.follows_a_phrase());
+        assert!(
+            refused
+                .says()
+                .contains("before this device kept what a yes was for")
+        );
+    }
+
+    /// Making a phrase, and following one, each forget the keys that were
+    /// typed (decision 2026-10-04 §16): none is spent under what the
+    /// device has become. The key with which a hand-over was taken stays,
+    /// spent, to say what became of it. (A device that leaves a phrase
+    /// forgets everything a person typed there with the rest.)
+    #[test]
+    fn test_making_a_phrase_and_following_one_forget_the_keys_that_were_typed() {
+        // Following one: two keys were typed, and one hands over.
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        let added = s.hand(0, 2);
+        let now = s.tick();
+        let on = &s[2];
+        for key in [s.key(1), s.key(0)] {
+            type_key(&on.conn, &on.identity, &key, Row::NoPhrase, false, now).unwrap();
+        }
+        let typed = acts::typed_key(&on.conn, &s.key(0)).unwrap().unwrap();
+        let given =
+            accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now).unwrap();
+        assert!(matches!(given, Some(Accepted::Joined(_))), "{given:?}");
+        let kept = acts::typed_keys(&on.conn).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].key, kept[0].taken_at), (s.key(0), Some(now)));
+
+        // Making one, on a device that followed none.
+        let mut s = Several::new(2);
+        let now = s.tick();
+        let on = &s[0];
+        type_key(&on.conn, &on.identity, &s.key(1), Row::NoPhrase, false, now).unwrap();
+        let made = crate::person::first_entry(&s.phrase, &on.key(), "device 0").unwrap();
+        crate::leaving::start_again(
+            &on.conn,
+            &on.identity,
+            Among::NoPhrase,
+            &made.entry,
+            &made.statement_key,
+            now,
+        )
+        .unwrap();
+        assert!(on.follows_a_phrase());
+        assert!(acts::typed_keys(&on.conn).unwrap().is_empty());
+        // And on a device that was alone under one, which leaves it.
+        type_key(&on.conn, &on.identity, &s.key(1), Row::Alone, false, now).unwrap();
+        let other = Phrase::parse(OTHER_WORDS).unwrap();
+        let made = crate::person::first_entry(&other, &on.key(), "device 0").unwrap();
+        crate::leaving::start_again(
+            &on.conn,
+            &on.identity,
+            Among::Alone,
+            &made.entry,
+            &made.statement_key,
+            now + 1,
+        )
+        .unwrap();
+        assert!(acts::typed_keys(&on.conn).unwrap().is_empty());
+    }
+
+    /// A device keeps at most eight typed keys, and a ninth is refused
+    /// (decision 2026-10-04 §16). A key that it keeps is typed again in
+    /// its place, and one that was typed more than a day ago makes room.
+    #[test]
+    fn test_a_device_keeps_eight_typed_keys_and_refuses_a_ninth() {
+        let s = Several::new(1);
+        let (on, now) = (&s[0], s.now);
+        let key = |n: u16| crate::several::identity_of(100 + n).public_key();
+        let types =
+            |n: u16, at: i64| type_key(&on.conn, &on.identity, &key(n), Row::NoPhrase, false, at);
+        for n in 0..8 {
+            types(n, now + i64::from(n)).unwrap();
+        }
+        assert!(matches!(
+            types(8, now + 8),
+            Err(PersonError::TooManyTypedKeys)
+        ));
+        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
+        assert_eq!(acts::typed_key(&on.conn, &key(8)).unwrap(), None);
+        // One of the eight, typed again.
+        types(3, now + 9).unwrap();
+        let again = acts::typed_key(&on.conn, &key(3)).unwrap().unwrap();
+        assert_eq!(again.typed_at, now + 9);
+        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
+        // A day after the first was typed it is kept no longer, and
+        // there is room for one.
+        let a_day_on = now + cordelia_core::protocol::TYPED_KEY_KEPT_SECS + 1;
+        types(8, a_day_on).unwrap();
+        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
+        assert_eq!(acts::typed_key(&on.conn, &key(0)).unwrap(), None);
+        assert!(matches!(
+            types(9, a_day_on),
+            Err(PersonError::TooManyTypedKeys)
+        ));
     }
 
     /// A hand-over that is refused spends no key: what became of it is
@@ -1759,7 +2190,7 @@ mod tests {
         let added = s.hand(0, 1);
         let now = s.tick();
         let (on, adder) = (&s[1], s.key(0));
-        acts::type_key(&on.conn, &adder, now).unwrap();
+        acts::type_key(&on.conn, &adder, "no_phrase", now).unwrap();
         let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
         let empty = on.everything();
 
@@ -1792,7 +2223,7 @@ mod tests {
         assert_eq!(late.unwrap(), None);
         assert_eq!(on.everything(), empty);
         // The key was typed again since: the old typing reads nothing.
-        acts::type_key(&on.conn, &adder, now + 10).unwrap();
+        acts::type_key(&on.conn, &adder, "no_phrase", now + 10).unwrap();
         let old = accept_typed(
             &on.conn,
             &on.identity,

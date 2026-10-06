@@ -386,14 +386,17 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
     let seen = look(config_path)?;
     names_this_device(&seen, &own)?;
     let from = named("", &typed);
-    let says = match (text(&seen, "state"), text(&seen, "among")) {
+    // What the yes says goes by the row of §5.1 that the device stands
+    // in, and the key is kept with that row: it is spent in no other.
+    let (row, says) = match (text(&seen, "state"), text(&seen, "among")) {
         ("no_phrase", _) => {
             let folders = seen["folders"].as_u64().unwrap_or(0);
-            format!(
+            let says = format!(
                 "This device, and the {folders} folder{} it maps, will join the devices of \
                  {from}: what is in those folders will be sent to them.",
                 if folders == 1 { "" } else { "s" }
-            )
+            );
+            ("no_phrase", says)
         }
         ("removed", _) => anyhow::bail!(
             "this device was removed: `cordelia init --new-key` first. It is then added as a \
@@ -403,10 +406,13 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
             "two changes were made apart, and this device has seen both: the fork is settled \
              first, with the phrase (`cordelia settle`)."
         ),
-        ("not_listed" | "not_opened", _) => format!(
-            "This device takes, within the hour, only what {from} hands over under the \
-             recovery phrase that it already follows, with the change that stopped it or one \
-             made after that. It keeps its folders, and carries what it holds."
+        ("not_listed" | "not_opened", _) => (
+            "not_listed",
+            format!(
+                "This device takes, within the hour, only what {from} hands over under the \
+                 recovery phrase that it already follows, with the change that stopped it or \
+                 one made after that. It keeps its folders, and carries what it holds."
+            ),
         ),
         (_, "alone") => {
             if seen["sync_on"] == true {
@@ -416,22 +422,27 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
                      devices takes two acts."
                 );
             }
-            format!(
+            let says = format!(
                 "The recovery phrase that this device follows stops working here: this device \
                  leaves it, and joins the devices of {from}."
-            )
+            );
+            ("alone", says)
         }
-        _ => format!(
-            "This device is one of several. It takes, within the hour, only what {from} hands \
-             over under the recovery phrase that it already follows, where that brings a \
-             change it can apply. Anything else moves nothing."
+        _ => (
+            "several",
+            format!(
+                "This device is one of several. It takes, within the hour, only what {from} \
+                 hands over under the recovery phrase that it already follows, where that \
+                 brings a change it can apply. Anything else moves nothing."
+            ),
         ),
     };
     if !at.yes(&says)? {
         println!("{NOT_A_YES}");
         return Ok(());
     }
-    let kept = api_post(config_path, "/api/v1/devices/accept", json!({ "key": key }))?;
+    let typed_in = json!({ "key": key, "row": row });
+    let kept = api_post(config_path, "/api/v1/devices/accept", typed_in)?;
     let until = kept["until"].as_u64().map(time_of).unwrap_or_default();
     println!("\nAsking the relays for what {from} hands over, until {until}.");
 

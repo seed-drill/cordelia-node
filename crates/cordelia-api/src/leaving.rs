@@ -292,6 +292,10 @@ pub fn start_again(
             forget(conn, identity, true, now)?;
         }
         let applied = follow_first(conn, identity, entry, statement_key, now)?;
+        // Whatever key was typed at `cordelia accept` before was typed
+        // by a device that had made no phrase of its own: none of them
+        // is spent under this one (§16).
+        acts::forget_every_typed_key(conn)?;
         // It then publishes its folders (§5.2): it holds a name for each
         // folder it maps, and the next sync cycle publishes what is in
         // them. The change entry goes to each relay ahead of that, as it
@@ -555,7 +559,7 @@ mod tests {
         let now = s.tick();
         let on = &s[1];
         crate::person::hold_name(&on.conn, "notes", now).unwrap();
-        acts::type_key(&on.conn, &[9; 32], now).unwrap();
+        acts::type_key(&on.conn, &[9; 32], "several", now).unwrap();
         acts::clear_notice(&on.conn, &[8; 32], now).unwrap();
         acts::note_left_out(&on.conn, &[7; 32], "laptop", 1, now).unwrap();
         assert!(!on.stored().is_empty());

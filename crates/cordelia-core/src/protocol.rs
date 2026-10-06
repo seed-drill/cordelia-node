@@ -1113,6 +1113,18 @@ pub const HAND_OVER_NAME: &str = "hand-over";
 /// was handed long ago is not taken for what a person means now.
 pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
 
+/// The most keys typed at `cordelia accept` that a device keeps: eight
+/// (decision 2026-10-04 §16). A ninth is refused. Each is a pair channel
+/// that the device asks its relays for, for its hour, and a key with
+/// which a hand-over could be taken.
+pub const MAX_TYPED_KEYS: usize = 8;
+
+/// How long a device keeps a key that was typed at `cordelia accept`, to
+/// say what became of it: a day (decision 2026-10-04 §5.1). It reads
+/// nothing after its hour.
+/// Derived: 24 times PAIR_KEY_TYPED_SECS.
+pub const TYPED_KEY_KEPT_SECS: i64 = 24 * PAIR_KEY_TYPED_SECS;
+
 /// How long the device that adds keeps a hand-over in its store, from the
 /// time the hand-over says it was made: two hours (decision 2026-10-04 §3,
 /// §6). A hand-over holds the person secret. No device takes one that was
@@ -2162,6 +2174,10 @@ mod tests {
         const { assert!(STATEMENTS_LEFT_SAID_BELOW < MAX_STATEMENT_NUMBER) };
         assert_eq!(LEAVING_SEND_WAIT_SECS, 30);
         assert_eq!(LEAVING_SEND_WAIT_SECS, WAKE_WAIT_SECS);
+        assert_eq!(MAX_TYPED_KEYS, 8);
+        assert_eq!(TYPED_KEY_KEPT_SECS, 86_400);
+        // A key is kept for longer than it reads, to say what became of it.
+        const { assert!(TYPED_KEY_KEPT_SECS > PAIR_KEY_TYPED_SECS) };
     }
 
     /// What the sync adapter goes by in a channel from its secret: how

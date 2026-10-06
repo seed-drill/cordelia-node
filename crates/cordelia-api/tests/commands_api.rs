@@ -113,7 +113,8 @@ async fn test_a_typed_key_is_kept_and_the_node_is_asked_for_a_whole_pass() {
     .await;
     assert_eq!(woken(&state).await, (false, false));
     let key = another_key();
-    let (status, said) = asks!(app, "/api/v1/devices/accept", json!({ "key": key }));
+    let typed = json!({ "key": key, "row": "no_phrase" });
+    let (status, said) = asks!(app, "/api/v1/devices/accept", typed);
     assert_eq!(status, 200, "{said}");
     assert_eq!(said["key"], key.as_str());
     assert_eq!(
@@ -127,6 +128,20 @@ async fn test_a_typed_key_is_kept_and_the_node_is_asked_for_a_whole_pass() {
     assert_eq!(seen["accepting"][0]["key"], key.as_str());
     assert_eq!(seen["accepting"][0]["asking"], true);
     // A look wakes nothing.
+    assert_eq!(woken(&state).await, (false, false));
+
+    // The request says which row of 5.1 the yes was for (decision
+    // 2026-10-04 §16). One that does not say is refused, and one whose
+    // row the device does not stand in is a conflict: the command asks
+    // again. Nothing is kept of either, and the node is not woken.
+    let other = another_key();
+    let (status, said) = asks!(app, "/api/v1/devices/accept", json!({ "key": other }));
+    assert_eq!(status, 400, "{said}");
+    let elsewhere = json!({ "key": other, "row": "alone" });
+    let (status, said) = asks!(app, "/api/v1/devices/accept", elsewhere);
+    assert_eq!(status, 409, "{said}");
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(seen["accepting"].as_array().unwrap().len(), 1, "{seen}");
     assert_eq!(woken(&state).await, (false, false));
 }
 
@@ -265,7 +280,10 @@ fn routes() -> Vec<(&'static str, Value)> {
         ),
         ("/api/v1/devices/add/look", json!({ "device": key })),
         ("/api/v1/devices/add", json!({ "device": key })),
-        ("/api/v1/devices/accept", json!({ "key": key })),
+        (
+            "/api/v1/devices/accept",
+            json!({ "key": key, "row": "no_phrase" }),
+        ),
         ("/api/v1/devices/leave", json!({})),
         ("/api/v1/devices/leave/sent", json!({})),
         ("/api/v1/devices/forget", json!({})),

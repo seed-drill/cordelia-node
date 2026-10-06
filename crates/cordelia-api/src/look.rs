@@ -1635,7 +1635,7 @@ mod tests {
                 .unwrap()
                 .accepting
         };
-        acts::type_key(conn, &key, s.now).unwrap();
+        acts::type_key(conn, &key, "no_phrase", s.now).unwrap();
         let asking = seen_at(s.now + 10);
         assert_eq!(asking.len(), 1);
         assert!(asking[0].asking && !asking[0].taken);

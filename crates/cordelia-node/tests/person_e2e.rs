@@ -67,6 +67,21 @@ fn all_have_sent(node: &Node, all: &[&Node]) {
     );
 }
 
+/// What `cordelia accept` sends for the key `key` once its yes is said
+/// on `node`: the key, and the row of 5.1 that the device stands in, by
+/// which the yes went. A device that takes no key in any row names the
+/// third.
+fn typed_on(node: &Node, key: &str) -> Value {
+    let seen = look(node);
+    let row = match (text(&seen, "state"), text(&seen, "among")) {
+        ("no_phrase", _) => "no_phrase",
+        ("not_listed" | "not_opened", _) => "not_listed",
+        (_, "alone") => "alone",
+        _ => "several",
+    };
+    json!({ "key": key, "row": row })
+}
+
 fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field].as_str().unwrap_or_default()
 }
@@ -564,7 +579,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // A key that is this device's own has no pair channel with it, and
     // is not kept; nor is one that is no key.
     for key in [key_before.as_str(), "cordelia_pk1nothing"] {
-        let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": key }));
+        let (status, said) = asks(&laptop, "/api/v1/devices/accept", typed_on(&laptop, key));
         assert_eq!(status, 400, "{said}");
     }
     assert!(look(&laptop)["accepting"].as_array().unwrap().is_empty());
@@ -726,12 +741,19 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let claude = laptop.home().join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
     laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
-    let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": other }));
+    let typed = typed_on(&laptop, &other);
+    let (status, said) = asks(&laptop, "/api/v1/devices/accept", typed.clone());
     assert_eq!(status, 400, "{said}");
     assert!(said.contains("`cordelia sync off` first"), "{said}");
     assert!(look(&laptop)["accepting"].as_array().unwrap().is_empty());
     laptop.cli(&["sync", "off"]);
-    let (status, said) = asks(&laptop, "/api/v1/devices/accept", json!({ "key": other }));
+    // With the yes for another row than the device stands in, nothing is
+    // kept: the command asks again.
+    let elsewhere = json!({ "key": other, "row": "no_phrase" });
+    let (status, said) = asks(&laptop, "/api/v1/devices/accept", elsewhere);
+    assert_eq!(status, 409, "{said}");
+    assert!(look(&laptop)["accepting"].as_array().unwrap().is_empty());
+    let (status, said) = asks(&laptop, "/api/v1/devices/accept", typed);
     assert_eq!(status, 200, "{said}");
     assert_eq!(look(&laptop)["accepting"].as_array().unwrap().len(), 1);
 }
@@ -1031,7 +1053,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let (status, said) = asks(
         &desktop,
         "/api/v1/devices/accept",
-        json!({ "key": laptop_key }),
+        typed_on(&desktop, &laptop_key),
     );
     assert_eq!(status, 400, "{said}");
     assert!(said.contains("this device was removed"), "{said}");
@@ -1676,7 +1698,7 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     let (status, said) = asks(
         forked,
         "/api/v1/devices/accept",
-        json!({ "key": key_of(other) }),
+        typed_on(forked, &key_of(other)),
     );
     assert_eq!(status, 400, "{said}");
     assert!(said.contains("two changes were made apart"), "{said}");

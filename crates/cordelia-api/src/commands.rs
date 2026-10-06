@@ -36,15 +36,13 @@ use cordelia_core::protocol::{
     CHANGE_FETCH_MAX_SECS, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS, RECEIVED_LAST_WEEK_SECS,
 };
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
-use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::fingerprint;
 use cordelia_crypto::statement::Statement;
-use cordelia_storage::acts;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
 
-use crate::adding::{self, WouldAdd};
+use crate::adding::{self, Row, WouldAdd};
 use crate::at_relays;
 use crate::auth;
 use crate::error::ApiError;
@@ -397,16 +395,22 @@ pub async fn add(
 pub struct AcceptRequest {
     /// The key of the device that adds this one, as a person typed it.
     pub key: String,
+    /// The row of §5.1 that the yes named: `no_phrase`, `alone`,
+    /// `several` or `not_listed`.
+    #[serde(default)]
+    pub row: Option<String>,
 }
 
-/// A person typed a key at `cordelia accept`: it is kept with its time,
-/// and the node asks its relays for what that device hands over until it
-/// is taken or the hour is gone (decision 2026-10-04 §5.1, §6). What
-/// became of it is in the look.
+/// A person typed a key at `cordelia accept`: it is kept with its time
+/// and the row that its yes named, and the node asks its relays for what
+/// that device hands over until it is taken or the hour is gone (decision
+/// 2026-10-04 §5.1, §6, §16). What became of it is in the look.
 ///
 /// Refused, with nothing kept, where no hand-over could be taken as the
 /// device stands: it was removed, it is in a fork, or it is alone under a
-/// phrase with sync on.
+/// phrase with sync on. Refused too where the device stands in another
+/// row than the yes named, as a conflict; and a ninth key
+/// ([`adding::type_key`]).
 pub async fn accept(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -414,27 +418,18 @@ pub async fn accept(
 ) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
     let key = key_of("key", &body.key)?;
+    let row = body.row.as_deref().and_then(Row::named).ok_or_else(|| {
+        ApiError::BadRequest(
+            "row says what the yes was for, and is one of no_phrase, alone, several and \
+             not_listed"
+                .into(),
+        )
+    })?;
     let typed_at = now();
     {
         let conn = db(&state);
-        derive::pair_secret(&state.identity, &key).map_err(|e| refused(e.into()))?;
-        match leaving::among(&conn, &state.identity).map_err(refused)? {
-            Among::Stopped(state @ (State::Removed | State::Fork)) => {
-                return Err(refused(PersonError::Stopped(state)));
-            }
-            Among::Alone if sync_is_on(&conn)? => {
-                return Err(ApiError::BadRequest(
-                    "sync is on here, and this device is alone under a recovery phrase: \
-                     `cordelia sync off` first, so that sending its folders to another set of \
-                     devices takes two acts."
-                        .into(),
-                ));
-            }
-            _ => {}
-        }
-        acts::type_key(&conn, &key, typed_at)?;
-        // What became of a key typed long ago is kept no longer.
-        acts::forget_typed_keys(&conn, typed_at - 24 * PAIR_KEY_TYPED_SECS)?;
+        let sync_on = sync_is_on(&conn)?;
+        adding::type_key(&conn, &state.identity, &key, row, sync_on, typed_at).map_err(refused)?;
     }
     // The node asks its relays for the hand-over in its whole pass: now,
     // and then at each one until it is taken or the hour is gone.

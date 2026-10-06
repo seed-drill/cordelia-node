@@ -120,6 +120,18 @@ pub enum PersonError {
     #[error("the statement was made on another device than this one: nothing was made")]
     MadeOnAnotherDevice,
 
+    #[error(
+        "sync is on here, and this device is alone under a recovery phrase: `cordelia sync off` \
+         first, so that sending its folders to another set of devices takes two acts."
+    )]
+    SyncIsOn,
+
+    #[error(
+        "this device keeps 8 keys that were typed at `cordelia accept`, and a ninth is refused: \
+         each is kept for a day from when it was typed."
+    )]
+    TooManyTypedKeys,
+
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
 

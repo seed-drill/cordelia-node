@@ -6,10 +6,11 @@
 //! with a statement:
 //!
 //! - **The keys a person typed** at `cordelia accept`
-//!   (`person_typed_keys`), each with when it was typed. A pair channel is
-//!   read only with such a key, and only for an hour after it was typed
-//!   (§2.2). A key with which a hand-over was taken is spent: it stays,
-//!   to say what became of it, and reads nothing more.
+//!   (`person_typed_keys`), each with when it was typed, and with the row
+//!   of §5.1 that the device stood in when its yes was said. A pair
+//!   channel is read only with such a key, and only for an hour after it
+//!   was typed (§2.2). A key with which a hand-over was taken is spent:
+//!   it stays, to say what became of it, and reads nothing more.
 //! - **The keys that a statement left out** (`person_left_out`): each key
 //!   that this device counted as a device before a statement it applied,
 //!   and that is in neither of that statement's lists (§8). Such a device
@@ -44,6 +45,10 @@ pub struct TypedKey {
     pub taken_at: Option<i64>,
     /// What became of the last hand-over that was read with it.
     pub said: Option<String>,
+    /// Where the device stood, of the rows of §5.1, when the key was
+    /// typed and its yes was said: the name of that row. Empty for a key
+    /// typed before rows were kept, which stands in none.
+    pub stood: String,
 }
 
 fn typed_from_row(row: &rusqlite::Row) -> rusqlite::Result<TypedKey> {
@@ -52,18 +57,27 @@ fn typed_from_row(row: &rusqlite::Row) -> rusqlite::Result<TypedKey> {
         typed_at: row.get(1)?,
         taken_at: row.get(2)?,
         said: row.get(3)?,
+        stood: row.get(4)?,
     })
 }
 
-/// A person typed `key` at `now`. It takes the place of what was kept of
-/// that key: typed again, a key that was spent reads again, for its hour.
-pub fn type_key(conn: &Connection, key: &[u8; 32], now: i64) -> Result<(), CordeliaError> {
+/// A person typed `key` at `now`, where the device stood in the row
+/// named `stood`. It takes the place of what was kept of that key: typed
+/// again, a key that was spent reads again, for its hour, in the row it
+/// was typed in this time.
+pub fn type_key(
+    conn: &Connection,
+    key: &[u8; 32],
+    stood: &str,
+    now: i64,
+) -> Result<(), CordeliaError> {
     conn.execute(
-        "INSERT INTO person_typed_keys (key, typed_at, taken_at, said)
-         VALUES (?1, ?2, NULL, NULL)
+        "INSERT INTO person_typed_keys (key, typed_at, taken_at, said, stood)
+         VALUES (?1, ?2, NULL, NULL, ?3)
          ON CONFLICT(key) DO UPDATE SET
-             typed_at = excluded.typed_at, taken_at = NULL, said = NULL",
-        params![key.as_slice(), now],
+             typed_at = excluded.typed_at, taken_at = NULL, said = NULL,
+             stood = excluded.stood",
+        params![key.as_slice(), now, stood],
     )
     .map_err(storage)?;
     Ok(())
@@ -74,7 +88,7 @@ pub fn type_key(conn: &Connection, key: &[u8; 32], now: i64) -> Result<(), Corde
 pub fn typed_keys(conn: &Connection) -> Result<Vec<TypedKey>, CordeliaError> {
     let mut stmt = conn
         .prepare(
-            "SELECT key, typed_at, taken_at, said FROM person_typed_keys
+            "SELECT key, typed_at, taken_at, said, stood FROM person_typed_keys
              ORDER BY typed_at ASC, key ASC",
         )
         .map_err(storage)?;
@@ -85,7 +99,7 @@ pub fn typed_keys(conn: &Connection) -> Result<Vec<TypedKey>, CordeliaError> {
 /// What the device keeps of `key`, where a person typed it.
 pub fn typed_key(conn: &Connection, key: &[u8; 32]) -> Result<Option<TypedKey>, CordeliaError> {
     conn.query_row(
-        "SELECT key, typed_at, taken_at, said FROM person_typed_keys WHERE key = ?1",
+        "SELECT key, typed_at, taken_at, said, stood FROM person_typed_keys WHERE key = ?1",
         params![key.as_slice()],
         typed_from_row,
     )
@@ -140,6 +154,25 @@ pub fn forget_typed_keys(conn: &Connection, before: i64) -> Result<usize, Cordel
         params![before],
     )
     .map_err(storage)
+}
+
+/// Keep nothing of any key that a person typed but `but`: the device has
+/// come to follow a phrase with that key, and no other key that was typed
+/// before reads anything after (decision 2026-10-04 §16). Returns how
+/// many went.
+pub fn forget_other_typed_keys(conn: &Connection, but: &[u8; 32]) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM person_typed_keys WHERE key != ?1",
+        params![but.as_slice()],
+    )
+    .map_err(storage)
+}
+
+/// Keep nothing of any key that a person typed: the device has made a
+/// phrase of its own (decision 2026-10-04 §16). Returns how many went.
+pub fn forget_every_typed_key(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_typed_keys", [])
+        .map_err(storage)
 }
 
 // ── The keys that a statement left out ───────────────────────────────
@@ -273,13 +306,16 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let (one, other) = ([1u8; 32], [2u8; 32]);
         assert_eq!(typed_key(&conn, &one).unwrap(), None);
-        type_key(&conn, &one, 100).unwrap();
-        type_key(&conn, &other, 90).unwrap();
+        type_key(&conn, &one, "no_phrase", 100).unwrap();
+        type_key(&conn, &other, "alone", 90).unwrap();
         let kept = typed_key(&conn, &one).unwrap().unwrap();
         assert_eq!(
             (kept.key, kept.typed_at, kept.taken_at, kept.said.clone()),
             (one, 100, None, None)
         );
+        // With the row that the device stood in when it was typed.
+        assert_eq!(kept.stood, "no_phrase");
+        assert_eq!(typed_keys(&conn).unwrap()[0].stood, "alone");
         // In the order they were typed.
         let all: Vec<[u8; 32]> = typed_keys(&conn)
             .unwrap()
@@ -290,13 +326,27 @@ mod tests {
 
         assert!(say_of_typed_key(&conn, &one, 100, "nothing was handed yet").unwrap());
         assert!(spend_typed_key(&conn, &one, 100, 130, "joined").unwrap());
-        type_key(&conn, &one, 200).unwrap();
+        type_key(&conn, &one, "several", 200).unwrap();
         let again = typed_key(&conn, &one).unwrap().unwrap();
         assert_eq!(
             (again.typed_at, again.taken_at, again.said),
             (200, None, None)
         );
+        // In the row it was typed in this time.
+        assert_eq!(again.stood, "several");
         assert_eq!(typed_keys(&conn).unwrap().len(), 2);
+
+        // Every key but one is forgotten, and then every key.
+        type_key(&conn, &[7u8; 32], "several", 300).unwrap();
+        assert_eq!(forget_other_typed_keys(&conn, &one).unwrap(), 2);
+        let left: Vec<[u8; 32]> = typed_keys(&conn)
+            .unwrap()
+            .iter()
+            .map(|typed| typed.key)
+            .collect();
+        assert_eq!(left, [one]);
+        assert_eq!(forget_every_typed_key(&conn).unwrap(), 1);
+        assert!(typed_keys(&conn).unwrap().is_empty());
     }
 
     /// A key is spent once, by the typing that took the hand-over: a
@@ -306,7 +356,7 @@ mod tests {
     fn test_a_key_is_spent_once_and_only_by_the_typing_that_took_the_hand_over() {
         let conn = db::open_in_memory().unwrap();
         let key = [3u8; 32];
-        type_key(&conn, &key, 100).unwrap();
+        type_key(&conn, &key, "no_phrase", 100).unwrap();
         // Another typing's time, and another key: nothing.
         assert!(!spend_typed_key(&conn, &key, 99, 110, "joined").unwrap());
         assert!(!spend_typed_key(&conn, &[4u8; 32], 100, 110, "joined").unwrap());
@@ -328,7 +378,7 @@ mod tests {
         );
 
         // What was typed long ago goes when it is asked to.
-        type_key(&conn, &[5u8; 32], 500).unwrap();
+        type_key(&conn, &[5u8; 32], "no_phrase", 500).unwrap();
         assert_eq!(forget_typed_keys(&conn, 500).unwrap(), 1);
         assert_eq!(typed_keys(&conn).unwrap().len(), 1);
     }
@@ -375,7 +425,7 @@ mod tests {
         assert!(!is_cleared(&conn, &one).unwrap());
 
         clear_notice(&conn, &one, 100).unwrap();
-        type_key(&conn, &one, 100).unwrap();
+        type_key(&conn, &one, "no_phrase", 100).unwrap();
         note_left_out(&conn, &one, "laptop", 2, 100).unwrap();
         assert_eq!(forget_all(&conn).unwrap(), 3);
         assert!(!is_cleared(&conn, &one).unwrap());
