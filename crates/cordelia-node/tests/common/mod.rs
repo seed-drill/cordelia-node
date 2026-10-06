@@ -771,6 +771,18 @@ impl AtTerminal {
         self
     }
 
+    /// Whether the terminal shows what is typed, and makes signals of the
+    /// keys that are for them (Ctrl-C among them): as a terminal is that
+    /// no program has set otherwise.
+    pub fn is_as_it_was(&self) -> (bool, bool) {
+        use rustix::termios::{LocalModes, tcgetattr};
+        let set = tcgetattr(&self.types).expect("the terminal says how it is set");
+        (
+            set.local_modes.contains(LocalModes::ECHO),
+            set.local_modes.contains(LocalModes::ISIG),
+        )
+    }
+
     /// End the input, as Ctrl-D does at the start of a line.
     pub fn ends_the_input(&mut self) -> &mut Self {
         self.presses(&[0x04])

@@ -2015,6 +2015,91 @@ fn a_phrase_is_shown_only_on_a_terminal_and_is_cleared_from_it() {
     assert!(said[..shown].contains("\x1b[?1049h"), "{said:?}");
 }
 
+// ── Keys at a prompt ─────────────────────────────────────────────────
+
+/// Ctrl-C at a prompt that hides what is typed, or while the other screen
+/// is up, is read as a key (decision 2026-10-04 §16): the terminal is put
+/// back as it was, with the other screen cleared and put away, and the
+/// command ends with nothing made. And what was typed ahead of a prompt
+/// is dropped: an Enter pressed twice at a yes does not take away the
+/// screen that shows a new phrase.
+#[test]
+fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let ctrl_c = [0x03u8];
+
+    // While the screen that shows a new phrase is up.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    assert_eq!(at.is_as_it_was(), (false, false), "each key is read");
+    let shown = words_shown(&at.said);
+    at.presses(&ctrl_c);
+    at.says("Interrupted: the terminal is as it was, and nothing was made.");
+    assert_eq!(at.is_as_it_was(), (true, true));
+    let said = at.refused();
+    let cleared_and_left = "\x1b[H\x1b[2J\x1b[3J\x1b[?1049l";
+    let after_the_words = &said[said.find(&shown).unwrap()..];
+    assert!(after_the_words.contains(cleared_and_left), "{said:?}");
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // While what is typed is hidden: at the words typed back, and at the
+    // phrase of a change.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down").types("");
+    at.says("Type the twelve words back");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(at.is_as_it_was(), (false, false), "hidden, and signals off");
+    at.presses(b"legal winner").presses(&ctrl_c);
+    at.says("Interrupted: the terminal is as it was, and nothing was made.");
+    assert_eq!(at.is_as_it_was(), (true, true));
+    let said = at.refused();
+    assert!(!said.contains("legal winner"), "{said}");
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // The keys that take back what was typed are acted on, where each
+    // key is read as it is pressed: the whole line, a word, and a
+    // letter. The words are typed back with all three, and are the
+    // phrase.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back");
+    let (all_but_last, last) = words.rsplit_once(' ').unwrap();
+    at.presses(b"not the words at all\x15");
+    at.presses(format!("{all_but_last} mistaken \x17{last}x\x7f").as_bytes());
+    at.types("");
+    let said = at.done();
+    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(!said.contains("mistaken"), "{said}");
+
+    let mut at = laptop.at_terminal(&["renew"]);
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words");
+    at.presses(&ctrl_c);
+    at.says("Interrupted: the terminal is as it was, and nothing was made.");
+    assert_eq!(at.is_as_it_was(), (true, true));
+    at.refused();
+    assert_eq!(look(&laptop)["change"], 1);
+
+    // An Enter pressed twice at the yes: the second is dropped before the
+    // screen that shows the new phrase goes up, and the screen stays.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("This replaces the recovery phrase that this device follows")
+        .says("Type yes to go on")
+        .presses(b"yes\n\n");
+    at.says("Press Enter when they are written down");
+    let said = at
+        .hears_for(std::time::Duration::from_millis(1500))
+        .to_string();
+    assert!(!said.contains("Type the twelve words back"), "{said:?}");
+    let _ = words;
+}
+
 // ── A chain of two, at a removal ─────────────────────────────────────
 
 /// A chain of two at a removal (decision 2026-10-04 §6, §16). The desktop
