@@ -33,6 +33,16 @@ use zeroize::{Zeroize, Zeroizing};
 pub const NOT_A_TERMINAL: &str = "this command asks before it does anything, and it asks at a \
                                   terminal: its input is not one. Nothing was done.";
 
+/// What a command that shows or reads a recovery phrase says where what
+/// it writes to is no terminal.
+pub const NOT_TO_A_TERMINAL: &str = "this command shows or reads a recovery phrase, and what it \
+                                     writes to is not a terminal: a phrase is shown on a \
+                                     terminal and nowhere else. Nothing was done.";
+
+/// Take everything off the screen: the cursor home, the screen cleared,
+/// and the lines that have scrolled off it cleared too.
+const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J\x1b[3J";
+
 /// The most that one line may hold: more than twelve of the longest words
 /// of a recovery phrase and the space between them, several times over.
 const MAX_LINE: usize = 1024;
@@ -185,8 +195,15 @@ impl Terminal {
     /// cannot be dumped or traced from here on ([`cannot_be_dumped`]).
     /// It is asked for before anything is read, the node's answers
     /// included.
+    ///
+    /// Refused too where what the command writes to is not a terminal:
+    /// a phrase that is shown would go wherever that leads (a file, or
+    /// another program), and stay there.
     pub fn for_a_phrase() -> anyhow::Result<Self> {
         let at = Self::at()?;
+        if !std::io::stdout().is_terminal() {
+            anyhow::bail!(NOT_TO_A_TERMINAL);
+        }
         cannot_be_dumped()?;
         Ok(at)
     }
@@ -209,21 +226,27 @@ impl Terminal {
     }
 
     /// Show `shown` once, under the line `says`, until a person presses
-    /// Enter at `asks`: and then take it off the screen, where the terminal
-    /// knows how. It is shown on the terminal's other screen, which is put
-    /// away when the person is done, and keeps no lines above what is typed
-    /// next. A terminal that has no other screen shows it where it is.
+    /// Enter at `asks`: and then take it off the screen. It is shown on
+    /// the terminal's other screen, which is cleared and then put away
+    /// when the person is done, and keeps no lines above what is typed
+    /// next. A terminal that has no other screen shows it where it is,
+    /// and it is cleared from there, with the lines that scrolled off.
     ///
     /// `shown` is written straight to the terminal: the buffer of the
     /// program's standard output never holds it.
     pub fn once(&self, says: &str, shown: &str, asks: &str) -> anyhow::Result<()> {
-        say("\x1b[?1049h\x1b[H\x1b[2J")?;
+        say("\x1b[?1049h")?;
+        say(CLEAR_SCREEN)?;
         say(says)?;
         say("\n\n    ")?;
         say_unbuffered(shown)?;
         say("\n\n")?;
         say(asks)?;
         let read = line();
+        // Cleared before the other screen is left, and so before anything
+        // more is asked: on a terminal that has no other screen this is
+        // what takes the words away.
+        say(CLEAR_SCREEN)?;
         say("\x1b[?1049l")?;
         read?;
         Ok(())

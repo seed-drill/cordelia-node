@@ -1953,6 +1953,68 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
     assert!(in_files, "the search reads the node's database");
 }
 
+// ── Where a phrase is shown ──────────────────────────────────────────
+
+/// A recovery phrase is shown only where what the command writes to is
+/// a terminal too, and is cleared from it before the words are typed
+/// back (decision 2026-10-04 §16). With a terminal for its input and a
+/// pipe for what it writes, as `cordelia phrase | tee log` runs it, each
+/// command that shows or reads a phrase refuses before it reads
+/// anything, and nothing of a phrase is in the pipe. At a terminal, the
+/// screen is cleared, with what scrolled off it, before the other screen
+/// is put away and the words are asked for.
+#[test]
+fn a_phrase_is_shown_only_on_a_terminal_and_is_cleared_from_it() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+
+    for args in [
+        &["phrase", "--name", "laptop"][..],
+        &["renew"],
+        &["remove-device", &other],
+        &["settle"],
+    ] {
+        let (ended, out, err) = laptop.at_terminal_into_a_pipe(args);
+        assert_eq!(ended, Some(false), "{args:?}: it wrote {out:?} and {err:?}");
+        assert!(
+            err.contains("what it writes to is not a terminal"),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains("Nothing was done."), "{args:?}: {err}");
+        // Nothing of a phrase is in the pipe: no line that is one, and
+        // nothing at all.
+        for line in out.lines().chain(err.lines()) {
+            let a_phrase = cordelia_crypto::phrase::Phrase::parse(line).is_ok();
+            assert!(!a_phrase, "{args:?} wrote a phrase into the pipe");
+        }
+        assert_eq!(out, "", "{args:?}");
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // At a terminal: the words are shown on the other screen, which is
+    // cleared, with what scrolled off, before it is put away.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&words);
+    let said = at.done();
+    let shown = said.find(&words).expect("the words were shown");
+    let cleared_and_left = "\x1b[H\x1b[2J\x1b[3J\x1b[?1049l";
+    let cleared = said[shown..]
+        .find(cleared_and_left)
+        .map(|at| shown + at)
+        .unwrap_or_else(|| panic!("the screen was not cleared before it was left: {said:?}"));
+    let asked = said.find("Type the twelve words back").unwrap();
+    assert!(shown < cleared && cleared < asked, "{said:?}");
+    // They were shown once, and on the other screen.
+    assert_eq!(said.matches(&words).count(), 1);
+    assert!(said[..shown].contains("\x1b[?1049h"), "{said:?}");
+}
+
 // ── A chain of two, at a removal ─────────────────────────────────────
 
 /// A chain of two at a removal (decision 2026-10-04 §6, §16). The desktop

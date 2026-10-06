@@ -172,6 +172,56 @@ impl Node {
         AtTerminal::running(self.name, self.binary(), args)
     }
 
+    /// Run a CLI command against this node with a terminal for its input,
+    /// and with what it writes sent down a pipe, as `cordelia phrase |
+    /// tee log` runs it. It is given twenty seconds to end by itself, and
+    /// is stopped then: whether it ended by itself and succeeded, and
+    /// what it wrote to its output and to its errors.
+    pub fn at_terminal_into_a_pipe(&self, args: &[&str]) -> (Option<bool>, String, String) {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::io::Read;
+        let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
+        grantpt(&ours).unwrap();
+        unlockpt(&ours).unwrap();
+        let theirs = ptsname(&ours, Vec::new()).unwrap();
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(theirs.to_str().unwrap())
+            .unwrap();
+        let mut child = self
+            .binary()
+            .args(args)
+            .stdin(input)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reads = |mut from: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut said = Vec::new();
+                let _ = from.read_to_end(&mut said);
+                String::from_utf8_lossy(&said).into_owned()
+            })
+        };
+        let out = reads(Box::new(child.stdout.take().unwrap()));
+        let err = reads(Box::new(child.stderr.take().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let ended = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status.success()),
+                None if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        drop(ours);
+        (ended, out.join().unwrap(), err.join().unwrap())
+    }
+
     /// [`Self::at_terminal`], for a command that reaches this node's API
     /// at `port` on this machine, and not at the node's own port: where
     /// a test listens there, and passes on what it is sent. The command
