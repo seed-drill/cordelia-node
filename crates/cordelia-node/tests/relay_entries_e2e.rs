@@ -1,9 +1,3 @@
-// Not built for now. These tests set devices up as the older kind of
-// channel did, which a device carries no longer (decision 2026-10-04
-// §10): the file is built again once its tests set them up under a
-// recovery phrase.
-#![cfg(any())]
-
 //! End to end, with real processes: a relay that carries channels from
 //! their secrets over real connections, beside the older kind of channel
 //! (decision 2026-10-04 §2.4, §2.5, §4.6).
@@ -283,6 +277,30 @@ impl Client {
             slot: None,
             rev: None,
         }
+    }
+
+    /// Every item of the older kind that the relay holds of `channel`,
+    /// as it hands them: the channel is listed from its start, and each
+    /// item listed is fetched, on one stream.
+    async fn items_of(&self, channel: &str) -> Vec<Item> {
+        use cordelia_network::item_sync;
+        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
+        codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+            .await
+            .unwrap();
+        let page = item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
+            .await
+            .expect("the relay lists the channel");
+        let ids: Vec<String> = page.items.into_iter().map(|item| item.item_id).collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        item_sync::send_fetch_request(&mut send, &ids)
+            .await
+            .unwrap();
+        item_sync::read_fetch_response(&mut recv)
+            .await
+            .expect("the relay hands the items it listed")
     }
 
     /// Push items of the older kind. `Err` where nothing was answered.
@@ -1956,22 +1974,38 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
         );
     }
 
-    // The control: on the same connection, the device answers its relay
-    // on a stream that it does serve.
+    // Nor does it answer on a stream of the older kind of channel, which
+    // a personal node carries no longer (decision 2026-10-04 §10): it
+    // serves no sync of one, and takes no push of one.
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     codec::write_protocol_byte(&mut send, Protocol::ItemSync)
         .await
         .unwrap();
-    let page = cordelia_network::item_sync::send_sync_page(
-        &mut send,
-        &mut recv,
-        "grp_550e8400-e29b-41d4-a716-446655440000",
-        0,
-        10,
+    let older = "grp_550e8400-e29b-41d4-a716-446655440000";
+    let page =
+        cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, older, 0, 10).await;
+    assert!(
+        page.is_err(),
+        "a personal node served a sync of the older kind: {page:?}"
+    );
+    let pushed = ask_on(
+        &conn,
+        Protocol::ItemPush,
+        WireMessage::PushPayload(PushPayload { items: Vec::new() }),
     )
-    .await
-    .expect("the device answers its relay on a stream it serves");
-    assert!(page.items.is_empty());
+    .await;
+    assert!(
+        pushed.is_err(),
+        "a personal node took a push of the older kind: {pushed:?}"
+    );
+
+    // The control: on the same connection, the device answers its relay
+    // on a stream that it does serve.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    cordelia_network::peer_sharing::request_peers(&mut stream, 8)
+        .await
+        .expect("the device answers its relay on a stream it serves");
 
     // And it stored nothing of what it was sent: no entry, and no
     // channel held as a relay holds one.
@@ -1987,11 +2021,15 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
 }
 
 /// The older kind of channel still syncs through a relay that carries
-/// the new kind beside it, and that is at its cap for the new kind: two
-/// devices pair through the relay, and what one publishes reaches the
-/// other. The older kind's room is counted by its own items, so what the
-/// relay holds of the new kind is no part of it, and neither kind is
+/// the new kind beside it, and that is at its cap for the new kind: what
+/// one node pushes of a channel of the older kind reaches another through
+/// the relay. The older kind's room is counted by its own items, so what
+/// the relay holds of the new kind is no part of it, and neither kind is
 /// refused or dropped for the other.
+///
+/// The two nodes are stand-ins that speak the older streams: a personal
+/// node carries no channel of the older kind (decision 2026-10-04 §10),
+/// and a relay carries it as it did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_older_kind_syncs_through_a_relay_that_is_full_of_the_new_kind() {
     // Room for three entries of the largest size, of each kind.
@@ -2015,35 +2053,29 @@ async fn the_older_kind_syncs_through_a_relay_that_is_full_of_the_new_kind() {
     );
     assert_eq!(holds(&relay), (cap, 0));
 
-    // Two devices, and the relay between them. Every channel of theirs
-    // is new to the relay, and of the older kind.
-    let mut a = node("a", "personal", Some(relay.p2p));
-    let mut b = node("b", "personal", Some(relay.p2p));
-    a.start();
-    b.start();
-    let all = [&relay, &a, &b];
-    wait_for("a healthy", &all, 30, || healthy(&a));
-    wait_for("b healthy", &all, 30, || healthy(&b));
-    wait_for("a connected to the relay", &all, 60, || has_hot_peer(&a));
-    wait_for("b connected to the relay", &all, 60, || has_hot_peer(&b));
-    let personal = pair(&a, &b, "b", &all);
+    // Two nodes, and the relay between them. The channel of theirs is
+    // new to the relay, and of the older kind.
+    let group = "grp_550e8400-e29b-41d4-a716-446655440000";
+    let other = client_of(&relay).await.expect("the other client connects");
 
-    // What one publishes reaches the other, through the relay.
-    a.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "content": { "text": "hello from a" } }),
+    // What one pushes reaches the other, through the relay: the other is
+    // listed the item, and is handed it as it was pushed.
+    let from_a = client.item(group, 2_000);
+    assert_eq!(
+        client
+            .push_items(vec![from_a.clone()])
+            .await
+            .unwrap()
+            .stored,
+        1
     );
-    wait_for("b receives a's item", &all, 90, || {
-        let listened = b.post(
-            "/api/v1/channels/listen",
-            serde_json::json!({ "channel": personal, "limit": 10 }),
-        );
-        listened["items"]
-            .as_array()?
-            .iter()
-            .any(|i| i["content"]["text"] == "hello from a" && i["signature_valid"] == true)
-            .then_some(())
-    });
+    let handed = other.items_of(group).await;
+    let fetched = handed
+        .into_iter()
+        .find(|item| item.item_id == from_a.item_id)
+        .expect("the other is handed the item");
+    assert_eq!(fetched.encrypted_blob, from_a.encrypted_blob);
+    assert_eq!(fetched.signature, from_a.signature);
 
     // The relay holds items of the older kind now, counted by what they
     // are: far less than its cap, though its database holds a cap's
@@ -2076,20 +2108,15 @@ async fn the_older_kind_syncs_through_a_relay_that_is_full_of_the_new_kind() {
         client.push(vec![newer.to_wire()]).await.unwrap(),
         [PushAnswer::Refused(EntryRefused::NoRoom)]
     );
-    b.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "content": { "text": "and back" } }),
+    let from_b = other.item(group, 2_000);
+    assert_eq!(
+        other.push_items(vec![from_b.clone()]).await.unwrap().stored,
+        1
     );
-    wait_for("a receives b's item", &all, 90, || {
-        let listened = a.post(
-            "/api/v1/channels/listen",
-            serde_json::json!({ "channel": personal, "limit": 10 }),
-        );
-        listened["items"]
-            .as_array()?
-            .iter()
-            .any(|i| i["content"]["text"] == "and back")
-            .then_some(())
-    });
+    let back = client.items_of(group).await;
+    assert!(
+        back.iter().any(|item| item.item_id == from_b.item_id),
+        "the first node is not handed what the other pushed"
+    );
     assert_eq!(holds(&relay).0, cap);
 }
