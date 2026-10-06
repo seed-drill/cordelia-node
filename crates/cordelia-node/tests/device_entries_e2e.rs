@@ -203,6 +203,13 @@ impl Device {
         relay.and_then(|relay| relay.link.clone()).unwrap()
     }
 
+    /// The connection itself to the relay it calls `name`, for a test
+    /// that opens streams of its own on it.
+    fn connection(&self, name: &str) -> quinn::Connection {
+        let link = self.link(name);
+        self.manager.get_connection(link.relay()).unwrap().clone()
+    }
+
     /// The whole pass, as the node makes it each time it fetches.
     async fn passes(&self) {
         self.engine.pass(&self.relays, Pass::Whole).await;
@@ -1242,6 +1249,71 @@ async fn a_show_that_gets_no_leave_is_made_again_after_a_wait_that_doubles() {
     device.changes(&phrase(), &[&device], &[]);
     device.passes().await;
     assert_eq!(shows(&stuck), [Seen::Whole]);
+}
+
+/// A request is written only under the change entry that it was built
+/// under (decision 2026-10-04 §16). The one way in asks which entry the
+/// device keeps before it opens a stream, and a relay can hold the
+/// opening back: here, by having every stream that a connection may have
+/// open at once in use. The device applies a change while it waits. Once
+/// the stream opens, nothing is written on it: the request was for a
+/// channel of the generation that the device has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_is_not_written_once_the_entry_it_was_built_under_is_kept_no_more() {
+    use cordelia_core::protocol::QUIC_MAX_BIDI_STREAMS;
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    relay.seen();
+    assert_eq!(device.has_leave("relay"), Ok(()));
+    let link = device.link("relay");
+    let proof = proof_on(&device, "relay", "notes");
+    async fn proves(device: &Device, link: &Link, proof: &WireMessage) -> Result<bool, Refused> {
+        let read = |answer| matches!(answer, WireMessage::ChannelProved(_));
+        device.opens(link, proof, read, |_, proved| proved).await
+    }
+    // The control: with a stream to be had at once, the proof is asked.
+    assert_eq!(proves(&device, &link, &proof).await, Ok(true));
+    assert_eq!(relay.seen(), [Seen::Prove]);
+
+    // Every stream that the connection may have open is held by the
+    // test: the next is held back until one is let go.
+    let conn = device.connection("relay");
+    let mut held = Vec::new();
+    loop {
+        let opened = tokio::time::timeout(Duration::from_millis(300), conn.open_bi()).await;
+        match opened {
+            Ok(stream) => held.push(stream.expect("a stream is opened")),
+            // The relay holds the next one back.
+            Err(_) => break,
+        }
+        assert!(held.len() <= 4 * QUIC_MAX_BIDI_STREAMS as usize);
+    }
+    assert!(!held.is_empty());
+    let asks = proves(&device, &link, &proof);
+    let meanwhile = async {
+        // The request has leave, and waits for its stream. Nothing has
+        // reached the relay.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(relay.seen().is_empty());
+        // The device applies a change: it keeps another entry now.
+        device.changes(&phrase(), &[&device], &[]);
+        // One stream is let go, and the relay lets another be opened.
+        let (mut send, mut recv) = held.pop().unwrap();
+        let _ = send.reset(0u32.into());
+        let _ = recv.stop(0u32.into());
+    };
+    let (asked, ()) = tokio::join!(asks, meanwhile);
+    assert_eq!(asked, Err(Refused::KeptAnother));
+    // The stream was opened, and nothing was written on it: the relay
+    // was asked for no proof.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seen = relay.seen();
+    assert!(!seen.contains(&Seen::Prove), "{seen:?}");
+    drop(held);
 }
 
 /// Only an answer starts the wait that doubles (decision 2026-10-04

@@ -584,6 +584,13 @@ impl Leave {
     /// request was built under ([`Asked::under`]), and where it has asked
     /// as much on this connection as it asks of a relay in a minute.
     ///
+    /// **Which entry the device keeps is asked again once the stream is
+    /// open, and before anything is written on it** (decision 2026-10-04
+    /// §16). A relay can hold the opening of a stream back, for as long
+    /// as the one timeout. Where the device has applied a change
+    /// meanwhile, the request is for a channel that it has left: the
+    /// stream is let go with nothing sent on it.
+    ///
     /// `opened` is called once the stream is about to be opened, under
     /// the lock of the database that the leave was asked under: for what
     /// is kept of a request whatever comes back. It is not called for a
@@ -620,7 +627,19 @@ impl Leave {
             }
             opened(&conn);
         }
-        let answer = ask(&link.conn, protocol, request)
+        let (mut send, mut recv) = open_stream(&link.conn)
+            .await
+            .map_err(Refused::NotAnswered)?;
+        // The stream is open, which may have taken the relay a while:
+        // the request is written only where the device still keeps the
+        // entry that it was built under.
+        let still = self.keeps(&lock(db), under);
+        if let Err(refused) = still {
+            let _ = send.reset(0u32.into());
+            let _ = recv.stop(0u32.into());
+            return Err(refused);
+        }
+        let answer = exchange(send, recv, protocol, request)
             .await
             .map_err(Refused::NotAnswered)?;
         let answer = read(answer);
@@ -754,6 +773,12 @@ impl Leave {
     /// that entry still.
     fn may_use(&self, conn: &Connection, link: &Link, under: &[u8; 32]) -> Result<(), Refused> {
         self.has(conn, link).map_err(Refused::NoLeave)?;
+        self.keeps(conn, under)
+    }
+
+    /// Whether the device still keeps the change entry named `under` as
+    /// the latest: the one that a request was built under.
+    fn keeps(&self, conn: &Connection, under: &[u8; 32]) -> Result<(), Refused> {
         match at_relays::kept_id(conn) {
             Ok(Some(kept)) if kept == *under => Ok(()),
             _ => Err(Refused::KeptAnother),
@@ -781,12 +806,31 @@ async fn ask(
     protocol: Protocol,
     request: &WireMessage,
 ) -> Result<WireMessage, String> {
-    let (mut send, mut recv) =
-        match tokio::time::timeout(codec::STREAM_TIMEOUT, conn.open_bi()).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(format!("open_bi failed: {e}")),
-            Err(_) => return Err("open_bi timed out".into()),
-        };
+    let (send, recv) = open_stream(conn).await?;
+    exchange(send, recv, protocol, request).await
+}
+
+/// Open a new stream on `conn`, within the codec's one timeout. The peer
+/// says how many streams a connection may have open at once, so it can
+/// hold this back for as long as that timeout.
+async fn open_stream(
+    conn: &quinn::Connection,
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    match tokio::time::timeout(codec::STREAM_TIMEOUT, conn.open_bi()).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(format!("open_bi failed: {e}")),
+        Err(_) => Err("open_bi timed out".into()),
+    }
+}
+
+/// Ask one thing on a stream that is open, of `protocol`, and read its
+/// answer.
+async fn exchange(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    protocol: Protocol,
+    request: &WireMessage,
+) -> Result<WireMessage, String> {
     let mut stream = tokio::io::join(&mut recv, &mut send);
     let answer = codec::send_request(&mut stream, protocol, request)
         .await
