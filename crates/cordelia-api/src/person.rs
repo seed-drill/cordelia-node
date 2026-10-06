@@ -1253,6 +1253,10 @@ fn come_to(
     if let Some(before) = before {
         let leaving = &before.statement.statement;
         note_left_out(conn, identity, leaving, statement, now)?;
+        // A device's word that it left is in the personal channel that
+        // is left with this statement: it is kept where the device is
+        // still listed and nobody cleared it (§7.1).
+        crate::look::keep_left_words(conn, identity, leaving, statement, now)?;
         let from = Generation {
             number: leaving.number,
             secret: applied_secret(conn, leaving)?,

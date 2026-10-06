@@ -273,6 +273,20 @@ pub struct Look {
     pub says: Vec<String>,
 }
 
+impl Look {
+    /// The keys of the devices that have said that they left (decision
+    /// 2026-10-04 §5.2, §7.1): of the statement's, and of those added
+    /// since. A command that makes a change asks about each.
+    pub fn said_left(&self) -> Vec<&str> {
+        let listed = self.devices.iter().filter(|device| device.left);
+        let added = self.added.iter().filter(|device| device.left);
+        listed
+            .map(|device| device.device.key.as_str())
+            .chain(added.map(|device| device.device.key.as_str()))
+            .collect()
+    }
+}
+
 /// What the statement of a device that follows no phrase says of itself
 /// (decision 2026-10-04 §5.2).
 pub const NO_PHRASE: &str = "no recovery phrase yet: memory stays on this machine. Make one here \
@@ -373,6 +387,12 @@ fn of_its_person(
     look.change = Some(statement.number);
     look.statements_left = statements_left(statement.number);
 
+    // A word "left" that was kept across a statement counts as the word
+    // in this generation's personal channel does (§7.1).
+    let kept_left: Vec<[u8; 32]> = acts::left_words(conn)?
+        .iter()
+        .map(|word| word.key)
+        .collect();
     for device in &statement.devices {
         look.devices.push(Listed {
             device: Shown::of(&device.key, &device.label)?,
@@ -380,7 +400,7 @@ fn of_its_person(
             maker: device.key == statement.maker,
             applied: reader.applied(conn, &device.key)?,
             sent: reader.sent(conn, &device.key)?,
-            left: reader.left(conn, &device.key)?.is_some(),
+            left: reader.left(conn, &device.key)?.is_some() || kept_left.contains(&device.key),
         });
     }
     for key in &statement.removed {
@@ -746,6 +766,62 @@ struct Told {
     /// The key that is shown as left out no more, where the notice is of
     /// one.
     left_out: Option<[u8; 32]>,
+    /// The key whose word "left" is kept no more, where the notice is of
+    /// a word that was kept across a statement.
+    kept_left: Option<[u8; 32]>,
+}
+
+/// What is said of a device that has said it left (decision 2026-10-04
+/// §5.2).
+fn left_says(device: &Shown) -> String {
+    format!(
+        "{} left, and started again under another phrase. It still holds the secret it had, \
+         and is still listed: removing it, with the phrase, is what cuts it off (`cordelia \
+         remove-device`)",
+        device.named()
+    )
+}
+
+/// Keep each device's word that it left across the statement that this
+/// device applies at `now` (decision 2026-10-04 §7.1): the word is in the
+/// personal channel of the generation that is left, which is read no
+/// more. It is called in the transaction that applies `statement`, before
+/// anything of the statement `leaving` is dropped.
+///
+/// A word is kept where the new statement still lists its device's key,
+/// and nobody had cleared its notice here. A word that was kept at an
+/// earlier statement stays for as long as each statement since lists the
+/// key: it goes once one does not.
+pub(crate) fn keep_left_words(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    leaving: &Statement,
+    statement: &Statement,
+    now: i64,
+) -> Result<(), PersonError> {
+    let own = identity.public_key();
+    let kept = held_rows::additions(conn)?;
+    let reader = Reader::of(conn, leaving, &kept)?;
+    let mut keys: Vec<[u8; 32]> = leaving.devices.iter().map(|device| device.key).collect();
+    for record in &kept {
+        if !keys.contains(&record.key) {
+            keys.push(record.key);
+        }
+    }
+    for key in keys.iter().filter(|key| **key != own) {
+        let Some(id) = reader.left(conn, key)? else {
+            continue;
+        };
+        if statement.lists(key) && !acts::is_cleared(conn, &id)? {
+            acts::note_left(conn, key, &id, leaving.number, now)?;
+        }
+    }
+    for word in acts::left_words(conn)? {
+        if !statement.lists(&word.key) {
+            acts::clear_left(conn, &word.key)?;
+        }
+    }
+    Ok(())
 }
 
 /// Every notice that the device has to show, cleared or not.
@@ -766,6 +842,7 @@ fn told(
         },
         id,
         left_out,
+        kept_left: None,
     };
     // Each record of an addition (§6). A record for a key that the
     // statement lists adds no device, and tells of none: a device that
@@ -795,13 +872,21 @@ fn told(
         let Some(id) = reader.left(conn, key)? else {
             continue;
         };
-        let says = format!(
-            "{} left, and started again under another phrase. It still holds the secret it \
-             had, and is still listed: removing it, with the phrase, is what cuts it off \
-             (`cordelia remove-device`)",
-            Shown::of(key, &reader.label(key))?.named()
-        );
+        let says = left_says(&Shown::of(key, &reader.label(key))?);
         all.push(tell(id, "left", says, None));
+    }
+    // Each word "left" that was kept across a statement (§7.1): its
+    // device is still listed, and nobody has cleared it here. A device
+    // whose word in this generation is shown above is shown once.
+    for word in acts::left_words(conn)? {
+        let shown_above = reader.left(conn, &word.key)?.is_some();
+        if word.key == own || shown_above || !statement.lists(&word.key) {
+            continue;
+        }
+        let says = left_says(&Shown::of(&word.key, &reader.label(&word.key))?);
+        let mut told = tell(word.notice, "left", says, None);
+        told.kept_left = Some(word.key);
+        all.push(told);
     }
     // Each key that is not in the last change (§8).
     for shown in acts::left_out(conn)? {
@@ -865,11 +950,14 @@ pub fn clear(
         if acts::is_cleared(conn, &told.id)? {
             return Ok(None);
         }
-        match told.left_out {
-            Some(key) => {
+        match (told.left_out, told.kept_left) {
+            (Some(key), _) => {
                 acts::clear_left_out(conn, &key)?;
             }
-            None => acts::clear_notice(conn, &told.id, now)?,
+            (None, Some(key)) => {
+                acts::clear_left(conn, &key)?;
+            }
+            (None, None) => acts::clear_notice(conn, &told.id, now)?,
         }
         Ok(Some(told.notice))
     })
@@ -1458,6 +1546,87 @@ mod tests {
         // It is still shown as having left, in the list.
         assert!(seen(&s, 0).devices[2].left);
         assert_eq!(kinds(&seen(&s, 1)), ["left"]);
+    }
+
+    /// A device's word that it left outlives the next change, for as long
+    /// as its key is listed and nobody has cleared it (decision
+    /// 2026-10-04 §7.1): on the device that makes the change, and on one
+    /// that applies it later. The word itself is in the personal channel
+    /// of the generation that was left, which nobody reads again.
+    #[test]
+    fn test_a_word_that_a_device_left_outlives_a_change_until_it_is_cleared() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let now = s.tick();
+        let word = begin(&s[2].conn, &s[2].identity, now)
+            .unwrap()
+            .word
+            .unwrap();
+        for n in [0, 1] {
+            give(&mut s, n, &word);
+            assert_eq!(kinds(&seen(&s, n)), ["left"]);
+        }
+        let told = seen(&s, 0).notices[0].clone();
+        let key_of_2 = seen(&s, 0).devices[2].device.key.clone();
+        assert_eq!(seen(&s, 0).said_left(), [key_of_2.as_str()]);
+
+        // Device 1 makes a change that still lists device 2.
+        let change = s.change(1, &[0, 1, 2], &[]);
+        let after = seen(&s, 1);
+        assert_eq!(after.change, Some(3));
+        assert_eq!(after.notices, std::slice::from_ref(&told));
+        assert!(after.devices[2].left);
+        assert_eq!(after.said_left(), [key_of_2.as_str()]);
+        // Device 0 applies it later: the word is still shown there.
+        give(&mut s, 0, &change);
+        assert_eq!(seen(&s, 0).change, Some(3));
+        assert_eq!(seen(&s, 0).notices, std::slice::from_ref(&told));
+        assert!(seen(&s, 0).devices[2].left);
+
+        // A person clears it on device 0: it is shown there no more, and
+        // is still shown on device 1.
+        let id: [u8; 32] = hex::decode(&told.id).unwrap().try_into().unwrap();
+        let now = s.tick();
+        let cleared = clear(&s[0].conn, &s[0].identity, &id, now).unwrap();
+        assert_eq!(cleared, Some(told.clone()));
+        assert_eq!(clear(&s[0].conn, &s[0].identity, &id, now).unwrap(), None);
+        assert!(seen(&s, 0).notices.is_empty());
+        assert!(!seen(&s, 0).devices[2].left);
+        assert!(seen(&s, 0).said_left().is_empty());
+        assert_eq!(kinds(&seen(&s, 1)), ["left"]);
+
+        // A change later that lists it still: kept where it was kept, and
+        // not shown again where it was cleared.
+        let change = s.change(1, &[0, 1, 2], &[]);
+        give(&mut s, 0, &change);
+        assert_eq!(seen(&s, 1).notices, std::slice::from_ref(&told));
+        assert!(seen(&s, 0).notices.is_empty());
+        // And one that lists it no more: the word goes with the device.
+        s.change(1, &[0, 1], &[2]);
+        assert!(seen(&s, 1).notices.is_empty());
+        assert!(acts::left_words(&s[1].conn).unwrap().is_empty());
+
+        // A word that a person had cleared before a change is not kept
+        // across it.
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let now = s.tick();
+        let word = begin(&s[2].conn, &s[2].identity, now)
+            .unwrap()
+            .word
+            .unwrap();
+        give(&mut s, 0, &word);
+        let id: [u8; 32] = hex::decode(&seen(&s, 0).notices[0].id)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        clear(&s[0].conn, &s[0].identity, &id, now).unwrap();
+        s.change(0, &[0, 1, 2], &[]);
+        assert!(seen(&s, 0).notices.is_empty());
+        assert!(!seen(&s, 0).devices[2].left);
+        assert!(acts::left_words(&s[0].conn).unwrap().is_empty());
     }
 
     /// A device that cannot go on says why: it was removed, is in no

@@ -665,6 +665,9 @@ fn received(state: &AppState, now: i64) -> Option<serde_json::Value> {
 /// the same two minutes: what it could not fetch is said ([`fetch`],
 /// [`cycle`]).
 ///
+/// It is handed the key of each device that has said that it left, of
+/// which a person is asked whether it stays ([`look::Look::said_left`]).
+///
 /// With those it is handed what the command shows of names: each name
 /// that the personal channel lists, with the keys that list it, so that
 /// the names which only a device being removed syncs can be shown; and
@@ -775,6 +778,9 @@ pub async fn change_prepare(
         "apart_statement": apart_statement,
         "additions": additions,
         "standing": standing,
+        // Each device that has said that it left: a person is asked
+        // about each (§7.1).
+        "left": seen.said_left(),
         "could_not_fetch": could_not_fetch,
         "names": names,
         "received": received(&state, now()),

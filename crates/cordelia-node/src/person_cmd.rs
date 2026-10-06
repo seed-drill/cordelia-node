@@ -862,6 +862,9 @@ struct Handed {
     /// the statement lists in neither list: what the node says a person
     /// is asked about.
     added: Vec<SignedAddition>,
+    /// The key of each device that has said that it left, as the node
+    /// says it: a person is asked about each.
+    left: Vec<[u8; 32]>,
     /// Each name that the personal channel lists, with the keys that
     /// list it, as this device holds that channel.
     names: Vec<(String, Vec<[u8; 32]>)>,
@@ -937,6 +940,9 @@ impl Handed {
                 added.push(record);
             }
         }
+        let left: Vec<[u8; 32]> = list(handed, "left")
+            .filter_map(|key| decode_public_key(key.as_str()?).ok())
+            .collect();
         let mut names = Vec::new();
         for listed in list(handed, "names") {
             let by: Vec<[u8; 32]> = list(listed, "by")
@@ -960,6 +966,7 @@ impl Handed {
             over: text(handed, "over").to_string(),
             apart,
             added,
+            left,
             names,
             received,
         })
@@ -1057,8 +1064,13 @@ struct Question {
     says: String,
 }
 
+/// What is said of a device that has said that it left.
+const SAID_IT_LEFT: &str = "It has said that it left, and started again under another phrase: \
+                            it still holds what it held";
+
 /// The devices that a person is asked about at a removal or a renewal,
 /// in the order they are asked (decision 2026-10-04 §6, §7.1): each
+/// device of the last change that has said that it left, and then each
 /// device added since the last change, with who added it and when.
 /// `goes` is the key that the change removes, where it removes one.
 ///
@@ -1076,6 +1088,22 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
         .iter()
         .partition(|record| !added_since(&record.addition.adder));
     let mut asked = Vec::new();
+    // A device of the last change that has said that it left is shown as
+    // that: its word is kept across a change for as long as its key is
+    // listed and nobody has cleared it.
+    for device in &handed.applied.statement.devices {
+        let key = device.key;
+        if key == own || Some(key) == goes || !handed.left.contains(&key) {
+            continue;
+        }
+        asked.push(Question {
+            device: device.clone(),
+            says: format!(
+                "\n{}, a device of the last change. {SAID_IT_LEFT}:",
+                named(&device.label, &key)
+            ),
+        });
+    }
     for record in first.into_iter().chain(after) {
         let added = &record.addition;
         let key = added.device.key;
@@ -1083,13 +1111,17 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
             continue;
         }
         let says = format!(
-            "\n{}, added since the last change, from {} at {}{}:",
+            "\n{}, added since the last change, from {} at {}{}{}:",
             named(&added.device.label, &key),
             named(&handed.label(&added.adder), &added.adder),
             time_of(added.at),
             match Some(added.adder) == goes {
                 true => ". It was added by the device that is being removed",
                 false => "",
+            },
+            match handed.left.contains(&key) {
+                true => format!(". {SAID_IT_LEFT}"),
+                false => String::new(),
             }
         );
         asked.push(Question {
@@ -1098,6 +1130,20 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
         });
     }
     asked
+}
+
+/// The devices of the last change that stay with nothing asked: each but
+/// the one that goes, and but those that a person is asked about.
+fn stays_unasked(handed: &Handed, goes: Option<[u8; 32]>, asked: &[Question]) -> Vec<Device> {
+    let is_asked = |key: &[u8; 32]| asked.iter().any(|question| question.device.key == *key);
+    handed
+        .applied
+        .statement
+        .devices
+        .iter()
+        .filter(|device| Some(device.key) != goes && !is_asked(&device.key))
+        .cloned()
+        .collect()
 }
 
 /// Make a change (see the module's documentation): what the node
@@ -1238,12 +1284,16 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
             }
             let in_both = applied.lists(&device.key) && apart.lists(&device.key);
             let says = format!(
-                "\n{}, a device of {}:",
+                "\n{}, a device of {}{}:",
                 named(&device.label, &device.key),
                 match (in_both, applied.lists(&device.key)) {
                     (true, _) => "both changes",
                     (false, true) => "the change this device had applied",
                     (false, false) => "the change made apart",
+                },
+                match handed.left.contains(&device.key) {
+                    true => format!(". {SAID_IT_LEFT}"),
+                    false => String::new(),
                 }
             );
             match asks_of(at, &says, true)? {
@@ -1292,17 +1342,13 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         println!("  {}", handed.received_from(&goes));
         removed.push(goes);
     }
-    for device in &applied.devices {
-        if Some(device.key) != goes {
-            stay.push(device.clone());
-        }
-    }
+    let asked = questions(handed, goes);
+    stay.extend(stays_unasked(handed, goes, &asked));
     if !applied.lists(&own) {
         // This device was added since: the device that makes a statement
         // is always among its devices, whoever added it.
         stay.push(own_listing(at, handed)?);
     }
-    let asked = questions(handed, goes);
     if !asked.is_empty() {
         println!(
             "\nOf each of these, say whether it stays or is removed. No answer is suggested \
@@ -1993,6 +2039,72 @@ mod tests {
             .map(|asked| asked.device.key)
             .collect();
         assert_eq!(keys, [key(5), key(6), key(7)]);
+    }
+
+    /// A device that has said that it left is asked about at a change
+    /// (decision 2026-10-04 §7.1): one that the last change lists is asked
+    /// about first, as that, and stays only where a person says so; one
+    /// that was added since is asked about as an addition, and that it
+    /// left is said. The device that goes, and this one, are asked about
+    /// by neither.
+    #[test]
+    fn a_device_that_has_said_it_left_is_asked_about_at_a_change() {
+        let f = Fixture::new();
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let own = f.own.public_key();
+        let written = |key: &[u8; 32]| encode_public_key(key).unwrap();
+        let mut handed = f.handed(&f.statement, &[f.adds(key(5), "desktop")]);
+        // Nobody has left: the devices of the last change stay, unasked.
+        let read = f.read(&handed).unwrap();
+        let asked = questions(&read, None);
+        assert_eq!(asked.len(), 1);
+        let stay: Vec<[u8; 32]> = stays_unasked(&read, None, &asked)
+            .iter()
+            .map(|device| device.key)
+            .collect();
+        assert_eq!(stay, [own, f.listed]);
+
+        // The phone, which the last change lists, and the desktop, added
+        // since, have each said that they left. So has this device, by
+        // the node's word, which asks nothing of it.
+        handed["left"] = json!([
+            written(&key(5)),
+            written(&f.listed),
+            written(&own),
+            "no key"
+        ]);
+        let read = f.read(&handed).unwrap();
+        assert_eq!(read.left, [key(5), f.listed, own]);
+        let asked = questions(&read, None);
+        let keys: Vec<[u8; 32]> = asked.iter().map(|asked| asked.device.key).collect();
+        assert_eq!(keys, [f.listed, key(5)]);
+        assert_eq!(
+            asked[0].says,
+            format!(
+                "\n{}, a device of the last change. It has said that it left, and started \
+                 again under another phrase: it still holds what it held:",
+                named("phone", &f.listed)
+            )
+        );
+        assert!(
+            asked[1]
+                .says
+                .ends_with(&format!("at {}. {SAID_IT_LEFT}:", time_of(7))),
+            "{}",
+            asked[1].says
+        );
+        // It stays only where a person says so: unasked, this device
+        // alone.
+        let stay: Vec<[u8; 32]> = stays_unasked(&read, None, &asked)
+            .iter()
+            .map(|device| device.key)
+            .collect();
+        assert_eq!(stay, [own]);
+        // Where it is the device that goes, nothing is asked of it.
+        let asked = questions(&read, Some(f.listed));
+        let keys: Vec<[u8; 32]> = asked.iter().map(|asked| asked.device.key).collect();
+        assert_eq!(keys, [key(5)]);
+        assert_eq!(stays_unasked(&read, Some(f.listed), &asked).len(), 1);
     }
 
     /// A device that the applied statement does not list was added since.

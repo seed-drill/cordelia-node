@@ -1,7 +1,7 @@
 //! What a person did on this device at a terminal, and what the device
 //! still has to tell them (decision 2026-10-04 §5.1, §6, §8).
 //!
-//! Three tables, in the node's database beside what a device holds of its
+//! Four tables, in the node's database beside what a device holds of its
 //! person ([`crate::person`]), so that each changes in one transaction
 //! with a statement:
 //!
@@ -20,6 +20,14 @@
 //!   is named by. A device added since the last change, and a device that
 //!   has left, are shown on every device until a person clears them
 //!   there, at a terminal (§5.2, §6).
+//!
+//! - **The words "left" that outlive a statement** (`person_left`): a
+//!   device's word that it left is in the personal channel of the
+//!   generation it left, which a device reads no more once it applies a
+//!   statement. Where that statement still lists the device's key, and
+//!   nobody had cleared the word here, it is kept: the key, and what its
+//!   notice is named by. It is shown until a person clears it, or a
+//!   statement lists the key no more (§5.2, §7.1).
 //!
 //! Nothing here decides anything: whether a key is still within its hour,
 //! and what a notice is named by, are decided where these are read.
@@ -247,6 +255,77 @@ pub fn clear_left_out(conn: &Connection, key: &[u8; 32]) -> Result<bool, Cordeli
     .map_err(storage)
 }
 
+// ── The words "left" that outlive a statement ────────────────────────
+
+/// A device's word that it left, kept across a statement that still
+/// lists its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftWord {
+    /// The key of the device that said it left.
+    pub key: [u8; 32],
+    /// What the notice of it is named by: what a person clears.
+    pub notice: [u8; 32],
+    /// The number of the statement under which the device said so.
+    pub number: u64,
+    /// When this device noted it: when it applied the next statement.
+    pub noted_at: i64,
+}
+
+/// The device whose key is `key` said that it left, under the statement
+/// numbered `number`, and the statement that this device applies at `now`
+/// still lists it: its word is kept, named by `notice`. A key whose word
+/// is kept already keeps the one it has.
+pub fn note_left(
+    conn: &Connection,
+    key: &[u8; 32],
+    notice: &[u8; 32],
+    number: u64,
+    now: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_left (key, notice, number, noted_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(key) DO NOTHING",
+        params![
+            key.as_slice(),
+            notice.as_slice(),
+            i64::try_from(number).unwrap_or(i64::MAX),
+            now
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Every word "left" that the device keeps, in order of key.
+pub fn left_words(conn: &Connection) -> Result<Vec<LeftWord>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key, notice, number, noted_at FROM person_left ORDER BY key ASC")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LeftWord {
+                key: row.get(0)?,
+                notice: row.get(1)?,
+                number: row.get::<_, i64>(2)?.max(0) as u64,
+                noted_at: row.get(3)?,
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Keep the word of `key` no longer: a person cleared it, or a statement
+/// lists the key no more. Returns whether it was kept.
+pub fn clear_left(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "DELETE FROM person_left WHERE key = ?1",
+        params![key.as_slice()],
+    )
+    .map(|rows| rows > 0)
+    .map_err(storage)
+}
+
 // ── The notices a person cleared ─────────────────────────────────────
 
 /// A person cleared the notice named `notice`, at `now`. Cleared twice,
@@ -286,7 +365,12 @@ pub fn forget_cleared(conn: &Connection) -> Result<usize, CordeliaError> {
 /// Returns how many rows went.
 pub fn forget_all(conn: &Connection) -> Result<usize, CordeliaError> {
     let mut gone = 0;
-    for table in ["person_typed_keys", "person_left_out", "person_cleared"] {
+    for table in [
+        "person_typed_keys",
+        "person_left_out",
+        "person_cleared",
+        "person_left",
+    ] {
         gone += conn
             .execute(&format!("DELETE FROM {table}"), [])
             .map_err(storage)?;
@@ -427,9 +511,44 @@ mod tests {
         clear_notice(&conn, &one, 100).unwrap();
         type_key(&conn, &one, "no_phrase", 100).unwrap();
         note_left_out(&conn, &one, "laptop", 2, 100).unwrap();
-        assert_eq!(forget_all(&conn).unwrap(), 3);
+        note_left(&conn, &one, &other, 2, 100).unwrap();
+        assert_eq!(forget_all(&conn).unwrap(), 4);
         assert!(!is_cleared(&conn, &one).unwrap());
         assert!(typed_keys(&conn).unwrap().is_empty());
         assert!(left_out(&conn).unwrap().is_empty());
+        assert!(left_words(&conn).unwrap().is_empty());
+    }
+
+    /// A word "left" is kept once for a key, as it was first noted, and
+    /// until it is cleared.
+    #[test]
+    fn test_a_word_left_is_kept_once_for_a_key_until_it_is_cleared() {
+        let conn = db::open_in_memory().unwrap();
+        let (one, other) = ([9u8; 32], [8u8; 32]);
+        assert!(left_words(&conn).unwrap().is_empty());
+        note_left(&conn, &one, &[1u8; 32], 2, 100).unwrap();
+        note_left(&conn, &other, &[2u8; 32], 2, 100).unwrap();
+        // Noted again at a later statement, it keeps what it had.
+        note_left(&conn, &one, &[3u8; 32], 3, 200).unwrap();
+        let kept = left_words(&conn).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].key, other);
+        assert_eq!(
+            kept[1],
+            LeftWord {
+                key: one,
+                notice: [1u8; 32],
+                number: 2,
+                noted_at: 100
+            }
+        );
+        assert!(clear_left(&conn, &one).unwrap());
+        assert!(!clear_left(&conn, &one).unwrap());
+        let kept: Vec<[u8; 32]> = left_words(&conn)
+            .unwrap()
+            .iter()
+            .map(|word| word.key)
+            .collect();
+        assert_eq!(kept, [other]);
     }
 }

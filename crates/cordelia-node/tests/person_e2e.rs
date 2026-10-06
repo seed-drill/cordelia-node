@@ -2046,6 +2046,116 @@ fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
     assert_eq!(seen["removed"].as_array().unwrap().len(), 3, "{seen}");
 }
 
+// ── A word that outlives a change ────────────────────────────────────
+
+/// A device's word that it left outlives the next change, for as long as
+/// its key is listed and nobody has cleared it (decision 2026-10-04
+/// §5.2, §7.1). The tablet leaves, and the laptop and the desktop are
+/// told. The laptop is then off while the desktop makes a change that
+/// still lists the tablet: its prompt asks about the tablet as a device
+/// that has said that it left. Afterwards the desktop still shows that
+/// the tablet left, and so does the laptop once it has applied the
+/// change, though the word itself is in a channel that neither reads
+/// again. At the change after that the tablet, which the last change
+/// lists, is asked about as that, with no answer suggested.
+#[test]
+fn a_devices_word_that_it_left_outlives_the_next_change() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let tablet = device_started("tablet", &relay);
+    let desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    for new in [&tablet, &desktop] {
+        adds(&laptop, new, new.name);
+        has_applied(new, 1, &[&relay, &laptop, &tablet, &desktop]);
+    }
+
+    // The tablet leaves, by a person's own command there.
+    let mut at = tablet.at_terminal(&["phrase", "--name", "tablet"]);
+    at.says("This device leaves the ")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("Press Enter when they are written down");
+    let its_own = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back").types(&its_own);
+    at.done();
+    let told_it_left = |node: &Node| -> Option<()> {
+        notices(node)
+            .iter()
+            .any(|says| says.contains("tablet") && says.contains("left, and started again"))
+            .then_some(())
+    };
+    wait_for(
+        "the laptop and the desktop are told that the tablet left",
+        &[&relay, &laptop, &tablet, &desktop],
+        120,
+        || told_it_left(&laptop).and(told_it_left(&desktop)),
+    );
+
+    // The laptop is off while the desktop makes a change. The desktop
+    // was added since the last change, and so was the tablet: the tablet
+    // is asked about, and that it has said it left is said.
+    laptop.stop();
+    let mut at = desktop.at_terminal(&["renew"]);
+    at.says("Type `stays` to list this device").types("stays");
+    at.says("tablet")
+        .says("added since the last change, from")
+        .says("It has said that it left, and started again under another phrase");
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("devices (3):");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    assert_eq!(look(&desktop)["change"], 2);
+    // The notice is still on the desktop afterwards.
+    assert!(told_it_left(&desktop).is_some(), "{}", look(&desktop));
+
+    // The laptop comes back, and applies the change: the word is still
+    // shown there.
+    laptop.start();
+    wait_for("the laptop is up again", &[&laptop], 30, || {
+        healthy(&laptop)
+    });
+    has_applied(&laptop, 2, &[&relay, &laptop, &desktop]);
+    assert!(told_it_left(&laptop).is_some(), "{}", look(&laptop));
+    for node in [&laptop, &desktop] {
+        let seen = look(node);
+        let listed = seen["devices"].as_array().unwrap();
+        let of_the_tablet = listed
+            .iter()
+            .find(|device| device["label"] == "tablet")
+            .unwrap_or_else(|| panic!("the tablet is not listed: {seen}"));
+        assert_eq!(of_the_tablet["left"], true, "{}: {seen}", node.name);
+    }
+
+    // At the next change the tablet is a device of the last change, and
+    // is asked about as one that has said that it left: no answer is
+    // suggested.
+    let mut at = desktop.at_terminal(&["renew"]);
+    at.says("tablet")
+        .says("a device of the last change. It has said that it left");
+    at.says("Type `stays` or `removed`").types("");
+    at.says("That is none of the answers. No answer is suggested: type one.");
+    at.says("Type `stays` or `removed`").types("removed");
+    at.says("devices (2):");
+    at.says("removed keys (1):");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    has_applied(&laptop, 3, &[&relay, &laptop, &desktop]);
+    // The word goes with the device.
+    for node in [&laptop, &desktop] {
+        assert!(told_it_left(node).is_none(), "{}", look(node));
+    }
+}
+
 // ── The process that holds the phrase ────────────────────────────────
 
 /// The command line that the system says process `pid` runs.
