@@ -880,15 +880,16 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
             words_of(&desktop_key)
         ));
         // The tablet was added by the device that is being removed: it
-        // is shown as that, and no answer is suggested for it.
+        // is shown as that. No answer is suggested for it, or for any
+        // device added since: pressing Enter answers nothing.
         at.says(&format!(
             "tablet ({}), added since the last change, from desktop ({})",
             words_of(&tablet_key),
             words_of(&desktop_key)
         ));
         at.says("It was added by the device that is being removed");
-        at.says("[no answer is suggested]").types("");
-        at.says("That is none of the answers.");
+        at.says("Type `stays` or `removed`").types("");
+        at.says("That is none of the answers. No answer is suggested: type one.");
         at.says("Type `stays` or `removed`").types("stays");
         // The lists, from the bytes that will be signed.
         at.says("The change that the recovery phrase will sign (change 2):");
@@ -1111,8 +1112,11 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&desktop_key),
         words_of(&laptop_key)
     ));
-    at.says("Type `stays` or `removed` [Enter: stays]")
-        .types("");
+    // No answer is suggested for a device added since, whoever added it
+    // (decision 2026-10-04 §6): pressing Enter answers nothing.
+    at.says("Type `stays` or `removed`").types("");
+    at.says("That is none of the answers. No answer is suggested: type one.");
+    at.says("Type `stays` or `removed`").types("stays");
     at.says("The change that the recovery phrase will sign (change 2):");
     at.says("devices (2):");
     at.says("Make this change?").says("Type yes to go on");
@@ -1230,8 +1234,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         "tablet ({}), added since the last change",
         words_of(&tablet_key)
     ));
-    at.says("Type `stays` or `removed` [Enter: stays]")
-        .types("removed");
+    at.says("Type `stays` or `removed`").types("removed");
     at.says("The change that the recovery phrase will sign (change 3):");
     at.says("devices (2):");
     at.says("removed keys (1):");
@@ -1268,8 +1271,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
 
     // The laptop's command stands at its phrase prompt.
     let mut at = laptop.at_terminal(&["renew"]);
-    at.says("Type `stays` or `removed` [Enter: stays]")
-        .types("");
+    at.says("Type `stays` or `removed`").types("stays");
     at.says("The change that the recovery phrase will sign (change 2):");
     at.says("Make this change?")
         .says("Type yes to go on")
@@ -1634,7 +1636,7 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     let words = makes_a_phrase(&laptop, "laptop");
     adds(&laptop, &desktop, "desktop");
     // A change that lists both.
-    renews(&laptop, &[""], &words).done();
+    renews(&laptop, &["stays"], &words).done();
     applies(&desktop, 2, &[&relay, &laptop, &desktop]);
     // On a device that has seen no two changes made apart there is
     // nothing to settle.
@@ -1718,8 +1720,8 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     ));
     at.says(
         "Type `stays` or `removed`, or `neither` (it is in no list, and is added again by hand)",
-    );
-    at.says("[no answer is suggested]").types("stays");
+    )
+    .types("stays");
     at.says("The change that the recovery phrase will sign (change 4):");
     at.says("devices (2):");
     at.says("Make this change?")
@@ -1949,6 +1951,99 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
         .filter(|(what, _)| what.contains("cordelia.db"))
         .any(|(_, bytes)| words_in(bytes).contains("laptop"));
     assert!(in_files, "the search reads the node's database");
+}
+
+// ── A chain of two, at a removal ─────────────────────────────────────
+
+/// A chain of two at a removal (decision 2026-10-04 §6, §16). The desktop
+/// makes the phrase, and adds the laptop and the tablet; the tablet adds
+/// the phone. On the laptop, which the last change does not list, the
+/// desktop is removed.
+///
+/// - The laptop is shown its own addition, and its listing is confirmed
+///   by a typed answer.
+/// - The tablet, which the device being removed added, is asked about
+///   before the phone, which the tablet added.
+/// - No answer is suggested for either: pressing Enter answers nothing,
+///   and where the input ends at a question the command is refused, with
+///   nothing made.
+#[test]
+fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
+    let relay = relay_started();
+    let desktop = device_started("desktop", &relay);
+    let laptop = device_started("laptop", &relay);
+    let tablet = device_started("tablet", &relay);
+    let phone = device_started("phone", &relay);
+    let all = [&relay, &desktop, &laptop, &tablet, &phone];
+    let words = makes_a_phrase(&desktop, "desktop");
+    for (adder, new) in [(&desktop, &laptop), (&desktop, &tablet), (&tablet, &phone)] {
+        adds(adder, new, new.name);
+        has_applied(new, 1, &all);
+    }
+    wait_for("the laptop counts each device added", &all, 120, || {
+        let seen = look(&laptop);
+        let counted = seen["added"]
+            .as_array()?
+            .iter()
+            .filter(|added| added["counted"] == true)
+            .count();
+        (counted == 3).then_some(())
+    });
+    let desktop_key = key_of(&desktop);
+
+    // The input ends at the first question: nothing is made.
+    let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
+    at.says("Type `stays` to list this device").types("stays");
+    at.says("No answer is suggested for any of them: each is typed.");
+    at.says("Type `stays` or `removed`").ends_the_input();
+    let said = at.refused_within(std::time::Duration::from_secs(60));
+    assert!(
+        said.contains("the input ended before an answer was typed. Nothing was made."),
+        "{said}"
+    );
+    assert!(!said.contains("Make this change?"), "{said}");
+    assert_eq!(look(&laptop)["change"], 1);
+
+    let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
+    at.says("To be removed:");
+    at.says("This device is not in the last change: it was added since")
+        .says("Type `stays` to list this device")
+        .types("stays");
+    at.says("No answer is suggested for any of them: each is typed.");
+    // The tablet first: the device that is being removed added it.
+    at.says("tablet")
+        .says("added since the last change, from")
+        .says("desktop")
+        .says("It was added by the device that is being removed");
+    at.says("Type `stays` or `removed`").types("");
+    at.says("That is none of the answers. No answer is suggested: type one.");
+    at.says("Type `stays` or `removed`").types("removed");
+    // Then the phone, which the tablet added: Enter keeps it no more
+    // than it keeps the tablet.
+    at.says("phone")
+        .says("added since the last change, from")
+        .says("tablet");
+    at.says("Type `stays` or `removed`").types("");
+    at.says("That is none of the answers. No answer is suggested: type one.");
+    at.says("Type `stays` or `removed`").types("removed");
+    at.says("The change that the recovery phrase will sign (change 2):");
+    at.says("devices (1):");
+    at.says("(this device)");
+    at.says("removed keys (3):");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 2).");
+    let said = at.done();
+    // Each of the two was asked about, and asked again where Enter was
+    // pressed: no third device was.
+    assert_eq!(said.matches("added since the last change, from").count(), 4);
+    let seen = look(&laptop);
+    assert_eq!(seen["change"], 2, "{seen}");
+    assert_eq!(seen["devices"].as_array().unwrap().len(), 1, "{seen}");
+    assert_eq!(seen["devices"][0]["key"], key_of(&laptop), "{seen}");
+    assert_eq!(seen["removed"].as_array().unwrap().len(), 3, "{seen}");
 }
 
 // ── The process that holds the phrase ────────────────────────────────
@@ -2304,7 +2399,7 @@ fn changes_made_while_passes_are_in_flight_leave_nothing_of_a_channel_left() {
     };
 
     // Three changes, one after another, each made while that goes on.
-    renews(&laptop, &[""], &words).done();
+    renews(&laptop, &["stays"], &words).done();
     for number in [3, 4] {
         let mut at = renews(&laptop, &[], &words);
         at.says(&format!("The change is made (change {number})."));

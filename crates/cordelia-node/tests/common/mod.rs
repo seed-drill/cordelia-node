@@ -711,6 +711,21 @@ impl AtTerminal {
         self
     }
 
+    /// Press keys that are no line: `bytes` go to the terminal as they
+    /// are, with no Enter after them.
+    pub fn presses(&mut self, bytes: &[u8]) -> &mut Self {
+        use std::io::Write;
+        std::thread::sleep(Duration::from_millis(150));
+        self.types.write_all(bytes).unwrap();
+        self.types.flush().unwrap();
+        self
+    }
+
+    /// End the input, as Ctrl-D does at the start of a line.
+    pub fn ends_the_input(&mut self) -> &mut Self {
+        self.presses(&[0x04])
+    }
+
     /// Wait for the command to end: whether it succeeded, and everything
     /// that its terminal showed. Fails where it does not end in five
     /// minutes.

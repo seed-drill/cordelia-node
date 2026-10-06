@@ -201,12 +201,11 @@ impl Terminal {
     }
 
     /// Ask for one answer on a line: what a person typed, without the space
-    /// around it. Empty where nothing was typed.
-    pub fn answer(&self, asks: &str) -> anyhow::Result<String> {
+    /// around it. Empty where a line was ended with nothing typed, and
+    /// `None` where the input ended before a line did.
+    pub fn answer(&self, asks: &str) -> anyhow::Result<Option<String>> {
         say(asks)?;
-        Ok(line()?
-            .map(|typed| typed.trim().to_string())
-            .unwrap_or_default())
+        Ok(line()?.map(|typed| typed.trim().to_string()))
     }
 
     /// Show `shown` once, under the line `says`, until a person presses

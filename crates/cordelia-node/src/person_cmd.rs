@@ -1025,36 +1025,79 @@ enum Answer {
     Neither,
 }
 
-/// Ask whether a device stays or is removed. `suggested` is the answer
-/// that pressing Enter gives, where one is suggested. `neither` says
-/// that the third answer is on offer: the device is in no list.
-fn asks_of(
-    at: &Terminal,
-    says: &str,
-    suggested: Option<Answer>,
-    neither: bool,
-) -> anyhow::Result<Answer> {
+/// Ask whether a device stays or is removed. **No answer is suggested:
+/// each is typed** (decision 2026-10-04 §6), and pressing Enter answers
+/// nothing. `neither` says that the third answer is on offer: the device
+/// is in no list.
+///
+/// Where the input ends at the question, the command is refused: nothing
+/// is made of an answer that nobody typed.
+fn asks_of(at: &Terminal, says: &str, neither: bool) -> anyhow::Result<Answer> {
     let third = match neither {
         true => ", or `neither` (it is in no list, and is added again by hand)",
         false => "",
     };
-    let enter = match suggested {
-        Some(Answer::Stays) => " [Enter: stays]",
-        Some(Answer::Removed) => " [Enter: removed]",
-        _ => " [no answer is suggested]",
-    };
     loop {
-        let typed = at.answer(&format!(
-            "{says}\n  Type `stays` or `removed`{third}{enter}: "
-        ))?;
-        match (typed.as_str(), suggested) {
-            ("stays", _) => return Ok(Answer::Stays),
-            ("removed", _) => return Ok(Answer::Removed),
-            ("neither", _) if neither => return Ok(Answer::Neither),
-            ("", Some(suggested)) => return Ok(suggested),
-            _ => println!("  That is none of the answers."),
+        let typed = at.answer(&format!("{says}\n  Type `stays` or `removed`{third}: "))?;
+        match typed.as_deref() {
+            Some("stays") => return Ok(Answer::Stays),
+            Some("removed") => return Ok(Answer::Removed),
+            Some("neither") if neither => return Ok(Answer::Neither),
+            Some(_) => println!("  That is none of the answers. No answer is suggested: type one."),
+            None => anyhow::bail!("the input ended before an answer was typed. Nothing was made."),
         }
     }
+}
+
+/// One device that a person is asked about at a removal or a renewal.
+struct Question {
+    /// The device, as the change lists it where it stays.
+    device: Device,
+    /// What is said of it before the answer is asked.
+    says: String,
+}
+
+/// The devices that a person is asked about at a removal or a renewal,
+/// in the order they are asked (decision 2026-10-04 §6, §7.1): each
+/// device added since the last change, with who added it and when.
+/// `goes` is the key that the change removes, where it removes one.
+///
+/// **A device is asked about before the devices that it added:** what a
+/// person says of the one bears on what they say of the others. A chain
+/// is two long at most, so those that a device of the statement added
+/// come first, and those that such a device added after them, each in
+/// the order the node handed them. This device and the one that goes
+/// are asked about by neither.
+fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
+    let own = handed.this_device;
+    let added_since = |key: &[u8; 32]| handed.added.iter().any(|r| r.addition.device.key == *key);
+    let (first, after): (Vec<&SignedAddition>, Vec<&SignedAddition>) = handed
+        .added
+        .iter()
+        .partition(|record| !added_since(&record.addition.adder));
+    let mut asked = Vec::new();
+    for record in first.into_iter().chain(after) {
+        let added = &record.addition;
+        let key = added.device.key;
+        if key == own || Some(key) == goes {
+            continue;
+        }
+        let says = format!(
+            "\n{}, added since the last change, from {} at {}{}:",
+            named(&added.device.label, &key),
+            named(&handed.label(&added.adder), &added.adder),
+            time_of(added.at),
+            match Some(added.adder) == goes {
+                true => ". It was added by the device that is being removed",
+                false => "",
+            }
+        );
+        asked.push(Question {
+            device: added.device.clone(),
+            says,
+        });
+    }
+    asked
 }
 
 /// Make a change (see the module's documentation): what the node
@@ -1203,7 +1246,7 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
                     (false, false) => "the change made apart",
                 }
             );
-            match asks_of(at, &says, None, true)? {
+            match asks_of(at, &says, true)? {
                 Answer::Stays => stay.push(device.clone()),
                 Answer::Removed => removed.push(device.key),
                 Answer::Neither => {}
@@ -1259,27 +1302,17 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         // is always among its devices, whoever added it.
         stay.push(own_listing(at, handed)?);
     }
-    for record in &handed.added {
-        let added = &record.addition;
-        let key = added.device.key;
-        if key == own || Some(key) == goes {
-            continue;
-        }
-        let by_the_one_that_goes = Some(added.adder) == goes;
-        let says = format!(
-            "\n{}, added since the last change, from {} at {}{}:",
-            named(&added.device.label, &key),
-            named(&handed.label(&added.adder), &added.adder),
-            time_of(added.at),
-            match by_the_one_that_goes {
-                true => ". It was added by the device that is being removed",
-                false => "",
-            }
+    let asked = questions(handed, goes);
+    if !asked.is_empty() {
+        println!(
+            "\nOf each of these, say whether it stays or is removed. No answer is suggested \
+             for any of them: each is typed."
         );
-        let suggested = (!by_the_one_that_goes).then_some(Answer::Stays);
-        match asks_of(at, &says, suggested, false)? {
-            Answer::Stays => stay.push(added.device.clone()),
-            Answer::Removed => removed.push(key),
+    }
+    for question in asked {
+        match asks_of(at, &question.says, false)? {
+            Answer::Stays => stay.push(question.device),
+            Answer::Removed => removed.push(question.device.key),
             Answer::Neither => {}
         }
     }
@@ -1299,7 +1332,7 @@ fn own_listing(at: &Terminal, handed: &Handed) -> anyhow::Result<Device> {
     let typed = at.answer(&format!(
         "{says}\n  Type `stays` to list this device, or anything else to stop: "
     ))?;
-    if typed != "stays" {
+    if typed.as_deref() != Some("stays") {
         anyhow::bail!("That was not `stays`. Nothing was done.");
     }
     Ok(device)
@@ -1899,6 +1932,67 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(refused.contains("under another change"), "{refused}");
+    }
+
+    /// At a removal or a renewal a person is asked about each device added
+    /// since the last change, a device before the devices that it added,
+    /// in whichever order the node handed the records (decision
+    /// 2026-10-04 §6): and never about this device, or the one that goes.
+    #[test]
+    fn a_device_is_asked_about_before_the_devices_that_it_added() {
+        let f = Fixture::new();
+        let id = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap();
+        let key = |n: u8| id(n).public_key();
+        // This device added 5 and 8; 5 added 6 and 7.
+        let records = [
+            f.added_by(&id(5), key(6), "tablet"),
+            f.adds(key(8), "watch"),
+            f.added_by(&id(5), key(7), "phone two"),
+            f.adds(key(5), "desktop"),
+        ];
+        let handed = f.read(&f.handed(&f.statement, &records)).unwrap();
+        let asked = questions(&handed, None);
+        let keys: Vec<[u8; 32]> = asked.iter().map(|asked| asked.device.key).collect();
+        assert_eq!(keys, [key(8), key(5), key(6), key(7)]);
+        assert_eq!(asked[1].device, Device::new(key(5), "desktop").unwrap());
+        assert_eq!(
+            asked[2].says,
+            format!(
+                "\n{}, added since the last change, from {} at {}:",
+                named("tablet", &key(6)),
+                named("desktop", &key(5)),
+                time_of(7)
+            )
+        );
+        // Where the device that added one is the one that goes, that is
+        // said, and the one that goes is not asked about.
+        let asked = questions(&handed, Some(key(5)));
+        let keys: Vec<[u8; 32]> = asked.iter().map(|asked| asked.device.key).collect();
+        assert_eq!(keys, [key(8), key(6), key(7)]);
+        assert!(
+            !asked[0].says.contains("being removed"),
+            "{}",
+            asked[0].says
+        );
+        for by_the_one_that_goes in &asked[1..] {
+            assert!(
+                by_the_one_that_goes
+                    .says
+                    .ends_with(". It was added by the device that is being removed:"),
+                "{}",
+                by_the_one_that_goes.says
+            );
+        }
+        // This device is asked about by nobody: its listing is confirmed
+        // apart.
+        let mut handed = f.handed(&f.statement, &records);
+        handed["this_device"] = encode_public_key(&key(8)).unwrap().into();
+        let read = Handed::of(&handed, &key(8)).unwrap();
+        let keys: Vec<[u8; 32]> = questions(&read, None)
+            .iter()
+            .map(|asked| asked.device.key)
+            .collect();
+        assert_eq!(keys, [key(5), key(6), key(7)]);
     }
 
     /// A device that the applied statement does not list was added since.
