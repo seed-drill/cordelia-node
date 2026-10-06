@@ -1,15 +1,23 @@
-// Not built for now. These tests set devices up as the older kind of
-// channel did, which a device carries no longer (decision 2026-10-04
-// §10): the file is built again once its tests set them up under a
-// recovery phrase.
-#![cfg(any())]
-
 //! The Claude Code adapter across two devices (decision
-//! 2026-09-30-agent-memory-sync §4.5, §10).
+//! 2026-09-30-agent-memory-sync §4.5, §10; decision 2026-10-04 §2.2, §5.2,
+//! §6, §10).
 //!
 //! Each device has its own home, `~/.claude`, and clone of the same
-//! repository at a different path. Nodes are in-process; a stand-in relay
-//! copies items between their databases.
+//! repository at a different path. Nodes are in-process. A stand-in relay
+//! gives what one device holds in the channels of its own to the other,
+//! through the one door for an entry from outside.
+//!
+//! Two devices of one person are made as a person makes them: the first
+//! makes a recovery phrase and adds the second, which accepts. A name's
+//! channel comes from the person's secret and the name, so no channel is
+//! made or joined: a device that maps a name has its channel.
+//!
+//! A node is set up with no relay, so that a folder's first cycle waits
+//! for none, unless a test says otherwise. A test does where a device
+//! comes to sync a name that the other has already written in, with files
+//! of its own to bring: its first cycle there then waits until the
+//! stand-in has handed it the name's channel, as it does on a node that
+//! has relays (decision 2026-10-04 §6).
 //!
 //! Most tests sync everything found (`--all`), which is how discovery is
 //! exercised; the tests from `nothing_syncs_until_a_folder_is_mapped` on
@@ -20,14 +28,24 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-use cordelia_api::entries::{self, Write};
-use cordelia_api::membership;
 use cordelia_api::state::AppState;
+use cordelia_api::{adding, names, person, publish, take};
+use cordelia_crypto::bech32::decode_channel_id;
+use cordelia_crypto::derive;
+use cordelia_crypto::entry::{Entry, Inside, Link, Value};
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_storage::{channels, items, naming};
+use cordelia_crypto::phrase::Phrase;
+use cordelia_storage::entries as stored;
+use cordelia_storage::meta;
+use cordelia_storage::person as held_rows;
 use cordelia_sync::claude::ClaudeAdapter;
 
 const REMOTE: &str = "git@github.com:seed-drill/cordelia-node.git";
+
+/// This machine's clock, in seconds.
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
 
 struct Device {
     state: AppState,
@@ -37,6 +55,8 @@ struct Device {
 }
 
 impl Device {
+    /// A device that follows no recovery phrase yet. Its node is set up
+    /// with no relay: a folder's first cycle waits for none.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         // Real paths, as Claude Code records them.
@@ -60,11 +80,10 @@ impl Device {
             outbox_refused: Default::default(),
             relist: Default::default(),
             sync_control: Default::default(),
-            usable_keys: Default::default(),
             own_channels: Default::default(),
             history: Default::default(),
         };
-        membership::ensure_own_inbox(&state).unwrap();
+        state.own_channels.set_up_with(0);
         let adapter = ClaudeAdapter::new(
             home.join(".claude"),
             home.clone(),
@@ -78,14 +97,24 @@ impl Device {
         }
     }
 
+    /// Make a recovery phrase on this device, as `cordelia phrase` does:
+    /// it follows the phrase from then, alone, and has a channel for
+    /// every name.
+    fn with_phrase(self) -> Self {
+        {
+            let db = self.state.db.lock().unwrap();
+            let phrase = Phrase::generate().unwrap();
+            person::first_statement(&db, &self.state.identity, &phrase, "desktop", now()).unwrap();
+        }
+        self
+    }
+
     /// Turn sync on for this device's Claude Code directory, as
-    /// `cordelia sync claude` does. A cycle does nothing until it is. It
-    /// comes after pairing: a device that already syncs is not moved into
-    /// another device's set.
+    /// `cordelia sync claude` does. A cycle does nothing until it is.
     fn sync_on(self) -> Self {
-        cordelia_storage::meta::set(
+        meta::set(
             &self.state.db.lock().unwrap(),
-            cordelia_storage::meta::SYNC_CLAUDE_DIR,
+            meta::SYNC_CLAUDE_DIR,
             &self.home.join(".claude").display().to_string(),
         )
         .unwrap();
@@ -167,64 +196,111 @@ impl Device {
     }
 }
 
-/// Copy every item `from` holds that `to` can use: `to`'s inbox, and every
-/// channel `to` has a row for.
+/// The secret of a device's personal channel, in the generation it has
+/// applied.
+fn personal_secret(d: &Device) -> [u8; 32] {
+    let db = d.state.db.lock().unwrap();
+    let person = held_rows::applied_secret(&db).unwrap().unwrap();
+    derive::personal_secret(&person.secret).unwrap()
+}
+
+/// The entries a device's store holds in the channel whose ID is
+/// `channel`, as it holds them and in the order it stored them.
+fn stored_in(d: &Device, channel: &[u8; 32]) -> Vec<stored::StoredEntry> {
+    let db = d.state.db.lock().unwrap();
+    stored::channel_entries_after(&db, channel, 0, 100_000).unwrap()
+}
+
+/// The channels of a device's own: the personal channel, and the channel
+/// of each name it holds. None on a device that follows no phrase.
+fn own_channels(d: &Device) -> Vec<[u8; 32]> {
+    let db = d.state.db.lock().unwrap();
+    let Some(person) = held_rows::applied_secret(&db).unwrap() else {
+        return Vec::new();
+    };
+    let personal = derive::personal_secret(&person.secret).unwrap();
+    let mut channels = vec![derive::channel_id(&personal).unwrap()];
+    channels.extend(
+        held_rows::names(&db)
+            .unwrap()
+            .into_iter()
+            .map(|held| held.channel),
+    );
+    channels
+}
+
+/// How many entries a device's store holds, in every channel.
+fn entries_held(d: &Device) -> i64 {
+    let db = d.state.db.lock().unwrap();
+    db.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// How far a device's store has got: the place of the last entry it
+/// stored in a channel of its own, and 0 where it holds none. Every entry
+/// the device writes or takes has a later place than any before it.
+fn written(d: &Device) -> i64 {
+    own_channels(d)
+        .iter()
+        .flat_map(|channel| stored_in(d, channel))
+        .map(|held| held.seq)
+        .max()
+        .unwrap_or(0)
+}
+
+/// A stand-in relay: give `to` every entry that `from` holds in the
+/// channels of its own and that `to` does not hold yet, through the one
+/// door for an entry from outside, as a relay's pages do. `to` takes what
+/// is of its personal channel and of the channel of a name that it holds
+/// itself, and refuses the rest, which is offered again the next time.
+///
+/// An entry that a key signed is refused until the record that makes
+/// that key count has arrived. So where a key came to count, or came to
+/// may add, everything is given again, as a node reads its channels again
+/// from the start.
+///
+/// The stand-in has then handed `to` the whole of the channel of each
+/// name that `to` holds, and `to` is told so, as a node tells itself of a
+/// relay: a folder there that waited for its channel waits no more.
 fn relay(from: &Device, to: &Device) {
-    let wanted: Vec<String> = {
-        let db = to.state.db.lock().unwrap();
-        let mut ids = channels::list_stored_channel_ids(&db).unwrap();
-        ids.extend(
-            channels::list_for_entity(&db, &to.pk())
-                .unwrap()
-                .into_iter()
-                .map(|c| c.channel_id),
-        );
-        ids.push(naming::inbox_channel_id(&to.pk()));
-        ids.sort();
-        ids.dedup();
-        ids
-    };
-    let stored: Vec<items::StoredItem> = {
-        let db = from.state.db.lock().unwrap();
-        wanted
-            .iter()
-            .flat_map(|ch| items::query_sync(&db, ch, None, 100_000).unwrap())
-            .collect()
-    };
+    let held: Vec<Entry> = own_channels(from)
+        .iter()
+        .flat_map(|channel| stored_in(from, channel))
+        .map(|held| held.entry)
+        .collect();
     let db = to.state.db.lock().unwrap();
-    for it in stored {
-        let slot: Option<[u8; 32]> = it.slot.as_ref().map(|s| s.as_slice().try_into().unwrap());
-        let _ = items::insert_item(
-            &db,
-            &items::NewItem {
-                item_id: &it.item_id,
-                channel_id: &it.channel_id,
-                author_id: it.author_id.as_slice().try_into().unwrap(),
-                item_type: &it.item_type,
-                published_at: &it.published_at,
-                parent_id: it.parent_id.as_deref(),
-                key_version: it.key_version,
-                content_hash: &it.content_hash,
-                signature: &it.signature,
-                encrypted_blob: &it.encrypted_blob,
-                is_tombstone: it.is_tombstone,
-                slot: slot.as_ref(),
-                rev: it.rev,
-            },
-        );
+    let mut again = true;
+    while again {
+        again = false;
+        for entry in &held {
+            let there = stored::author_entry(&db, &entry.channel, &entry.slot, &entry.author);
+            if there.unwrap().is_some_and(|there| there.entry == *entry) {
+                continue;
+            }
+            let entry = entry.clone().check().unwrap();
+            let taken = take::take(&db, &to.state.identity, &entry, now()).unwrap();
+            if let take::Taken::Own {
+                came_to_count,
+                came_to_add,
+                ..
+            } = taken
+            {
+                again |= came_to_count + came_to_add > 0;
+            }
+        }
+    }
+    for held in held_rows::names(&db).unwrap() {
+        let handed = std::time::Instant::now();
+        to.state
+            .own_channels
+            .fetched_from(&held.channel, "stand-in", handed);
     }
 }
 
-/// Everything flows both ways until quiet: relay, apply invites, grant
-/// join requests, sync -- what each node's p2p loop and adapter do.
+/// Everything flows both ways until quiet: the relay, and a cycle of each
+/// device's adapter, which is what each node's loops do.
 fn settle(a: &mut Device, b: &mut Device) {
     for _ in 0..5 {
-        relay(a, b);
-        relay(b, a);
-        membership::process_inbox(&a.state).unwrap();
-        membership::process_inbox(&b.state).unwrap();
-        membership::process_join_requests(&a.state).unwrap();
-        membership::process_join_requests(&b.state).unwrap();
         relay(a, b);
         relay(b, a);
         a.cycle();
@@ -235,17 +311,43 @@ fn settle(a: &mut Device, b: &mut Device) {
 /// Set a per-device sync setting in node metadata.
 fn set_meta(d: &Device, key: &str, value: &str) {
     let db = d.state.db.lock().unwrap();
-    cordelia_storage::meta::set(&db, key, value).unwrap();
+    meta::set(&db, key, value).unwrap();
 }
 
-/// Two devices of one person: A adds B, B accepts A. Nothing syncs until
-/// folders are mapped.
+/// `first`, which follows a phrase, adds `new` under `label`, as
+/// `cordelia add-device` does, and `new` accepts what it is handed, as
+/// `cordelia accept` does: it follows the same phrase from then, and has
+/// the same channel for every name.
+fn add(first: &Device, new: &Device, label: &str) {
+    let at = now();
+    let added = {
+        let db = first.state.db.lock().unwrap();
+        adding::add_device(&db, &first.state.identity, &new.pk(), label, at).unwrap()
+    };
+    let db = new.state.db.lock().unwrap();
+    let sync_on = meta::get(&db, meta::SYNC_CLAUDE_DIR).unwrap().is_some();
+    let accepted = adding::accept(
+        &db,
+        &new.state.identity,
+        &first.pk(),
+        at,
+        sync_on,
+        &added.hand_over,
+        at,
+    )
+    .unwrap();
+    assert!(
+        matches!(accepted, adding::Accepted::Joined(_)),
+        "{accepted:?}"
+    );
+}
+
+/// Two devices of one person: A makes a recovery phrase and adds B, and B
+/// accepts. Nothing syncs until folders are mapped.
 fn paired_explicit() -> (Device, Device) {
-    let a = Device::new();
+    let a = Device::new().with_phrase();
     let b = Device::new();
-    membership::add_device(&a.state, &b.pk(), Some("b")).unwrap();
-    relay(&a, &b);
-    membership::accept(&b.state, &a.pk(), Some("a")).unwrap();
+    add(&a, &b, "laptop");
     (a.sync_on(), b.sync_on())
 }
 
@@ -253,13 +355,22 @@ fn paired_explicit() -> (Device, Device) {
 fn paired() -> (Device, Device) {
     let (a, b) = paired_explicit();
     for d in [&a, &b] {
-        set_meta(d, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+        set_meta(d, meta::SYNC_CLAUDE_ALL, "on");
     }
     (a, b)
 }
 
+/// The names that a device's folders are mapped to.
+fn mapped(db: &rusqlite::Connection) -> Vec<String> {
+    let mappings: Vec<cordelia_api::types::SyncMapping> = meta::get(db, meta::SYNC_CLAUDE_MAPPINGS)
+        .unwrap()
+        .map_or_else(Vec::new, |json| serde_json::from_str(&json).unwrap());
+    mappings.into_iter().map(|mapping| mapping.name).collect()
+}
+
 /// Declare a mapping on a device, as `cordelia sync map` does: through the
-/// node's own handler, with its checks.
+/// node's own handler, with its checks, and with what the node then says
+/// of the names it syncs.
 fn map(d: &Device, folder: &Path, name: &str) {
     let request = cordelia_api::types::SyncMapRequest {
         folder: folder.display().to_string(),
@@ -267,25 +378,32 @@ fn map(d: &Device, folder: &Path, name: &str) {
         home: folder == d.home,
     };
     let db = d.state.db.lock().unwrap();
+    let before = mapped(&db);
     cordelia_api::sync::add_mapping(&d.state.sync_control, &db, &request, &d.home).unwrap();
+    cordelia_api::sync::names_follow(&d.state, &db, &before);
 }
 
 /// Remove a mapping on a device, as `cordelia sync unmap` does, through
 /// the node's own handler: the folder forgets what it had agreed with its
 /// channel, and is also excluded, so nothing picks it up under another
-/// name.
+/// name. The device says no longer that it syncs the name, and holds it
+/// no more.
 fn unmap(d: &Device, folder: &Path) {
     let request = cordelia_api::types::SyncUnmapRequest {
         folder: folder.display().to_string(),
     };
     let db = d.state.db.lock().unwrap();
+    let before = mapped(&db);
     cordelia_api::sync::remove_mapping(&d.state.sync_control, &db, &request).unwrap();
+    cordelia_api::sync::names_follow(&d.state, &db, &before);
 }
 
 /// Change a device's sync settings as `cordelia sync claude` does: through
-/// the node's own handler, with what it forgets. Turning sync off is
-/// followed by what the node's loop does next: this person's other devices
-/// stop listing what this one synced.
+/// the node's own handler, with what it forgets and what it then says of
+/// the names it syncs. Turning sync off is followed by what the node's
+/// loop does next: it sees to it that this device says of no name that it
+/// syncs it, so that this person's other devices stop listing what this
+/// one synced.
 fn claude(d: &Device, mut body: serde_json::Value) {
     let off = body["enabled"] == false;
     if !off {
@@ -294,8 +412,10 @@ fn claude(d: &Device, mut body: serde_json::Value) {
     let request: cordelia_api::types::SyncClaudeRequest = serde_json::from_value(body).unwrap();
     {
         let db = d.state.db.lock().unwrap();
+        let before = mapped(&db);
         cordelia_api::sync::set_claude(&d.state.sync_control, &db, &request, Some(&d.home))
             .unwrap();
+        cordelia_api::sync::names_follow(&d.state, &db, &before);
     }
     if off {
         let count = d.state.sync_control.generation();
@@ -314,12 +434,6 @@ fn settle_reporting(
 ) {
     let mut reports = Default::default();
     for _ in 0..5 {
-        relay(a, b);
-        relay(b, a);
-        for d in [&*a, &*b] {
-            membership::process_inbox(&d.state).unwrap();
-            membership::process_join_requests(&d.state).unwrap();
-        }
         relay(a, b);
         relay(b, a);
         reports = (a.adapter.run_cycle(&a.state), b.adapter.run_cycle(&b.state));
@@ -344,7 +458,7 @@ fn read(dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
-/// The channel a device syncs `name` with.
+/// The channel a device syncs `name` with: its ID, as it is written.
 fn channel_of(d: &mut Device, name: &str) -> String {
     d.cycle()
         .folders
@@ -354,11 +468,96 @@ fn channel_of(d: &mut Device, name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} is not syncing on this device"))
 }
 
-/// Whether a device could read a channel: it is a member, or holds its key.
-fn can_read(d: &Device, channel: &str) -> bool {
+/// Whether a device has anything of the channel whose ID is written
+/// `channel`: it holds the name that the channel is of, or its store
+/// holds an entry of it. (Every device of a person can derive the channel
+/// of every name. It fetches and keeps only those of the names it holds.)
+fn holds(d: &Device, channel: &str) -> bool {
+    let id = decode_channel_id(channel).unwrap();
+    let named = {
+        let db = d.state.db.lock().unwrap();
+        held_rows::name_of_channel(&db, &id).unwrap().is_some()
+    };
+    named || !stored_in(d, &id).is_empty()
+}
+
+/// What a device takes as the current version of `file` in the name
+/// `name`, which it holds: its revision and its value, or `None` where
+/// the slot holds no version.
+fn version_of(d: &Device, name: &str, file: &str) -> Option<(u64, Value)> {
     let db = d.state.db.lock().unwrap();
-    channels::is_member(&db, channel, &d.pk()).unwrap()
-        || cordelia_storage::psk::read_psk(&d.state.home_dir, channel).is_ok()
+    let slot = publish::read(&db, name, file).unwrap().slot;
+    slot.current.map(|version| (version.rev, version.value))
+}
+
+/// The entries a device holds of the current version of `file` in the
+/// name `name`: for each, the key that signed it and its chain.
+fn entries_of(d: &Device, name: &str, file: &str) -> Vec<([u8; 32], Option<Vec<Link>>)> {
+    let db = d.state.db.lock().unwrap();
+    let slot = publish::read(&db, name, file).unwrap().slot;
+    let current = slot.current.expect("the slot holds a version");
+    current
+        .entries
+        .into_iter()
+        .map(|entry| (entry.author, entry.chain))
+        .collect()
+}
+
+/// Put in a device's store its own entry under `name` in the channel
+/// whose secret is `secret`, at `rev`, with the chain of a new file's
+/// entry: what the device would hold had it written it, whatever a
+/// command or the adapter would have refused to write.
+fn put(d: &Device, secret: &[u8; 32], name: &str, value: Value, rev: u64) {
+    let inside = Inside {
+        name: name.to_string(),
+        value,
+        chain: Some(Vec::new()),
+    };
+    let entry = Entry::seal(secret, &d.state.identity, rev, &inside)
+        .unwrap()
+        .check()
+        .unwrap();
+    let db = d.state.db.lock().unwrap();
+    let outcome = stored::store(&db, &entry, now()).unwrap();
+    assert_eq!(outcome, stored::Outcome::Stored);
+}
+
+/// Publish `value` under `file` in the name `name`, which the device
+/// holds, over whatever the slot holds: as its node's API does for any
+/// caller, with none of the adapter's checks.
+fn write(d: &Device, name: &str, file: &str, value: Value) {
+    let db = d.state.db.lock().unwrap();
+    let read = publish::read(&db, name, file).unwrap();
+    let write = publish::Write {
+        name,
+        file,
+        value,
+        planned: publish::PlannedAgainst::what_is_in(&read.slot),
+        merge: None,
+    };
+    let published = publish::publish(&db, &d.state.identity, &write, now()).unwrap();
+    assert!(
+        matches!(published, publish::Published::Made(_)),
+        "{published:?}"
+    );
+}
+
+/// What a device's store holds in the channel whose secret is `secret`,
+/// opened: each entry's signer, with what the entry holds.
+fn opened(d: &Device, secret: &[u8; 32]) -> Vec<([u8; 32], Inside)> {
+    let channel = derive::channel_id(secret).unwrap();
+    stored_in(d, &channel)
+        .into_iter()
+        .map(|held| {
+            let entry = held.entry.check().unwrap();
+            (entry.author, entry.open(secret).unwrap())
+        })
+        .collect()
+}
+
+/// What a chain names `text` by, as signed by the device `by`.
+fn link(text: &str, by: &Device) -> Link {
+    Link::of(&Value::Text(text.into()), by.pk())
 }
 
 const PROJECT: &str = "github.com/seed-drill/cordelia-node";
@@ -419,6 +618,7 @@ fn project_memory_follows_the_repo_not_the_path() {
         .find(|f| f.project == "github.com/seed-drill/cordelia-node")
         .expect("project folder reported");
     assert!(project.channel_id.is_some() && !project.waiting);
+    assert_eq!(project.channel_id, Some(channel_of(&mut a, PROJECT)));
 
     // Home memory does not leak into the project folder, or vice versa.
     let (a_home, b_home) = (a.home_memory(), b.home_memory());
@@ -665,32 +865,56 @@ fn an_index_overtaken_by_two_edits_is_kept_whole_beside_it() {
     }
 }
 
-/// Only the entries of memory files say what they were written after.
-/// What the adapter writes in the personal channel (the map from a name to
-/// its channel, each device's list of what it syncs) says nothing, and is
-/// read by its revision as it always was.
+/// Only the entries of memory files say what they were written after: an
+/// edit's entry names, first in its chain, the version it was written
+/// over. What the adapter writes in the personal channel (each device's
+/// word that it syncs a name) is written after nothing: it has the chain
+/// of a new file's entry, and is read from its own signer alone.
 #[test]
 fn only_memory_entries_say_what_they_were_written_after() {
     let (mut a, mut b) = paired();
     let a_mem = a.home_memory();
-    b.home_memory();
+    let b_mem = b.home_memory();
     std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
     settle(&mut a, &mut b);
-    let home = channel_of(&mut a, "~");
-    let personal = membership::personal_channel_id(&a.state).unwrap();
-    let says = |channel: &str| -> Vec<(String, bool)> {
+    std::fs::write(b_mem.join("notes.md"), "two\n").unwrap();
+    settle(&mut a, &mut b);
+
+    // Each of the two devices' words that it syncs home memory.
+    let mut words: Vec<([u8; 32], Inside)> = opened(&a, &personal_secret(&a))
+        .into_iter()
+        .filter(|(_, inside)| inside.name.starts_with("name/"))
+        .collect();
+    words.sort_by_key(|(signer, _)| *signer);
+    let mut signers = vec![a.pk(), b.pk()];
+    signers.sort();
+    assert_eq!(
+        words.iter().map(|(signer, _)| *signer).collect::<Vec<_>>(),
+        signers
+    );
+    for (_, word) in &words {
+        assert_eq!(word.name, names::word_name("~"));
+        assert_eq!(word.chain, Some(Vec::new()), "{word:?}");
+    }
+
+    // The one memory file, whose version is B's edit of what A wrote.
+    let in_home: Vec<(String, Vec<Option<Vec<Link>>>)> = {
         let db = a.state.db.lock().unwrap();
-        cordelia_api::entries::current(&a.state, &db, channel)
+        publish::read_name(&db, "~")
             .unwrap()
+            .slots
             .into_iter()
-            .map(|e| (e.key, e.current.after.is_some()))
+            .filter_map(|slot| slot.current)
+            .map(|version| {
+                let chains = version.entries.into_iter().map(|e| e.chain).collect();
+                (version.name, chains)
+            })
             .collect()
     };
-    let in_personal = says(&personal);
-    // The name's channel, and each of the two devices' lists.
-    assert!(in_personal.len() >= 3, "{in_personal:?}");
-    assert!(in_personal.iter().all(|(_, says)| !says), "{in_personal:?}");
-    assert_eq!(says(&home), [("notes.md".to_string(), true)]);
+    assert_eq!(
+        in_home,
+        [("notes.md".to_string(), vec![Some(vec![link("one\n", &a)])])]
+    );
 }
 
 #[test]
@@ -700,31 +924,26 @@ fn keys_that_are_not_safe_file_names_are_never_written() {
     let b_mem = b.home_memory();
     std::fs::write(a_mem.join("ok.md"), "fine\n").unwrap();
     settle(&mut a, &mut b);
-    let channel = channel_of(&mut a, "~");
 
-    // A member publishes keys that would escape the memory folder.
-    for key in ["../escaped.md", ".hidden.md", "sub/dir.md", "/abs.md"] {
-        let db = a.state.db.lock().unwrap();
-        entries::publish(
-            &a.state,
-            &db,
-            &channel,
-            &Write {
-                key,
-                content: &serde_json::json!("evil"),
-                metadata: None,
-                item_type: "memory",
-                deleted: false,
-                after: None,
-            },
-        )
-        .unwrap();
+    // One of the person's devices publishes, through its node's API,
+    // names that would escape the memory folder.
+    let unsafe_names = ["../escaped.md", ".hidden.md", "sub/dir.md", "/abs.md"];
+    for name in unsafe_names {
+        write(&a, "~", name, Value::Text("evil".into()));
     }
     std::fs::write(a_mem.join("later.md"), "also fine\n").unwrap();
     settle(&mut a, &mut b);
 
-    // The channel delivers; the unsafe keys are not written anywhere.
+    // The channel delivers, those entries with the rest; the unsafe names
+    // are not written anywhere.
     assert_eq!(read(&b_mem, "later.md").as_deref(), Some("also fine\n"));
+    for name in unsafe_names {
+        assert_eq!(
+            version_of(&b, "~", name),
+            Some((1, Value::Text("evil".into()))),
+            "{name}"
+        );
+    }
     assert!(!b_mem.parent().unwrap().join("escaped.md").exists());
     assert!(!b_mem.join(".hidden.md").exists());
     assert!(!b_mem.join("sub").exists());
@@ -739,8 +958,8 @@ fn keys_that_are_not_safe_file_names_are_never_written() {
 
 #[test]
 fn folders_without_a_repository_are_reported_not_synced() {
-    let mut a = Device::new().sync_on();
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+    let mut a = Device::new().with_phrase().sync_on();
+    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
     let scratch = a.home.join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let mem = a.claude_folder(&scratch);
@@ -755,8 +974,13 @@ fn folders_without_a_repository_are_reported_not_synced() {
     assert!(report.available.is_empty());
 }
 
+/// A device with no folder for a project has nothing of it: it does not
+/// hold the name, and its store takes no entry of the name's channel,
+/// though a relay hands it every one. (Every device of a person can
+/// derive the channel of every name. What keeps a project's memory off a
+/// device is that the device neither fetches nor stores it.)
 #[test]
-fn a_device_without_the_project_never_holds_its_key() {
+fn a_device_without_the_project_holds_nothing_of_it() {
     let (mut a, mut b) = paired();
     let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
     std::fs::write(a_mem.join("decision.md"), "Invite-only channels only.\n").unwrap();
@@ -769,25 +993,33 @@ fn a_device_without_the_project_never_holds_its_key() {
         .iter()
         .find(|f| f.project == "github.com/seed-drill/cordelia-node")
         .and_then(|f| f.channel_id.clone())
-        .expect("A created the project channel");
-    let db = b.state.db.lock().unwrap();
+        .expect("A syncs the project");
+    // Not for want of being handed it: B refuses each entry of the
+    // project's channel, as one of a channel that is none of its own.
+    let offered = stored_in(&a, &decode_channel_id(&channel).unwrap());
+    assert!(!offered.is_empty());
+    for held in offered {
+        let entry = held.entry.check().unwrap();
+        let db = b.state.db.lock().unwrap();
+        assert_eq!(
+            take::take(&db, &b.state.identity, &entry, now()).unwrap(),
+            take::Taken::Refused(take::NotTaken::AnotherChannel)
+        );
+    }
     assert!(
-        !channels::is_member(&db, &channel, &b.pk()).unwrap(),
-        "B was never added"
-    );
-    drop(db);
-    assert!(
-        cordelia_storage::psk::read_psk(&b.state.home_dir, &channel).is_err(),
-        "B holds no key for a project it does not have"
+        !holds(&b, &channel),
+        "B holds nothing of a project it does not have"
     );
 
-    // Once B clones the project, it asks, A grants, and the memory arrives.
+    // Once B clones the project it has the project's channel, and the
+    // memory arrives.
     let b_mem = b.claude_folder(&b.clone_at("src/cn"));
     settle(&mut a, &mut b);
     assert_eq!(
         read(&b_mem, "decision.md").as_deref(),
         Some("Invite-only channels only.\n")
     );
+    assert_eq!(channel_of(&mut b, PROJECT), channel);
 }
 
 #[test]
@@ -795,7 +1027,7 @@ fn excluded_projects_never_sync() {
     let (mut a, mut b) = paired();
     set_meta(
         &a,
-        cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE,
+        meta::SYNC_CLAUDE_EXCLUDE,
         r#"["github.com/seed-drill/*"]"#,
     );
     let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
@@ -840,9 +1072,9 @@ fn a_project_is_excluded_however_its_ending_is_spelled() {
             r#"["GitHub.com/Client-Co/*"]"#,
         ),
     ] {
-        let mut a = Device::new().sync_on();
-        set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
-        set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_EXCLUDE, stored);
+        let mut a = Device::new().with_phrase().sync_on();
+        set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
+        set_meta(&a, meta::SYNC_CLAUDE_EXCLUDE, stored);
         let memory = a.claude_folder(&a.clone_of("Work/plans", remote));
         std::fs::write(memory.join("secret.md"), "stays on this machine\n").unwrap();
 
@@ -855,7 +1087,7 @@ fn a_project_is_excluded_however_its_ending_is_spelled() {
 #[test]
 fn home_memory_can_be_left_off_a_device() {
     let (mut a, mut b) = paired();
-    set_meta(&b, cordelia_storage::meta::SYNC_CLAUDE_HOME, "off");
+    set_meta(&b, meta::SYNC_CLAUDE_HOME, "off");
     let a_home = a.home_memory();
     let b_home = b.home_memory();
     std::fs::write(a_home.join("user_role.md"), "general profile\n").unwrap();
@@ -870,59 +1102,7 @@ fn home_memory_can_be_left_off_a_device() {
     assert_eq!(read(&a_home, "lab_notes.md"), None, "nor send it");
     assert!(b.cycle().excluded.contains(&"~".to_string()));
     let channel = channel_of(&mut a, "~");
-    assert!(!can_read(&b, &channel), "B holds no key for home memory");
-}
-
-#[test]
-fn a_device_cannot_ask_to_join_on_anothers_behalf() {
-    let (mut a, mut b) = paired();
-    // D is also one of this person's devices, but has no clone of the project.
-    let d = Device::new();
-    membership::add_device(&a.state, &d.pk(), Some("d")).unwrap();
-    relay(&a, &d);
-    membership::accept(&d.state, &a.pk(), Some("a")).unwrap();
-    let mut d = d.sync_on();
-
-    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
-    std::fs::write(a_mem.join("decision.md"), "x\n").unwrap();
-    settle(&mut a, &mut b);
-    settle(&mut a, &mut d);
-    let channel = a
-        .cycle()
-        .folders
-        .into_iter()
-        .find(|f| f.project == "github.com/seed-drill/cordelia-node")
-        .and_then(|f| f.channel_id)
-        .unwrap();
-
-    // B, a device of the same person, publishes a request that names D.
-    let personal = membership::personal_channel_id(&b.state).unwrap();
-    let naming_d = format!(
-        "join/{channel}/{}",
-        cordelia_crypto::bech32::encode_public_key(&d.pk()).unwrap()
-    );
-    {
-        let db = b.state.db.lock().unwrap();
-        entries::publish(
-            &b.state,
-            &db,
-            &personal,
-            &Write {
-                key: &naming_d,
-                content: &serde_json::json!({ "channel_id": channel }),
-                metadata: None,
-                item_type: "membership",
-                deleted: false,
-                after: None,
-            },
-        )
-        .unwrap();
-    }
-    settle(&mut a, &mut b);
-
-    // A honours a request only from the device it names: D stays out.
-    let db = a.state.db.lock().unwrap();
-    assert!(!channels::is_member(&db, &channel, &d.pk()).unwrap());
+    assert!(!holds(&b, &channel), "B holds nothing of home memory");
 }
 
 // ── Declared mappings (the default: nothing syncs until it is mapped) ──
@@ -947,10 +1127,7 @@ fn nothing_syncs_until_a_folder_is_mapped() {
     // the name it would get; a folder that is not a repository has none.
     let report = a.cycle();
     assert!(report.folders.is_empty(), "{:?}", report.folders);
-    assert!(
-        report.available.is_empty(),
-        "no channel exists for anything"
-    );
+    assert!(report.available.is_empty(), "no device syncs anything");
     let shown = |dir: &Path| Some(dir.display().to_string());
     let mut found: Vec<(Option<String>, Option<String>)> = report
         .unmapped
@@ -973,7 +1150,7 @@ fn nothing_syncs_until_a_folder_is_mapped() {
     assert_eq!(read(&b_home, "user_role.md"), None);
 
     // A maps the project. It syncs from A; B sees the name on offer, and
-    // still holds neither the memory nor its key.
+    // still holds nothing of its memory.
     map(&a, &a_repo, PROJECT);
     settle(&mut a, &mut b);
     let report = a.cycle();
@@ -985,7 +1162,7 @@ fn nothing_syncs_until_a_folder_is_mapped() {
     let channel = channel_of(&mut a, PROJECT);
     assert_eq!(b.cycle().available, vec![PROJECT.to_string()]);
     assert_eq!(read(&b_mem, "decision.md"), None, "B has not mapped it");
-    assert!(!can_read(&b, &channel));
+    assert!(!holds(&b, &channel));
 
     // B maps its clone: the memory arrives. Home was mapped by neither.
     map(&b, &b_repo, PROJECT);
@@ -1036,27 +1213,22 @@ fn home_memory_reaches_only_the_devices_that_map_it() {
     map(&a, &a.home.clone(), "~");
     settle(&mut a, &mut b);
 
-    // B is offered home memory, and holds none of it: not the files, not
-    // the key, and nothing in the personal channel that every device has.
+    // B is offered home memory, and holds none of it: not the files,
+    // nothing of its channel, and nothing in the personal channel that
+    // every device has.
     let channel = channel_of(&mut a, "~");
     assert_eq!(b.cycle().available, vec!["~".to_string()]);
     assert_eq!(read(&b_home, "user_role.md"), None);
     assert_eq!(read(&a_home, "lab_notes.md"), None);
-    assert!(!can_read(&b, &channel));
-    {
-        let personal = membership::personal_channel_id(&b.state).unwrap();
-        let db = b.state.db.lock().unwrap();
-        for entry in entries::current(&b.state, &db, &personal).unwrap() {
-            assert!(
-                !entry
-                    .current
-                    .content
-                    .to_string()
-                    .contains("general profile"),
-                "home memory in the personal channel: {}",
-                entry.key
-            );
-        }
+    assert!(!holds(&b, &channel));
+    let in_personal = opened(&b, &personal_secret(&b));
+    assert!(!in_personal.is_empty());
+    for (_, entry) in in_personal {
+        assert!(
+            !String::from_utf8_lossy(entry.value.bytes()).contains("general profile"),
+            "home memory in the personal channel: {}",
+            entry.name
+        );
     }
 
     // Once B maps its home directory, both sides merge.
@@ -1094,7 +1266,7 @@ fn memory_is_kept_per_repository_not_per_folder() {
     map(&a, &a_repo, PROJECT);
 
     // B syncs everything it finds, and has only run in a subdirectory too.
-    set_meta(&b, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+    set_meta(&b, meta::SYNC_CLAUDE_ALL, "on");
     let b_repo = b.clone_at("src/cn");
     let b_sub = b_repo.join("docs");
     std::fs::create_dir_all(&b_sub).unwrap();
@@ -1175,11 +1347,7 @@ fn a_tree_laid_out_by_hand_still_syncs_with_all() {
     )
     .unwrap();
     // Sync is pointed at the tree, as `cordelia sync claude --dir` does.
-    set_meta(
-        &a,
-        cordelia_storage::meta::SYNC_CLAUDE_DIR,
-        &tree.display().to_string(),
-    );
+    set_meta(&a, meta::SYNC_CLAUDE_DIR, &tree.display().to_string());
     a.adapter = ClaudeAdapter::new(tree, a.home.clone(), &a.pk());
 
     let b_mem = b.claude_folder(&b.clone_at("src/cn"));
@@ -1212,47 +1380,39 @@ fn what_other_devices_sync_is_what_they_sync_now() {
     assert_eq!(b.cycle().available, vec!["lab-notes".to_string()]);
     assert!(a.cycle().available.is_empty(), "A syncs it itself");
 
-    // A device speaks only for itself: B cannot list names on A's behalf.
-    // D, a third device, hears B's version before A can answer it.
+    // A device speaks only for itself: its word that it syncs a name is
+    // read from the key that signed it, and from no other. So B cannot
+    // take A's word back, whatever it writes under that name: here a
+    // delete, far above A's word. D, a third device, hears B's before A
+    // can answer it.
     let d = Device::new();
-    membership::add_device(&a.state, &d.pk(), Some("d")).unwrap();
-    relay(&a, &d);
-    membership::accept(&d.state, &a.pk(), Some("a")).unwrap();
+    add(&a, &d, "laptop");
     let mut d = d.sync_on();
     settle(&mut a, &mut d);
     assert_eq!(d.cycle().available, vec!["lab-notes".to_string()]);
-    let personal = membership::personal_channel_id(&b.state).unwrap();
-    let a_key = cordelia_crypto::bech32::encode_public_key(&a.pk()).unwrap();
-    {
-        let db = b.state.db.lock().unwrap();
-        entries::publish(
-            &b.state,
-            &db,
-            &personal,
-            &Write {
-                key: &format!("syncing/{a_key}"),
-                content: &serde_json::json!({ "names": ["lab-notes", "made-up"] }),
-                metadata: None,
-                item_type: "memory",
-                deleted: false,
-                after: None,
-            },
-        )
-        .unwrap();
-    }
+    let word = names::word_name("lab-notes");
+    put(&b, &personal_secret(&b), &word, Value::Delete, 1000);
     relay(&b, &d);
+    let in_personal = opened(&d, &personal_secret(&d));
     assert!(
-        !d.cycle().available.contains(&"made-up".to_string()),
-        "a list is read only from the device it is about"
+        in_personal
+            .iter()
+            .any(|(signer, entry)| *signer == b.pk() && entry.name == word),
+        "D holds what B wrote"
+    );
+    assert_eq!(
+        d.cycle().available,
+        vec!["lab-notes".to_string()],
+        "a word is read only from the device that signed it"
     );
     settle(&mut a, &mut b);
     settle(&mut a, &mut d);
     assert_eq!(b.cycle().available, vec!["lab-notes".to_string()]);
     assert_eq!(d.cycle().available, vec!["lab-notes".to_string()]);
 
-    // A stops syncing it. The name stays in this person's map, but no
-    // device syncs it, so it is no longer on offer.
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_MAPPINGS, "[]");
+    // A stops syncing it, and its next cycle says so no longer. No device
+    // syncs the name now, so it is no longer on offer.
+    set_meta(&a, meta::SYNC_CLAUDE_MAPPINGS, "[]");
     settle(&mut a, &mut b);
     assert!(b.cycle().available.is_empty());
 
@@ -1324,12 +1484,6 @@ fn a_folder_that_fails_is_reported_and_the_others_still_sync() {
     for _ in 0..5 {
         relay(&a, &b);
         relay(&b, &a);
-        for d in [&a, &b] {
-            membership::process_inbox(&d.state).unwrap();
-            membership::process_join_requests(&d.state).unwrap();
-        }
-        relay(&a, &b);
-        relay(&b, &a);
         a.cycle();
         report = b.adapter.run_cycle(&b.state);
     }
@@ -1370,8 +1524,7 @@ fn a_file_that_fails_is_an_error_of_the_cycle_and_the_folder_still_syncs() {
     // A edits both files.
     std::fs::write(a_mem.join("a.md"), "from a\n").unwrap();
     std::fs::write(a_mem.join("z.md"), "from a\n").unwrap();
-    let hash = cordelia_crypto::sha256(b"a.md");
-    let in_the_way = b_mem.join(format!(".cordelia-tmp-{}", hex::encode(&hash[..8])));
+    let in_the_way = b_mem.join(cordelia_storage::atomic::temporary_name("a.md"));
     std::fs::create_dir(&in_the_way).unwrap();
     a.cycle();
     relay(&a, &b);
@@ -1437,9 +1590,6 @@ fn a_cycle_stops_when_a_setting_changes_under_it() {
     a.state.sync_control.changed(&a.state.db.lock().unwrap());
     std::fs::write(a_one_mem.join("x.md"), "edited\n").unwrap();
     std::fs::remove_file(a_two_mem.join("y.md")).unwrap();
-    let written = |d: &Device| {
-        cordelia_storage::items::outbox_len(&d.state.db.lock().unwrap(), &d.pk()).unwrap()
-    };
     let before = written(&a);
 
     let report = a.adapter.run_cycle_under(&a.state, settings);
@@ -1523,9 +1673,6 @@ fn a_cycle_does_nothing_once_sync_is_off() {
     settle(&mut a, &mut b);
 
     std::fs::write(a_mem.join("x.md"), "edited\n").unwrap();
-    let written = |d: &Device| {
-        cordelia_storage::items::outbox_len(&d.state.db.lock().unwrap(), &d.pk()).unwrap()
-    };
     let before = written(&a);
     let off: cordelia_api::types::SyncClaudeRequest =
         serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap();
@@ -1559,9 +1706,6 @@ fn a_cycle_runs_only_for_the_directory_that_is_set() {
     settle(&mut a, &mut b);
 
     std::fs::write(a_mem.join("x.md"), "edited\n").unwrap();
-    let written = |d: &Device| {
-        cordelia_storage::items::outbox_len(&d.state.db.lock().unwrap(), &d.pk()).unwrap()
-    };
     let before = written(&a);
     let set = a.home.join(".claude");
     let respelled = PathBuf::from(format!("{}//.claude", a.home.display()));
@@ -1632,6 +1776,14 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
 #[test]
 fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     let (mut a, mut b) = paired();
+    // A folder that is found again has no record in its channel, and the
+    // device held the name no more while it was out: its first cycle
+    // waits until the channel was fetched from a relay (decision
+    // 2026-10-04 §6). So each node is set up with one relay here, the
+    // stand-in, as a node that hears from other devices is.
+    for d in [&a, &b] {
+        d.state.own_channels.set_up_with(1);
+    }
     let a_home = a.home_memory();
     let b_home = b.home_memory();
     std::fs::write(a_home.join("profile.md"), "general profile\n").unwrap();
@@ -1694,12 +1846,12 @@ fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
     // it (its transcripts have gone, say). Then no handler forgot for it.
     // The first cycle that no longer finds it does. The scope is written
     // behind the handler's back here, to stand for that.
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "off");
+    set_meta(&a, meta::SYNC_CLAUDE_ALL, "off");
     settle(&mut a, &mut b);
     std::fs::remove_file(a_home.join("profile.md")).unwrap();
     settle(&mut a, &mut b);
     assert_eq!(files(&a_home), [""; 0], "it does not sync");
-    set_meta(&a, cordelia_storage::meta::SYNC_CLAUDE_ALL, "on");
+    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
     settle(&mut a, &mut b);
     assert_eq!(files(&b_home), ["profile.md"]);
     assert_eq!(files(&a_home), ["profile.md"]);
@@ -1820,23 +1972,16 @@ fn a_claude_folder_is_believed_only_about_its_own_directory() {
     assert_eq!(report.unmapped[0].cwd, None);
 }
 
-/// Two devices of one person, already paired, both start syncing home
-/// memory before hearing from each other (as when both are upgraded). Each
-/// creates a channel; they end up in one, with every file on both.
+/// Two devices of one person both start syncing home memory before
+/// hearing from each other (as when both take up a version under which
+/// every channel starts afresh). Neither makes a channel, and neither
+/// joins one: the person's secret gives each the same channel for the
+/// name. They end with every file on both. A file that the two published
+/// with two texts meets as a tie: one text is the file, and the other is
+/// kept beside it.
 #[test]
-fn two_devices_starting_at_once_end_up_in_one_channel() {
+fn two_devices_starting_at_once_are_in_one_channel_with_every_file_on_both() {
     let (mut a, mut b) = paired();
-    // Let B's joining settle first, so it does not hold back.
-    settle(&mut a, &mut b);
-    {
-        let personal = membership::personal_channel_id(&b.state).unwrap();
-        let db = b.state.db.lock().unwrap();
-        db.execute(
-            "UPDATE channel_members SET joined_at = '2026-01-01T00:00:00Z' WHERE channel_id = ?1",
-            [&personal],
-        )
-        .unwrap();
-    }
     let a_home = a.home_memory();
     let b_home = b.home_memory();
     std::fs::write(a_home.join("same.md"), "the same on both\n").unwrap();
@@ -1846,10 +1991,17 @@ fn two_devices_starting_at_once_end_up_in_one_channel() {
     std::fs::write(a_home.join("differs.md"), "a's version\n").unwrap();
     std::fs::write(b_home.join("differs.md"), "b's version\n").unwrap();
 
-    // Each runs a cycle before any item has travelled.
+    // Each runs a cycle before any entry has travelled, and publishes
+    // what it has into a channel that is still empty.
     let first_a = channel_of(&mut a, "~");
     let first_b = channel_of(&mut b, "~");
-    assert_ne!(first_a, first_b, "each created a channel");
+    assert_eq!(first_a, first_b, "one channel, which neither made");
+    for (device, text) in [(&a, "a's version\n"), (&b, "b's version\n")] {
+        assert_eq!(
+            version_of(device, "~", "differs.md"),
+            Some((1, Value::Text(text.into())))
+        );
+    }
     settle(&mut a, &mut b);
     settle(&mut a, &mut b);
 
@@ -1859,6 +2011,12 @@ fn two_devices_starting_at_once_end_up_in_one_channel() {
     for name in ["same.md", "only_a.md", "only_b.md", "differs.md"] {
         assert!(names.contains(&name.to_string()), "{names:?}");
     }
+    // The file that was the same on both is one version, and nothing is
+    // kept beside it.
+    assert!(
+        !names.iter().any(|n| n.starts_with("same.conflict-")),
+        "{names:?}"
+    );
     // The file that differed: one version in place, the other beside it.
     let kept: Vec<&String> = names
         .iter()
@@ -1871,43 +2029,65 @@ fn two_devices_starting_at_once_end_up_in_one_channel() {
     ];
     versions.sort();
     assert_eq!(versions, ["a's version\n", "b's version\n"]);
+    assert_eq!(read(&b_home, "differs.md"), read(&a_home, "differs.md"));
 }
 
+/// A name is on offer to a person's other devices once a device says
+/// that it syncs it, and it says so from when it maps the name: also while
+/// its folder there still waits for the name's channel to be fetched from
+/// a relay, which is all that a folder's first cycle waits for.
 #[test]
 fn a_name_is_offered_only_once_a_device_syncs_it() {
     let (mut a, mut b) = paired_explicit();
-    // B has just joined A's devices, so it waits before making a channel
-    // for a name nobody has: until then it is not syncing it.
+    // B is set up with two relays, and has heard from neither.
+    b.state.own_channels.set_up_with(2);
     let b_notes = b.plain_dir("notes");
-    b.claude_folder(&b_notes);
-    map(&b, &b_notes, "solo");
+    let b_mem = b.claude_folder(&b_notes);
+    std::fs::write(b_mem.join("idea.md"), "a thought\n").unwrap();
     settle(&mut a, &mut b);
-    assert!(b.cycle().folders[0].waiting);
     assert!(a.cycle().available.is_empty(), "nothing to offer yet");
+
+    // B maps a name nobody has. Its folder has no record in the name's
+    // channel, and waits for the channel: nothing of it is published.
+    map(&b, &b_notes, "solo");
+    let waits = b.cycle().folders.remove(0);
+    assert!(waits.waiting, "{waits:?}");
+    assert_eq!(waits.published, 0);
+    assert_eq!(version_of(&b, "solo", "idea.md"), None);
+    // It has said that it syncs the name all the same: A is offered it.
+    relay(&b, &a);
+    assert_eq!(a.cycle().available, vec!["solo".to_string()]);
+
+    // One relay hands B the channel: the folder still waits, for the
+    // other relay to have its time. Once that one has handed it too, the
+    // folder has its first cycle.
+    let channel = decode_channel_id(waits.channel_id.as_deref().unwrap()).unwrap();
+    let handed = std::time::Instant::now();
+    b.state.own_channels.fetched_from(&channel, "one", handed);
+    assert!(b.cycle().folders[0].waiting);
+    b.state
+        .own_channels
+        .fetched_from(&channel, "another", handed);
+    let synced = b.cycle().folders.remove(0);
+    assert!(!synced.waiting, "{synced:?}");
+    assert_eq!(synced.published, 1);
+    assert_eq!(
+        version_of(&b, "solo", "idea.md"),
+        Some((1, Value::Text("a thought\n".into())))
+    );
 
     // A name that could not be mapped is never passed on: it would end up
     // in a command for the person to copy.
-    let personal = membership::personal_channel_id(&b.state).unwrap();
-    let b_key = cordelia_crypto::bech32::encode_public_key(&b.pk()).unwrap();
-    {
-        let db = b.state.db.lock().unwrap();
-        entries::publish(
-            &b.state,
-            &db,
-            &personal,
-            &Write {
-                key: &format!("syncing/{b_key}"),
-                content: &serde_json::json!({ "names": ["fine", "x; rm -rf ~", "Has Space"] }),
-                metadata: None,
-                item_type: "memory",
-                deleted: false,
-                after: None,
-            },
-        )
-        .unwrap();
+    let personal = personal_secret(&b);
+    for name in ["fine", "x; rm -rf ~", "Has Space"] {
+        let word = names::word_name(name);
+        put(&b, &personal, &word, Value::Text(String::new()), 1);
     }
     relay(&b, &a);
-    assert_eq!(a.cycle().available, vec!["fine".to_string()]);
+    assert_eq!(
+        a.cycle().available,
+        vec!["fine".to_string(), "solo".to_string()]
+    );
 }
 
 /// A git repository created above a mapped folder moves its memory to the
@@ -1915,7 +2095,7 @@ fn a_name_is_offered_only_once_a_device_syncs_it() {
 /// nothing had changed.
 #[test]
 fn a_repository_appearing_above_a_mapped_folder_is_reported() {
-    let mut a = Device::new().sync_on();
+    let mut a = Device::new().with_phrase().sync_on();
     let workspace = a.plain_dir("workspace");
     let notes = a.plain_dir("workspace/notes");
     a.claude_folder(&notes);
@@ -1981,27 +2161,32 @@ fn a_file_that_grows_too_large_is_left_alone_and_deleted_nowhere() {
 }
 
 /// A file can be under the size limit and still not fit in an entry: an
-/// entry holds its name too, and its text is escaped. It is found when it
-/// is published, and treated the same way: left alone, reported, and
-/// deleted nowhere.
+/// entry holds its name too, and the two are bounded together. It is found
+/// when it is published, and treated the same way: left alone, reported,
+/// and deleted nowhere. A text is counted as it is, whatever is in it.
 #[test]
-fn a_file_that_does_not_fit_once_escaped_is_left_alone_too() {
+fn a_file_that_does_not_fit_with_its_name_is_left_alone_too() {
     let (mut a, mut b) = paired();
     let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
-    std::fs::write(a_mem.join("quotes.md"), "small\n").unwrap();
+    std::fs::write(a_mem.join("long.md"), "small\n").unwrap();
     settle(&mut a, &mut b);
 
-    // 40 KB of quotation marks is 80 KB once escaped.
+    // As large as a file may be: with its name it is over the bound. And
+    // 40 KB of quotation marks, which is 40 KB in an entry.
+    let long = "x".repeat(cordelia_sync::claude::MAX_FILE_BYTES);
     let quotes = "\"".repeat(40_000);
-    assert!(quotes.len() < cordelia_sync::claude::MAX_FILE_BYTES);
+    assert!(!publish::fits("long.md", &Value::Text(long.clone())));
+    assert!(publish::fits("quotes.md", &Value::Text(quotes.clone())));
+    std::fs::write(a_mem.join("long.md"), &long).unwrap();
     std::fs::write(a_mem.join("quotes.md"), &quotes).unwrap();
     let (report, _) = settle_reporting(&mut a, &mut b);
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let too_large: Vec<&String> = report.folders.iter().flat_map(|f| &f.too_large).collect();
-    assert_eq!(too_large, vec!["quotes.md"]);
-    assert_eq!(read(&b_mem, "quotes.md").as_deref(), Some("small\n"));
-    assert_eq!(read(&a_mem, "quotes.md"), Some(quotes));
+    assert_eq!(too_large, vec!["long.md"]);
+    assert_eq!(read(&b_mem, "long.md").as_deref(), Some("small\n"));
+    assert_eq!(read(&a_mem, "long.md"), Some(long));
+    assert_eq!(read(&b_mem, "quotes.md"), Some(quotes));
 }
 
 /// A file that stops being plain text (here, replaced by a link) is not
@@ -2097,4 +2282,245 @@ fn a_cycle_that_keeps_enough_sweeps_local_history() {
     assert_eq!(most, 2);
     let newest = store.list().unwrap().records[0].id.clone();
     assert_eq!(store.read(&newest).unwrap().unwrap().1, Some(text(6)));
+}
+
+// ── Before there is a phrase, and a second device's first sync ─────────
+
+/// A device that follows no recovery phrase has no secret, and publishes
+/// nothing (decision 2026-10-04 §5.2). Sync can be on and folders mapped:
+/// a cycle lists them and says why nothing syncs, and writes nothing, in
+/// its store or in a folder. Once the device makes a phrase, its folders
+/// are published.
+#[test]
+fn a_device_that_follows_no_phrase_publishes_nothing_until_it_makes_one() {
+    let mut a = Device::new().sync_on();
+    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
+    let home = a.home_memory();
+    std::fs::write(home.join("user_role.md"), "Prefers short answers.\n").unwrap();
+    let notes = a.plain_dir("notes");
+    let mem = a.claude_folder(&notes);
+    std::fs::write(mem.join("idea.md"), "a thought\n").unwrap();
+    map(&a, &notes, "lab-notes");
+
+    // Its folders are listed, the one that is mapped and the one that is
+    // found, and nothing was done for either.
+    let listed = |report: &cordelia_sync::claude::CycleReport| -> Vec<(String, bool)> {
+        let mut listed: Vec<(String, bool)> = report
+            .folders
+            .iter()
+            .map(|f| (f.project.clone(), f.mapped))
+            .collect();
+        listed.sort();
+        listed
+    };
+    let both = [("lab-notes".to_string(), true), ("~".to_string(), false)];
+    let report = a.cycle();
+    assert_eq!(
+        report.publishes_nothing.as_deref(),
+        Some(cordelia_api::look::NO_PHRASE)
+    );
+    assert!(!report.stopped, "{report:?}");
+    assert_eq!(listed(&report), both);
+    for folder in &report.folders {
+        assert_eq!(folder.channel_id, None, "{folder:?}");
+        assert!(!folder.waiting, "{folder:?}");
+        assert_eq!(
+            (folder.published, folder.pulled, folder.conflicts),
+            (0, 0, 0),
+            "{folder:?}"
+        );
+        assert_eq!(folder.error, None, "{folder:?}");
+    }
+    assert!(report.available.is_empty(), "{report:?}");
+
+    // Nothing was written: no entry, no name held, no word said, and the
+    // folders are as they were.
+    assert_eq!(entries_held(&a), 0);
+    {
+        let db = a.state.db.lock().unwrap();
+        assert!(held_rows::names(&db).unwrap().is_empty());
+        assert!(names::said_here(&db, &a.state.identity).unwrap().is_empty());
+    }
+    assert_eq!(files(&home), ["user_role.md"]);
+    assert_eq!(files(&mem), ["idea.md"]);
+    assert_eq!(
+        read(&home, "user_role.md").as_deref(),
+        Some("Prefers short answers.\n")
+    );
+    assert_eq!(read(&mem, "idea.md").as_deref(), Some("a thought\n"));
+
+    // It makes a phrase: the next cycle publishes both folders, and the
+    // device says of each name that it syncs it.
+    let mut a = a.with_phrase();
+    let report = a.cycle();
+    assert_eq!(report.publishes_nothing, None);
+    assert_eq!(listed(&report), both);
+    for folder in &report.folders {
+        assert!(folder.channel_id.is_some(), "{folder:?}");
+        assert_eq!(folder.published, 1, "{folder:?}");
+    }
+    assert_eq!(
+        version_of(&a, "~", "user_role.md"),
+        Some((1, Value::Text("Prefers short answers.\n".into())))
+    );
+    assert_eq!(
+        version_of(&a, "lab-notes", "idea.md"),
+        Some((1, Value::Text("a thought\n".into())))
+    );
+    let db = a.state.db.lock().unwrap();
+    let said = names::said_here(&db, &a.state.identity).unwrap();
+    assert_eq!(said.into_iter().collect::<Vec<_>>(), ["lab-notes", "~"]);
+}
+
+/// A second device meets the person's channels at its first sync
+/// (decision 2026-10-04 §10, step 5). The first device has made the
+/// phrase, and has published `on_first` from its home memory. The second
+/// gathered `on_second` alone, with sync on and no phrase, so nothing of
+/// it was published. It is then added, and accepts.
+///
+/// The second device is set up with one relay, the stand-in: a folder's
+/// first cycle waits until the stand-in has handed it the name's channel
+/// (decision 2026-10-04 §6), so its files meet what the first device
+/// sent, and are not published beside it as new files of its own.
+///
+/// Returns the two devices and their home memory folders, once they are
+/// quiet.
+fn first_sync(
+    on_first: &[(&str, &str)],
+    on_second: &[(&str, &str)],
+) -> (Device, Device, PathBuf, PathBuf) {
+    let mut a = Device::new().with_phrase().sync_on();
+    let mut b = Device::new().sync_on();
+    b.state.own_channels.set_up_with(1);
+    for d in [&a, &b] {
+        set_meta(d, meta::SYNC_CLAUDE_ALL, "on");
+    }
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    for (mem, texts) in [(&a_mem, on_first), (&b_mem, on_second)] {
+        for (name, text) in texts {
+            std::fs::write(mem.join(name), text).unwrap();
+        }
+    }
+    let published: usize = a.cycle().folders.iter().map(|f| f.published).sum();
+    assert_eq!(published, on_first.len());
+    assert!(b.cycle().publishes_nothing.is_some());
+    assert_eq!(entries_held(&b), 0);
+
+    add(&a, &b, "laptop");
+    // Its first cycle waits: it has not been handed the channel.
+    let report = b.cycle();
+    assert!(report.folders[0].waiting, "{report:?}");
+    settle(&mut a, &mut b);
+    (a, b, a_mem, b_mem)
+}
+
+/// A file with the same text on both is agreed: nothing is kept beside
+/// it, and the second device publishes nothing for it. An edit of it then
+/// goes over the first device's version, as an edit of a file that has
+/// always synced does.
+#[test]
+fn at_a_first_sync_a_file_with_the_same_text_on_both_is_agreed() {
+    let same = [("same.md", "the same on both\n")];
+    let (mut a, mut b, a_mem, b_mem) = first_sync(&same, &same);
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(files(mem), ["same.md"]);
+        assert_eq!(read(mem, "same.md").as_deref(), Some("the same on both\n"));
+    }
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "~", "same.md"),
+            Some((1, Value::Text("the same on both\n".into())))
+        );
+        assert_eq!(entries_of(d, "~", "same.md"), [(a.pk(), Some(Vec::new()))]);
+    }
+
+    std::fs::write(b_mem.join("same.md"), "edited on the second\n").unwrap();
+    settle(&mut a, &mut b);
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(files(mem), ["same.md"]);
+        assert_eq!(
+            read(mem, "same.md").as_deref(),
+            Some("edited on the second\n")
+        );
+    }
+    let over = vec![link("the same on both\n", &a)];
+    assert_eq!(entries_of(&a, "~", "same.md"), [(b.pk(), Some(over))]);
+}
+
+/// A file that differs takes the channel's text, and the second device's
+/// text is kept beside it as a copy, which then reaches the first device
+/// as any file does. It is so whichever of the two texts would win a tie:
+/// the two do not meet as a tie.
+#[test]
+fn at_a_first_sync_a_file_that_differs_takes_the_channels_and_is_kept_beside_it() {
+    let (one, another) = ("one text\n", "another text\n");
+    for (first, second) in [(one, another), (another, one)] {
+        let (a, b, a_mem, b_mem) = first_sync(&[("differs.md", first)], &[("differs.md", second)]);
+        for mem in [&a_mem, &b_mem] {
+            assert_eq!(read(mem, "differs.md").as_deref(), Some(first));
+            let copies = copies_of(mem, "differs.md");
+            assert_eq!(copies.len(), 1, "{copies:?}");
+            assert_eq!(copies[0].1, second);
+            assert_eq!(files(mem).len(), 2, "{:?}", files(mem));
+        }
+        assert_eq!(
+            copies_of(&a_mem, "differs.md"),
+            copies_of(&b_mem, "differs.md")
+        );
+        // The channel's version is still the first device's.
+        for d in [&a, &b] {
+            assert_eq!(
+                entries_of(d, "~", "differs.md"),
+                [(a.pk(), Some(Vec::new()))]
+            );
+        }
+    }
+}
+
+/// A file that only the second device has is published: memory it had
+/// gathered alone is not lost.
+#[test]
+fn at_a_first_sync_a_file_only_here_is_published() {
+    let (a, b, a_mem, b_mem) = first_sync(
+        &[("first.md", "from the first\n")],
+        &[("second.md", "gathered alone\n")],
+    );
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(files(mem), ["first.md", "second.md"]);
+        assert_eq!(read(mem, "first.md").as_deref(), Some("from the first\n"));
+        assert_eq!(read(mem, "second.md").as_deref(), Some("gathered alone\n"));
+    }
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "~", "second.md"),
+            Some((1, Value::Text("gathered alone\n".into())))
+        );
+        assert_eq!(
+            entries_of(d, "~", "second.md"),
+            [(b.pk(), Some(Vec::new()))]
+        );
+    }
+}
+
+/// The index is merged, as two indexes are: each device's lines are in it
+/// on both, and nothing is kept beside it.
+#[test]
+fn at_a_first_sync_the_index_is_merged() {
+    let base = "- [Base](base.md) — shared\n";
+    let on_first = format!("{base}- [A](a.md) — from the first\n");
+    let on_second = format!("{base}- [B](b.md) — from the second\n");
+    let (_a, _b, a_mem, b_mem) =
+        first_sync(&[("MEMORY.md", &on_first)], &[("MEMORY.md", &on_second)]);
+    let index = read(&a_mem, "MEMORY.md").unwrap();
+    assert_eq!(read(&b_mem, "MEMORY.md").unwrap(), index);
+    for line in ["(base.md)", "(a.md)", "(b.md)"] {
+        assert_eq!(
+            index.matches(line).count(),
+            1,
+            "{line} in the merged index:\n{index}"
+        );
+    }
+    for mem in [&a_mem, &b_mem] {
+        assert_eq!(files(mem), ["MEMORY.md"]);
+    }
 }
