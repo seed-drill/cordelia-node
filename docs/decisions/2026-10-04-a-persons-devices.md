@@ -862,7 +862,7 @@ Each property of section 1 has tests. The threat model's rows T16 (a device that
 3. **The phrase is typed** to remove, to recover, to settle two changes made apart, to renew, and to bring in what a removed device left behind (7.3). Never to add. A person who has lost it can add devices and can never remove one, short of starting again with a new phrase. And nothing syncs until there is a phrase (5.2).
 4. **The upgrade is a new start** (section 10): the phrase on one device, and each other added with the two commands. The relays carry the older channels for one version more, each kind within a cap of its own, so that a device that has not been upgraded is not cut off in the middle. A personal node does nothing of the older kind from this version on.
 5. **A relay's room** (2.5): an allowance of 256 new channels an hour for an address; the newest still go first; what nobody has used for 90 days goes. And what is not defended: a full relay, older channels filled and kept by whoever holds their keys, and the limits by address.
-6. **What leaves the code with this:** the inbox, sealed channel states, epochs and key rings, join requests, owner roles, and the keepers and key-exchange endpoints from before v1.
+6. **What a device no longer does:** it has no inbox, no sealed channel states, no epochs or key rings, no join requests and no owner roles. A relay goes on carrying the older kind of channel, which has them, for one version more (section 10).
 
 **Put off:**
 
@@ -911,7 +911,7 @@ For an outside reviewer: where this design is under most strain, and where a fau
 - **A show is short after the first on a connection** (2.4, item 5), and the leave it gives a device lasts 10 seconds (4.6): one function gives that leave, and no stream for a channel of the device's own is opened but through it, nor is what comes back taken. A relay asks its memory of the connection before its store: a short show of anything but the entry shown whole there is answered without a look at what is held.
 - **A relay counts requests on the streams of these channels,** as it counts the older kind's writes and syncs: 3,000 a minute for a connection (`ENTRY_REQUESTS_PER_PEER_PER_MINUTE`), sized for a device with 256 names (a pull of each every ten seconds, its day's proofs in one burst, its shows and what it pushes), and a breach beyond it.
 - **A relay writes that a channel was used at most once an hour,** and never an earlier time than the one it has: a proof, or a show, is otherwise a write for whoever asks.
-- **A pull that is refused because the asker has had its bytes for the minute is no breach** (the relay sized the page; the asker cannot know its room), **and the answer to a show is always handed,** counted, though it take the asker over by one entry: a device that is over its bytes must still hear of a removal.
+- **A pull that is refused because the asker has had its bytes for the minute is no breach:** the relay sized the page, and the asker cannot know its room.
 - **The address that a connection's streams are counted under is read once,** when the connection is made.
 - **One relay never holds up another** once the device is awake: each relay has its pass, and the wake rule is the only thing that couples them.
 - **A request is sent only under the change entry that it was built under:** the one way in is given that entry's ID and refuses, at both askings, where the device keeps another; a pass at a relay ends when the kept entry changes, and the next reads the device's channels afresh.
