@@ -1860,9 +1860,21 @@ fn claude_memory_syncs_between_two_machines() {
             "missing {expected:?} in:\n{found}"
         );
     }
+    // Nothing is mapped: the state is off. What is about a person's
+    // devices holds all the same (decision 2026-10-04 §10.1): the device
+    // that was added, and that nobody has cleared, is amber on each of
+    // the two, and the line says it.
+    for n in [&a, &b] {
+        let s = state(n);
+        assert_eq!(s["state"], "off", "{s}");
+        assert_eq!(s["level"], "amber", "{s}");
+        assert_eq!(
+            s["summary"], "memory: 1 device added, not yet cleared",
+            "{s}"
+        );
+        assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
+    }
     let s = state(&a);
-    assert_eq!(s["state"], "off", "{s}");
-    assert_eq!(s["summary"], "memory: nothing mapped", "{s}");
     assert_eq!(s["sync"]["all"], false, "{s}");
     // Each is carried with whether `cordelia sync map` would sync it:
     // all three would, and so each has its directory under `cwd`.
