@@ -2981,6 +2981,79 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
 
 // ── A node of another version ────────────────────────────────────────
 
+/// A command that changes anything is refused where the node's version
+/// could not be learned, and sends the node nothing (decision 2026-10-04
+/// §10.1, rule 6): here the node's status is answered by nobody. Turning
+/// sync off is sent all the same, and what only shows is answered.
+#[test]
+fn a_command_that_changes_anything_refuses_a_node_whose_version_it_cannot_learn() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let claude = laptop.home().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+    let silent = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/status").then_some(false),
+    );
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let home = laptop.home();
+    let folder = home.to_str().unwrap();
+    let soon = std::time::Duration::from_secs(60);
+
+    let changes: [&[&str]; 12] = [
+        &["sync", "claude"],
+        &["sync", "map", folder, "notes"],
+        &["sync", "home", "off"],
+        &["restore", "an-id"],
+        &["history", "drop", "--all"],
+        &["init", "--new-key"],
+        &["phrase", "--name", "laptop"],
+        &["add-device", &other],
+        &["accept", &other],
+        &["devices", "--clear"],
+        &["remove-device", &other],
+        &["renew"],
+    ];
+    for args in changes {
+        let before = silent.asked().len();
+        let said = laptop
+            .at_terminal_through(silent.port, args)
+            .refused_within(soon);
+        assert!(
+            said.contains("The running node's version could not be learned."),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("nothing was done."), "{args:?}: {said}");
+        assert!(
+            said.contains("cannot reach the local node at"),
+            "{args:?}: {said}"
+        );
+        let asked = silent.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], true, "{settings}");
+    assert_eq!(settings["mappings"], json!([]), "{settings}");
+
+    // What only shows is answered, and turning sync off is sent.
+    let said = laptop.at_terminal_through(silent.port, &["devices"]).done();
+    assert!(said.contains("This device: "), "{said}");
+    let said = laptop
+        .at_terminal_through(silent.port, &["sync", "off"])
+        .done();
+    assert!(said.contains("Sync is off."), "{said}");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], false, "{settings}");
+}
+
 /// A command that changes anything refuses a node of another version
 /// than its own, with the note that says how to restart it, and sends it
 /// nothing (decision 2026-10-04 §10.1, rule 6; §16): every `sync`

@@ -2793,13 +2793,21 @@ pub(crate) fn api_post_told(
 /// it is not said again beside a refusal.
 static VERSION_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The running node's status, as it answers a command that asks within
+/// `timeout`, or why it could not be had.
+fn node_status(
+    config_path: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let mut config = Config::load(&config::expand_tilde(config_path))?;
+    config.apply_env_overrides();
+    local_api(&config, false, "/api/v1/status", timeout)
+}
+
 /// What to say about the running node, if it answers and is not the version
 /// this command is.
 fn node_version_note(config_path: &str) -> Option<String> {
-    let mut config = Config::load(&config::expand_tilde(config_path)).ok()?;
-    config.apply_env_overrides();
-    let timeout = std::time::Duration::from_secs(3);
-    let node = local_api(&config, false, "/api/v1/status", timeout).ok()?;
+    let node = node_status(config_path, std::time::Duration::from_secs(3)).ok()?;
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
@@ -2807,6 +2815,18 @@ fn node_version_note(config_path: &str) -> Option<String> {
 /// version, after the note that says how to restart it.
 const NOT_SENT_TO_ANOTHER_VERSION: &str = "This command changes something, and is not sent to a \
                                            node of another version: nothing was done.";
+
+/// What a command that changes anything says where the node did not say
+/// which version it is, after why.
+const VERSION_NOT_LEARNED: &str = "The running node's version could not be learned. This command \
+                                   changes something, and is sent only to a node of its own \
+                                   version: nothing was done.";
+
+/// How long a command that changes something waits for the node to say
+/// which version it is: as long as it waits for the node to do what it
+/// asks. A node that is busy answers late, and is not taken for one that
+/// does not answer.
+const VERSION_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Refuse a running node of another version than this command (decision
 /// 2026-10-04 §10.1, rule 6; §16). A command that changes anything is
@@ -2821,10 +2841,22 @@ const NOT_SENT_TO_ANOTHER_VERSION: &str = "This command changes something, and i
 /// sync off is sent to any node, and what only shows is answered beside
 /// one, with the note ([`note_another_version`]).
 ///
-/// A node that does not answer is not refused here: the command's own
-/// request then says that it is not reached.
+/// **Where the node's version could not be learned, the command is
+/// refused too:** the node did not answer, or what answered was no
+/// status. A command that changes something is not sent to a node that
+/// may be of any version.
 pub(crate) fn refuse_another_version(config_path: &str) -> anyhow::Result<()> {
-    match node_version_note(config_path) {
+    refuse_by_version(&node_status(config_path, VERSION_ASKED_FOR))
+}
+
+/// [`refuse_another_version`], given what the node answered when it was
+/// asked its status.
+fn refuse_by_version(status: &anyhow::Result<serde_json::Value>) -> anyhow::Result<()> {
+    let node = match status {
+        Ok(node) => node,
+        Err(why) => anyhow::bail!("{why}\n{VERSION_NOT_LEARNED}"),
+    };
+    match version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION")) {
         None => Ok(()),
         Some(note) => {
             VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5042,6 +5074,52 @@ mod tests {
                 && older.contains("command is version 0.2.0-alpha.6")
                 && older.contains(&format!("restart it with `{restart}`")),
             "{older}"
+        );
+    }
+
+    /// A command that changes something is refused where the node's
+    /// version could not be learned, as it is where the node is of
+    /// another version (decision 2026-10-04 §10.1, rule 6): the node did
+    /// not answer, or what answered was no status. It says why, and that
+    /// nothing was done. A node of the command's own version is not
+    /// refused.
+    #[test]
+    fn test_a_node_whose_version_is_not_learned_is_refused() {
+        let own = env!("CARGO_PKG_VERSION");
+        let of_this_version = Ok(serde_json::json!({ "version": own }));
+        assert!(refuse_by_version(&of_this_version).is_ok());
+
+        let not_reached: anyhow::Result<serde_json::Value> = Err(anyhow::anyhow!(
+            "cannot reach the local node at the address"
+        ));
+        let refused = refuse_by_version(&not_reached).unwrap_err().to_string();
+        assert!(
+            refused.starts_with("cannot reach the local node at the address\n"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("The running node's version could not be learned."),
+            "{refused}"
+        );
+        assert!(refused.ends_with("nothing was done."), "{refused}");
+
+        let another = Ok(serde_json::json!({ "version": "0.0.0-another" }));
+        let refused = refuse_by_version(&another).unwrap_err().to_string();
+        assert!(
+            refused.contains("The running node is version 0.0.0-another"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("is not sent to a node of another version"),
+            "{refused}"
+        );
+        // What answers and says no version is a node from before nodes
+        // said theirs.
+        let says_none = Ok(serde_json::json!({ "status": "running" }));
+        let refused = refuse_by_version(&says_none).unwrap_err().to_string();
+        assert!(
+            refused.contains("from before nodes said their version"),
+            "{refused}"
         );
     }
 
