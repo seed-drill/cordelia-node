@@ -1090,8 +1090,9 @@ labels of exporters do (RFC 5705 §4).
 | `LABEL_CHANNEL_PROOF` | `cordelia v2 proof` | The proof that a connection holds a channel's key |
 | `LABEL_SESSION_VALUE` | `EXPORTER-cordelia v2 session` | The value both ends export from a TLS session |
 | `LABEL_FINGERPRINT` | `cordelia v2 fingerprint` | A key's fingerprint (a hash) |
+| `LABEL_CARRY_WORD` | `cordelia v2 carry word` | The phrase's signature on a person's word for a carry: which name, which keys that do not count, and which files above a version that is held (decision §7.3, §9). A signature under it is no statement and no entry |
 
-`LABELS` is all 23, for the test that sets one against another.
+`LABELS` is all 24, for the test that sets one against another.
 
 #### FINGERPRINT_WORDS_SHOWN = 4
 
@@ -1137,9 +1138,11 @@ machines one after the other; no measurement behind it yet.
 
 #### MAX_TYPED_KEYS = 8
 
-**Rationale:** The most keys typed at `accept` that a device keeps. A ninth
-is refused. Each is a pair channel that the device asks its relays for, for
-its hour, and a key with which a hand-over could be taken.
+**Rationale:** The most keys typed at `accept` that are within their hour on
+a device at one time. A ninth is refused. Each is a pair channel that the
+device asks its relays for, for its hour, and a key with which a hand-over
+could be taken. A key whose hour has gone holds no place: it is kept only to
+say what became of it (`TYPED_KEY_KEPT_SECS`).
 
 **Why 8:** chosen as room to spare over the one key that adding a device
 takes; no measurement behind it yet.
@@ -1348,6 +1351,20 @@ channel is kept, an hour is nothing.
 **Derivation:** As often as expired deletes are collected,
 `TOMBSTONE_GC_INTERVAL_SECS`. Hourly is plenty against 90 days.
 
+#### KEYED_TOMBSTONE_RETENTION_DAYS = 90, for a delete among entries
+
+**Rationale:** The value is the one that the record of 2026-09-30 gives a
+deleted key (§4.4 there): a device that was offline for longer can bring a
+deleted file back with a stale edit, and 90 days covers a laptop left in a
+drawer for a season. It is also how long a delete is held among the entries
+of a channel from its secret, at a relay and in a device's own store
+(decision §2.3, §7.3), counted from when the node stored the entry. A delete
+that is carried at a statement is a new entry, and starts again.
+
+**The timer:** a relay and a device each look once in
+`TOMBSTONE_GC_INTERVAL_SECS`, an hour, which is plenty against 90 days. It
+is one timer, and one length of time, for both kinds of channel.
+
 #### ENTRY_OFFER_INTERVAL_SECS = 5, RELAY_ENTRY_PULL_INTERVAL_SECS = 10
 
 **Derivation:** A relay passes the entries it took on to the relays it
@@ -1503,9 +1520,164 @@ that a device was stolen on Tuesday wants to see what it wrote since
 what local history keeps by default (`HISTORY_DAYS`, §10), which
 `protocol.rs` asserts.
 
+#### CARRY_READ_MAX_SECS = 120
+
+**Derivation:** `CHANGE_FETCH_MAX_SECS`: as long as the fetch before a
+change.
+
+**Rationale:** How long a carry by command reads one name at the relays, at
+most (decision §7.3): the fetch of the new channel, and then the name's
+channel in each generation that the device left. What was not read to its
+end by then is said, and the command can be run again.
+
+#### CARRY_FIRST_MAX_SECS = 180
+
+**Derivation:** `CARRY_READ_MAX_SECS` + 60: a little longer than the carry
+may read.
+
+**Rationale:** A device that comes to sync a name carries it first (decision
+§7.3). This is how long a channel that a carry is being made into holds back
+the first cycle of a folder that has just been mapped to its name, at most.
+A carry that never says it has ended holds nothing up for longer.
+
+#### CARRY_FROM_WORDS = 6
+
+**Rationale:** How many words of a key's fingerprint name a removed key at
+`cordelia sync carry --from` (decision §7.3). A statement lists removed keys
+bare, so a machine that never knew a device has no label for it. Six words
+are 66 bits. `protocol.rs` asserts that they are more than a device is shown
+by (`FINGERPRINT_WORDS_SHOWN`), and within the hash.
+
+**Why six:** chosen with the four that a device is shown by; no measurement
+behind it yet.
+
+#### CARRY_WORD_SECS = 600
+
+**Rationale:** How long a person's word for a carry stands (decision §7.3):
+ten minutes from when the phrase signed it. The command hands it to the node
+at once, and a word that is found later is no word.
+
+**Why ten minutes:** neither the code nor the record gives a reason for the
+number. It is longer than a carry may read a name (`CARRY_READ_MAX_SECS`);
+no measurement behind it yet.
+
+#### CARRY_PART_MAX_BYTES = 512 KB
+
+**Derivation:** Half of what one message of the wire holds,
+`MAX_MESSAGE_BYTES` / 2.
+
+**Rationale:** The most bytes of entries that the node hands a command in
+one answer (decision §7.3, §9), where the command reads a channel whose
+secret the node does not hold. A channel may hold more than one answer of
+the local API carries, so it is handed a part at a time. An entry over the
+bound is handed alone, and `protocol.rs` asserts that a part holds an entry
+of any size that a channel carries.
+
+#### RECOVERY_MAX_NAMES = 1,024
+
+**Rationale:** The most names a recovery carries (decision §9). A device
+that is gone listed names too, and can have listed any number of its own.
+The names that a recovery leaves are named.
+
+**Why 1,024:** neither the code nor the record gives a reason for the
+number; no measurement behind it yet.
+
+#### RECOVERY_MAX_DEVICES_SHOWN = 256
+
+**Rationale:** The most devices a recovery shows at its prompt, of the
+statement's and of those added since (decision §9). Beyond it the command
+says how many it could not show, and the look takes nothing from those.
+`protocol.rs` asserts that it is no fewer than a reader may count
+(`MAX_COUNTED_DEVICES`): a recovery shows every device that counts, and the
+records that it may keep as not counted beside them.
+
+#### RECOVERY_MAX_LEFT_SECRETS = 9
+
+**Derivation:** `MAX_EARLIER_SECRETS` + 1.
+
+**Rationale:** The most secrets of generations before its own that a machine
+which recovers is handed, and keeps as a device keeps a secret it left
+(decision §3, §9): the one of the generation it recovered from, and as many
+before it as a change entry gives the phrase.
+
+#### FILE_NAME_SHOWN_CHARS = 120
+
+**Rationale:** The most characters of a file's name that a command prints,
+and that the node puts in a line of its status. Another device may have
+written the name, and a name may be as long as an entry's text. What is cut
+is marked as cut.
+
+**Why 120:** neither the code nor the record gives a reason for the number;
+no measurement behind it yet.
+
+### 12.10 The Status Line
+
+#### STATUS_AMBER_WAIT_SECS = 300
+
+**Rationale:** How long a thing that will pass by itself has lasted before
+the status line shows it as amber (decision §10.1): no relay connected; a
+relay that is connected and does not hold the latest change; and, after a
+change, names that are not yet in the new generation or not yet sent.
+
+**Why five minutes:** a machine that wakes, a relay that restarts and a
+device that has just applied a change are each through it in less, and what
+lasts longer is worth a person's knowing. The first two are counted by the
+node's own clock, which does not run while the machine sleeps. `protocol.rs`
+asserts that a device that wakes has heard from its relays, or given them
+up, well within it (twice `WAKE_WAIT_SECS`).
+
+#### REMOVAL_NOT_APPLIED_SHOWN_DAYS = 7
+
+**Rationale:** For how many days after a device applied a removal the status
+line shows as amber that some device has not applied it (decision §8,
+§10.1). After that it is said in `cordelia devices` only: a device that lies
+in a drawer does not keep every status line amber for good. Names that no
+device lists yet in the new generation are shown for as long. `protocol.rs`
+asserts that it is shorter than a left secret is kept
+(`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
+known.
+
+**Why seven:** neither the code nor the record gives a reason for the
+number; no measurement behind it yet.
+
+#### NO_ROOM_STANDS_SECS = 1,200
+
+**Derivation:** 2 × `OUTBOX_REFUSED_RETRY_MAX_SECS`.
+
+**Rationale:** For how long after a relay refused something for room, or for
+the address's allowance, the status line takes it that the relay still
+refuses (decision §10.1). A device keeps the time of a relay's last refusal,
+and offers again what was refused after a wait that doubles up to
+`OUTBOX_REFUSED_RETRY_MAX_SECS`. So a relay that still refuses has refused
+again within twice that, and one that has not has taken what it was offered,
+or was offered nothing more.
+
+### 12.11 The First Start
+
+#### FIRST_START_RETRY_BASE_SECS = 5, FIRST_START_RETRY_MAX_SECS = 600
+
+**Derivation:** The maximum is `OUTBOX_REFUSED_RETRY_MAX_SECS`: ten minutes,
+the longest wait before anything a relay refused is offered again.
+
+**Rationale:** How long a personal node waits before it tries its first
+start on this version again, after a try that failed (decision §10.1): the
+sync cycle's five seconds after the first, and twice as long after each
+further one, up to the maximum. A start that cannot succeed (no room for the
+copy, no leave to write) does not write its copy again every five seconds.
+And a person who has made room is not kept waiting for longer than ten
+minutes, and need not restart the node.
+
+#### FIRST_START_RETRY_SLACK_SECS = 1
+
+**Rationale:** How much before its wait has passed a try at the first start
+is still made (decision §10.1). A try is made when a sync cycle would have
+run, and the first wait is a cycle long: without this, the timer's own
+jitter would put every try off by a whole cycle. `protocol.rs` asserts that
+it is less than the first wait.
+
 ---
 
 *Spec version: 1.4*
 *Created: 2026-03-16*
 *Updated: 2026-09-30*
-*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9; decisions/2026-10-04-a-persons-devices.md*
+*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md*

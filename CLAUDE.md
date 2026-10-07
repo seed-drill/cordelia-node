@@ -45,10 +45,11 @@ cordelia-node/
                          #   The older kind: channel_state, psk_envelope, signing
     cordelia-storage/    # SQLite (schema.rs: steps 1 to 18). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
-                         #   relay (a relay's channels and room); at_relays (where a device
-                         #   stands at each relay); sync_state, index_lines, history;
-                         #   first_start (the copy and the step); the older kind: channels,
-                         #   items, psk, search
+                         #   relay (a relay's channels and room, and its sweeps); at_relays
+                         #   (where a device stands at each relay); sync_state, index_lines,
+                         #   history; meta (the keys of node_meta); first_start (the copy,
+                         #   the step and the guard); the older kind: channels, items, psk,
+                         #   search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
                          #   the five streams of entries (0x10 to 0x14); transport.rs
                          #   exports the session's value for a proof
@@ -56,15 +57,21 @@ cordelia-node/
                          #   counts, carrying), adding, change, leaving, look, names, publish,
                          #   take (the one door for an entry), at_relays, local (the local
                          #   API for the names a device holds), commands (the routes behind
-                         #   the device commands), first_start, sync, history. The older
-                         #   Channels API (handlers, entries, verify): a relay's and a bootnode's
+                         #   the device commands), carry and carrying (a carry that a person
+                         #   asks for, and the phrase's word for it), recover, swept (old
+                         #   deletes in a device's own store), found (what `map` would sync,
+                         #   and the notice), first_start (a node that is held up), sync,
+                         #   history. The older Channels API (handlers, entries, verify): a
+                         #   relay's and a bootnode's
     cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
                          #   (claude.rs, plan.rs; claude/sequences.rs is the harness of
                          #   sequences over several devices)
     cordelia-node/       # Binary: CLI (main.rs), person_cmd and terminal (the device
-                         #   commands and their prompts), daemon lifecycle, p2p.rs,
+                         #   commands and their prompts), carry_cmd (`sync carry`),
+                         #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, and leave), indicator
+                         #   device_entries (a device's passes, and leave), indicator (the
+                         #   state and the level of a status)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
     specs/               # Protocol and component specs + TLA+ model
@@ -99,7 +106,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -139,7 +146,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `MAX_CHANNELS_ASKED_OF_A_PEER` | 1024 | parameter-rationale.md §4 |
 | `STATE_OFFER_RETRY_BASE_SECS`, `STATE_OFFER_RETRY_MAX_SECS` | 60s, 6h | parameter-rationale.md §4 |
 | `MAX_STATE_KEYS` | 1024 | parameter-rationale.md §4 |
-| `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 | decision 2026-09-30 §4.4 |
+| `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 (also a delete among entries, at a relay and on a device) | decision 2026-09-30 §4.4; parameter-rationale.md §12.7 |
 | `HISTORY_DAYS`, `HISTORY_MAX_BYTES` | 30, 256MB | parameter-rationale.md §10 |
 | `HISTORY_TURN_WAIT_SECS`, `HISTORY_SWEEP_INTERVAL_SECS` | 10s, 3600s | parameter-rationale.md §10 |
 | `HISTORY_SWEEP_SHARE` | 8 (swept at a cycle's end once an eighth of the size is kept) | parameter-rationale.md §10 |
@@ -171,12 +178,12 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_ENTRY_NAME_AND_VALUE_BYTES` | 60KB | parameter-rationale.md §12.4 |
 | `ENTRY_CLEAR_BYTES`, `ENTRY_WIRE_OVERHEAD_BYTES`, `MAX_ENTRY_WIRE_BYTES` | 233, 237, 65,773 (derived) | parameter-rationale.md §12.4 |
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
-| `LABEL_*` (23 of them, all in `LABELS`) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (24 of them, all in `LABELS`; `LABEL_CARRY_WORD` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
 | `PAIR_KEY_TYPED_SECS`, `TYPED_KEY_KEPT_SECS`, `HAND_OVER_KEPT_SECS` | 3600s, 86400s, 7200s | parameter-rationale.md §12.6 |
-| `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8, 2 | parameter-rationale.md §12.6 |
+| `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8 (within their hour at one time), 2 | parameter-rationale.md §12.6 |
 | `HAND_OVER_CHANGE_ENTRY_BYTES`, `MAX_HAND_OVER_BYTES` | 32,960, 54,275 (derived) | parameter-rationale.md §12.6 |
 | `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
@@ -200,6 +207,14 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `CHANGE_FETCH_MAX_SECS`, `CHANGE_FETCH_PASSES` | 120s, 3 | parameter-rationale.md §12.9 |
 | `STATEMENTS_LEFT_SAID_BELOW` | 16 | parameter-rationale.md §12.9 |
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
+| `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
+| `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
+| `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
+| `RECOVERY_MAX_NAMES`, `RECOVERY_MAX_DEVICES_SHOWN`, `RECOVERY_MAX_LEFT_SECRETS` | 1024, 256, 9 (derived) | parameter-rationale.md §12.9 |
+| `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |
+| `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
+| `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
+| `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
 
 ## Running Tests
 
