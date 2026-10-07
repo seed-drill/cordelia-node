@@ -3067,4 +3067,103 @@ mod tests {
         assert_eq!(key_files(again.key_files), (0, 0, there));
         assert_eq!(std::fs::read(keys.join("grp_new.key")).unwrap(), [7u8; 32]);
     }
+
+    // ── A version from before, started on this database ──────────────
+
+    /// What the released version (0.2.0-alpha.8) runs against its
+    /// database when it starts, statement for statement and in its order,
+    /// up to its first write and the one after it.
+    ///
+    /// Where they come from, at the tag `v0.2.0-alpha.8`: `cmd_start` in
+    /// `crates/cordelia-node/src/main.rs` opens the database
+    /// (`schema::init_db`: the pragmas, and the schema's version, which
+    /// it reads and compares with each of its own steps; on a database of
+    /// this version none of them runs), removes swarm channels
+    /// (`channels::remove_swarm_channels`: a transaction that lists
+    /// them), and then, for a personal node, makes its inbox
+    /// (`channels::ensure_inbox`, through `membership::ensure_own_inbox`):
+    /// its first write.
+    fn the_released_version_starts(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;",
+        )?;
+        let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert!(
+            current >= schema::RELEASED_SCHEMA_VERSION,
+            "a step of the released version would run"
+        );
+        {
+            let batch = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let ids: Vec<String> = {
+                let mut stmt = batch.prepare(
+                    "SELECT channel_id FROM channels WHERE substr(channel_id, 1, ?1) = ?2",
+                )?;
+                let rows = stmt.query_map(params![15i64, "cordelia:swarm:"], |row| row.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            assert!(ids.is_empty());
+            batch.commit()?;
+        }
+        let (inbox, owner, now) = (
+            format!("inbox_{}", "ab".repeat(32)),
+            [9u8; 32],
+            "2026-10-07T08:00:00+00:00",
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
+         VALUES (?1, 'inbox', 'realtime', 'invite_only', ?2, ?3, ?3)",
+            params![inbox, owner.as_slice(), now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', ?3)",
+            params![inbox, owner.as_slice(), now],
+        )?;
+        Ok(())
+    }
+
+    /// The released version, started by mistake on a database of this
+    /// version, stops at its first write with the guard's words, and has
+    /// changed nothing before it (decision 2026-10-04 §10.1): on a
+    /// database that was stepped, and on a first install's. Its first
+    /// write is an insert that passes over a row which is there already:
+    /// the guard refuses that form as it refuses any.
+    #[test]
+    fn the_released_version_stops_at_its_first_write_and_has_changed_nothing() {
+        // On a database of the released version itself, the statements
+        // run to their end: they are that version's own.
+        let (_dir, conn) = released_node(|_| {});
+        the_released_version_starts(&conn).unwrap();
+        assert_eq!(
+            rows(&conn, "channels"),
+            7,
+            "the released version's start made its inbox"
+        );
+
+        let (dir, conn) = released_node(|_| {});
+        start(&conn, dir.path(), VERSION).unwrap();
+        let first_install = tempfile::tempdir().unwrap();
+        let fresh = db::open(&first_install.path().join(DATABASE)).unwrap();
+        assert_eq!(
+            start(&fresh, first_install.path(), VERSION).unwrap().done,
+            Done::Marked
+        );
+        for (database, words) in [
+            (dir.path(), guard_words(VERSION)),
+            (first_install.path(), guard_words_with_no_copy(VERSION)),
+        ] {
+            // As another process opens it.
+            let conn = Connection::open(database.join(DATABASE)).unwrap();
+            let before = everything(&conn);
+            let refused = the_released_version_starts(&conn).unwrap_err().to_string();
+            assert!(refused.contains(&words), "{refused}");
+            assert!(conn.is_autocommit());
+            assert_eq!(everything(&conn), before);
+            assert_eq!(rows(&conn, "channels"), 0);
+        }
+    }
 }
