@@ -43,7 +43,7 @@ fn asks(node: &Node, path: &str, body: Value) -> (u16, String) {
 /// without what it says of its relays, which changes as it reaches them.
 fn holds(node: &Node) -> Value {
     let mut seen = look(node);
-    for of_its_relays in ["relays", "waiting", "says"] {
+    for of_its_relays in ["relays", "waiting", "not_reached", "says"] {
         seen.as_object_mut().unwrap().remove(of_its_relays);
     }
     seen
