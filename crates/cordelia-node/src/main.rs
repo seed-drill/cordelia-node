@@ -3135,6 +3135,27 @@ fn version_note(node: Option<&str>, own: &str) -> Option<String> {
     }
 }
 
+/// The name that `cordelia sync unmap <word>` asks the node to let go
+/// of (decision 2026-10-04 §7.3): one that the device may hold by a
+/// carry, with no folder mapped to it. It is asked only where the word
+/// has nothing to do with a mapping, so that no folder is ever unmapped
+/// by it: not where the word is a mapping's name or folder
+/// (`names_a_mapping`), not where it is a mapping's name in another
+/// spelling, and not where it ends in `/`, which is a folder as a shell
+/// completes one.
+fn name_to_let_go(
+    word: &str,
+    mappings: &[(String, String)],
+    names_a_mapping: bool,
+) -> Option<String> {
+    if names_a_mapping || word.trim().ends_with('/') {
+        return None;
+    }
+    let name = cordelia_core::sync_name::tidy(word);
+    let mapped = mappings.iter().any(|(_, mapped)| *mapped == name);
+    (!mapped && mapping_named(mappings, word).is_none()).then_some(name)
+}
+
 /// What `cordelia sync unmap <name>` says where the node let go of a
 /// name that this device held by a carry, with no folder mapped to it
 /// (decision 2026-10-04 §7.3).
@@ -3481,8 +3502,8 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             // node lets go of such a name, and says that it did
             // (decision 2026-10-04 §7.3), with sync on or off. Where it
             // does not, the word names nothing here, as before.
-            if by_name.is_none() && by_folder.is_none() {
-                let name = cordelia_core::sync_name::tidy(&folder);
+            let names_a_mapping = by_name.is_some() || by_folder.is_some();
+            if let Some(name) = name_to_let_go(&folder, &mappings, names_a_mapping) {
                 let asked = api_post_told(
                     config_path,
                     "/api/v1/sync/unmap",
@@ -6238,6 +6259,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(NODE_LOCK)).unwrap();
         assert!(lock_data_dir(dir.path()).unwrap().is_none());
+    }
+
+    /// `cordelia sync unmap <word>` asks the node to let go of a name
+    /// only where the word has nothing to do with a mapping (decision
+    /// 2026-10-04 §7.3): no folder is unmapped by the asking. Not for a
+    /// word that names a mapping, in whatever spelling; and not for one
+    /// that ends in `/`, which is a folder.
+    #[test]
+    fn test_unmap_asks_to_let_go_only_of_a_word_that_names_no_mapping() {
+        let mappings = vec![("/srv/agents/sam/notes".to_string(), "lab".to_string())];
+        let asked =
+            |word: &str, names_a_mapping: bool| name_to_let_go(word, &mappings, names_a_mapping);
+        // A name that no folder is mapped to: asked, in its one spelling.
+        assert_eq!(asked("team", false).as_deref(), Some("team"));
+        assert_eq!(asked(" Team.git ", false).as_deref(), Some("team"));
+        // A mapping's name or folder, as the command found it.
+        assert_eq!(asked("lab", true), None);
+        assert_eq!(asked("/srv/agents/sam/notes", true), None);
+        // A mapping's name with a `/` at its end is a folder that is not
+        // mapped: the mapping is not unmapped by it. Nor is anything
+        // asked for any word that ends so.
+        assert_eq!(asked("lab/", false), None);
+        assert_eq!(asked("team/", false), None);
+        // A mapping's name in another spelling.
+        assert_eq!(asked("LAB", false), None);
+        assert_eq!(asked("lab.git", false), None);
     }
 
     /// Where the node let go of a name that a carry held with no folder
