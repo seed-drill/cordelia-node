@@ -239,6 +239,7 @@ pub struct OwnChannels {
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
+#[derive(Clone)]
 pub enum ProvedBy {
     /// The node holds the channel's secret: it makes the proof for each
     /// connection itself. The secret is of a generation that the device
@@ -248,7 +249,20 @@ pub enum ProvedBy {
     /// for each relay by its name: the command that was typed the phrase,
     /// in its own process, over the value of each connection's session
     /// ([`DoorAsk::Sessions`]). The node is handed no secret.
-    Proofs(Vec<(String, [u8; 64])>),
+    Proofs(Vec<ProofMade>),
+}
+
+/// A proof of a channel's key that a command made for the connection to
+/// one relay (decision 2026-10-04 §16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofMade {
+    /// The relay, by its name.
+    pub relay: String,
+    /// The value of the session that the proof was made over. It holds
+    /// on the connection with that session, and on no other: where the
+    /// relay's connection has another by now, the proof is not sent.
+    pub session: [u8; 32],
+    pub proof: [u8; 64],
 }
 
 /// What one relay handed through the door for a carry.
@@ -261,6 +275,18 @@ pub enum LeftRead {
     NotHeld,
     /// Nothing was read, and why.
     NotRead(String),
+    /// Nothing was read: the connection is another than the one that
+    /// the proof was made for, or there was none when the proofs were
+    /// made (decision 2026-10-04 §16). Whoever made them asks for the
+    /// sessions again and makes them again, for the connection there is
+    /// now. It is never taken for a relay that holds none.
+    Changed,
+    /// Nothing was read: the connection has no room left for a proof
+    /// more. A relay remembers so many channels for one connection, and
+    /// places are kept back for the device's own channels (decision
+    /// 2026-10-04 §16). Whoever asked has the connection made again
+    /// ([`DoorAsk::Remake`]), and reads on there.
+    NoRoom,
     /// What it handed of the channel, each entry as its bytes on the
     /// wire, and whether the channel was read to its end.
     Read { entries: Vec<Vec<u8>>, whole: bool },
@@ -285,12 +311,24 @@ pub enum DoorAsk {
     },
     /// Read the channel whose ID is `channel` at each relay, until
     /// `until`: it is of a generation that the device has left, or never
-    /// followed.
+    /// followed. With `only`, it is read at the relays of those names
+    /// alone, and each other is not answered for: a read goes on so at a
+    /// relay whose connection was made again.
     Read {
         channel: [u8; 32],
         by: ProvedBy,
+        only: Option<Vec<String>>,
         until: Instant,
         answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
+    },
+    /// Have the connection to the relay called `relay` made again
+    /// (decision 2026-10-04 §16): it is closed, and the node dials the
+    /// relay anew. A relay remembers the channels that were proved on a
+    /// connection for that connection alone: a new one starts with none.
+    /// Answered with whether there was a connection to close.
+    Remake {
+        relay: String,
+        answer: tokio::sync::oneshot::Sender<bool>,
     },
 }
 
@@ -406,6 +444,17 @@ impl OwnChannels {
     pub fn carrying(&self, channel: &[u8; 32], now: Instant) {
         let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
         carrying.insert(*channel, now);
+    }
+
+    /// The channels that a carry is being made into at `now`, for a test.
+    #[cfg(test)]
+    pub(crate) fn carried_into(&self, now: Instant) -> std::collections::BTreeSet<[u8; 32]> {
+        let carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        let began = |channel: &[u8; 32]| carrying.get(channel).copied();
+        let lasts = |channel: &&[u8; 32]| {
+            began(channel).is_some_and(|began| now.saturating_duration_since(began) < CARRYING_WAIT)
+        };
+        carrying.keys().filter(lasts).copied().collect()
     }
 
     /// The carry into the channel whose ID is `channel` has ended.
@@ -1660,9 +1709,22 @@ mod tests {
         }
 
         // It changes nothing: done once, while a cycle holds the turn,
-        // with nothing counted and nothing forgotten.
+        // with nothing counted and nothing forgotten. (It is done on a
+        // thread of its own, and given a time: work that waited for the
+        // cycle here would wait for ever, since this test holds the
+        // turn, and the test is to fail then, and not to hang.)
         let turn = state.history.turn();
-        assert_eq!(state.as_a_change_where(done, |_| Came::Nothing), 1);
+        let other = std::sync::Arc::clone(&state);
+        let nothing = std::thread::spawn(move || other.as_a_change_where(done, |_| Came::Nothing));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !nothing.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "work that changes nothing waited for the cycle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(nothing.join().unwrap(), 1);
         assert_eq!(state.sync_control.generation(), before);
         assert!(
             state

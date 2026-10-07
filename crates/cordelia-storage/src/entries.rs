@@ -366,8 +366,9 @@ pub fn holds_only_deletes_stored(
 }
 
 /// Remove every entry of one slot of a channel. Returns how many there
-/// were. A slot goes whole or not at all: were a delete to go alone, a
-/// lower revision by another author would be the slot's version again.
+/// were. A relay's sweep takes a slot so, where every entry in it is an
+/// old delete: were a delete to go from a slot that holds more, a lower
+/// revision by another author would be the slot's version again.
 pub fn remove_slot(
     conn: &Connection,
     channel: &[u8; 32],
@@ -376,6 +377,24 @@ pub fn remove_slot(
     conn.execute(
         "DELETE FROM entries WHERE channel_id = ?1 AND slot = ?2",
         params![channel.as_slice(), slot.as_slice()],
+    )
+    .map_err(storage)
+}
+
+/// Remove from one slot of a channel each delete that the store took at
+/// `by` or before, in seconds: what a device's sweep of old deletes takes
+/// of a slot (decision 2026-10-04 §16). An entry that is no delete stays,
+/// and so does a delete that the store took since. Returns how many went.
+pub fn remove_deletes_stored(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    by: i64,
+) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM entries
+         WHERE channel_id = ?1 AND slot = ?2 AND is_delete = 1 AND stored_at <= ?3",
+        params![channel.as_slice(), slot.as_slice(), by],
     )
     .map_err(storage)
 }
@@ -1147,6 +1166,47 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(
+            channel_entries_after(&conn, &other_channel(), 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A device's sweep takes of a slot only its old deletes (decision
+    /// 2026-10-04 §16): a text in the slot stays, a delete that the store
+    /// took since stays, and so does every other slot and channel.
+    #[test]
+    fn test_only_the_old_deletes_of_a_slot_are_removed() {
+        let conn = db::open_in_memory().unwrap();
+        let delete = |n: u8, rev: u64, name: &str| made(&SECRET, n, rev, name, Value::Delete);
+        let mixed = text(1, 3, "mixed.md", "a text");
+        let younger = delete(3, 2, "mixed.md");
+        let elsewhere = delete(2, 4, "other.md");
+        let other_channel_delete = made(&OTHER_SECRET, 2, 4, "mixed.md", Value::Delete);
+        for (entry, at) in [
+            (mixed.clone(), NOW),
+            (delete(2, 4, "mixed.md"), NOW),
+            (younger.clone(), NOW + 100),
+            (elsewhere.clone(), NOW),
+            (other_channel_delete, NOW),
+        ] {
+            assert_eq!(store(&conn, &entry, at).unwrap(), Outcome::Stored);
+        }
+        let removed =
+            |name: &str, by: i64| remove_deletes_stored(&conn, &channel(), &slot(name), by);
+        // Before any of them was stored, none goes.
+        assert_eq!(removed("mixed.md", NOW - 1).unwrap(), 0);
+        assert_eq!(held(&conn).len(), 4);
+        // The old delete goes: the text stays, and the younger delete.
+        assert_eq!(removed("mixed.md", NOW).unwrap(), 1);
+        assert_eq!(ids(&conn), [mixed.id(), younger.id(), elsewhere.id()]);
+        assert_eq!(removed("mixed.md", NOW).unwrap(), 0);
+        // Once the younger one is old it goes too, and the text is left.
+        assert_eq!(removed("mixed.md", NOW + 100).unwrap(), 1);
+        assert_eq!(ids(&conn), [mixed.id(), elsewhere.id()]);
+        // The other channel holds what it held.
         assert_eq!(
             channel_entries_after(&conn, &other_channel(), 0, 10)
                 .unwrap()

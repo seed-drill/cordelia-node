@@ -1109,6 +1109,10 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         applied_secs,
         names_to_go: person["names"]["to_go"].as_array().map_or(0, Vec::len),
         to_go_secs: ago(&person["names"]["to_go_since"]),
+        carried_to_go: person["names"]["carried_to_go"]
+            .as_array()
+            .map_or(0, Vec::len),
+        carried_to_go_secs: ago(&person["names"]["carried_to_go_since"]),
     }
 }
 
@@ -1130,6 +1134,42 @@ fn format_uptime(secs: u64) -> String {
 /// lock on for as long as it runs.
 const NODE_LOCK: &str = "node.lock";
 
+/// What became of a try at the lock on a data directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lock {
+    /// This node holds it.
+    Held,
+    /// Another node holds it: this one does not start.
+    AnotherNode,
+    /// It could not be taken, for any other reason, as the system says
+    /// it: the node starts without it.
+    NotTaken(String),
+}
+
+/// What a node makes of the system's answer to its try at the lock
+/// (decision 2026-10-04 §10.1). **Only that another node holds the lock
+/// keeps this one from starting.** Any other failure, whatever it is,
+/// leaves the node with no lock, and it starts all the same: a volume
+/// that knows no locks is one where a node must still run.
+fn lock_tried(tried: Result<(), std::fs::TryLockError>) -> Lock {
+    match tried {
+        Ok(()) => Lock::Held,
+        Err(std::fs::TryLockError::WouldBlock) => Lock::AnotherNode,
+        Err(std::fs::TryLockError::Error(e)) => Lock::NotTaken(e.to_string()),
+    }
+}
+
+/// The node goes on with no lock on its data directory: it says so in
+/// its log, once, with why the lock could not be taken.
+fn goes_on_with_no_lock(data_dir: &std::path::Path, why: &str) -> Option<std::fs::File> {
+    tracing::warn!(
+        "the lock on the data directory {} could not be taken ({why}): the node goes on \
+         without it, and nothing stops a second node from being started on that directory",
+        data_dir.display()
+    );
+    None
+}
+
 /// Take the lock that says a node is running on the data directory
 /// `data_dir` (decision 2026-10-04 §10.1): an advisory lock on a file
 /// there, which the system lets go of when the process ends, however it
@@ -1138,9 +1178,13 @@ const NODE_LOCK: &str = "node.lock";
 ///
 /// Where another process holds it, a node is running on that directory:
 /// this one says so, and has changed nothing. The file holds nothing, and
-/// is left where it is when the node stops. On a volume that knows no
-/// such lock the node starts, and says that it could not take one.
-fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+/// is left where it is when the node stops.
+///
+/// **Nothing else keeps the node from starting** ([`lock_tried`]). Where
+/// the lock cannot be taken for any other reason (the volume knows no
+/// such lock, or the file cannot be opened), the node says so once and
+/// goes on without it: `None` is returned.
+fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<Option<std::fs::File>> {
     let path = data_dir.join(NODE_LOCK);
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -1149,26 +1193,18 @@ fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("the lock on {} cannot be taken: {e}", data_dir.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(e) => return Ok(goes_on_with_no_lock(data_dir, &e.to_string())),
+    };
+    match lock_tried(file.try_lock()) {
+        Lock::Held => Ok(Some(file)),
+        Lock::AnotherNode => anyhow::bail!(
             "another node is running on the data directory {}: a data directory is one node's. \
              Nothing was changed. Stop that node first, or give this one a directory of its own.",
             data_dir.display()
         ),
-        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-            tracing::warn!(
-                "the volume of the data directory knows no lock: nothing stops a second node \
-                 from being started on it"
-            );
-            Ok(file)
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            anyhow::bail!("the lock on {} cannot be taken: {e}", data_dir.display())
-        }
+        Lock::NotTaken(why) => Ok(goes_on_with_no_lock(data_dir, &why)),
     }
 }
 
@@ -1496,7 +1532,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400))).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection()).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -2859,6 +2895,20 @@ pub(crate) fn api_post_within(
     Ok(json)
 }
 
+/// Overwrite every string that `body` holds, wherever it is in it
+/// (decision 2026-10-04 §16): a secret that a command hands the node is
+/// in the request as text, and the command's own copy of that text is
+/// not left in its memory once the request is sent.
+pub(crate) fn wipe_strings(body: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    match body {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(all) => all.iter_mut().for_each(wipe_strings),
+        serde_json::Value::Object(all) => all.values_mut().for_each(wipe_strings),
+        _ => {}
+    }
+}
+
 /// What the node answered a command.
 pub(crate) enum Told {
     /// It did what was asked, and says this.
@@ -2878,6 +2928,18 @@ pub(crate) fn api_post_told(
     body: serde_json::Value,
     limit: Option<std::time::Duration>,
 ) -> anyhow::Result<Told> {
+    api_post_told_of(config_path, path, &body, limit)
+}
+
+/// [`api_post_told`], of a body that whoever asks keeps: a command that
+/// hands the node what the recovery phrase opened overwrites its own
+/// copy of that once it is sent ([`wipe_strings`]).
+pub(crate) fn api_post_told_of(
+    config_path: &str,
+    path: &str,
+    body: &serde_json::Value,
+    limit: Option<std::time::Duration>,
+) -> anyhow::Result<Told> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
@@ -2893,7 +2955,7 @@ pub(crate) fn api_post_told(
     let mut resp = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
-        .send_json(&body)
+        .send_json(body)
         .map_err(|e| {
             anyhow::anyhow!(
                 "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
@@ -3071,6 +3133,40 @@ fn version_note(node: Option<&str>, own: &str) -> Option<String> {
              is version {own}. {after}"
         )),
     }
+}
+
+/// The name that `cordelia sync unmap <word>` asks the node to let go
+/// of (decision 2026-10-04 §7.3): one that the device may hold by a
+/// carry, with no folder mapped to it. It is asked only where the word
+/// has nothing to do with a mapping, so that no folder is ever unmapped
+/// by it: not where the word is a mapping's name or folder
+/// (`names_a_mapping`), not where it is a mapping's name in another
+/// spelling, and not where it ends in `/`, which is a folder as a shell
+/// completes one.
+fn name_to_let_go(
+    word: &str,
+    mappings: &[(String, String)],
+    names_a_mapping: bool,
+) -> Option<String> {
+    if names_a_mapping || word.trim().ends_with('/') {
+        return None;
+    }
+    let name = cordelia_core::sync_name::tidy(word);
+    let mapped = mappings.iter().any(|(_, mapped)| *mapped == name);
+    (!mapped && mapping_named(mappings, word).is_none()).then_some(name)
+}
+
+/// What `cordelia sync unmap <name>` says where the node let go of a
+/// name that this device held by a carry, with no folder mapped to it
+/// (decision 2026-10-04 §7.3).
+fn let_go_says(name: &str) -> String {
+    let name = sync_label(name);
+    format!(
+        "This device holds {name} no longer. It held it by a carry, with no folder mapped to \
+         it: nothing more of {name} is sent from here or fetched, and what it had brought in \
+         and had not yet sent to a relay is not sent. Your other devices keep what they hold \
+         of it."
+    )
 }
 
 /// The mapping `cordelia sync unmap <word>` means, given the mapping whose
@@ -3381,7 +3477,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             }
         }
         SyncCommand::Unmap { folder } => {
-            let settings = sync_settings(config_path)?;
+            let settings = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
             let mappings = declared_mappings(&settings);
             // A name; or a folder, which may be any folder of a mapped
             // repository, or one that is no longer on disk.
@@ -3401,6 +3497,30 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 }
                 mapping_at(&mappings, &spellings)
             };
+            // A word that names no mapping may be a name that this
+            // device holds by a carry, with no folder mapped to it: the
+            // node lets go of such a name, and says that it did
+            // (decision 2026-10-04 §7.3), with sync on or off. Where it
+            // does not, the word names nothing here, as before.
+            let names_a_mapping = by_name.is_some() || by_folder.is_some();
+            if let Some(name) = name_to_let_go(&folder, &mappings, names_a_mapping) {
+                let asked = api_post_told(
+                    config_path,
+                    "/api/v1/sync/unmap",
+                    serde_json::json!({ "folder": name }),
+                    None,
+                )?;
+                if let Told::Yes(after) = asked
+                    && let Some(name) = after["let_go"].as_str()
+                {
+                    println!("{}", let_go_says(name));
+                    return Ok(());
+                }
+            }
+            // A folder is unmapped with sync on.
+            if settings["enabled"].as_bool() != Some(true) {
+                anyhow::bail!("Sync is off. Turn it on with `cordelia sync claude`.");
+            }
             // A word that ends in `/` is a folder. If it is not a mapped
             // one, and is a mapping's name without the `/`, say so.
             if by_folder.is_none()
@@ -5463,7 +5583,10 @@ mod tests {
                 { "name": "old", "by": [], "by_gone": [{ "key": "g" }] },
                 { "name": "team", "by": [{ "key": "a" }], "by_gone": [{ "key": "g" }] },
             ],
-            "names": { "sent": ["x"], "to_go": ["lab"], "to_go_since": now - 30 },
+            "names": {
+                "sent": ["x"], "to_go": ["lab", "old", "team"], "to_go_since": now - 30,
+                "carried_to_go": ["old", "team"], "carried_to_go_since": now - 20,
+            },
         });
         assert_eq!(
             devices_facts(&look, now),
@@ -5479,8 +5602,11 @@ mod tests {
                 no_room_secs: vec![60, 0],
                 names_not_listed: 2,
                 applied_secs: Some(3_600),
-                names_to_go: 1,
+                names_to_go: 3,
                 to_go_secs: Some(30),
+                // Of those, the names that a carry holds with no folder.
+                carried_to_go: 2,
+                carried_to_go_secs: Some(20),
             }
         );
 
@@ -6091,6 +6217,95 @@ mod tests {
         );
         let said = mapping_meant("x", None, None).unwrap_err().to_string();
         assert!(said.contains("not mapped on this device"), "{said}");
+    }
+
+    /// **Only that another node holds the lock on a data directory keeps
+    /// a node from starting** (decision 2026-10-04 §10.1). Whatever else
+    /// the system answers a try at the lock with, the node goes on
+    /// without it: a volume that knows no locks, and any other failure.
+    /// So does a node whose lock file cannot be opened at all.
+    #[test]
+    fn test_only_another_nodes_lock_keeps_a_node_from_starting() {
+        use std::fs::TryLockError;
+        use std::io::{Error, ErrorKind};
+        assert_eq!(lock_tried(Ok(())), Lock::Held);
+        assert_eq!(lock_tried(Err(TryLockError::WouldBlock)), Lock::AnotherNode);
+        for kind in [
+            ErrorKind::Unsupported,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let tried = lock_tried(Err(TryLockError::Error(Error::from(kind))));
+            assert!(matches!(tried, Lock::NotTaken(_)), "{kind:?}: {tried:?}");
+        }
+
+        // On a directory: the first node holds the lock, and a second is
+        // told that another node is running there.
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_data_dir(dir.path()).unwrap();
+        assert!(held.is_some());
+        let second = lock_data_dir(dir.path()).unwrap_err().to_string();
+        assert!(
+            second.starts_with("another node is running on the data directory"),
+            "{second}"
+        );
+        assert!(second.contains("Nothing was changed."), "{second}");
+        // Once the first lets go, the lock is taken again.
+        drop(held);
+        assert!(lock_data_dir(dir.path()).unwrap().is_some());
+
+        // The file of the lock cannot be opened: here a folder is in its
+        // place. The node goes on, with no lock.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(NODE_LOCK)).unwrap();
+        assert!(lock_data_dir(dir.path()).unwrap().is_none());
+    }
+
+    /// `cordelia sync unmap <word>` asks the node to let go of a name
+    /// only where the word has nothing to do with a mapping (decision
+    /// 2026-10-04 §7.3): no folder is unmapped by the asking. Not for a
+    /// word that names a mapping, in whatever spelling; and not for one
+    /// that ends in `/`, which is a folder.
+    #[test]
+    fn test_unmap_asks_to_let_go_only_of_a_word_that_names_no_mapping() {
+        let mappings = vec![("/srv/agents/sam/notes".to_string(), "lab".to_string())];
+        let asked =
+            |word: &str, names_a_mapping: bool| name_to_let_go(word, &mappings, names_a_mapping);
+        // A name that no folder is mapped to: asked, in its one spelling.
+        assert_eq!(asked("team", false).as_deref(), Some("team"));
+        assert_eq!(asked(" Team.git ", false).as_deref(), Some("team"));
+        // A mapping's name or folder, as the command found it.
+        assert_eq!(asked("lab", true), None);
+        assert_eq!(asked("/srv/agents/sam/notes", true), None);
+        // A mapping's name with a `/` at its end is a folder that is not
+        // mapped: the mapping is not unmapped by it. Nor is anything
+        // asked for any word that ends so.
+        assert_eq!(asked("lab/", false), None);
+        assert_eq!(asked("team/", false), None);
+        // A mapping's name in another spelling.
+        assert_eq!(asked("LAB", false), None);
+        assert_eq!(asked("lab.git", false), None);
+    }
+
+    /// Where the node let go of a name that a carry held with no folder
+    /// (decision 2026-10-04 §7.3), `cordelia sync unmap <name>` says so:
+    /// that the device holds the name no longer, and that what it had
+    /// brought in and not yet sent is not sent.
+    #[test]
+    fn test_what_unmap_says_of_a_name_that_a_carry_held() {
+        let said = let_go_says("lab");
+        assert!(
+            said.starts_with(
+                "This device holds lab no longer. It held it by a carry, with no folder mapped \
+                 to it: nothing more of lab is sent from here or fetched"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("what it had brought in and had not yet sent to a relay is not sent"),
+            "{said}"
+        );
+        assert!(said.ends_with("Your other devices keep what they hold of it."));
     }
 
     /// A command asks the node only at one of the two addresses that the

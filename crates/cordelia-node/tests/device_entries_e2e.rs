@@ -24,13 +24,13 @@ use cordelia_api::change::make_change;
 use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProvedBy,
+    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy,
 };
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    OUTBOX_REFUSED_RETRY_MAX_SECS, OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
-    entry_cost,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -79,6 +79,12 @@ struct Device {
 impl Device {
     /// A new install, which follows no phrase and is set up with no relay.
     fn new(label: &'static str) -> Self {
+        Self::proving_at_most(label, MAX_CHANNELS_PROVED_ON_A_CONNECTION)
+    }
+
+    /// [`Self::new`], for a device whose relays remember the proofs of
+    /// `most_proved` channels for one connection.
+    fn proving_at_most(label: &'static str, most_proved: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let identity = NodeIdentity::generate().unwrap();
         let for_transport = Arc::new(NodeIdentity::from_seed(*identity.seed()).unwrap());
@@ -113,7 +119,7 @@ impl Device {
             history: Default::default(),
         });
         let clock = Clock::system();
-        let engine = DeviceEntries::new(state.clone(), clock.clone());
+        let engine = DeviceEntries::proving_at_most(state.clone(), clock.clone(), most_proved);
         Self {
             label,
             state,
@@ -2153,6 +2159,95 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     assert_eq!(held[0].id(), by_one.id());
     assert!(!holds_at(&relay, &other.channel("notes"), &waiting.id()));
     assert_eq!(other.stands(), Stands::Stopped(State::Fork));
+}
+
+/// **A statement that no relay held, shown later** (decision 2026-10-04
+/// §7.6). The desktop makes a change with no relay in reach, and is
+/// lost. The laptop, which has seen no statement, makes the change
+/// again: it has the number that the lost one had, and its relay holds
+/// it. The other relay holds the entry from before.
+///
+/// The lost device comes to light at that other relay: **the relay,
+/// which holds an earlier change entry, takes the one it is shown.** The
+/// tablet, **which is behind, is answered with it there and applies
+/// it:** it is with the lost device. The laptop, **which has applied the
+/// other statement at that number, is shown it there and is in a
+/// fork;** and so is the tablet, once it is shown the laptop's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
+    let (near, far) = (relay_started("near", None), relay_started("far", None));
+    let (mut lost, mut remains, mut behind) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    lost.makes_the_phrase(&phrase());
+    lost.adds(&remains);
+    lost.adds(&behind);
+    // The laptop is at one relay and the tablet at the other. The
+    // desktop is at both: each relay holds the first change entry.
+    lost.connects("near", &near).await;
+    lost.connects("far", &far).await;
+    remains.connects("near", &near).await;
+    behind.connects("far", &far).await;
+    all_pass(&[&lost, &remains, &behind], 3).await;
+    let first = lost.latest();
+    for relay in [&near, &far] {
+        assert!(holds_at(relay, &first.channel, &first.id()));
+    }
+
+    // The desktop makes a change with no relay in reach, and is lost:
+    // no relay held it. The tablet is off.
+    lost.disconnects("near");
+    lost.disconnects("far");
+    behind.disconnects("far");
+    let unheard = lost.changes(&phrase(), &[&lost, &remains, &behind], &[]);
+    // The laptop has seen no statement. The change that it makes, which
+    // removes the desktop, has the number that the lost one had. Its
+    // relay holds it, and the other holds the entry from before.
+    let again = remains.changes(&phrase(), &[&remains, &behind], &[&lost]);
+    assert_eq!(again.rev, unheard.rev);
+    assert_ne!(again.id(), unheard.id());
+    remains.passes().await;
+    assert!(holds_at(&near, &again.channel, &again.id()));
+    assert!(holds_at(&far, &first.channel, &first.id()));
+
+    // The lost device comes to light at the relay that holds the
+    // earlier entry: the relay takes the one it is shown.
+    lost.connects("far", &far).await;
+    lost.passes().await;
+    let at_far = held_at(&far, &unheard.channel);
+    assert_eq!(at_far.len(), 1);
+    assert_eq!(at_far[0].id(), unheard.id());
+
+    // The tablet, which is behind, is answered with it there, and
+    // applies it: it is with the lost device.
+    assert_eq!(behind.latest().id(), first.id());
+    behind.connects("far", &far).await;
+    behind.passes().await;
+    assert_eq!(behind.latest().id(), unheard.id());
+    assert_eq!(behind.stands(), Stands::Applied);
+
+    // The laptop has applied the other statement at that number. Shown
+    // the lost one's at that relay, it is in a fork, and keeps both.
+    remains.connects("far", &far).await;
+    remains.passes().await;
+    assert_eq!(remains.stands(), Stands::Stopped(State::Fork));
+    let shows = at_relays::to_show(&remains.db()).unwrap().unwrap();
+    assert_eq!(
+        (shows.entry.id(), shows.apart),
+        (again.id(), Some(unheard.id()))
+    );
+    // And the tablet, which applied the lost one's, is in a fork once it
+    // is shown the laptop's, at the relay that holds that one.
+    behind.connects("near", &near).await;
+    behind.passes().await;
+    assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
+    let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
+    assert_eq!(
+        (shows.entry.id(), shows.apart),
+        (unheard.id(), Some(again.id()))
+    );
 }
 
 /// The channels that `request` names: the one that is proved or pulled,
@@ -4260,11 +4355,23 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
 /// Ask the device's engine to read `channel` at each relay through the
 /// door for a carry, as the node does where a command's work asked.
 async fn reads_left(device: &Device, channel: [u8; 32], by: ProvedBy) -> Vec<LeftAt> {
+    reads_left_at(device, channel, by, None).await
+}
+
+/// [`reads_left`], at the relays named in `only` alone where it names
+/// some.
+async fn reads_left_at(
+    device: &Device,
+    channel: [u8; 32],
+    by: ProvedBy,
+    only: Option<Vec<String>>,
+) -> Vec<LeftAt> {
     let (answer, answered) = tokio::sync::oneshot::channel();
     let until = std::time::Instant::now() + Duration::from_secs(30);
     let ask = DoorAsk::Read {
         channel,
         by,
+        only,
         until,
         answer,
     };
@@ -4370,22 +4477,33 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
     let (name, session) = (&sessions[0].0, sessions[0].1.unwrap());
     assert_eq!(name, "relay");
     let proof = cordelia_crypto::proof::make(&old_secret, &session, &a.key()).unwrap();
-    let by_proof = ProvedBy::Proofs(vec![("relay".into(), proof)]);
-    let read = reads_left(&a, old, by_proof).await;
+    let made = |relay: &str, session: [u8; 32], proof: [u8; 64]| {
+        ProvedBy::Proofs(vec![ProofMade {
+            relay: relay.into(),
+            session,
+            proof,
+        }])
+    };
+    let read = reads_left(&a, old, made("relay", session, proof)).await;
     assert_eq!(
         handed_ids(&read[0].read),
         Some((at_the_relay.clone(), true))
     );
     let for_another = cordelia_crypto::proof::make(&old_secret, &session, &new.key()).unwrap();
-    let read = reads_left(
-        &a,
-        old,
-        ProvedBy::Proofs(vec![("relay".into(), for_another)]),
-    )
-    .await;
+    let read = reads_left(&a, old, made("relay", session, for_another)).await;
     assert_eq!(read[0].read, LeftRead::NotHeld);
-    let read = reads_left(&a, old, ProvedBy::Proofs(vec![("other".into(), proof)])).await;
-    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("no proof")));
+    // **A proof goes with the session that it was made over** (§16),
+    // and is sent on the connection with that session alone. One that
+    // is said to be made over another is not sent, though it would
+    // hold: the relay is answered for as one whose connection changed,
+    // and never as one that holds none. So is a relay that no proof
+    // was made for: it had no connection when the proofs were made.
+    let pulled = a.counts("relay").pulled;
+    let read = reads_left(&a, old, made("relay", [7; 32], proof)).await;
+    assert_eq!(read[0].read, LeftRead::Changed);
+    let read = reads_left(&a, old, made("other", session, proof)).await;
+    assert_eq!(read[0].read, LeftRead::Changed);
+    assert_eq!(a.counts("relay").pulled, pulled);
 
     // A channel that the relay does not hold, and a secret that is not
     // the channel's: no, with nothing handed.
@@ -4410,6 +4528,16 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
         .map(|at| (at.relay.as_str(), at.read == LeftRead::NotReached))
         .collect();
     assert_eq!(said, [("relay", false), ("far", true)]);
+    // Asked for at some of them, it is read at those alone, and no
+    // other is answered for.
+    for (only, reached) in [("relay", true), ("far", false)] {
+        let read = reads_left_at(&a, old, by_secret(), Some(vec![only.to_string()])).await;
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].relay, only);
+        assert_eq!(read[0].read != LeftRead::NotReached, reached);
+    }
+    let nowhere = reads_left_at(&a, old, by_secret(), Some(Vec::new())).await;
+    assert!(nowhere.is_empty(), "{nowhere:?}");
 
     // A node that is held up reads nothing.
     a.state
@@ -4533,6 +4661,29 @@ async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
     assert!(handed_ids(&read[0].read).unwrap().1);
     assert_eq!(relay.requests().len(), 2);
 
+    // **A page of which nothing is an entry of the channel is not the
+    // channel's end.** The relay hands a page of the channel, and then
+    // one that holds an entry of another channel and bytes that are no
+    // entry: the reading stops there, with what it had, and the channel
+    // is said to be read in part.
+    let (first, junk) = (pages[0].clone(), pages[1][1..].to_vec());
+    relay.pulls(move |pull| {
+        let page = match pull.after {
+            0 => first.clone(),
+            _ => junk.clone(),
+        };
+        EntryPulled {
+            next: pull.after + 1,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let read = reads_left(&a, old, by_secret()).await;
+    let (ids, whole) = handed_ids(&read[0].read).unwrap();
+    assert!(!whole, "{read:?}");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(relay.requests().len(), 3);
+
     // A channel of the device's own is refused, and the relay is asked
     // nothing: the name's channel in the generation applied, and the
     // personal channel.
@@ -4588,6 +4739,128 @@ async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
     }
     assert!(asked_enough);
     assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
+}
+
+/// **A read of a generation that was left counts each proof it sends,
+/// and keeps places back for the device's own channels** (decision
+/// 2026-10-04 §16), against a stand-in that sees every request. A relay
+/// remembers the proofs of so many channels for one connection, of
+/// channels that it holds or not, and looks at none beyond them: here
+/// twelve.
+///
+/// The device holds four channels of its own, and reads thirty of a
+/// generation that was left, of which the relay holds none: it answers
+/// each proof with no. Each of those proofs is counted all the same. On
+/// one connection the device sends twelve proofs and not one more:
+/// eight for what it reads, and one for each channel of its own, whether
+/// the pass or the read comes first there. **Where a read finds no room
+/// it asks nothing of the relay, and says so;** on a connection that is
+/// made again it goes on from the channel it was at, and every channel
+/// is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_what_was_left_counts_its_proofs_and_keeps_places_for_the_devices_own() {
+    const MOST: usize = 12;
+    let relay = StandIn::started().await;
+    let mut a = Device::proving_at_most("laptop", MOST);
+    a.makes_the_phrase(&phrase());
+    for name in ["one", "two", "three"] {
+        a.holds(name);
+    }
+    let own: BTreeSet<[u8; 32]> = ["one", "two", "three"]
+        .iter()
+        .map(|name| a.channel(name))
+        .chain([a.personal()])
+        .collect();
+    // Thirty channels of a generation that was left, and three more:
+    // names that the device does not hold, each with its secret.
+    let left: Vec<([u8; 32], [u8; 32])> = (0..33)
+        .map(|n| {
+            let secret = derive::own_secret(&a.secret(), &format!("left-{n}")).unwrap();
+            (secret, derive::channel_id(&secret).unwrap())
+        })
+        .collect();
+    // The proofs that the relay saw since it was last asked: those of
+    // the device's own channels, and those of channels that were left.
+    let proofs = |relay: &StandIn| -> (usize, usize) {
+        let proved: Vec<[u8; 32]> = relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::ChannelProve(prove) => Some(prove.channel),
+                _ => None,
+            })
+            .collect();
+        let of_its_own = proved.iter().filter(|channel| own.contains(*channel));
+        let of_its_own = of_its_own.count();
+        (of_its_own, proved.len() - of_its_own)
+    };
+
+    a.connects_to("relay", relay.port, relay.key).await;
+    // On the first connection the pass comes first: a proof for each
+    // channel of the device's own.
+    a.passes().await;
+    let mut on_this_connection = proofs(&relay);
+    assert_eq!(on_this_connection, (4, 0));
+    let mut connections = vec![];
+    for (secret, channel) in &left[..30] {
+        loop {
+            let by = ProvedBy::Secret(zeroize::Zeroizing::new(*secret));
+            let read = reads_left(&a, *channel, by).await;
+            let (of_its_own, of_what_was_left) = proofs(&relay);
+            on_this_connection.0 += of_its_own;
+            on_this_connection.1 += of_what_was_left;
+            match &read[0].read {
+                // The relay holds none of it: the proof was sent, and
+                // is counted.
+                LeftRead::NotHeld => {
+                    assert_eq!(of_what_was_left, 1);
+                    break;
+                }
+                // No room: nothing was asked of the relay. The pass
+                // still has a place for each channel of the device's
+                // own, and the connection then has as many proofs as a
+                // relay remembers, and not one more.
+                LeftRead::NoRoom => {
+                    assert_eq!((of_its_own, of_what_was_left), (0, 0));
+                    a.passes().await;
+                    on_this_connection.0 += proofs(&relay).0;
+                    assert_eq!(on_this_connection, (4, MOST - 4));
+                    connections.push(on_this_connection);
+                    // Made again, a connection starts with none
+                    // remembered: here the read comes first.
+                    a.connects_to("relay", relay.port, relay.key).await;
+                    on_this_connection = (0, 0);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    // Thirty channels, eight on a connection: three connections that
+    // were filled, and six on the fourth, where the pass then proves
+    // each channel of the device's own.
+    assert_eq!(connections, vec![(4, 8); 3]);
+    assert_eq!(on_this_connection, (0, 6));
+    a.passes().await;
+    assert_eq!(proofs(&relay), (4, 0));
+    // Two more are read there, and the connection is full: a third has
+    // no room.
+    let reads = |n: usize| {
+        let (secret, channel) = left[n];
+        reads_left(
+            &a,
+            channel,
+            ProvedBy::Secret(zeroize::Zeroizing::new(secret)),
+        )
+    };
+    for n in [30, 31] {
+        assert_eq!(reads(n).await[0].read, LeftRead::NotHeld);
+    }
+    assert_eq!(reads(32).await[0].read, LeftRead::NoRoom);
+    assert_eq!(proofs(&relay), (0, 2));
+    // A channel that was read on this connection has its place there,
+    // which the relay remembers: it is read again with no room asked.
+    assert_eq!(reads(29).await[0].read, LeftRead::NotHeld);
+    assert_eq!(proofs(&relay), (0, 1));
 }
 
 // ── The node, as a process ───────────────────────────────────────────
@@ -4690,6 +4963,108 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     assert_eq!(device.holds_of(&channel).len(), 1);
     assert_eq!(device.text("notes", "stays.md").as_deref(), Some("a text"));
     assert_eq!(device.text("notes", "gone.md"), None);
+}
+
+/// **A file made again under a swept name reaches a device that swept
+/// later** (decision 2026-10-04 §16), against a relay. The laptop writes
+/// a file and deletes it. Ninety days on, by the laptop's clock and by
+/// the relay's, each has swept the delete, and the laptop makes the file
+/// again: at the first revision. The desktop is behind: it still holds
+/// the delete, of the same author, at a higher revision. It pulls the new
+/// entry, keeps nothing of it, and its place at the relay moves past it.
+///
+/// When the desktop's own 90 days have passed, its sweep takes the
+/// delete and forgets its place in that channel, and in no other. Its
+/// next whole pass reads the channel from the start: the file is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_made_again_under_a_swept_name_reaches_a_device_that_swept_later() {
+    use cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS;
+    const HELD_SECS: u64 = KEYED_TOMBSTONE_RETENTION_DAYS as u64 * 24 * 60 * 60;
+    let mut relay = relay_started("relay", None);
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.connects("relay", &relay).await;
+        device.holds("lab");
+    }
+    let first = laptop.writes("lab", "again.md", "first");
+    laptop.writes("lab", "other.md", "stays");
+    all_pass(&[&laptop, &desktop], 3).await;
+    laptop.deletes("lab", "again.md");
+    all_pass(&[&laptop, &desktop], 3).await;
+    let lab = laptop.channel("lab");
+    for device in [&laptop, &desktop] {
+        assert_eq!(device.holds_of(&lab).len(), 2);
+        assert_eq!(device.text("lab", "again.md").as_deref(), Some("Delete"));
+    }
+    assert_eq!(held_at(&relay, &lab).len(), 2);
+
+    // Ninety days on for the laptop: its delete goes, and its slot holds
+    // nothing.
+    laptop.clock.run_ahead(Duration::from_secs(HELD_SECS + 60));
+    laptop.engine.sweep_deletes();
+    assert_eq!(laptop.holds_of(&lab).len(), 1);
+    // And for the relay. (While it is stopped, time goes by for the
+    // delete that it holds.)
+    relay.stop();
+    {
+        let db = rusqlite::Connection::open(relay.data_dir().join("cordelia.db")).unwrap();
+        let changed = db
+            .execute(
+                "UPDATE entries SET stored_at = stored_at - ?1
+                 WHERE channel_id = ?2 AND is_delete = 1",
+                rusqlite::params![(HELD_SECS + 60) as i64, lab.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    wait_for("the relay sweeps the old delete", &[&relay], 30, || {
+        (held_at(&relay, &lab).len() == 1).then_some(())
+    });
+    for device in [&mut laptop, &mut desktop] {
+        device.connects("relay", &relay).await;
+    }
+
+    // The laptop makes the file again: at the first revision. The relay
+    // takes it.
+    let again = laptop.writes("lab", "again.md", "made again");
+    assert_eq!(again.rev, first.rev);
+    all_pass(&[&laptop], 2).await;
+    assert!(holds_at(&relay, &lab, &again.id()));
+
+    // The desktop still holds the delete. Whatever it is handed from
+    // the place it has reached, it keeps nothing of the new entry: that
+    // is below the delete, and of the delete's author.
+    all_pass(&[&desktop], 2).await;
+    let at = desktop.place("relay", &lab);
+    assert_ne!(at, ([0u8; 8], 0));
+    assert!(!desktop.holds_of(&lab).contains(&again.id()));
+    assert_eq!(desktop.text("lab", "again.md").as_deref(), Some("Delete"));
+    let personal = derive::channel_id(&desktop.personal_secret()).unwrap();
+    let in_personal = desktop.place("relay", &personal);
+    assert_ne!(in_personal.1, 0);
+
+    // The desktop's own 90 days: its delete goes, and its place in that
+    // channel is forgotten. Its place in its personal channel stays.
+    desktop.clock.run_ahead(Duration::from_secs(HELD_SECS + 60));
+    desktop.engine.sweep_deletes();
+    assert_eq!(desktop.holds_of(&lab).len(), 1);
+    assert_eq!(desktop.text("lab", "again.md"), None);
+    assert_eq!(desktop.place("relay", &lab), ([0u8; 8], 0));
+    assert_eq!(desktop.place("relay", &personal), in_personal);
+    // The next whole pass reads the channel from its start: the file is
+    // there.
+    desktop.passes().await;
+    assert_ne!(desktop.place("relay", &lab), ([0u8; 8], 0));
+    assert!(desktop.holds_of(&lab).contains(&again.id()));
+    assert_eq!(
+        desktop.text("lab", "again.md").as_deref(),
+        Some("made again")
+    );
+    assert_eq!(desktop.text("lab", "other.md").as_deref(), Some("stays"));
 }
 
 /// A node that is held up makes no pass (decision 2026-10-04 §10.1):

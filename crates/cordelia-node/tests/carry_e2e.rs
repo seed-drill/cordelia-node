@@ -294,6 +294,129 @@ fn six_words_of(n: &Node) -> String {
     cordelia_api::carry::naming_words(&key)
 }
 
+/// The names that `n` holds, as `cordelia devices` is told them: those
+/// it has sent, and those still to go.
+fn names_held(n: &Node) -> Vec<String> {
+    let seen = person_of(n);
+    let of = |field: &str| seen["names"][field].as_array().cloned().unwrap_or_default();
+    let mut names: Vec<String> = of("sent")
+        .iter()
+        .chain(&of("to_go"))
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// **`--from` holds a name only once something is taken** (decision
+/// 2026-10-04 §7.3). The desktop alone syncs `lab`, and is removed. The
+/// laptop, which never held the name, looks at what the removed key
+/// signed there: the command says what it found, and after a no the
+/// laptop holds no name, and nothing was done. With a yes and the phrase
+/// the files come in, and the laptop holds the name and lists it, with no
+/// folder mapped to it.
+///
+/// **Such a name can be let go:** `cordelia sync unmap lab` lets go of
+/// it, and says so. Asked again, the word names nothing here.
+#[test]
+fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(
+        d_mem.join("one.md"),
+        "written on the desktop
+",
+    )
+    .unwrap();
+    std::fs::write(
+        d_mem.join("two.md"),
+        "and this
+",
+    )
+    .unwrap();
+    sync_is_turned_on(&desktop);
+    let out = desktop.cli(&["sync", "map", &path(&d_notes), "lab"]);
+    assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    wait_for(
+        "the desktop has sent its files",
+        &[&relay, &desktop],
+        120,
+        || (held(&desktop).len() == 2 && has_sent_everything(&desktop).is_some()).then_some(()),
+    );
+    let desktop_key = key_of(&desktop);
+    desktop.stop();
+
+    // The desktop is removed, on the laptop, which holds no name.
+    let all = [&relay, &laptop];
+    let mut at = removes(&laptop, &desktop_key, &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for("the relay holds the change", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+    assert!(names_held(&laptop).is_empty());
+
+    // What the removed key signed is said, and a no takes nothing: the
+    // laptop holds no name for having looked.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("What this removed key signed in lab:")
+        .says("2 versions would go into slots where the new channel holds nothing.")
+        .says("Bring in 2 versions into slots where the new channel holds nothing?")
+        .types("no");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+    // Nor is there anything to let go of: the laptop syncs nothing.
+    let unmapped = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(unmapped.contains("Sync is off."), "{unmapped}");
+
+    // With a yes and the phrase the files come in, and the laptop holds
+    // the name and lists it.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("Bring in 2 versions into slots").types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    println!("{said}");
+    assert!(said.contains("lab: 2 versions brought in"), "{said}");
+    assert!(
+        said.contains("This device now holds lab and lists it, with no folder mapped to it"),
+        "{said}"
+    );
+    assert!(
+        said.contains("To let go of it: cordelia sync unmap lab"),
+        "{said}"
+    );
+    assert_eq!(names_held(&laptop), ["lab"]);
+    let texts: Vec<Option<String>> = held(&laptop).into_iter().map(|(_, _, text)| text).collect();
+    assert_eq!(
+        texts,
+        [
+            Some("written on the desktop\n".to_string()),
+            Some("and this\n".to_string())
+        ]
+    );
+    wait_for("the laptop has sent what it carried", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+
+    // The name has no folder to unmap: unmapping its name lets go of it.
+    let said = laptop.cli(&["sync", "unmap", "lab"]);
+    assert!(
+        said.starts_with("This device holds lab no longer. It held it by a carry"),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+    let again = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(again.contains("Sync is off."), "{again}");
+}
+
 /// The copies that a folder keeps beside its files.
 fn kept_beside(memory: &Path) -> Vec<String> {
     let mut beside: Vec<String> = std::fs::read_dir(memory)
@@ -450,6 +573,18 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
     );
     assert_eq!(held(&laptop), before);
 
+    // The removed device is named by its key, written whole, too.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", &desktop_key]);
+    at.says("What this removed key signed in lab:")
+        .says(&format!("({six_words}) \"desktop\""))
+        .says("Bring in 1 version into the slot")
+        .types("no");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+
     // Anything but a yes takes nothing, and asks for no phrase.
     let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 1 version into the slot").types("y");
@@ -466,8 +601,10 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
 
     // With the phrase: the new file comes in, into its empty slot. The
     // version above the laptop's stays where it is without the second
-    // yes.
-    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    // yes. (What the node is sent is passed on by this test, and kept.)
+    let through = PassesOn::to(laptop.http);
+    let mut at =
+        laptop.at_terminal_through(through.port, &["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 1 version into the slot").types("yes");
     at.says("Also bring in 1 version above").types("no");
     at.says("The recovery phrase, twelve words").types(&words);
@@ -491,6 +628,22 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         Some("what both hold\n")
     );
     assert!(kept_beside(&l_mem).is_empty());
+
+    // **A word is taken once** (§16): a program that saw the word cross
+    // to the node posts the same request again, within the word's ten
+    // minutes, and is refused.
+    let seen = through.bodies("/api/v1/carry/from");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let held_now = held(&laptop);
+    let (status, refused) = laptop.post_told("/api/v1/carry/from", &seen[0]);
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("was taken before: a word is taken once"),
+        "{refused}"
+    );
+    assert_eq!(held(&laptop), held_now);
 
     // Named by its six words, with the second yes: the version comes in
     // above the laptop's, and the laptop's text is kept beside the file.
@@ -621,8 +774,10 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     assert_eq!(read(&d_mem.join("late.md")), None);
 
     // With the phrase, the generation between is read, and the phone's
-    // file comes in.
-    let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
+    // file comes in. (What the node is sent is passed on by this test,
+    // and kept.)
+    let through = PassesOn::to(desktop.http);
+    let mut at = desktop.at_terminal_through(through.port, &["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");
     at.says("The recovery phrase, twelve words").types(&words);
     let said = at.done();
@@ -639,6 +794,40 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     wait_for("the file is in the desktop's folder", &all, 120, || {
         (read(&d_mem.join("late.md"))?.as_str() == "the phone's last words\n").then_some(())
     });
+
+    // **What is handed on the phrase's word is bound to that word**
+    // (§16). A program that saw the word and its batch cross to the node
+    // posts the batch again: it was taken once. It posts versions of its
+    // own under the word, as the same batch and as another: the key of
+    // the run signed neither.
+    let seen = through.bodies("/api/v1/carry/handed");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let held_now = held(&desktop);
+    let (status, again) = desktop.post_told("/api/v1/carry/handed", &seen[0]);
+    assert_eq!(status, 400, "{again}");
+    assert!(
+        again
+            .to_string()
+            .contains("was taken before under this word"),
+        "{again}"
+    );
+    let mut its_own = seen[0].clone();
+    its_own["versions"][0]["text"] = "what somebody else wrote".into();
+    its_own["versions"][0]["rev"] = 9.into();
+    let mut another = its_own.clone();
+    another["number"] = 1.into();
+    for forged in [&its_own, &another] {
+        let (status, refused) = desktop.post_told("/api/v1/carry/handed", forged);
+        assert_eq!(status, 400, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("is not signed by the key that the word"),
+            "{refused}"
+        );
+    }
+    assert_eq!(held(&desktop), held_now);
+
     // Run again, the new channel holds it.
     let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");

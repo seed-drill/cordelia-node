@@ -444,15 +444,22 @@ pub fn names_to_go(
 /// A status says that names are not yet sent only once they have waited
 /// for some minutes: what was written a moment ago, and what a relay
 /// that has just connected is being sent, is on its way.
+///
+/// `of` says which names are asked about: every name, or those that the
+/// device holds by a carry ([`crate::names::carried`]).
 pub fn names_waiting_since(
     conn: &Connection,
     identity: &NodeIdentity,
     relays: &[([u8; 32], i64)],
+    of: &dyn Fn(&str) -> bool,
 ) -> Result<Option<i64>, PersonError> {
     let carried_up_to = kept_rows::carried_up_to(conn)?;
     let mut since: Option<i64> = None;
     for channel in crate::at_relays::channels(conn, identity)? {
-        if !matches!(channel.kind, Kind::Name(_)) {
+        let Kind::Name(name) = &channel.kind else {
+            continue;
+        };
+        if !of(name) {
             continue;
         }
         let first_after = |place: i64| -> Result<Option<(i64, i64)>, PersonError> {
@@ -700,10 +707,20 @@ mod tests {
         acts::type_key(&on.conn, &[9; 32], "several", now).unwrap();
         acts::clear_notice(&on.conn, &[8; 32], now).unwrap();
         acts::note_left_out(&on.conn, &[7; 32], "laptop", 1, now).unwrap();
+        crate::look::note_not_shown(&on.conn, &[[7; 32]]).unwrap();
+        assert_eq!(crate::look::not_shown(&on.conn).unwrap(), [[7; 32]]);
+        // A word of its phrase that it took.
+        let under = on.latest().id();
+        let word = crate::carry::Word::give(&s.phrase, &on.key(), &under, "said".into(), now);
+        let word = word.unwrap();
+        crate::carry::take_once(&on.conn, &word, now).unwrap();
+        assert!(crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(!on.stored().is_empty());
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         assert!(!on.follows_a_phrase());
+        assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
+        assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());
         assert_eq!(
             held_rows::change_entry(&on.conn, Kept::Latest).unwrap(),

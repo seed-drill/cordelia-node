@@ -347,52 +347,11 @@ fn checked(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// What a database holds, as far as a copy is compared with the database
-/// it was made of: everything the node notes for itself, its settings
-/// among them, and how many rows each table of the older kind has, with
-/// what the folders had agreed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Holds {
-    /// A hash over each thing the node notes for itself, in order.
-    noted: [u8; 32],
-    /// How many rows each of [`OLDER_TABLES`] and [`AGREED_TABLES`] has.
-    rows: Vec<i64>,
-}
-
-/// What `conn`'s database holds ([`Holds`]).
-fn holds(conn: &Connection) -> rusqlite::Result<Holds> {
-    use sha2::{Digest, Sha256};
-    let mut noted = Sha256::new();
-    let mut stmt = conn.prepare("SELECT key, value FROM node_meta ORDER BY key")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        for text in [row.get::<_, String>(0)?, row.get::<_, String>(1)?] {
-            noted.update((text.len() as u64).to_be_bytes());
-            noted.update(text.as_bytes());
-        }
-    }
-    let rows = OLDER_TABLES
-        .iter()
-        .chain(&AGREED_TABLES)
-        .map(|table| {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Holds {
-        noted: noted.finalize().into(),
-        rows,
-    })
-}
-
-/// A copy that was made and checked ([`copy`]): its folder, and what its
-/// database holds.
+/// A copy that was made and checked ([`copy`]): its folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copied {
     /// The folder `before-<version>`, beside the database.
     pub folder: PathBuf,
-    holds: Holds,
 }
 
 /// Whether the key files of the older channels are, each of them, in a
@@ -408,24 +367,25 @@ fn key_files_are_in(data_dir: &Path, copy: &Path) -> bool {
             .all(|file| a_copy_holds(std::slice::from_ref(&copy.to_path_buf()), file))
 }
 
-/// Whether a copy that this start made can be used for the step now
-/// (decision 2026-10-04 §10.1): its database is where it was put, the
-/// node's database holds what the copy's holds, and so do the key files.
-/// A copy is made of the database as its opening left it, and the node
-/// writes nothing of this while its first start is not done: where
-/// something was written all the same, the copy is of another state than
-/// the step would be taken from, and is not used.
-fn still_good(copied: &Copied, conn: &Connection, data_dir: &Path) -> bool {
+/// Whether a copy that this run of the node made can be used for the
+/// step now (decision 2026-10-04 §10.1): its database is where it was
+/// put, and the key files of the older channels are in it, each with its
+/// bytes.
+///
+/// **Whether the database was written since is asked of nothing.** A
+/// copy is made of the database as its opening left it, and it is kept
+/// only by the run of the node that made it, between that run's tries:
+/// that run writes nothing of this while its first start is not done,
+/// and a new start makes a new copy. Whatever could be compared here, a
+/// write could pass it by.
+fn still_good(copied: &Copied, data_dir: &Path) -> bool {
     let there = std::fs::symlink_metadata(copied.folder.join(DATABASE))
         .is_ok_and(|database| database.is_file());
-    there
-        && holds(conn).is_ok_and(|now| now == copied.holds)
-        && key_files_are_in(data_dir, &copied.folder)
+    there && key_files_are_in(data_dir, &copied.folder)
 }
 
-/// Fill the folder `partial` with the copy, flushed and checked. Returns
-/// what the copy's database holds.
-fn fill(conn: &Connection, data_dir: &Path, partial: &Path) -> Result<Holds, String> {
+/// Fill the folder `partial` with the copy, flushed and checked.
+fn fill(conn: &Connection, data_dir: &Path, partial: &Path) -> Result<(), String> {
     let at = |what: &str, path: &Path, e: &dyn std::fmt::Display| {
         format!("{what} {}: {e}", path.display())
     };
@@ -459,10 +419,7 @@ fn fill(conn: &Connection, data_dir: &Path, partial: &Path) -> Result<Holds, Str
     flush_names(partial);
 
     // Opened again and checked, and only then given its name.
-    checked(&database)?;
-    Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|copy| holds(&copy))
-        .map_err(|e| at("could not read", &database, &e))
+    checked(&database)
 }
 
 /// [`copy`], saying only why it failed.
@@ -496,7 +453,7 @@ fn make_copy(
         ));
     }
 
-    let named = fill(conn, data_dir, &partial).and_then(|holds| {
+    let named = fill(conn, data_dir, &partial).and_then(|()| {
         // A whole copy that a start finds, with no mark in the database,
         // is from a start that did not finish or from a going back: it is
         // kept as the earlier one, in the place of any before it. So
@@ -505,16 +462,12 @@ fn make_copy(
             remove_whatever(&earlier).map_err(|e| at("could not remove", &earlier, &e))?;
             std::fs::rename(&whole, &earlier).map_err(|e| at("could not keep", &whole, &e))?;
         }
-        std::fs::rename(&partial, &whole).map_err(|e| at("could not name", &whole, &e))?;
-        Ok(holds)
+        std::fs::rename(&partial, &whole).map_err(|e| at("could not name", &whole, &e))
     });
     match named {
-        Ok(holds) => {
+        Ok(()) => {
             flush_names(data_dir);
-            Ok(Copied {
-                folder: whole,
-                holds,
-            })
+            Ok(Copied { folder: whole })
         }
         Err(why) => {
             // What was written of a copy that failed goes at once, and
@@ -574,8 +527,7 @@ pub fn copy(
 /// which it opens for reading only: so that a node makes its copy without
 /// holding its own connection, and goes on answering what asks how it
 /// stands (decision 2026-10-04 §10.1). The copy is used for the step only
-/// where the node's database then holds what the copy holds
-/// ([`first_start`]).
+/// by the run of the node that made it ([`first_start`]).
 pub fn copy_apart(
     database: &Path,
     data_dir: &Path,
@@ -1092,14 +1044,17 @@ pub fn due(conn: &Connection, data_dir: &Path) -> Result<Due, CordeliaError> {
 ///   taken, and where the step fails nothing of it is left: either way
 ///   there is no mark, and a later call tries again.
 ///
-/// `copied` is what one start of the node keeps between its tries: a
-/// copy that was made and checked, and that no step has used. Where it
-/// holds one, and the database and the key files still hold what that
-/// copy holds, the copy is used and none is made: a step that keeps
-/// failing does not write the copy again at every try. One that no
-/// longer holds what the database holds is removed, and made again. A
-/// caller may put a copy there that it made on a connection of its own
-/// ([`copy_apart`]).
+/// `copied` is what one run of the node keeps between its tries, and in
+/// its memory alone: a copy that was made and checked, and that no step
+/// has used. Where it holds one whose database is in its place, and
+/// whose key files are those of the node's folder, the copy is used and
+/// none is made: a step that keeps failing does not write the copy again
+/// at every try. **A copy is used again only within one run of the
+/// node,** which writes nothing of this while its first start is not
+/// done: a new start makes a new copy. One that is good no longer is not
+/// removed: a copy is made again, which keeps the one it finds as the
+/// earlier one ([`copy`]). A caller may put a copy there that it made on
+/// a connection of its own ([`copy_apart`]).
 ///
 /// Then, whichever of these it was, the key files of the older channels
 /// are removed ([`remove_older_key_files`]): a start that was cut short
@@ -1120,13 +1075,10 @@ pub fn first_start(
         }
         Due::Step => {
             let copy = match copied.take() {
-                Some(made) if still_good(&made, conn, data_dir) => made,
-                stale => {
-                    if let Some(stale) = stale {
-                        let _ = remove_whatever(&stale.folder);
-                    }
-                    copy(conn, data_dir, version, room).map_err(NotDone::NotCopied)?
-                }
+                Some(made) if still_good(&made, data_dir) => made,
+                // One that is good no longer stays where it is: the copy
+                // that is made now keeps it as the earlier one.
+                _ => copy(conn, data_dir, version, room).map_err(NotDone::NotCopied)?,
             };
             // Kept for the next try of this start, should the step fail.
             let folder = copy.folder.clone();
@@ -2855,22 +2807,21 @@ mod tests {
         assert_eq!(key_files(started.key_files).0, released::KEY_FILES.len());
     }
 
-    /// A copy is used again only where the database and the key files
-    /// hold what the copy holds. Where something was written since (a
-    /// setting, a row of the older kind, a key file), or the copy's
-    /// database is gone, that copy is removed and one is made again: the
-    /// step is never taken over a copy of another state. The copy that
-    /// went is not kept as the earlier one.
+    /// A copy is used again only where its database is in its place and
+    /// its key files are those of the node's folder (decision 2026-10-04
+    /// §10.1). Where a key file was written since, or the copy's database
+    /// is gone, a copy is made again, and **the one that is good no
+    /// longer is kept as the earlier one, and is not removed.**
+    ///
+    /// **Whether the database was written since is asked of nothing:**
+    /// a copy is kept only by the run of the node that made it, which
+    /// writes nothing of this while its first start is not done. Here
+    /// the database is written between two tries all the same, and the
+    /// copy that was made is the one that is used.
     #[test]
-    fn a_copy_is_made_again_where_the_database_was_written_since() {
+    fn a_copy_that_is_good_no_longer_is_kept_as_the_earlier_one() {
         type Change = fn(&Connection, &Path);
-        let changes: [(&str, Change); 4] = [
-            ("a setting", |conn, _| {
-                meta::set(conn, meta::SYNC_CLAUDE_DIR, "/home/sam/elsewhere").unwrap();
-            }),
-            ("a row of the older kind", |conn, _| {
-                new_channel(conn, "grp_since").unwrap();
-            }),
+        let good_no_longer: [(&str, Change); 2] = [
             ("a key file", |_, data| {
                 let key = data.join("channel-keys").join(released::KEY_FILES[0]);
                 std::fs::write(key, [0xEE; 32]).unwrap();
@@ -2879,7 +2830,7 @@ mod tests {
                 std::fs::remove_file(data.join("before-0.2.0-test").join(DATABASE)).unwrap();
             }),
         ];
-        for (what, change) in changes {
+        for (what, change) in good_no_longer {
             let (dir, conn) = a_node_whose_step_fails();
             let data = dir.path();
             let mut copied = None;
@@ -2895,8 +2846,16 @@ mod tests {
                 matches!(started.done, Done::Stepped { .. }),
                 "{what}: {started:?}"
             );
+            // A copy was made again, and the one from before is kept
+            // beside it as the earlier one, with all that was in it.
             assert!(!sign.exists(), "{what}: the copy from before was used");
-            assert_eq!(copies_in(data), ["before-0.2.0-test"], "{what}");
+            let earlier = data.join("before-0.2.0-test.earlier");
+            assert!(earlier.join("a-sign").exists(), "{what}");
+            assert_eq!(
+                copies_in(data),
+                ["before-0.2.0-test", "before-0.2.0-test.earlier"],
+                "{what}"
+            );
             // The copy holds what the database held when the step was
             // taken.
             let copy = data.join("before-0.2.0-test");
@@ -2911,6 +2870,35 @@ mod tests {
             expected.retain(|line| line != "trigger no_row");
             assert_eq!(in_the_copy, expected, "{what}");
             assert_eq!(key_files_held(&copy), key_files_now, "{what}");
+        }
+
+        // What the database holds is not compared: written between two
+        // tries, the copy that was made is used all the same, and no
+        // second is made.
+        let written: [(&str, Change); 2] = [
+            ("a setting", |conn, _| {
+                meta::set(conn, meta::SYNC_CLAUDE_DIR, "/home/sam/elsewhere").unwrap();
+            }),
+            ("a row of the older kind", |conn, _| {
+                new_channel(conn, "grp_since").unwrap();
+            }),
+        ];
+        for (what, change) in written {
+            let (dir, conn) = a_node_whose_step_fails();
+            let data = dir.path();
+            let mut copied = None;
+            a_try(&conn, data, &mut copied).unwrap_err();
+            let made = copied.clone().unwrap();
+            let sign = sign_in(&made.folder);
+            change(&conn, data);
+            conn.execute_batch("DROP TRIGGER no_row").unwrap();
+            let started = a_try(&conn, data, &mut copied).unwrap();
+            assert!(
+                matches!(started.done, Done::Stepped { .. }),
+                "{what}: {started:?}"
+            );
+            assert!(sign.exists(), "{what}: the copy was made again");
+            assert_eq!(copies_in(data), ["before-0.2.0-test"], "{what}");
         }
     }
 

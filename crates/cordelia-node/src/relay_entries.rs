@@ -200,9 +200,10 @@ impl Proved {
     }
 
     /// Whether a proof for `channel` is looked at: it is remembered
-    /// already, or there is room to remember one channel more.
-    fn has_room_for(&self, channel: &[u8; 32]) -> bool {
-        self.holds(channel) || self.channels.len() < MAX_CHANNELS_PROVED_ON_A_CONNECTION
+    /// already, or there is room to remember one channel more, of the
+    /// `most` that a relay remembers for a connection.
+    fn has_room_for(&self, channel: &[u8; 32], most: usize) -> bool {
+        self.holds(channel) || self.channels.len() < most
     }
 
     /// A proof for `channel` held.
@@ -486,6 +487,8 @@ pub struct RelayEntries {
     /// How long a channel that found no room here is left before it is
     /// pulled again from a listed relay.
     ask_again: Duration,
+    /// The most channels whose proofs it remembers for one connection.
+    most_proved: usize,
 }
 
 impl RelayEntries {
@@ -500,7 +503,15 @@ impl RelayEntries {
             pulling: Mutex::default(),
             stopped_at: Mutex::default(),
             ask_again,
+            most_proved: MAX_CHANNELS_PROVED_ON_A_CONNECTION,
         }
+    }
+
+    /// The same relay, remembering the proofs of `most` channels for one
+    /// connection, where that is fewer than a relay does.
+    pub fn remembering_at_most(mut self, most: usize) -> Self {
+        self.most_proved = most.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION);
+        self
     }
 
     /// The keys of the relays that the operator lists: each configured
@@ -808,7 +819,7 @@ impl RelayEntries {
         // A connection that has proved as many channels as one may is
         // answered as for a proof that fails, and the proof is not looked
         // at: nothing more is remembered for it.
-        if !proved.has_room_for(&prove.channel) {
+        if !proved.has_room_for(&prove.channel, self.most_proved) {
             return no;
         }
         // The signature, before the channel is looked up and before the
@@ -2754,7 +2765,7 @@ mod tests {
         for n in 0..1021u32 {
             let mut made_up = [0x33; 32];
             made_up[..4].copy_from_slice(&n.to_be_bytes());
-            assert!(proved.has_room_for(&made_up));
+            assert!(proved.has_room_for(&made_up, MAX_CHANNELS_PROVED_ON_A_CONNECTION));
             proved.remember(made_up);
         }
         assert_eq!(proved.len(), 1023);
@@ -2784,6 +2795,50 @@ mod tests {
         let mut another = Proved::default();
         assert!(prove(2000, &mut another));
         assert_eq!(another.len(), 1);
+    }
+
+    /// A relay that is set up to remember the proofs of fewer channels
+    /// for one connection than a relay does, as a test has one do, looks
+    /// at none beyond those: and never at more than the protocol's own
+    /// bound, whatever it is set up with.
+    #[test]
+    fn a_relay_remembers_for_a_connection_as_many_proofs_as_it_is_set_up_to() {
+        let at = Relay {
+            entries: relay().entries.remembering_at_most(2),
+            ..relay()
+        };
+        for c in [7, 8, 9] {
+            at.hold(&small(c, 1, 5), NOW - 2 * HOUR);
+        }
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        let prove = |c: u16, proved: &mut Proved| {
+            let proof = proof::make(&secret(c), &session.value, &session.prover).unwrap();
+            proved_said(at.answer(
+                1,
+                Protocol::ChannelProve,
+                WireMessage::ChannelProve(ChannelProve {
+                    channel: channel(c),
+                    proof,
+                }),
+                Some(&session),
+                proved,
+            ))
+        };
+        let mut proved = Proved::default();
+        assert!(prove(7, &mut proved));
+        assert!(prove(8, &mut proved));
+        // The third is not looked at, though the relay holds its channel
+        // and the proof holds. One that is remembered is proved again.
+        assert!(!prove(9, &mut proved));
+        assert_eq!(proved.len(), 2);
+        assert!(prove(7, &mut proved));
+
+        let more = relay().entries.remembering_at_most(usize::MAX);
+        assert_eq!(more.most_proved, MAX_CHANNELS_PROVED_ON_A_CONNECTION);
+        assert_eq!(relay().entries.most_proved, 1024);
     }
 
     // ── Pull ─────────────────────────────────────────────────────────

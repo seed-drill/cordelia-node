@@ -150,6 +150,22 @@ pub struct LimitsConfig {
     pub max_connections_per_ip: u32,
     pub max_item_bytes: u64,
     pub writes_per_channel_per_minute: u32,
+    /// The most channels whose keys one connection proves: what a relay
+    /// remembers for a connection, and what a device sends on one. It
+    /// can only be set lower than MAX_CHANNELS_PROVED_ON_A_CONNECTION,
+    /// which is what both ends go by. No deployment sets it: a test
+    /// lowers it, on a relay and on its devices alike.
+    pub channels_proved_on_a_connection: u32,
+}
+
+impl LimitsConfig {
+    /// The most channels whose keys one connection proves, as it is
+    /// used: what is configured, no fewer than 2 and no more than the
+    /// protocol's own bound.
+    pub fn most_proved_on_a_connection(&self) -> usize {
+        (self.channels_proved_on_a_connection as usize)
+            .clamp(2, protocol::MAX_CHANNELS_PROVED_ON_A_CONNECTION)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +280,7 @@ impl Default for LimitsConfig {
             max_connections_per_ip: protocol::MAX_CONNECTIONS_PER_IP as u32,
             max_item_bytes: protocol::MAX_ITEM_BYTES as u64,
             writes_per_channel_per_minute: protocol::WRITES_PER_CHANNEL_PER_MINUTE,
+            channels_proved_on_a_connection: protocol::MAX_CHANNELS_PROVED_ON_A_CONNECTION as u32,
         }
     }
 }
@@ -417,6 +434,32 @@ mod tests {
         assert_eq!(config.governor.warm_max, protocol::WARM_MAX);
         // D6 fix: cold_max = 50 (was 200)
         assert_eq!(config.governor.cold_max, protocol::COLD_MAX);
+    }
+
+    /// The most channels whose keys one connection proves is the
+    /// protocol's own bound, and can only be set lower: what is set
+    /// higher, or to less than two, is taken as the nearest.
+    #[test]
+    fn test_the_proofs_on_a_connection_can_only_be_set_lower() {
+        let most = |set: u32| {
+            let mut config = Config::default();
+            config.limits.channels_proved_on_a_connection = set;
+            config.limits.most_proved_on_a_connection()
+        };
+        assert_eq!(
+            Config::default().limits.most_proved_on_a_connection(),
+            1_024
+        );
+        assert_eq!(most(16), 16);
+        assert_eq!(most(1_023), 1_023);
+        assert_eq!(most(1_025), 1_024);
+        assert_eq!(most(u32::MAX), 1_024);
+        assert_eq!(most(2), 2);
+        assert_eq!(most(1), 2);
+        assert_eq!(most(0), 2);
+        let set: Config =
+            toml::from_str("[limits]\nchannels_proved_on_a_connection = 16\n").unwrap();
+        assert_eq!(set.limits.most_proved_on_a_connection(), 16);
     }
 
     #[test]

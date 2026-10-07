@@ -16,10 +16,15 @@
 //!    made apart: it shows both lists, asks which to recover from, and
 //!    the statement it makes settles them.
 //! 3. It reads that generation's personal channel and shows every
-//!    device, up to 256, each with the first words of its key's
-//!    fingerprint and how much it signed there, and asks of each one of
-//!    three things: the person still has it, it is lost or broken, or it
-//!    may be in someone else's hands. No answer is suggested.
+//!    device, each with the first words of its key's fingerprint and how
+//!    much it signed there: the statement's devices first, always; then
+//!    the keys added since that count; then the records that do not
+//!    count; 256 rows in all. It says first where the answers could not
+//!    all be kept: a statement has room for 256 removed keys. Of each
+//!    device that counts it asks one of three things: the person still
+//!    has it, it is lost or broken, or it may be in someone else's
+//!    hands. No answer is suggested. A record that does not count is
+//!    shown as that, and nothing is asked of it.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -52,18 +57,20 @@ use cordelia_api::change::{prepare_recovery, read_with};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
-use cordelia_core::protocol::{RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES};
+use cordelia_core::protocol::{
+    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
+};
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
-use cordelia_crypto::{derive, fingerprint, proof};
+use cordelia_crypto::{derive, fingerprint};
 
-use crate::carry_cmd::read_through_the_node;
+use crate::carry_cmd::{Sessions, read_with_secret};
 use crate::person_cmd::{
     NOT_A_YES, counted, default_label, file_shown, list, look, made_all_the_same, named,
     names_this_device, own_key, text, time_of, typed_phrase,
 };
 use crate::terminal::Terminal;
-use crate::{Told, api_post_told, refuse_before_a_phrase};
+use crate::{Told, api_post_told, api_post_told_of, refuse_before_a_phrase, wipe_strings};
 
 /// What `cordelia recover` says before it asks for anything (decision
 /// 2026-10-04 §9).
@@ -93,6 +100,35 @@ Of each, say one of three things. No answer is suggested: each is typed.
            only by `cordelia sync carry <name> --from <device>`, with the phrase, which says
            what it means.";
 
+/// What is said of a record that does not count, in the place of a
+/// question (decision 2026-10-04 §9, step 3).
+const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
+    brought back, and its key is not removed.";
+
+/// What is said before the first question where the answers could not
+/// all be kept (decision 2026-10-04 §9, step 3): a statement has room for
+/// 256 removed keys, and lists every key removed so far.
+fn room_says(room: &recover::Room) -> Option<String> {
+    if room.for_every_answer() {
+        return None;
+    }
+    Some(format!(
+        "\nNot every answer could be kept. A change has room for {MAX_STATEMENT_REMOVED} removed \
+         keys, and lists every key removed so far: {} removed already, and {} asked about \
+         here. At most {} of them can be said to be gone (`lost` or `hands`). Where more are, the \
+         change cannot be made, and nothing is done.",
+        match room.removed {
+            1 => "1 is".to_string(),
+            n => format!("{n} are"),
+        },
+        match room.asked {
+            1 => "1 device is".to_string(),
+            n => format!("{n} devices are"),
+        },
+        room.can_go
+    ))
+}
+
 /// The command that a recovery goes on to when its change is made:
 /// [`recover_made`], in a process of its own.
 pub const MADE_COMMAND: &str = "recover-made";
@@ -108,43 +144,96 @@ fn told(asked: anyhow::Result<Told>) -> anyhow::Result<Value> {
     }
 }
 
-/// A proof of the key of the channel whose secret is `secret`, for each
-/// connection that has a session, as the node is handed them.
-fn proofs_for(
-    secret: &[u8; 32],
-    sessions: &[(String, [u8; 32])],
-    own: &[u8; 32],
-) -> anyhow::Result<Vec<Value>> {
-    let mut proofs = Vec::new();
-    for (relay, session) in sessions {
-        let proof = proof::make(secret, session, own)?;
-        proofs.push(json!({ "relay": relay, "proof": hex::encode(proof) }));
-    }
-    Ok(proofs)
-}
-
 /// Read the channel whose secret is `secret` at every relay, through the
-/// node, and say of which relay it could not be read to its end.
+/// node, and say of which relay it could not be read to its end. The
+/// proofs are made over `sessions`: where a connection has changed since
+/// those were said, they are asked for again, and the proofs are made
+/// again ([`read_with_secret`], decision 2026-10-04 §16).
 fn read_channel(
     config_path: &str,
     secret: &[u8; 32],
-    sessions: &[(String, [u8; 32])],
+    sessions: &mut Sessions,
     own: &[u8; 32],
     what: &str,
 ) -> anyhow::Result<Vec<CheckedEntry>> {
-    let channel = derive::channel_id(secret)?;
-    let proofs = proofs_for(secret, sessions, own)?;
-    let (entries, relays) = read_through_the_node(config_path, &channel, proofs)?;
-    for relay in &relays {
-        let read = text(relay, "read");
-        if !matches!(read, "whole" | "not held") {
-            println!(
-                "  Could not read {what} at {} to its end ({read}).",
-                text(relay, "relay")
-            );
-        }
+    Ok(read_and_not_read(config_path, secret, sessions, own, what)?.0)
+}
+
+/// [`read_channel`], with the relays at which the channel could not be
+/// read to its end, each by its name.
+fn read_and_not_read(
+    config_path: &str,
+    secret: &[u8; 32],
+    sessions: &mut Sessions,
+    own: &[u8; 32],
+    what: &str,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>)> {
+    let (entries, relays) = read_with_secret(config_path, secret, sessions, own)?;
+    let not_read = not_read_to_its_end(&relays);
+    for (relay, read) in &not_read {
+        println!("  Could not read {what} at {relay} to its end ({read}).");
     }
-    Ok(entries)
+    let not_read = not_read.into_iter().map(|(relay, _)| relay).collect();
+    Ok((entries, not_read))
+}
+
+/// Of what the node says of each relay, those at which a channel could
+/// not be read to its end, with what is said of each: a relay that
+/// handed the channel whole, or holds none of it, is not among them.
+fn not_read_to_its_end(relays: &[Value]) -> Vec<(String, String)> {
+    relays
+        .iter()
+        .filter(|relay| !matches!(text(relay, "read"), "whole" | "not held"))
+        .map(|relay| (text(relay, "relay").into(), text(relay, "read").into()))
+        .collect()
+}
+
+/// What is said where no change of the phrase was found (decision
+/// 2026-10-04 §9, §16). Where every relay that was reached was read to
+/// its end, none of them holds one. **Where one could not be read, that
+/// is what is said, with the relay's name:** it is never said to hold
+/// none for that.
+fn none_found_says(not_read: &[String]) -> String {
+    if not_read.is_empty() {
+        return "no relay that was reached holds a change of this recovery phrase: there is \
+                nothing to recover from. Either these are not the words of your devices' phrase, \
+                or the relays have dropped what they held: a relay keeps what nobody has used \
+                for 90 days, and no longer. Nothing was done."
+            .to_string();
+    }
+    format!(
+        "the recovery phrase's own channel could not be read to its end at {}, and no change of \
+         this recovery phrase was found in what was read: whether a relay holds one is not \
+         known. Run `cordelia recover` again. Nothing was done.",
+        not_read.join(", ")
+    )
+}
+
+/// What is said of two changes that were made apart, before the person
+/// says which to recover from (decision 2026-10-04 §9, step 2):
+/// `on_neither` is how many more changes the relays hold that are on the
+/// chain of neither of the two. And what the recovery does with the two:
+/// **what the devices of the other had not sent comes back only by
+/// adding them again.**
+fn apart_lines(on_neither: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if on_neither > 0 {
+        lines.push(format!(
+            "{} besides those is on neither's chain, and is not settled by this recovery.",
+            match on_neither {
+                1 => "1 more change".to_string(),
+                n => format!("{n} more changes"),
+            }
+        ));
+    }
+    lines.push(
+        "The recovery is made from one of them, and the change it makes settles the two: every \
+         key that either removed stays removed. The devices of the other that are not asked \
+         about here are in no list after it, and what they had written and not sent to a relay \
+         comes back only by adding them again."
+            .to_string(),
+    );
+    lines
 }
 
 /// A statement's lists, a line each, read from the statement: each key
@@ -262,11 +351,11 @@ fn will_do_lines(
             shown(nothing)
         ));
     }
-    if generation.not_shown > 0 {
+    if !generation.not_shown.is_empty() {
         lines.push(format!(
-            "{} more could not be shown: the look takes nothing from those, and each is in no \
-             list.",
-            counted(generation.not_shown, "record of an addition")
+            "{} more could not be shown: the look takes nothing from those, each is in no list, \
+             and this machine keeps each as left out: `cordelia devices` shows it with its key.",
+            counted(generation.not_shown.len(), "record of an addition")
                 .replace("record of an additions", "records of additions")
         ));
     }
@@ -297,7 +386,8 @@ fn will_do_lines(
     }
     if !names.only_other_hands.is_empty() {
         lines.push(format!(
-            "{} left, which only a device listed from which nothing is taken: {}.",
+            "{} left, which only a device listed from which nothing is taken, or a key that \
+             does not count: {}.",
             match names.only_other_hands.len() {
                 1 => "1 name is".to_string(),
                 n => format!("{n} names are"),
@@ -339,7 +429,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let maker = Device::new(own, &label)?;
 
     // The relays that the machine is set up with, and which is reached.
-    let mut sessions: Vec<(String, [u8; 32])> = Vec::new();
+    let mut sessions: Sessions = Vec::new();
     for relay in list(&asked, "sessions") {
         match relay["session"].as_str().and_then(carry::key_named) {
             Some(session) => sessions.push((text(relay, "relay").to_string(), session)),
@@ -359,9 +449,9 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let handed = {
+    let (handed, not_read) = {
         let secret = phrase.channel_secret()?;
-        read_channel(config_path, &secret, &sessions, &own, "it")?
+        read_and_not_read(config_path, &secret, &mut sessions, &own, "it")?
     };
 
     // 2. The change entry with the highest number, of those whose
@@ -374,16 +464,11 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         })
         .collect();
     let Some(found) = recover::found(candidates) else {
-        anyhow::bail!(
-            "no relay that was reached holds a change of this recovery phrase: there is nothing \
-             to recover from. Either these are not the words of your devices' phrase, or the \
-             relays have dropped what they held: a relay keeps what nobody has used for 90 days, \
-             and no longer. Nothing was done."
-        );
+        anyhow::bail!("{}", none_found_says(&not_read));
     };
-    let (from, apart) = match found.apart.first() {
-        None => (found.from, None),
-        Some(other) => {
+    let (from, apart) = match found.second() {
+        None => (found.from.clone(), None),
+        Some((other, on_neither)) => {
             println!(
                 "\nTwo changes were made apart: the relays hold one that is not on the other's \
                  chain. Each is shown from its signed bytes."
@@ -395,26 +480,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
                     println!("{line}");
                 }
             }
-            if found.apart.len() > 1 {
-                println!(
-                    "\n{} besides those is on neither's chain, and is not settled by this \
-                     recovery.",
-                    match found.apart.len() - 1 {
-                        1 => "1 more change".to_string(),
-                        n => format!("{n} more changes"),
-                    }
-                );
+            for line in apart_lines(on_neither) {
+                println!("\n{line}");
             }
-            println!(
-                "\nThe recovery is made from one of them, and the change it makes settles the \
-                 two: every key that either removed stays removed. The devices of the other \
-                 that are not asked about here are in no list after it."
-            );
             loop {
                 let typed = at.answer("  Type `1` or `2`, the one to recover from: ")?;
                 match typed.as_deref() {
-                    Some("1") => break (found.from, Some(other.clone())),
-                    Some("2") => break (other.clone(), Some(found.from)),
+                    Some("1") => break (found.from.clone(), Some(other.clone())),
+                    Some("2") => break (other.clone(), Some(found.from.clone())),
                     Some(_) => println!("  That is neither. No answer is suggested: type one."),
                     None => anyhow::bail!(
                         "the input ended before an answer was typed. Nothing was made."
@@ -437,7 +510,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         let handed = read_channel(
             config_path,
             &personal,
-            &sessions,
+            &mut sessions,
             &own,
             "the personal channel",
         )?;
@@ -451,12 +524,24 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          what tells two apart.\n\n{THREE_ANSWERS}",
         statement.number
     );
+    // Before anything is asked: whether the answers could all be kept.
+    let apart_statement = apart.as_ref().map(|other| &other.statement.statement);
+    if let Some(says) = room_says(&recover::room(&statement, apart_statement, rows, &own)) {
+        println!("{says}");
+    }
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
         let says = row_says(rows, at_row, statement.number);
         if rows[at_row].key == own {
             println!("{says}\n  It is this machine: it is the one device of the change.");
             answers.push(Answer::Have);
+            continue;
+        }
+        // A record that does not count is shown as that, and nothing is
+        // asked of it.
+        if !rows[at_row].counts {
+            println!("{says}\n{NOT_ASKED}");
+            answers.push(Answer::NotAsked);
             continue;
         }
         let mut says = says;
@@ -477,11 +562,11 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         }
         answers.push(asks_of(&at, &says)?);
     }
-    if generation.not_shown > 0 {
+    if !generation.not_shown.is_empty() {
         println!(
             "\n{} beyond the {RECOVERY_MAX_DEVICES_SHOWN} that are shown: nothing is asked of \
              those.",
-            counted(generation.not_shown, "more record")
+            counted(generation.not_shown.len(), "more record")
         );
     }
 
@@ -495,7 +580,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     for earlier in &for_phrase.earlier {
         let personal = Zeroizing::new(derive::personal_secret(&earlier.secret)?);
         let what = format!("the personal channel of change {}", earlier.number);
-        let handed = read_channel(config_path, &personal, &sessions, &own, &what)?;
+        let handed = read_channel(config_path, &personal, &mut sessions, &own, &what)?;
         before.push(recover::names_before(
             &handed,
             &earlier.secret,
@@ -549,36 +634,47 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 
     // The secrets that the machine keeps: of the generation recovered
     // from, and of those before it that its entry gave the phrase.
+    // (Each is written from where it lies: no copy of it is made on the
+    // way, and the text that is made of it is overwritten once it is
+    // sent.)
     let mut left = vec![json!({
         "number": statement.number,
-        "secret": hex::encode(for_phrase.secret),
+        "secret": hex::encode(&for_phrase.secret[..]),
     })];
     for earlier in &for_phrase.earlier {
-        left.push(json!({ "number": earlier.number, "secret": hex::encode(earlier.secret) }));
+        left.push(json!({ "number": earlier.number, "secret": hex::encode(&earlier.secret[..]) }));
     }
     drop(for_phrase);
+    let key_and_label =
+        |row: &Row| -> Value { json!({ "key": hex::encode(row.key), "label": row.label }) };
     let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
         rows.iter()
             .zip(&answers)
             .filter(|(row, said)| answer(said) && row.key != own)
-            .map(|(row, _)| json!({ "key": hex::encode(row.key), "label": row.label }))
+            .map(|(row, _)| key_and_label(row))
             .collect()
     };
-    let body = json!({
+    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
+    let mut body = json!({
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
-        "gone": labelled(|said| *said != Answer::Have),
+        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
         "still_have": labelled(|said| *said == Answer::Have),
+        "not_shown": not_shown,
         "word": word,
     });
     drop(statement_key);
-    let made = api_post_told(
+    let made = api_post_told_of(
         config_path,
         "/api/v1/recover/make",
-        body,
+        &body,
         Some(Duration::from_secs(60)),
     );
+    // The secrets that the phrase opened are in the request as text:
+    // what this process still holds of that text is overwritten.
+    wipe_strings(&mut body);
+    drop(body);
     match made {
         Ok(Told::Yes(_)) => {}
         Ok(Told::No { message, .. }) => anyhow::bail!("{message}\nNothing was made."),
@@ -672,6 +768,19 @@ fn goes_on_in_a_new_process(
 /// key's words are worked out here, from the key.
 fn look_lines(found: &Value) -> Vec<String> {
     let number = |field: &str| found[field].as_u64().unwrap_or(0) as usize;
+    // Where the new channels could not be read, the look took nothing
+    // (§7.3): which of their slots hold nothing was not known.
+    if found["new_not_read"] == true {
+        return vec![
+            "The look took nothing: the new channels could not be read at a relay (no relay \
+             answered, or the read did not end), so which of their slots hold nothing was not \
+             known. It is not made again by itself. What the relays hold of each device that is \
+             gone is brought in by `cordelia sync carry <name> --from <device>`, with the \
+             phrase, once a relay can be read: with no device named, it lists the removed \
+             keys that signed there."
+                .to_string(),
+        ];
+    }
     let mut lines = vec![format!(
         "The look is made: {} read, and {} carried, in {}.",
         counted(number("names"), "name"),
@@ -731,9 +840,16 @@ fn look_lines(found: &Value) -> Vec<String> {
             .filter_map(Value::as_str)
             .map(file_shown)
             .collect();
+        // The command that brings it in names the key by its six words:
+        // and by the key written whole, where the node says that those
+        // words name another removed key too (§7.3).
+        let named = match lacks["by_words"] == false {
+            true => crate::carry_cmd::key_written(&key),
+            false => format!("\"{words}\""),
+        };
         lines.push(format!(
             "  {} signed {} that the new channels lack, in: {}. It is brought in only with the \
-             phrase: cordelia sync carry <name> --from \"{words}\"",
+             phrase: cordelia sync carry <name> --from {named}",
             crate::person_cmd::words_then(&words, text(lacks, "label")),
             counted(lacks["versions"].as_u64().unwrap_or(0) as usize, "version"),
             names.join(", ")
@@ -843,7 +959,26 @@ fn after_lines(seen: &Value) -> Vec<String> {
             counted(to_go, "name")
         ),
     });
-    let still: Vec<&Value> = list(seen, "left_out").collect();
+    // A key that could not be shown is left out too, and is no device
+    // that the person said they still have.
+    let (not_shown, still): (Vec<&Value>, Vec<&Value>) =
+        list(seen, "left_out").partition(|device| device["key"].is_string());
+    if !not_shown.is_empty() {
+        lines.push(format!(
+            "{} could not be shown, and nothing was asked of {}: `cordelia devices` shows {} \
+             with its key.",
+            counted(not_shown.len(), "record of an addition")
+                .replace("record of an additions", "records of additions"),
+            match not_shown.len() {
+                1 => "it",
+                _ => "them",
+            },
+            match not_shown.len() {
+                1 => "it",
+                _ => "each",
+            }
+        ));
+    }
     if !still.is_empty() {
         lines.push(
             "\nEach device that you still have has stopped, and is added again by hand, with \
@@ -925,6 +1060,129 @@ mod tests {
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
     }
 
+    /// Of two changes made apart, the command says how many more are on
+    /// neither's chain, where any is, and what settling the two means
+    /// (decision 2026-10-04 §9, step 2): what the devices of the other
+    /// branch had not sent comes back only by adding them again.
+    #[test]
+    fn test_what_is_said_of_two_changes_made_apart() {
+        let settles = apart_lines(0);
+        assert_eq!(settles.len(), 1, "{settles:?}");
+        assert!(
+            settles[0].starts_with("The recovery is made from one of them"),
+            "{settles:?}"
+        );
+        assert!(
+            settles[0].ends_with(
+                "are in no list after it, and what they had written and not sent to a relay \
+                 comes back only by adding them again."
+            ),
+            "{settles:?}"
+        );
+        let one = apart_lines(1);
+        assert_eq!(
+            one[0],
+            "1 more change besides those is on neither's chain, and is not settled by this \
+             recovery."
+        );
+        assert_eq!(one[1], settles[0]);
+        assert!(apart_lines(3)[0].starts_with("3 more changes besides those"));
+    }
+
+    /// Where no change of the phrase was found and a relay could not be
+    /// read to its end, the command says which relay, and that it is not
+    /// known whether one holds a change (decision 2026-10-04 §16): it
+    /// says that no relay holds one only where each was read to its end.
+    #[test]
+    fn test_a_relay_that_was_not_read_is_never_said_to_hold_no_change() {
+        let said = |relay: &str, read: &str| json!({ "relay": relay, "read": read });
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let relays = [
+            said("one", "whole"),
+            said("two", changed),
+            said("three", "not held"),
+            said("four", "part"),
+        ];
+        let not_read = not_read_to_its_end(&relays);
+        assert_eq!(
+            not_read,
+            [
+                ("two".to_string(), changed.to_string()),
+                ("four".to_string(), "part".to_string())
+            ]
+        );
+        let names: Vec<String> = not_read.into_iter().map(|(relay, _)| relay).collect();
+        let says = none_found_says(&names);
+        assert!(
+            says.starts_with(
+                "the recovery phrase's own channel could not be read to its end at two, four, \
+                 and no change of this recovery phrase was found in what was read"
+            ),
+            "{says}"
+        );
+        assert!(says.contains("whether a relay holds one is not known"));
+        assert!(!says.contains("no relay that was reached holds"), "{says}");
+        assert!(says.ends_with("Nothing was done."));
+        let none = none_found_says(&[]);
+        assert!(
+            none.starts_with("no relay that was reached holds a change of this recovery phrase"),
+            "{none}"
+        );
+        assert!(none.ends_with("Nothing was done."));
+    }
+
+    /// Where the answers could not all be kept, that is said before the
+    /// first question (decision 2026-10-04 §9, step 3): a statement has
+    /// room for 256 removed keys. Nothing is said where they could.
+    #[test]
+    fn test_what_is_said_where_not_every_answer_could_be_kept() {
+        let room = |removed: usize, asked: usize| recover::Room {
+            removed,
+            asked,
+            can_go: MAX_STATEMENT_REMOVED - removed,
+        };
+        assert_eq!(room_says(&room(0, 64)), None);
+        assert_eq!(room_says(&room(250, 6)), None);
+        let says = room_says(&room(251, 6)).unwrap();
+        assert!(
+            says.contains(
+                "Not every answer could be kept. A change has room for 256 removed keys, and \
+                 lists every key removed so far: 251 are removed already, and 6 devices are \
+                 asked about here. At most 5 of them can be said to be gone (`lost` or `hands`)."
+            ),
+            "{says}"
+        );
+        let one = room_says(&room(255, 2)).unwrap();
+        assert!(one.contains("At most 1 of them"), "{one}");
+        let full = room_says(&room(256, 1)).unwrap();
+        assert!(
+            full.contains("256 are removed already, and 1 device is asked about here. At most 0"),
+            "{full}"
+        );
+    }
+
+    /// What a command hands the node of the secrets that the phrase
+    /// opened is text in a request: the command's own copy of that text
+    /// is overwritten once the request is sent, wherever in the request
+    /// it is (decision 2026-10-04 §16).
+    #[test]
+    fn test_the_text_of_a_request_is_overwritten_once_it_is_sent() {
+        let mut body = json!({
+            "entry": "aa",
+            "left": [{ "number": 2, "secret": "0f0f" }, { "number": 1, "secret": "f0f0" }],
+            "word": { "what": "said", "until": 5 },
+        });
+        wipe_strings(&mut body);
+        assert_eq!(
+            body,
+            json!({
+                "entry": "",
+                "left": [{ "number": 2, "secret": "" }, { "number": 1, "secret": "" }],
+                "word": { "what": "", "until": 5 },
+            })
+        );
+    }
+
     /// What a recovery will do is said before its yes (decision
     /// 2026-10-04 §9): from whom the look takes, and from whom it takes
     /// nothing, with the command that brings what they wrote; the names
@@ -933,7 +1191,7 @@ mod tests {
     fn test_what_a_recovery_will_do_is_said_before_its_yes() {
         let generation = Generation {
             rows: rows(),
-            not_shown: 2,
+            not_shown: vec![row(5, "fifth", Some(1), false), row(6, "", Some(1), false)],
             names: Vec::new(),
             cut_short: None,
         };
@@ -966,7 +1224,8 @@ mod tests {
         assert!(
             all.contains(
                 "2 records of additions more could not be shown: the look takes nothing from \
-                 those, and each is in no list."
+                 those, each is in no list, and this machine keeps each as left out: `cordelia \
+                 devices` shows it with its key."
             ),
             "{all}"
         );
@@ -977,7 +1236,8 @@ mod tests {
         );
         assert!(
             all.contains(
-                "1 name is left, which only a device listed from which nothing is taken: theirs."
+                "1 name is left, which only a device listed from which nothing is taken, or a \
+                 key that does not count: theirs."
             ),
             "{all}"
         );
@@ -1025,6 +1285,8 @@ mod tests {
                 { "key": hex::encode(key), "label": "desktop", "versions": 3,
                   "names": ["lab", "notes"] },
                 { "key": "no key", "label": "odd", "versions": 9, "names": [] },
+                { "key": hex::encode([9u8; 32]), "label": "tablet", "versions": 1,
+                  "names": ["lab"], "by_words": false },
             ],
         });
         let lines = look_lines(&found);
@@ -1059,8 +1321,34 @@ mod tests {
             )),
             "{all}"
         );
+        // A key whose six words name another removed key too is named
+        // by the key written whole, which the command works out too.
+        let whole = cordelia_crypto::bech32::encode_public_key(&[9u8; 32]).unwrap();
+        assert!(
+            all.contains(&format!(
+                "\"tablet\" signed 1 version that the new channels lack, in: lab. It is \
+                 brought in only with the phrase: cordelia sync carry <name> --from {whole}"
+            )),
+            "{all}"
+        );
         // What is no key is not shown.
         assert!(!all.contains("odd"), "{all}");
+
+        // A look that could not read the new channels took nothing, and
+        // says so, with the command that brings in what the relays hold.
+        let not_read = json!({ "finished": true, "new_not_read": true, "names": 3, "carried": 0 });
+        let lines = look_lines(&not_read);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "The look took nothing: the new channels could not be read at a relay"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("`cordelia sync carry <name> --from <device>`"),
+            "{lines:?}"
+        );
 
         // A look that found nothing more says the one line.
         let plain = json!({ "names": 1, "carried": 1, "carried_names": 1 });
@@ -1084,10 +1372,25 @@ mod tests {
             ],
             "not_reached": ["three"],
             "names": { "to_go": ["a", "b", "c"], "sent": ["d"] },
-            "left_out": [{ "label": "desktop", "words": "w1 w2 w3 w4", "number": 3 }],
+            "left_out": [
+                { "label": "desktop", "words": "w1 w2 w3 w4", "number": 3 },
+                { "label": "added 9", "words": "n1 n2 n3 n4", "number": 3, "key": "cordelia_pk1x" },
+                { "label": "", "words": "m1 m2 m3 m4", "number": 3, "key": "cordelia_pk1y" },
+            ],
         });
         let lines = after_lines(&seen);
         let all = lines.join("\n");
+        // What could not be shown is no device that the person said they
+        // still have: it is said apart, and is not to be added again.
+        assert!(
+            all.contains(
+                "2 records of additions could not be shown, and nothing was asked of them: \
+                 `cordelia devices` shows each with its key."
+            ),
+            "{all}"
+        );
+        assert!(!all.contains("added 9"), "{all}");
+        assert_eq!(all.matches("cordelia add-device <that key>").count(), 1);
         assert_eq!(lines[0], "one holds the change.");
         assert_eq!(
             lines[1],

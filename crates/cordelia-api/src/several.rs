@@ -488,10 +488,37 @@ pub(crate) struct Node {
     pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
     /// Whether the relay hands a channel in part, and not to its end.
     pub(crate) in_part: Arc<std::sync::atomic::AtomicBool>,
+    /// How many of the next whole passes end before they have read every
+    /// channel to its end.
+    pub(crate) short_passes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the relay is not connected: it has no session.
+    pub(crate) not_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// How many of the next reads through the door find that the
+    /// connection has no room left for a proof.
+    pub(crate) no_room: Arc<std::sync::atomic::AtomicUsize>,
+    /// How often the connection to the relay was made again: each has a
+    /// session of its own ([`session_after`]).
+    pub(crate) remade: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many askings for the sessions it takes, once a connection is
+    /// to be made again, until the new one is there: until then the old
+    /// session is said, and a read finds the old connection, with no
+    /// room.
+    pub(crate) remake_takes: Arc<std::sync::atomic::AtomicUsize>,
+    /// At each read through the door: the channels that a folder's first
+    /// cycle waits for a carry in, and would still wait for a second
+    /// short of the longest that a carry holds one back, measured from
+    /// the read.
+    pub(crate) held_back_at_reads: Arc<Mutex<Vec<std::collections::BTreeSet<[u8; 32]>>>>,
 }
 
 /// The session of the connection to the relay of a test.
 pub(crate) const SESSION: [u8; 32] = [5; 32];
+
+/// The session of the connection to the relay of a test once it was
+/// made again so often: [`SESSION`], while it was not.
+pub(crate) fn session_after(remade: usize) -> [u8; 32] {
+    [SESSION[0] + remade as u8; 32]
+}
 
 impl Node {
     /// The node of `machine`, with a stand-in for its loop: asked for
@@ -506,11 +533,20 @@ impl Node {
         let asked: Asked = Default::default();
         let did: Arc<Mutex<Vec<&'static str>>> = Default::default();
         let (passes, order) = (Arc::clone(&state), Arc::clone(&did));
+        let short_passes: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let short = Arc::clone(&short_passes);
         tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
             loop {
                 passes.own_channels.wait_asked().await;
                 let pass = passes.own_channels.whole_pass_begins();
                 order.lock().unwrap().push("pass");
+                let ends_short = short
+                    .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                    .is_ok();
+                if ends_short {
+                    passes.own_channels.whole_pass_was_short(pass);
+                }
                 passes.own_channels.whole_pass_ended(pass);
             }
         });
@@ -518,11 +554,71 @@ impl Node {
         let order = Arc::clone(&did);
         let in_part: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let part = Arc::clone(&in_part);
+        let not_connected: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let away = Arc::clone(&not_connected);
+        let no_room: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let full = Arc::clone(&no_room);
+        let remade: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let made_again = Arc::clone(&remade);
+        let remake_takes: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let takes = Arc::clone(&remake_takes);
+        let held_back_at_reads: Arc<Mutex<Vec<std::collections::BTreeSet<[u8; 32]>>>> =
+            Default::default();
+        let held_back = Arc::clone(&held_back_at_reads);
         tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            // How many askings for the sessions are still answered with
+            // the session of the connection that is being made again.
+            let mut not_there_for = 0usize;
             loop {
                 match node.own_channels.wait_door().await {
                     DoorAsk::Sessions { answer } => {
-                        let _ = answer.send(vec![("relay".to_string(), Some(SESSION))]);
+                        let made = made_again.load(SeqCst);
+                        let session = match (away.load(SeqCst), not_there_for) {
+                            (true, _) => None,
+                            (false, 0) => Some(session_after(made)),
+                            (false, _) => Some(session_after(made - 1)),
+                        };
+                        not_there_for = not_there_for.saturating_sub(1);
+                        let _ = answer.send(vec![("relay".to_string(), session)]);
+                    }
+                    DoorAsk::Remake { answer, .. } => {
+                        order.lock().unwrap().push("remake");
+                        made_again.fetch_add(1, SeqCst);
+                        // The asking that notes the session from before
+                        // is answered with it, and so many after it.
+                        not_there_for = takes.load(SeqCst);
+                        let _ = answer.send(true);
+                    }
+                    DoorAsk::Read { answer, .. }
+                        if not_there_for > 0
+                            || full
+                                .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                                .is_ok() =>
+                    {
+                        order.lock().unwrap().push("no room");
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read: LeftRead::NoRoom,
+                        }]);
+                    }
+                    // Proofs that were made over another session than
+                    // the connection's hold nowhere: the connection
+                    // changed.
+                    DoorAsk::Read {
+                        by: ProvedBy::Proofs(made),
+                        answer,
+                        ..
+                    } if !made.iter().any(|made| {
+                        made.relay == "relay"
+                            && made.session == session_after(made_again.load(SeqCst))
+                    }) =>
+                    {
+                        order.lock().unwrap().push("changed");
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read: LeftRead::Changed,
+                        }]);
                     }
                     DoorAsk::Read {
                         channel,
@@ -533,6 +629,12 @@ impl Node {
                         let by_secret = matches!(by, ProvedBy::Secret(_));
                         log.lock().unwrap().push((channel, by_secret));
                         order.lock().unwrap().push("read");
+                        let nearly = std::time::Duration::from_secs(
+                            cordelia_core::protocol::CARRY_FIRST_MAX_SECS - 1,
+                        );
+                        let then = std::time::Instant::now() + nearly;
+                        let waits = node.own_channels.carried_into(then);
+                        held_back.lock().unwrap().push(waits);
                         let read = match holds.lock().unwrap().get(&channel) {
                             None => LeftRead::NotHeld,
                             Some(entries) => LeftRead::Read {
@@ -554,6 +656,12 @@ impl Node {
             asked,
             did,
             in_part,
+            short_passes,
+            not_connected,
+            no_room,
+            remade,
+            remake_takes,
+            held_back_at_reads,
         }
     }
 
@@ -2015,8 +2123,9 @@ mod tests {
         let (conn, identity) = (&s[0].conn, &s[0].identity);
         let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
         // Each relay with when it was last connected.
-        let since =
-            |relays: &[([u8; 32], i64)]| names_waiting_since(conn, identity, relays).unwrap();
+        let since = |relays: &[([u8; 32], i64)]| {
+            names_waiting_since(conn, identity, relays, &|_| true).unwrap()
+        };
         // Both connected before anything was stored.
         let long = |relays: &[[u8; 32]]| {
             let relays: Vec<([u8; 32], i64)> = relays.iter().map(|relay| (*relay, 0)).collect();
@@ -2076,7 +2185,7 @@ mod tests {
         // The personal channel is no name: what waits of it is not said.
         let alone = Machine::new(7);
         assert_eq!(
-            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)]).unwrap(),
+            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)], &|_| true).unwrap(),
             None
         );
     }

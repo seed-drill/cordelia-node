@@ -165,11 +165,12 @@ pub fn take(state: &AppState, version: &str, room: RoomThere) -> bool {
 /// - **The copy is made on a connection of its own,** without the node's
 ///   lock: the node goes on answering what asks how it stands, and says
 ///   that a copy is being made. The lock is taken for the step, which
-///   uses the copy only where the database then holds what the copy
-///   holds, and makes it again where it does not. (A database that is in
-///   no file is copied on the node's own connection.)
-/// - **A copy that was made is used again** by a later try of this start
-///   where only the step failed.
+///   uses that copy: this run of the node made it, and writes nothing of
+///   this while its first start is not done. (A database that is in no
+///   file is copied on the node's own connection.)
+/// - **A copy that was made is used again** by a later try of this run
+///   where only the step failed, and by no other run: a new start makes
+///   a new copy, and keeps the one it finds as the earlier one.
 /// - **The tries back off:** after one that failed, nothing is tried
 ///   before its wait has passed ([`wait_after`]), counted from when the
 ///   try began, but for a second of slack for the timer that calls this.

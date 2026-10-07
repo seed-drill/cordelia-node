@@ -40,11 +40,24 @@
 //! pull, reads what the relays handed here, and hands the node the
 //! versions that keys which count signed.
 //!
+//! **A proof goes with the session it was made over** (§16): it holds on
+//! that connection and on no other. Where the node says that a relay's
+//! connection has changed since, the command asks for the sessions again
+//! and makes its proofs again ([`read_with_secret`]); where it still
+//! cannot read, it says which relay it did not read. It never takes that
+//! for a relay that holds none.
+//!
 //! **The phrase stays in this process,** as in every command that reads
 //! one (decision 2026-10-04 §5): it is typed with echo off, signs a word
 //! that says what may be taken ([`cordelia_api::carry::Word`]), and is
 //! dropped before anything is read at a relay or handed to the node.
 //! The node is handed that word, and no secret.
+//!
+//! **What `--phrase` hands the node is bound to its word** (§16): the
+//! word names a key that this command makes for the one run, and each
+//! batch of versions is signed by that key over its number and its
+//! hash. The key is overwritten once the last batch is handed, and the
+//! secrets that the phrase opened once the last channel is read.
 
 use std::time::Duration;
 
@@ -54,8 +67,11 @@ use zeroize::Zeroizing;
 use cordelia_api::carry::{self, Allows, Handed, Word};
 use cordelia_api::change::read_with;
 use cordelia_api::person::PersonError;
-use cordelia_core::protocol::{CARRY_FIRST_MAX_SECS, CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS};
+use cordelia_core::protocol::{
+    CARRY_FIRST_MAX_SECS, CARRY_HANDED_MAX_BYTES, CARRY_PROOFS_MADE_AGAIN, CARRY_READ_MAX_SECS,
+};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::statement::StatementError;
 use cordelia_crypto::{derive, fingerprint, proof};
 
@@ -77,8 +93,9 @@ const CARRY_WAITS: Duration = Duration::from_secs(CARRY_READ_MAX_SECS + 90);
 
 /// `cordelia sync carry [<name>] [--from [<key>]...] [--phrase]`
 /// (decision 2026-10-04 §7.3). Each `--from` names one removed key, by
-/// its label or by the first six words of its key's fingerprint; with no
-/// key after it, the removed keys that signed there are listed.
+/// its label, by the first six words of its key's fingerprint, or by the
+/// key written whole; with no key after it, the removed keys that signed
+/// there are listed.
 pub(crate) fn carry(
     config_path: &str,
     name: Option<String>,
@@ -231,11 +248,18 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
     let Some(at) = at else {
         println!(
             "Nothing was taken. To bring in what one of them wrote: cordelia sync carry {} \
-             --from \"<its label, or those six words>\"",
+             --from \"<its label, those six words, or its key>\"",
             file_shown(name)
         );
         return Ok(());
     };
+    // Which slots are empty is judged only where the new channel was
+    // fetched whole just before (§7.3): where it could not be, nothing
+    // is asked, and nothing is taken.
+    if let Some(says) = new_not_read_says(&found, name) {
+        println!("{says}");
+        return Ok(());
+    }
 
     // What it found, before anything is asked (§7.3).
     let found = Found::of(&found)?;
@@ -336,6 +360,22 @@ fn word_for(
     }
     let now = chrono::Utc::now().timestamp();
     Ok(Word::give(&phrase, own, under, allows.says()?, now)?)
+}
+
+/// What `--from` says where the new channel could not be fetched whole
+/// before anything was judged (decision 2026-10-04 §7.3): which of its
+/// slots hold nothing is not known, so nothing is taken. `None` where it
+/// was read.
+fn new_not_read_says(found: &Value, name: &str) -> Option<String> {
+    if found["new_read"] != false {
+        return None;
+    }
+    Some(format!(
+        "The new channel of {} could not be read at a relay: no relay answered, or the read did \
+         not end. Which of its slots hold nothing is not known, so nothing is taken. Run this \
+         again once a relay can be read.",
+        file_shown(name)
+    ))
 }
 
 /// What `--from` found, read from the node's answer. The keys are read
@@ -482,11 +522,20 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             continue;
         };
         let entries = signed["entries"].as_u64().unwrap_or(0) as usize;
-        lines.push(format!(
+        let mut line = format!(
             "  {}: {}",
             words_then(&carry::naming_words(&key), text(signed, "label")),
             counted(entries, "entry").replace("entrys", "entries")
-        ));
+        );
+        // Where the node says that those words name another removed key
+        // too, the key is given written whole: that names it alone.
+        if signed["by_words"] == false {
+            line.push_str(&format!(
+                ". Those words name another removed key here too: name this one by its key, {}",
+                key_written(&key)
+            ));
+        }
+        lines.push(line);
     }
     match lines.is_empty() {
         true => vec![format!(
@@ -502,6 +551,11 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             lines
         }
     }
+}
+
+/// A key written whole, as `--from` takes one (decision 2026-10-04 §7.3).
+pub(crate) fn key_written(key: &[u8; 32]) -> String {
+    cordelia_crypto::bech32::encode_public_key(key).unwrap_or_else(|_| hex::encode(key))
 }
 
 /// What could not be read, by generation and relay, in lines.
@@ -571,15 +625,15 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
     let counts: Vec<[u8; 32]> = list(&handed, "counts")
         .filter_map(|key| carry::key_named(key.as_str()?))
         .collect();
-    let sessions: Vec<(String, [u8; 32])> = list(&handed, "sessions")
-        .filter_map(|at| {
-            let session = carry::key_named(at["session"].as_str()?)?;
-            Some((text(at, "relay").to_string(), session))
-        })
-        .collect();
+    let mut sessions = sessions_of(&handed);
     if sessions.is_empty() {
         anyhow::bail!("no relay is connected: nothing can be read. Nothing was taken.");
     }
+
+    // The key of this run, which the word names: each batch that is
+    // handed under the word is signed by it. It is made here, and
+    // overwritten when it is dropped.
+    let run = NodeIdentity::generate()?;
 
     // The phrase opens the secrets, signs its word, and is dropped
     // before anything is read at a relay.
@@ -596,18 +650,19 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         };
         let allows = Allows::Handed {
             name: name.to_string(),
+            run: hex::encode(run.public_key()),
         };
         let now = chrono::Utc::now().timestamp();
         let word = Word::give(&phrase, &own, &under, allows.says()?, now)?;
         // The secret of the name's channel in each generation that the
-        // entry gives the phrase, the newest first: the person secret
-        // of each is dropped with the part that held it.
+        // entry gives the phrase, the newest first. Each person secret
+        // is read where it lies, in the part that the phrase opened,
+        // and is overwritten with that part: no copy of it is made.
         let mut generations: Vec<(u64, Zeroizing<[u8; 32]>)> = Vec::new();
-        let its_own = (statement.statement.number, for_phrase.secret);
-        let earlier = for_phrase.earlier.iter().map(|e| (e.number, e.secret));
-        for (number, secret) in [its_own].into_iter().chain(earlier) {
-            let secret = Zeroizing::new(secret);
-            generations.push((number, Zeroizing::new(derive::own_secret(&secret, name)?)));
+        let its_own = (statement.statement.number, &for_phrase.secret);
+        let earlier = for_phrase.earlier.iter().map(|e| (e.number, &e.secret));
+        for (number, secret) in std::iter::once(its_own).chain(earlier) {
+            generations.push((number, Zeroizing::new(derive::own_secret(secret, name)?)));
         }
         (word, generations)
     };
@@ -623,12 +678,7 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
             continue;
         }
         read_any = true;
-        let mut proofs = Vec::new();
-        for (relay, session) in &sessions {
-            let proof = proof::make(secret, session, &own)?;
-            proofs.push(json!({ "relay": relay, "proof": hex::encode(proof) }));
-        }
-        let (entries, relays) = read_through_the_node(config_path, &channel, proofs)?;
+        let (entries, relays) = read_with_secret(config_path, secret, &mut sessions, &own)?;
         for relay in &relays {
             let read = text(relay, "read");
             if !matches!(read, "whole" | "not held") {
@@ -662,19 +712,152 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         "name": name, "generations": [], "carried": 0, "held": 0, "higher": 0,
         "ties": [], "above": [], "deletes": 0, "by_other_keys": by_other_keys, "nothing": null,
     });
-    for batch in batches(&newest, CARRY_PART_MAX_BYTES) {
+    for (number, batch) in batches(&newest, CARRY_HANDED_MAX_BYTES).iter().enumerate() {
+        let signature = run.sign(&carry::batch_signed(number as u64, batch)?);
         let done = told(api_post_told(
             config_path,
             "/api/v1/carry/handed",
-            json!({ "word": word, "versions": batch }),
+            json!({
+                "word": word,
+                "number": number,
+                "signature": hex::encode(signature),
+                "versions": batch,
+            }),
             Some(CARRY_WAITS),
         ))?;
         add_to(&mut total, &done);
     }
+    // The last batch is handed: the key of the run is overwritten.
+    drop(run);
     for line in carried_lines(&total) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Each relay that is connected, by its name, with the value of the
+/// session of its connection: what a proof for that connection is made
+/// over.
+pub(crate) type Sessions = Vec<(String, [u8; 32])>;
+
+/// The sessions that an answer of the node's lists: each relay that has
+/// a connection, with its session.
+pub(crate) fn sessions_of(answer: &Value) -> Sessions {
+    list(answer, "sessions")
+        .filter_map(|at| {
+            let session = carry::key_named(at["session"].as_str()?)?;
+            Some((text(at, "relay").to_string(), session))
+        })
+        .collect()
+}
+
+/// The sessions, as the node says them now.
+pub(crate) fn sessions_now(config_path: &str) -> anyhow::Result<Sessions> {
+    let answer = told(api_post_told(
+        config_path,
+        "/api/v1/carry/sessions",
+        json!({}),
+        Some(Duration::from_secs(60)),
+    ))?;
+    Ok(sessions_of(&answer))
+}
+
+/// A proof of the key of the channel whose secret is `secret`, for each
+/// connection in `sessions`, as the node is handed them: each with the
+/// relay's name and with the session that it was made over.
+pub(crate) fn proofs_for(
+    secret: &[u8; 32],
+    sessions: &Sessions,
+    own: &[u8; 32],
+) -> anyhow::Result<Vec<Value>> {
+    let mut proofs = Vec::new();
+    for (relay, session) in sessions {
+        let proof = proof::make(secret, session, own)?;
+        proofs.push(json!({
+            "relay": relay,
+            "session": hex::encode(session),
+            "proof": hex::encode(proof),
+        }));
+    }
+    Ok(proofs)
+}
+
+/// Read the channel whose secret is `secret` at each relay, through the
+/// node, with proofs that are made here over each connection's session
+/// (decision 2026-10-04 §16). **Where the node says that a relay's
+/// connection has changed since the sessions were said, they are asked
+/// for again, and the proofs are made again:** `sessions` is then what
+/// the node says now. Returns the entries, and what is said of each
+/// relay. The secret is held here for as long as this takes, and no
+/// longer than whoever asks holds it.
+pub(crate) fn read_with_secret(
+    config_path: &str,
+    secret: &[u8; 32],
+    sessions: &mut Sessions,
+    own: &[u8; 32],
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let channel = derive::channel_id(secret)?;
+    read_again_where_changed(
+        sessions,
+        |sessions| {
+            let proofs = proofs_for(secret, sessions, own)?;
+            read_through_the_node(config_path, &channel, proofs)
+        },
+        || sessions_now(config_path),
+    )
+}
+
+/// Whether what the node says of a relay is that its connection is
+/// another than the one that the proof was made for.
+fn connection_changed(said: &Value) -> bool {
+    text(said, "read") == cordelia_api::carrying::CONNECTION_CHANGED
+}
+
+/// Whether what the node says of a relay is that nothing more could be
+/// had there: it handed the channel whole, or holds none of it.
+fn read_to_its_end(said: &Value) -> bool {
+    matches!(text(said, "read"), "whole" | "not held")
+}
+
+/// [`read_with_secret`], with what reads and what asks for the sessions
+/// given: `read` reads the channel with proofs over the sessions it is
+/// handed, and `ask` gives the sessions as the node says them now.
+///
+/// The channel is read once. For as long as the node says of a relay
+/// that its connection changed, the sessions are asked for again and the
+/// channel is read again: CARRY_PROOFS_MADE_AGAIN times at most. What
+/// was handed is kept from every reading, each entry once. Of each relay
+/// the last thing said stands, but that a relay which was read to its
+/// end stays so: and where the connection still changed at the last
+/// reading, that is what is said of the relay.
+fn read_again_where_changed(
+    sessions: &mut Sessions,
+    mut read: impl FnMut(&Sessions) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+    mut ask: impl FnMut() -> anyhow::Result<Sessions>,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let mut entries: Vec<CheckedEntry> = Vec::new();
+    let mut said: Vec<Value> = Vec::new();
+    for made_again in 0..=CARRY_PROOFS_MADE_AGAIN {
+        let (handed, relays) = read(sessions)?;
+        for entry in handed {
+            if !entries.iter().any(|held| held.id() == entry.id()) {
+                entries.push(entry);
+            }
+        }
+        let changed = relays.iter().any(connection_changed);
+        for relay in relays {
+            match said.iter_mut().find(|of| of["relay"] == relay["relay"]) {
+                Some(of) if read_to_its_end(of) => {}
+                Some(of) => *of = relay,
+                None => said.push(relay),
+            }
+        }
+        if !changed || made_again == CARRY_PROOFS_MADE_AGAIN {
+            break;
+        }
+        *sessions = ask()?;
+    }
+    Ok((entries, said))
 }
 
 /// Read the channel whose ID is `channel` at each relay, through the
@@ -714,18 +897,27 @@ pub(crate) fn read_through_the_node(
     Ok((entries, relays))
 }
 
-/// `versions` in batches, each of which holds no more than `max_bytes`
-/// of text, and one version at least.
+/// How many bytes `version` takes in the body of the request that hands
+/// it (decision 2026-10-04 §7.3): as it is written there, with its
+/// chain, and with its name and its text as they are escaped; and what
+/// goes between two versions.
+fn handed_bytes(version: &Handed) -> usize {
+    serde_json::to_vec(version).map_or(usize::MAX, |written| written.len() + 1)
+}
+
+/// `versions` in batches, each of which takes no more than `max_bytes`
+/// in a request's body ([`handed_bytes`]), and holds one version at
+/// least.
 fn batches(versions: &[Handed], max_bytes: usize) -> Vec<&[Handed]> {
     let mut batches = Vec::new();
-    let (mut start, mut bytes) = (0, 0);
+    let (mut start, mut bytes) = (0usize, 0usize);
     for (at, version) in versions.iter().enumerate() {
-        let size = version.text.as_ref().map_or(0, String::len) + version.name.len();
-        if at > start && bytes + size > max_bytes {
+        let size = handed_bytes(version);
+        if at > start && bytes.saturating_add(size) > max_bytes {
             batches.push(&versions[start..at]);
             (start, bytes) = (at, 0);
         }
-        bytes += size;
+        bytes = bytes.saturating_add(size);
     }
     if start < versions.len() {
         batches.push(&versions[start..]);
@@ -785,7 +977,8 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
     if done["held_anew"] == true {
         lines.push(format!(
             "  This device now holds {name} and lists it, with no folder mapped to it: it \
-             sends what it carried, and carries the name at each later change."
+             sends what it carried, and carries the name at each later change. To let go of \
+             it: cordelia sync unmap {name}"
         ));
     }
     if number("higher") > 0 {
@@ -868,6 +1061,21 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Where the new channel could not be fetched whole, `--from` says so
+    /// before it asks for anything, and takes nothing (decision
+    /// 2026-10-04 §7.3). Where it was read, nothing is said of it.
+    #[test]
+    fn test_from_says_where_the_new_channel_could_not_be_read() {
+        assert_eq!(new_not_read_says(&json!({ "new_read": true }), "lab"), None);
+        assert_eq!(new_not_read_says(&json!({}), "lab"), None);
+        let says = new_not_read_says(&json!({ "new_read": false }), "lab").unwrap();
+        assert!(
+            says.starts_with("The new channel of lab could not be read at a relay"),
+            "{says}"
+        );
+        assert!(says.contains("so nothing is taken"), "{says}");
+    }
+
     /// What a carry of one name did is said in lines (decision 2026-10-04
     /// §7.3): what was brought in, what was left and why, and what could
     /// not be read; and nothing where the node said nothing of a carry.
@@ -899,6 +1107,10 @@ mod tests {
         );
         assert!(
             all.contains("This device now holds lab and lists it"),
+            "{all}"
+        );
+        assert!(
+            all.contains("To let go of it: cordelia sync unmap lab"),
             "{all}"
         );
         assert!(
@@ -1071,11 +1283,24 @@ mod tests {
         let key = [7u8; 32];
         let found = json!({ "signed": [
             { "key": hex::encode(key), "words": "not these", "label": "desktop", "entries": 2 },
-            { "key": hex::encode([8u8; 32]), "label": "", "entries": 1 },
+            { "key": hex::encode([8u8; 32]), "label": "", "entries": 1, "by_words": true },
             { "key": "no key", "label": "odd", "entries": 9 },
+            { "key": hex::encode([9u8; 32]), "label": "old", "entries": 4, "by_words": false },
         ]});
         let lines = signed_lines(&found, "lab");
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        // A key whose six words name another removed key too is given
+        // written whole, as `--from` takes one: worked out from the key.
+        let whole = cordelia_crypto::bech32::encode_public_key(&[9u8; 32]).unwrap();
+        assert!(whole.starts_with("cordelia_pk1"), "{whole}");
+        assert_eq!(
+            lines[3],
+            format!(
+                "  ({}) \"old\": 4 entries. Those words name another removed key here too: \
+                 name this one by its key, {whole}",
+                carry::naming_words(&[9u8; 32])
+            )
+        );
         assert!(
             lines[0].starts_with("Removed keys that signed in lab"),
             "{lines:?}"
@@ -1099,6 +1324,138 @@ mod tests {
         );
     }
 
+    /// **A proof goes with the session that it was made over** (decision
+    /// 2026-10-04 §16): each proof that the node is handed says the relay
+    /// and that session, and holds over it and over no other.
+    #[test]
+    fn test_a_proof_is_handed_with_the_session_it_was_made_over() {
+        let (secret, own) = ([3u8; 32], [4u8; 32]);
+        let channel = derive::channel_id(&secret).unwrap();
+        let answer = json!({ "sessions": [
+            { "relay": "one", "session": hex::encode([1u8; 32]) },
+            // A relay that has no connection has no session: no proof is
+            // made for it.
+            { "relay": "far", "session": null },
+            { "relay": "two", "session": hex::encode([2u8; 32]) },
+        ]});
+        let sessions = sessions_of(&answer);
+        assert_eq!(
+            sessions,
+            [
+                ("one".to_string(), [1u8; 32]),
+                ("two".to_string(), [2u8; 32])
+            ]
+        );
+        let proofs = proofs_for(&secret, &sessions, &own).unwrap();
+        assert_eq!(proofs.len(), 2);
+        for (made, (relay, session)) in proofs.iter().zip(&sessions) {
+            assert_eq!(made["relay"], json!(relay));
+            assert_eq!(made["session"], json!(hex::encode(session)));
+            let bytes: [u8; 64] = hex::decode(text(made, "proof"))
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert!(proof::check(&channel, session, &own, &bytes));
+            assert!(!proof::check(&channel, &[9u8; 32], &own, &bytes));
+        }
+    }
+
+    /// Where the node says of a relay that its connection changed, the
+    /// command asks for the sessions again and reads again with proofs
+    /// made over those (decision 2026-10-04 §16): so often as the
+    /// protocol says, and no more. What every reading handed is kept,
+    /// each entry once. A relay whose connection still changed at the
+    /// last reading is said to be that: it is never said to hold none.
+    #[test]
+    fn test_proofs_are_made_again_where_a_connection_changed() {
+        use cordelia_crypto::entry::{Inside, Value as Held};
+        use std::cell::RefCell;
+        let author = NodeIdentity::generate().unwrap();
+        let entry = |n: u8| {
+            let inside = Inside {
+                name: format!("{n}.md"),
+                value: Held::Text("x".into()),
+                chain: Some(Vec::new()),
+            };
+            Entry::seal(&[9; 32], &author, 1, &inside)
+                .unwrap()
+                .check()
+                .unwrap()
+        };
+        let (first, second, third) = (entry(1), entry(2), entry(3));
+        let said = |relay: &str, read: &str| json!({ "relay": relay, "read": read });
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let at = |n: u8| -> Sessions { vec![("one".to_string(), [n; 32])] };
+        // What each reading answers, in order; the sessions that each
+        // was made over; and how often the sessions were asked for.
+        let run = |readings: Vec<(Vec<CheckedEntry>, Vec<Value>)>| {
+            let mut sessions = at(0);
+            let over: RefCell<Vec<Sessions>> = RefCell::new(Vec::new());
+            let asked = RefCell::new(0u8);
+            let mut readings = readings.into_iter();
+            let (entries, relays) = read_again_where_changed(
+                &mut sessions,
+                |sessions| {
+                    over.borrow_mut().push(sessions.clone());
+                    Ok(readings.next().expect("no more is read"))
+                },
+                || {
+                    *asked.borrow_mut() += 1;
+                    Ok(at(*asked.borrow()))
+                },
+            )
+            .unwrap();
+            let ids: Vec<[u8; 32]> = entries.iter().map(|entry| entry.id()).collect();
+            (ids, relays, over.into_inner(), asked.into_inner(), sessions)
+        };
+
+        // Nothing changed: one reading, and the sessions are not asked
+        // for again.
+        let whole = vec![said("one", "whole"), said("two", "not held")];
+        let (ids, relays, over, asked, sessions) = run(vec![(vec![first.clone()], whole.clone())]);
+        assert_eq!((ids, relays), (vec![first.id()], whole));
+        assert_eq!((over, asked, sessions), (vec![at(0)], 0, at(0)));
+
+        // One relay's connection changed: the sessions are asked for,
+        // the channel is read again with proofs over what was said, and
+        // what both readings handed is kept, each entry once. A relay
+        // that was read to its end stays so.
+        let (ids, relays, over, asked, sessions) = run(vec![
+            (
+                vec![first.clone(), second.clone()],
+                vec![said("one", changed), said("two", "whole")],
+            ),
+            (
+                vec![second.clone(), third.clone(), first.clone()],
+                vec![said("one", "whole"), said("two", "not reached")],
+            ),
+        ]);
+        assert_eq!(ids, [first.id(), second.id(), third.id()]);
+        assert_eq!(relays, [said("one", "whole"), said("two", "whole")]);
+        assert_eq!((over, asked, sessions), (vec![at(0), at(1)], 1, at(1)));
+
+        // A connection that changes at every reading: the proofs are
+        // made again as often as the protocol says, and then the relay
+        // is said to be one whose connection changed.
+        assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
+        let every = || (Vec::new(), vec![said("one", changed)]);
+        let (ids, relays, over, asked, sessions) = run(vec![every(), every(), every()]);
+        assert!(ids.is_empty());
+        assert_eq!(relays, [said("one", changed)]);
+        assert_eq!(over, [at(0), at(1), at(2)]);
+        assert_eq!((asked, sessions), (2, at(2)));
+        assert!(connection_changed(&relays[0]) && !read_to_its_end(&relays[0]));
+        // What is said last of a relay that was not read to its end
+        // stands.
+        let (_, relays, _, asked, _) = run(vec![
+            (Vec::new(), vec![said("one", changed), said("two", "part")]),
+            (Vec::new(), vec![said("one", "part"), said("two", changed)]),
+            (Vec::new(), vec![said("one", "part"), said("two", "whole")]),
+        ]);
+        assert_eq!(relays, [said("one", "part"), said("two", "whole")]);
+        assert_eq!(asked, 2);
+    }
+
     /// Versions are handed to the node a batch at a time, each within
     /// what one request carries, and one version at least; and what the
     /// node says of each batch is added up.
@@ -1120,11 +1477,46 @@ mod tests {
         let sizes = |max: usize| -> Vec<usize> {
             batches(&all, max).iter().map(|batch| batch.len()).collect()
         };
-        assert_eq!(sizes(1_000), [4]);
-        assert_eq!(sizes(100), [2, 1, 1]);
+        // A version is counted as it is written in the body, and with
+        // what goes between two.
+        let written = |version: &Handed| serde_json::to_vec(version).unwrap().len() + 1;
+        let (a, c, d) = (written(&all[0]), written(&all[2]), written(&all[3]));
+        assert_eq!(handed_bytes(&all[0]), a);
+        assert!(a > 40 + 1 && c > a && a > d);
+        assert_eq!(sizes(usize::MAX), [4]);
+        assert_eq!(sizes(2 * a + c + d), [4]);
+        assert_eq!(sizes(2 * a + c + d - 1), [3, 1]);
+        assert_eq!(sizes(2 * a), [2, 1, 1]);
+        assert_eq!(sizes(2 * a - 1), [1, 1, 1, 1]);
         // A version over the bound goes alone.
         assert_eq!(sizes(10), [1, 1, 1, 1]);
         assert!(batches(&[], 100).is_empty());
+
+        // **The chain and the escaping count** (§7.3). A text of bytes
+        // that are written as six each, and a chain of a hundred links:
+        // a version takes many times its text and its name.
+        let long = Handed {
+            name: "n".into(),
+            rev: 1,
+            text: Some("\u{1}".repeat(100)),
+            signer: "ab".repeat(32),
+            chain: Some(vec!["cd".repeat(32); 100]),
+        };
+        assert!(handed_bytes(&long) > 6 * 100 + 100 * 66 + 64);
+        // Four hundred of them hold 40,400 bytes of text and names, and
+        // are far more than one request's body in all: they go in
+        // batches, each of which is within the bound as it is written.
+        let many = vec![long; 400];
+        let in_batches = batches(&many, CARRY_HANDED_MAX_BYTES);
+        assert!(in_batches.len() > 5, "{}", in_batches.len());
+        assert_eq!(
+            in_batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            400
+        );
+        for batch in in_batches {
+            let body = serde_json::to_vec(batch).unwrap().len();
+            assert!(body <= CARRY_HANDED_MAX_BYTES + 1, "{body}");
+        }
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],

@@ -719,11 +719,20 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
         out.push("Not in the last change (each holds what your devices held before it):".into());
     }
     for device in left_out {
-        out.push(format!(
-            "  {}: add it again, or it was meant to go. Its key is the one it prints \
-             (`cordelia id`).",
-            shown(device)
-        ));
+        out.push(match device["key"].as_str() {
+            None => format!(
+                "  {}: add it again, or it was meant to go. Its key is the one it prints \
+                 (`cordelia id`).",
+                shown(device)
+            ),
+            // A row that the recovery could not show, and asked nothing
+            // of: it is shown with its key (decision 2026-10-04 §9).
+            Some(key) => format!(
+                "  {}  {key}: the recovery could not show it, and asked nothing of it. Nothing \
+                 that it wrote was brought back.",
+                shown(device)
+            ),
+        });
     }
     if let Some(apart) = seen["apart"].as_object() {
         out.push(String::new());
@@ -3111,8 +3120,30 @@ mod tests {
                 { "name": "lab", "file": hostile },
             ],
             "names_not_shown": 3,
+            "left_out": [
+                { "label": "tablet", "words": "t t t t", "number": 2 },
+                { "label": "added 7", "words": "n n n n", "number": 2,
+                  "key": "cordelia_pk1notshown" },
+            ],
         });
         let lines = devices_lines(&seen, &key(1)).join("\n");
+        // A key that is not in the last change is shown by its label,
+        // and its key is asked for as that device prints it. One that a
+        // recovery could not show is shown with its key (§9).
+        assert!(
+            lines.contains(
+                "(t t t t) \"tablet\": add it again, or it was meant to go. Its key is the one \
+                 it prints (`cordelia id`)."
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(
+                "(n n n n) \"added 7\"  cordelia_pk1notshown: the recovery could not show it, \
+                 and asked nothing of it."
+            ),
+            "{lines}"
+        );
         assert!(
             lines.contains(
                 "\n3 names that cannot be shown are listed by a device: what they are called \

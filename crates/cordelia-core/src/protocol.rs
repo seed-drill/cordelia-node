@@ -1259,6 +1259,30 @@ pub const LABEL_SESSION_VALUE: &[u8] = b"EXPORTER-cordelia v2 session";
 /// MAX_CHANNELS_ASKED_OF_A_PEER.
 pub const MAX_CHANNELS_PROVED_ON_A_CONNECTION: usize = MAX_CHANNELS_ASKED_OF_A_PEER;
 
+/// How many of the places that a relay remembers for one connection a
+/// read of a generation that was left keeps back, beyond those that the
+/// device's own channels still need there (decision 2026-10-04 §16): one
+/// in sixty-four of them, which is 16 of 1,024. It is for a name that the
+/// device comes to hold while the read goes on, and for the pair channel
+/// of a device that is being added.
+pub const LEFT_PROOFS_MARGIN_SHARE: usize = 64;
+
+/// How many places of one connection a read of a generation that was
+/// left keeps back for the device's own channels (decision 2026-10-04
+/// §16): as many as the device has channels of its own that are not yet
+/// proved there, `own_not_proved`, and a margin
+/// (LEFT_PROOFS_MARGIN_SHARE). `most` is how many a relay remembers for
+/// one connection.
+///
+/// **Never more than half of them.** A device that holds more channels
+/// than half a connection's places cannot keep a place back for each and
+/// still read: it then shares a connection half and half, and the read
+/// has the connection made again as often as it needs.
+pub const fn left_proofs_kept_back(own_not_proved: usize, most: usize) -> usize {
+    let kept = own_not_proved.saturating_add(most / LEFT_PROOFS_MARGIN_SHARE);
+    if kept > most / 2 { most / 2 } else { kept }
+}
+
 /// The protocol byte of a stream on which a connection shows an entry, and
 /// is answered with what the receiver holds (decision 2026-10-04 §2.4,
 /// item 5). The five streams of entries are 0x10 to 0x14, apart from the
@@ -1632,6 +1656,22 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
 
+/// How often a command that was typed the phrase makes its proofs again
+/// for one channel, at most (decision 2026-10-04 §16): a proof holds on
+/// the connection whose session it was made over, and where the node
+/// says that a connection has changed since, the command asks for the
+/// sessions again and makes the proofs anew. After the second time it
+/// says which relay it could not read.
+pub const CARRY_PROOFS_MADE_AGAIN: usize = 2;
+
+/// The label under which the key of one run of a command signs a batch
+/// of versions that it hands the node on the phrase's word (decision
+/// 2026-10-04 §16): the batch's number, and the hash of its versions as
+/// they are handed. The word names that key, and the command makes it
+/// for the one run: a signature under this label is no word, no
+/// statement and no entry.
+pub const LABEL_CARRY_BATCH: &[u8] = b"cordelia v2 carry batch";
+
 /// The most bytes of entries that the node hands a command in one answer
 /// (decision 2026-10-04 §7.3, §9), where the command reads a channel
 /// whose secret the node does not hold: a channel may hold more than one
@@ -1639,6 +1679,23 @@ pub const CARRY_WORD_SECS: i64 = 10 * 60;
 /// entry over the bound is handed alone.
 /// Derived: half of what one message of the wire holds, MAX_MESSAGE_BYTES.
 pub const CARRY_PART_MAX_BYTES: usize = MAX_MESSAGE_BYTES as usize / 2;
+
+/// The most bytes of one request's body that the local API of a device
+/// reads as JSON (decision 2026-10-04 §16): a body over it is refused,
+/// and is not read. What a command hands the node in one request is
+/// sized against this ([`CARRY_HANDED_MAX_BYTES`]).
+pub const LOCAL_API_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most bytes of versions that a command hands the node in one
+/// request (decision 2026-10-04 §7.3): each version counted as it is
+/// written in the request's body, with its chain, and with its name and
+/// its text as they are escaped there. A version over the bound is
+/// handed alone.
+/// Derived: a quarter of LOCAL_API_BODY_MAX_BYTES. A batch within the
+/// bound, and one version alone of the largest size that an entry holds,
+/// escaped as far as a text can be, each fit a request's body beside the
+/// word and the batch's signature.
+pub const CARRY_HANDED_MAX_BYTES: usize = LOCAL_API_BODY_MAX_BYTES / 4;
 
 /// The most names a recovery carries (decision 2026-10-04 §9): a device
 /// that is gone listed names too, and can have listed any number of its
@@ -1659,7 +1716,7 @@ pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
 pub const RECOVERY_MAX_LEFT_SECRETS: usize = MAX_EARLIER_SECRETS + 1;
 
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 24] = [
+pub const LABELS: [&[u8]; 25] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1684,6 +1741,7 @@ pub const LABELS: [&[u8]; 24] = [
     LABEL_SESSION_VALUE,
     LABEL_FINGERPRINT,
     LABEL_CARRY_WORD,
+    LABEL_CARRY_BATCH,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2289,7 +2347,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 24);
+        assert_eq!(LABELS.len(), 25);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2339,7 +2397,25 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
+        assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
+        assert!(LABELS.contains(&LABEL_CARRY_BATCH));
         assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
+        assert_eq!(LOCAL_API_BODY_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(CARRY_HANDED_MAX_BYTES, 512 * 1024);
+        // A batch at its bound fits a body. So does one version alone of
+        // the largest size, with every byte of its name and its text
+        // written as six, which is the most that JSON makes of one, and
+        // every byte of its chain as four: two of hex, and what goes
+        // between two links.
+        const {
+            assert!(
+                CARRY_HANDED_MAX_BYTES
+                    + 6 * MAX_ENTRY_NAME_AND_VALUE_BYTES
+                    + 4 * MAX_ENTRY_CHAIN_BYTES
+                    < LOCAL_API_BODY_MAX_BYTES
+            )
+        };
         // A part holds an entry of any size that a channel carries.
         const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };
         assert_eq!(RECOVERY_MAX_NAMES, 1_024);
@@ -2415,6 +2491,37 @@ mod tests {
         );
         // A connection remembers only so many channels as proved.
         assert_eq!(MAX_CHANNELS_PROVED_ON_A_CONNECTION, 1024);
+    }
+
+    /// What a read of a generation that was left keeps back of a
+    /// connection's places (decision 2026-10-04 §16): one for each
+    /// channel of the device's own that is not yet proved there, and a
+    /// margin of one place in sixty-four; and never more than half.
+    #[test]
+    fn test_what_a_read_of_a_generation_that_was_left_keeps_back_decision_2026_10_04_16() {
+        const MOST: usize = MAX_CHANNELS_PROVED_ON_A_CONNECTION;
+        assert_eq!(LEFT_PROOFS_MARGIN_SHARE, 64);
+        assert_eq!(left_proofs_kept_back(0, MOST), 16);
+        assert_eq!(left_proofs_kept_back(1, MOST), 17);
+        assert_eq!(left_proofs_kept_back(30, MOST), 46);
+        // A device with tens of channels leaves a read nearly all of a
+        // connection, and has a place for each of its own.
+        assert_eq!(MOST - left_proofs_kept_back(30, MOST), 978);
+        // Never more than half: a read always has half a connection.
+        assert_eq!(left_proofs_kept_back(496, MOST), 512);
+        assert_eq!(left_proofs_kept_back(497, MOST), 512);
+        assert_eq!(left_proofs_kept_back(1_025, MOST), 512);
+        assert_eq!(left_proofs_kept_back(usize::MAX, MOST), 512);
+        // Where a relay remembers fewer, as a test has one do.
+        assert_eq!(left_proofs_kept_back(6, 16), 6);
+        assert_eq!(left_proofs_kept_back(9, 16), 8);
+        assert_eq!(left_proofs_kept_back(0, 16), 0);
+        // A recovery's look of 1,024 names in nine generations reads
+        // 9,216 channels: half a connection at a time, in 18 connections.
+        let read = RECOVERY_MAX_NAMES * RECOVERY_MAX_LEFT_SECRETS;
+        assert_eq!(read, 9_216);
+        let on_one = MOST - left_proofs_kept_back(RECOVERY_MAX_NAMES + 1, MOST);
+        assert_eq!(read.div_ceil(on_one), 18);
     }
 
     /// The stream between relays that work together has a byte of its

@@ -408,6 +408,7 @@ fn routes() -> Vec<(&'static str, Value)> {
         ("/api/v1/carry/from/look", json!({ "name": "lab" })),
         ("/api/v1/carry/from", json!({ "word": no_word() })),
         ("/api/v1/carry/phrase/look", json!({ "name": "lab" })),
+        ("/api/v1/carry/sessions", json!({})),
         (
             "/api/v1/carry/read",
             json!({ "channel": "00", "proofs": [] }),
@@ -415,7 +416,7 @@ fn routes() -> Vec<(&'static str, Value)> {
         ("/api/v1/carry/read/part", json!({ "read": 1, "from": 0 })),
         (
             "/api/v1/carry/handed",
-            json!({ "word": no_word(), "versions": [] }),
+            json!({ "word": no_word(), "number": 0, "signature": "", "versions": [] }),
         ),
         ("/api/v1/recover/look", json!({})),
         (
@@ -429,6 +430,60 @@ fn routes() -> Vec<(&'static str, Value)> {
 /// A word that nobody gave, as a request carries one.
 fn no_word() -> Value {
     json!({ "what": "", "until": 0, "signature": "" })
+}
+
+/// **A request's body is read up to its bound, and no further** (decision
+/// 2026-10-04 §16): what a command hands the node in one request is sized
+/// against it. A body over the bound is refused before it is read. One
+/// that holds a batch at its bound, and one version of the largest size
+/// beside it, is read: here it is answered as any request with no word
+/// that holds.
+#[actix_web::test]
+async fn test_a_request_body_is_read_up_to_its_bound_and_no_further() {
+    use cordelia_core::protocol::{
+        CARRY_HANDED_MAX_BYTES, LOCAL_API_BODY_MAX_BYTES, MAX_ENTRY_CHAIN_BYTES,
+        MAX_ENTRY_NAME_AND_VALUE_BYTES,
+    };
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    // A request that hands versions, with a body of so many bytes.
+    let body_of = |bytes: usize| -> Vec<u8> {
+        let mut body = json!({
+            "word": no_word(), "number": 0, "signature": "", "versions": [], "more": "",
+        });
+        let empty = serde_json::to_vec(&body).unwrap().len();
+        body["more"] = "x".repeat(bytes - empty).into();
+        let body = serde_json::to_vec(&body).unwrap();
+        assert_eq!(body.len(), bytes);
+        body
+    };
+    let mut answered = Vec::new();
+    let largest_batch = CARRY_HANDED_MAX_BYTES
+        + 6 * MAX_ENTRY_NAME_AND_VALUE_BYTES
+        + 4 * MAX_ENTRY_CHAIN_BYTES
+        + 4096;
+    for bytes in [
+        largest_batch,
+        LOCAL_API_BODY_MAX_BYTES,
+        LOCAL_API_BODY_MAX_BYTES + 1,
+    ] {
+        let request = test::TestRequest::post()
+            .uri("/api/v1/carry/handed")
+            .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body_of(bytes))
+            .to_request();
+        answered.push(test::call_service(&app, request).await.status().as_u16());
+    }
+    // Read, and refused for its word; read; and not read.
+    assert_eq!(answered, [400, 400, 413]);
 }
 
 /// A carry that a person asks for, at the route (decision 2026-10-04
@@ -529,6 +584,44 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     // Asked again, the name is held already.
     let (_, said) = asks!(app, "/api/v1/carry", carry);
     assert_eq!(said["held_anew"], false);
+
+    // The sessions, at the route where a command asks for them again
+    // once a connection has changed (§16): with no network, none. And a
+    // proof is handed with the session that it was made over: one that
+    // says what is no session is refused.
+    let (status, said) = asks!(app, "/api/v1/carry/sessions", json!({}));
+    assert_eq!((status, &said["sessions"]), (200, &json!([])), "{said}");
+    let read = |session: String| {
+        let proof = json!({
+            "relay": "relay", "session": session, "proof": hex::encode([0u8; 64]),
+        });
+        json!({ "channel": hex::encode([7u8; 32]), "proofs": [proof] })
+    };
+    let (status, said) = asks!(app, "/api/v1/carry/read", read("0102".into()));
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string()
+            .contains("a session is not as many bytes in hex"),
+        "{said}"
+    );
+    let (status, said) = asks!(app, "/api/v1/carry/read", read(hex::encode([1u8; 32])));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!((&said["relays"], &said["entries"]), (&json!([]), &json!(0)));
+
+    // The name is held by the carry, with no folder mapped to it:
+    // unmapping it lets go of it, and the answer says so. Asked again,
+    // nothing is mapped so, as for any word that names no mapping.
+    let unmap = json!({ "folder": "lab" });
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["let_go"], "lab");
+    assert_eq!(held(&state), None);
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap);
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string().contains("is not mapped on this device"),
+        "{said}"
+    );
 }
 
 /// A recovery, at the routes (decision 2026-10-04 §9, steps 4 and 5).

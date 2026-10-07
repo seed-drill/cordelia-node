@@ -268,6 +268,12 @@ pub fn channels_waiting(state: &AppState) -> u64 {
 /// relay the node is connected to, and those of which something waits at
 /// one of them. A relay that is not connected is not asked here: whether
 /// it holds the change is said of it apart.
+///
+/// **Of what is still to go, the names that the device holds by a carry
+/// or a recovery, with no folder mapped to them, are said apart**
+/// ([`crate::names::carried`], decision 2026-10-04 §10.1), with since
+/// when the first of those has waited: they wait whatever sync says, and
+/// on a machine that maps nothing, and a status says so of them.
 fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
     let relays: Vec<[u8; 32]> = relays_reached(state)
         .into_iter()
@@ -279,13 +285,32 @@ fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
     // Since when the first of what is still to go has waited: at each
     // relay, from the later of when it was stored and when that relay
     // was last connected.
-    let since =
-        leaving::names_waiting_since(&conn, &state.identity, &reached_since).map_err(refused)?;
+    let waiting_since = |of: &dyn Fn(&str) -> bool| {
+        leaving::names_waiting_since(&conn, &state.identity, &reached_since, of).map_err(refused)
+    };
+    let since = waiting_since(&|_| true)?;
     let (to_go, sent): (Vec<_>, Vec<_>) = names.into_iter().partition(|(_, to_go)| *to_go);
     let named = |names: Vec<(String, bool)>| -> Vec<String> {
         names.into_iter().map(|(name, _)| name).collect()
     };
-    Ok(json!({ "sent": named(sent), "to_go": named(to_go), "to_go_since": since }))
+    let to_go = named(to_go);
+    // Those of them that a carry holds, with no folder.
+    let by_a_carry = crate::names::carried(&conn).map_err(refused)?;
+    let carried: Vec<&String> = to_go
+        .iter()
+        .filter(|name| by_a_carry.contains(*name))
+        .collect();
+    let carried_since = match carried.is_empty() {
+        true => None,
+        false => waiting_since(&|name| by_a_carry.contains(name))?,
+    };
+    Ok(json!({
+        "sent": named(sent),
+        "to_go": to_go,
+        "to_go_since": since,
+        "carried_to_go": carried,
+        "carried_to_go_since": carried_since,
+    }))
 }
 
 /// The files whose record a change could not carry, as an answer lists
@@ -1214,38 +1239,42 @@ mod tests {
     fn test_what_a_device_has_still_to_send_is_said_by_name_of_the_relays_it_reaches() {
         let mut s = Several::of_one_person(1);
         s.hold(&[0], "lab");
-        s.hold(&[0], "team");
+        // One name is held by a carry, with no folder mapped to it.
+        let held_at = s.tick();
+        crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "team", held_at).unwrap();
         s.write(0, "lab", "notes.md", "one");
         s.write(0, "team", "notes.md", "one");
         let state = state_of(s.machines.remove(0));
         // The names, and since when the first of what is still to go has
         // waited: a time where something waits, and none where nothing
-        // does.
+        // does. So too of the names that a carry holds.
         let names_sent = |state: &AppState| -> Result<serde_json::Value, ApiError> {
             let mut names = super::names_sent(state)?;
-            let since = names
-                .as_object_mut()
-                .unwrap()
-                .remove("to_go_since")
-                .unwrap();
-            let waits = !names["to_go"].as_array().unwrap().is_empty();
-            assert_eq!(since.as_i64().is_some(), waits, "{names}: {since}");
+            for (since, of) in [
+                ("to_go_since", "to_go"),
+                ("carried_to_go_since", "carried_to_go"),
+            ] {
+                let since = names.as_object_mut().unwrap().remove(since).unwrap();
+                let waits = !names[of].as_array().unwrap().is_empty();
+                assert_eq!(since.as_i64().is_some(), waits, "{names}: {since}");
+            }
             Ok(names)
         };
         // No relay is connected: nothing is known to wait anywhere.
         assert_eq!(channels_waiting(&state), 0);
         assert_eq!(
             names_sent(&state).unwrap(),
-            json!({ "sent": ["lab", "team"], "to_go": [] })
+            json!({ "sent": ["lab", "team"], "to_go": [], "carried_to_go": [] })
         );
 
         let relay = [7u8; 32];
         connected(&state, &relay, "relay.example:9474");
-        // The personal channel and both names wait there.
+        // The personal channel and both names wait there. Of the names,
+        // the one that a carry holds is said apart too.
         assert_eq!(channels_waiting(&state), 3);
         assert_eq!(
             names_sent(&state).unwrap(),
-            json!({ "sent": [], "to_go": ["lab", "team"] })
+            json!({ "sent": [], "to_go": ["lab", "team"], "carried_to_go": ["team"] })
         );
         {
             let conn = db(&state);
@@ -1255,7 +1284,7 @@ mod tests {
         assert_eq!(channels_waiting(&state), 2);
         assert_eq!(
             names_sent(&state).unwrap(),
-            json!({ "sent": ["lab"], "to_go": ["team"] })
+            json!({ "sent": ["lab"], "to_go": ["team"], "carried_to_go": ["team"] })
         );
         // With a second relay, at which more waits: what is counted is
         // the most that wait at any one of them.
@@ -1263,7 +1292,55 @@ mod tests {
         assert_eq!(channels_waiting(&state), 3);
         assert_eq!(
             names_sent(&state).unwrap(),
-            json!({ "sent": [], "to_go": ["lab", "team"] })
+            json!({ "sent": [], "to_go": ["lab", "team"], "carried_to_go": ["team"] })
+        );
+        // Since when the names that a carry holds have waited is of
+        // those names alone: an entry of the other name that was stored
+        // long before does not count for them.
+        {
+            let conn = db(&state);
+            let lab = held_rows::channel_of_name(&conn, "lab").unwrap().unwrap();
+            conn.execute(
+                "UPDATE entries SET stored_at = 700 WHERE channel_id = ?1",
+                [lab.as_slice()],
+            )
+            .unwrap();
+            let team = held_rows::channel_of_name(&conn, "team").unwrap().unwrap();
+            conn.execute(
+                "UPDATE entries SET stored_at = 900 WHERE channel_id = ?1",
+                [team.as_slice()],
+            )
+            .unwrap();
+            let asked = [(relay, 0), ([8u8; 32], 0)];
+            let since = |of: &dyn Fn(&str) -> bool| {
+                leaving::names_waiting_since(&conn, &state.identity, &asked, of).unwrap()
+            };
+            assert_eq!(since(&|_| true), Some(700));
+            assert_eq!(since(&|name| name == "team"), Some(900));
+            assert_eq!(since(&|_| false), None);
+        }
+        // So the node says it, of a relay that has been connected since
+        // before either was stored.
+        state.peers.write().unwrap()[1].connected_secs = (now() - 100) as u64;
+        let said = super::names_sent(&state).unwrap();
+        assert_eq!(
+            (&said["to_go_since"], &said["carried_to_go_since"]),
+            (&json!(700), &json!(900)),
+            "{said}"
+        );
+        state.peers.write().unwrap()[1].connected_secs = 1;
+        // With the name sent everywhere, nothing that a carry holds
+        // waits.
+        {
+            let conn = db(&state);
+            let team = held_rows::channel_of_name(&conn, "team").unwrap().unwrap();
+            for relay in [relay, [8u8; 32]] {
+                kept_rows::sent(&conn, &relay, &team, i64::MAX / 2).unwrap();
+            }
+        }
+        assert_eq!(
+            names_sent(&state).unwrap(),
+            json!({ "sent": ["team"], "to_go": ["lab"], "carried_to_go": [] })
         );
         // Since when: at a relay, from the later of when the entry was
         // stored and when that relay was last connected (decision

@@ -1238,6 +1238,12 @@ fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
         .lines()
         .find(|line| line.contains("folders stopped syncing on this device"));
     assert!(warned.is_some_and(|line| line.contains("WARN")), "{log}");
+    // The step wrote the scope off itself: the start that follows it
+    // found the scope off, and said nothing of one that was stored on.
+    assert!(
+        !log.contains("what was stored said that everything found on this machine syncs"),
+        "{log}"
+    );
     // The report that the notice was made from is removed: a cycle of
     // this version has stored its own since, or none has run yet.
     let report = meta::get(&conn, meta::SYNC_CLAUDE_REPORT).unwrap();
