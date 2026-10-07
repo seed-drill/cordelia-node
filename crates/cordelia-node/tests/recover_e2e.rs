@@ -739,6 +739,180 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
 }
 
+/// Put in the store of `device`, which is stopped, `count` records of
+/// additions that it signed under the statement it has applied, each of
+/// a key that is nobody's: when it is started it sends them to its
+/// relays, as it sends anything it wrote in its personal channel.
+/// Returns the device's key.
+fn signs_records(device: &Node, count: u16) -> [u8; 32] {
+    use cordelia_crypto::addition::Addition;
+    use cordelia_crypto::entry::{Entry, Inside, Value};
+    use cordelia_crypto::identity::NodeIdentity;
+    use cordelia_crypto::statement::{Device, SignedStatement};
+    let identity = NodeIdentity::from_file(&device.data_dir().join("identity.key")).unwrap();
+    let conn = rusqlite::Connection::open(device.data_dir().join("cordelia.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    let statement: Vec<u8> = conn
+        .query_row("SELECT statement FROM person", [], |row| row.get(0))
+        .unwrap();
+    let statement = SignedStatement::from_bytes(&statement).unwrap().statement;
+    let secret: Vec<u8> = conn
+        .query_row(
+            "SELECT secret FROM person_secrets WHERE left_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let secret: [u8; 32] = secret.try_into().unwrap();
+    let personal = cordelia_crypto::derive::personal_secret(&secret).unwrap();
+    let rev = (statement.number << cordelia_core::protocol::REV_COUNT_BITS) + 1;
+    let now = chrono::Utc::now().timestamp();
+    for n in 0..count {
+        let mut seed = [0x5a; 32];
+        seed[..2].copy_from_slice(&n.to_be_bytes());
+        let key = NodeIdentity::from_seed(seed).unwrap().public_key();
+        let added = Device::new(key, &format!("added {n}")).unwrap();
+        let record = Addition::under(&statement, added, identity.public_key(), now as u64)
+            .unwrap()
+            .sign(&identity)
+            .unwrap();
+        let inside = Inside {
+            name: cordelia_api::person::added_name(&key).unwrap(),
+            value: Value::Other(record.to_bytes().unwrap()),
+            chain: Some(Vec::new()),
+        };
+        let entry = Entry::seal(&personal, &identity, rev, &inside)
+            .unwrap()
+            .check()
+            .unwrap();
+        cordelia_storage::entries::store(&conn, &entry, now).unwrap();
+    }
+    identity.public_key()
+}
+
+/// **One device that counts cannot push the person's other devices out
+/// of a recovery by what it signs** (decision 2026-10-04 §9, step 3). A
+/// change lists the laptop and the desktop. The laptop, which is first in
+/// its list, then signs 300 records of additions: 62 of them count, and
+/// the others do not. The desktop is shown all the same, straight after
+/// the laptop, and asked about: what it wrote comes back.
+///
+/// A record that does not count is shown as that, and nothing is asked
+/// of it: its key is not made a removed key. What could not be shown
+/// beyond the 256 rows is kept as left out on the new machine, and
+/// `cordelia devices` shows each with its key.
+#[test]
+fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() {
+    let relay = relay_started();
+    let mut two = two_devices(&[&relay], None);
+    // A change that lists both, the laptop first.
+    let mut at = renews(&two.laptop, &["stays"], &two.words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&relay, &two.laptop, &two.desktop];
+    wait_for("the desktop applies change 2", &all, 120, || {
+        (person_of(&two.desktop)["change"] == 2).then_some(())
+    });
+    // The desktop writes a file under that change.
+    const SINCE: &str = "written on the desktop since\n";
+    std::fs::write(two.desktop_memory.join("c.md"), SINCE).unwrap();
+    wait_for("the relay was sent everything", &all, 180, || {
+        let there = text_of(&two.desktop, "c.md")? == SINCE;
+        there
+            .then_some(())
+            .and(has_sent_everything(&two.laptop))
+            .and(has_sent_everything(&two.desktop))
+    });
+    two.desktop.stop();
+
+    // The laptop signs 300 records, and the relay is sent each.
+    two.laptop.stop();
+    let laptop_key = signs_records(&two.laptop, 300);
+    two.laptop.start();
+    wait_for("the laptop is up again", &[&relay, &two.laptop], 30, || {
+        healthy(&two.laptop)
+    });
+    wait_for(
+        "the relay holds the records",
+        &[&relay, &two.laptop],
+        180,
+        || {
+            let held: i64 = store_of(&relay)
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE author = ?1",
+                    rusqlite::params![laptop_key.as_slice()],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            (held >= 300).then_some(())
+        },
+    );
+    two.laptop.stop();
+
+    // The laptop may be in someone else's hands, and so may each key
+    // that it added and that counts: 62 of them. The desktop is lost.
+    let new = device_started("new", &relay);
+    let mut answers = vec!["hands", "lost"];
+    answers.extend(std::iter::repeat_n("hands", 62));
+    let mut at = recovers(&new, None, &two.words, &answers);
+    at.says("The change is made (change 3)")
+        .says("The look is made: 1 name read, and ");
+    let said = at.done();
+    println!("{said}");
+    assert!(said.contains("Recovering from change 2."), "{said}");
+    assert!(
+        said.contains("\"desktop\", a device of change 2. It signed "),
+        "{said}"
+    );
+    // Each record that does not count is shown as that, and is asked
+    // nothing: 256 rows in all, of which 64 count.
+    assert_eq!(
+        said.matches("by a record that does not count").count(),
+        192,
+        "{said}"
+    );
+    assert_eq!(
+        said.matches("It is no device: nothing is asked of it")
+            .count(),
+        192,
+        "{said}"
+    );
+    assert!(
+        said.contains("46 more records beyond the 256 that are shown: nothing is asked of those."),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "this machine keeps each as left out: `cordelia devices` shows it with its key"
+        ),
+        "{said}"
+    );
+    // The devices that count are removed, and no other key.
+    assert!(said.contains("removed keys (64):"), "{said}");
+    assert!(!said.contains("Not every answer could be kept"), "{said}");
+
+    // What the desktop wrote comes back.
+    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
+    assert_eq!(text_of(&new, "c.md").as_deref(), Some(SINCE));
+    let seen = person_of(&new);
+    assert_eq!(seen["change"], 3);
+    assert_eq!(seen["removed"].as_array().unwrap().len(), 64);
+    let left_out = seen["left_out"].as_array().unwrap();
+    assert_eq!(left_out.len(), 46, "{left_out:?}");
+    assert!(
+        left_out.iter().all(|kept| kept["key"].is_string()),
+        "{left_out:?}"
+    );
+    let listed = new.cli(&["devices"]);
+    let first = left_out[0]["key"].as_str().unwrap();
+    assert!(
+        listed.contains(&format!(
+            "{first}: the recovery could not show it, and asked nothing of it."
+        )),
+        "{listed}"
+    );
+}
+
 /// A recovery that is cut short, and the one after it (decision
 /// 2026-10-04 §9). The relay has no room for a new channel: it takes the
 /// first machine's change entry, which needs none, and nothing that the

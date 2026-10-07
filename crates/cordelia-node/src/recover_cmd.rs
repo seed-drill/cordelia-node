@@ -16,10 +16,15 @@
 //!    made apart: it shows both lists, asks which to recover from, and
 //!    the statement it makes settles them.
 //! 3. It reads that generation's personal channel and shows every
-//!    device, up to 256, each with the first words of its key's
-//!    fingerprint and how much it signed there, and asks of each one of
-//!    three things: the person still has it, it is lost or broken, or it
-//!    may be in someone else's hands. No answer is suggested.
+//!    device, each with the first words of its key's fingerprint and how
+//!    much it signed there: the statement's devices first, always; then
+//!    the keys added since that count; then the records that do not
+//!    count; 256 rows in all. It says first where the answers could not
+//!    all be kept: a statement has room for 256 removed keys. Of each
+//!    device that counts it asks one of three things: the person still
+//!    has it, it is lost or broken, or it may be in someone else's
+//!    hands. No answer is suggested. A record that does not count is
+//!    shown as that, and nothing is asked of it.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -52,7 +57,9 @@ use cordelia_api::change::{prepare_recovery, read_with};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
-use cordelia_core::protocol::{RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES};
+use cordelia_core::protocol::{
+    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
+};
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
 use cordelia_crypto::{derive, fingerprint, proof};
@@ -92,6 +99,35 @@ Of each, say one of three things. No answer is suggested: each is typed.
            brought back by this recovery, nor what a device that it added wrote. That comes in
            only by `cordelia sync carry <name> --from <device>`, with the phrase, which says
            what it means.";
+
+/// What is said of a record that does not count, in the place of a
+/// question (decision 2026-10-04 §9, step 3).
+const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
+    brought back, and its key is not removed.";
+
+/// What is said before the first question where the answers could not
+/// all be kept (decision 2026-10-04 §9, step 3): a statement has room for
+/// 256 removed keys, and lists every key removed so far.
+fn room_says(room: &recover::Room) -> Option<String> {
+    if room.for_every_answer() {
+        return None;
+    }
+    Some(format!(
+        "\nNot every answer could be kept. A change has room for {MAX_STATEMENT_REMOVED} removed \
+         keys, and lists every key removed so far: {} removed already, and {} asked about \
+         here. At most {} of them can be said to be gone (`lost` or `hands`). Where more are, the \
+         change cannot be made, and nothing is done.",
+        match room.removed {
+            1 => "1 is".to_string(),
+            n => format!("{n} are"),
+        },
+        match room.asked {
+            1 => "1 device is".to_string(),
+            n => format!("{n} devices are"),
+        },
+        room.can_go
+    ))
+}
 
 /// The command that a recovery goes on to when its change is made:
 /// [`recover_made`], in a process of its own.
@@ -262,11 +298,11 @@ fn will_do_lines(
             shown(nothing)
         ));
     }
-    if generation.not_shown > 0 {
+    if !generation.not_shown.is_empty() {
         lines.push(format!(
-            "{} more could not be shown: the look takes nothing from those, and each is in no \
-             list.",
-            counted(generation.not_shown, "record of an addition")
+            "{} more could not be shown: the look takes nothing from those, each is in no list, \
+             and this machine keeps each as left out: `cordelia devices` shows it with its key.",
+            counted(generation.not_shown.len(), "record of an addition")
                 .replace("record of an additions", "records of additions")
         ));
     }
@@ -451,12 +487,24 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          what tells two apart.\n\n{THREE_ANSWERS}",
         statement.number
     );
+    // Before anything is asked: whether the answers could all be kept.
+    let apart_statement = apart.as_ref().map(|other| &other.statement.statement);
+    if let Some(says) = room_says(&recover::room(&statement, apart_statement, rows, &own)) {
+        println!("{says}");
+    }
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
         let says = row_says(rows, at_row, statement.number);
         if rows[at_row].key == own {
             println!("{says}\n  It is this machine: it is the one device of the change.");
             answers.push(Answer::Have);
+            continue;
+        }
+        // A record that does not count is shown as that, and nothing is
+        // asked of it.
+        if !rows[at_row].counts {
+            println!("{says}\n{NOT_ASKED}");
+            answers.push(Answer::NotAsked);
             continue;
         }
         let mut says = says;
@@ -477,11 +525,11 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         }
         answers.push(asks_of(&at, &says)?);
     }
-    if generation.not_shown > 0 {
+    if !generation.not_shown.is_empty() {
         println!(
             "\n{} beyond the {RECOVERY_MAX_DEVICES_SHOWN} that are shown: nothing is asked of \
              those.",
-            counted(generation.not_shown, "more record")
+            counted(generation.not_shown.len(), "more record")
         );
     }
 
@@ -557,19 +605,23 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         left.push(json!({ "number": earlier.number, "secret": hex::encode(earlier.secret) }));
     }
     drop(for_phrase);
+    let key_and_label =
+        |row: &Row| -> Value { json!({ "key": hex::encode(row.key), "label": row.label }) };
     let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
         rows.iter()
             .zip(&answers)
             .filter(|(row, said)| answer(said) && row.key != own)
-            .map(|(row, _)| json!({ "key": hex::encode(row.key), "label": row.label }))
+            .map(|(row, _)| key_and_label(row))
             .collect()
     };
+    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
     let body = json!({
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
-        "gone": labelled(|said| *said != Answer::Have),
+        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
         "still_have": labelled(|said| *said == Answer::Have),
+        "not_shown": not_shown,
         "word": word,
     });
     drop(statement_key);
@@ -843,7 +895,26 @@ fn after_lines(seen: &Value) -> Vec<String> {
             counted(to_go, "name")
         ),
     });
-    let still: Vec<&Value> = list(seen, "left_out").collect();
+    // A key that could not be shown is left out too, and is no device
+    // that the person said they still have.
+    let (not_shown, still): (Vec<&Value>, Vec<&Value>) =
+        list(seen, "left_out").partition(|device| device["key"].is_string());
+    if !not_shown.is_empty() {
+        lines.push(format!(
+            "{} could not be shown, and nothing was asked of {}: `cordelia devices` shows {} \
+             with its key.",
+            counted(not_shown.len(), "record of an addition")
+                .replace("record of an additions", "records of additions"),
+            match not_shown.len() {
+                1 => "it",
+                _ => "them",
+            },
+            match not_shown.len() {
+                1 => "it",
+                _ => "each",
+            }
+        ));
+    }
     if !still.is_empty() {
         lines.push(
             "\nEach device that you still have has stopped, and is added again by hand, with \
@@ -925,6 +996,36 @@ mod tests {
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
     }
 
+    /// Where the answers could not all be kept, that is said before the
+    /// first question (decision 2026-10-04 §9, step 3): a statement has
+    /// room for 256 removed keys. Nothing is said where they could.
+    #[test]
+    fn test_what_is_said_where_not_every_answer_could_be_kept() {
+        let room = |removed: usize, asked: usize| recover::Room {
+            removed,
+            asked,
+            can_go: MAX_STATEMENT_REMOVED - removed,
+        };
+        assert_eq!(room_says(&room(0, 64)), None);
+        assert_eq!(room_says(&room(250, 6)), None);
+        let says = room_says(&room(251, 6)).unwrap();
+        assert!(
+            says.contains(
+                "Not every answer could be kept. A change has room for 256 removed keys, and \
+                 lists every key removed so far: 251 are removed already, and 6 devices are \
+                 asked about here. At most 5 of them can be said to be gone (`lost` or `hands`)."
+            ),
+            "{says}"
+        );
+        let one = room_says(&room(255, 2)).unwrap();
+        assert!(one.contains("At most 1 of them"), "{one}");
+        let full = room_says(&room(256, 1)).unwrap();
+        assert!(
+            full.contains("256 are removed already, and 1 device is asked about here. At most 0"),
+            "{full}"
+        );
+    }
+
     /// What a recovery will do is said before its yes (decision
     /// 2026-10-04 §9): from whom the look takes, and from whom it takes
     /// nothing, with the command that brings what they wrote; the names
@@ -933,7 +1034,7 @@ mod tests {
     fn test_what_a_recovery_will_do_is_said_before_its_yes() {
         let generation = Generation {
             rows: rows(),
-            not_shown: 2,
+            not_shown: vec![row(5, "fifth", Some(1), false), row(6, "", Some(1), false)],
             names: Vec::new(),
             cut_short: None,
         };
@@ -966,7 +1067,8 @@ mod tests {
         assert!(
             all.contains(
                 "2 records of additions more could not be shown: the look takes nothing from \
-                 those, and each is in no list."
+                 those, each is in no list, and this machine keeps each as left out: `cordelia \
+                 devices` shows it with its key."
             ),
             "{all}"
         );
@@ -1084,10 +1186,25 @@ mod tests {
             ],
             "not_reached": ["three"],
             "names": { "to_go": ["a", "b", "c"], "sent": ["d"] },
-            "left_out": [{ "label": "desktop", "words": "w1 w2 w3 w4", "number": 3 }],
+            "left_out": [
+                { "label": "desktop", "words": "w1 w2 w3 w4", "number": 3 },
+                { "label": "added 9", "words": "n1 n2 n3 n4", "number": 3, "key": "cordelia_pk1x" },
+                { "label": "", "words": "m1 m2 m3 m4", "number": 3, "key": "cordelia_pk1y" },
+            ],
         });
         let lines = after_lines(&seen);
         let all = lines.join("\n");
+        // What could not be shown is no device that the person said they
+        // still have: it is said apart, and is not to be added again.
+        assert!(
+            all.contains(
+                "2 records of additions could not be shown, and nothing was asked of them: \
+                 `cordelia devices` shows each with its key."
+            ),
+            "{all}"
+        );
+        assert!(!all.contains("added 9"), "{all}");
+        assert_eq!(all.matches("cordelia add-device <that key>").count(), 1);
         assert_eq!(lines[0], "one holds the change.");
         assert_eq!(
             lines[1],

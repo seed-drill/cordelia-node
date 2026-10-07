@@ -700,10 +700,13 @@ mod tests {
         acts::type_key(&on.conn, &[9; 32], "several", now).unwrap();
         acts::clear_notice(&on.conn, &[8; 32], now).unwrap();
         acts::note_left_out(&on.conn, &[7; 32], "laptop", 1, now).unwrap();
+        crate::look::note_not_shown(&on.conn, &[[7; 32]]).unwrap();
+        assert_eq!(crate::look::not_shown(&on.conn).unwrap(), [[7; 32]]);
         assert!(!on.stored().is_empty());
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         assert!(!on.follows_a_phrase());
+        assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());
         assert_eq!(
             held_rows::change_entry(&on.conn, Kept::Latest).unwrap(),

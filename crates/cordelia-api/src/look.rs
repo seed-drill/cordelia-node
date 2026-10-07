@@ -177,6 +177,11 @@ pub struct LeftOutKey {
     pub words: String,
     /// The number of the statement that left it out.
     pub number: u64,
+    /// Its key, as a key is written, where a recovery left it out
+    /// without showing it (decision 2026-10-04 §9, step 3): a person was
+    /// shown it nowhere else, and nothing was asked of it. `None` for a
+    /// key that was shown.
+    pub key: Option<String>,
 }
 
 /// A statement's two lists, as a device that can read it shows them.
@@ -523,15 +528,21 @@ fn of_its_person(
         });
     }
 
+    let never_shown = not_shown(conn)?;
     for shown in acts::left_out(conn)? {
         // One whose notice a person cleared is shown no more.
         if shown.cleared_at.is_some() {
             continue;
         }
+        let key = match never_shown.contains(&shown.key) {
+            true => Some(Shown::of(&shown.key, "")?.key),
+            false => None,
+        };
         look.left_out.push(LeftOutKey {
             label: shown.label,
             words: fingerprint::shown(&shown.key),
             number: shown.number,
+            key,
         });
     }
 
@@ -791,6 +802,35 @@ pub(crate) fn note_removed_labels(
     let as_kept = serde_json::to_string(&as_kept)
         .map_err(|e| PersonError::Held(format!("the labels of the removed keys: {e}")))?;
     meta::set(conn, meta::PERSON_REMOVED_LABELS, &as_kept)?;
+    Ok(())
+}
+
+/// The keys that a recovery made on this machine left out without
+/// showing them (decision 2026-10-04 §9, step 3), as it noted them
+/// ([`note_not_shown`]).
+pub fn not_shown(conn: &Connection) -> Result<Vec<[u8; 32]>, PersonError> {
+    let kept: Vec<String> = meta::get(conn, meta::PERSON_NOT_SHOWN)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default();
+    Ok(kept
+        .iter()
+        .filter_map(|key| hex::decode(key).ok()?.try_into().ok())
+        .collect())
+}
+
+/// Note the keys that the recovery which was just made on this machine
+/// left out without showing them (decision 2026-10-04 §9, step 3), so
+/// that `cordelia devices` shows each with its key: a person was shown
+/// it nowhere else. What was noted before is replaced.
+pub(crate) fn note_not_shown(conn: &Connection, keys: &[[u8; 32]]) -> Result<(), PersonError> {
+    if keys.is_empty() {
+        meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
+        return Ok(());
+    }
+    let as_kept: Vec<String> = keys.iter().map(hex::encode).collect();
+    let as_kept = serde_json::to_string(&as_kept)
+        .map_err(|e| PersonError::Held(format!("the keys that were not shown: {e}")))?;
+    meta::set(conn, meta::PERSON_NOT_SHOWN, &as_kept)?;
     Ok(())
 }
 
@@ -1135,11 +1175,22 @@ fn told(
     let shown_left_out = acts::left_out(conn)?
         .into_iter()
         .filter(|shown| shown.cleared_at.is_none());
+    let never_shown = not_shown(conn)?;
     for shown in shown_left_out {
-        let says = format!(
-            "{} is not in the last change: add it again, or it was meant to go",
-            Shown::of(&shown.key, &shown.label)?.named()
-        );
+        let of_it = Shown::of(&shown.key, &shown.label)?;
+        let says = match never_shown.contains(&shown.key) {
+            false => format!(
+                "{} is not in the last change: add it again, or it was meant to go",
+                of_it.named()
+            ),
+            // A row that the recovery could not show: its key is said,
+            // since a person was shown it nowhere else (§9, step 3).
+            true => format!(
+                "{} is not in the last change, and the recovery could not show it or ask                  about it: its key is {}",
+                of_it.named(),
+                of_it.key
+            ),
+        };
         all.push(tell(
             left_out_notice(&shown.key),
             "left_out",
