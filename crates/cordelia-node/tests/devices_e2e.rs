@@ -3073,12 +3073,19 @@ fn swarm_key_files(n: &Node) -> Vec<String> {
 /// for itself each time it started, up to 0.2.0-alpha.7, as that version
 /// made it: its row, the node as its owner, and its key file. Its ID
 /// holds the node's entity ID. Returns the ID.
+///
+/// A database of this version refuses a new row of the older kind, from
+/// its first start on (decision 2026-10-04 §10.1). Where the node has
+/// started, the test takes that guard away first: it puts the row where
+/// nothing of this version would.
 fn swarm_channel_as_an_earlier_version_made_it(n: &Node) -> String {
     let id = cordelia_storage::naming::swarm_channel_id(&entity_id(n));
     let pk = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
     let psk = cordelia_crypto::generate_psk().unwrap();
     let now = "2026-10-01T00:00:00+00:00";
     let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    cordelia_storage::first_start::remove_guard(&db).unwrap();
     db.execute(
         "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
          VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
