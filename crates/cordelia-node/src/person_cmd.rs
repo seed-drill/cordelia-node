@@ -73,7 +73,7 @@ Without the phrase a device can be added, and none can ever be removed or recove
 Nobody else holds it, and this device does not keep it: it is shown once, now.";
 
 /// What is said where a person did not say yes.
-const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
+pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
 
 /// How often the node is asked while a command waits for something to
 /// come about.
@@ -85,7 +85,7 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 const ACCEPT_STAYS: Duration = Duration::from_secs(60);
 
 /// How often a mistyped phrase may be typed again at one prompt.
-const PHRASE_TRIES: usize = 3;
+pub(crate) const PHRASE_TRIES: usize = 3;
 
 /// How often the node is asked again whether it made what a command
 /// handed it, where its answer was lost: once every [`ASK_EVERY`].
@@ -99,7 +99,7 @@ const ASKS_AGAIN: usize = 10;
 /// Refused where what answered says nothing of where the device stands
 /// (it has no `state`): that is no look of a node of this version, and
 /// nothing is read from it (decision 2026-10-04 §16).
-fn look(config_path: &str) -> anyhow::Result<Value> {
+pub(crate) fn look(config_path: &str) -> anyhow::Result<Value> {
     let seen = api_post(config_path, "/api/v1/devices/list", json!({}))?;
     if seen["state"].as_str().is_none() {
         anyhow::bail!(
@@ -111,7 +111,7 @@ fn look(config_path: &str) -> anyhow::Result<Value> {
     Ok(seen)
 }
 
-fn text<'a>(value: &'a Value, field: &str) -> &'a str {
+pub(crate) fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field].as_str().unwrap_or_default()
 }
 
@@ -143,7 +143,7 @@ fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
     false
 }
 
-fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
+pub(crate) fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
     value[field].as_array().into_iter().flatten()
 }
 
@@ -152,7 +152,7 @@ fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
 /// It is cut where a name is cut, and its control characters and the
 /// marks that change the direction of text are shown as escapes, as
 /// local history prints names.
-fn file_shown(name: &str) -> String {
+pub(crate) fn file_shown(name: &str) -> String {
     crate::history_cmd::printable(&cordelia_api::look::name_shown(name))
 }
 
@@ -167,7 +167,7 @@ fn is_own(device: &Value, own: &[u8; 32]) -> bool {
 /// (decision 2026-10-04 §16). What a command shows as this device, signs
 /// for and prints is this, and never the node's word of it: whatever
 /// answers at the node's address could otherwise name a key of its own.
-fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
     let mut config = Config::load(&config::expand_tilde(config_path))?;
     config.apply_env_overrides();
     let key_path = config.data_dir().join(cordelia_api::commands::KEY_FILE);
@@ -180,7 +180,7 @@ fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
 /// Refuse where `answer`, which the node gave, names another key as this
 /// device than `own`, the key in this device's key file (decision
 /// 2026-10-04 §16). An answer that names none is refused likewise.
-fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
+pub(crate) fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
     if decode_public_key(text(answer, "this_device")).ok() == Some(*own) {
         return Ok(());
     }
@@ -202,7 +202,7 @@ fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
 /// words where a person looks for the real ones. Quoted, with whatever
 /// would end the quotes marked, it cannot pass for anything that this
 /// command says itself.
-fn named(label: &str, key: &[u8; 32]) -> String {
+pub(crate) fn named(label: &str, key: &[u8; 32]) -> String {
     words_then(&fingerprint::shown(key), label)
 }
 
@@ -212,7 +212,7 @@ fn shown(device: &Value) -> String {
 }
 
 /// The words of a key's fingerprint, and then its label, quoted.
-fn words_then(words: &str, label: &str) -> String {
+pub(crate) fn words_then(words: &str, label: &str) -> String {
     match label.is_empty() {
         true => format!("the device ({words})"),
         false => format!("({words}) {label:?}"),
@@ -220,7 +220,7 @@ fn words_then(words: &str, label: &str) -> String {
 }
 
 /// A time in seconds, as a person reads it.
-fn time_of(at: u64) -> String {
+pub(crate) fn time_of(at: u64) -> String {
     i64::try_from(at)
         .ok()
         .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
@@ -230,7 +230,7 @@ fn time_of(at: u64) -> String {
 
 /// The name that this machine goes by, for the label of a device that a
 /// person gave none.
-fn default_label() -> String {
+pub(crate) fn default_label() -> String {
     #[cfg(unix)]
     let host = rustix::system::uname()
         .nodename()
@@ -254,7 +254,7 @@ fn default_label() -> String {
 
 /// An entry, from the hex of its bytes, checked as whatever a device is
 /// given is checked.
-fn entry_of(hex_bytes: &str) -> anyhow::Result<CheckedEntry> {
+pub(crate) fn entry_of(hex_bytes: &str) -> anyhow::Result<CheckedEntry> {
     Ok(Entry::from_wire(&hex::decode(hex_bytes)?)?.check()?)
 }
 
@@ -890,7 +890,7 @@ fn names_lines(seen: &Value) -> Vec<String> {
 }
 
 /// A count with its noun: `1 name`, `3 names`.
-fn counted(n: usize, noun: &str) -> String {
+pub(crate) fn counted(n: usize, noun: &str) -> String {
     match n {
         1 => format!("1 {noun}"),
         n => format!("{n} {noun}s"),
@@ -1598,7 +1598,18 @@ const REFUSES_THE_KEY: &str = "refuse";
 ///
 /// The change then goes on as any removal: the key is among the removed
 /// keys of the statement that is shown, before the yes and the phrase.
+///
+/// **A key that is no device's key at all is refused** (decision
+/// 2026-10-04 §2.2): a point under which anyone can sign, and to which
+/// nothing can be sealed, is added by nothing, so there is nothing of it
+/// to refuse, and no statement lists it.
 fn refuses_a_key_it_does_not_know(at: &Terminal, goes: &[u8; 32]) -> anyhow::Result<()> {
+    if !cordelia_crypto::identity::is_usable_public_key(goes) {
+        anyhow::bail!(
+            "that key is no device's key, and no device of yours: nothing is added under it, \
+             so there is nothing to refuse. Nothing was done."
+        );
+    }
     println!(
         "\nThe key ({}) {NO_DEVICE_IT_KNOWS}",
         fingerprint::shown(goes)
