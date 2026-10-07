@@ -1995,11 +1995,24 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
             }
         }
     }
-    api_post(config_path, "/api/v1/devices/forget", json!({}))?;
-
-    // The new key, in the place of the old one.
+    // The new key is written beside the old one first, then the node
+    // forgets, and only then does the new key take the old one's place:
+    // a device never has a node that has forgotten and no new key on the
+    // disk to go on with.
     let identity = NodeIdentity::generate()?;
-    replace_key_file(&key_path, identity.seed())?;
+    give_new_key(&key_path, identity.seed(), || {
+        let asked = api_post_told(
+            config_path,
+            "/api/v1/devices/forget",
+            json!({}),
+            Some(Duration::from_secs(30)),
+        );
+        match asked {
+            Ok(Told::Yes(_)) => Forgot::Yes,
+            Ok(Told::No { message, .. }) => Forgot::No(message),
+            Err(lost) => Forgot::NotKnown(lost.to_string()),
+        }
+    })?;
     let key = encode_public_key(&identity.public_key())?;
     let was = written.identity.entity_id.clone();
     let name = was.rsplit_once('_').map_or(was.as_str(), |(name, _)| name);
@@ -2018,39 +2031,77 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Put `seed` in the place of the key file at `path` (decision 2026-10-04
-/// §16): it is written to a file beside it, flushed, and renamed over it,
-/// so that the key file holds the old key or the new one, whole, whatever
-/// stops the command between. The file is the device's alone to read from
-/// the moment it is made. Where it cannot be written, the device keeps
-/// the key it had.
-fn replace_key_file(path: &std::path::Path, seed: &[u8; 32]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut beside = path.as_os_str().to_owned();
-    beside.push(".new");
-    let beside = std::path::PathBuf::from(beside);
-    // Made anew each time: never written through whatever was left under
-    // that name.
-    let _ = std::fs::remove_file(&beside);
-    let mut made = std::fs::OpenOptions::new();
-    made.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        made.mode(0o600);
-    }
-    let written = made
-        .open(&beside)
-        .and_then(|mut file| {
-            file.write_all(seed)?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&beside, path));
-    if let Err(e) = written {
+/// What the node answered when it was asked to forget what it holds of
+/// its person.
+enum Forgot {
+    /// It forgot.
+    Yes,
+    /// It refused, and says why: it holds what it held.
+    No(String),
+    /// Its answer was lost: it may have forgotten.
+    NotKnown(String),
+}
+
+/// Give the device whose key file is at `path` the key of `seed`, in
+/// three steps, and say what state the device is in where any of them
+/// fails (decision 2026-10-04 §5.2, §16):
+///
+/// 1. **the new key is written beside the old one** ([`write_beside`]).
+///    Where that fails nothing was changed;
+/// 2. **the node forgets** what it holds of its person (`forget`). Where
+///    it refuses, the device keeps its key and what it holds; where its
+///    answer is lost, the device keeps its key, and `cordelia devices`
+///    says whether the node forgot;
+/// 3. **the new key takes the old one's place,** by a rename, so that the
+///    key file holds the old key or the new one, whole. Where that fails
+///    the node has forgotten and the device keeps the key it had: it
+///    follows no phrase, and the command is run again.
+///
+/// The node forgets only once the new key is on the disk: a device is
+/// never left with a node that has forgotten and no new key to take.
+/// What was written beside the key file is removed wherever the new key
+/// does not take its place.
+fn give_new_key(
+    path: &std::path::Path,
+    seed: &[u8; 32],
+    forget: impl FnOnce() -> Forgot,
+) -> anyhow::Result<()> {
+    let beside = write_beside(path, seed).map_err(|e| {
+        anyhow::anyhow!(
+            "could not write the new key ({e}): nothing was changed. The key file is as it \
+             was, and this device keeps the key it had and what it holds of your devices."
+        )
+    })?;
+    let discarded = || {
         let _ = std::fs::remove_file(&beside);
+    };
+    match forget() {
+        Forgot::Yes => {}
+        Forgot::No(why) => {
+            discarded();
+            anyhow::bail!(
+                "{why}\nThe node did not forget what it holds of your devices, and the new key \
+                 was discarded: this device keeps the key it had and what it holds. Where it \
+                 said that it left, that word stands. Run `cordelia init --new-key` again."
+            );
+        }
+        Forgot::NotKnown(why) => {
+            discarded();
+            anyhow::bail!(
+                "{why}\nIt is not known whether the node forgot what it holds of your devices: \
+                 its answer was lost. The new key was discarded, and this device keeps the key \
+                 it had. `cordelia devices` says where it stands: if it follows no recovery \
+                 phrase, the node has forgotten. Either way, run `cordelia init --new-key` \
+                 again to give it a new key."
+            );
+        }
+    }
+    if let Err(e) = std::fs::rename(&beside, path) {
+        discarded();
         anyhow::bail!(
-            "could not write the new key ({e}): the key file is as it was, and this device \
-             keeps the key it had."
+            "the node has forgotten what it held of your devices, and the new key could not be \
+             put in the place of the old one ({e}): this device keeps the key it had, and \
+             follows no recovery phrase. Run `cordelia init --new-key` again."
         );
     }
     // The name is flushed too, as far as the volume can.
@@ -2060,6 +2111,35 @@ fn replace_key_file(path: &std::path::Path, seed: &[u8; 32]) -> anyhow::Result<(
         let _ = folder.sync_all();
     }
     Ok(())
+}
+
+/// Write `seed` to a file beside the key file at `path`, flushed, and
+/// return where (decision 2026-10-04 §16). The file is the device's alone
+/// to read from the moment it is made, and is made anew each time: never
+/// written through whatever was left under that name. Where it cannot be
+/// written, nothing is left beside the key file.
+fn write_beside(path: &std::path::Path, seed: &[u8; 32]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = std::path::PathBuf::from(beside);
+    let _ = std::fs::remove_file(&beside);
+    let mut made = std::fs::OpenOptions::new();
+    made.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        made.mode(0o600);
+    }
+    let written = made.open(&beside).and_then(|mut file| {
+        file.write_all(seed)?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&beside);
+        return Err(e);
+    }
+    Ok(beside)
 }
 
 #[cfg(test)]
@@ -2522,7 +2602,7 @@ mod tests {
         std::fs::write(&path, [1u8; 32]).unwrap();
         // What an earlier run left beside it is not written through.
         std::fs::write(&beside, b"left by a run that was stopped").unwrap();
-        replace_key_file(&path, &[2u8; 32]).unwrap();
+        give_new_key(&path, &[2u8; 32], || Forgot::Yes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32]);
         assert!(!beside.exists());
         #[cfg(unix)]
@@ -2538,18 +2618,103 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             let before = std::fs::metadata(&path).unwrap().ino();
             let kept_open = std::fs::File::open(&path).unwrap();
-            replace_key_file(&path, &[3u8; 32]).unwrap();
+            give_new_key(&path, &[3u8; 32], || Forgot::Yes).unwrap();
             assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
             let mut still = Vec::new();
             std::io::Read::read_to_end(&mut &kept_open, &mut still).unwrap();
             assert_eq!(still, [2u8; 32], "the old file was written into");
         }
-        // Where the folder is gone, nothing is written, and it says so.
+    }
+
+    /// `cordelia init --new-key` writes the new key beside the old one
+    /// first, then has the node forget, and only then puts the new key in
+    /// the old one's place (decision 2026-10-04 §5.2, §16). Where any of
+    /// the three fails it says what state the device is in, and nothing
+    /// is left beside the key file.
+    #[test]
+    fn a_new_key_is_on_the_disk_before_the_node_forgets_and_each_failure_says_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let beside = dir.path().join("identity.key.new");
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        let as_it_was = || {
+            assert_eq!(std::fs::read(&path).unwrap(), [1u8; 32]);
+            assert!(!beside.exists(), "something was left beside the key file");
+        };
+
+        // When the node is asked to forget, the new key is on the disk
+        // beside the old one, whole, and the key file is the old one.
+        let asked = std::cell::Cell::new(0);
+        give_new_key(&path, &[2u8; 32], || {
+            asked.set(asked.get() + 1);
+            assert_eq!(std::fs::read(&beside).unwrap(), [2u8; 32]);
+            assert_eq!(std::fs::read(&path).unwrap(), [1u8; 32]);
+            Forgot::Yes
+        })
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32]);
+        assert!(!beside.exists());
+        std::fs::write(&path, [1u8; 32]).unwrap();
+
+        // The new key cannot be written: the node is not asked to forget,
+        // and nothing was changed.
         let nowhere = dir.path().join("no-such-folder").join("identity.key");
-        let refused = replace_key_file(&nowhere, &[4u8; 32])
+        let refused = give_new_key(&nowhere, &[4u8; 32], || {
+            panic!("the node was asked to forget before the new key was written")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("could not write the new key"), "{refused}");
+        assert!(refused.contains("nothing was changed"), "{refused}");
+        assert!(refused.contains("keeps the key it had"), "{refused}");
+
+        // The node refuses to forget: the device keeps its key and what
+        // it holds.
+        let refused = give_new_key(&path, &[2u8; 32], || Forgot::No("the node is busy".into()))
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("keeps the key it had"), "{refused}");
+        assert!(refused.starts_with("the node is busy\n"), "{refused}");
+        assert!(
+            refused.contains("keeps the key it had and what it holds"),
+            "{refused}"
+        );
+        as_it_was();
+
+        // The node's answer is lost: the device keeps its key, and is
+        // told where to look.
+        let lost = give_new_key(&path, &[2u8; 32], || {
+            Forgot::NotKnown("the answer was lost".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(lost.starts_with("the answer was lost\n"), "{lost}");
+        assert!(
+            lost.contains("It is not known whether the node forgot"),
+            "{lost}"
+        );
+        assert!(lost.contains("`cordelia devices` says"), "{lost}");
+        as_it_was();
+
+        // The node forgot, and the new key cannot take the old one's
+        // place: where the key file is, there is a folder that holds
+        // something.
+        let folder = dir.path().join("a-folder.key");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("held"), "x").unwrap();
+        let not_placed = give_new_key(&folder, &[2u8; 32], || Forgot::Yes)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            not_placed.contains("the node has forgotten what it held"),
+            "{not_placed}"
+        );
+        assert!(
+            not_placed.contains("keeps the key it had, and follows no recovery phrase"),
+            "{not_placed}"
+        );
+        assert!(!dir.path().join("a-folder.key.new").exists());
+        assert!(folder.join("held").exists());
     }
 
     /// The command that a change goes on to is one that this program
