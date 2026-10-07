@@ -127,8 +127,8 @@ pub enum PersonError {
     SyncIsOn,
 
     #[error(
-        "this device keeps 8 keys that were typed at `cordelia accept`, and a ninth is refused: \
-         each is kept for a day from when it was typed."
+        "8 keys that were typed at `cordelia accept` are within their hour on this device, and \
+         a ninth is refused: each holds its place for an hour from when it was typed."
     )]
     TooManyTypedKeys,
 

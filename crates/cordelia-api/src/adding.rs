@@ -2166,10 +2166,14 @@ mod tests {
         for n in 0..8 {
             types(n, now + i64::from(n)).unwrap();
         }
-        assert!(matches!(
-            types(8, now + 8),
-            Err(PersonError::TooManyTypedKeys)
-        ));
+        let refused = types(8, now + 8).unwrap_err();
+        assert!(matches!(refused, PersonError::TooManyTypedKeys));
+        assert!(
+            refused
+                .to_string()
+                .contains("each holds its place for an hour from when it was typed"),
+            "{refused}"
+        );
         assert_eq!(kept(), 8);
         assert_eq!(acts::typed_key(&on.conn, &key(8)).unwrap(), None);
         // One of the eight, typed again.
