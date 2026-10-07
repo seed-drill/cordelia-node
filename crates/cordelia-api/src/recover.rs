@@ -74,6 +74,8 @@ use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::statement::SignedStatement;
 use cordelia_storage::acts;
+use cordelia_storage::at_relays as kept_rows;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, Kept, Person, State};
 
 use crate::carry::{self, Allows, Rule, Tally, Word};
@@ -653,6 +655,10 @@ pub fn follow(
             for name in &to_look.names {
                 names::hold_for_a_carry(conn, identity, name, at)?;
             }
+            // What this machine carries, it carries by the look: until
+            // that has ended it does not write that it has sent what it
+            // carried (§8).
+            meta::set(conn, meta::PERSON_LOOK_PENDING, "1")?;
             Ok(applied.number)
         })
     })?;
@@ -755,6 +761,11 @@ pub async fn progress(
 /// to their end; and, for each removed key, how many versions that key
 /// signed in what was read that the new channels lack, with the names
 /// they are in.
+///
+/// **When it has ended, what the store has taken is what this machine
+/// carried:** it is sent as what a device carries is sent, and only then
+/// may the machine come to write that it has sent what it carried
+/// ([`crate::at_relays::say_sent`]).
 pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_json::Value {
     let first = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     commands::fetch(state, true, first).await;
@@ -885,6 +896,20 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
         "failed": failed,
         "lacking": lacking,
     });
+    // The look has ended: what the store has taken up to here is what
+    // this machine carried, and it may now come to say that it has sent
+    // it (§7.3, §8).
+    {
+        let conn = db(state);
+        let ended = in_one(&conn, || {
+            kept_rows::carried_to_here(&conn)?;
+            meta::remove(&conn, meta::PERSON_LOOK_PENDING)?;
+            Ok(())
+        });
+        if let Err(e) = ended {
+            tracing::warn!("the look of a recovery could not be noted as ended: {e}");
+        }
+    }
     state.own_channels.set_look(found.clone());
     state.own_channels.written();
     found
@@ -1579,6 +1604,30 @@ mod tests {
             Err(PersonError::FollowsAPhrase)
         ));
 
+        // Until the look has ended, the machine does not write that it
+        // has sent what it carried, though nothing waits at its relay:
+        // what it carries, it carries by the look.
+        let relay = [7u8; 32];
+        let sent_everything = |node: &Node| {
+            let conn = db(&node.state);
+            let far = i64::MAX / 2;
+            for channel in crate::at_relays::channels(&conn, &node.state.identity).unwrap() {
+                kept_rows::sent(&conn, &relay, &channel.id, far).unwrap();
+                kept_rows::carried(&conn, &relay, &channel.id, far).unwrap();
+            }
+        };
+        let says_sent = |node: &Node| {
+            let conn = db(&node.state);
+            crate::at_relays::say_sent(&conn, &node.state.identity, &[relay], now()).unwrap()
+        };
+        sent_everything(&node);
+        assert!(
+            meta::get(&db(&node.state), meta::PERSON_LOOK_PENDING)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!says_sent(&node));
+
         // The look. The change entry goes first: the node is asked for
         // a whole pass, which shows it to every relay, and nothing is
         // read at a relay before that pass has been made.
@@ -1620,6 +1669,30 @@ mod tests {
             chain[0],
             cordelia_crypto::entry::Link::of(&text("of device 0"), k0)
         );
+
+        // The look has ended: what it brought in is what this machine
+        // carried, and waits to be sent as that. Once it is sent, the
+        // machine writes that it has sent what it carried.
+        assert_eq!(
+            meta::get(&db(&node.state), meta::PERSON_LOOK_PENDING).unwrap(),
+            None
+        );
+        {
+            let conn = db(&node.state);
+            let other_relay = [8u8; 32];
+            let waits =
+                crate::at_relays::carried_waits_at(&conn, &node.state.identity, &other_relay);
+            assert!(waits.unwrap());
+            let lab = held_rows::channel_of_name(&conn, LAB).unwrap().unwrap();
+            let last = cordelia_storage::entries::channel_entries_after(&conn, &lab, 0, 100)
+                .unwrap()
+                .iter()
+                .map(|held| held.seq)
+                .max()
+                .unwrap();
+            assert!(kept_rows::carried_up_to(&conn).unwrap() >= last);
+        }
+        assert!(says_sent(&node));
 
         // What the other device wrote comes in by the command that names
         // its key, with the phrase: by the label it was shown by.
@@ -1822,6 +1895,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(firsts["keys"][0]["key"], hex::encode(first_key));
+    }
+
+    /// A recovery whose look was interrupted was cut short (decision
+    /// 2026-10-04 §8, §9): the machine never writes, under that
+    /// statement, that it has sent what it carried, however much it has
+    /// sent. Under a later statement it carries what it holds as any
+    /// device does, and says so as any device does.
+    #[actix_web::test]
+    async fn test_a_machine_whose_look_was_interrupted_never_says_that_it_sent() {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let node = new_machine(9, &gone);
+        let made = makes(
+            &node,
+            &from,
+            &gone.at_the_relay[1].1,
+            &[Answer::Lost, Answer::Lost],
+        );
+        follows(&node, &made).unwrap();
+        // No look is made: the node was stopped. Everything that the
+        // machine holds is sent to its relay.
+        let relay = [7u8; 32];
+        let conn = db(&node.state);
+        let identity = &node.state.identity;
+        let sent_everything = || {
+            let far = i64::MAX / 2;
+            for channel in crate::at_relays::channels(&conn, identity).unwrap() {
+                kept_rows::sent(&conn, &relay, &channel.id, far).unwrap();
+                kept_rows::carried(&conn, &relay, &channel.id, far).unwrap();
+            }
+        };
+        sent_everything();
+        assert!(!crate::at_relays::say_sent(&conn, identity, &[relay], now()).unwrap());
+        assert!(
+            meta::get(&conn, meta::PERSON_LOOK_PENDING)
+                .unwrap()
+                .is_some()
+        );
+
+        // A later change, made on this machine.
+        let held = person::held(&conn).unwrap().unwrap();
+        let entry = make_change(
+            &phrase(),
+            &held.statement,
+            &person::latest_entry(&conn).unwrap(),
+            &identity.public_key(),
+            held.statement.statement.devices.clone(),
+            &[],
+        )
+        .unwrap();
+        let shown = person::shown(&conn, identity, &entry, now()).unwrap();
+        assert!(matches!(shown, person::Shown::Applied(_)), "{shown:?}");
+        assert_eq!(meta::get(&conn, meta::PERSON_LOOK_PENDING).unwrap(), None);
+        sent_everything();
+        assert!(crate::at_relays::say_sent(&conn, identity, &[relay], now()).unwrap());
     }
 
     /// A machine that was recovered from, and that had written that it

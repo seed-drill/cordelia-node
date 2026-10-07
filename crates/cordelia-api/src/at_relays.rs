@@ -79,6 +79,7 @@ use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::version;
 use cordelia_storage::at_relays::{self as kept_rows};
 use cordelia_storage::entries;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, State};
 use cordelia_storage::relay::{Mark, NO_MARK};
 
@@ -594,6 +595,11 @@ pub fn carried_waits_at(
 /// waits at any of them ([`carried_waits_at`]). With no relay nothing is
 /// sent, and nothing is said. Nor is anything said twice, or by a device
 /// that has stopped.
+///
+/// **A machine that recovered says nothing until its look has ended**
+/// (§9): what it carries, it carries by that look. Where the look was
+/// interrupted it never says so under that statement, and the recovery
+/// that follows says that this one was cut short.
 pub fn say_sent(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -602,6 +608,11 @@ pub fn say_sent(
 ) -> Result<bool, PersonError> {
     in_one(conn, || {
         if relays.is_empty() || stands(conn)? != Stands::Applied {
+            return Ok(false);
+        }
+        // A machine that recovered has not carried what it takes until
+        // its look has ended (§9): it says nothing before that.
+        if meta::get(conn, meta::PERSON_LOOK_PENDING)?.is_some() {
             return Ok(false);
         }
         let standing = Standing::to_write(conn)?;

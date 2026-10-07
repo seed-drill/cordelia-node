@@ -78,6 +78,7 @@ use cordelia_crypto::version::{self, Version};
 use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries::{self, Outcome};
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
 use cordelia_storage::sync_state;
 
@@ -1462,6 +1463,9 @@ fn come_to(
         statement.removed.iter().any(|key| !had.removes(key))
     });
     crate::look::note_removed_a_key(conn, removes_a_key)?;
+    // The look of a recovery was of the statement that is left: under
+    // this one the device carried what it holds, in this transaction.
+    meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     // A name that a device lists in the generation it has come to, or
     // that it left 90 days ago, is noted no more.
     held_rows::forget_names_before(conn, Some(now))?;

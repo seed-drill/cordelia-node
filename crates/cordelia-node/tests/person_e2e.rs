@@ -1996,9 +1996,18 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
     let mut bytes_searched = 0;
     for (what, bytes) in &searched {
         bytes_searched += bytes.len();
-        let found = words_in(bytes);
-        for word in &phrase_words {
-            assert!(!found.contains(*word), "the word {word:?} is in {what}");
+        // The terminal shows the first words of keys' fingerprints,
+        // which are from the list that a phrase's words are from: one
+        // of them can be a word of the phrase by chance, and two in a
+        // row cannot.
+        if what == "what the terminal showed" {
+            let two = two_words_in_a_row(bytes, &phrase_words);
+            assert_eq!(two, None, "two words of the phrase are in {what}");
+        } else {
+            let found = words_in(bytes);
+            for word in &phrase_words {
+                assert!(!found.contains(*word), "the word {word:?} is in {what}");
+            }
         }
         let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
         for secret in &only_the_phrases {

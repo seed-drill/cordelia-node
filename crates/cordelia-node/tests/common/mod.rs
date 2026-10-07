@@ -1273,3 +1273,25 @@ pub fn words_in(bytes: &[u8]) -> std::collections::HashSet<String> {
         .map(|word| String::from_utf8_lossy(word).to_lowercase())
         .collect()
 }
+
+/// Two words of `phrase` that follow one another there and stand one
+/// after the other in `bytes`, where there are two.
+///
+/// It is what is asked of what a terminal showed: the terminal shows the
+/// first words of keys' fingerprints, which are from the list that a
+/// phrase's words are from, and one of them can be a word of the phrase
+/// by chance. Two in a row are not.
+pub fn two_words_in_a_row(bytes: &[u8], phrase: &[&str]) -> Option<(String, String)> {
+    let said: Vec<String> = bytes
+        .split(|byte| !byte.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).to_lowercase())
+        .collect();
+    said.windows(2)
+        .find(|pair| {
+            phrase
+                .windows(2)
+                .any(|two| two[0] == pair[0] && two[1] == pair[1])
+        })
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+}

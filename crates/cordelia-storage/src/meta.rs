@@ -70,6 +70,14 @@ pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
 /// device leaves its phrase.
 pub const PERSON_NAMES_CARRIED: &str = "person.names_carried";
 
+/// Whether the look of a recovery that was made on this machine has not
+/// ended (decision 2026-10-04 §8, §9): it is set where the recovery's
+/// statement is applied, and goes when the look has carried what it
+/// takes. While it is set the machine does not write that it has sent
+/// what it carried: a recovery whose look was interrupted was cut short,
+/// and the next recovery says so.
+pub const PERSON_LOOK_PENDING: &str = "person.look_pending";
+
 /// JSON object of what this device called each key that a statement it
 /// applied removed, by the key in hex (decision 2026-10-04 §7.3): a
 /// statement lists removed keys bare, and a person names one by its
