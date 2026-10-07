@@ -9,6 +9,11 @@ use crate::StorageError;
 /// Current schema version (incremented per migration).
 pub const SCHEMA_VERSION: u32 = 18;
 
+/// The schema version of the released version of the program
+/// (0.2.0-alpha.8): the last before the entries of a channel from its
+/// secret.
+pub const RELEASED_SCHEMA_VERSION: u32 = 10;
+
 /// Migration v1: Phase 1 initial schema.
 ///
 /// All DDL from data-formats.md §3.1-§3.5.
@@ -693,6 +698,20 @@ fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), Stor
 
 /// Initialise the database: set pragmas and run pending migrations.
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
+    run_steps(conn, SCHEMA_VERSION)
+}
+
+/// Initialise a database as the released version of the program does:
+/// its pragmas, and the schema's steps up to that version's
+/// ([`RELEASED_SCHEMA_VERSION`]) and none after. For a test of what this
+/// version does with a database of that one (decision 2026-10-04 §10.1).
+pub fn init_db_as_released(conn: &Connection) -> Result<(), StorageError> {
+    run_steps(conn, RELEASED_SCHEMA_VERSION)
+}
+
+/// Set the pragmas, and run the steps that the database has not had, up
+/// to version `up_to`: this schema's, or the released version's.
+fn run_steps(conn: &Connection, up_to: u32) -> Result<(), StorageError> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;",
@@ -764,6 +783,10 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     if current < 10 {
         tracing::info!("applying migration v10 (the lines of memories deleted here)");
         migrate_in_one(conn, MIGRATION_V10, 10)?;
+    }
+
+    if up_to <= RELEASED_SCHEMA_VERSION {
+        return Ok(());
     }
 
     if current < 11 {
@@ -881,6 +904,42 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A database as the released version leaves it is at that version's
+    /// schema, with its tables and none of a later step's; opened as this
+    /// version opens any, it is stepped the rest of the way (decision
+    /// 2026-10-04 §10.1).
+    #[test]
+    fn test_a_database_as_released_is_stepped_no_further_than_the_released_version() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has = |conn: &Connection, table: &str| -> bool {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_as_released(&conn).unwrap();
+        assert_eq!(version(&conn), RELEASED_SCHEMA_VERSION);
+        assert_eq!(RELEASED_SCHEMA_VERSION, 10);
+        assert!(has(&conn, "index_lines") && has(&conn, "channels"));
+        assert!(!has(&conn, "entries") && !has(&conn, "person"));
+        // Again: nothing more.
+        init_db_as_released(&conn).unwrap();
+        assert_eq!(version(&conn), RELEASED_SCHEMA_VERSION);
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert!(has(&conn, "entries") && has(&conn, "person"));
+        // A database that is further on is left where it is.
+        init_db_as_released(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
     }
 
     #[test]

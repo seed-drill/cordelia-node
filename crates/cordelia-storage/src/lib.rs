@@ -8,6 +8,7 @@ pub mod atomic;
 pub mod channels;
 pub mod db;
 pub mod entries;
+pub mod first_start;
 pub mod history;
 pub mod index_lines;
 pub mod items;
