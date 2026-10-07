@@ -191,6 +191,23 @@ pub fn answered(
     })
 }
 
+/// Do `work` on what came from outside, and say with what it came to
+/// whether the device applied a statement by it or its state changed
+/// (decision 2026-10-04 §4.2): where it stands, or the change entry that
+/// it keeps as the latest, is another after the work than before it. A
+/// device that applies a statement keeps that statement's entry, and one
+/// that stops, or comes to be in a fork, stands elsewhere.
+///
+/// Where either cannot be read, it is taken to have changed: whoever
+/// asks then counts a change that may be none, and misses none.
+pub fn telling_a_change<T>(conn: &Connection, work: impl FnOnce(&Connection) -> T) -> (T, bool) {
+    let stood = |conn: &Connection| Some((stands(conn).ok()?, kept_id(conn).ok()?));
+    let before = stood(conn);
+    let done = work(conn);
+    let after = stood(conn);
+    (done, before.is_none() || before != after)
+}
+
 // ── The channels ─────────────────────────────────────────────────────
 
 /// Which of a device's channels one is.

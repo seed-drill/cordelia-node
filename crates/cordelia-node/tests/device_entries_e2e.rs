@@ -1863,11 +1863,16 @@ async fn a_device_that_could_not_apply_a_change_has_no_leave_anywhere_until_it_h
         .execute_batch("ALTER TABLE person_carried RENAME TO elsewhere")
         .unwrap();
     let before = (behind.counts("lacks"), behind.counts("has"));
+    let counted = behind.state.sync_control.generation();
     behind.passes().await;
     behind.sends().await;
     // It applied nothing, and has no leave: not at the relay that
     // answered with the change, and not at the one that answered "held".
     assert_ne!(behind.latest().id(), change.id());
+    // Nor was anything counted as a change of settings: not the answer,
+    // and not the pass that tried the change again.
+    behind.passes().await;
+    assert_eq!(behind.state.sync_control.generation(), counted);
     assert_eq!(behind.has_leave("has"), Err(NoLeave::NotApplied));
     assert_eq!(behind.has_leave("lacks"), Err(NoLeave::NotApplied));
     for (relay, before) in [("lacks", before.0), ("has", before.1)] {
@@ -1894,6 +1899,9 @@ async fn a_device_that_could_not_apply_a_change_has_no_leave_anywhere_until_it_h
     behind.passes().await;
     assert_eq!(behind.latest().id(), change.id());
     assert_eq!(behind.status().cannot_go_on, None);
+    // The statement was applied: that is a change of settings, counted
+    // before the work and again once it is done.
+    assert_eq!(behind.state.sync_control.generation(), counted + 2);
     behind.passes().await;
     for relay in ["lacks", "has"] {
         assert_eq!(behind.has_leave(relay), Ok(()), "{relay}");
@@ -1993,7 +2001,9 @@ async fn a_device_that_follows_no_phrase_opens_no_stream() {
 
 /// A relay that answers a show with an entry that does not check, with
 /// one that is behind the one shown, or with one of another phrase:
-/// nothing is applied, and no leave is given.
+/// nothing is applied, and no leave is given. **Nor is any of them a
+/// change of settings** (decision 2026-10-04 §4.2): a relay answers so as
+/// often as it is shown an entry, and no sync cycle is stopped for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing() {
     let relay = StandIn::started().await;
@@ -2027,6 +2037,7 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
         forged.to_wire(),
         Vec::new(),
     ];
+    let counted = device.state.sync_control.generation();
     for (n, answer) in answers.into_iter().enumerate() {
         // A show in short is told of another, and the whole entry is
         // answered with this one. (The wait after a show that got no
@@ -2049,6 +2060,11 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
         assert_eq!(device.stands(), Stands::Applied, "{n}");
         assert_eq!(device.status().cannot_go_on, None, "{n}");
         assert_eq!(device.at("relay").holds_latest, Some(false), "{n}");
+        assert_eq!(
+            device.state.sync_control.generation(),
+            counted,
+            "{n}: counted as a change of settings"
+        );
     }
     // The control: a relay that holds the entry is shown it, once the
     // wait has gone by, and the device goes on.
@@ -3881,10 +3897,13 @@ async fn a_typed_keys_pair_channel_is_read_without_leave_and_its_hand_over_accep
     new.sends().await;
     assert_eq!(new.stands(), Stands::NoPhrase);
     // The whole pass asks, and what the relay holds is accepted: the
-    // device follows the phrase, and has applied its statement.
+    // device follows the phrase, and has applied its statement. That is
+    // a change of settings, counted before the work and once it is done.
+    let counted = new.state.sync_control.generation();
     new.passes().await;
     assert_eq!(new.stands(), Stands::Applied);
     assert_eq!(new.latest().id(), adder.latest().id());
+    assert_eq!(new.state.sync_control.generation(), counted + 2);
     // The key is spent, and reads nothing more.
     let kept = acts::typed_key(&new.db(), &adder.key()).unwrap().unwrap();
     assert!(kept.taken_at.is_some());
@@ -3903,6 +3922,67 @@ async fn a_typed_keys_pair_channel_is_read_without_leave_and_its_hand_over_accep
     assert_eq!((begun, ended), (2, 2));
     new.sends().await;
     assert_eq!(new.state.own_channels.whole_passes(), (2, 2));
+}
+
+/// A hand-over that is read from a pair channel and is not taken is no
+/// change of settings (decision 2026-10-04 §4.2): nothing is counted, and
+/// no sync cycle is stopped for it. Here the key was typed while the
+/// device followed no phrase, and the device has made a phrase of its own
+/// since: the yes was for another row, and the hand-over is refused.
+///
+/// Typed again where the device stands, the hand-over is taken, and that
+/// is a change. The device is moved: it has left the phrase it had made,
+/// and keeps no note of which relays had handed the channels it held, so
+/// that a folder's first cycle in a channel it comes to waits until the
+/// channel was fetched (§6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_over_is_a_change_of_settings_only_where_it_is_taken() {
+    let relay = relay_started("relay", None);
+    let (mut adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    added.unwrap();
+    adder.connects("relay", &relay).await;
+    adder.passes().await;
+
+    let typed = types(&new, &adder);
+    new.makes_the_phrase(&Phrase::parse(OTHER_WORDS).unwrap());
+    let its_own = new.latest().id();
+    new.connects("relay", &relay).await;
+    let counted = new.state.sync_control.generation();
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    let Ok(PairRead::Read(read)) = read else {
+        panic!("{read:?}");
+    };
+    assert!(
+        matches!(read.as_slice(), [Accepted::Refused(_)]),
+        "{read:?}"
+    );
+    assert_eq!(new.latest().id(), its_own);
+    assert_eq!(new.state.sync_control.generation(), counted);
+
+    new.state.own_channels.set_up_with(1);
+    let channel = [8u8; 32];
+    let noted = std::time::Instant::now();
+    new.state
+        .own_channels
+        .fetched_from(&channel, "relay", noted);
+    assert!(new.state.own_channels.first_fetch_done(&channel, noted));
+    let typed = types(&new, &adder);
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    let Ok(PairRead::Read(read)) = read else {
+        panic!("{read:?}");
+    };
+    assert!(matches!(read.as_slice(), [Accepted::Moved(_)]), "{read:?}");
+    assert_eq!(new.latest().id(), adder.latest().id());
+    assert_eq!(new.state.sync_control.generation(), counted + 2);
+    assert!(!new.state.own_channels.first_fetch_done(&channel, noted));
 }
 
 /// The door for a typed key can do nothing else. It asks the relay

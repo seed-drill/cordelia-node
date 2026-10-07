@@ -808,6 +808,18 @@ fn swept(swept: std::io::Result<cordelia_storage::history::Swept>) {
     }
 }
 
+/// What work on something from outside came to, for whoever syncs the
+/// device's folders ([`AppState::as_a_change_where`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Came {
+    /// No statement was applied, and the device stands where it stood.
+    Nothing,
+    /// A statement was applied, or the device's state changed.
+    Changed,
+    /// The device left the phrase it followed, and follows another.
+    Left,
+}
+
 /// One connected peer, as `cordelia peers` shows it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerSnapshot {
@@ -890,6 +902,51 @@ impl AppState {
         }
         self.sync_control.changed(&db);
         done
+    }
+
+    /// Do `work` on what came from outside and may change which channels
+    /// are the device's own, or where the device stands: an entry that a
+    /// relay answered a show with, one that a pass tries again, and one
+    /// read from a pair channel (decision 2026-10-04 §4.2, §4.6). `came`
+    /// says of what the work came to whether it did ([`Came`]).
+    ///
+    /// **Only then is it a change of settings.** Most of what arrives so
+    /// changes nothing: an entry that the device keeps, one behind the
+    /// statement it has applied, one that is refused. Counted each time,
+    /// such an entry would stop the cycle that is running, and a relay
+    /// could stop every cycle at the rate of its answers.
+    ///
+    /// So the work is done first with the database alone, in a
+    /// transaction of its own. Where it comes to nothing in that sense,
+    /// that stands: nothing is counted, and no cycle is waited for. Where
+    /// it comes to something, the transaction is undone, and the work is
+    /// done again as a change is ([`Self::as_a_change`], or
+    /// [`Self::as_a_leaving`] where the device left a phrase by it): the
+    /// change is counted, a cycle that is running stops, and the work is
+    /// done once that cycle's turn has ended. What the second doing
+    /// comes to is what is said, whatever the first came to: the
+    /// database may have changed between the two.
+    ///
+    /// `work` writes nowhere but in the database it is given: whatever
+    /// else it did could not be undone.
+    pub fn as_a_change_where<T>(
+        &self,
+        work: impl Fn(&Connection) -> T,
+        came: impl Fn(&T) -> Came,
+    ) -> T {
+        {
+            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            // Undone where it is dropped: also where the work unwinds.
+            let first =
+                rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate);
+            if let Ok(first) = first {
+                let done = work(&first);
+                if came(&done) == Came::Nothing && first.commit().is_ok() {
+                    return done;
+                }
+            }
+        }
+        self.as_a_leaving(work, |done| came(done) == Came::Left)
     }
 
     /// Uptime in seconds since node start.
@@ -1149,6 +1206,84 @@ mod tests {
         assert_eq!(done, Ok(true));
         assert!(!state.own_channels.first_fetch_done(&channel, now));
         assert_eq!(state.sync_control.generation(), before + 6);
+    }
+
+    /// What comes from outside is a change of settings only where it
+    /// applies a statement or changes the device's state (decision
+    /// 2026-10-04 §4.2). Work that changes neither is done with the
+    /// database alone: nothing is counted, what the adapter keeps beside
+    /// files stands, and it does not wait for a cycle that is running.
+    /// Work that does is undone and done again as a change is: counted
+    /// before and after, and only once the cycle's turn has ended. And
+    /// what work that failed wrote is not kept, nor counted.
+    #[test]
+    fn test_what_comes_from_outside_counts_as_a_change_only_where_it_changes_something() {
+        let state = std::sync::Arc::new(test_state());
+        // The work: it counts, in the database, how often it was done.
+        let done = |db: &Connection| -> i64 {
+            let so_far = cordelia_storage::meta::get(db, "test.done").unwrap();
+            let now = so_far.map_or(0, |n| n.parse::<i64>().unwrap()) + 1;
+            cordelia_storage::meta::set(db, "test.done", &now.to_string()).unwrap();
+            now
+        };
+        let channel = [1u8; 32];
+        let noted = Instant::now();
+        state.own_channels.set_up_with(1);
+        state.own_channels.fetched_from(&channel, "one", noted);
+        let before = state.sync_control.generation();
+        {
+            let db = state.db.lock().unwrap();
+            let kept = Kept {
+                version: PlannedAgainst::NoVersion,
+                copy: "a.conflict-x.md".into(),
+                hash: [1; 32],
+                under: PlannedAgainst::NoVersion,
+            };
+            state.sync_control.keep(&db, "/m", "channel", "a.md", kept);
+        }
+
+        // It changes nothing: done once, while a cycle holds the turn,
+        // with nothing counted and nothing forgotten.
+        let turn = state.history.turn();
+        assert_eq!(state.as_a_change_where(done, |_| Came::Nothing), 1);
+        assert_eq!(state.sync_control.generation(), before);
+        assert!(
+            state
+                .sync_control
+                .kept_beside("/m", "channel", "a.md")
+                .is_some()
+        );
+
+        // It changes something: what the first doing wrote is undone, the
+        // change is counted so that the cycle stops, and the work is done
+        // again once the cycle's turn has ended.
+        let other = std::sync::Arc::clone(&state);
+        let change = std::thread::spawn(move || other.as_a_change_where(done, |_| Came::Changed));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while state.sync_control.generation() == before {
+            assert!(Instant::now() < deadline, "the change was not counted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!change.is_finished(), "the work did not wait for the cycle");
+        assert_eq!(state.sync_control.generation(), before + 1);
+        drop(turn);
+        // Written once more, and no more: the first doing was undone.
+        assert_eq!(change.join().unwrap(), 2);
+        assert_eq!(state.sync_control.generation(), before + 2);
+        assert!(
+            state
+                .sync_control
+                .kept_beside("/m", "channel", "a.md")
+                .is_none()
+        );
+        // Neither had the device leave a phrase: what was noted of the
+        // relays that handed its channels stands. Where it did leave,
+        // nothing is noted any more.
+        assert!(state.own_channels.first_fetch_done(&channel, noted));
+        assert_eq!(state.as_a_change_where(done, |_| Came::Left), 3);
+        assert_eq!(state.sync_control.generation(), before + 4);
+        assert!(!state.own_channels.first_fetch_done(&channel, noted));
     }
 
     /// A cycle has a number, which is above the count of cycles begun at

@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted};
 use cordelia_api::at_relays::{self, Stands};
-use cordelia_api::state::AppState;
+use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_ENTRIES, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
@@ -679,9 +679,10 @@ impl Leave {
     /// A hand-over that is taken has the device apply a statement, so
     /// each is given to [`adding::accept_typed`] as what may change which
     /// channels are the device's own is done
-    /// ([`AppState::as_a_change`], decision 2026-10-04 §4.2): it waits
-    /// for a sync cycle that is running to stop, and counts as a change
-    /// of settings.
+    /// ([`AppState::as_a_change_where`], decision 2026-10-04 §4.2):
+    /// where one is taken, it waits for a sync cycle that is running to
+    /// stop, and counts as a change of settings. One that is refused
+    /// counts as none.
     pub async fn pair(
         &self,
         state: &AppState,
@@ -737,9 +738,23 @@ impl Leave {
         let mut read = Vec::new();
         for entry in &handed {
             let now = self.clock.unix();
-            let accepted = state.as_a_change(|conn| {
-                adding::accept_typed(conn, identity, typed, sync_on(conn), entry, now)
-            });
+            // It is a change of settings only where the hand-over was
+            // taken: a statement was applied, or the device's state
+            // changed. A device that is moved has left the phrase it
+            // followed: the node then keeps no note of which relays had
+            // handed the channels it held.
+            let (accepted, _) = state.as_a_change_where(
+                |conn| {
+                    at_relays::telling_a_change(conn, |conn| {
+                        adding::accept_typed(conn, identity, typed, sync_on(conn), entry, now)
+                    })
+                },
+                |(accepted, changed)| match accepted {
+                    Ok(Some(Accepted::Moved(_))) => Came::Left,
+                    _ if *changed => Came::Changed,
+                    _ => Came::Nothing,
+                },
+            );
             match accepted {
                 Ok(Some(accepted)) => read.push(accepted),
                 // The key reads nothing more: it was spent, or typed

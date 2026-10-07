@@ -81,8 +81,8 @@ use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropp
 use cordelia_api::at_relays::{
     self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
 };
-use cordelia_api::person::Shown;
-use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn, NoRoom};
+use cordelia_api::person::{PersonError, Shown};
+use cordelia_api::state::{AppState, AtRelay, AtRelays, Came, CannotGoOn, NoRoom};
 use cordelia_api::take::Taken;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
@@ -666,9 +666,10 @@ impl DeviceEntries {
             return;
         };
         let now = self.clock.unix();
-        let outcome = self
-            .state
-            .as_a_change(|db| at_relays::answered(db, &self.state.identity, &shown, &answer, now));
+        // Tried at each pass, it counts as a change of settings only
+        // once it is dealt with by applying a statement or by a change of
+        // the device's state.
+        let outcome = self.answered_as_a_change(&shown, &answer, now);
         match outcome {
             // The entry went through the one door, and the device did
             // with it what a change entry has it do: nothing waits now.
@@ -859,18 +860,45 @@ impl DeviceEntries {
         false
     }
 
+    /// Give the one door the entry `another` that the device was answered
+    /// with where it showed `shown` ([`at_relays::answered`]).
+    ///
+    /// Applying a statement waits for a sync cycle that is running to
+    /// stop, and counts as a change of settings (decision 2026-10-04
+    /// §4.2): no file is written, and nothing is published, in an old
+    /// channel after it. So does a change of the device's state. **An
+    /// entry that does neither counts as no change**
+    /// ([`AppState::as_a_change_where`]): one that the device keeps, one
+    /// behind the statement it has applied, one that is refused. A relay
+    /// answers with such an entry as often as it is shown one, and a
+    /// cycle is not stopped for it.
+    fn answered_as_a_change(
+        &self,
+        shown: &CheckedEntry,
+        another: &CheckedEntry,
+        now: i64,
+    ) -> Result<Answered, PersonError> {
+        let identity = &self.state.identity;
+        let (outcome, _) = self.state.as_a_change_where(
+            |db| {
+                at_relays::telling_a_change(db, |db| {
+                    at_relays::answered(db, identity, shown, another, now)
+                })
+            },
+            |(_, changed)| match changed {
+                true => Came::Changed,
+                false => Came::Nothing,
+            },
+        );
+        outcome
+    }
+
     /// The device was answered on `link` with `another`, where it showed
     /// `shown`: the entry goes through the one door. Returns whether the
     /// device applied a change by it, and so keeps another entry now.
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
         let now = self.clock.unix();
-        // Applying a statement waits for a sync cycle that is running to
-        // stop, and counts as a change of settings (decision 2026-10-04
-        // §4.2): no file is written, and nothing is published, in an old
-        // channel after it.
-        let outcome = self
-            .state
-            .as_a_change(|db| at_relays::answered(db, &self.state.identity, shown, another, now));
+        let outcome = self.answered_as_a_change(shown, another, now);
         let relay = link.name();
         match outcome {
             Ok(Answered::Shown(Shown::Applied(applied))) => {
