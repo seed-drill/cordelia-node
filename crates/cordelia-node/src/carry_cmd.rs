@@ -45,6 +45,12 @@
 //! that says what may be taken ([`cordelia_api::carry::Word`]), and is
 //! dropped before anything is read at a relay or handed to the node.
 //! The node is handed that word, and no secret.
+//!
+//! **What `--phrase` hands the node is bound to its word** (§16): the
+//! word names a key that this command makes for the one run, and each
+//! batch of versions is signed by that key over its number and its
+//! hash. The key is overwritten once the last batch is handed, and the
+//! secrets that the phrase opened once the last channel is read.
 
 use std::time::Duration;
 
@@ -56,6 +62,7 @@ use cordelia_api::change::read_with;
 use cordelia_api::person::PersonError;
 use cordelia_core::protocol::{CARRY_FIRST_MAX_SECS, CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::statement::StatementError;
 use cordelia_crypto::{derive, fingerprint, proof};
 
@@ -604,6 +611,11 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         anyhow::bail!("no relay is connected: nothing can be read. Nothing was taken.");
     }
 
+    // The key of this run, which the word names: each batch that is
+    // handed under the word is signed by it. It is made here, and
+    // overwritten when it is dropped.
+    let run = NodeIdentity::generate()?;
+
     // The phrase opens the secrets, signs its word, and is dropped
     // before anything is read at a relay.
     let (word, generations) = {
@@ -619,18 +631,19 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         };
         let allows = Allows::Handed {
             name: name.to_string(),
+            run: hex::encode(run.public_key()),
         };
         let now = chrono::Utc::now().timestamp();
         let word = Word::give(&phrase, &own, &under, allows.says()?, now)?;
         // The secret of the name's channel in each generation that the
-        // entry gives the phrase, the newest first: the person secret
-        // of each is dropped with the part that held it.
+        // entry gives the phrase, the newest first. Each person secret
+        // is read where it lies, in the part that the phrase opened,
+        // and is overwritten with that part: no copy of it is made.
         let mut generations: Vec<(u64, Zeroizing<[u8; 32]>)> = Vec::new();
-        let its_own = (statement.statement.number, for_phrase.secret);
-        let earlier = for_phrase.earlier.iter().map(|e| (e.number, e.secret));
-        for (number, secret) in [its_own].into_iter().chain(earlier) {
-            let secret = Zeroizing::new(secret);
-            generations.push((number, Zeroizing::new(derive::own_secret(&secret, name)?)));
+        let its_own = (statement.statement.number, &for_phrase.secret);
+        let earlier = for_phrase.earlier.iter().map(|e| (e.number, &e.secret));
+        for (number, secret) in std::iter::once(its_own).chain(earlier) {
+            generations.push((number, Zeroizing::new(derive::own_secret(secret, name)?)));
         }
         (word, generations)
     };
@@ -685,15 +698,23 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         "name": name, "generations": [], "carried": 0, "held": 0, "higher": 0,
         "ties": [], "above": [], "deletes": 0, "by_other_keys": by_other_keys, "nothing": null,
     });
-    for batch in batches(&newest, CARRY_PART_MAX_BYTES) {
+    for (number, batch) in batches(&newest, CARRY_PART_MAX_BYTES).iter().enumerate() {
+        let signature = run.sign(&carry::batch_signed(number as u64, batch)?);
         let done = told(api_post_told(
             config_path,
             "/api/v1/carry/handed",
-            json!({ "word": word, "versions": batch }),
+            json!({
+                "word": word,
+                "number": number,
+                "signature": hex::encode(signature),
+                "versions": batch,
+            }),
             Some(CARRY_WAITS),
         ))?;
         add_to(&mut total, &done);
     }
+    // The last batch is handed: the key of the run is overwritten.
+    drop(run);
     for line in carried_lines(&total) {
         println!("{line}");
     }

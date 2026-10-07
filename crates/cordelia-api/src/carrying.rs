@@ -25,7 +25,12 @@
 //! the node is handed no secret. It proves the channel's key with proofs
 //! that the command made ([`read_proved`]), hands back what the relays
 //! handed, as it came, and is then handed the versions in the clear
-//! ([`handed_take`]), again under a word that the phrase signed.
+//! ([`handed_take`]), again under a word that the phrase signed: a batch
+//! at a time, each signed by the key that the word names for its run.
+//!
+//! **A word is taken once** ([`carry::take_once`]), and under the word of
+//! `--phrase` each batch is ([`carry::take_batch_once`]): in the
+//! transaction that brings in what the word allows.
 //!
 //! The device's own store is brought up to what the relays hold of the
 //! new channel first (a whole pass), so that what is judged against is
@@ -701,10 +706,15 @@ pub const NO_FOLDER_FOR_ABOVE: &str = "no folder of this device's is mapped to t
 /// for a file that the word names, which a second yes named. A delete of
 /// theirs is never taken.
 ///
-/// Refused, with nothing taken: a word that does not hold; a key that
-/// the statement applied does not list as removed; and a file named to
-/// come in above a version, for a name that no folder of this device's
-/// is mapped to: nothing would be kept of the text that it replaces.
+/// **The word is taken once** (decision 2026-10-04 §16), in the
+/// transaction that brings the versions in: posted again, it is refused,
+/// and nothing is read for it.
+///
+/// Refused, with nothing taken: a word that does not hold, or that was
+/// taken before; a key that the statement applied does not list as
+/// removed; and a file named to come in above a version, for a name that
+/// no folder of this device's is mapped to: nothing would be kept of the
+/// text that it replaces.
 pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Value, PersonError> {
     let not = |why: &str| PersonError::NotCarried(why.to_string());
     let Allows::From { name, keys, above } = allowed(state, word)? else {
@@ -713,6 +723,9 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
     let name = name.as_str();
     let (left, keys) = {
         let conn = db(state);
+        if carry::is_taken(&conn, word, now())? {
+            return Err(not(&format!("{}.", carry::WORD_TAKEN)));
+        }
         let held = applied(&conn)?;
         if !names::is_a_name(name) {
             return Err(PersonError::NameNotHeld(name.to_string()));
@@ -762,16 +775,23 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
     {
         let conn = db(state);
         // The word was given under the change entry that the device kept
-        // then: where it keeps another by now, nothing is taken.
+        // then: where it keeps another by now, nothing is taken. And it
+        // is taken once, as one with what it brings in.
         allowed_still(&conn, state, word)?;
-        for version in newest_of(&read, &keys)? {
-            let rule = match above.contains(&version.name) {
-                true => Rule::Above,
-                false => Rule::EmptySlots,
-            };
-            let brought = carry::bring(&conn, &state.identity, name, &version, rule, now())?;
-            done.tally.count(&version.name, brought);
-        }
+        let versions = newest_of(&read, &keys)?;
+        done.tally = person::in_one(&conn, || {
+            carry::take_once(&conn, word, now())?;
+            let mut tally = Tally::default();
+            for version in &versions {
+                let rule = match above.contains(&version.name) {
+                    true => Rule::Above,
+                    false => Rule::EmptySlots,
+                };
+                let brought = carry::bring(&conn, &state.identity, name, version, rule, now())?;
+                tally.count(&version.name, brought);
+            }
+            Ok(tally)
+        })?;
     }
     if done.tally.carried > 0 {
         state.own_channels.written();
@@ -973,27 +993,59 @@ pub async fn read_part(
 pub struct HandedRequest {
     /// The word that the phrase gave ([`Allows::Handed`]).
     pub word: Word,
+    /// The number of this batch under the word: each is taken once.
+    pub number: u64,
+    /// The signature of the key that the word names for its run, over
+    /// the batch's number and the hash of its versions, in hex
+    /// ([`carry::batch_signed`]).
+    pub signature: String,
     /// The versions that the command read, each in the clear.
     pub versions: Vec<Handed>,
+}
+
+/// One batch of versions that a command hands the node under its word:
+/// its number, the signature of the key of the run over it, in hex, and
+/// the versions.
+#[derive(Debug, Clone, Copy)]
+pub struct Batch<'a> {
+    pub number: u64,
+    pub signature: &'a str,
+    pub versions: &'a [Handed],
 }
 
 /// Take the versions that the command read in generations whose secret
 /// this device never held (decision 2026-10-04 §7.3), under the word
 /// that the phrase gave for the name.
 ///
-/// Each is judged as a carry by command judges a version that it read
-/// itself ([`carry::bring`]): it comes in as this device's own entry, at
-/// its revision, where the new channel holds neither that version nor an
-/// entry at a higher revision. **One whose signer does not count is not
-/// taken:** it is counted, and that is all.
+/// **What is handed is bound to the word** (decision 2026-10-04 §16):
+/// the word names a key that the command made for that one run, the
+/// batch is signed by that key over its number and its hash, and each
+/// number is taken once under the word. So whoever sees the word cross
+/// to the node can hand in no version of their own, and nothing twice.
+///
+/// Each version is judged as a carry by command judges a version that it
+/// read itself ([`carry::bring`]): it comes in as this device's own
+/// entry, at its revision, where the new channel holds neither that
+/// version nor an entry at a higher revision. **One whose signer does not
+/// count is not taken:** it is counted, and that is all.
+///
+/// Refused, with nothing taken: a word that does not hold; a batch that
+/// the key of the run did not sign; a batch whose number was taken
+/// before; and a batch that holds a version at a revision which no entry
+/// may have under the statement applied ([`Handed::may_be_under`]).
 pub fn take_handed(
     state: &AppState,
     word: &Word,
-    versions: &[Handed],
+    batch: Batch,
 ) -> Result<serde_json::Value, PersonError> {
-    let Allows::Handed { name } = allowed(state, word)? else {
+    let not = |why: &str| PersonError::NotCarried(format!("{why}."));
+    let Allows::Handed { name, run } = allowed(state, word)? else {
         return Err(PersonError::NoWord);
     };
+    let run = carry::key_named(&run).ok_or(PersonError::NoWord)?;
+    if !carry::batch_holds(&run, batch.number, batch.versions, batch.signature) {
+        return Err(not(carry::BATCH_NOT_SIGNED));
+    }
     let mut done = Carried {
         read_all: true,
         ..Default::default()
@@ -1001,18 +1053,27 @@ pub fn take_handed(
     {
         let conn = db(state);
         allowed_still(&conn, state, word)?;
-        let counting = person::who_counts(&conn)?;
-        for handed in versions {
-            let version = handed.version()?;
-            let counts = version.entries.iter().all(|e| counting.counts(&e.author));
-            if !counts {
-                done.by_other_keys += 1;
-                continue;
-            }
-            let brought =
-                carry::bring(&conn, &state.identity, &name, &version, Rule::Counts, now())?;
-            done.tally.count(&version.name, brought);
+        let number = applied(&conn)?.statement.statement.number;
+        if !batch.versions.iter().all(|one| one.may_be_under(number)) {
+            return Err(not(carry::REVISION_MAY_NOT_BE));
         }
+        let counting = person::who_counts(&conn)?;
+        (done.tally, done.by_other_keys) = person::in_one(&conn, || {
+            carry::take_batch_once(&conn, word, batch.number, now())?;
+            let (mut tally, mut by_other_keys) = (Tally::default(), 0);
+            for handed in batch.versions {
+                let version = handed.version()?;
+                let counts = version.entries.iter().all(|e| counting.counts(&e.author));
+                if !counts {
+                    by_other_keys += 1;
+                    continue;
+                }
+                let brought =
+                    carry::bring(&conn, &state.identity, &name, &version, Rule::Counts, now())?;
+                tally.count(&version.name, brought);
+            }
+            Ok((tally, by_other_keys))
+        })?;
     }
     if done.tally.carried > 0 {
         state.own_channels.written();
@@ -1027,7 +1088,12 @@ pub async fn handed_take(
     body: web::Json<HandedRequest>,
 ) -> Result<HttpResponse, ApiError> {
     commands::asked(&req, &state)?;
-    let done = take_handed(&state, &body.word, &body.versions);
+    let batch = Batch {
+        number: body.number,
+        signature: &body.signature,
+        versions: &body.versions,
+    };
+    let done = take_handed(&state, &body.word, batch);
     Ok(HttpResponse::Ok().json(done.map_err(commands::refused)?))
 }
 
@@ -1277,7 +1343,13 @@ mod tests {
             // Its ten minutes have gone by.
             Word::give(&phrase, &own, &under, says.clone(), now() - 601).unwrap(),
             // It allows another thing.
-            node.word(&phrase, &Allows::Handed { name: LAB.into() }),
+            node.word(
+                &phrase,
+                &Allows::Handed {
+                    name: LAB.into(),
+                    run: hex::encode(counts),
+                },
+            ),
             // Its text was changed after it was signed.
             Word {
                 what: from(&[removed], &["kept.md"]).says().unwrap(),
@@ -1316,8 +1388,26 @@ mod tests {
         assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("of device 0"));
         assert_eq!(node.text(LAB, "deleted.md"), None);
         assert_eq!(node.stored(), before + 1);
-        // Run again, it takes what the new channel still lacks: nothing.
-        let again = take_from(&node.state, &word).await.unwrap();
+        // **A word is taken once:** posted again, it is refused, whatever
+        // case its signature is written in, and nothing is read for it.
+        node.asked.lock().unwrap().clear();
+        let in_capitals = Word {
+            signature: word.signature.to_uppercase(),
+            ..word.clone()
+        };
+        for posted_again in [&word, &in_capitals] {
+            let refused = take_from(&node.state, posted_again).await;
+            assert!(
+                matches!(&refused, Err(PersonError::NotCarried(why)) if why.contains(carry::WORD_TAKEN)),
+                "{refused:?}"
+            );
+        }
+        assert!(node.asked.lock().unwrap().is_empty());
+        assert_eq!(node.stored(), before + 1);
+        // Run again, with a word given anew, it takes what the new
+        // channel still lacks: nothing.
+        let anew = Word::give(&phrase, &own, &under, says.clone(), now() - 1).unwrap();
+        let again = take_from(&node.state, &anew).await.unwrap();
         assert_eq!((&again["carried"], &again["held"]), (&json!(0), &json!(1)));
 
         // With a folder mapped, the second yes named the file: it comes
@@ -1439,6 +1529,11 @@ mod tests {
     /// and hands back what the relay handed, a part at a time; and it
     /// takes the versions that it is handed only under the phrase's
     /// word, and only where a key that counts signed them.
+    ///
+    /// **What is handed is bound to the word** (§16): a batch that the
+    /// key of the run did not sign is refused, and so is a batch that is
+    /// posted twice, and one that holds a version at a revision which no
+    /// entry may have under the statement applied.
     #[actix_web::test]
     async fn test_a_generation_never_held_is_read_by_the_command_and_handed_in_the_clear() {
         let mut s = Several::of_one_person(3);
@@ -1519,21 +1614,88 @@ mod tests {
             .collect();
         assert_eq!(versions.len(), 2);
         let before = node.stored();
+        // The key of this run, which the word names: it signs each
+        // batch over its number and its hash.
+        let run = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        let handed = Allows::Handed {
+            name: LAB.into(),
+            run: hex::encode(run.public_key()),
+        };
+        let signed_by =
+            |key: &cordelia_crypto::identity::NodeIdentity, number: u64, versions: &[Handed]| {
+                hex::encode(key.sign(&carry::batch_signed(number, versions).unwrap()))
+            };
+        let takes = |word: &Word, number: u64, signature: &str, versions: &[Handed]| {
+            let batch = Batch {
+                number,
+                signature,
+                versions,
+            };
+            take_handed(&node.state, word, batch)
+        };
+        let first_batch = signed_by(&run, 0, &versions);
         // With no word that holds, nothing is taken.
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         for word in [
-            node.word(&other, &Allows::Handed { name: LAB.into() }),
+            node.word(&other, &handed),
             node.word(&phrase, &from(&[one], &[])),
         ] {
-            let refused = take_handed(&node.state, &word, &versions);
+            let refused = takes(&word, 0, &first_batch, &versions);
             assert!(matches!(refused, Err(PersonError::NoWord)), "{refused:?}");
         }
+        let word = node.word(&phrase, &handed);
+        let not_signed = |refused: Result<serde_json::Value, PersonError>| {
+            assert!(
+                matches!(&refused, Err(PersonError::NotCarried(why)) if why.contains(carry::BATCH_NOT_SIGNED)),
+                "{refused:?}"
+            );
+        };
+        // A batch that the key of the run did not sign: another key
+        // signed it; the run's key signed another number, or other
+        // versions; or it is signed by nothing.
+        let another = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        not_signed(takes(
+            &word,
+            0,
+            &signed_by(&another, 0, &versions),
+            &versions,
+        ));
+        not_signed(takes(&word, 1, &first_batch, &versions));
+        let mut changed = versions.clone();
+        changed[0].text = Some("a text of somebody's own".into());
+        not_signed(takes(&word, 0, &first_batch, &changed));
+        not_signed(takes(&word, 0, &first_batch, &versions[..1]));
+        not_signed(takes(&word, 0, "zz", &versions));
+        // A version at a revision that no entry may have under the
+        // statement applied, which is the second: one in a band above
+        // it, and revision 0. The key of the run signed each batch.
+        let above = (3u64 << cordelia_core::protocol::REV_COUNT_BITS) + 1;
+        for rev in [above, 0] {
+            let mut at_no_revision = versions.clone();
+            at_no_revision[1].rev = rev;
+            let refused = takes(
+                &word,
+                0,
+                &signed_by(&run, 0, &at_no_revision),
+                &at_no_revision,
+            );
+            assert!(
+                matches!(&refused, Err(PersonError::NotCarried(why)) if why.contains(carry::REVISION_MAY_NOT_BE)),
+                "{rev}: {refused:?}"
+            );
+        }
         assert_eq!(node.stored(), before);
-        // With the phrase's word, each comes in as a carry by command
-        // brings one in.
-        let word = node.word(&phrase, &Allows::Handed { name: LAB.into() });
-        let done = take_handed(&node.state, &word, &versions).unwrap();
+        // With the phrase's word, and signed by the key of its run, each
+        // comes in as a carry by command brings one in.
+        let done = takes(&word, 0, &first_batch, &versions).unwrap();
         assert_eq!(done["carried"], 2, "{done}");
+        // **A batch is taken once:** posted again under its word, it is
+        // refused, and nothing is judged again.
+        let again = takes(&word, 0, &first_batch, &versions);
+        assert!(
+            matches!(&again, Err(PersonError::NotCarried(why)) if why.contains(carry::BATCH_TAKEN)),
+            "{again:?}"
+        );
         assert_eq!(
             node.text(LAB, "kept.md").as_deref(),
             Some("edited on device 2")
@@ -1549,7 +1711,8 @@ mod tests {
             signer: hex::encode(one),
             ..versions[0].clone()
         };
-        let done = take_handed(&node.state, &word, &[theirs]).unwrap();
+        let theirs = [theirs];
+        let done = takes(&word, 1, &signed_by(&run, 1, &theirs), &theirs).unwrap();
         assert_eq!(
             (&done["carried"], &done["by_other_keys"]),
             (&json!(0), &json!(1))

@@ -70,7 +70,7 @@ use crate::person_cmd::{
     names_this_device, own_key, text, time_of, typed_phrase,
 };
 use crate::terminal::Terminal;
-use crate::{Told, api_post_told, refuse_before_a_phrase};
+use crate::{Told, api_post_told, api_post_told_of, refuse_before_a_phrase, wipe_strings};
 
 /// What `cordelia recover` says before it asks for anything (decision
 /// 2026-10-04 §9).
@@ -597,12 +597,15 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 
     // The secrets that the machine keeps: of the generation recovered
     // from, and of those before it that its entry gave the phrase.
+    // (Each is written from where it lies: no copy of it is made on the
+    // way, and the text that is made of it is overwritten once it is
+    // sent.)
     let mut left = vec![json!({
         "number": statement.number,
-        "secret": hex::encode(for_phrase.secret),
+        "secret": hex::encode(&for_phrase.secret[..]),
     })];
     for earlier in &for_phrase.earlier {
-        left.push(json!({ "number": earlier.number, "secret": hex::encode(earlier.secret) }));
+        left.push(json!({ "number": earlier.number, "secret": hex::encode(&earlier.secret[..]) }));
     }
     drop(for_phrase);
     let key_and_label =
@@ -615,7 +618,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             .collect()
     };
     let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
-    let body = json!({
+    let mut body = json!({
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
@@ -625,12 +628,16 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "word": word,
     });
     drop(statement_key);
-    let made = api_post_told(
+    let made = api_post_told_of(
         config_path,
         "/api/v1/recover/make",
-        body,
+        &body,
         Some(Duration::from_secs(60)),
     );
+    // The secrets that the phrase opened are in the request as text:
+    // what this process still holds of that text is overwritten.
+    wipe_strings(&mut body);
+    drop(body);
     match made {
         Ok(Told::Yes(_)) => {}
         Ok(Told::No { message, .. }) => anyhow::bail!("{message}\nNothing was made."),
@@ -1036,6 +1043,28 @@ mod tests {
         assert!(
             full.contains("256 are removed already, and 1 device is asked about here. At most 0"),
             "{full}"
+        );
+    }
+
+    /// What a command hands the node of the secrets that the phrase
+    /// opened is text in a request: the command's own copy of that text
+    /// is overwritten once the request is sent, wherever in the request
+    /// it is (decision 2026-10-04 §16).
+    #[test]
+    fn test_the_text_of_a_request_is_overwritten_once_it_is_sent() {
+        let mut body = json!({
+            "entry": "aa",
+            "left": [{ "number": 2, "secret": "0f0f" }, { "number": 1, "secret": "f0f0" }],
+            "word": { "what": "said", "until": 5 },
+        });
+        wipe_strings(&mut body);
+        assert_eq!(
+            body,
+            json!({
+                "entry": "",
+                "left": [{ "number": 2, "secret": "" }, { "number": 1, "secret": "" }],
+                "word": { "what": "", "until": 5 },
+            })
         );
     }
 

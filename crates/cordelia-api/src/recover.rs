@@ -726,6 +726,9 @@ pub fn follow(
     let number = state.as_a_change(|conn| {
         in_one(conn, || {
             let applied = person::follow_recovered(conn, identity, entry, statement_key, left, at)?;
+            // The word for the look is taken once (§16), as one with
+            // the statement that it was given under.
+            carry::take_once(conn, word, at)?;
             // Whatever key was typed at `cordelia accept` before was
             // typed by a device that followed no phrase: none of them is
             // spent under this one (§16).
@@ -1719,7 +1722,12 @@ mod tests {
                 &phrase(),
                 &own,
                 &made.entry.id(),
-                Allows::Handed { name: LAB.into() }.says().unwrap(),
+                Allows::Handed {
+                    name: LAB.into(),
+                    run: hex::encode(k0),
+                }
+                .says()
+                .unwrap(),
                 now(),
             )
             .unwrap(),
@@ -1819,6 +1827,9 @@ mod tests {
             follows(&node, &made),
             Err(PersonError::FollowsAPhrase)
         ));
+        // And the word for the look is taken with it: a word is taken
+        // once (§16).
+        assert!(carry::is_taken(&db(&node.state), &made.word, now()).unwrap());
 
         // Until the look has ended, the machine does not write that it
         // has sent what it carried, though nothing waits at its relay:

@@ -1632,6 +1632,14 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
 
+/// The label under which the key of one run of a command signs a batch
+/// of versions that it hands the node on the phrase's word (decision
+/// 2026-10-04 §16): the batch's number, and the hash of its versions as
+/// they are handed. The word names that key, and the command makes it
+/// for the one run: a signature under this label is no word, no
+/// statement and no entry.
+pub const LABEL_CARRY_BATCH: &[u8] = b"cordelia v2 carry batch";
+
 /// The most bytes of entries that the node hands a command in one answer
 /// (decision 2026-10-04 §7.3, §9), where the command reads a channel
 /// whose secret the node does not hold: a channel may hold more than one
@@ -1659,7 +1667,7 @@ pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
 pub const RECOVERY_MAX_LEFT_SECRETS: usize = MAX_EARLIER_SECRETS + 1;
 
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 24] = [
+pub const LABELS: [&[u8]; 25] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1684,6 +1692,7 @@ pub const LABELS: [&[u8]; 24] = [
     LABEL_SESSION_VALUE,
     LABEL_FINGERPRINT,
     LABEL_CARRY_WORD,
+    LABEL_CARRY_BATCH,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2289,7 +2298,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 24);
+        assert_eq!(LABELS.len(), 25);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2339,6 +2348,8 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
+        assert!(LABELS.contains(&LABEL_CARRY_BATCH));
         assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
         // A part holds an entry of any size that a channel carries.
         const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };

@@ -47,10 +47,12 @@ impl NodeIdentity {
     /// Generate a new random identity from CSPRNG.
     pub fn generate() -> Result<Self, CryptoError> {
         let rng = SystemRandom::new();
-        let mut seed = [0u8; 32];
-        rng.fill(&mut seed)
+        // The seed is made in memory that is overwritten when it is
+        // dropped: no copy of it is left here.
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rng.fill(&mut seed[..])
             .map_err(|_| CryptoError::IdentityError("RNG failure".into()))?;
-        Self::from_seed(seed)
+        Self::from_wiped_seed(&seed)
     }
 
     /// Create identity from a raw 32-byte Ed25519 seed.

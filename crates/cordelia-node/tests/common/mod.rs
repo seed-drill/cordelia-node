@@ -455,6 +455,25 @@ impl Node {
         resp.body_mut().read_json().unwrap()
     }
 
+    /// POST `body` to the node's API with its token, as any program that
+    /// holds the token can, and give back what it answered whether or
+    /// not it refused: the HTTP status, and the answer.
+    pub fn post_told(&self, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        let url = format!("http://127.0.0.1:{}{path}", self.http);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut resp = agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", self.token()))
+            .send_json(body)
+            .unwrap_or_else(|e| panic!("{}: POST {path} failed: {e}", self.name));
+        let status = resp.status().as_u16();
+        (status, resp.body_mut().read_json().unwrap_or_default())
+    }
+
     /// Set `max_storage_bytes` for this node, before it is started: the
     /// most a relay's database may hold.
     pub fn max_storage_bytes(&self, bytes: u64) {
@@ -1254,6 +1273,30 @@ impl PassesOn {
             }
         });
         Self { port: at, sent }
+    }
+
+    /// The body of each request that was POSTed to `path` through here,
+    /// as JSON, in the order they were sent: what a program that sees
+    /// the requests cross to the node has seen of them.
+    pub fn bodies(&self, path: &str) -> Vec<serde_json::Value> {
+        let sent = self.sent();
+        let text = String::from_utf8_lossy(&sent).to_string();
+        let asked = format!("POST {path} HTTP/1.1\r\n");
+        let mut bodies = Vec::new();
+        for (at, _) in text.match_indices(&asked) {
+            let request = &text[at..];
+            let Some((head, rest)) = request.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            });
+            let body = length.and_then(|length| rest.get(..length));
+            bodies.extend(body.and_then(|body| serde_json::from_str(body).ok()));
+        }
+        bodies
     }
 
     pub fn sent(&self) -> Vec<u8> {

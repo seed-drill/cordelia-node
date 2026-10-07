@@ -415,7 +415,7 @@ fn routes() -> Vec<(&'static str, Value)> {
         ("/api/v1/carry/read/part", json!({ "read": 1, "from": 0 })),
         (
             "/api/v1/carry/handed",
-            json!({ "word": no_word(), "versions": [] }),
+            json!({ "word": no_word(), "number": 0, "signature": "", "versions": [] }),
         ),
         ("/api/v1/recover/look", json!({})),
         (

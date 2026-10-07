@@ -37,6 +37,16 @@
 //!   above a version that it holds. **A delete that such a key signed is
 //!   never taken:** the file that it had deleted comes back.
 //!
+//! **What a command hands the node on the phrase's word is bound to
+//! that word** (decision 2026-10-04 §16). A word names the device, the
+//! change entry it keeps, a time after which it is void, and what it
+//! allows ([`Word`], [`Allows`]). A word under which versions are handed
+//! names a key that the command made for that one run, and each batch is
+//! signed by that key over its number and its hash ([`batch_signed`]).
+//! **The node takes each word once, and each batch once** ([`take_once`],
+//! [`take_batch_once`]): a program that sees a word cross to the node can
+//! do nothing with it.
+//!
 //! Plain functions over the node's database and the device's own key.
 
 use std::collections::BTreeMap;
@@ -45,15 +55,16 @@ use rusqlite::Connection;
 
 use cordelia_core::protocol::{
     CARRY_FROM_WORDS, CARRY_WORD_SECS, ENTRY_LINK_HASH_BYTES, ENTRY_LINK_SIGNER_BYTES,
-    LABEL_CARRY_WORD,
+    LABEL_CARRY_BATCH, LABEL_CARRY_WORD,
 };
-use cordelia_core::revision::lifted;
+use cordelia_core::revision::{lifted, may_be_under};
 use cordelia_crypto::entry::{CheckedEntry, Link, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::version::{self, Version};
 use cordelia_crypto::{derive, sha256};
 use cordelia_storage::entries::{self, Outcome};
+use cordelia_storage::meta;
 
 use crate::person::{PersonError, carried_entry, in_one};
 use crate::publish::Standing;
@@ -367,6 +378,16 @@ impl Handed {
         })
     }
 
+    /// Whether the version may be an entry under the statement numbered
+    /// `number`, which is the one applied: its revision, as it is once it
+    /// has crossed into that generation ([`lifted`]), is one that an
+    /// entry may have there ([`may_be_under`], decision 2026-10-04 §2.3).
+    /// **A version that is handed at any other revision is refused:** the
+    /// node did not read it, and takes its revision as it is written.
+    pub fn may_be_under(&self, number: u64) -> bool {
+        may_be_under(lifted(self.rev), number)
+    }
+
     /// The version that was handed, as [`bring`] takes one. Refused where
     /// a key or a link is not one.
     pub fn version(&self) -> Result<Version, PersonError> {
@@ -500,8 +521,11 @@ pub enum Allows {
     /// `cordelia sync carry <name> --phrase`: what the command read of
     /// the channel of `name`, in generations whose secret this device
     /// never held and the phrase opened, comes in as a carry by command
-    /// does, where a key that counts signed it.
-    Handed { name: String },
+    /// does, where a key that counts signed it. `run` is the public half
+    /// of a key that the command made for this one run, in hex: each
+    /// batch of versions handed under the word is signed by it
+    /// ([`batch_signed`]).
+    Handed { name: String, run: String },
     /// `cordelia recover`: the look, made once. The names that are
     /// carried, in their order, and the keys that it takes from, each in
     /// hex: the devices that the person still has, and those that are
@@ -542,6 +566,155 @@ fn word_signed(device: &[u8; 32], under: &[u8; 32], until: i64, what: &str) -> V
     signed.extend_from_slice(&until.to_be_bytes());
     signed.extend_from_slice(&sha256(what.as_bytes()));
     signed
+}
+
+// ── A word is taken once, and so is each batch under one ─────────────
+
+/// What the key of a run signs for one batch of versions that the
+/// command hands the node under its word (decision 2026-10-04 §16): the
+/// label, the batch's number, and the hash of the versions as they are
+/// handed.
+pub fn batch_signed(number: u64, versions: &[Handed]) -> Result<Vec<u8>, PersonError> {
+    let handed = serde_json::to_vec(versions)
+        .map_err(|e| PersonError::Held(format!("a batch of versions: {e}")))?;
+    let mut signed = Vec::with_capacity(LABEL_CARRY_BATCH.len() + 8 + 32);
+    signed.extend_from_slice(LABEL_CARRY_BATCH);
+    signed.extend_from_slice(&number.to_be_bytes());
+    signed.extend_from_slice(&sha256(&handed));
+    Ok(signed)
+}
+
+/// Whether the key `run`, which a word names as the key of its run,
+/// signed the batch numbered `number` that holds `versions`: `signature`
+/// is in hex.
+pub fn batch_holds(run: &[u8; 32], number: u64, versions: &[Handed], signature: &str) -> bool {
+    let signature: Option<[u8; 64]> = hex::decode(signature)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok());
+    let (Some(signature), Ok(signed)) = (signature, batch_signed(number, versions)) else {
+        return false;
+    };
+    cordelia_crypto::identity::verify_signature(run, &signed, &signature)
+}
+
+/// What is said where a word was taken before.
+pub const WORD_TAKEN: &str = "that word of the recovery phrase was taken before: a word is taken \
+    once. Nothing was taken. Run the command again: it asks for the phrase again";
+
+/// What is said where a batch was taken before under its word.
+pub const BATCH_TAKEN: &str = "that batch of versions was taken before under this word of the \
+    recovery phrase: each is taken once. Nothing was taken";
+
+/// What is said where the key that a word names for its run did not sign
+/// a batch.
+pub const BATCH_NOT_SIGNED: &str = "that batch of versions is not signed by the key that the \
+    word of the recovery phrase names for its run. Nothing was taken";
+
+/// What is said where a version is handed at a revision that no entry
+/// may have under the statement applied.
+pub const REVISION_MAY_NOT_BE: &str = "a version was handed at a revision that no entry may have \
+    under the change that this device has applied. Nothing was taken";
+
+/// A word that this device has taken, for as long as the word stands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct TakenWord {
+    /// The word's signature, in hex, as its bytes are written.
+    word: String,
+    /// Until when the word stands, in seconds: it is kept until then.
+    until: i64,
+    /// The numbers of the batches that were taken under it.
+    #[serde(default)]
+    batches: Vec<u64>,
+}
+
+/// What a word is kept by: its signature, in hex as its bytes are
+/// written, whatever case it was handed in. `None` where it is none.
+fn kept_by(word: &Word) -> Option<String> {
+    let signature: [u8; 64] = hex::decode(&word.signature).ok()?.try_into().ok()?;
+    Some(hex::encode(signature))
+}
+
+/// The words that this device has taken and that are not void at `now`.
+fn taken_words(conn: &Connection, now: i64) -> Result<Vec<TakenWord>, PersonError> {
+    let kept: Vec<TakenWord> = meta::get(conn, meta::PERSON_WORDS_TAKEN)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default();
+    Ok(kept.into_iter().filter(|one| one.until >= now).collect())
+}
+
+/// Keep `words` as the words that this device has taken.
+fn keep_taken(conn: &Connection, words: &[TakenWord]) -> Result<(), PersonError> {
+    if words.is_empty() {
+        meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
+        return Ok(());
+    }
+    let kept = serde_json::to_string(words)
+        .map_err(|e| PersonError::Held(format!("the words that were taken: {e}")))?;
+    meta::set(conn, meta::PERSON_WORDS_TAKEN, &kept)?;
+    Ok(())
+}
+
+/// Whether `word` was taken before, and stands still.
+pub fn is_taken(conn: &Connection, word: &Word, now: i64) -> Result<bool, PersonError> {
+    let by = kept_by(word);
+    let taken = taken_words(conn, now)?;
+    Ok(taken.iter().any(|one| Some(&one.word) == by.as_ref()))
+}
+
+/// Take `word`, at `now`: **a word is taken once** (decision 2026-10-04
+/// §16). The node keeps its signature until the word is void. Whoever
+/// calls this has asked whether the word holds ([`Word::holds`]), and
+/// does what the word allows in the same transaction: where that fails,
+/// the word is not taken.
+///
+/// Refused where the word was taken before.
+pub fn take_once(conn: &Connection, word: &Word, now: i64) -> Result<(), PersonError> {
+    in_one(conn, || {
+        let by = kept_by(word).ok_or(PersonError::NoWord)?;
+        let mut taken = taken_words(conn, now)?;
+        if taken.iter().any(|one| one.word == by) {
+            return Err(PersonError::NotCarried(format!("{WORD_TAKEN}.")));
+        }
+        taken.push(TakenWord {
+            word: by,
+            until: word.until,
+            batches: Vec::new(),
+        });
+        keep_taken(conn, &taken)
+    })
+}
+
+/// Take the batch numbered `number` under `word`, at `now`: **each
+/// number is taken once under a word** (decision 2026-10-04 §16).
+/// Whoever calls this has asked whether the word holds, and whether the
+/// key that it names for its run signed the batch ([`batch_holds`]).
+///
+/// Refused where a batch of that number was taken before under the word.
+pub fn take_batch_once(
+    conn: &Connection,
+    word: &Word,
+    number: u64,
+    now: i64,
+) -> Result<(), PersonError> {
+    in_one(conn, || {
+        let by = kept_by(word).ok_or(PersonError::NoWord)?;
+        let mut taken = taken_words(conn, now)?;
+        if !taken.iter().any(|one| one.word == by) {
+            taken.push(TakenWord {
+                word: by.clone(),
+                until: word.until,
+                batches: Vec::new(),
+            });
+        }
+        let Some(of_it) = taken.iter_mut().find(|one| one.word == by) else {
+            return Err(PersonError::NoWord);
+        };
+        if of_it.batches.contains(&number) {
+            return Err(PersonError::NotCarried(format!("{BATCH_TAKEN}.")));
+        }
+        of_it.batches.push(number);
+        keep_taken(conn, &taken)
+    })
 }
 
 // ── Naming a removed key ─────────────────────────────────────────────
@@ -1265,6 +1438,142 @@ mod tests {
         assert_eq!(key_named(&hex::encode(s.key(1))), Some(s.key(1)));
         assert_eq!(key_named("zz"), None);
         assert_eq!(key_named("00"), None);
+    }
+
+    /// **A word is taken once, and so is each batch that is handed under
+    /// one** (decision 2026-10-04 §16). The node keeps a word that it has
+    /// taken, by its signature, until the word is void: taken again, in
+    /// whatever case its signature is written, it is refused. Under a
+    /// word, each number is taken once. A word that is void is kept no
+    /// longer.
+    #[test]
+    fn test_a_word_is_taken_once_and_each_batch_under_it_once() {
+        let s = three();
+        let conn = &s[0].conn;
+        let (device, under) = (s.key(0), s[0].latest().id());
+        let word = |says: &str, at: i64| {
+            Word::give(&s.phrase, &device, &under, says.to_string(), at).unwrap()
+        };
+        let now = 5_000;
+        let (one, other) = (word("one", now), word("other", now));
+        let refused = |taken: Result<(), PersonError>, why: &str| {
+            assert!(
+                matches!(&taken, Err(PersonError::NotCarried(said)) if said.contains(why)),
+                "{taken:?}"
+            );
+        };
+
+        assert!(!is_taken(conn, &one, now).unwrap());
+        take_once(conn, &one, now).unwrap();
+        assert!(is_taken(conn, &one, now).unwrap());
+        assert!(!is_taken(conn, &other, now).unwrap());
+        refused(take_once(conn, &one, now + 1), WORD_TAKEN);
+        // Its signature in capitals is the same signature.
+        let in_capitals = Word {
+            signature: one.signature.to_uppercase(),
+            ..one.clone()
+        };
+        assert_ne!(in_capitals.signature, one.signature);
+        assert!(is_taken(conn, &in_capitals, now).unwrap());
+        refused(take_once(conn, &in_capitals, now + 1), WORD_TAKEN);
+        // Another word is taken beside it. One whose signature is none
+        // is no word.
+        take_once(conn, &other, now).unwrap();
+        let none = Word {
+            signature: "zz".into(),
+            ..one.clone()
+        };
+        assert!(matches!(
+            take_once(conn, &none, now),
+            Err(PersonError::NoWord)
+        ));
+        assert!(matches!(
+            take_batch_once(conn, &none, 0, now),
+            Err(PersonError::NoWord)
+        ));
+
+        // Under a word, each number is taken once: and under another
+        // word, the same numbers are taken.
+        let handed = word("handed", now);
+        for number in [0, 1, 7] {
+            take_batch_once(conn, &handed, number, now).unwrap();
+        }
+        for number in [0, 1, 7] {
+            refused(take_batch_once(conn, &handed, number, now + 1), BATCH_TAKEN);
+        }
+        take_batch_once(conn, &handed, 2, now + 1).unwrap();
+        take_batch_once(conn, &word("handed too", now), 0, now).unwrap();
+        // A word under which a batch was taken is a word that was taken.
+        assert!(is_taken(conn, &handed, now).unwrap());
+
+        // What is kept is kept until the word is void, and no longer.
+        let kept = |at: i64| taken_words(conn, at).unwrap().len();
+        assert_eq!(kept(now), 4);
+        assert_eq!(kept(one.until), 4);
+        assert_eq!(kept(one.until + 1), 0);
+        // A word that is given later stands longer, and is kept longer.
+        let later = word("later", now + 100);
+        take_once(conn, &later, now + 100).unwrap();
+        assert_eq!(kept(one.until + 1), 1);
+        // Once a word is taken after the others are void, they go.
+        take_once(conn, &word("last", one.until + 1), one.until + 1).unwrap();
+        let noted = meta::get(conn, meta::PERSON_WORDS_TAKEN).unwrap().unwrap();
+        assert!(!noted.contains(&one.signature), "{noted}");
+        assert!(noted.contains(&later.signature), "{noted}");
+    }
+
+    /// A batch of versions is signed by the key of its run over its
+    /// number and the hash of its versions (decision 2026-10-04 §16):
+    /// another key's signature, another number, and other versions do
+    /// not hold. A signature under the label of a batch is no word's.
+    #[test]
+    fn test_a_batch_is_signed_by_the_key_of_its_run_over_its_number_and_its_hash() {
+        let s = three();
+        let run = &s[1].identity;
+        let version = |file: &str, said: &str| Handed {
+            name: file.into(),
+            rev: 3,
+            text: Some(said.into()),
+            signer: hex::encode(s.key(2)),
+            chain: Some(Vec::new()),
+        };
+        let batch = [version("a.md", "one"), version("b.md", "two")];
+        let signature = hex::encode(run.sign(&batch_signed(4, &batch).unwrap()));
+        assert!(batch_holds(&s.key(1), 4, &batch, &signature));
+        assert!(batch_holds(&s.key(1), 4, &batch, &signature.to_uppercase()));
+        // Another key, another number, other versions, fewer, none.
+        assert!(!batch_holds(&s.key(0), 4, &batch, &signature));
+        assert!(!batch_holds(&s.key(1), 5, &batch, &signature));
+        let other = [version("a.md", "one"), version("b.md", "three")];
+        assert!(!batch_holds(&s.key(1), 4, &other, &signature));
+        let turned = [batch[1].clone(), batch[0].clone()];
+        assert!(!batch_holds(&s.key(1), 4, &turned, &signature));
+        assert!(!batch_holds(&s.key(1), 4, &batch[..1], &signature));
+        assert!(!batch_holds(&s.key(1), 4, &[], &signature));
+        assert!(!batch_holds(&s.key(1), 4, &batch, "zz"));
+        assert!(!batch_holds(&s.key(1), 4, &batch, ""));
+        // What is signed begins with the label of a batch.
+        let signed = batch_signed(4, &batch).unwrap();
+        assert!(signed.starts_with(LABEL_CARRY_BATCH));
+        assert_eq!(signed.len(), LABEL_CARRY_BATCH.len() + 8 + 32);
+
+        // A version may be handed only at a revision that an entry may
+        // have under the statement applied, as it is once it has crossed
+        // into that generation.
+        let at_rev = |rev: u64| Handed {
+            rev,
+            ..batch[0].clone()
+        };
+        let top_half = REV_BAND_HALF + 4;
+        assert!(at_rev(3).may_be_under(1));
+        assert!(at_rev(at(2, 9)).may_be_under(2));
+        // In the top half of band 0: it is lifted into band 1.
+        assert!(at_rev(top_half).may_be_under(1));
+        assert!(at_rev(top_half).may_be_under(2));
+        assert!(!at_rev(0).may_be_under(1));
+        assert!(!at_rev(at(2, 1)).may_be_under(1));
+        assert!(!at_rev(at(1, top_half)).may_be_under(1));
+        assert!(!at_rev(3).may_be_under(0));
     }
 
     /// Where two removed keys are named in one run, the newest version

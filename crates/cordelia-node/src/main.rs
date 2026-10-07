@@ -2859,6 +2859,20 @@ pub(crate) fn api_post_within(
     Ok(json)
 }
 
+/// Overwrite every string that `body` holds, wherever it is in it
+/// (decision 2026-10-04 §16): a secret that a command hands the node is
+/// in the request as text, and the command's own copy of that text is
+/// not left in its memory once the request is sent.
+pub(crate) fn wipe_strings(body: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    match body {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(all) => all.iter_mut().for_each(wipe_strings),
+        serde_json::Value::Object(all) => all.values_mut().for_each(wipe_strings),
+        _ => {}
+    }
+}
+
 /// What the node answered a command.
 pub(crate) enum Told {
     /// It did what was asked, and says this.
@@ -2878,6 +2892,18 @@ pub(crate) fn api_post_told(
     body: serde_json::Value,
     limit: Option<std::time::Duration>,
 ) -> anyhow::Result<Told> {
+    api_post_told_of(config_path, path, &body, limit)
+}
+
+/// [`api_post_told`], of a body that whoever asks keeps: a command that
+/// hands the node what the recovery phrase opened overwrites its own
+/// copy of that once it is sent ([`wipe_strings`]).
+pub(crate) fn api_post_told_of(
+    config_path: &str,
+    path: &str,
+    body: &serde_json::Value,
+    limit: Option<std::time::Duration>,
+) -> anyhow::Result<Told> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
@@ -2893,7 +2919,7 @@ pub(crate) fn api_post_told(
     let mut resp = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
-        .send_json(&body)
+        .send_json(body)
         .map_err(|e| {
             anyhow::anyhow!(
                 "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."

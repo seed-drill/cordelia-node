@@ -702,11 +702,18 @@ mod tests {
         acts::note_left_out(&on.conn, &[7; 32], "laptop", 1, now).unwrap();
         crate::look::note_not_shown(&on.conn, &[[7; 32]]).unwrap();
         assert_eq!(crate::look::not_shown(&on.conn).unwrap(), [[7; 32]]);
+        // A word of its phrase that it took.
+        let under = on.latest().id();
+        let word = crate::carry::Word::give(&s.phrase, &on.key(), &under, "said".into(), now);
+        let word = word.unwrap();
+        crate::carry::take_once(&on.conn, &word, now).unwrap();
+        assert!(crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(!on.stored().is_empty());
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         assert!(!on.follows_a_phrase());
         assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
+        assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());
         assert_eq!(
             held_rows::change_entry(&on.conn, Kept::Latest).unwrap(),

@@ -92,6 +92,14 @@ pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
 /// was shown it nowhere else. It goes when the device leaves its phrase.
 pub const PERSON_NOT_SHOWN: &str = "person.not_shown";
 
+/// JSON array of the words of the recovery phrase that this device has
+/// taken and that are not void yet (decision 2026-10-04 §16): each by its
+/// signature in hex, with until when it stands and the numbers of the
+/// batches that were taken under it. A word is taken once, and so is each
+/// batch handed under one. A word goes from the list once its time has
+/// gone by, and the list goes when the device leaves its phrase.
+pub const PERSON_WORDS_TAKEN: &str = "person.words_taken";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

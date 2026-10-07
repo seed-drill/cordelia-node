@@ -466,8 +466,10 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
 
     // With the phrase: the new file comes in, into its empty slot. The
     // version above the laptop's stays where it is without the second
-    // yes.
-    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    // yes. (What the node is sent is passed on by this test, and kept.)
+    let through = PassesOn::to(laptop.http);
+    let mut at =
+        laptop.at_terminal_through(through.port, &["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 1 version into the slot").types("yes");
     at.says("Also bring in 1 version above").types("no");
     at.says("The recovery phrase, twelve words").types(&words);
@@ -491,6 +493,22 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         Some("what both hold\n")
     );
     assert!(kept_beside(&l_mem).is_empty());
+
+    // **A word is taken once** (§16): a program that saw the word cross
+    // to the node posts the same request again, within the word's ten
+    // minutes, and is refused.
+    let seen = through.bodies("/api/v1/carry/from");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let held_now = held(&laptop);
+    let (status, refused) = laptop.post_told("/api/v1/carry/from", &seen[0]);
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("was taken before: a word is taken once"),
+        "{refused}"
+    );
+    assert_eq!(held(&laptop), held_now);
 
     // Named by its six words, with the second yes: the version comes in
     // above the laptop's, and the laptop's text is kept beside the file.
@@ -621,8 +639,10 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     assert_eq!(read(&d_mem.join("late.md")), None);
 
     // With the phrase, the generation between is read, and the phone's
-    // file comes in.
-    let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
+    // file comes in. (What the node is sent is passed on by this test,
+    // and kept.)
+    let through = PassesOn::to(desktop.http);
+    let mut at = desktop.at_terminal_through(through.port, &["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");
     at.says("The recovery phrase, twelve words").types(&words);
     let said = at.done();
@@ -639,6 +659,40 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     wait_for("the file is in the desktop's folder", &all, 120, || {
         (read(&d_mem.join("late.md"))?.as_str() == "the phone's last words\n").then_some(())
     });
+
+    // **What is handed on the phrase's word is bound to that word**
+    // (§16). A program that saw the word and its batch cross to the node
+    // posts the batch again: it was taken once. It posts versions of its
+    // own under the word, as the same batch and as another: the key of
+    // the run signed neither.
+    let seen = through.bodies("/api/v1/carry/handed");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let held_now = held(&desktop);
+    let (status, again) = desktop.post_told("/api/v1/carry/handed", &seen[0]);
+    assert_eq!(status, 400, "{again}");
+    assert!(
+        again
+            .to_string()
+            .contains("was taken before under this word"),
+        "{again}"
+    );
+    let mut its_own = seen[0].clone();
+    its_own["versions"][0]["text"] = "what somebody else wrote".into();
+    its_own["versions"][0]["rev"] = 9.into();
+    let mut another = its_own.clone();
+    another["number"] = 1.into();
+    for forged in [&its_own, &another] {
+        let (status, refused) = desktop.post_told("/api/v1/carry/handed", forged);
+        assert_eq!(status, 400, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("is not signed by the key that the word"),
+            "{refused}"
+        );
+    }
+    assert_eq!(held(&desktop), held_now);
+
     // Run again, the new channel holds it.
     let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");
