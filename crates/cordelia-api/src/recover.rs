@@ -2342,6 +2342,9 @@ mod tests {
             in_part: Default::default(),
             short_passes: Default::default(),
             not_connected: Default::default(),
+            no_room: Default::default(),
+            remade: Default::default(),
+            remake_takes: Default::default(),
         };
         let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
         let (number, to_look) = follows(&alone, &made).unwrap();

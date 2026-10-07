@@ -493,10 +493,27 @@ pub(crate) struct Node {
     pub(crate) short_passes: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the relay is not connected: it has no session.
     pub(crate) not_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// How many of the next reads through the door find that the
+    /// connection has no room left for a proof.
+    pub(crate) no_room: Arc<std::sync::atomic::AtomicUsize>,
+    /// How often the connection to the relay was made again: each has a
+    /// session of its own ([`session_after`]).
+    pub(crate) remade: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many askings for the sessions it takes, once a connection is
+    /// to be made again, until the new one is there: until then the old
+    /// session is said, and a read finds the old connection, with no
+    /// room.
+    pub(crate) remake_takes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The session of the connection to the relay of a test.
 pub(crate) const SESSION: [u8; 32] = [5; 32];
+
+/// The session of the connection to the relay of a test once it was
+/// made again so often: [`SESSION`], while it was not.
+pub(crate) fn session_after(remade: usize) -> [u8; 32] {
+    [SESSION[0] + remade as u8; 32]
+}
 
 impl Node {
     /// The node of `machine`, with a stand-in for its loop: asked for
@@ -534,15 +551,48 @@ impl Node {
         let part = Arc::clone(&in_part);
         let not_connected: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let away = Arc::clone(&not_connected);
+        let no_room: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let full = Arc::clone(&no_room);
+        let remade: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let made_again = Arc::clone(&remade);
+        let remake_takes: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let takes = Arc::clone(&remake_takes);
         tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            // How many askings for the sessions are still answered with
+            // the session of the connection that is being made again.
+            let mut not_there_for = 0usize;
             loop {
                 match node.own_channels.wait_door().await {
                     DoorAsk::Sessions { answer } => {
-                        let session = match away.load(std::sync::atomic::Ordering::SeqCst) {
-                            true => None,
-                            false => Some(SESSION),
+                        let made = made_again.load(SeqCst);
+                        let session = match (away.load(SeqCst), not_there_for) {
+                            (true, _) => None,
+                            (false, 0) => Some(session_after(made)),
+                            (false, _) => Some(session_after(made - 1)),
                         };
+                        not_there_for = not_there_for.saturating_sub(1);
                         let _ = answer.send(vec![("relay".to_string(), session)]);
+                    }
+                    DoorAsk::Remake { answer, .. } => {
+                        order.lock().unwrap().push("remake");
+                        made_again.fetch_add(1, SeqCst);
+                        // The asking that notes the session from before
+                        // is answered with it, and so many after it.
+                        not_there_for = takes.load(SeqCst);
+                        let _ = answer.send(true);
+                    }
+                    DoorAsk::Read { answer, .. }
+                        if not_there_for > 0
+                            || full
+                                .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                                .is_ok() =>
+                    {
+                        order.lock().unwrap().push("no room");
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read: LeftRead::NoRoom,
+                        }]);
                     }
                     DoorAsk::Read {
                         channel,
@@ -576,6 +626,9 @@ impl Node {
             in_part,
             short_passes,
             not_connected,
+            no_room,
+            remade,
+            remake_takes,
         }
     }
 

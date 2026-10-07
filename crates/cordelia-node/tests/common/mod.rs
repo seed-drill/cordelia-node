@@ -498,6 +498,19 @@ impl Node {
         std::fs::write(self.config(), config.replace(ticks, &ticks_now)).unwrap();
     }
 
+    /// The most channels whose keys one connection proves, for before
+    /// the node starts: what a relay remembers for a connection, and what
+    /// a device sends on one. A test gives a relay and its devices one
+    /// number.
+    pub fn proofs_on_a_connection(&self, most: usize) {
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        assert!(!config.contains("[limits]"), "{config}");
+        config.push_str(&format!(
+            "\n[limits]\nchannels_proved_on_a_connection = {most}\n"
+        ));
+        std::fs::write(self.config(), config).unwrap();
+    }
+
     /// How long this relay waits before it asks a device again which
     /// channels it holds, and before it takes again a channel it dropped.
     /// For before the node starts.

@@ -72,6 +72,15 @@
 //! from a relay in a minute, and hands back what each relay handed. It
 //! stores nothing, keeps no place, and pushes nothing.
 //!
+//! **Such a read counts each proof that it sends** (§16). A relay
+//! remembers the proofs of so many channels for one connection, held or
+//! not, and looks at none beyond them. The read keeps back as many places
+//! as the device has channels of its own that are not yet proved on the
+//! connection, and a margin ([`left_proofs_kept_back`]); where it has no
+//! room left it says so, and whoever asked has the connection to that
+//! relay made again and reads on: a new connection starts with none
+//! remembered.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -100,7 +109,7 @@ use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
     ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
     OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
-    PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, entry_cost,
+    PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -198,7 +207,10 @@ struct OfLink {
     /// The entry that was last shown whole on it, by what it is named by:
     /// only that one may be shown in short.
     shown_whole: Option<[u8; 32]>,
-    /// The channels whose keys were proved on it, and when.
+    /// The channels whose keys were proved on it, and when: those of the
+    /// device's own, and those that were read as channels of a generation
+    /// that was left, each from the moment its proof is sent. It is what
+    /// the relay remembers for the connection, or more.
     proved: HashMap<[u8; 32], Instant>,
     /// When the channels of the names that the personal channel lists
     /// were last proved on it, all of them.
@@ -294,6 +306,9 @@ pub struct DeviceEntries {
     state: Arc<AppState>,
     clock: Clock,
     leave: Leave,
+    /// The most channels whose keys are proved on one connection: what a
+    /// relay remembers for one.
+    most_proved: usize,
     kept: Mutex<Kept>,
     /// While the device wakes, one pass at a time asks every relay first.
     waking: tokio::sync::Mutex<()>,
@@ -307,10 +322,18 @@ pub struct DeviceEntries {
 impl DeviceEntries {
     /// For the node whose state is `state`, reading the time from `clock`.
     pub fn new(state: Arc<AppState>, clock: Clock) -> Arc<Self> {
+        Self::proving_at_most(state, clock, MAX_CHANNELS_PROVED_ON_A_CONNECTION)
+    }
+
+    /// [`Self::new`], for a node whose relays remember the proofs of
+    /// `most_proved` channels for one connection, where that is fewer
+    /// than a relay does: no more than that are proved on one.
+    pub fn proving_at_most(state: Arc<AppState>, clock: Clock, most_proved: usize) -> Arc<Self> {
         Arc::new(Self {
             state,
             leave: Leave::new(clock.clone()),
             clock,
+            most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
             waking: tokio::sync::Mutex::new(()),
             turns: Mutex::default(),
@@ -409,7 +432,10 @@ impl DeviceEntries {
     /// - **A read:** the channel is read at every relay beside one
     ///   another, each through the one door ([`Self::read_left`]), and
     ///   each relay is answered for by its name: one that is not
-    ///   connected as that.
+    ///   connected as that. Where the asking names relays, it is read at
+    ///   those alone.
+    /// - **A connection to be made again** is the node's own to make: it
+    ///   holds the connections. Asked here, it is answered with no.
     ///
     /// **A node that is held up reads nothing** (decision 2026-10-04
     /// §10.1): every relay is answered for as not read.
@@ -423,9 +449,13 @@ impl DeviceEntries {
                     .collect();
                 let _ = answer.send(sessions);
             }
+            DoorAsk::Remake { answer, .. } => {
+                let _ = answer.send(false);
+            }
             DoorAsk::Read {
                 channel,
                 by,
+                only,
                 until,
                 answer,
             } => {
@@ -433,7 +463,11 @@ impl DeviceEntries {
                 let own = self.state.identity.public_key();
                 let mut reads = tokio::task::JoinSet::new();
                 let mut read: Vec<LeftAt> = Vec::new();
-                for relay in relays {
+                let asked_of = |relay: &&Relay| {
+                    let only = only.as_ref();
+                    only.is_none_or(|only| only.contains(&relay.name))
+                };
+                for relay in relays.iter().filter(asked_of) {
                     let name = relay.name.clone();
                     let Some(link) = open(relay) else {
                         let read_as = LeftRead::NotReached;
@@ -502,6 +536,14 @@ impl DeviceEntries {
     /// used up it waits for room, and a relay is never asked for more
     /// than it may hand a connection. A channel that is not read to its
     /// end by `until` is handed back as that.
+    ///
+    /// **The proof is counted from the moment it is sent, whatever the
+    /// relay answers** (decision 2026-10-04 §16): a relay remembers every
+    /// proof that holds, of a channel it holds or not. And it is sent
+    /// only where the connection has room for it beyond what the
+    /// device's own channels still need there ([`Self::room_for_left`]):
+    /// where it has none, nothing is asked of the relay, and the read
+    /// says so.
     async fn read_left(
         &self,
         link: &Link,
@@ -524,20 +566,15 @@ impl DeviceEntries {
                 continue;
             }
             // A relay remembers so many channels for a connection, and
-            // looks at no proof beyond them: one more is not sent.
-            let room = proved || {
-                let kept = lock(&self.kept);
-                let proved = kept.links.get(&link.id()).map(|of| &of.proved);
-                proved.is_none_or(|proved| {
-                    proved.contains_key(channel)
-                        || proved.len() < MAX_CHANNELS_PROVED_ON_A_CONNECTION
-                })
-            };
-            if !room {
-                return LeftRead::NotRead(
-                    "this connection has proved as many channels as a relay remembers for one"
-                        .into(),
-                );
+            // looks at no proof beyond them: one for which there is no
+            // room is not sent. One that is sent is counted now.
+            if !proved {
+                if !self.room_for_left(link, channel) {
+                    return LeftRead::NoRoom;
+                }
+                let mut kept = lock(&self.kept);
+                let of = kept.links.entry(link.id()).or_default();
+                of.proved.entry(*channel).or_insert(self.clock.now());
             }
             let page = self
                 .leave
@@ -557,10 +594,6 @@ impl DeviceEntries {
                     self.took(link, counted);
                     {
                         let mut kept = lock(&self.kept);
-                        if !proved {
-                            let of = kept.links.entry(link.id()).or_default();
-                            of.proved.insert(*channel, self.clock.now());
-                        }
                         let of = kept.relays.entry(link.name().to_string()).or_default();
                         of.counts.pages += 1;
                         of.counts.pulled += entries.len() as u64;
@@ -599,6 +632,28 @@ impl DeviceEntries {
                 }
             }
         }
+    }
+
+    /// Whether the connection at `link` has room for the proof of
+    /// `channel`, a channel of a generation that was left (decision
+    /// 2026-10-04 §16). A relay remembers so many channels for one
+    /// connection. Of those places, as many are kept back as the device
+    /// has channels of its own that are not yet proved there, and a
+    /// margin ([`left_proofs_kept_back`]): what is read of a generation
+    /// that was left never takes the place of a channel of the device's
+    /// own. A channel that was proved there already has its place.
+    fn room_for_left(&self, link: &Link, channel: &[u8; 32]) -> bool {
+        let own = at_relays::channels(&lock(&self.state.db), &self.state.identity);
+        let own = own.unwrap_or_default();
+        let kept = lock(&self.kept);
+        let none = HashMap::new();
+        let proved = kept.links.get(&link.id()).map_or(&none, |of| &of.proved);
+        if proved.contains_key(channel) {
+            return true;
+        }
+        let not_proved = own.iter().filter(|own| !proved.contains_key(&own.id));
+        let kept_back = left_proofs_kept_back(not_proved.count(), self.most_proved);
+        proved.len() + kept_back < self.most_proved
     }
 
     /// Ask the relay at `link` for what the device of each key in `typed`
@@ -1400,8 +1455,7 @@ impl DeviceEntries {
             // A relay remembers so many channels for a connection, and
             // looks at no proof beyond them.
             let room = proved.is_none_or(|proved| {
-                proved.contains_key(&channel.id)
-                    || proved.len() < MAX_CHANNELS_PROVED_ON_A_CONNECTION
+                proved.contains_key(&channel.id) || proved.len() < self.most_proved
             });
             if !room {
                 return Step::Done(false);
@@ -1470,7 +1524,7 @@ impl DeviceEntries {
         if !due {
             return;
         }
-        let most = MAX_CHANNELS_PROVED_ON_A_CONNECTION.saturating_sub(own);
+        let most = self.most_proved.saturating_sub(own);
         let listed = at_relays::listed(&lock(&self.state.db), most);
         let Ok(listed) = listed else { return };
         for channel in &listed {

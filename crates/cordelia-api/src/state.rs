@@ -239,6 +239,7 @@ pub struct OwnChannels {
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
+#[derive(Clone)]
 pub enum ProvedBy {
     /// The node holds the channel's secret: it makes the proof for each
     /// connection itself. The secret is of a generation that the device
@@ -261,6 +262,17 @@ pub enum LeftRead {
     NotHeld,
     /// Nothing was read, and why.
     NotRead(String),
+    /// Nothing was read: the connection is another than the one that
+    /// the proofs were made for. Whoever made them makes them again, for
+    /// the connection there is now. It is never taken for a relay that
+    /// holds none.
+    Changed,
+    /// Nothing was read: the connection has no room left for a proof
+    /// more. A relay remembers so many channels for one connection, and
+    /// places are kept back for the device's own channels (decision
+    /// 2026-10-04 §16). Whoever asked has the connection made again
+    /// ([`DoorAsk::Remake`]), and reads on there.
+    NoRoom,
     /// What it handed of the channel, each entry as its bytes on the
     /// wire, and whether the channel was read to its end.
     Read { entries: Vec<Vec<u8>>, whole: bool },
@@ -285,12 +297,24 @@ pub enum DoorAsk {
     },
     /// Read the channel whose ID is `channel` at each relay, until
     /// `until`: it is of a generation that the device has left, or never
-    /// followed.
+    /// followed. With `only`, it is read at the relays of those names
+    /// alone, and each other is not answered for: a read goes on so at a
+    /// relay whose connection was made again.
     Read {
         channel: [u8; 32],
         by: ProvedBy,
+        only: Option<Vec<String>>,
         until: Instant,
         answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
+    },
+    /// Have the connection to the relay called `relay` made again
+    /// (decision 2026-10-04 §16): it is closed, and the node dials the
+    /// relay anew. A relay remembers the channels that were proved on a
+    /// connection for that connection alone: a new one starts with none.
+    /// Answered with whether there was a connection to close.
+    Remake {
+        relay: String,
+        answer: tokio::sync::oneshot::Sender<bool>,
     },
 }
 

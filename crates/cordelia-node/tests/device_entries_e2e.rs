@@ -29,8 +29,8 @@ use cordelia_api::state::{
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    OUTBOX_REFUSED_RETRY_MAX_SECS, OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
-    entry_cost,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -79,6 +79,12 @@ struct Device {
 impl Device {
     /// A new install, which follows no phrase and is set up with no relay.
     fn new(label: &'static str) -> Self {
+        Self::proving_at_most(label, MAX_CHANNELS_PROVED_ON_A_CONNECTION)
+    }
+
+    /// [`Self::new`], for a device whose relays remember the proofs of
+    /// `most_proved` channels for one connection.
+    fn proving_at_most(label: &'static str, most_proved: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let identity = NodeIdentity::generate().unwrap();
         let for_transport = Arc::new(NodeIdentity::from_seed(*identity.seed()).unwrap());
@@ -113,7 +119,7 @@ impl Device {
             history: Default::default(),
         });
         let clock = Clock::system();
-        let engine = DeviceEntries::new(state.clone(), clock.clone());
+        let engine = DeviceEntries::proving_at_most(state.clone(), clock.clone(), most_proved);
         Self {
             label,
             state,
@@ -4260,11 +4266,23 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
 /// Ask the device's engine to read `channel` at each relay through the
 /// door for a carry, as the node does where a command's work asked.
 async fn reads_left(device: &Device, channel: [u8; 32], by: ProvedBy) -> Vec<LeftAt> {
+    reads_left_at(device, channel, by, None).await
+}
+
+/// [`reads_left`], at the relays named in `only` alone where it names
+/// some.
+async fn reads_left_at(
+    device: &Device,
+    channel: [u8; 32],
+    by: ProvedBy,
+    only: Option<Vec<String>>,
+) -> Vec<LeftAt> {
     let (answer, answered) = tokio::sync::oneshot::channel();
     let until = std::time::Instant::now() + Duration::from_secs(30);
     let ask = DoorAsk::Read {
         channel,
         by,
+        only,
         until,
         answer,
     };
@@ -4410,6 +4428,16 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
         .map(|at| (at.relay.as_str(), at.read == LeftRead::NotReached))
         .collect();
     assert_eq!(said, [("relay", false), ("far", true)]);
+    // Asked for at some of them, it is read at those alone, and no
+    // other is answered for.
+    for (only, reached) in [("relay", true), ("far", false)] {
+        let read = reads_left_at(&a, old, by_secret(), Some(vec![only.to_string()])).await;
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].relay, only);
+        assert_eq!(read[0].read != LeftRead::NotReached, reached);
+    }
+    let nowhere = reads_left_at(&a, old, by_secret(), Some(Vec::new())).await;
+    assert!(nowhere.is_empty(), "{nowhere:?}");
 
     // A node that is held up reads nothing.
     a.state
@@ -4588,6 +4616,128 @@ async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
     }
     assert!(asked_enough);
     assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
+}
+
+/// **A read of a generation that was left counts each proof it sends,
+/// and keeps places back for the device's own channels** (decision
+/// 2026-10-04 §16), against a stand-in that sees every request. A relay
+/// remembers the proofs of so many channels for one connection, of
+/// channels that it holds or not, and looks at none beyond them: here
+/// twelve.
+///
+/// The device holds four channels of its own, and reads thirty of a
+/// generation that was left, of which the relay holds none: it answers
+/// each proof with no. Each of those proofs is counted all the same. On
+/// one connection the device sends twelve proofs and not one more:
+/// eight for what it reads, and one for each channel of its own, whether
+/// the pass or the read comes first there. **Where a read finds no room
+/// it asks nothing of the relay, and says so;** on a connection that is
+/// made again it goes on from the channel it was at, and every channel
+/// is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_what_was_left_counts_its_proofs_and_keeps_places_for_the_devices_own() {
+    const MOST: usize = 12;
+    let relay = StandIn::started().await;
+    let mut a = Device::proving_at_most("laptop", MOST);
+    a.makes_the_phrase(&phrase());
+    for name in ["one", "two", "three"] {
+        a.holds(name);
+    }
+    let own: BTreeSet<[u8; 32]> = ["one", "two", "three"]
+        .iter()
+        .map(|name| a.channel(name))
+        .chain([a.personal()])
+        .collect();
+    // Thirty channels of a generation that was left, and three more:
+    // names that the device does not hold, each with its secret.
+    let left: Vec<([u8; 32], [u8; 32])> = (0..33)
+        .map(|n| {
+            let secret = derive::own_secret(&a.secret(), &format!("left-{n}")).unwrap();
+            (secret, derive::channel_id(&secret).unwrap())
+        })
+        .collect();
+    // The proofs that the relay saw since it was last asked: those of
+    // the device's own channels, and those of channels that were left.
+    let proofs = |relay: &StandIn| -> (usize, usize) {
+        let proved: Vec<[u8; 32]> = relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::ChannelProve(prove) => Some(prove.channel),
+                _ => None,
+            })
+            .collect();
+        let of_its_own = proved.iter().filter(|channel| own.contains(*channel));
+        let of_its_own = of_its_own.count();
+        (of_its_own, proved.len() - of_its_own)
+    };
+
+    a.connects_to("relay", relay.port, relay.key).await;
+    // On the first connection the pass comes first: a proof for each
+    // channel of the device's own.
+    a.passes().await;
+    let mut on_this_connection = proofs(&relay);
+    assert_eq!(on_this_connection, (4, 0));
+    let mut connections = vec![];
+    for (secret, channel) in &left[..30] {
+        loop {
+            let by = ProvedBy::Secret(zeroize::Zeroizing::new(*secret));
+            let read = reads_left(&a, *channel, by).await;
+            let (of_its_own, of_what_was_left) = proofs(&relay);
+            on_this_connection.0 += of_its_own;
+            on_this_connection.1 += of_what_was_left;
+            match &read[0].read {
+                // The relay holds none of it: the proof was sent, and
+                // is counted.
+                LeftRead::NotHeld => {
+                    assert_eq!(of_what_was_left, 1);
+                    break;
+                }
+                // No room: nothing was asked of the relay. The pass
+                // still has a place for each channel of the device's
+                // own, and the connection then has as many proofs as a
+                // relay remembers, and not one more.
+                LeftRead::NoRoom => {
+                    assert_eq!((of_its_own, of_what_was_left), (0, 0));
+                    a.passes().await;
+                    on_this_connection.0 += proofs(&relay).0;
+                    assert_eq!(on_this_connection, (4, MOST - 4));
+                    connections.push(on_this_connection);
+                    // Made again, a connection starts with none
+                    // remembered: here the read comes first.
+                    a.connects_to("relay", relay.port, relay.key).await;
+                    on_this_connection = (0, 0);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    // Thirty channels, eight on a connection: three connections that
+    // were filled, and six on the fourth, where the pass then proves
+    // each channel of the device's own.
+    assert_eq!(connections, vec![(4, 8); 3]);
+    assert_eq!(on_this_connection, (0, 6));
+    a.passes().await;
+    assert_eq!(proofs(&relay), (4, 0));
+    // Two more are read there, and the connection is full: a third has
+    // no room.
+    let reads = |n: usize| {
+        let (secret, channel) = left[n];
+        reads_left(
+            &a,
+            channel,
+            ProvedBy::Secret(zeroize::Zeroizing::new(secret)),
+        )
+    };
+    for n in [30, 31] {
+        assert_eq!(reads(n).await[0].read, LeftRead::NotHeld);
+    }
+    assert_eq!(reads(32).await[0].read, LeftRead::NoRoom);
+    assert_eq!(proofs(&relay), (0, 2));
+    // A channel that was read on this connection has its place there,
+    // which the relay remembers: it is read again with no room asked.
+    assert_eq!(reads(29).await[0].read, LeftRead::NotHeld);
+    assert_eq!(proofs(&relay), (0, 1));
 }
 
 // ── The node, as a process ───────────────────────────────────────────

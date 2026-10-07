@@ -82,6 +82,15 @@ fn db(state: &AppState) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
 /// A node with no network has nobody to ask: nothing is read, of no
 /// relay. Where the node does not take the asking up in time, nothing is
 /// read either.
+///
+/// **Where a connection has no room left for the channel's proof, it is
+/// made again, and the read goes on there** (decision 2026-10-04 §16): a
+/// relay remembers the proofs of so many channels for one connection,
+/// and a new connection starts with none remembered. The node holding
+/// the channel's secret proves it anew on the new connection. Proofs
+/// that a command made were made for the connection that is gone: the
+/// relay is then answered for as one whose connection changed, and the
+/// command makes them again.
 pub async fn read_at_relays(
     state: &AppState,
     channel: [u8; 32],
@@ -91,10 +100,53 @@ pub async fn read_at_relays(
     if state.push_tx.is_none() {
         return Vec::new();
     }
+    let mut read = asks_to_read(state, channel, by.clone(), None, until).await;
+    loop {
+        let no_room = |at: &&LeftAt| at.read == LeftRead::NoRoom;
+        let full: Vec<String> = read
+            .iter()
+            .filter(no_room)
+            .map(|at| at.relay.clone())
+            .collect();
+        if full.is_empty() || Instant::now() >= until {
+            return read;
+        }
+        let remade = made_again(state, &full, until).await;
+        let again = match &by {
+            ProvedBy::Secret(_) if remade.is_empty() => return read,
+            ProvedBy::Secret(_) => {
+                asks_to_read(state, channel, by.clone(), Some(remade), until).await
+            }
+            ProvedBy::Proofs(_) => full
+                .iter()
+                .map(|relay| LeftAt {
+                    relay: relay.clone(),
+                    read: LeftRead::Changed,
+                })
+                .collect(),
+        };
+        for at in again {
+            if let Some(of_it) = read.iter_mut().find(|of_it| of_it.relay == at.relay) {
+                *of_it = at;
+            }
+        }
+    }
+}
+
+/// One asking of the door to read `channel`: at every relay, or at those
+/// named in `only`.
+async fn asks_to_read(
+    state: &AppState,
+    channel: [u8; 32],
+    by: ProvedBy,
+    only: Option<Vec<String>>,
+    until: Instant,
+) -> Vec<LeftAt> {
     let (answer, answered) = tokio::sync::oneshot::channel();
     state.own_channels.ask_door(DoorAsk::Read {
         channel,
         by,
+        only,
         until,
         answer,
     });
@@ -104,6 +156,42 @@ pub async fn read_at_relays(
     match tokio::time::timeout(wait, answered).await {
         Ok(Ok(read)) => read,
         _ => Vec::new(),
+    }
+}
+
+/// How often the node is asked whether a connection that is being made
+/// again is there.
+const REMADE_ASKED_EVERY: Duration = Duration::from_millis(200);
+
+/// Have the connection to each relay named in `relays` made again
+/// (decision 2026-10-04 §16), and wait, until `until` at most, for each
+/// to have a connection that is another than the one it had: one with
+/// another session. Returns the relays that have one.
+async fn made_again(state: &AppState, relays: &[String], until: Instant) -> Vec<String> {
+    let session_of = |all: &[(String, Option<[u8; 32]>)], relay: &String| {
+        let of_it = all.iter().find(|(name, _)| name == relay);
+        of_it.and_then(|(_, session)| *session)
+    };
+    let before = sessions(state).await;
+    for relay in relays {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        state.own_channels.ask_door(DoorAsk::Remake {
+            relay: relay.clone(),
+            answer,
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(30), answered).await;
+    }
+    loop {
+        tokio::time::sleep(REMADE_ASKED_EVERY).await;
+        let now = sessions(state).await;
+        let another = |relay: &&String| {
+            let is = session_of(&now, relay);
+            is.is_some() && is != session_of(&before, relay)
+        };
+        let remade: Vec<String> = relays.iter().filter(another).cloned().collect();
+        if remade.len() == relays.len() || Instant::now() >= until {
+            return remade;
+        }
     }
 }
 
@@ -178,6 +266,8 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
             LeftRead::NotReached => "not reached".to_string(),
             LeftRead::NotHeld => "not held".to_string(),
             LeftRead::NotRead(why) => format!("not read: {why}"),
+            LeftRead::Changed => "not read: the connection changed".to_string(),
+            LeftRead::NoRoom => "not read: the connection has no room left for a proof".to_string(),
             LeftRead::Read {
                 entries: wire,
                 whole,
@@ -1485,6 +1575,94 @@ mod tests {
         );
         assert_eq!(node.text(LAB, "only.md").as_deref(), Some("of device 2"));
         assert!(look_for_phrase(&node.state, LAB).await.is_ok());
+    }
+
+    /// Where a connection has no room left for the proof of a channel
+    /// that was left, it is made again, and the read goes on there
+    /// (decision 2026-10-04 §16): a relay remembers the proofs of so many
+    /// channels for one connection, and a new connection starts with
+    /// none. The node proves the channel anew where it holds its secret.
+    /// Proofs that a command made were made for the connection that is
+    /// gone: the relay is answered for as one whose connection changed,
+    /// and never as one that holds none.
+    #[actix_web::test]
+    async fn test_a_read_goes_on_at_a_connection_that_was_made_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1], LAB);
+        let old = s[1].own(LAB);
+        s.write(1, LAB, "stays.md", "of device 1");
+        let at_the_relay = s[1].stored_in(&old);
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &at_the_relay);
+        let own = node.state.identity.public_key();
+
+        // The connection has no room, twice: it is made again each time,
+        // and the channel is then read to its end.
+        node.no_room.store(2, SeqCst);
+        let done = carry_name(&node.state, LAB, false).await.unwrap();
+        assert_eq!(
+            *node.did.lock().unwrap(),
+            ["pass", "no room", "remake", "no room", "remake", "read"]
+        );
+        assert_eq!(node.remade.load(SeqCst), 2);
+        assert!(done.read_all);
+        assert_eq!(done.tally.carried, 1);
+        assert_eq!(node.text(LAB, "stays.md").as_deref(), Some("of device 1"));
+        let said = done.says(LAB);
+        assert_eq!(
+            said["generations"][0]["relays"],
+            json!([{ "relay": "relay", "read": "whole" }])
+        );
+
+        // With proofs that a command made: the connection is made again,
+        // and the command is told that it changed.
+        node.did.lock().unwrap().clear();
+        node.no_room.store(1, SeqCst);
+        let channel = derive::channel_id(&old).unwrap();
+        let session = crate::several::session_after(2);
+        let proof = cordelia_crypto::proof::make(&old, &session, &own).unwrap();
+        let read = read_with_proofs(&node.state, channel, vec![("relay".into(), proof)]).await;
+        assert_eq!(*node.did.lock().unwrap(), ["no room", "remake"]);
+        assert_eq!(read["entries"], 0, "{read}");
+        assert_eq!(
+            read["relays"],
+            json!([{ "relay": "relay", "read": "not read: the connection changed" }])
+        );
+        assert_eq!(
+            sessions(&node.state).await,
+            [("relay".to_string(), Some(crate::several::session_after(3)))]
+        );
+
+        // The read goes on only once the connection is another: while
+        // the node still says the session of the one that is being made
+        // again, it waits, and asks nothing of the relay.
+        node.did.lock().unwrap().clear();
+        node.no_room.store(1, SeqCst);
+        node.remake_takes.store(3, SeqCst);
+        let by = ProvedBy::Secret(Zeroizing::new(old));
+        let within = Instant::now() + Duration::from_secs(30);
+        let at = read_at_relays(&node.state, channel, by, within).await;
+        assert_eq!(*node.did.lock().unwrap(), ["no room", "remake", "read"]);
+        assert!(matches!(at[0].read, LeftRead::Read { whole: true, .. }));
+        node.remake_takes.store(0, SeqCst);
+
+        // Where the time has gone by, the connection is not made again,
+        // and the relay is said to be one that was not read: for want of
+        // room, and not as one that holds none.
+        node.did.lock().unwrap().clear();
+        node.no_room.store(1, SeqCst);
+        let by = ProvedBy::Secret(Zeroizing::new(old));
+        let at = read_at_relays(&node.state, channel, by, Instant::now()).await;
+        assert_eq!(*node.did.lock().unwrap(), ["no room"]);
+        assert_eq!(
+            handed(&at).1,
+            [json!({
+                "relay": "relay",
+                "read": "not read: the connection has no room left for a proof",
+            })]
+        );
     }
 
     /// The new channel was fetched whole where a whole pass that began

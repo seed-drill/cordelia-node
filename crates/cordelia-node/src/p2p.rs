@@ -2102,6 +2102,7 @@ pub async fn p2p_loop(
     trusted_peer_ids: Vec<NodeId>,
     max_storage_bytes: u64,
     relay_ask_again: std::time::Duration,
+    most_proved: usize,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -2198,11 +2199,14 @@ pub async fn p2p_loop(
     // of any other role has none, and answers none of their streams.
     let relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>> =
         (node_role == "relay").then(|| {
-            std::sync::Arc::new(crate::relay_entries::RelayEntries::new(
-                max_storage_bytes,
-                relay_addrs.clone(),
-                relay_ask_again,
-            ))
+            std::sync::Arc::new(
+                crate::relay_entries::RelayEntries::new(
+                    max_storage_bytes,
+                    relay_addrs.clone(),
+                    relay_ask_again,
+                )
+                .remembering_at_most(most_proved),
+            )
         });
     // The cap is read here, when the node starts, and at no other time:
     // a relay whose cap came down drops its newest channels now.
@@ -2217,9 +2221,10 @@ pub async fn p2p_loop(
     // passes that prove, pull and push. Only a personal node has one, and
     // it does nothing on a device that follows no phrase.
     let device_entries = (node_role == "personal").then(|| {
-        cordelia_node::device_entries::DeviceEntries::new(
+        cordelia_node::device_entries::DeviceEntries::proving_at_most(
             state.clone().into_inner(),
             cordelia_node::device_entries::Clock::system(),
+            most_proved,
         )
     });
 
@@ -2836,9 +2841,29 @@ pub async fn p2p_loop(
             // or never followed, read at each relay (decision 2026-10-04
             // §7.3, §9). Off the select loop: it waits on the relays.
             ask = state.own_channels.wait_door(), if device_entries.is_some() => {
-                if let Some(device) = device_entries.clone() {
-                    let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr);
-                    tokio::spawn(async move { device.door(&relays, ask).await });
+                let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr);
+                match (ask, device_entries.clone()) {
+                    // The connection to a relay is made again (decision
+                    // 2026-10-04 §16): a read of a generation that was
+                    // left has no room there for another proof, and a
+                    // relay remembers the proofs of a connection for
+                    // that connection alone. It is closed here, and the
+                    // relay is dialled anew as any relay that is not
+                    // connected is: nothing is kept of the tries before.
+                    (cordelia_api::state::DoorAsk::Remake { relay, answer }, _) => {
+                        let link = relays.into_iter().find(|set_up| set_up.name == relay);
+                        let peer = link.and_then(|set_up| set_up.link).map(|link| link.relay().clone());
+                        if let Some(peer) = &peer {
+                            tracing::info!(%relay, "the connection to a relay is made again: it has no room left for a proof");
+                            conn_mgr.disconnect(peer);
+                            relay_tries.remove(&relay);
+                        }
+                        let _ = answer.send(peer.is_some());
+                    }
+                    (ask, Some(device)) => {
+                        tokio::spawn(async move { device.door(&relays, ask).await });
+                    }
+                    (_, None) => {}
                 }
             }
 

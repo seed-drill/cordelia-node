@@ -920,6 +920,114 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
     );
 }
 
+/// What `n` holds under the name `name`, by key, with its text.
+fn held_under(n: &Node, name: &str) -> Vec<(String, Option<String>)> {
+    let answer = n.post("/api/v1/channels/entries", json!({ "channel": name }));
+    let mut held: Vec<(String, Option<String>)> = answer["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["key"].as_str().unwrap_or_default().to_string(),
+                entry["content"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+/// **A recovery reads more channels than one connection has places for**
+/// (decision 2026-10-04 §16). The relay here remembers the proofs of 16
+/// channels for one connection, and the new machine goes by the same
+/// number. The person has five names, in two generations: the look reads
+/// ten channels of generations that were left, after the command has
+/// read three, while the machine comes to hold six channels of its own.
+///
+/// The read counts each proof that it sends, and keeps a place back for
+/// each channel of the machine's own. Where a connection has no room
+/// left, it is made again, and the look goes on from the name it was at:
+/// every name is read, and every file comes back. And the machine's own
+/// channels have their places: what it carried is sent.
+#[test]
+fn a_recovery_reads_more_names_than_one_connection_has_places_for() {
+    const NAMES: [&str; 5] = ["five", "four", "one", "three", "two"];
+    let mut relay = node("relay", "relay", None);
+    relay.proofs_on_a_connection(16);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let out = laptop.cli(&[
+        "sync",
+        "claude",
+        "--dir",
+        &path(&laptop.home().join(".claude")),
+    ]);
+    assert!(out.starts_with("Sync turned on.\n"), "{out}");
+    for name in NAMES {
+        let folder = laptop.home().join(format!("notes-{name}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let memory = claude_folder(&laptop.home(), &folder);
+        std::fs::write(memory.join("a.md"), format!("written under {name}\n")).unwrap();
+        let out = laptop.cli(&["sync", "map", &path(&folder), name]);
+        assert!(out.contains(&format!("to {name}.")), "{out}");
+    }
+    let all = [&relay, &laptop];
+    let each_is_held = |n: &Node| {
+        NAMES.iter().try_for_each(|name| {
+            let said = format!("written under {name}\n");
+            (held_under(n, name) == [("a.md".to_string(), Some(said))]).then_some(())
+        })
+    };
+    wait_for("the relay was sent each name", &all, 180, || {
+        each_is_held(&laptop).and(has_sent_everything(&laptop))
+    });
+    // A change: each name is in two generations at the relay.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for("the relay was sent what was carried", &all, 180, || {
+        let applied = person_of(&laptop)["change"] == 2;
+        (applied && person_of(&laptop)["devices"][0]["sent"] == true)
+            .then_some(())
+            .and(has_sent_everything(&laptop))
+    });
+    laptop.stop();
+
+    let mut new = node("new", "personal", Some(relay.p2p));
+    new.proofs_on_a_connection(16);
+    new.start();
+    wait_for("new machine healthy", &[&new], 30, || healthy(&new));
+    wait_for("it reaches its relay", &[&new, &relay], 60, || {
+        has_hot_peer(&new)
+    });
+    let mut at = recovers(&new, None, &words, &["lost"]);
+    at.says("The change is made (change 3)")
+        .says("The look is made: 5 names read, and 5 versions carried, in 5 names.");
+    let said = at.done();
+    println!("{said}");
+    assert!(!said.contains("Could not read"), "{said}");
+    // Every file came back, under each name.
+    assert_eq!(each_is_held(&new), Some(()));
+    // The connection had no room left, and was made again.
+    let log = std::fs::read_to_string(new.log()).unwrap();
+    assert!(
+        log.contains("the connection to a relay is made again"),
+        "{}",
+        new.log_tail()
+    );
+    // And the machine's own channels have their places on the
+    // connection there is now: what it carried is sent.
+    wait_for(
+        "the new machine has sent what it carried",
+        &[&relay, &new],
+        180,
+        || has_sent_everything(&new),
+    );
+}
+
 /// A recovery that is cut short, and the one after it (decision
 /// 2026-10-04 §9). The relay has no room for a new channel: it takes the
 /// first machine's change entry, which needs none, and nothing that the

@@ -146,6 +146,7 @@ Rate limiting and resource caps. Protects against DoS, Sybil attacks, and storag
 | `max_message_bytes` | integer | `1048576` (1 MB) | > 0 | Maximum wire message size. Messages exceeding this are rejected and the stream is reset. | network-protocol.md SS3.1, SS12.4 |
 | `writes_per_peer_per_minute` | integer | `10` | > 0 | Maximum writes accepted from a single peer per minute. | network-protocol.md SS12.4 |
 | `writes_per_channel_per_minute` | integer | `100` | > 0 | Maximum writes per channel per minute (aggregate across all peers). | network-protocol.md SS12.4 |
+| `channels_proved_on_a_connection` | integer | `1024` | 2-1024 (a value outside is taken as the nearest) | The most channels whose keys one connection proves: what a relay remembers for a connection, and what a device sends on one. It can only be set lower than the protocol's own bound, which both ends go by. No deployment sets it: a test lowers it, on a relay and on its devices alike. | decision 2026-10-04 §2.4, §16 |
 | `max_bytes_per_peer_per_second` | integer | `10485760` (10 MB/s) | > 0 | Maximum bandwidth per peer per second. | network-protocol.md SS16.4, SS12.4 |
 | `max_push_items_per_channel_per_minute` | integer | `1000` | > 0 | Maximum push items per channel per minute. | network-protocol.md SS16.4, SS12.4 |
 | `max_relay_fanout_per_second` | integer | `100` | > 0 | Relay re-push rate cap (items per second). Only relevant for relay nodes. | network-protocol.md SS16.4, SS12.4 |
