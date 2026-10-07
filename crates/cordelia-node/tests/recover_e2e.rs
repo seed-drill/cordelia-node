@@ -927,6 +927,13 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
 /// in by `cordelia sync carry lab --from`, with both keys named in one
 /// run, each by the first six words of its fingerprint: the second
 /// machine never knew either by a label.
+///
+/// **The command never ends its look saying less than "keep this machine
+/// on" while what it carried is unsent.** What is still to send is asked
+/// of the relays that the node is connected to, and the node says which
+/// those are from the moment a relay is reached: the first machine here
+/// would otherwise be told, for as long as its governor has not ticked,
+/// that no relay is connected and so that nothing waits.
 #[test]
 fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() {
     let mut relay = relay_started();
@@ -946,7 +953,16 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
     relay.start();
     wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
 
-    let mut first = device_started("first", &relay);
+    // The first machine's governor ticks only every half minute: what
+    // the command says at its end is what the node knows from when its
+    // relay was reached, and not from a tick that came before that.
+    let mut first = node("first", "personal", Some(relay.p2p));
+    first.governor_tick_secs(30);
+    first.start();
+    wait_for("device healthy", &[&first], 30, || healthy(&first));
+    wait_for("device reaches its relay", &[&first, &relay], 60, || {
+        has_hot_peer(&first)
+    });
     let mut at = recovers(&first, None, &two.words, &["lost", "lost"]);
     at.says("The change is made (change 2)")
         .says("The look is made: 1 name read, and 2 versions carried, in 1 name.");

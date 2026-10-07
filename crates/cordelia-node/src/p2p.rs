@@ -1987,6 +1987,24 @@ pub fn post_connect(
         .peers_warm
         .store(warm as u64, std::sync::atomic::Ordering::Relaxed);
 
+    // Step 6a: the connected peers, as the local API says them. They
+    // are said at each tick of the governor: said here too, a command
+    // that asks what is still to send to a relay straight after the
+    // relay was reached is not answered from a list that was made before
+    // the connection, in which no relay is connected and so nothing
+    // waits anywhere (decision 2026-10-04 §8, §9).
+    let connected: Vec<&cordelia_network::governor::PeerInfo> = governor
+        .all_peers()
+        .filter(|p| {
+            matches!(
+                p.state,
+                cordelia_network::governor::PeerState::Hot
+                    | cordelia_network::governor::PeerState::Warm
+            )
+        })
+        .collect();
+    publish_peers(state, &connected, conn_mgr);
+
     // Step 6b: Sync peer states for protocol gating (§2.1)
     // Without this, push handler rejects items from peers promoted during
     // bootstrap/accept (before first governor tick syncs peer_states).

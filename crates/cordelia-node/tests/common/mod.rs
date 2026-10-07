@@ -469,6 +469,16 @@ impl Node {
         .unwrap();
     }
 
+    /// How often this node's governor ticks, in seconds, for before the
+    /// node starts: at each tick it looks at its connections again.
+    pub fn governor_tick_secs(&self, secs: u64) {
+        let config = std::fs::read_to_string(self.config()).unwrap();
+        let ticks = "tick_interval_secs = 2\n";
+        assert_eq!(config.matches(ticks).count(), 1, "{config}");
+        let ticks_now = format!("tick_interval_secs = {secs}\n");
+        std::fs::write(self.config(), config.replace(ticks, &ticks_now)).unwrap();
+    }
+
     /// How long this relay waits before it asks a device again which
     /// channels it holds, and before it takes again a channel it dropped.
     /// For before the node starts.
