@@ -394,6 +394,8 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
     std::thread::sleep(Duration::from_secs(2));
     let later = no_relay_secs(&a).as_u64().unwrap();
     assert!(later > first && later < 120, "{first} then {later}");
+    // `cordelia status --json` carries it as the node says it.
+    assert!(state(&a)["no_relay_secs"].as_u64() >= Some(later));
 
     relay.start();
     wait_for("relay healthy", &[&relay, &a], 30, || healthy(&relay));
@@ -407,6 +409,9 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
         30,
         || no_relay_secs(&a).is_null().then_some(()),
     );
+    let said = state(&a);
+    assert!(said["no_relay_secs"].is_null(), "{said}");
+    assert!(said.as_object().unwrap().contains_key("no_relay_secs"));
 }
 
 /// The peers `n` is connected to, by key.

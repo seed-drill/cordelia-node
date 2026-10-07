@@ -645,6 +645,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             // The node's own version: `version` above is this command's.
             out["node_version"] = live["version"].clone();
             out["uptime_secs"] = live["uptime_secs"].clone();
+            // For how long no relay has been connected, by the node's
+            // own clock: null while one is (decision 2026-10-04 §10.1).
+            out["no_relay_secs"] = live["no_relay_secs"].clone();
             out["peers"] = serde_json::json!({
                 "hot": live["peers_hot"],
                 "warm": live["peers_warm"],
