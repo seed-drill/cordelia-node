@@ -493,3 +493,76 @@ fn an_edit_made_before_a_device_heard_of_a_change_arrives_as_an_edit_of_the_carr
     assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
     assert_eq!(files(&a_mem), files(&b_mem));
 }
+
+/// After a change, the command says that this machine may be closed only
+/// once the device's own word says that it has sent what it carried, and
+/// every relay it is set up with is connected and holds the change
+/// (decision 2026-10-04 §7.1, step 4; §8).
+///
+/// Here a device carries more than it sends one relay in a minute. A
+/// device is removed: the relay takes the change, and is stopped before
+/// the names have gone. The command does not say that the machine may be
+/// closed, and says what is missing.
+#[test]
+fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
+    use cordelia_core::protocol::OUTBOX_BYTES_PER_MINUTE;
+    let mut relay = relay_started();
+    let a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let words = pair(&a, &b, "laptop", &[&relay, &a, &b]).unwrap();
+
+    // More than a device sends one relay in a minute: each file's entry
+    // is counted at more than its text.
+    let (notes, memory) = notes_of(&a);
+    let files = 40;
+    let text = "a memory that is kept. ".repeat(2000);
+    assert!((files * text.len()) as u64 > OUTBOX_BYTES_PER_MINUTE);
+    for n in 0..files {
+        std::fs::write(
+            memory.join(format!("note-{n:02}.md")),
+            format!("{n}\n{text}"),
+        )
+        .unwrap();
+    }
+    syncs_notes_as_lab(&a, &notes);
+    wait_for("a has published its folder", &[&relay, &a], 90, || {
+        (held(&a).len() == files).then_some(())
+    });
+
+    // The laptop is removed. The relay takes the change, which is shown
+    // to it before anything else; of what the device carried, the names
+    // have not gone.
+    let mut at = removes(&a, &key_of(&b), &[], &words);
+    at.says("The change is made (change 2)");
+    wait_for("the relay holds the change", &[&relay, &a], 30, || {
+        let seen = person_of(&a);
+        let relays = seen["relays"].as_array()?;
+        (seen["change"] == 2 && relays.iter().all(|relay| relay["holds_latest"] == true))
+            .then_some(())
+    });
+    let seen = person_of(&a);
+    assert_eq!(seen["names"]["to_go"], json!(["lab"]), "{seen}");
+    relay.stop();
+
+    // The node sees that the relay is gone, and no row says any more
+    // what waits there. The command stays, and says what is missing.
+    wait_for("the device sees that its relay is gone", &[&a], 60, || {
+        let seen = person_of(&a);
+        (seen["not_reached"].as_array()?.len() == 1 && seen["waiting"].as_array()?.is_empty())
+            .then_some(())
+    });
+    let said = at.hears_for(std::time::Duration::from_secs(8)).to_string();
+    assert!(!said.contains("this machine may be closed"), "{said}");
+    // Nor that a name is sent: with the relay gone, that is not known.
+    assert!(!said.contains("1 name sent"), "{said}");
+    assert!(
+        said.contains("is not connected, and what is still to send there is not known until it is"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "keep this machine on: this device has not yet sent every relay what it carried"
+        ),
+        "{said}"
+    );
+}

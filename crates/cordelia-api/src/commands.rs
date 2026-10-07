@@ -206,6 +206,29 @@ fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
         .collect()
 }
 
+/// The relays that the device is set up with, by the names of its
+/// configuration, to which the node is not connected now. What waits to
+/// be sent to one of them is in no row of [`waiting`]: a command that
+/// waits until everything is sent counts each as missing (decision
+/// 2026-10-04 §7.1, step 4).
+///
+/// `at` is where the device stands at its relays, which names every
+/// relay it is set up with. A relay is connected where the node's list
+/// of its relays says so, by that name.
+fn not_reached(state: &AppState, at: &crate::state::AtRelays) -> Vec<String> {
+    let known = state.relays.read().unwrap_or_else(|e| e.into_inner());
+    let connected = |name: &str| {
+        known
+            .iter()
+            .any(|relay| relay.host == name && relay.state == "connected")
+    };
+    at.relays
+        .iter()
+        .map(|relay| relay.relay.clone())
+        .filter(|name| !connected(name))
+        .collect()
+}
+
 /// How many of this device's own channels have something that waits to
 /// be sent to a relay the node is connected to: the most that wait at
 /// any one of them. None on a node that follows no phrase, and none
@@ -265,6 +288,7 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
     answer["waiting"] = waiting(&state)?.into();
+    answer["not_reached"] = not_reached(&state, &at).into();
     // What it has still to send, by name: a status says it in a line.
     let names = names_sent(&state)?;
     let to_go: Vec<&str> = names["to_go"]
@@ -1114,6 +1138,54 @@ mod tests {
         peers[1].role = "node".into();
         drop(peers);
         assert_eq!(channels_waiting(&state), 0);
+    }
+
+    /// A relay that the device is set up with and that the node is not
+    /// connected to is named as not reached (decision 2026-10-04 §7.1,
+    /// step 4): no row says what waits to be sent there. It is known by
+    /// the name of the configuration, in the node's list of its relays.
+    #[test]
+    fn test_a_relay_that_is_set_up_and_not_connected_is_named_as_not_reached() {
+        use crate::state::{AtRelay, AtRelays, RelaySnapshot};
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let at = |name: &str| AtRelay {
+            relay: name.into(),
+            holds_latest: Some(true),
+            heard_since_woke: true,
+            no_room: None,
+            another_form: 0,
+            refuses: None,
+        };
+        let set_up = AtRelays {
+            relays: vec![at("one.example:9474"), at("two.example:9474")],
+            cannot_go_on: None,
+        };
+        let known = |name: &str, stands: &str| RelaySnapshot {
+            host: name.into(),
+            key: None,
+            state: stands.into(),
+            unreachable_secs: None,
+            last_tried_secs: None,
+            error: None,
+        };
+        // Before the node has listed its relays, none is known to be
+        // connected.
+        assert_eq!(
+            not_reached(&state, &set_up),
+            ["one.example:9474", "two.example:9474"]
+        );
+        *state.relays.write().unwrap() = vec![
+            known("one.example:9474", "connected"),
+            known("two.example:9474", "unreachable"),
+        ];
+        assert_eq!(not_reached(&state, &set_up), ["two.example:9474"]);
+        state.relays.write().unwrap()[1].state = "connecting".into();
+        assert_eq!(not_reached(&state, &set_up), ["two.example:9474"]);
+        state.relays.write().unwrap()[1].state = "connected".into();
+        assert!(not_reached(&state, &set_up).is_empty());
+        // A device that is set up with no relay has none to reach.
+        assert!(not_reached(&state, &AtRelays::default()).is_empty());
     }
 
     /// How much each device wrote that this device received in the last
