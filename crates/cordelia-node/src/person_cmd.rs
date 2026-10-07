@@ -3100,7 +3100,7 @@ mod tests {
         // So is a line of the status that names one.
         let (_, says) = status_lines(&json!({
             "short": "x",
-            "says": [format!("what this device held of 1 file: gh\u{1b}[2Kost.md in lab")],
+            "says": ["what this device held of 1 file: gh\u{1b}[2Kost.md in lab"],
         }));
         assert_eq!(
             says,
