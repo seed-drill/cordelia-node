@@ -1572,7 +1572,7 @@ mod tests {
             name: "lab".into(),
             file: "ghost.md".into(),
         };
-        assert_eq!(seen.not_carried, [ghost]);
+        assert_eq!(seen.not_carried, std::slice::from_ref(&ghost));
         assert!(
             seen.says.iter().any(|line| line.contains("ghost.md in lab")
                 && line.contains("meets its channel as a new file does")),
@@ -1587,6 +1587,43 @@ mod tests {
             meta::get(&s[0].conn, meta::PERSON_NOT_CARRIED).unwrap(),
             None
         );
+
+        // A file is said no longer once it has met its channel: a folder
+        // has a record of it in the channel of its name. Until then it
+        // stays, whatever else the folder has a record of there, and
+        // whatever a folder has a record of under that file's name in
+        // another channel. A file under a name that the device holds no
+        // more has no channel to meet, and goes.
+        let conn = &s[0].conn;
+        let noted = |conn: &rusqlite::Connection| -> Vec<NotCarried> {
+            let now = crate::several::START;
+            let seen = look(conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+            seen.not_carried
+        };
+        let gone = NotCarried {
+            name: "held-no-more".into(),
+            file: "left.md".into(),
+        };
+        let note = |files: &[&NotCarried]| {
+            let files: Vec<(String, String)> = files
+                .iter()
+                .map(|file| (file.name.clone(), file.file.clone()))
+                .collect();
+            crate::look::note_not_carried(conn, &files).unwrap();
+        };
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        note(&[&ghost, &gone]);
+        let channel = written(&s[0], "lab");
+        let record = agreed(&s[0], 1, "met");
+        sync_state::save(conn, folder, &channel, "other.md", &record).unwrap();
+        sync_state::save(conn, folder, "another-channel", "ghost.md", &record).unwrap();
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 1);
+        assert_eq!(noted(conn), std::slice::from_ref(&ghost));
+        sync_state::save(conn, folder, &channel, "ghost.md", &record).unwrap();
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 1);
+        assert!(noted(conn).is_empty());
+        assert_eq!(meta::get(conn, meta::PERSON_NOT_CARRIED).unwrap(), None);
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
     }
 
     /// Each device that applies a statement writes so in the new personal

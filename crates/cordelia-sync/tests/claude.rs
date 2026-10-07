@@ -1733,6 +1733,40 @@ fn a_name_stopped_and_held_again_in_one_generation_deletes_nothing() {
     assert_eq!(recorded(&a), 2);
 }
 
+/// A file whose record a change could not carry is said, in `cordelia
+/// devices` and in a status, until it has met its channel (decision
+/// 2026-10-04 §4.2): a cycle that leaves its folder with a record of it
+/// there takes it from what is said. A file that has not met its channel
+/// yet stays.
+#[test]
+fn a_file_that_was_not_carried_is_said_until_it_has_met_its_channel() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let one = a.plain_dir("one");
+    let mem = a.claude_folder(&one);
+    std::fs::write(mem.join("x.md"), "here\n").unwrap();
+    map(&a, &one, "one");
+    let not_carried = |d: &Device| -> Vec<String> {
+        let db = d.state.db.lock().unwrap();
+        let seen = cordelia_api::look::look(&db, &d.state.identity, &Default::default(), now());
+        let files = seen.unwrap().not_carried;
+        files.into_iter().map(|file| file.file).collect()
+    };
+    // As the device notes them when it applies a statement: one file
+    // that its folder has, and one that is too large to meet anything.
+    let big = "x".repeat(cordelia_sync::claude::MAX_FILE_BYTES + 1);
+    std::fs::write(mem.join("large.md"), big).unwrap();
+    set_meta(
+        &a,
+        meta::PERSON_NOT_CARRIED,
+        r#"[{"name":"one","file":"x.md"},{"name":"one","file":"large.md"}]"#,
+    );
+    assert_eq!(not_carried(&a), ["x.md", "large.md"]);
+
+    let report = a.cycle();
+    assert_eq!(report.folders[0].published, 1, "{report:?}");
+    assert_eq!(not_carried(&a), ["large.md"]);
+}
+
 /// Whether sync is on is a setting like the others. A cycle reads it with
 /// the rest, under the lock: turned off, there is nothing for it to do,
 /// even if the loop that started it saw sync on a moment before.

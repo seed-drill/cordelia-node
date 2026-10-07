@@ -44,7 +44,7 @@ use cordelia_core::protocol::{
     MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS, STATEMENTS_LEFT_SAID_BELOW,
 };
 use cordelia_crypto::addition::SignedAddition;
-use cordelia_crypto::bech32::encode_public_key;
+use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
 use cordelia_crypto::change_entry;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::Value;
@@ -57,6 +57,7 @@ use cordelia_storage::acts;
 use cordelia_storage::entries;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
+use cordelia_storage::sync_state;
 
 use crate::adding::within_its_hour;
 use crate::leaving::{Among, among, left_name};
@@ -681,7 +682,8 @@ fn not_carried(conn: &Connection) -> Result<Vec<NotCarried>, PersonError> {
 /// Note the files whose record could not be carried at the statement
 /// that this device has just applied, for `cordelia devices` to say
 /// (decision 2026-10-04 §4.2). What was noted at the statement before is
-/// replaced: those files have met their channels since.
+/// replaced. A file goes from the note once it has met its channel
+/// ([`clear_not_carried_that_met`]).
 pub(crate) fn note_not_carried(
     conn: &Connection,
     files: &[(String, String)],
@@ -701,6 +703,44 @@ pub(crate) fn note_not_carried(
         .map_err(|e| PersonError::Held(format!("the files that were not carried: {e}")))?;
     meta::set(conn, meta::PERSON_NOT_CARRIED, &noted)?;
     Ok(())
+}
+
+/// Drop from the note of the files that were not carried
+/// ([`note_not_carried`]) each file that has met its channel since
+/// (decision 2026-10-04 §4.2): a folder has a record of it in the channel
+/// of the name it syncs under, so the file was published there as this
+/// device's own, or took the version that the channel had. A file under
+/// a name that the device holds no more is dropped too: it syncs here no
+/// longer, and has no channel to meet. Returns how many went.
+///
+/// The sync adapter does so at the end of a cycle. Until then the file is
+/// said in `cordelia devices` and in a status, and no longer than that:
+/// not until the next change.
+pub fn clear_not_carried_that_met(conn: &Connection) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let noted = not_carried(conn)?;
+        if noted.is_empty() {
+            return Ok(0);
+        }
+        let mut still: Vec<(String, String)> = Vec::new();
+        for file in &noted {
+            let met = match held_rows::channel_of_name(conn, &file.name)? {
+                Some(channel) => {
+                    let written = encode_channel_id(&channel)?;
+                    let recorded = sync_state::files(conn, &written)?;
+                    recorded.iter().any(|(_, key)| *key == file.file)
+                }
+                None => true,
+            };
+            if !met {
+                still.push((file.name.clone(), file.file.clone()));
+            }
+        }
+        if still.len() != noted.len() {
+            note_not_carried(conn, &still)?;
+        }
+        Ok(noted.len() - still.len())
+    })
 }
 
 /// What the personal channel of the generation applied says of each

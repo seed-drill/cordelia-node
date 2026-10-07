@@ -787,6 +787,14 @@ impl ClaudeAdapter {
         if looked_up_all && let Err(e) = forget_other_folders(state, &syncing, generation) {
             report.errors.push(format!("agreements: {e}"));
         }
+        // A file whose record a change could not carry is said until it
+        // has met its channel (decision 2026-10-04 §4.2): once a folder
+        // has a record of it there, it is said no more.
+        let met = lock(state)
+            .and_then(|db| cordelia_api::look::clear_not_carried_that_met(&db).map_err(of_person));
+        if let Err(e) = met {
+            report.errors.push(format!("files not carried: {e}"));
+        }
 
         match exchange_names(state, &wanted, generation) {
             Ok(available) => report.available = available,
