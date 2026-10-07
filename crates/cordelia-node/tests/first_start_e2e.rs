@@ -539,6 +539,29 @@ fn status_of(node: &Node) -> serde_json::Value {
     serde_json::from_str(&node.cli(&["status", "--json"])).unwrap()
 }
 
+/// A node that is held up is red whatever sync says (decision 2026-10-04
+/// §10.1): `cordelia status` gives the level red and the state
+/// `attention`, with `says` in the line, which is drawn in red, and the
+/// bar is `active`.
+fn held_up_is_red(node: &Node, says: &str) {
+    let status = status_of(node);
+    assert_eq!(
+        (&status["level"], &status["state"]),
+        (&serde_json::json!("red"), &serde_json::json!("attention")),
+        "{status}"
+    );
+    assert_eq!(status["summary"], says, "{status}");
+    assert_eq!(status["holds"][0]["what"], "held", "{status}");
+    let line = node.cli(&["status", "--line"]);
+    assert!(line.contains(&format!("▲ {says}")), "{line}");
+    let bar: serde_json::Value = serde_json::from_str(&node.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(
+        bar["class"],
+        serde_json::json!(["attention", "red", "active"]),
+        "{bar}"
+    );
+}
+
 /// Until its first start on this version has succeeded a node stays up,
 /// runs no cycle and no pass, refuses every request that changes
 /// anything except one that turns sync off, and says why in its status
@@ -670,6 +693,12 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     // The scope that was on by being absent is written down as on, so
     // that the step still finds it so with the directory gone.
     assert_eq!(scope(&device).as_deref(), Some("on"));
+    // A node that is held up is red whatever sync says: with sync off
+    // the level, the state, the line and the bar say so still.
+    held_up_is_red(
+        &device,
+        "memory not syncing: the first start on this version is not done",
+    );
 
     // The copy can be made: the node makes its first start by itself,
     // at its next try. (The tries back off, and several have failed by
@@ -685,8 +714,12 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     let mark = first_start::mark(&conn).unwrap().unwrap();
     assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
     assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
+    // Sync is off and the device follows no phrase: its state is off,
+    // nothing holds, and the words still say that it is not added yet.
     let status = status_of(&device);
-    assert_eq!(status["summary"], "memory sync off", "{status}");
+    assert_eq!(status["summary"], "memory: not added yet", "{status}");
+    assert_eq!(status["state"], "off", "{status}");
+    assert!(status["level"].is_null(), "{status}");
     // The device is left the notice of what stopped, though sync was
     // turned off before the step could be taken; and the scope is off.
     let notices = first_start::notices(&conn).unwrap();
@@ -774,6 +807,12 @@ fn a_database_from_a_later_version_is_refused_by_the_node_and_by_each_command() 
     );
     assert_eq!(status["held"]["by"], "later_database", "{status}");
     named(status["held"]["why"].as_str().unwrap());
+    // It is red, though the node refuses the request that would say
+    // whether sync is on.
+    held_up_is_red(
+        &device,
+        "memory not syncing: the database is from a later version",
+    );
     let said = device.cli(&["status"]);
     assert!(said.contains("Held up:   the database at"), "{said}");
     for refused in [

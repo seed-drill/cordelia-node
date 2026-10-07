@@ -1544,11 +1544,19 @@ fn a_command_asks_no_address_but_the_nodes_own() {
             "{said}"
         );
         // A node that was not asked has a state of its own, and no
-        // level: the bar's `active` goes with red alone.
+        // level: the bar is drawn as it was before there was a level,
+        // `active` with `attention`, and the line in red.
         assert!(said["level"].is_null(), "{said}");
         let out = n.command_given(&given, &["status", "--waybar"]);
         let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(said["class"], "attention", "{said}");
+        assert_eq!(
+            said["class"],
+            serde_json::json!(["attention", "active"]),
+            "{said}"
+        );
+        let out = n.command_given(&given, &["status", "--line"]);
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.contains("▲ memory: node not asked"), "{line}");
         let tooltip = said["tooltip"].as_str().unwrap();
         assert!(
             tooltip.contains("not asked") && tooltip.contains(&named),

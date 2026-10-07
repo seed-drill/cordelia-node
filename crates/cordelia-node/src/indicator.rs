@@ -17,8 +17,15 @@
 //!   level, for a panel that draws from it alone.
 //! - **Before any level:** a device that is not set up, a node that is
 //!   stopped or was not asked, and a relay or a bootnode are states of
-//!   their own, with no level. A level is for a personal node that runs,
-//!   with sync on.
+//!   their own, with no level. A level is for a personal node that runs.
+//! - **What is about folders needs sync on, something mapped and a
+//!   report. What is about a person's devices holds wherever this device
+//!   follows a phrase,** with sync on or off, and with or without a folder
+//!   mapped: a device that maps nothing is still one of the person's. **A
+//!   node that is held up is red whatever sync says.**
+//! - **The line and the level never disagree:** where a state is
+//!   `attention` and there is no level, the line and the bar draw as they
+//!   did before there was one ([`line`], [`bar`]).
 
 /// A sync report older than this means the adapter has stopped cycling
 /// (it runs every `cordelia_sync::claude::CYCLE_SECS`).
@@ -252,12 +259,17 @@ fn no_phrase_says(moved_on: bool) -> &'static str {
     }
 }
 
+/// What the line says of a device that was answered with a change that
+/// it could not apply.
+const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applied";
+
 /// Everything that holds, of the two lists, in their order: red first
 /// (decision 2026-10-04 §10.1). None before any level: on a device that
-/// is not set up, beside a node that is stopped or was not asked, on a
-/// relay or a bootnode, and with sync off.
+/// is not set up, beside a node that is stopped or was not asked, and on
+/// a relay or a bootnode.
 ///
-/// **Red,** in this order:
+/// **Red,** in this order. The first two hold whatever sync says, and
+/// the rest with sync on:
 /// 1. this device has stopped: it was removed, or is in no list, or is
 ///    in a fork, or was answered with a change that it could not open or
 ///    apply;
@@ -273,8 +285,11 @@ fn no_phrase_says(moved_on: bool) -> &'static str {
 /// 8. files too large;
 /// 9. folders that stopped syncing.
 ///
-/// **Amber,** in this order, and only with something mapped and a
-/// report: with neither, nothing would move anyway.
+/// **Amber,** in this order. What is about folders (1 to 3, and 7 to 9)
+/// holds only with sync on, something mapped and a report: with none of
+/// them, nothing would move anyway. What is about a person's devices (4
+/// to 6) holds wherever this device follows a phrase, with sync on or
+/// off, and with or without a folder mapped.
 /// 1. no relay connected for more than five minutes, by the node's own
 ///    clock;
 /// 2. entries that relays keep refusing;
@@ -296,9 +311,17 @@ fn no_phrase_says(moved_on: bool) -> &'static str {
 pub fn holds(f: &Facts) -> Vec<Holds> {
     let mut out: Vec<Holds> = Vec::new();
     let personal_and_running = f.initialised && !f.not_asked && f.running && f.role == "personal";
-    if !personal_and_running || !f.sync_enabled {
+    if !personal_and_running {
         return out;
     }
+    let on = f.sync_enabled;
+    let report = f.report_age_secs.is_some();
+    // What is about folders: nothing of it moves with sync off, with
+    // nothing mapped, or before a first report.
+    let of_folders = on && f.mapped > 0 && report;
+    // What is about a person's devices: wherever the device follows a
+    // phrase.
+    let follows_a_phrase = f.stands != "no_phrase";
     let mut red = |what: &'static str, says: String| {
         out.push(Holds {
             level: Level::Red,
@@ -308,49 +331,46 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     };
     let count = |n: usize, one: &str| format!("{n} {}", plural(n as u64, one));
 
+    // Whatever sync says: a device that has stopped, and a node that is
+    // held up. Nothing here asks whether sync is on: a node that is held
+    // up refuses the request that would say so.
     if let Some(says) = stopped_says(&f.stands) {
         red("stopped", says.into());
     } else if f.devices.not_applied {
-        red(
-            "stopped",
-            "memory not syncing: a change could not be applied".into(),
-        );
+        red("stopped", NOT_APPLIED_SAYS.into());
     }
     if let Some(by) = f.held.as_deref() {
         red("held", held_says(by).into());
     }
-    if f.stands == "no_phrase" && f.mapped > 0 {
-        red("no_phrase", no_phrase_says(f.moved_on).into());
-    }
-    if !f.errors.is_empty() {
-        red("errors", "memory sync error".into());
-    }
-    if stalled(f) {
-        red("stalled", "memory sync stalled".into());
-    }
-    let report = f.report_age_secs.is_some();
     let notice = f.notice.as_ref().filter(|notice| notice.counts());
     // Where "starting" or "nothing mapped" would be said, the notice is.
     let notice_first = !report || f.mapped == 0;
-    if let Some(notice) = notice.filter(|_| notice_first) {
-        red("stopped_syncing", notice.says());
-    }
-    if !f.conflicts.is_empty() {
-        let conflicts = count(f.conflicts.len(), "conflict");
-        red("conflicts", format!("memory: {conflicts}"));
-    }
-    if !f.too_large.is_empty() {
-        let files = count(f.too_large.len(), "file");
-        red("too_large", format!("memory: {files} too large"));
-    }
-    if let Some(notice) = notice.filter(|_| !notice_first) {
-        red("stopped_syncing", notice.says());
+    if on {
+        if f.stands == "no_phrase" && f.mapped > 0 {
+            red("no_phrase", no_phrase_says(f.moved_on).into());
+        }
+        if !f.errors.is_empty() {
+            red("errors", "memory sync error".into());
+        }
+        if stalled(f) {
+            red("stalled", "memory sync stalled".into());
+        }
+        if let Some(notice) = notice.filter(|_| notice_first) {
+            red("stopped_syncing", notice.says());
+        }
+        if !f.conflicts.is_empty() {
+            let conflicts = count(f.conflicts.len(), "conflict");
+            red("conflicts", format!("memory: {conflicts}"));
+        }
+        if !f.too_large.is_empty() {
+            let files = count(f.too_large.len(), "file");
+            red("too_large", format!("memory: {files} too large"));
+        }
+        if let Some(notice) = notice.filter(|_| !notice_first) {
+            red("stopped_syncing", notice.says());
+        }
     }
 
-    // With nothing mapped, or with no report yet, there is no amber.
-    if f.mapped == 0 || !report {
-        return out;
-    }
     let mut amber = |what: &'static str, says: String| {
         out.push(Holds {
             level: Level::Amber,
@@ -360,38 +380,45 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     };
     let long = |secs: &u64| *secs > AMBER_WAIT_SECS;
     let d = &f.devices;
-    if let Some(secs) = f.no_relay_secs.filter(long) {
-        amber(
-            "no_relay",
-            format!("memory: no relay for {} minutes", secs / 60),
-        );
+    if of_folders {
+        if let Some(secs) = f.no_relay_secs.filter(long) {
+            amber(
+                "no_relay",
+                format!("memory: no relay for {} minutes", secs / 60),
+            );
+        }
+        if f.outbox_refused > 0 {
+            let n = f.outbox_refused;
+            amber("refused", format!("memory: {n} not taken by a relay"));
+        }
+        if f.other_version {
+            amber(
+                "other_version",
+                "memory: the node is another version (restart it)".into(),
+            );
+        }
     }
-    if f.outbox_refused > 0 {
-        let n = f.outbox_refused;
-        amber("refused", format!("memory: {n} not taken by a relay"));
+    if follows_a_phrase {
+        if d.removal_not_applied_secs
+            .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
+        {
+            amber(
+                "removal_not_applied",
+                "memory: a removal not yet applied by every device".into(),
+            );
+        }
+        if d.added_not_cleared > 0 {
+            let devices = count(d.added_not_cleared, "device");
+            amber("added", format!("memory: {devices} added, not yet cleared"));
+        }
+        match d.said_left {
+            0 => {}
+            1 => amber("left", "memory: a device has left".into()),
+            n => amber("left", format!("memory: {n} devices have left")),
+        }
     }
-    if f.other_version {
-        amber(
-            "other_version",
-            "memory: the node is another version (restart it)".into(),
-        );
-    }
-    if d.removal_not_applied_secs
-        .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
-    {
-        amber(
-            "removal_not_applied",
-            "memory: a removal not yet applied by every device".into(),
-        );
-    }
-    if d.added_not_cleared > 0 {
-        let devices = count(d.added_not_cleared, "device");
-        amber("added", format!("memory: {devices} added, not yet cleared"));
-    }
-    match d.said_left {
-        0 => {}
-        1 => amber("left", "memory: a device has left".into()),
-        n => amber("left", format!("memory: {n} devices have left")),
+    if !of_folders {
+        return out;
     }
     match d
         .without_latest_secs
@@ -538,26 +565,45 @@ pub fn derive(f: &Facts) -> (State, String) {
     if let Some(by) = f.held.as_deref() {
         return (Attention, held_says(by).into());
     }
-    if !f.sync_enabled {
-        return (Off, "memory sync off".into());
-    }
-    // Only a device that has applied a statement publishes anything
-    // (decision 2026-10-04 §5.2). One that follows no phrase yet syncs
-    // nothing, and one that has stopped needs the person: neither is said
-    // to be synced, whatever its last cycle listed.
-    //
-    // **With no phrase the state is `attention`** (decision 2026-10-04
-    // §10.1), so that a panel which draws from the state alone does not
-    // show the device as synced, or as resting: nothing it holds syncs
-    // until a person acts. A device that is not to be added turns sync
-    // off. It is "not added yet" where it took this version with what an
-    // earlier one held, and has "no recovery phrase yet" where it is a
-    // new install.
-    if f.stands == "no_phrase" {
-        return (Attention, no_phrase_says(f.moved_on).into());
-    }
+    // A device that has stopped needs the person, with sync on or off
+    // (decision 2026-10-04 §10.1): it was removed, or is in no list, or
+    // is in a fork, or was answered with a change that it could not open
+    // or apply. It is one of the person's devices whatever it syncs, and
+    // is never said to be synced, or resting.
     if let Some(says) = stopped_says(&f.stands) {
         return (Attention, says.into());
+    }
+    if f.devices.not_applied {
+        return (Attention, NOT_APPLIED_SAYS.into());
+    }
+    // Only a device that has applied a statement publishes anything
+    // (decision 2026-10-04 §5.2). **With no phrase, sync on and something
+    // mapped, the state is `attention`** (decision 2026-10-04 §10.1), so
+    // that a panel which draws from the state alone does not show the
+    // device as synced: nothing it holds syncs until a person acts. A
+    // device that is not to be added turns sync off.
+    let no_phrase = f.stands == "no_phrase";
+    if no_phrase && f.sync_enabled && f.mapped > 0 {
+        return (Attention, no_phrase_says(f.moved_on).into());
+    }
+    let (state, says) = of_its_folders(f);
+    // With sync off, or nothing mapped, the state is what it would be
+    // without that, and the words still say it: "not added yet" where
+    // the device took this version with what an earlier one held, and "no
+    // recovery phrase yet" where it is a new install. What needs the
+    // person is said first.
+    if no_phrase && state != Attention {
+        return (state, no_phrase_says(f.moved_on).into());
+    }
+    (state, says)
+}
+
+/// The state of a personal node that runs, is not held up and has not
+/// stopped, by what it says of its folders ([`derive`]).
+fn of_its_folders(f: &Facts) -> (State, String) {
+    use State::*;
+    if !f.sync_enabled {
+        return (Off, "memory sync off".into());
     }
     if !f.errors.is_empty() {
         return (Attention, "memory sync error".into());
@@ -653,8 +699,11 @@ pub fn line(state: State, level: Option<Level>, summary: &str, color: bool) -> S
 /// The JSON is the shape Waybar's custom modules take, which Omarchy's bar
 /// reads too: `text`, `tooltip` and `class`. The class is the state name,
 /// and with a level the level's name after it (`red`, `amber`). **`active`,
-/// which Omarchy highlights, is added with red alone.** The icons are Nerd
-/// Font glyphs: a level has its own, and with none the state has.
+/// which Omarchy highlights, is added with red; and, where there is no
+/// level, with the state `attention`, as it was before there was a
+/// level:** no state lost its highlight, and the bar never rests while
+/// the line is red. Amber is never `active`. The icons are Nerd Font
+/// glyphs: a level has its own, and with none the state has.
 /// Empty when there is nothing to show.
 pub fn bar(state: State, level: Option<Level>, summary: &str, details: &[String]) -> String {
     let icon = match (level, state) {
@@ -675,6 +724,7 @@ pub fn bar(state: State, level: Option<Level>, summary: &str, details: &[String]
     let class = match level {
         Some(Level::Red) => serde_json::json!([state.as_str(), "red", "active"]),
         Some(Level::Amber) => serde_json::json!([state.as_str(), "amber"]),
+        None if state == State::Attention => serde_json::json!([state.as_str(), "active"]),
         None => serde_json::json!(state.as_str()),
     };
     serde_json::json!({ "text": icon, "tooltip": tooltip, "class": class }).to_string()
@@ -865,6 +915,10 @@ mod tests {
         ),
     ];
 
+    /// The things of the amber list that are about a person's devices:
+    /// the rest of it is about folders.
+    const OF_DEVICES: [&str; 3] = ["removal_not_applied", "added", "left"];
+
     /// What has no level, as it always was: each says its own.
     const NO_LEVEL: [(Edit, State, &str); 6] = [
         (
@@ -1046,7 +1100,12 @@ mod tests {
                     assert_eq!(shown.level, Some(Level::Red), "{red_says}");
                     assert_eq!(shown.summary, red_says, "with {amber_what}");
                     // The tooltip has everything: the amber thing too.
-                    assert!(whats(&shown).contains(&amber_what), "{red_says}");
+                    // (What is about a person's devices holds only where
+                    // the device follows a phrase.)
+                    let no_phrase = whats(&shown).contains(&"no_phrase");
+                    if !(no_phrase && OF_DEVICES.contains(&amber_what)) {
+                        assert!(whats(&shown).contains(&amber_what), "{red_says}");
+                    }
                 }
             }
         }
@@ -1084,15 +1143,15 @@ mod tests {
     /// Before any level (decision 2026-10-04 §10.1): a device that is not
     /// set up, a node that is stopped or was not asked, a relay and a
     /// bootnode are states of their own, shown as they always were, with
-    /// no level. So is a personal node with sync off: the line says off.
+    /// no level, whatever else is said of them.
     #[test]
-    fn what_is_not_a_personal_node_that_runs_with_sync_on_has_no_level() {
+    fn what_is_not_a_personal_node_that_runs_has_no_level() {
         let everything = |f: &mut Facts| {
             for (edit, _, _) in RED.iter().skip(5).chain(AMBER.iter()) {
                 edit(f);
             }
         };
-        let cases: [(Edit, State, &str); 6] = [
+        let cases: [(Edit, State, &str); 5] = [
             (
                 &|f| f.initialised = false,
                 State::Uninitialised,
@@ -1121,59 +1180,330 @@ mod tests {
                 State::Offline,
                 "bootnode: no peers",
             ),
+        ];
+        for (edit, state, says) in cases {
+            for stands in ["applied", "removed", "no_phrase"] {
+                let shown = with(&|f| {
+                    everything(f);
+                    f.stands = stands.into();
+                    edit(f);
+                });
+                assert_eq!(shown.level, None, "{says}");
+                assert!(shown.holds.is_empty(), "{says}");
+                assert_eq!((shown.state, shown.summary.as_str()), (state, says));
+            }
+        }
+    }
+
+    /// A node that is held up is red whatever sync says (decision
+    /// 2026-10-04 §10.1): its first start on this version has not
+    /// succeeded, or its database is of a later version. Nothing asks
+    /// whether sync is on first: a node that is held by a later database
+    /// refuses the request that would say so, and the command then knows
+    /// neither whether sync is on, nor what is mapped, nor where the
+    /// device stands.
+    #[test]
+    fn a_node_that_is_held_up_is_red_whatever_sync_says() {
+        for (by, says) in [
+            (
+                "first_start",
+                "memory not syncing: the first start on this version is not done",
+            ),
+            (
+                "later_database",
+                "memory not syncing: the database is from a later version",
+            ),
+        ] {
+            let held = |edit: &dyn Fn(&mut Facts)| {
+                with(&|f| {
+                    f.held = Some(by.into());
+                    edit(f);
+                })
+            };
+            let cases: [&dyn Fn(&mut Facts); 5] = [
+                &|_| {},
+                &|f| f.sync_enabled = false,
+                &|f| {
+                    f.sync_enabled = false;
+                    f.mapped = 0;
+                    f.folders = 0;
+                },
+                &|f| f.stands = "no_phrase".into(),
+                // As the command has it beside a node that refuses every
+                // request but that of its status.
+                &|f| {
+                    *f = Facts {
+                        initialised: true,
+                        running: true,
+                        role: "personal".into(),
+                        held: f.held.clone(),
+                        ..Default::default()
+                    }
+                },
+            ];
+            for edit in cases {
+                let shown = held(edit);
+                assert_eq!(
+                    (shown.level, shown.state),
+                    (Some(Level::Red), State::Attention),
+                    "{by}"
+                );
+                assert_eq!(shown.summary, says);
+                assert!(whats(&shown).contains(&"held"), "{by}");
+            }
+            // With sync off it is all that holds.
+            assert_eq!(whats(&held(&|f| f.sync_enabled = false)), ["held"]);
+        }
+    }
+
+    /// What is about a person's devices holds wherever this device
+    /// follows a phrase, with sync on or off, and with or without a
+    /// folder mapped or a report (decision 2026-10-04 §10.1): red for a
+    /// device that has stopped, with the state `attention`; amber for a
+    /// removal that some device has not applied, an addition that nobody
+    /// cleared, and a device that said it left. A device that maps
+    /// nothing is still one of the person's. What is about folders needs
+    /// sync on, something mapped and a report: none of it holds
+    /// otherwise.
+    #[test]
+    fn what_is_about_a_persons_devices_holds_whatever_sync_says() {
+        let wheres: [(Edit, &str); 4] = [
+            (&|f| f.sync_enabled = false, "sync off"),
+            (
+                &|f| {
+                    f.mapped = 0;
+                    f.folders = 0;
+                },
+                "nothing mapped",
+            ),
+            (&|f| f.report_age_secs = None, "no report yet"),
             (
                 &|f| {
                     f.sync_enabled = false;
-                    f.held = None;
+                    f.mapped = 0;
+                    f.folders = 0;
+                    f.report_age_secs = None;
                 },
-                State::Off,
-                "memory sync off",
+                "none of the three",
             ),
         ];
-        for (edit, state, says) in cases {
-            let shown = with(&|f| {
-                everything(f);
-                edit(f);
+        for (place, where_) in wheres {
+            // Red, and `attention`: each way a device has stopped.
+            for (stopped, what, says) in &RED[..5] {
+                let shown = with(&|f| {
+                    stopped(f);
+                    place(f);
+                });
+                assert_eq!(
+                    (shown.level, shown.state),
+                    (Some(Level::Red), State::Attention),
+                    "{says}, {where_}"
+                );
+                assert_eq!(shown.summary, *says, "{where_}");
+                assert_eq!(whats(&shown), [*what], "{where_}");
+            }
+            // Amber: each of the three, alone, with the state as it is
+            // without it.
+            for (amber, what, says) in &AMBER[3..6] {
+                let without = with(place);
+                let shown = with(&|f| {
+                    amber(f);
+                    place(f);
+                });
+                assert_eq!(shown.level, Some(Level::Amber), "{says}, {where_}");
+                assert_eq!(shown.summary, *says, "{where_}");
+                assert_eq!(whats(&shown), [*what], "{where_}");
+                assert_eq!(shown.state, without.state, "{where_}");
+            }
+            // Everything amber at once: the three, in their order, and
+            // nothing that is about folders.
+            let all = with(&|f| {
+                for (edit, _, _) in AMBER {
+                    edit(f);
+                }
+                place(f);
             });
-            assert_eq!(shown.level, None, "{says}");
-            assert!(shown.holds.is_empty(), "{says}");
-            assert_eq!((shown.state, shown.summary.as_str()), (state, says));
+            assert_eq!(whats(&all), OF_DEVICES, "{where_}");
+            // A device that follows no phrase is no person's: none of
+            // them holds there.
+            let no_phrase = with(&|f| {
+                for (edit, _, _) in AMBER {
+                    edit(f);
+                }
+                place(f);
+                f.stands = "no_phrase".into();
+            });
+            let held = whats(&no_phrase);
+            assert!(
+                OF_DEVICES.iter().all(|what| !held.contains(what)),
+                "{where_}"
+            );
         }
-        // Sync off with a notice stored: no level, and the line says off.
+        // With sync off, the line says the first of them, and the state
+        // is `off` still.
         let off = with(&|f| {
             f.sync_enabled = false;
-            f.notice = Some(Stopped {
-                folders: 3,
-                not_known: false,
-            });
+            f.devices.added_not_cleared = 1;
+        });
+        assert_eq!(
+            (off.state, off.level, off.summary.as_str()),
+            (
+                State::Off,
+                Some(Level::Amber),
+                "memory: 1 device added, not yet cleared"
+            )
+        );
+        // Sync off with a notice stored, errors, conflicts and no relay:
+        // nothing of folders holds, and the line says off.
+        let off = with(&|f| {
+            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[6..]) {
+                edit(f);
+            }
+            f.sync_enabled = false;
         });
         assert_eq!((off.level, off.state), (None, State::Off));
+        assert!(off.holds.is_empty());
         assert_eq!(off.summary, "memory sync off");
-        // A node that is held up with sync off: no level, and the state
-        // and the line say that it is held up, as they did.
-        let held = with(&|f| {
-            f.sync_enabled = false;
-            f.held = Some("first_start".into());
-        });
-        assert_eq!((held.level, held.state), (None, State::Attention));
-        assert_eq!(
-            held.summary,
-            "memory not syncing: the first start on this version is not done"
-        );
     }
 
-    /// With nothing mapped, or with no report yet, there is no amber:
-    /// nothing would move anyway (decision 2026-10-04 §10.1). Red is red
-    /// all the same: the notice, errors and a stalled cycle.
+    /// Where this device was answered with a change that it could not
+    /// apply, the state is `attention`, and not `synced` (decision
+    /// 2026-10-04 §10.1): it sends nothing and takes nothing until it
+    /// can. So it is with sync off, and with nothing mapped; and a node
+    /// that is held up, or a device that has stopped for good, says that
+    /// first.
     #[test]
-    fn with_nothing_mapped_or_no_report_yet_there_is_no_amber() {
-        let all_amber = |f: &mut Facts| {
-            for (edit, _, _) in AMBER {
+    fn a_device_that_could_not_apply_a_change_is_attention_and_not_synced() {
+        let says = "memory not syncing: a change could not be applied";
+        let not_applied = |edit: &dyn Fn(&mut Facts)| {
+            let mut f = synced();
+            f.devices.not_applied = true;
+            edit(&mut f);
+            derive(&f)
+        };
+        assert_eq!(not_applied(&|_| {}), (State::Attention, says.into()));
+        assert_eq!(
+            not_applied(&|f| f.sync_enabled = false),
+            (State::Attention, says.into())
+        );
+        assert_eq!(
+            not_applied(&|f| {
+                f.mapped = 0;
+                f.folders = 0;
+            }),
+            (State::Attention, says.into())
+        );
+        assert_eq!(
+            not_applied(&|f| f.errors = vec!["x".into()]),
+            (State::Attention, says.into())
+        );
+        assert_eq!(
+            not_applied(&|f| f.stands = "fork".into()).1,
+            "memory not syncing: two changes made apart"
+        );
+        assert_eq!(
+            not_applied(&|f| f.held = Some("first_start".into())).1,
+            "memory not syncing: the first start on this version is not done"
+        );
+        // Without it, synced.
+        assert_eq!(derive(&synced()).0, State::Synced);
+    }
+
+    /// The line and the level never disagree, and no state lost its
+    /// highlight (decision 2026-10-04 §10.1). Over every pair of things
+    /// that can be said of a node, with sync on and off, with and without
+    /// a folder mapped, and under a phrase and under none: where the
+    /// state is `attention`, either a level holds or the line and the bar
+    /// draw as they did before there was a level, in red and `active`;
+    /// with red the line is red and the bar `active`; with amber the line
+    /// has amber's mark and the bar is not `active`; and with no level
+    /// and another state nothing is highlighted.
+    #[test]
+    fn the_line_and_the_level_never_disagree() {
+        let things: Vec<Edit> = RED
+            .iter()
+            .map(|(edit, _, _)| *edit)
+            .chain(AMBER.iter().map(|(edit, _, _)| *edit))
+            .chain(NO_LEVEL.iter().map(|(edit, _, _)| *edit))
+            .chain([
+                (&|f: &mut Facts| f.running = false) as Edit,
+                &|f: &mut Facts| f.not_asked = true,
+                &|f: &mut Facts| f.role = "relay".into(),
+            ])
+            .collect();
+        let places: [Edit; 5] = [
+            &|_| {},
+            &|f| f.sync_enabled = false,
+            &|f| {
+                f.mapped = 0;
+                f.folders = 0;
+            },
+            &|f| {
+                if f.stands == "applied" {
+                    f.stands = "no_phrase".into();
+                }
+            },
+            &|f| {
+                f.sync_enabled = false;
+                if f.stands == "applied" {
+                    f.stands = "no_phrase".into();
+                }
+            },
+        ];
+        let (mut seen, mut attention_alone) = (0, 0);
+        for one in &things {
+            for other in &things {
+                for place in places {
+                    let shown = with(&|f| {
+                        one(f);
+                        other(f);
+                        place(f);
+                    });
+                    let line = line(shown.state, shown.level, "x", false);
+                    let drawn: serde_json::Value =
+                        serde_json::from_str(&bar(shown.state, shown.level, "x", &[])).unwrap();
+                    let active = drawn["class"]
+                        .as_array()
+                        .is_some_and(|class| class.iter().any(|class| class == "active"));
+                    let red = line.starts_with('▲');
+                    match (shown.level, shown.state) {
+                        (Some(Level::Red), _) => assert!(red && active, "{shown:?}"),
+                        (Some(Level::Amber), _) => {
+                            assert!(line.starts_with('◆') && !active, "{shown:?}")
+                        }
+                        (None, State::Attention) => {
+                            attention_alone += 1;
+                            assert!(red && active, "{shown:?}");
+                        }
+                        (None, _) => assert!(!red && !active, "{shown:?}"),
+                    }
+                    // With a level, the line says a thing of that level.
+                    if let Some(level) = shown.level {
+                        let first = shown.holds.iter().find(|holds| holds.level == level);
+                        assert_eq!(Some(&shown.summary), first.map(|holds| &holds.says));
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, things.len() * things.len() * places.len());
+        // A node that was not asked is `attention` with no level: it is
+        // drawn as it always was.
+        assert!(attention_alone > 0);
+    }
+
+    /// With nothing mapped, or with no report yet, there is no amber of
+    /// folders: nothing would move anyway (decision 2026-10-04 §10.1).
+    /// Red is red all the same: the notice, errors and a stalled cycle.
+    #[test]
+    fn with_nothing_mapped_or_no_report_yet_there_is_no_amber_of_folders() {
+        let of_folders = |f: &mut Facts| {
+            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[6..]) {
                 edit(f);
             }
         };
         let nothing_mapped = with(&|f| {
-            all_amber(f);
+            of_folders(f);
             f.mapped = 0;
             f.folders = 0;
         });
@@ -1191,11 +1521,26 @@ mod tests {
         assert_eq!((no_relay.level, no_relay.state), (None, State::Off));
         assert_eq!(no_relay.summary, "memory: nothing mapped");
         let no_report = with(&|f| {
-            all_amber(f);
+            of_folders(f);
             f.report_age_secs = None;
         });
         assert_eq!(no_report.level, None);
         assert_eq!(no_report.summary, "memory sync starting");
+        // Each thing of folders needs all three: with one of them
+        // missing, none holds.
+        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[6..]) {
+            for missing in [
+                (&|f: &mut Facts| f.mapped = 0) as &dyn Fn(&mut Facts),
+                &|f: &mut Facts| f.report_age_secs = None,
+                &|f: &mut Facts| f.sync_enabled = false,
+            ] {
+                let shown = with(&|f| {
+                    edit(f);
+                    missing(f);
+                });
+                assert!(!whats(&shown).contains(what), "{what}");
+            }
+        }
 
         // Red with nothing mapped: errors, a stalled cycle, the notice.
         for (edit, what) in [
@@ -1218,7 +1563,7 @@ mod tests {
             ),
         ] {
             let shown = with(&|f| {
-                all_amber(f);
+                of_folders(f);
                 f.mapped = 0;
                 f.folders = 0;
                 edit(f);
@@ -1228,25 +1573,77 @@ mod tests {
         }
     }
 
-    /// A device that follows no phrase is red where something is mapped
-    /// (decision 2026-10-04 §10.1): nothing it holds syncs until a person
-    /// acts. With nothing mapped that makes no level; its state is
-    /// `attention` either way, so that a panel which draws from the state
-    /// does not show it as synced.
+    /// A device that follows no phrase is red, and its state `attention`,
+    /// only with sync on and something mapped (decision 2026-10-04
+    /// §10.1): nothing it holds syncs until a person acts. With sync off,
+    /// or nothing mapped, the state is what it would be without that, and
+    /// the words still say it: "no recovery phrase yet" on a new install,
+    /// and "not added yet" where the device took this version with what
+    /// an earlier one held.
     #[test]
-    fn no_phrase_is_red_only_where_something_is_mapped() {
-        let mapped = with(&|f| f.stands = "no_phrase".into());
+    fn no_phrase_is_red_only_with_sync_on_and_something_mapped() {
+        let no_phrase = |edit: &dyn Fn(&mut Facts)| {
+            with(&|f| {
+                f.stands = "no_phrase".into();
+                edit(f);
+            })
+        };
+        let new_install = "memory stays here: no recovery phrase yet";
+        let mapped = no_phrase(&|_| {});
         assert_eq!(
-            (mapped.level, mapped.state),
-            (Some(Level::Red), State::Attention)
+            (mapped.level, mapped.state, mapped.summary.as_str()),
+            (Some(Level::Red), State::Attention, new_install)
         );
-        let nothing = with(&|f| {
-            f.stands = "no_phrase".into();
+        // Nothing mapped: off, as it would be, and the words say it.
+        let nothing = no_phrase(&|f| {
             f.mapped = 0;
             f.folders = 0;
         });
-        assert_eq!((nothing.level, nothing.state), (None, State::Attention));
-        assert_eq!(nothing.summary, "memory stays here: no recovery phrase yet");
+        assert_eq!(
+            (nothing.level, nothing.state, nothing.summary.as_str()),
+            (None, State::Off, new_install)
+        );
+        assert!(nothing.holds.is_empty());
+        // Sync off: off, and the words say it; with something mapped,
+        // and with nothing.
+        for mapped in [2, 0] {
+            let off = no_phrase(&|f| {
+                f.sync_enabled = false;
+                f.mapped = mapped;
+            });
+            assert_eq!(
+                (off.level, off.state, off.summary.as_str()),
+                (None, State::Off, new_install)
+            );
+            let moved_on = no_phrase(&|f| {
+                f.sync_enabled = false;
+                f.mapped = mapped;
+                f.moved_on = true;
+            });
+            assert_eq!(
+                (moved_on.level, moved_on.state, moved_on.summary.as_str()),
+                (None, State::Off, "memory: not added yet")
+            );
+        }
+        // Nothing mapped and no report yet: starting, as it would be.
+        let starting = no_phrase(&|f| {
+            f.mapped = 0;
+            f.folders = 0;
+            f.report_age_secs = None;
+        });
+        assert_eq!(
+            (starting.level, starting.state, starting.summary.as_str()),
+            (None, State::Syncing, new_install)
+        );
+        // What needs the person with nothing mapped is said first.
+        let error = no_phrase(&|f| {
+            f.mapped = 0;
+            f.errors = vec!["x".into()];
+        });
+        assert_eq!(
+            (error.level, error.state, error.summary.as_str()),
+            (Some(Level::Red), State::Attention, "memory sync error")
+        );
         // With nothing mapped and a notice: red, and the line says that
         // folders stopped syncing.
         let notice = with(&|f| {
@@ -1713,11 +2110,27 @@ mod tests {
                 (State::Attention, format!("memory not syncing: {says}"))
             );
         }
-        // With sync off, that is what is said.
+        // With sync off, a device with no phrase is off, and still
+        // says that it has none; one that has stopped needs the person
+        // all the same.
         let mut f = synced();
         f.stands = "no_phrase".into();
         f.sync_enabled = false;
-        assert_eq!(state(&f), (State::Off, "memory sync off".into()));
+        assert_eq!(
+            state(&f),
+            (
+                State::Off,
+                "memory stays here: no recovery phrase yet".into()
+            )
+        );
+        f.stands = "removed".into();
+        assert_eq!(
+            state(&f),
+            (
+                State::Attention,
+                "memory not syncing: this device was removed".into()
+            )
+        );
     }
 
     /// A node that is held up is said to be so, ahead of everything that
@@ -1944,12 +2357,13 @@ mod tests {
         assert_eq!(bar(State::Uninitialised, Some(Level::Red), "x", &[]), "");
     }
 
-    /// The bar form carries a class for each level, after the state's,
-    /// and its `active`, which Omarchy's bar highlights, goes with red
-    /// alone (decision 2026-10-04 §10.1). Each level has an icon of its
-    /// own.
+    /// The bar form carries a class for each level, after the state's
+    /// (decision 2026-10-04 §10.1). `active`, which Omarchy's bar
+    /// highlights, goes with red, and never with amber; and with no
+    /// level it goes with the state `attention`, as it did before there
+    /// was a level. Each level has an icon of its own.
     #[test]
-    fn the_bar_has_a_class_for_each_level_and_active_with_red_alone() {
+    fn the_bar_has_a_class_for_each_level_and_active_with_red_or_attention() {
         let of = |state: State, level: Option<Level>| -> serde_json::Value {
             serde_json::from_str(&bar(state, level, "x", &[])).unwrap()
         };
@@ -1972,18 +2386,21 @@ mod tests {
             of(State::Synced, Some(Level::Red))["class"],
             serde_json::json!(["synced", "red", "active"])
         );
-        // With no level: the state alone, and never `active`, whatever
-        // the state.
+        // With no level: the state alone, and `active` with `attention`
+        // and no other state.
         for state in [
             State::Synced,
             State::Syncing,
             State::Offline,
-            State::Attention,
             State::Off,
             State::Stopped,
         ] {
             assert_eq!(of(state, None)["class"], state.as_str());
         }
+        assert_eq!(
+            of(State::Attention, None)["class"],
+            serde_json::json!(["attention", "active"])
+        );
         assert_eq!(of(State::Attention, None)["text"], "\u{f0026}");
     }
 
