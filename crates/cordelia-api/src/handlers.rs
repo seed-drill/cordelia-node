@@ -1544,6 +1544,11 @@ pub(crate) async fn status_with(
         })
         .unwrap_or_default();
 
+    let no_relay_secs = state
+        .own_channels
+        .no_relay_for(std::time::Instant::now())
+        .map(|none_for| none_for.as_secs());
+
     // Why the node is held up, where it is (decision 2026-10-04 §10.1):
     // by what, and why in words for a person.
     let held = state
@@ -1554,6 +1559,10 @@ pub(crate) async fn status_with(
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
         "held": held,
+        // How many key files of an older version were left in place at
+        // this start, since no copy holds them (decision 2026-10-04
+        // §10.1).
+        "key_files_in_place": state.held.key_files_in_place(),
         // So that a command can tell when the node is not the version it is.
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime as u64,
@@ -1563,5 +1572,9 @@ pub(crate) async fn status_with(
         "sync_errors": sync_errors,
         "outbox_waiting": outbox_waiting,
         "outbox_refused": outbox_refused,
+        // For how long no relay has been connected, by the node's own
+        // clock, which does not run while the machine sleeps (decision
+        // 2026-10-04 §10.1). Null while one is connected.
+        "no_relay_secs": no_relay_secs,
     })))
 }

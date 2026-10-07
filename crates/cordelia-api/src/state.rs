@@ -116,12 +116,35 @@ impl Held {
 ///
 /// It is kept in memory: a step that fails because the database cannot
 /// be written has nowhere else to put it.
+///
+/// With it is what one start of the node keeps of its first start on this
+/// version: what its tries keep between them, and how many key files of
+/// an older version were left in place.
 #[derive(Default)]
 pub struct HeldUp {
     why: Mutex<Option<Held>>,
+    tries: Mutex<crate::first_start::Tries>,
+    key_files_in_place: std::sync::atomic::AtomicUsize,
 }
 
 impl HeldUp {
+    /// What the tries at the first start keep between them. One try is
+    /// made at a time: the next waits here for it.
+    pub fn tries(&self) -> std::sync::MutexGuard<'_, crate::first_start::Tries> {
+        self.tries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many key files of an older version were left in place at this
+    /// start, since no copy holds them (decision 2026-10-04 §10.1).
+    pub fn key_files_in_place(&self) -> usize {
+        self.key_files_in_place.load(Ordering::Relaxed)
+    }
+
+    /// Note how many key files of an older version were left in place.
+    pub fn set_key_files_in_place(&self, files: usize) {
+        self.key_files_in_place.store(files, Ordering::Relaxed);
+    }
+
     /// Why the node is held up, where it is.
     pub fn why(&self) -> Option<Held> {
         self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -167,6 +190,19 @@ impl HeldUp {
 /// folder with no record in a channel yet waits for that before its
 /// first cycle there ([`OwnChannels::first_fetch_done`], decision
 /// 2026-10-04 §6).
+///
+/// And it carries since when each relay has been connected, and since
+/// when none has, by the node's own clock ([`OwnChannels::
+/// relays_connected`]): what a status says of a device that is offline,
+/// and of a relay that does not hold the latest change (decision
+/// 2026-10-04 §10.1).
+///
+/// And it carries what a command's work asks through the door for a
+/// carry ([`OwnChannels::ask_door`], decision 2026-10-04 §7.3, §9): a
+/// channel of a generation that the device has left, or never followed,
+/// read at each relay. The node takes each asking up and answers it.
+/// And which channels a carry is being made into, before a folder's
+/// first cycle there ([`OwnChannels::carrying`]).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -185,6 +221,94 @@ pub struct OwnChannels {
     /// For each channel of a name, by its ID: the relays that have handed
     /// the whole of it, and when the first of them had.
     fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
+    /// Since when each relay has been connected, and since when none has.
+    connected: Mutex<Connected>,
+    /// What was asked through the door for a carry, and is not taken up
+    /// yet.
+    door: Mutex<std::collections::VecDeque<DoorAsk>>,
+    door_asked: tokio::sync::Notify,
+    /// The channels that a carry is being made into, each with when that
+    /// began.
+    carrying: Mutex<std::collections::HashMap<[u8; 32], Instant>>,
+    /// What was last read at the relays for a command, with what that
+    /// reading is named by: kept until the command has been handed it.
+    shelf: Mutex<(u64, Vec<Vec<u8>>)>,
+    /// How far the look of a recovery is, and what it found, where this
+    /// node has made one since it started (decision 2026-10-04 §9).
+    look: Mutex<Option<serde_json::Value>>,
+}
+
+/// How a channel's key is proved to a relay, through the door for a carry.
+pub enum ProvedBy {
+    /// The node holds the channel's secret: it makes the proof for each
+    /// connection itself. The secret is of a generation that the device
+    /// left, or was handed at a recovery (decision 2026-10-04 §3, §9).
+    Secret(zeroize::Zeroizing<[u8; 32]>),
+    /// The proofs were made by whoever holds the channel's secret, one
+    /// for each relay by its name: the command that was typed the phrase,
+    /// in its own process, over the value of each connection's session
+    /// ([`DoorAsk::Sessions`]). The node is handed no secret.
+    Proofs(Vec<(String, [u8; 64])>),
+}
+
+/// What one relay handed through the door for a carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftRead {
+    /// The node is not connected to the relay.
+    NotReached,
+    /// The relay does not hold the channel, or the proof did not hold
+    /// there: a relay says neither which.
+    NotHeld,
+    /// Nothing was read, and why.
+    NotRead(String),
+    /// What it handed of the channel, each entry as its bytes on the
+    /// wire, and whether the channel was read to its end.
+    Read { entries: Vec<Vec<u8>>, whole: bool },
+}
+
+/// A relay that the device is set up with, by its name, with what it
+/// handed through the door for a carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftAt {
+    pub relay: String,
+    pub read: LeftRead,
+}
+
+/// What a command's work asks of the node through the door for a carry
+/// (decision 2026-10-04 §7.3, §9).
+pub enum DoorAsk {
+    /// Each relay that the device is set up with, by its name, with the
+    /// value of the session of the connection to it, where there is one:
+    /// what a proof for that connection is made over.
+    Sessions {
+        answer: tokio::sync::oneshot::Sender<Vec<(String, Option<[u8; 32]>)>>,
+    },
+    /// Read the channel whose ID is `channel` at each relay, until
+    /// `until`: it is of a generation that the device has left, or never
+    /// followed.
+    Read {
+        channel: [u8; 32],
+        by: ProvedBy,
+        until: Instant,
+        answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
+    },
+}
+
+/// How long a channel that a carry is being made into holds back a
+/// folder's first cycle there, at most: a carry that never says it has
+/// ended holds nothing up for longer.
+const CARRYING_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(cordelia_core::protocol::CARRY_FIRST_MAX_SECS);
+
+/// Since when the node's relays have been connected, by the node's own
+/// clock.
+#[derive(Debug, Default)]
+struct Connected {
+    /// Each relay that is connected, by its name, with since when.
+    since: std::collections::HashMap<String, Instant>,
+    /// Since when no relay has been connected: `None` while one is, and
+    /// before the node has said.
+    none_since: Option<Instant>,
 }
 
 /// Which relays have handed the whole of one channel, by name, and when
@@ -250,6 +374,114 @@ impl OwnChannels {
         self.asked.notified().await;
     }
 
+    /// A command's work asks something through the door for a carry: the
+    /// node takes it up, and answers on the asking's own channel.
+    pub fn ask_door(&self, ask: DoorAsk) {
+        self.door
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ask);
+        self.door_asked.notify_one();
+    }
+
+    /// Wait for something to be asked through the door for a carry, and
+    /// take it up: each asking is taken up once.
+    pub async fn wait_door(&self) -> DoorAsk {
+        loop {
+            let asked = self
+                .door
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            if let Some(asked) = asked {
+                return asked;
+            }
+            self.door_asked.notified().await;
+        }
+    }
+
+    /// A carry is being made into the channel whose ID is `channel`, from
+    /// `now`: a folder with no record in it yet waits for the carry
+    /// before its first cycle there ([`Self::first_fetch_done`]).
+    pub fn carrying(&self, channel: &[u8; 32], now: Instant) {
+        let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying.insert(*channel, now);
+    }
+
+    /// The carry into the channel whose ID is `channel` has ended.
+    pub fn carried(&self, channel: &[u8; 32]) {
+        let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying.remove(channel);
+    }
+
+    /// Whether a carry is being made into the channel at `now`: one
+    /// began, has not said that it ended, and its wait has not gone by.
+    fn is_carrying(&self, channel: &[u8; 32], now: Instant) -> bool {
+        let carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying
+            .get(channel)
+            .is_some_and(|began| now.saturating_duration_since(*began) < CARRYING_WAIT)
+    }
+
+    /// Keep how far the look of a recovery is, or what it found (decision
+    /// 2026-10-04 §9, step 5), for the command that waits for it. It is
+    /// kept in memory alone: a look that is interrupted is not taken up
+    /// again by itself, and a node that starts again says nothing of one.
+    pub fn set_look(&self, said: serde_json::Value) {
+        *self.look.lock().unwrap_or_else(|e| e.into_inner()) = Some(said);
+    }
+
+    /// What was last kept of the look of a recovery ([`Self::set_look`]).
+    pub fn look(&self) -> Option<serde_json::Value> {
+        self.look.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keep `entries`, which were read at the relays for a command that
+    /// holds a secret the node does not (decision 2026-10-04 §7.3, §9),
+    /// until the command has been handed them, a part at a time
+    /// ([`Self::shelved`]). What was kept of an earlier reading goes.
+    /// Returns what this reading is named by.
+    pub fn shelve(&self, entries: Vec<Vec<u8>>) -> u64 {
+        let mut shelf = self.shelf.lock().unwrap_or_else(|e| e.into_inner());
+        shelf.0 += 1;
+        shelf.1 = entries;
+        shelf.0
+    }
+
+    /// A part of the reading named `id`, from the entry numbered `from`
+    /// on: as many entries as hold `max_bytes` between them, and one at
+    /// least; and where the next part begins, where there is one. `None`
+    /// where that reading is kept no longer. **Once its last part is
+    /// handed, nothing is kept of it.**
+    pub fn shelved(
+        &self,
+        id: u64,
+        from: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<Vec<u8>>, Option<usize>)> {
+        let mut shelf = self.shelf.lock().unwrap_or_else(|e| e.into_inner());
+        if shelf.0 != id || from > shelf.1.len() {
+            return None;
+        }
+        let mut part: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0;
+        for entry in &shelf.1[from..] {
+            if !part.is_empty() && bytes + entry.len() > max_bytes {
+                break;
+            }
+            bytes += entry.len();
+            part.push(entry.clone());
+        }
+        let next = from + part.len();
+        if next >= shelf.1.len() {
+            shelf.1 = Vec::new();
+            // What it was named by names nothing from now on.
+            shelf.0 += 1;
+            return Some((part, None));
+        }
+        Some((part, Some(next)))
+    }
+
     /// The node begins a whole pass. Returns the pass's number, which it
     /// gives back when the pass ends.
     pub fn whole_pass_begins(&self) -> u64 {
@@ -311,7 +543,15 @@ impl OwnChannels {
     /// only the wait says that the others had their time. A node that is
     /// set up with no relay has none to wait for, and nobody to publish
     /// to: its folders do not wait.
+    ///
+    /// **A device that comes to sync a name carries it first** (decision
+    /// 2026-10-04 §7.3): while a carry is being made into the channel,
+    /// the folder waits for that too, so that what it publishes is
+    /// written over what was carried, and not beside it.
     pub fn first_fetch_done(&self, channel: &[u8; 32], now: Instant) -> bool {
+        if self.is_carrying(channel, now) {
+            return false;
+        }
         if self.relays_set_up() == Some(0) {
             return true;
         }
@@ -331,6 +571,62 @@ impl OwnChannels {
     pub fn forget_fetched(&self, channel: &[u8; 32]) {
         let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
         fetched.remove(channel);
+    }
+
+    /// The node says which of the relays it is set up with are connected
+    /// at `now`, each by its name: it does so as often as it looks.
+    ///
+    /// A relay that was connected the last time it said so has been
+    /// connected since it first said so; one that is connected now and
+    /// was not has been since `now`. And where none is connected, none
+    /// has been since the node first said so: at its start, a node says
+    /// that none is.
+    ///
+    /// `now` is the node's own clock, which does not run while the
+    /// machine sleeps: a machine that wakes has not been without a relay
+    /// for the time it slept (decision 2026-10-04 §10.1).
+    pub fn relays_connected(&self, relays: &[&str], now: Instant) {
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        connected
+            .since
+            .retain(|relay, _| relays.contains(&relay.as_str()));
+        for relay in relays {
+            connected.since.entry(relay.to_string()).or_insert(now);
+        }
+        match relays.is_empty() {
+            true => {
+                connected.none_since.get_or_insert(now);
+            }
+            false => connected.none_since = None,
+        }
+    }
+
+    /// For how long no relay has been connected, at `now`. `None` while
+    /// one is connected, and where the node has not said.
+    pub fn no_relay_for(&self, now: Instant) -> Option<std::time::Duration> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let since = connected.none_since?;
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// For how long the relay called `relay` has been connected, at
+    /// `now`. `None` where it is not connected.
+    pub fn connected_for(&self, relay: &str, now: Instant) -> Option<std::time::Duration> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let since = connected.since.get(relay)?;
+        Some(now.saturating_duration_since(*since))
+    }
+
+    /// Keep nothing of which relays have handed any channel: the device
+    /// has left the phrase it followed, its store holds nothing of the
+    /// channels it held, and its folders have forgotten what they had
+    /// agreed. Whatever channel it comes to hold is fetched again before
+    /// a folder's first cycle there, though it be one that it held
+    /// before: a device that comes back to the generation it left has the
+    /// same channel for each name.
+    pub fn forget_every_fetched(&self) {
+        let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        fetched.clear();
     }
 }
 
@@ -494,6 +790,9 @@ pub struct SyncControl {
     cycles_ended: AtomicU64,
     /// The number of the last cycle that stopped before its end.
     cycles_cut_short: AtomicU64,
+    /// When the node last stored a cycle's report in this run, by its
+    /// own clock.
+    report_stored: Mutex<Option<Instant>>,
 }
 
 impl SyncControl {
@@ -668,6 +967,27 @@ impl SyncControl {
         self.wake.notify_one();
     }
 
+    /// The node has stored a cycle's report, at `now` by its own clock.
+    pub fn report_stored(&self, now: Instant) {
+        *self.report_stored.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
+
+    /// For how long the node has stored no report of a cycle, at `now`:
+    /// since the later of `started`, when the node started, and the last
+    /// report it stored in this run (decision 2026-10-04 §10.1).
+    ///
+    /// Both are read by the node's own clock, which does not run while
+    /// the machine sleeps. A status says that the cycle has stalled by
+    /// this alone: were the report's age read by the wall clock, a
+    /// machine that wakes would be stalled until its next cycle, and
+    /// were only the start read by the node's own, a report of an
+    /// earlier run would make a node that has just started stalled.
+    pub fn no_report_for(&self, started: Instant, now: Instant) -> std::time::Duration {
+        let stored = *self.report_stored.lock().unwrap_or_else(|e| e.into_inner());
+        let since = stored.map_or(started, |stored| stored.max(started));
+        now.saturating_duration_since(since)
+    }
+
     /// The node begins a cycle. Returns the cycle's number, which it
     /// gives back when the cycle ends.
     pub fn cycle_begins(&self) -> u64 {
@@ -796,6 +1116,18 @@ fn swept(swept: std::io::Result<cordelia_storage::history::Swept>) {
     }
 }
 
+/// What work on something from outside came to, for whoever syncs the
+/// device's folders ([`AppState::as_a_change_where`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Came {
+    /// No statement was applied, and the device stands where it stood.
+    Nothing,
+    /// A statement was applied, or the device's state changed.
+    Changed,
+    /// The device left the phrase it followed, and follows another.
+    Left,
+}
+
 /// One connected peer, as `cordelia peers` shows it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerSnapshot {
@@ -847,13 +1179,82 @@ impl AppState {
     /// It is counted whether or not the work then changes anything, as a
     /// settings command is.
     pub fn as_a_change<T>(&self, work: impl FnOnce(&Connection) -> T) -> T {
+        self.as_a_leaving(work, |_| false)
+    }
+
+    /// [`Self::as_a_change`], for work that may have the device leave the
+    /// phrase it follows: `left` says of what was done whether it did.
+    ///
+    /// A device that leaves a phrase drops what its store holds of every
+    /// channel of its own, and its folders forget what they had agreed.
+    /// Where it has, the node keeps nothing more of which relays had
+    /// handed each channel ([`OwnChannels::forget_every_fetched`]), under
+    /// the hold of the database's lock that the work was done under: a
+    /// device that comes back to the generation it left, in the same run
+    /// of the node, has the same channel for each name, and a folder's
+    /// first cycle there waits until that channel was fetched again
+    /// (decision 2026-10-04 §6). Otherwise the cycle would run on an
+    /// empty copy of the channel, and publish every file a second time.
+    pub fn as_a_leaving<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> T,
+        left: impl FnOnce(&T) -> bool,
+    ) -> T {
         let locked = || self.db.lock().unwrap_or_else(|e| e.into_inner());
         self.sync_control.changed(&locked());
         let _turn = self.history.turn();
         let db = locked();
         let done = work(&db);
+        if left(&done) {
+            self.own_channels.forget_every_fetched();
+        }
         self.sync_control.changed(&db);
         done
+    }
+
+    /// Do `work` on what came from outside and may change which channels
+    /// are the device's own, or where the device stands: an entry that a
+    /// relay answered a show with, one that a pass tries again, and one
+    /// read from a pair channel (decision 2026-10-04 §4.2, §4.6). `came`
+    /// says of what the work came to whether it did ([`Came`]).
+    ///
+    /// **Only then is it a change of settings.** Most of what arrives so
+    /// changes nothing: an entry that the device keeps, one behind the
+    /// statement it has applied, one that is refused. Counted each time,
+    /// such an entry would stop the cycle that is running, and a relay
+    /// could stop every cycle at the rate of its answers.
+    ///
+    /// So the work is done first with the database alone, in a
+    /// transaction of its own. Where it comes to nothing in that sense,
+    /// that stands: nothing is counted, and no cycle is waited for. Where
+    /// it comes to something, the transaction is undone, and the work is
+    /// done again as a change is ([`Self::as_a_change`], or
+    /// [`Self::as_a_leaving`] where the device left a phrase by it): the
+    /// change is counted, a cycle that is running stops, and the work is
+    /// done once that cycle's turn has ended. What the second doing
+    /// comes to is what is said, whatever the first came to: the
+    /// database may have changed between the two.
+    ///
+    /// `work` writes nowhere but in the database it is given: whatever
+    /// else it did could not be undone.
+    pub fn as_a_change_where<T>(
+        &self,
+        work: impl Fn(&Connection) -> T,
+        came: impl Fn(&T) -> Came,
+    ) -> T {
+        {
+            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            // Undone where it is dropped: also where the work unwinds.
+            let first =
+                rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate);
+            if let Ok(first) = first {
+                let done = work(&first);
+                if came(&done) == Came::Nothing && first.commit().is_ok() {
+                    return done;
+                }
+            }
+        }
+        self.as_a_leaving(work, |done| came(done) == Came::Left)
     }
 
     /// Uptime in seconds since node start.
@@ -968,6 +1369,44 @@ mod tests {
         assert_eq!(waited, (true, false));
     }
 
+    /// A device that comes to sync a name carries it first (decision
+    /// 2026-10-04 §7.3): while a carry is being made into a channel, a
+    /// folder's first cycle there waits for it, though the channel was
+    /// fetched from every relay. It waits for that channel alone, until
+    /// the carry says that it has ended, and for no longer than a carry
+    /// may take: one that never says so holds nothing up for good.
+    #[test]
+    fn test_a_first_cycle_waits_for_a_carry_into_its_channel() {
+        let own = OwnChannels::default();
+        let (channel, other) = ([1u8; 32], [2u8; 32]);
+        let start = Instant::now();
+        let later = |secs: u64| start + std::time::Duration::from_secs(secs);
+        own.set_up_with(1);
+        own.fetched_from(&channel, "one", later(0));
+        own.fetched_from(&other, "one", later(0));
+        assert!(own.first_fetch_done(&channel, later(1)));
+
+        own.carrying(&channel, later(1));
+        assert!(!own.first_fetch_done(&channel, later(1)));
+        assert!(!own.first_fetch_done(&channel, later(100)));
+        assert!(own.first_fetch_done(&other, later(1)));
+        // The carry has ended.
+        own.carried(&channel);
+        assert!(own.first_fetch_done(&channel, later(2)));
+
+        // A carry that never says that it ended.
+        let wait = cordelia_core::protocol::CARRY_FIRST_MAX_SECS;
+        own.carrying(&channel, later(10));
+        assert!(!own.first_fetch_done(&channel, later(10 + wait - 1)));
+        assert!(own.first_fetch_done(&channel, later(10 + wait)));
+        // A node that is set up with no relay waits for a carry too.
+        let alone = OwnChannels::default();
+        alone.set_up_with(0);
+        assert!(alone.first_fetch_done(&channel, later(0)));
+        alone.carrying(&channel, later(0));
+        assert!(!alone.first_fetch_done(&channel, later(1)));
+    }
+
     /// A folder's first cycle in a channel waits for the channel to be
     /// fetched: from one relay at least, and from each other relay that
     /// the device is set up with, or until the wait for those has gone by
@@ -1000,6 +1439,15 @@ mod tests {
         // Held no more, it is fetched again before a first cycle there.
         own.forget_fetched(&channel);
         assert!(!own.first_fetch_done(&channel, later(3600)));
+        // And so is every channel, once the device has left its phrase.
+        own.fetched_from(&channel, "one", later(10));
+        own.fetched_from(&channel, "two", later(10));
+        own.fetched_from(&other, "one", later(10));
+        own.fetched_from(&other, "two", later(10));
+        assert!(own.first_fetch_done(&channel, later(10)));
+        own.forget_every_fetched();
+        assert!(!own.first_fetch_done(&channel, later(3600)));
+        assert!(!own.first_fetch_done(&other, later(3600)));
 
         // A device set up with one relay waits for that one, and no longer.
         own.set_up_with(1);
@@ -1071,6 +1519,188 @@ mod tests {
                 .kept_beside("/m", "channel", "a.md")
                 .is_none()
         );
+    }
+
+    /// For how long the node has stored no report of a cycle (decision
+    /// 2026-10-04 §10.1): since it started, until it stores one, and
+    /// then since the last it stored. A time before the start counts
+    /// from the start.
+    #[test]
+    fn test_for_how_long_no_report_was_stored_is_by_the_nodes_own_clock() {
+        let control = SyncControl::default();
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let secs = |now: Instant| control.no_report_for(at(100), now).as_secs();
+        // Started at 100, and no report yet.
+        assert_eq!(secs(at(100)), 0);
+        assert_eq!(secs(at(170)), 70);
+        assert_eq!(secs(at(50)), 0);
+        control.report_stored(at(160));
+        assert_eq!(secs(at(170)), 10);
+        assert_eq!(secs(at(400)), 240);
+        control.report_stored(at(395));
+        assert_eq!(secs(at(400)), 5);
+        // A report from before the start, were there one: from the
+        // start.
+        control.report_stored(at(20));
+        assert_eq!(secs(at(400)), 300);
+    }
+
+    /// Since when no relay has been connected, and since when each has
+    /// been, by the clock that the node gives (decision 2026-10-04
+    /// §10.1). Nothing is said before the node has: a relay that stays
+    /// connected has been since it first was, one that comes back has
+    /// been since it came back, and none has been connected since the
+    /// last of them went.
+    #[test]
+    fn test_since_when_each_relay_is_connected_and_since_when_none_is() {
+        let own = OwnChannels::default();
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let secs = |time: Option<std::time::Duration>| time.map(|time| time.as_secs());
+        assert_eq!(secs(own.no_relay_for(at(100))), None);
+        assert_eq!(secs(own.connected_for("one", at(100))), None);
+
+        // The node starts: none is connected.
+        own.relays_connected(&[], at(0));
+        own.relays_connected(&[], at(2));
+        assert_eq!(secs(own.no_relay_for(at(40))), Some(40));
+        // One connects, and then the other: no relay is missing, and
+        // each has been connected since it was first said to be.
+        own.relays_connected(&["one"], at(50));
+        own.relays_connected(&["one", "two"], at(60));
+        own.relays_connected(&["one", "two"], at(70));
+        assert_eq!(secs(own.no_relay_for(at(400))), None);
+        assert_eq!(secs(own.connected_for("one", at(400))), Some(350));
+        assert_eq!(secs(own.connected_for("two", at(400))), Some(340));
+        // One goes and comes back: it has been connected since it came
+        // back. With the other still there, a relay was connected
+        // throughout.
+        own.relays_connected(&["two"], at(500));
+        assert_eq!(secs(own.connected_for("one", at(510))), None);
+        assert_eq!(secs(own.no_relay_for(at(510))), None);
+        own.relays_connected(&["one", "two"], at(520));
+        assert_eq!(secs(own.connected_for("one", at(600))), Some(80));
+        assert_eq!(secs(own.connected_for("two", at(600))), Some(540));
+        // Both go: none has been connected since then, however often
+        // the node says so.
+        own.relays_connected(&[], at(700));
+        own.relays_connected(&[], at(900));
+        assert_eq!(secs(own.no_relay_for(at(1000))), Some(300));
+        assert_eq!(secs(own.connected_for("two", at(1000))), None);
+        // A time before the one that was noted is no time at all.
+        assert_eq!(secs(own.no_relay_for(at(650))), Some(0));
+    }
+
+    /// Work that has the device leave the phrase it follows is done as a
+    /// change of settings is, and the node then keeps nothing of which
+    /// relays had handed each channel: a folder's first cycle in a
+    /// channel that the device comes back to waits until it was fetched
+    /// again (decision 2026-10-04 §6). Work that leaves nothing keeps
+    /// what was noted.
+    #[test]
+    fn test_a_device_that_leaves_its_phrase_keeps_no_note_of_what_was_fetched() {
+        let state = test_state();
+        state.own_channels.set_up_with(1);
+        let channel = [1u8; 32];
+        let now = Instant::now();
+        state.own_channels.fetched_from(&channel, "one", now);
+        let before = state.sync_control.generation();
+
+        // It did not leave: what was noted stands, and the change counts.
+        let done = state.as_a_leaving(|_db| Ok::<bool, ()>(false), |done| *done == Ok(true));
+        assert_eq!(done, Ok(false));
+        assert!(state.own_channels.first_fetch_done(&channel, now));
+        assert_eq!(state.sync_control.generation(), before + 2);
+        // Nor where the work failed.
+        let failed = state.as_a_leaving(|_db| Err::<bool, ()>(()), |done| *done == Ok(true));
+        assert_eq!(failed, Err(()));
+        assert!(state.own_channels.first_fetch_done(&channel, now));
+
+        // It left: nothing is noted any more, by the time the work's hold
+        // of the database is given up.
+        let done = state.as_a_leaving(|_db| Ok::<bool, ()>(true), |done| *done == Ok(true));
+        assert_eq!(done, Ok(true));
+        assert!(!state.own_channels.first_fetch_done(&channel, now));
+        assert_eq!(state.sync_control.generation(), before + 6);
+    }
+
+    /// What comes from outside is a change of settings only where it
+    /// applies a statement or changes the device's state (decision
+    /// 2026-10-04 §4.2). Work that changes neither is done with the
+    /// database alone: nothing is counted, what the adapter keeps beside
+    /// files stands, and it does not wait for a cycle that is running.
+    /// Work that does is undone and done again as a change is: counted
+    /// before and after, and only once the cycle's turn has ended. And
+    /// what work that failed wrote is not kept, nor counted.
+    #[test]
+    fn test_what_comes_from_outside_counts_as_a_change_only_where_it_changes_something() {
+        let state = std::sync::Arc::new(test_state());
+        // The work: it counts, in the database, how often it was done.
+        let done = |db: &Connection| -> i64 {
+            let so_far = cordelia_storage::meta::get(db, "test.done").unwrap();
+            let now = so_far.map_or(0, |n| n.parse::<i64>().unwrap()) + 1;
+            cordelia_storage::meta::set(db, "test.done", &now.to_string()).unwrap();
+            now
+        };
+        let channel = [1u8; 32];
+        let noted = Instant::now();
+        state.own_channels.set_up_with(1);
+        state.own_channels.fetched_from(&channel, "one", noted);
+        let before = state.sync_control.generation();
+        {
+            let db = state.db.lock().unwrap();
+            let kept = Kept {
+                version: PlannedAgainst::NoVersion,
+                copy: "a.conflict-x.md".into(),
+                hash: [1; 32],
+                under: PlannedAgainst::NoVersion,
+            };
+            state.sync_control.keep(&db, "/m", "channel", "a.md", kept);
+        }
+
+        // It changes nothing: done once, while a cycle holds the turn,
+        // with nothing counted and nothing forgotten.
+        let turn = state.history.turn();
+        assert_eq!(state.as_a_change_where(done, |_| Came::Nothing), 1);
+        assert_eq!(state.sync_control.generation(), before);
+        assert!(
+            state
+                .sync_control
+                .kept_beside("/m", "channel", "a.md")
+                .is_some()
+        );
+
+        // It changes something: what the first doing wrote is undone, the
+        // change is counted so that the cycle stops, and the work is done
+        // again once the cycle's turn has ended.
+        let other = std::sync::Arc::clone(&state);
+        let change = std::thread::spawn(move || other.as_a_change_where(done, |_| Came::Changed));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while state.sync_control.generation() == before {
+            assert!(Instant::now() < deadline, "the change was not counted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!change.is_finished(), "the work did not wait for the cycle");
+        assert_eq!(state.sync_control.generation(), before + 1);
+        drop(turn);
+        // Written once more, and no more: the first doing was undone.
+        assert_eq!(change.join().unwrap(), 2);
+        assert_eq!(state.sync_control.generation(), before + 2);
+        assert!(
+            state
+                .sync_control
+                .kept_beside("/m", "channel", "a.md")
+                .is_none()
+        );
+        // Neither had the device leave a phrase: what was noted of the
+        // relays that handed its channels stands. Where it did leave,
+        // nothing is noted any more.
+        assert!(state.own_channels.first_fetch_done(&channel, noted));
+        assert_eq!(state.as_a_change_where(done, |_| Came::Left), 3);
+        assert_eq!(state.sync_control.generation(), before + 4);
+        assert!(!state.own_channels.first_fetch_done(&channel, noted));
     }
 
     /// A cycle has a number, which is above the count of cycles begun at

@@ -62,6 +62,16 @@
 //! entry to show. Where the entry that a relay answered with is one that
 //! the device refuses, what a status reads says so for that relay.
 //!
+//! ## A carry that a person asked for
+//!
+//! `cordelia sync carry` and `cordelia recover` read, at each relay, a
+//! channel of a generation that the device has left or never followed
+//! (decision 2026-10-04 §7.3, §9). [`DeviceEntries::door`] takes such an
+//! asking up: it reads the channel at each relay, page by page, through
+//! the one door for that ([`Leave::left`]), within what the device takes
+//! from a relay in a minute, and hands back what each relay handed. It
+//! stores nothing, keeps no place, and pushes nothing.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -81,8 +91,10 @@ use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropp
 use cordelia_api::at_relays::{
     self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
 };
-use cordelia_api::person::Shown;
-use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn, NoRoom};
+use cordelia_api::person::{PersonError, Shown};
+use cordelia_api::state::{
+    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftRead, NoRoom, ProvedBy,
+};
 use cordelia_api::take::Taken;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
@@ -101,7 +113,9 @@ use cordelia_storage::person::State;
 use cordelia_storage::relay::{Mark, NO_MARK};
 use rusqlite::Connection;
 
-pub use leave::{Asked, Clock, Leave, Link, LinkId, NoLeave, PairRead, Refused};
+pub use leave::{
+    Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
+};
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -110,6 +124,11 @@ const PROOF_AGAIN: Duration = Duration::from_secs(CHANNEL_PROOF_AGAIN_SECS);
 /// The most shows on one connection in one pass: the entry in short, then
 /// whole, and again for each change that the device applies on the way.
 const SHOWS_IN_A_PASS: usize = 6;
+
+/// How long a read through the door for a carry waits before it asks
+/// again, where the device has taken from the relay what it takes in a
+/// minute, or has asked what it asks in one.
+const LEFT_ROOM_WAIT: Duration = Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS);
 
 /// Lock a mutex, also one whose holder panicked: what it guards is whole
 /// after any one step.
@@ -378,6 +397,210 @@ impl DeviceEntries {
         }
     }
 
+    /// Take up what a command's work asked through the door for a carry
+    /// (decision 2026-10-04 §7.3, §9), and answer it. `relays` is every
+    /// relay that the device is set up with, each with its connection
+    /// where there is one.
+    ///
+    /// - **The sessions:** each relay by its name, with the value of the
+    ///   session of its connection, which a proof for that connection is
+    ///   made over. A command that was typed the phrase makes its proofs
+    ///   with these, in its own process.
+    /// - **A read:** the channel is read at every relay beside one
+    ///   another, each through the one door ([`Self::read_left`]), and
+    ///   each relay is answered for by its name: one that is not
+    ///   connected as that.
+    ///
+    /// **A node that is held up reads nothing** (decision 2026-10-04
+    /// §10.1): every relay is answered for as not read.
+    pub async fn door(self: &Arc<Self>, relays: &[Relay], ask: DoorAsk) {
+        let open = |relay: &Relay| relay.link.clone().filter(|link| link.is_open());
+        match ask {
+            DoorAsk::Sessions { answer } => {
+                let sessions = relays
+                    .iter()
+                    .map(|relay| (relay.name.clone(), open(relay).and_then(|l| l.session())))
+                    .collect();
+                let _ = answer.send(sessions);
+            }
+            DoorAsk::Read {
+                channel,
+                by,
+                until,
+                answer,
+            } => {
+                let held_up = self.state.held.why().is_some();
+                let own = self.state.identity.public_key();
+                let mut reads = tokio::task::JoinSet::new();
+                let mut read: Vec<LeftAt> = Vec::new();
+                for relay in relays {
+                    let name = relay.name.clone();
+                    let Some(link) = open(relay) else {
+                        let read_as = LeftRead::NotReached;
+                        read.push(LeftAt {
+                            relay: name,
+                            read: read_as,
+                        });
+                        continue;
+                    };
+                    if held_up {
+                        let read_as = LeftRead::NotRead("the node is held up".into());
+                        read.push(LeftAt {
+                            relay: name,
+                            read: read_as,
+                        });
+                        continue;
+                    }
+                    // The proof for this connection: made here where the
+                    // node holds the channel's secret, and otherwise the
+                    // one that was made for this relay.
+                    let proof = match &by {
+                        ProvedBy::Secret(secret) => link.session().and_then(|session| {
+                            cordelia_crypto::proof::make(secret, &session, &own).ok()
+                        }),
+                        ProvedBy::Proofs(proofs) => proofs
+                            .iter()
+                            .find(|(relay, _)| *relay == name)
+                            .map(|(_, proof)| *proof),
+                    };
+                    let Some(proof) = proof else {
+                        let read_as = LeftRead::NotRead("no proof for this connection".into());
+                        read.push(LeftAt {
+                            relay: name,
+                            read: read_as,
+                        });
+                        continue;
+                    };
+                    let engine = Arc::clone(self);
+                    reads.spawn(async move {
+                        let read = engine.read_left(&link, &channel, &proof, until).await;
+                        LeftAt { relay: name, read }
+                    });
+                }
+                while let Some(done) = reads.join_next().await {
+                    if let Ok(done) = done {
+                        read.push(done);
+                    }
+                }
+                // In the order of the relays that the device is set up
+                // with.
+                let place = |at: &LeftAt| relays.iter().position(|relay| relay.name == at.relay);
+                read.sort_by_key(place);
+                let _ = answer.send(read);
+            }
+        }
+    }
+
+    /// Read the channel whose ID is `channel` at the relay at `link`,
+    /// from its start, through the one door for a carry
+    /// ([`Leave::left`]): the proof once, and then page after page until
+    /// a page holds nothing, until a page does not move the place, or
+    /// until `until`.
+    ///
+    /// **What the device takes from one relay in a minute is bounded
+    /// here as in a pass** ([`Self::room_to_take`]): where the minute is
+    /// used up it waits for room, and a relay is never asked for more
+    /// than it may hand a connection. A channel that is not read to its
+    /// end by `until` is handed back as that.
+    async fn read_left(
+        &self,
+        link: &Link,
+        channel: &[u8; 32],
+        proof: &[u8; 64],
+        until: Instant,
+    ) -> LeftRead {
+        let mut place = (NO_MARK, 0u64);
+        let mut read: Vec<Vec<u8>> = Vec::new();
+        let mut proved = false;
+        loop {
+            if Instant::now() >= until {
+                return LeftRead::Read {
+                    entries: read,
+                    whole: false,
+                };
+            }
+            if !self.room_to_take(link) {
+                tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                continue;
+            }
+            // A relay remembers so many channels for a connection, and
+            // looks at no proof beyond them: one more is not sent.
+            let room = proved || {
+                let kept = lock(&self.kept);
+                let proved = kept.links.get(&link.id()).map(|of| &of.proved);
+                proved.is_none_or(|proved| {
+                    proved.contains_key(channel)
+                        || proved.len() < MAX_CHANNELS_PROVED_ON_A_CONNECTION
+                })
+            };
+            if !room {
+                return LeftRead::NotRead(
+                    "this connection has proved as many channels as a relay remembers for one"
+                        .into(),
+                );
+            }
+            let page = self
+                .leave
+                .left(&self.state, link, channel, proof, place, !proved)
+                .await;
+            match page {
+                Ok(LeftPage::NotHeld) => return LeftRead::NotHeld,
+                Ok(LeftPage::Page {
+                    entries,
+                    handed,
+                    mark,
+                    next,
+                }) => {
+                    // What the relay handed counts as taken from it,
+                    // whatever is then done with it.
+                    let counted = handed.iter().map(|bytes| counted_as_handed(*bytes)).sum();
+                    self.took(link, counted);
+                    {
+                        let mut kept = lock(&self.kept);
+                        if !proved {
+                            let of = kept.links.entry(link.id()).or_default();
+                            of.proved.insert(*channel, self.clock.now());
+                        }
+                        let of = kept.relays.entry(link.name().to_string()).or_default();
+                        of.counts.pages += 1;
+                        of.counts.pulled += entries.len() as u64;
+                    }
+                    proved = true;
+                    let moved = (mark, next) != place;
+                    let nothing = entries.is_empty();
+                    read.extend(entries.iter().map(|entry| entry.to_wire()));
+                    // A page that holds nothing, or that leaves the place
+                    // where it was, is the channel's end.
+                    if nothing || !moved {
+                        return LeftRead::Read {
+                            entries: read,
+                            whole: true,
+                        };
+                    }
+                    place = (mark, next);
+                }
+                // Asked enough for this minute: it waits, and asks again.
+                Err(LeftRefused::AskedEnough) => tokio::time::sleep(LEFT_ROOM_WAIT).await,
+                Err(refused) if read.is_empty() => {
+                    return LeftRead::NotRead(match refused {
+                        LeftRefused::OwnChannel => {
+                            "it is a channel of this device's own, which is not read this way"
+                                .into()
+                        }
+                        LeftRefused::NotAnswered(why) => why,
+                        LeftRefused::AskedEnough => "asked enough".into(),
+                    });
+                }
+                Err(_) => {
+                    return LeftRead::Read {
+                        entries: read,
+                        whole: false,
+                    };
+                }
+            }
+        }
+    }
+
     /// Ask the relay at `link` for what the device of each key in `typed`
     /// hands over, through the one door for that ([`Leave::pair`]):
     /// keys that a person typed at `cordelia accept` within the last
@@ -569,6 +792,29 @@ impl DeviceEntries {
         self.relay_pass(link, kind).await
     }
 
+    // ── Old deletes ─────────────────────────────────────────────────
+
+    /// Drop from the device's own store each slot whose delete it has
+    /// held for 90 days (decision 2026-10-04 §2.3, §7.3;
+    /// [`cordelia_api::swept`]): on the node's hourly timer. A node that
+    /// is held up sweeps nothing.
+    pub fn sweep_deletes(&self) {
+        let held_up = self.state.held.why().is_some();
+        if held_up {
+            return;
+        }
+        let swept = cordelia_api::swept::sweep_deletes(&lock(&self.state.db), self.clock.unix());
+        match swept {
+            Ok(swept) if swept.slots > 0 => tracing::info!(
+                slots = swept.slots,
+                entries = swept.entries,
+                "swept the deletes that this device has held for 90 days"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not sweep old deletes"),
+        }
+    }
+
     // ── What the adder of a device owes ─────────────────────────────
 
     /// The hand-overs that this device made and that are two hours old go
@@ -666,9 +912,10 @@ impl DeviceEntries {
             return;
         };
         let now = self.clock.unix();
-        let outcome = self
-            .state
-            .as_a_change(|db| at_relays::answered(db, &self.state.identity, &shown, &answer, now));
+        // Tried at each pass, it counts as a change of settings only
+        // once it is dealt with by applying a statement or by a change of
+        // the device's state.
+        let outcome = self.answered_as_a_change(&shown, &answer, now);
         match outcome {
             // The entry went through the one door, and the device did
             // with it what a change entry has it do: nothing waits now.
@@ -859,18 +1106,45 @@ impl DeviceEntries {
         false
     }
 
+    /// Give the one door the entry `another` that the device was answered
+    /// with where it showed `shown` ([`at_relays::answered`]).
+    ///
+    /// Applying a statement waits for a sync cycle that is running to
+    /// stop, and counts as a change of settings (decision 2026-10-04
+    /// §4.2): no file is written, and nothing is published, in an old
+    /// channel after it. So does a change of the device's state. **An
+    /// entry that does neither counts as no change**
+    /// ([`AppState::as_a_change_where`]): one that the device keeps, one
+    /// behind the statement it has applied, one that is refused. A relay
+    /// answers with such an entry as often as it is shown one, and a
+    /// cycle is not stopped for it.
+    fn answered_as_a_change(
+        &self,
+        shown: &CheckedEntry,
+        another: &CheckedEntry,
+        now: i64,
+    ) -> Result<Answered, PersonError> {
+        let identity = &self.state.identity;
+        let (outcome, _) = self.state.as_a_change_where(
+            |db| {
+                at_relays::telling_a_change(db, |db| {
+                    at_relays::answered(db, identity, shown, another, now)
+                })
+            },
+            |(_, changed)| match changed {
+                true => Came::Changed,
+                false => Came::Nothing,
+            },
+        );
+        outcome
+    }
+
     /// The device was answered on `link` with `another`, where it showed
     /// `shown`: the entry goes through the one door. Returns whether the
     /// device applied a change by it, and so keeps another entry now.
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
         let now = self.clock.unix();
-        // Applying a statement waits for a sync cycle that is running to
-        // stop, and counts as a change of settings (decision 2026-10-04
-        // §4.2): no file is written, and nothing is published, in an old
-        // channel after it.
-        let outcome = self
-            .state
-            .as_a_change(|db| at_relays::answered(db, &self.state.identity, shown, another, now));
+        let outcome = self.answered_as_a_change(shown, another, now);
         let relay = link.name();
         match outcome {
             Ok(Answered::Shown(Shown::Applied(applied))) => {

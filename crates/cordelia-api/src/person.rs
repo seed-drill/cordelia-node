@@ -57,7 +57,7 @@ use zeroize::{Zeroize, Zeroizing};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
-    PERSONAL_APPLIED_SENT,
+    PERSONAL_APPLIED_SENT, RECOVERY_MAX_LEFT_SECRETS,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
@@ -78,6 +78,7 @@ use cordelia_crypto::version::{self, Version};
 use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries::{self, Outcome};
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
 use cordelia_storage::sync_state;
 
@@ -92,6 +93,12 @@ pub enum PersonError {
 
     #[error("the statement is not the first of a phrase, made on this device and listing it alone")]
     NotAFirstStatement,
+
+    #[error(
+        "the statement is not a recovery's: made on this device and listing it alone, after \
+         another statement"
+    )]
+    NotARecovery,
 
     #[error("this device has stopped ({0:?}): the way on is a person's")]
     Stopped(State),
@@ -127,13 +134,23 @@ pub enum PersonError {
     SyncIsOn,
 
     #[error(
-        "this device keeps 8 keys that were typed at `cordelia accept`, and a ninth is refused: \
-         each is kept for a day from when it was typed."
+        "8 keys that were typed at `cordelia accept` are within their hour on this device, and \
+         a ninth is refused: each holds its place for an hour from when it was typed."
     )]
     TooManyTypedKeys,
 
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
+
+    #[error(
+        "the word that was given with the recovery phrase does not hold here: the phrase that \
+         this device follows did not give it, or it was given for another device or before the \
+         last change, or its ten minutes have gone by. Nothing was taken."
+    )]
+    NoWord,
+
+    #[error("{0}")]
+    NotCarried(String),
 
     #[error("a merge is written over a version, and the slot holds none")]
     MergeOverNoVersion,
@@ -1141,6 +1158,87 @@ pub fn follow_first(
     })
 }
 
+/// Follow the phrase whose statement `entry` carries, on a device that
+/// follows none, where a recovery made that statement on this device
+/// (decision 2026-10-04 §5.1, §9, step 4): the node's half of `cordelia
+/// recover`. `entry` is the change entry that the command made with the
+/// phrase, and `statement_key` the phrase's statement key. The node opens
+/// the secret that the entry seals to this device's key, and applies the
+/// statement: it has nothing to carry.
+///
+/// `left` are the secrets of the generation that was recovered from, and
+/// of those before it that its change entry gave the phrase, each with
+/// its statement's number. **The machine keeps them as a device keeps a
+/// secret it left, for 90 days** (§3, §9): they are for the look that
+/// follows, and for a carry by command after it. They are the one thing
+/// that the phrase opens which the node is handed.
+///
+/// Refused, with nothing changed: on a device that already follows a
+/// phrase; an entry that is no change entry, or that the statement key
+/// does not open; a statement that is not a recovery's (made on this
+/// device, listing it alone, after another statement); a secret that is
+/// not sealed to this device, or is not the one that the statement
+/// commits to; more secrets than an entry gives; and one that is said to
+/// be of this statement or a later one.
+pub fn follow_recovered(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    statement_key: &[u8; 32],
+    left: &[(u64, [u8; 32])],
+    now: i64,
+) -> Result<Applied, PersonError> {
+    in_one(conn, || {
+        if held_rows::person(conn)?.is_some() {
+            return Err(PersonError::FollowsAPhrase);
+        }
+        let following = Following {
+            phrase_key: entry.author,
+            statement_key: *statement_key,
+            phrase_channel: entry.channel,
+        };
+        let opened = change_entry::open_for_device(
+            entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        )?;
+        opened.statement.verify()?;
+        let own = identity.public_key();
+        let made = &opened.statement.statement;
+        let is_a_recoverys = made.number > 1
+            && !made.chain.is_empty()
+            && made.maker == own
+            && made.devices.len() == 1
+            && made.devices[0].key == own;
+        if !is_a_recoverys {
+            return Err(PersonError::NotARecovery);
+        }
+        let DeviceSecret::Opened(secret) = opened.secret else {
+            return Err(PersonError::SecretNotCommitted);
+        };
+        let before_it = left
+            .iter()
+            .all(|(number, _)| *number >= 1 && *number < made.number);
+        if left.len() > RECOVERY_MAX_LEFT_SECRETS || !before_it {
+            return Err(PersonError::NotARecovery);
+        }
+        let change = Change {
+            following: &following,
+            statement: &opened.statement,
+            secret: &secret,
+            entry,
+        };
+        its_own_entry(&change)?;
+        let applied = apply_judged(conn, identity, None, &change, now)?;
+        for (number, left_secret) in left {
+            held_rows::keep_left_secret(conn, *number, left_secret, now)?;
+        }
+        Ok(applied)
+    })
+}
+
 /// Whether the change's entry is its statement's own, under what the
 /// device follows: it is opened as the phrase's change entry, and the
 /// statement key opens it to this very statement.
@@ -1355,6 +1453,19 @@ fn come_to(
     // What a name's folders had agreed in a slot that held no version is
     // noted, for `cordelia devices` to say which files (§4.2).
     crate::look::note_not_carried(conn, &applied.not_carried)?;
+    // Whether this statement removes a key that the one before did not
+    // is kept now, while both are at hand (§10.1): a status says that a
+    // removal is not yet applied by every device only where it does. A
+    // renewal removes nobody, and a device that comes to its first
+    // statement saw nobody removed.
+    let removes_a_key = before.is_some_and(|before| {
+        let had = &before.statement.statement;
+        statement.removed.iter().any(|key| !had.removes(key))
+    });
+    crate::look::note_removed_a_key(conn, removes_a_key)?;
+    // The look of a recovery was of the statement that is left: under
+    // this one the device carried what it holds, in this transaction.
+    meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     // A name that a device lists in the generation it has come to, or
     // that it left 90 days ago, is noted no more.
     held_rows::forget_names_before(conn, Some(now))?;
@@ -1436,6 +1547,10 @@ fn note_left_out(
             .label;
         counted.push((record.key, label));
     }
+    // What this device called each key that the statement removes is
+    // kept: a statement lists removed keys bare, and a person names one
+    // by its label where they bring in what it wrote (§7.3).
+    crate::look::note_removed_labels(conn, statement, &counted)?;
     // Each is noted. One that the statement lists, in either list, is
     // shown no more by the time the statement is applied: that is asked
     // for every key that is noted, this statement's and an earlier
@@ -1573,7 +1688,7 @@ impl Carry<'_> {
 /// from ([`chain::carried_from`]): the entry's chain as it is where this
 /// device signed it, and otherwise that entry's link first and then its
 /// chain. One entry's chain is never put behind another entry's signer.
-fn carried_entry(
+pub(crate) fn carried_entry(
     identity: &NodeIdentity,
     to: &[u8; 32],
     version: &Version,

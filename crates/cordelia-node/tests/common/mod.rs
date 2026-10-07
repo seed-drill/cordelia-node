@@ -240,6 +240,59 @@ impl Node {
         AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
     }
 
+    /// Start a second node on this node's data directory, with ports of
+    /// its own: it is given a copy of the node's configuration that
+    /// differs in its two ports, and in nothing else. It is given thirty
+    /// seconds to end by itself, and is stopped then: whether it ended
+    /// by itself and succeeded, and what it wrote. Its relays are this
+    /// node's, which are on this machine.
+    pub fn second_on_its_data_dir(&self) -> (Option<bool>, String) {
+        for host in self.will_dial() {
+            assert_on_this_machine(self.name, &host);
+        }
+        let (http, p2p) = (free_port(), free_port());
+        let own = std::fs::read_to_string(self.config()).unwrap();
+        let second = own
+            .replace(
+                &format!("http_port = {}", self.http),
+                &format!("http_port = {http}"),
+            )
+            .replace(
+                &format!("p2p_port = {}", self.p2p),
+                &format!("p2p_port = {p2p}"),
+            )
+            .replace(
+                &format!("listen_addr = \"0.0.0.0:{}\"", self.p2p),
+                &format!("listen_addr = \"0.0.0.0:{p2p}\""),
+            );
+        assert_ne!(own, second);
+        let config = self.dir.path().join("config-second.toml");
+        std::fs::write(&config, second).unwrap();
+        let log_path = self.dir.path().join("second.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        let mut child = self
+            .binary_at(&config, inherited)
+            .arg("start")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let ended = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status.success()),
+                None if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        (ended, std::fs::read_to_string(log_path).unwrap_or_default())
+    }
+
     /// This node's stand-in home directory (for the sync adapter): a real
     /// path, as Claude Code records them.
     pub fn home(&self) -> PathBuf {
@@ -872,7 +925,22 @@ pub fn wait_for<T>(
     }
 }
 
+/// Whether the node answers, and is not in the middle of the copy of its
+/// first start on this version. A node answers from the moment its port
+/// is bound, while that copy is still being made (decision 2026-10-04
+/// §10.1): a test that goes on from here finds the node as its start
+/// leaves it. ([`answers`] is the first half alone.)
 pub fn healthy(n: &Node) -> Option<()> {
+    answers(n)?;
+    let status = n.get("/api/v1/status")?;
+    let under_way = status["held"]["why"]
+        .as_str()
+        .is_some_and(|why| why.contains("is under way"));
+    (!under_way).then_some(())
+}
+
+/// Whether the node answers at all.
+pub fn answers(n: &Node) -> Option<()> {
     let url = format!("http://127.0.0.1:{}/api/v1/health", n.http);
     direct().get(&url).call().ok().map(|_| ())
 }
@@ -959,8 +1027,39 @@ pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
     assert_eq!(accept, key_of(adder));
     let mut at = new.at_terminal(&["accept", &accept]);
     at.says("Type yes to go on").types("yes");
-    let accepted = at.done();
+    let accepted = became_of_the_key(new, &accept, at.done());
     (added, accepted)
+}
+
+/// What became of a key typed at `cordelia accept` on `device`, given
+/// what the command said: where the command ended with nothing taken yet
+/// (it stays a minute, and the node goes on asking for the rest of the
+/// hour), this waits until the node says that a hand-over was read with
+/// the key, and gives back what the command said with what the node says
+/// became of it. It waits for that state, and for no length of time: on
+/// a loaded machine a hand-over can arrive after the command has ended,
+/// and a test that went on at once would go on before the device stands
+/// where the test takes it to stand.
+pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
+    if !said.contains("Nothing was taken yet") {
+        return said;
+    }
+    let became = wait_for(
+        "a hand-over is read with the key typed at accept",
+        &[device],
+        600,
+        || {
+            let seen = person_of(device);
+            let of_the_key = seen["accepting"]
+                .as_array()?
+                .iter()
+                .find(|typed| typed["key"] == key)?
+                .clone();
+            let became = of_the_key["said"].as_str().unwrap_or_default().to_string();
+            (of_the_key["taken"] == true || !became.is_empty()).then_some(became)
+        },
+    );
+    format!("{said}\n{became}.")
 }
 
 /// `cordelia remove-device` on `device`, for the device whose key is
@@ -1025,6 +1124,18 @@ pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> Option<String> {
     words
 }
 
+/// A person clears, at a terminal and with a yes, the one thing that `n`
+/// has to tell them (`cordelia devices --clear`): after a device was
+/// added, each device tells of it until it is cleared there, and the
+/// status line is amber meanwhile (decision 2026-10-04 §10.1).
+pub fn clears_what_it_tells(n: &Node) {
+    let told = person_of(n)["notices"].as_array().map_or(0, Vec::len);
+    assert_eq!(told, 1, "{}: one thing to clear", n.name);
+    let mut at = n.at_terminal(&["devices", "--clear"]);
+    at.says("Type yes to go on").types("yes");
+    assert!(at.done().contains("Cleared on this device."));
+}
+
 /// The folder Claude Code keeps for a session started in `dir`.
 pub fn claude_project(home: &std::path::Path, dir: &std::path::Path) -> PathBuf {
     let name: String = dir
@@ -1063,4 +1174,124 @@ pub fn relays_of(n: &Node) -> Vec<serde_json::Value> {
         .ok()
         .and_then(|v| v["relays"].as_array().cloned())
         .unwrap_or_default()
+}
+
+// ── What a test of a recovery phrase searches ───────────────────────
+
+/// A phrase of twelve words that are words of nothing this program
+/// says, so that a search for any one of them finds only the phrase.
+pub fn a_phrase_of_words_that_nothing_else_says() -> String {
+    let first = [
+        "giraffe", "kangaroo", "squirrel", "dolphin", "elephant", "lobster", "mushroom", "pumpkin",
+        "sausage", "walnut", "banana",
+    ];
+    let last = [
+        "cactus", "coconut", "dinosaur", "gorilla", "hamster", "lizard", "monkey", "oyster",
+        "pelican", "pigeon", "rabbit", "raccoon", "salmon", "spider", "turkey", "turtle", "tomato",
+        "potato", "peanut", "pepper", "noodle", "muffin", "garlic", "ginger", "cherry", "cereal",
+        "butter", "bamboo", "avocado", "tornado", "volcano", "umbrella", "trumpet", "violin",
+        "guitar",
+    ];
+    // The last word carries the checksum: one in sixteen fits.
+    last.iter()
+        .map(|last| format!("{} {last}", first.join(" ")))
+        .find(|words| cordelia_crypto::phrase::Phrase::parse(words).is_ok())
+        .expect("one of these words ends a phrase that begins with those")
+}
+
+/// Everything that is sent to a port on this machine is passed on to
+/// another, and kept: for a test that reads what a node was sent.
+pub struct PassesOn {
+    pub port: u16,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl PassesOn {
+    pub fn to(port: u16) -> Self {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let at = listener.local_addr().unwrap().port();
+        let kept = sent.clone();
+        std::thread::spawn(move || {
+            for from in listener.incoming().flatten() {
+                let Ok(to) = TcpStream::connect(("127.0.0.1", port)) else {
+                    continue;
+                };
+                let (mut asks, mut node) = (from.try_clone().unwrap(), to.try_clone().unwrap());
+                let kept = kept.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = asks.read(&mut buf) {
+                        if n == 0 || node.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        kept.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                    let _ = node.shutdown(Shutdown::Write);
+                });
+                let (mut node, mut asks) = (to, from);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = node.read(&mut buf) {
+                        if n == 0 || asks.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = asks.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        Self { port: at, sent }
+    }
+
+    pub fn sent(&self) -> Vec<u8> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// Every file under `dir`, with its bytes.
+pub fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            found.push((path, bytes));
+        }
+    }
+    found
+}
+
+/// The words in `bytes`: each run of letters, in lower case.
+pub fn words_in(bytes: &[u8]) -> std::collections::HashSet<String> {
+    bytes
+        .split(|byte| !byte.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).to_lowercase())
+        .collect()
+}
+
+/// Two words of `phrase` that follow one another there and stand one
+/// after the other in `bytes`, where there are two.
+///
+/// It is what is asked of what a terminal showed: the terminal shows the
+/// first words of keys' fingerprints, which are from the list that a
+/// phrase's words are from, and one of them can be a word of the phrase
+/// by chance. Two in a row are not.
+pub fn two_words_in_a_row(bytes: &[u8], phrase: &[&str]) -> Option<(String, String)> {
+    let said: Vec<String> = bytes
+        .split(|byte| !byte.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).to_lowercase())
+        .collect();
+    said.windows(2)
+        .find(|pair| {
+            phrase
+                .windows(2)
+                .any(|two| two[0] == pair[0] && two[1] == pair[1])
+        })
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
 }

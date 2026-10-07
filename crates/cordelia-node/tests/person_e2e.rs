@@ -897,11 +897,20 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["remove-device", &laptop_key])
         .refused();
     assert!(said.contains("that is this device's own key"), "{said}");
-    // A key that is nobody's device.
-    let said = laptop
-        .at_terminal(&["remove-device", &key_of(&relay)])
-        .refused();
-    assert!(said.contains("no device of yours"), "{said}");
+    // A key that is nobody's device: the command says so, and asks a
+    // typed answer before anything else. No answer is suggested: Enter
+    // answers nothing, and nothing is made.
+    let mut at = laptop.at_terminal(&["remove-device", &key_of(&relay)]);
+    at.says("is no device of yours that this device knows of");
+    at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+        .types("");
+    let said = at.refused();
+    assert!(
+        said.contains("That was not `refuse`. Nothing was done."),
+        "{said}"
+    );
+    assert!(!said.contains("Make this change?"), "{said}");
+    assert_eq!(look(&laptop)["change"], 1);
 
     // A wrong phrase: one that is a phrase, and not this device's.
     let other_phrase =
@@ -1040,7 +1049,15 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         "{listed}"
     );
     assert!(listed.contains("Removed keys:"), "{listed}");
-    assert!(listed.contains(&desktop_key), "{listed}");
+    // A statement lists a removed key bare: it is shown by the label
+    // that this device knew it by.
+    assert!(
+        listed.contains(&format!(
+            "  ({}) \"desktop\"  {desktop_key}",
+            words_of(&desktop_key)
+        )),
+        "{listed}"
+    );
 
     // The removed device stops, and says why.
     wait_for("the desktop learns that it was removed", &all, 120, || {
@@ -1112,6 +1129,112 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["remove-device", &desktop_key])
         .refused();
     assert!(said.contains("that key was removed already"), "{said}");
+}
+
+/// A key that this device knows nothing of is removed by key (decision
+/// 2026-10-04 §10): a key that is in no list is refused by nothing, and
+/// the two commands would add it. `cordelia remove-device <key>` says that
+/// this is no device it knows of, and that removing it refuses that key
+/// for good, and asks a typed answer, with none suggested: a yes is not
+/// the answer. It then goes on as any removal: the key is among the
+/// removed keys that the phrase signs, every device of the person's
+/// applies the change, and the key is added by none of them after it.
+#[test]
+fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    // A machine that was a device of the person's before every device
+    // was added again, say: it has a key, and is in no list.
+    let old = device_started("tablet", &relay);
+    let all = [&relay, &laptop, &desktop, &old];
+    let words = makes_a_phrase(&laptop, "laptop");
+    let (laptop_key, desktop_key, old_key) = (key_of(&laptop), key_of(&desktop), key_of(&old));
+    adds(&laptop, &desktop, "desktop");
+
+    let asks_its_answer = |answer: &str| {
+        let mut at = laptop.at_terminal(&["remove-device", &old_key]);
+        at.says(&format!(
+            "The key ({}) is no device of yours that this device knows of: it is in no list \
+             of the last change, and was not added since",
+            words_of(&old_key)
+        ));
+        at.says("Removing it refuses that key for good");
+        at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+            .types(answer);
+        at
+    };
+    // A yes is not the answer, and nor is the word that removes a device
+    // which is known: nothing is made, and nothing more is asked.
+    for not_it in ["yes", "removed"] {
+        let said = asks_its_answer(not_it).refused();
+        assert!(
+            said.contains("That was not `refuse`. Nothing was done."),
+            "{said}"
+        );
+        assert!(!said.contains("Type `stays` or `removed`"), "{said}");
+        assert!(
+            !said.contains("The recovery phrase, twelve words"),
+            "{said}"
+        );
+    }
+    assert_eq!(look(&laptop)["change"], 1);
+
+    // The answer, typed: it goes on as any removal. The desktop was added
+    // since the last change, and is asked about; the lists that the
+    // phrase will sign have the key among the removed, by its words, with
+    // no label, for this device knew none.
+    let mut at = asks_its_answer("refuse");
+    at.says(&format!(
+        "({}) \"desktop\", added since the last change",
+        words_of(&desktop_key)
+    ));
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("The change that the recovery phrase will sign (change 2):");
+    at.says("devices (2):");
+    at.says("removed keys (1):");
+    at.says(&format!("({})", words_of(&old_key)));
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 2).");
+    let said = at.done();
+    assert!(
+        !said.contains(&format!("({}), known here as", words_of(&old_key))),
+        "{said}"
+    );
+    assert!(said.contains("this machine may be closed."), "{said}");
+
+    // The statement that the laptop has applied lists the key as removed,
+    // and the desktop applies it.
+    assert_eq!(look(&laptop)["change"], 2);
+    applies(&desktop, 2, &all);
+    for device in [&laptop, &desktop] {
+        let removed = look(device)["removed"].clone();
+        assert_eq!(removed.as_array().unwrap().len(), 1, "{removed}");
+        assert_eq!(removed[0]["key"], old_key.as_str(), "{removed}");
+    }
+    let listed = laptop.cli(&["devices"]);
+    assert!(listed.contains("Removed keys:"), "{listed}");
+    assert!(listed.contains(&old_key), "{listed}");
+
+    // The key is refused for good: no device of the person's adds it.
+    for device in [&laptop, &desktop] {
+        let said = device
+            .at_terminal(&["add-device", &old_key, "--name", "tablet"])
+            .refused();
+        assert!(
+            said.contains("that key was removed, and a removed key is not added again"),
+            "{said}"
+        );
+    }
+    // And it is removed once: a second time says that it was.
+    let said = laptop.at_terminal(&["remove-device", &old_key]).refused();
+    assert!(said.contains("that key was removed already"), "{said}");
+    // The machine of that key followed no phrase, and follows none.
+    assert_eq!(text(&look(&old), "state"), "no_phrase");
+    let _ = laptop_key;
 }
 
 // ── cordelia renew ───────────────────────────────────────────────────
@@ -1226,7 +1349,9 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&laptop_key)
     ));
     at.says("Type yes to go on").types("yes");
-    let said = at.done();
+    // The command stays a minute: where the hand-over is read later than
+    // that, the node says what became of the key.
+    let said = became_of_the_key(&tablet, &laptop_key, at.done());
     assert!(
         said.contains("this device has applied change 2, which it was handed"),
         "{said}"
@@ -1727,7 +1852,10 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         .at_terminal(&["add-device", &key_of(&relay)])
         .refused();
     assert!(said.contains("two changes were made apart"), "{said}");
-    let said = forked.at_terminal(&["accept", &key_of(other)]).refused();
+    // (It asks nothing, and so ends at once.)
+    let said = forked
+        .at_terminal(&["accept", &key_of(other)])
+        .refused_within(std::time::Duration::from_secs(60));
     assert!(said.contains("the fork is settled"), "{said}");
     let said = forked.at_terminal(&["renew"]).refused();
     assert!(said.contains("two changes were made apart"), "{said}");
@@ -1776,102 +1904,6 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
 }
 
 // ── The phrase stays in the command's process ────────────────────────
-
-/// A phrase of twelve words that are words of nothing this program
-/// says, so that a search for any one of them finds only the phrase.
-fn a_phrase_of_words_that_nothing_else_says() -> String {
-    let first = [
-        "giraffe", "kangaroo", "squirrel", "dolphin", "elephant", "lobster", "mushroom", "pumpkin",
-        "sausage", "walnut", "banana",
-    ];
-    let last = [
-        "cactus", "coconut", "dinosaur", "gorilla", "hamster", "lizard", "monkey", "oyster",
-        "pelican", "pigeon", "rabbit", "raccoon", "salmon", "spider", "turkey", "turtle", "tomato",
-        "potato", "peanut", "pepper", "noodle", "muffin", "garlic", "ginger", "cherry", "cereal",
-        "butter", "bamboo", "avocado", "tornado", "volcano", "umbrella", "trumpet", "violin",
-        "guitar",
-    ];
-    // The last word carries the checksum: one in sixteen fits.
-    last.iter()
-        .map(|last| format!("{} {last}", first.join(" ")))
-        .find(|words| cordelia_crypto::phrase::Phrase::parse(words).is_ok())
-        .expect("one of these words ends a phrase that begins with those")
-}
-
-/// Everything that is sent to a port on this machine is passed on to
-/// another, and kept: for a test that reads what a node was sent.
-struct PassesOn {
-    port: u16,
-    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-}
-
-impl PassesOn {
-    fn to(port: u16) -> Self {
-        use std::io::{Read, Write};
-        use std::net::{Shutdown, TcpListener, TcpStream};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let at = listener.local_addr().unwrap().port();
-        let kept = sent.clone();
-        std::thread::spawn(move || {
-            for from in listener.incoming().flatten() {
-                let Ok(to) = TcpStream::connect(("127.0.0.1", port)) else {
-                    continue;
-                };
-                let (mut asks, mut node) = (from.try_clone().unwrap(), to.try_clone().unwrap());
-                let kept = kept.clone();
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 16 * 1024];
-                    while let Ok(n) = asks.read(&mut buf) {
-                        if n == 0 || node.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        kept.lock().unwrap().extend_from_slice(&buf[..n]);
-                    }
-                    let _ = node.shutdown(Shutdown::Write);
-                });
-                let (mut node, mut asks) = (to, from);
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 16 * 1024];
-                    while let Ok(n) = node.read(&mut buf) {
-                        if n == 0 || asks.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                    let _ = asks.shutdown(Shutdown::Write);
-                });
-            }
-        });
-        Self { port: at, sent }
-    }
-
-    fn sent(&self) -> Vec<u8> {
-        self.sent.lock().unwrap().clone()
-    }
-}
-
-/// Every file under `dir`, with its bytes.
-fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(files_under(&path));
-        } else if let Ok(bytes) = std::fs::read(&path) {
-            found.push((path, bytes));
-        }
-    }
-    found
-}
-
-/// The words in `bytes`: each run of letters, in lower case.
-fn words_in(bytes: &[u8]) -> std::collections::HashSet<String> {
-    bytes
-        .split(|byte| !byte.is_ascii_alphabetic())
-        .filter(|word| !word.is_empty())
-        .map(|word| String::from_utf8_lossy(word).to_lowercase())
-        .collect()
-}
 
 /// The recovery phrase never leaves the command's process (decision
 /// 2026-10-04 §5). Through a removal, with the phrase typed at the
@@ -1964,9 +1996,18 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
     let mut bytes_searched = 0;
     for (what, bytes) in &searched {
         bytes_searched += bytes.len();
-        let found = words_in(bytes);
-        for word in &phrase_words {
-            assert!(!found.contains(*word), "the word {word:?} is in {what}");
+        // The terminal shows the first words of keys' fingerprints,
+        // which are from the list that a phrase's words are from: one
+        // of them can be a word of the phrase by chance, and two in a
+        // row cannot.
+        if what == "what the terminal showed" {
+            let two = two_words_in_a_row(bytes, &phrase_words);
+            assert_eq!(two, None, "two words of the phrase are in {what}");
+        } else {
+            let found = words_in(bytes);
+            for word in &phrase_words {
+                assert!(!found.contains(*word), "the word {word:?} is in {what}");
+            }
         }
         let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
         for secret in &only_the_phrases {
@@ -2981,14 +3022,144 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
 
 // ── A node of another version ────────────────────────────────────────
 
+/// A command that changes anything is refused where the node's version
+/// could not be learned, and sends the node nothing (decision 2026-10-04
+/// §10.1, rule 6): here the node's status is answered by nobody. Turning
+/// sync off is sent all the same, and what only shows is answered.
+#[test]
+fn a_command_that_changes_anything_refuses_a_node_whose_version_it_cannot_learn() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let claude = laptop.home().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    laptop.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+    let silent = Answers::losing(
+        &laptop,
+        |_, _| {},
+        |path| (path == "/api/v1/status").then_some(false),
+    );
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let home = laptop.home();
+    let folder = home.to_str().unwrap();
+    let soon = std::time::Duration::from_secs(60);
+
+    let changes: [&[&str]; 12] = [
+        &["sync", "claude"],
+        &["sync", "map", folder, "notes"],
+        &["sync", "home", "off"],
+        &["restore", "an-id"],
+        &["history", "drop", "--all"],
+        &["init", "--new-key"],
+        &["phrase", "--name", "laptop"],
+        &["add-device", &other],
+        &["accept", &other],
+        &["devices", "--clear"],
+        &["remove-device", &other],
+        &["renew"],
+    ];
+    for args in changes {
+        let before = silent.asked().len();
+        let said = laptop
+            .at_terminal_through(silent.port, args)
+            .refused_within(soon);
+        assert!(
+            said.contains("The running node's version could not be learned."),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("nothing was done."), "{args:?}: {said}");
+        assert!(
+            said.contains("cannot reach the local node at"),
+            "{args:?}: {said}"
+        );
+        let asked = silent.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], true, "{settings}");
+    assert_eq!(settings["mappings"], json!([]), "{settings}");
+
+    // What only shows is answered, and turning sync off is sent.
+    let said = laptop.at_terminal_through(silent.port, &["devices"]).done();
+    assert!(said.contains("This device: "), "{said}");
+    let said = laptop
+        .at_terminal_through(silent.port, &["sync", "off"])
+        .done();
+    assert!(said.contains("Sync is off."), "{said}");
+    let settings = laptop.post("/api/v1/sync/status", json!({}));
+    assert_eq!(settings["enabled"], false, "{settings}");
+}
+
+/// A command that makes or asks for a recovery phrase asks how the node
+/// stands first, and shows no word and asks for none where the node is
+/// held up (decision 2026-10-04 §10.1): it says why the node is, and has
+/// asked the node for nothing but how it stands. Here the node is behind
+/// a stand-in that says it is held up for its first start.
+#[test]
+fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let why = "the first start on this version is not done: no room for the copy";
+    let held = Answers::in_the_place_of(&laptop, move |path, answer| {
+        if path == "/api/v1/status" {
+            answer["held"] = json!({ "by": "first_start", "why": why });
+        }
+    });
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let soon = std::time::Duration::from_secs(60);
+    let of_a_phrase: [&[&str]; 4] = [
+        &["phrase", "--name", "laptop"],
+        &["remove-device", &other],
+        &["renew"],
+        &["settle"],
+    ];
+    for args in of_a_phrase {
+        let before = held.asked().len();
+        let said = laptop
+            .at_terminal_through(held.port, args)
+            .refused_within(soon);
+        assert!(said.contains(why), "{args:?}: {said}");
+        assert!(
+            said.contains("no recovery phrase was shown or asked for, and nothing was done."),
+            "{args:?}: {said}"
+        );
+        for shown in [
+            "A recovery phrase is twelve words",
+            "The recovery phrase, shown once",
+            "Type the twelve words back",
+            "The recovery phrase, twelve words",
+        ] {
+            assert!(!said.contains(shown), "{args:?}: {said}");
+        }
+        let asked = held.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // The control: the node itself is not held up, and a phrase is made.
+    makes_a_phrase(&laptop, "laptop");
+    assert_eq!(look(&laptop)["change"], 1);
+}
+
 /// A command that changes anything refuses a node of another version
 /// than its own, with the note that says how to restart it, and sends it
 /// nothing (decision 2026-10-04 §10.1, rule 6; §16): every `sync`
 /// command but `status` and `off`, `restore`, `history drop`, `init
 /// --new-key`, and each command of a person's devices but `devices` with
 /// no act. Turning sync off is sent to any node. `cordelia status`,
-/// `cordelia sync status`, `cordelia devices` and `cordelia history`
-/// still answer beside such a node, with the note. And a look that says
+/// `cordelia sync status` (its `--seen` included), `cordelia devices`
+/// and `cordelia history` still answer beside such a node, with the
+/// note. And a look that says
 /// nothing of where the device stands is no look of this version: it is
 /// refused.
 ///
@@ -3016,14 +3187,13 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 
     // Each command that changes something: refused, with the note, and
     // the node is asked for nothing but its version.
-    let changes: [&[&str]; 16] = [
+    let changes: [&[&str]; 15] = [
         &["sync", "claude"],
         &["sync", "claude", "--mapped-only"],
         &["sync", "map", folder, "notes"],
         &["sync", "unmap", "notes"],
         &["sync", "home", "on"],
-        &["sync", "exclude", "github.com/someone/something"],
-        &["sync", "include", "github.com/someone/something"],
+        &["sync", "home", "off"],
         &["restore", "an-id"],
         &["history", "drop", "--all"],
         &["init", "--new-key"],
@@ -3058,10 +3228,40 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     let settings = laptop.post("/api/v1/sync/status", json!({}));
     assert_eq!(settings["enabled"], true, "{settings}");
 
-    // What only shows is answered, with the note.
-    let shows: [&[&str]; 5] = [
+    // What is no more is refused before the node is asked anything at
+    // all, its version included (decision 2026-10-04 §10.1): whatever
+    // version the node is, nothing is sent to it.
+    let no_more: [&[&str]; 4] = [
+        &["sync", "claude", "--all"],
+        &[
+            "sync",
+            "claude",
+            "--exclude",
+            "github.com/someone/something",
+        ],
+        &["sync", "exclude", "github.com/someone/something"],
+        &["sync", "include", "github.com/someone/something"],
+    ];
+    for args in no_more {
+        let before = another.asked().len();
+        let said = laptop
+            .at_terminal_through(another.port, args)
+            .refused_within(soon);
+        assert!(
+            said.contains("only mapped folders sync"),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("nothing was changed"), "{args:?}: {said}");
+        assert!(!said.contains(note), "{args:?}: {said}");
+        assert_eq!(another.asked().len(), before, "{args:?} asked the node");
+    }
+
+    // What only shows is answered, with the note: `cordelia sync
+    // status` with the act that puts its notice away among them.
+    let shows: [&[&str]; 6] = [
         &["status"],
         &["sync", "status"],
+        &["sync", "status", "--seen"],
         &["devices"],
         &["history"],
         &["history", "notes"],
@@ -3112,6 +3312,57 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     assert!(!said.contains("The running node is version"), "{said}");
     let settings = laptop.post("/api/v1/sync/status", json!({}));
     assert_eq!(settings["enabled"], true, "{settings}");
+    // `--mapped-only` is sent, as the only scope there is: `all: false`
+    // (decision 2026-10-04 §10.1). Seen at a stand-in that changes
+    // nothing of what the node answers.
+    let same = Answers::in_the_place_of(&laptop, |_, _| {});
+    let said = laptop
+        .at_terminal_through(same.port, &["sync", "claude", "--mapped-only"])
+        .done();
+    assert!(
+        said.contains("Only mapped folders sync: that is the only scope there is."),
+        "{said}"
+    );
+    let sent: Vec<Value> = same
+        .asked()
+        .iter()
+        .filter(|(path, _)| path == "/api/v1/sync/claude")
+        .filter_map(|(_, body)| serde_json::from_slice(body).ok())
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        (&sent[0]["enabled"], &sent[0]["all"]),
+        (&json!(true), &json!(false))
+    );
+
+    // A node of another version is one of the things that a status
+    // holds, where something is mapped and a cycle has reported: only
+    // the command knows of it, and so the level is the command's
+    // (decision 2026-10-04 §10.1). Beside the node as it is, it is not.
+    let notes = home.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    laptop.cli(&["sync", "map", notes.to_str().unwrap(), "notes"]);
+    let status_through = |port: u16| -> Value {
+        let said = laptop
+            .at_terminal_through(port, &["status", "--json"])
+            .done();
+        let from = said.find('{').unwrap_or_else(|| panic!("{said}"));
+        serde_json::from_str(&said[from..]).unwrap_or_else(|e| panic!("{e}: {said}"))
+    };
+    let whats = |status: &Value| -> Vec<String> {
+        let all = status["holds"].as_array().into_iter().flatten();
+        all.filter_map(|holds| holds["what"].as_str().map(str::to_string))
+            .collect()
+    };
+    wait_for("a cycle has reported the folder", &[&laptop], 60, || {
+        (status_through(same.port)["sync"]["folders"] == 1).then_some(())
+    });
+    assert_eq!(whats(&status_through(same.port)), ["no_phrase"]);
+    let beside_another = status_through(another.port);
+    assert_eq!(whats(&beside_another), ["no_phrase", "other_version"]);
+    assert_eq!(beside_another["level"], "red", "{beside_another}");
+    assert_eq!(beside_another["node_version"], "0.0.0-another");
+    laptop.cli(&["sync", "unmap", "notes"]);
 
     // A look that says nothing of where the device stands: refused, by
     // a command that only shows as by one that acts.

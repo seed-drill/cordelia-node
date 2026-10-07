@@ -137,6 +137,19 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     wait_for("device healthy", &[&relay, &device], 30, || {
         healthy(&device)
     });
+    // The node answers from the moment its port is bound: the copy and
+    // the step are made by then, or are being made, and its status says
+    // which.
+    wait_for("the first start is made", &[&relay, &device], 60, || {
+        status_of(&device)["held"].is_null().then_some(())
+    });
+    // What the schema's steps said when the database was opened is in
+    // the log: logging is set up before that.
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert!(
+        log.contains("applying migration v11 (entries of a channel from its secret)"),
+        "{log}"
+    );
 
     // The copy, beside the database: at this schema's version, with every
     // older row and each key file.
@@ -232,10 +245,14 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     // The guard is a device's, and a device's start leaves it.
     assert!(has_guard(&database_of(&device)));
     // A key file of an older channel that is found at a later start is
-    // removed then, whatever the mark says.
+    // removed then, whatever the mark says, where the copy holds it: one
+    // that the copy holds under that name with the same bytes goes, and
+    // one that no copy holds is left in place, and the status says so.
     device.stop();
-    let left = device.data_dir().join("channel-keys").join("grp_lab.key");
-    std::fs::write(&left, [1u8; 32]).unwrap();
+    let keys = device.data_dir().join("channel-keys");
+    let (held, not_held) = (keys.join("grp_lab.key"), keys.join("grp_since.key"));
+    std::fs::copy(copy.join("channel-keys").join("grp_lab.key"), &held).unwrap();
+    std::fs::write(&not_held, [1u8; 32]).unwrap();
     device.start();
     wait_for(
         "device healthy a third time",
@@ -243,7 +260,15 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
         30,
         || healthy(&device),
     );
-    assert!(!left.exists());
+    assert!(!held.exists());
+    assert_eq!(std::fs::read(&not_held).unwrap(), [1u8; 32]);
+    let status = status_of(&device);
+    assert_eq!(status["key_files_in_place"], 1, "{status}");
+    let said = device.cli(&["status"]);
+    assert!(
+        said.contains("Key files: 1 key file of an older version was left in place"),
+        "{said}"
+    );
 }
 
 /// A node that cannot bind the port of its local API, because another
@@ -296,6 +321,149 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
     assert_eq!(older_rows(&conn), before);
 }
 
+/// A node answers from the moment its port is bound, while the copy of
+/// its first start is still being made (decision 2026-10-04 §10.1): its
+/// status says that a copy is being made, a command that asks how it
+/// stands is told so, and a request that changes anything is refused, as
+/// by any node whose first start has not succeeded. Here the database is
+/// large enough for the copy to take a while.
+#[test]
+fn a_node_answers_while_the_copy_of_its_first_start_is_being_made() {
+    let mut device = node("laptop", "personal", None);
+    {
+        let conn = in_the_released_form(&device);
+        conn.execute_batch("CREATE TABLE ballast (held BLOB NOT NULL);")
+            .unwrap();
+        for _ in 0..96 {
+            conn.execute("INSERT INTO ballast VALUES (randomblob(1048576))", [])
+                .unwrap();
+        }
+    }
+    let other = device.home().join("work/other").display().to_string();
+    std::fs::create_dir_all(&other).unwrap();
+
+    device.start();
+    // Asked as often as it can be, from the first answer on.
+    let began = std::time::Instant::now();
+    let mut under_way = None;
+    loop {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(120),
+            "the node never made its first start:\n{}",
+            device.log_tail()
+        );
+        let Some(status) = device.get("/api/v1/status") else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        };
+        let Some(why) = status["held"]["why"].as_str() else {
+            break;
+        };
+        assert_eq!(status["held"]["by"], "first_start", "{status}");
+        assert!(why.contains("is under way"), "{why}");
+        if under_way.is_none() {
+            // A command is told how the node stands, and one that
+            // changes anything is refused with the same words.
+            let said = device.cli(&["status"]);
+            let refused = device.command(&["sync", "map", &other, "notes"]);
+            under_way = Some((why.to_string(), said, refused));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (why, said, refused) = under_way.expect("the node answered only once the copy was made");
+    assert!(
+        why.contains("a copy of the database from before this version is being made"),
+        "{why}"
+    );
+    // (A command that was asked as the copy ended may have found the
+    // node done: what it said then is not judged.)
+    if said.contains("Held up:") {
+        assert!(said.contains("is under way"), "{said}");
+    }
+    if !refused.status.success() {
+        let refused = String::from_utf8_lossy(&refused.stderr);
+        assert!(refused.contains("is under way"), "{refused}");
+    }
+    // The copy was made whole, and the step taken.
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+    let copy = device.data_dir().join(format!("before-{VERSION}"));
+    let copied = Connection::open_with_flags(
+        copy.join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(rows(&copied, "ballast"), 96);
+    let conn = database_of(&device);
+    let mark = first_start::mark(&conn).unwrap().unwrap();
+    assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
+}
+
+/// A data directory is one node's (decision 2026-10-04 §10.1): a second
+/// node that is started on the directory of one that runs, with ports of
+/// its own, says so and stops, and has changed nothing. Here the first
+/// is held up before its first start, so that anything the second did to
+/// the database would show: every older row and each key file is there,
+/// there is no mark, and no second copy was begun. Once the first has
+/// stopped, a node starts there as any does.
+#[cfg(unix)]
+#[test]
+fn a_second_node_on_the_same_data_directory_says_so_and_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut device = node("laptop", "personal", None);
+    let before = {
+        let conn = in_the_released_form(&device);
+        older_rows(&conn)
+    };
+    // The first cannot make its copy, and is held up: what is left of a
+    // copy cannot be removed.
+    let partial = format!("before-{VERSION}.partial");
+    let closed = device.data_dir().join(&partial).join("closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    std::fs::write(closed.join("a-file"), "x").unwrap();
+    let mode = |mode: u32| {
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(0o000);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("the first try has failed", &[&device], 30, || {
+        status_of(&device)["held"]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("is not done"))
+            .then_some(())
+    });
+    // The second could make the copy, were it to try.
+    mode(0o700);
+    std::fs::remove_dir_all(device.data_dir().join(&partial)).unwrap();
+
+    let (ended, said) = device.second_on_its_data_dir();
+    assert_eq!(ended, Some(false), "{said}");
+    assert!(
+        said.contains("another node is running on the data directory"),
+        "{said}"
+    );
+    assert!(said.contains("Nothing was changed."), "{said}");
+    {
+        let conn = database_of(&device);
+        assert_eq!(older_rows(&conn), before);
+        assert_eq!(first_start::mark(&conn).unwrap(), None);
+    }
+    assert_eq!(
+        names_in(&device.data_dir().join("channel-keys")),
+        released::KEY_FILES
+    );
+    // The first goes on, and makes its first start when it next tries.
+    wait_for("the first makes its first start", &[&device], 120, || {
+        status_of(&device)["held"].is_null().then_some(())
+    });
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+
+    // With the first stopped, the directory is free again.
+    device.stop();
+    device.start();
+    wait_for("device healthy again", &[&device], 30, || healthy(&device));
+}
+
 /// A relay's database is stepped as any version steps it: it keeps every
 /// older row and each key file, makes no copy, and has no mark (decision
 /// 2026-10-04 §10.1). A relay goes on carrying the older kind.
@@ -334,8 +502,14 @@ fn a_relay_that_is_started_on_a_devices_database_removes_the_guard() {
     drop(in_the_released_form(&relay));
     {
         let conn = cordelia_storage::db::open(&relay.data_dir().join("cordelia.db")).unwrap();
-        let moved_on =
-            first_start::first_start(&conn, &relay.data_dir(), VERSION, chrono::Utc::now());
+        let moved_on = first_start::first_start(
+            &conn,
+            &relay.data_dir(),
+            VERSION,
+            chrono::Utc::now(),
+            &first_start::room_not_known,
+            &mut None,
+        );
         assert!(moved_on.is_ok(), "{moved_on:?}");
         assert!(has_guard(&conn));
     }
@@ -365,12 +539,35 @@ fn status_of(node: &Node) -> serde_json::Value {
     serde_json::from_str(&node.cli(&["status", "--json"])).unwrap()
 }
 
+/// A node that is held up is red whatever sync says (decision 2026-10-04
+/// §10.1): `cordelia status` gives the level red and the state
+/// `attention`, with `says` in the line, which is drawn in red, and the
+/// bar is `active`.
+fn held_up_is_red(node: &Node, says: &str) {
+    let status = status_of(node);
+    assert_eq!(
+        (&status["level"], &status["state"]),
+        (&serde_json::json!("red"), &serde_json::json!("attention")),
+        "{status}"
+    );
+    assert_eq!(status["summary"], says, "{status}");
+    assert_eq!(status["holds"][0]["what"], "held", "{status}");
+    let line = node.cli(&["status", "--line"]);
+    assert!(line.contains(&format!("▲ {says}")), "{line}");
+    let bar: serde_json::Value = serde_json::from_str(&node.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(
+        bar["class"],
+        serde_json::json!(["attention", "red", "active"]),
+        "{bar}"
+    );
+}
+
 /// Until its first start on this version has succeeded a node stays up,
 /// runs no cycle and no pass, refuses every request that changes
 /// anything except one that turns sync off, and says why in its status
-/// (decision 2026-10-04 §10.1). It tries again each time a cycle would
-/// have run: once the copy can be made, it is made and the step taken,
-/// with no restart.
+/// (decision 2026-10-04 §10.1). It tries again by itself, after a wait
+/// that doubles with each try that fails: once the copy can be made, it
+/// is made and the step taken, with no restart.
 #[cfg(unix)]
 #[test]
 fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
@@ -401,8 +598,16 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     let all = [&relay, &device];
     wait_for("device healthy", &all, 30, || healthy(&device));
 
-    // It stays up, and says why, with the room that the copy needs.
-    let status = status_of(&device);
+    // It stays up, and says why, with the room that the copy needs and
+    // the room there is. (Until its first try has failed it says that a
+    // copy is being made.)
+    let status = wait_for("the first try has failed", &all, 30, || {
+        let status = status_of(&device);
+        let not_done = status["held"]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("is not done"));
+        not_done.then_some(status)
+    });
     assert_eq!(status["state"], "attention", "{status}");
     assert_eq!(
         status["summary"], "memory not syncing: the first start on this version is not done",
@@ -414,7 +619,7 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
         why.starts_with("the first start on this version is not done: the copy of the database"),
         "{why}"
     );
-    assert!(why.contains("bytes of room"), "{why}");
+    assert!(why.contains("bytes of room, and the volume has "), "{why}");
     let said = device.cli(&["status"]);
     assert!(said.contains(&format!("Held up:   {why}")), "{said}");
     let line = device.cli(&["status", "--line"]);
@@ -488,10 +693,18 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     // The scope that was on by being absent is written down as on, so
     // that the step still finds it so with the directory gone.
     assert_eq!(scope(&device).as_deref(), Some("on"));
+    // A node that is held up is red whatever sync says: with sync off
+    // the level, the state, the line and the bar say so still.
+    held_up_is_red(
+        &device,
+        "memory not syncing: the first start on this version is not done",
+    );
 
-    // The copy can be made: the node makes its first start by itself.
+    // The copy can be made: the node makes its first start by itself,
+    // at its next try. (The tries back off, and several have failed by
+    // now: the next is within a minute and a half of the last.)
     mode(0o700);
-    wait_for("the node makes its first start", &all, 30, || {
+    wait_for("the node makes its first start", &all, 120, || {
         status_of(&device)["held"].is_null().then_some(())
     });
     assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
@@ -501,8 +714,12 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     let mark = first_start::mark(&conn).unwrap().unwrap();
     assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
     assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
+    // Sync is off and the device follows no phrase: its state is off,
+    // nothing holds, and the words still say that it is not added yet.
     let status = status_of(&device);
-    assert_eq!(status["summary"], "memory sync off", "{status}");
+    assert_eq!(status["summary"], "memory: not added yet", "{status}");
+    assert_eq!(status["state"], "off", "{status}");
+    assert!(status["level"].is_null(), "{status}");
     // The device is left the notice of what stopped, though sync was
     // turned off before the step could be taken; and the scope is off.
     let notices = first_start::notices(&conn).unwrap();
@@ -590,6 +807,12 @@ fn a_database_from_a_later_version_is_refused_by_the_node_and_by_each_command() 
     );
     assert_eq!(status["held"]["by"], "later_database", "{status}");
     named(status["held"]["why"].as_str().unwrap());
+    // It is red, though the node refuses the request that would say
+    // whether sync is on.
+    held_up_is_red(
+        &device,
+        "memory not syncing: the database is from a later version",
+    );
     let said = device.cli(&["status"]);
     assert!(said.contains("Held up:   the database at"), "{said}");
     for refused in [
@@ -884,6 +1107,56 @@ fn a_phrase_is_made_on_a_device_of_the_released_version_and_its_folders_are_publ
     assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
 }
 
+/// The stored scope is off whenever sync is on (decision 2026-10-04
+/// §10.1): a node that starts with sync on writes it off, from a scope
+/// that is stored on and from none stored with a directory set, as a
+/// database that an earlier build left has it. With sync off it writes
+/// nothing, and the command that turns sync on then does. Its first
+/// start on this version is done here, and takes no part.
+#[test]
+fn a_node_that_starts_with_sync_on_writes_the_stored_scope_off() {
+    use cordelia_storage::meta;
+    let relay = relay_started();
+    let mut device = device_started("laptop", &relay);
+    let all = [&relay];
+    let dir = device.home().join(".claude").display().to_string();
+    let said = device.cli(&["sync", "claude", "--dir", &dir]);
+    assert!(said.starts_with("Sync turned on.\n"), "{said}");
+    let scope = |device: &Node| meta::get(&database_of(device), meta::SYNC_CLAUDE_ALL).unwrap();
+    assert_eq!(scope(&device).as_deref(), Some("off"));
+    // The node is stopped, and its database is left as `stored` has the
+    // scope; then it is started.
+    let started_from = |device: &mut Node, stored: Option<&str>| {
+        device.stop();
+        {
+            let conn = Connection::open(device.data_dir().join("cordelia.db")).unwrap();
+            match stored {
+                Some(stored) => meta::set(&conn, meta::SYNC_CLAUDE_ALL, stored).unwrap(),
+                None => meta::remove(&conn, meta::SYNC_CLAUDE_ALL).unwrap(),
+            }
+        }
+        device.start();
+        wait_for("device healthy", &all, 30, || healthy(device));
+    };
+    for stored in [Some("on"), None] {
+        started_from(&mut device, stored);
+        wait_for("the scope is written off", &all, 30, || {
+            (scope(&device).as_deref() == Some("off")).then_some(())
+        });
+    }
+
+    // With sync off nothing is written at a start: the scope is as it
+    // was left. Turning sync on writes it off.
+    device.cli(&["sync", "off"]);
+    started_from(&mut device, Some("on"));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(scope(&device).as_deref(), Some("on"));
+    device.cli(&["sync", "claude"]);
+    assert_eq!(scope(&device).as_deref(), Some("off"));
+    let status = status_of(&device);
+    assert_eq!(status["sync"]["all"], false, "{status}");
+}
+
 /// The same device with the scope stored on has the notice (decision
 /// 2026-10-04 §10.1): the date, the Claude Code directory, and each folder
 /// that the last stored report shows as syncing without a mapping. The
@@ -952,6 +1225,19 @@ fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
     );
     let status = status_of(&device);
     assert_eq!(status["sync"]["all"], false, "{status}");
+    // The log says it, once, with how many: a person who reads the log
+    // of the start that stopped them is told there too.
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(
+        log.matches("sync: 2 folders stopped syncing on this device")
+            .count(),
+        1,
+        "{log}"
+    );
+    let warned = log
+        .lines()
+        .find(|line| line.contains("folders stopped syncing on this device"));
+    assert!(warned.is_some_and(|line| line.contains("WARN")), "{log}");
     // The report that the notice was made from is removed: a cycle of
     // this version has stored its own since, or none has run yet.
     let report = meta::get(&conn, meta::SYNC_CLAUDE_REPORT).unwrap();
@@ -959,4 +1245,458 @@ fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
         report.is_none_or(|report| !report.contains("2026-10-05T09:12:44")),
         "the released version's report is still stored"
     );
+}
+
+// ── Only what is mapped syncs ────────────────────────────────────────
+
+/// The name that a clone made by [`clone_at`] is found under: its remote.
+const TOOLS: &str = "github.com/seed-drill/cordelia-node";
+
+/// A git repository at `rel` under `home`, with a remote: what a version
+/// that synced everything found had found, under the remote's name.
+fn clone_at(home: &Path, rel: &str) -> std::path::PathBuf {
+    let repo = home.join(rel);
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/seed-drill/cordelia-node.git",
+        ],
+    ] {
+        // Without git's own variables: `GIT_DIR`, where the caller has
+        // it set, would make these act on the caller's repository.
+        let mut git = std::process::Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("GIT_")) {
+                git.env_remove(&name);
+            }
+        }
+        let made = git.arg("-C").arg(&repo).args(&args).output().unwrap();
+        assert!(made.status.success(), "git {args:?}: {made:?}");
+    }
+    repo
+}
+
+fn read(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// What holds on a node, each thing in a word, as `cordelia status
+/// --json` lists it.
+fn holds_of(status: &serde_json::Value) -> Vec<String> {
+    let all = status["holds"].as_array().into_iter().flatten();
+    all.filter_map(|holds| holds["what"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// With real processes (decision 2026-10-04 §10.1): only what is mapped
+/// syncs, and a device whose folders stopped is told which.
+///
+/// Two devices. The laptop's database says that the scope was on,
+/// written before its node starts, with a repository that was found, a
+/// stored report that shows it syncing without a mapping, and a control
+/// folder that is mapped. Its first start stores the notice. The desktop
+/// maps the same two names.
+///
+/// - An edit in the repository does not reach the desktop; the control
+///   folder's does.
+/// - The laptop's status carries the notice and names the repository,
+///   and its level is red: in `--json`, the line, the bar form and the
+///   plain status; `cordelia sync status` says it first. It is still
+///   there after a restart.
+/// - A file is deleted in the repository, and the repository is mapped:
+///   it merges. The file comes back, and is not deleted on the desktop;
+///   the laptop's edit reaches the desktop. The notice no longer names
+///   the repository, and `--seen` puts it away.
+///
+/// `scope` is what the laptop's database has stored as its scope. With
+/// `before_mappings` its stored report is in the form from before
+/// mappings, in which a folder has no directory: the notice then has no
+/// command for it, and the list of what is found has.
+fn folders_that_stopped_sync_again_once_they_are_mapped(
+    scope: Option<&str>,
+    before_mappings: bool,
+) {
+    use cordelia_storage::meta;
+    use serde_json::json;
+    let relay = relay_started();
+    let desktop = device_started("desktop", &relay);
+    let mut laptop = node("laptop", "personal", Some(relay.p2p));
+    let home = laptop.home();
+    let shown = |path: &Path| path.display().to_string();
+
+    // On the laptop: the control folder, which is mapped, and the
+    // repository, which was found. Each holds memory.
+    let lab = std::path::PathBuf::from(lab_of(&laptop));
+    std::fs::create_dir_all(&lab).unwrap();
+    let lab_mem = claude_folder(&home, &lab);
+    let repo = clone_at(&home, "work/tools");
+    let repo_mem = claude_folder(&home, &repo);
+    std::fs::write(repo_mem.join("shared.md"), "what both devices hold\n").unwrap();
+    let repo_folder = shown(&claude_project(&home, &repo));
+    {
+        let conn = in_the_released_form(&laptop);
+        match scope {
+            Some(scope) => meta::set(&conn, meta::SYNC_CLAUDE_ALL, scope).unwrap(),
+            None => {
+                meta::remove(&conn, meta::SYNC_CLAUDE_ALL).unwrap();
+            }
+        }
+        // The last cycle's report, as the version before stored it: the
+        // control folder, and the repository, which synced unmapped.
+        let folder = |dir: &Path, name: &str, mapped: bool| {
+            let mut folder = json!({
+                "channel_id": null, "conflict_files": [], "conflicts": 0, "error": null,
+                "folder": shown(&claude_project(&home, dir)),
+                "last_published_at": null, "last_pulled_at": null,
+                "project": name, "published": 0, "pulled": 0, "skipped": [], "too_large": [],
+                "waiting": false,
+            });
+            if !before_mappings {
+                folder["cwd"] = shown(dir).into();
+                folder["mapped"] = mapped.into();
+            }
+            folder
+        };
+        let report = json!({
+            "at": "2026-10-05T09:12:44.512203817+00:00",
+            "available": [], "errors": [], "excluded": [],
+            "folders": [folder(&lab, "lab", true), folder(&repo, TOOLS, false)],
+            "generation": 4, "unmapped": [], "unsynced": [],
+        });
+        meta::set(&conn, meta::SYNC_CLAUDE_REPORT, &report.to_string()).unwrap();
+    }
+    laptop.start();
+    let all = [&relay, &desktop, &laptop];
+    wait_for("laptop healthy", &all, 30, || healthy(&laptop));
+    wait_for("laptop reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
+    });
+
+    // Its first start stored the notice, and the scope is off. It is not
+    // added yet, and says that first: both are red.
+    let named = |status: &serde_json::Value| -> serde_json::Value {
+        let all = status["sync"]["notice"]["folders"].as_array().unwrap();
+        let found = all
+            .iter()
+            .find(|folder| folder["folder"] == repo_folder.as_str());
+        found
+            .unwrap_or_else(|| panic!("the notice does not name the repository: {status}"))
+            .clone()
+    };
+    let status = status_of(&laptop);
+    assert_eq!(status["sync"]["all"], false, "{status}");
+    assert_eq!(status["sync"]["notice"]["stopped"], 1, "{status}");
+    assert_eq!(status["sync"]["notice"]["not_known"], false, "{status}");
+    assert_eq!(named(&status)["name"], TOOLS);
+    assert_eq!(status["level"], "red", "{status}");
+    assert_eq!(status["summary"], "memory: not added yet", "{status}");
+    assert_eq!(holds_of(&status), ["no_phrase", "stopped_syncing"]);
+
+    // The two become one person's devices. The desktop maps its clone,
+    // under the remote's name, and its control folder.
+    pair(&desktop, &laptop, "laptop", &all);
+    let d_home = desktop.home();
+    let said = desktop.cli(&["sync", "claude", "--dir", &shown(&d_home.join(".claude"))]);
+    assert!(said.starts_with("Sync turned on.\n"), "{said}");
+    let d_repo = clone_at(&d_home, "code/tools");
+    let d_repo_mem = claude_folder(&d_home, &d_repo);
+    std::fs::write(d_repo_mem.join("shared.md"), "what both devices hold\n").unwrap();
+    std::fs::write(
+        d_repo_mem.join("from_desktop.md"),
+        "written on the desktop\n",
+    )
+    .unwrap();
+    let d_lab = d_home.join("lab");
+    std::fs::create_dir_all(&d_lab).unwrap();
+    let d_lab_mem = claude_folder(&d_home, &d_lab);
+    desktop.cli(&["sync", "map", &shown(&d_repo)]);
+    desktop.cli(&["sync", "map", &shown(&d_lab), "lab"]);
+    let mapped: Vec<String> = status_of(&desktop)["sync"]["mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|mapping| mapping["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(mapped, [TOOLS, "lab"]);
+
+    // An edit in each folder on the laptop. The control folder's reaches
+    // the desktop. The repository's does not: it is not mapped here.
+    std::fs::write(repo_mem.join("decision.md"), "decided on the laptop\n").unwrap();
+    std::fs::write(lab_mem.join("notes.md"), "noted on the laptop\n").unwrap();
+    wait_for(
+        "the control folder's edit reaches the desktop",
+        &all,
+        120,
+        || (read(&d_lab_mem.join("notes.md"))?.as_str() == "noted on the laptop\n").then_some(()),
+    );
+    // Some cycles later still not, and nothing of the desktop's came
+    // into the repository's folder here.
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    assert_eq!(read(&d_repo_mem.join("decision.md")), None);
+    assert_eq!(read(&repo_mem.join("from_desktop.md")), None);
+    let seen = person_of(&laptop);
+    let held: Vec<&str> = ["sent", "to_go"]
+        .iter()
+        .flat_map(|key| seen["names"][key].as_array().unwrap())
+        .filter_map(|name| name.as_str())
+        .collect();
+    assert_eq!(held, ["lab"], "the laptop holds no name for the repository");
+
+    // The laptop's status carries the notice, and is red: folders
+    // stopped syncing.
+    let status = wait_for("the laptop says what stopped", &all, 60, || {
+        let status = status_of(&laptop);
+        (status["summary"] == "memory: 1 folder stopped syncing").then_some(status)
+    });
+    assert_eq!(
+        (&status["level"], &status["state"]),
+        (&json!("red"), &json!("attention"))
+    );
+    assert!(holds_of(&status).contains(&"stopped_syncing".to_string()));
+    assert_eq!(status["sync"]["notice"]["stopped"], 1, "{status}");
+    let repository = named(&status);
+    assert_eq!(repository["name"], TOOLS);
+    let line = laptop.cli(&["status", "--line"]);
+    assert!(
+        line.contains("▲ memory: 1 folder stopped syncing"),
+        "{line}"
+    );
+    let bar: serde_json::Value =
+        serde_json::from_str(&laptop.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(bar["class"], json!(["attention", "red", "active"]), "{bar}");
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(tooltip.contains("Stopped syncing: "), "{tooltip}");
+    // The tooltip and the plain status list everything that holds, and
+    // not only what the line says: a device was added, and is not
+    // cleared.
+    assert_eq!(holds_of(&status), ["stopped_syncing", "added"]);
+    let also = "To know: 1 device added, not yet cleared";
+    assert!(tooltip.contains(also), "{tooltip}");
+    let plain = laptop.cli(&["status"]);
+    assert!(
+        plain.contains("Memory:    memory: 1 folder stopped syncing"),
+        "{plain}"
+    );
+    assert!(plain.contains(&format!("    also:     {also}")), "{plain}");
+    assert!(plain.contains("    stopped:  "), "{plain}");
+    // `cordelia sync status` says it first, with the command that maps
+    // the repository under the name it synced under; or, from a report
+    // of before mappings, that its directory is not known, with the
+    // command in the list of what is found.
+    let said = laptop.cli(&["sync", "status"]);
+    assert!(
+        said.starts_with("1 folder stopped syncing on this device"),
+        "{said}"
+    );
+    let by_the_notice = format!("cordelia sync map ~/work/tools {TOOLS}");
+    match before_mappings {
+        false => {
+            assert_eq!(repository["mappable"], true, "{repository}");
+            assert_eq!(repository["cwd"], shown(&repo).as_str());
+            assert!(
+                tooltip.contains(&format!("~/work/tools ({TOOLS})")),
+                "{tooltip}"
+            );
+            assert!(said.contains(&by_the_notice), "{said}");
+        }
+        true => {
+            assert_eq!(repository["why_not"], "no_directory", "{repository}");
+            assert!(repository["cwd"].is_null(), "{repository}");
+            assert!(said.contains("its directory is not known"), "{said}");
+            assert!(!said.contains(&by_the_notice), "{said}");
+            let found = said.split("Found on this machine, not syncing:").nth(1);
+            let found = found.unwrap_or_else(|| panic!("{said}"));
+            assert!(found.contains("cordelia sync map ~/work/tools\n"), "{said}");
+        }
+    }
+    assert!(said.contains("cordelia sync status --seen"), "{said}");
+
+    if !before_mappings {
+        // The notice is still there after a restart.
+        laptop.stop();
+        laptop.start();
+        let all = [&relay, &desktop, &laptop];
+        wait_for("laptop healthy again", &all, 30, || healthy(&laptop));
+        wait_for("the laptop is red again", &all, 60, || {
+            let status = status_of(&laptop);
+            (status["summary"] == "memory: 1 folder stopped syncing").then_some(())
+        });
+
+        // `map` checks when it is run. A memory tree laid out by hand
+        // records a directory: `map` of that directory would sync
+        // another folder, and is refused with the reason.
+        let other = home.join("work/other");
+        std::fs::create_dir_all(&other).unwrap();
+        let tree = home.join(".claude/projects/workspace");
+        std::fs::create_dir_all(tree.join("memory")).unwrap();
+        std::fs::write(tree.join("memory/kept.md"), "kept by hand\n").unwrap();
+        let line = format!("{{\"cwd\":{:?}}}\n", shown(&other));
+        std::fs::write(tree.join("scope.jsonl"), line).unwrap();
+        // And a folder that is no repository, which is found; a
+        // repository then appears above it.
+        let notes = home.join("deep/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        claude_folder(&home, &notes);
+        let said = wait_for("the laptop lists both", &all, 60, || {
+            let said = laptop.cli(&["sync", "status"]);
+            let both = said.contains("this layout cannot be mapped")
+                && said.contains("cordelia sync map ~/deep/notes <name>");
+            both.then_some(said)
+        });
+        assert!(
+            said.contains("~/.claude/projects/workspace/memory"),
+            "{said}"
+        );
+        assert!(!said.contains("cordelia sync map ~/work/other"), "{said}");
+        let refused = laptop.refused(&["sync", "map", &shown(&other), "other"]);
+        assert!(
+            refused.contains("this layout cannot be mapped"),
+            "{refused}"
+        );
+        assert!(refused.contains("nothing was mapped"), "{refused}");
+        // It says which folder is in the way, and what clears it.
+        assert!(refused.contains("/.claude/projects/workspace"), "{refused}");
+        assert!(refused.contains("which is not there"), "{refused}");
+        assert!(
+            refused.contains("To sync the memory in") && refused.contains("move it into"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("start a Claude Code session in"),
+            "{refused}"
+        );
+        let above = home.join("deep");
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&above)
+            .args(["init", "-q"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let refused = laptop.refused(&["sync", "map", &shown(&notes), "notes"]);
+        assert!(refused.contains("would sync another folder"), "{refused}");
+        assert!(
+            refused.contains("a git repository that contains it"),
+            "{refused}"
+        );
+        let mappings = status_of(&laptop)["sync"]["mappings"].clone();
+        assert_eq!(mappings.as_array().unwrap().len(), 1, "{mappings}");
+    }
+    let all = [&relay, &desktop, &laptop];
+
+    // A file is deleted in the repository, and then the repository is
+    // mapped: by the notice's command, or by the list's.
+    std::fs::remove_file(repo_mem.join("shared.md")).unwrap();
+    let said = match before_mappings {
+        false => laptop.cli(&["sync", "map", &shown(&repo), TOOLS]),
+        true => laptop.cli(&["sync", "map", &shown(&repo)]),
+    };
+    assert!(
+        said.contains(&format!("Mapped ~/work/tools to {TOOLS}.")),
+        "{said}"
+    );
+    // It merges: what each side wrote reaches the other, and the file
+    // that was deleted here comes back, and is not deleted there.
+    wait_for("the laptop's edit reaches the desktop", &all, 120, || {
+        (read(&d_repo_mem.join("decision.md"))?.as_str() == "decided on the laptop\n").then_some(())
+    });
+    wait_for("the desktop's file reaches the laptop", &all, 120, || {
+        (read(&repo_mem.join("from_desktop.md"))?.as_str() == "written on the desktop\n")
+            .then_some(())
+    });
+    wait_for("the deleted file comes back", &all, 120, || {
+        (read(&repo_mem.join("shared.md"))?.as_str() == "what both devices hold\n").then_some(())
+    });
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    assert_eq!(
+        read(&d_repo_mem.join("shared.md")).as_deref(),
+        Some("what both devices hold\n"),
+        "it is not deleted on the desktop"
+    );
+    assert_eq!(
+        read(&repo_mem.join("shared.md")).as_deref(),
+        Some("what both devices hold\n")
+    );
+
+    // The notice no longer names the repository: nothing of it is red.
+    let status = wait_for("the notice names nothing that stopped", &all, 60, || {
+        let status = status_of(&laptop);
+        (status["sync"]["notice"]["stopped"] == 0 && status["level"] != "red").then_some(status)
+    });
+    assert_eq!(named(&status)["mapped"], true, "{status}");
+    assert!(!holds_of(&status).contains(&"stopped_syncing".to_string()));
+    let said = laptop.cli(&["sync", "status"]);
+    assert!(
+        said.starts_with("Every folder that stopped syncing on this device is mapped again."),
+        "{said}"
+    );
+    // Seen: the notice is shown once more, and then put away, and the
+    // status carries none.
+    let said = laptop.cli(&["sync", "status", "--seen"]);
+    assert!(
+        said.starts_with(
+            "Every folder that stopped syncing on this device is mapped again.\n\nThe notice \
+             of the folders that stopped syncing is put away."
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("--seen"), "{said}");
+    let status = status_of(&laptop);
+    assert!(status["sync"]["notice"].is_null(), "{status}");
+    assert!(!laptop.cli(&["sync", "status"]).contains("stopped syncing"));
+    let conn = database_of(&laptop);
+    assert!(first_start::notices(&conn).unwrap().is_empty());
+
+    if !before_mappings {
+        // The tree laid out by hand stands in the way of its directory
+        // only while Claude Code's own folder for that directory is not
+        // there. A session is started in the directory: the same command
+        // now maps that folder, which is what was asked, and nothing
+        // that the tree holds leaves the machine.
+        let other = home.join("work/other");
+        let own_mem = claude_folder(&home, &other);
+        std::fs::write(own_mem.join("own.md"), "of the directory itself\n").unwrap();
+        let said = wait_for("the laptop lists the own folder", &all, 60, || {
+            let said = laptop.cli(&["sync", "status"]);
+            said.contains("cordelia sync map ~/work/other <name>")
+                .then_some(said)
+        });
+        assert!(said.contains("this layout cannot be mapped"), "{said}");
+        let said = laptop.cli(&["sync", "map", &shown(&other), "other"]);
+        assert!(said.contains("Mapped ~/work/other to other."), "{said}");
+        let d_other = d_home.join("work/other");
+        std::fs::create_dir_all(&d_other).unwrap();
+        let d_other_mem = claude_folder(&d_home, &d_other);
+        desktop.cli(&["sync", "map", &shown(&d_other), "other"]);
+        wait_for(
+            "the own folder's file reaches the desktop",
+            &all,
+            120,
+            || {
+                (read(&d_other_mem.join("own.md"))?.as_str() == "of the directory itself\n")
+                    .then_some(())
+            },
+        );
+        assert_eq!(read(&d_other_mem.join("kept.md")), None);
+        let tree = home.join(".claude/projects/workspace/memory/kept.md");
+        assert_eq!(read(&tree).as_deref(), Some("kept by hand\n"));
+    }
+}
+
+#[test]
+fn folders_that_synced_unmapped_stop_and_sync_again_once_they_are_mapped() {
+    folders_that_stopped_sync_again_once_they_are_mapped(Some("on"), false);
+}
+
+/// The same from data where no scope is stored, with a directory set,
+/// and a stored report in the form from before mappings.
+#[test]
+fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() {
+    folders_that_stopped_sync_again_once_they_are_mapped(None, true);
 }

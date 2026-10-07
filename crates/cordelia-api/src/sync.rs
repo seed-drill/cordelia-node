@@ -38,10 +38,9 @@ fn store_mappings(db: &rusqlite::Connection, list: &[SyncMapping]) -> Result<(),
 
 /// The exclude list, each entry read as it would be stored now
 /// ([`clean_exclusion`]). A name is read in its one spelling: an earlier
-/// version could store one that ended in `.git`, which is read here as the
-/// name a project is found under. A folder keeps a space at the end of
-/// its name, since that is the text the adapter compares a directory
-/// with; its separators are tidied, and one with `..` in it is dropped.
+/// version could store one that ended in `.git`. A folder keeps a space
+/// at the end of its name; its separators are tidied, and one with `..`
+/// in it is dropped.
 fn exclusions(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
     let stored: Vec<String> = meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
         .and_then(|j| serde_json::from_str(&j).ok())
@@ -58,59 +57,142 @@ fn store_exclusions(db: &rusqlite::Connection, list: &[String]) -> Result<(), Ap
 }
 
 fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
-    let report =
-        meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
-    let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
-    let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
     use cordelia_storage::person::State;
-    let stands = match crate::at_relays::stands(&db) {
-        Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
-        Ok(crate::at_relays::Stands::Applied) => "applied",
-        Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
-        Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
-        Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
-        Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
-        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    // What a stored notice names is asked of the disk and of git once
+    // the database's lock is let go.
+    let (mut status, notices, last_dir) = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
+        let report =
+            meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+        let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
+        let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
+        let stands = match crate::at_relays::stands(&db) {
+            Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
+            Ok(crate::at_relays::Stands::Applied) => "applied",
+            Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
+            Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
+            Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
+            Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
+            Err(e) => return Err(ApiError::Internal(e.to_string())),
+        };
+        let status = SyncStatusResponse {
+            enabled: dir.is_some(),
+            dir,
+            // Whatever is stored: only mapped folders sync.
+            all: false,
+            mappings: mappings(&db)?,
+            exclude: exclusions(&db)?,
+            home,
+            home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
+            generation: state.sync_control.generation(),
+            report,
+            no_report_secs: state
+                .sync_control
+                .no_report_for(state.started_at, std::time::Instant::now())
+                .as_secs(),
+            last_change_at,
+            stands,
+            held: state.held.why().map(|held| held.says().to_string()),
+            moved_on: crate::look::moved_on(&db)?,
+            notice: None,
+            carried: None,
+        };
+        let notices = cordelia_storage::first_start::notices(&db)?;
+        let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
+        (status, notices, last_dir)
     };
-    Ok(SyncStatusResponse {
-        enabled: dir.is_some(),
-        dir,
-        all: meta::get(&db, meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on"),
-        mappings: mappings(&db)?,
-        exclude: exclusions(&db)?,
-        home,
-        home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
-        generation: state.sync_control.generation(),
-        report,
-        last_change_at,
-        stands,
-        held: state.held.why().map(|held| held.says().to_string()),
-        moved_on: crate::look::moved_on(&db)?,
-    })
+    if !notices.is_empty() {
+        // Asked against the Claude Code directory that is set, or, with
+        // sync off, the one that turning sync on would use: the last one
+        // kept, or the default (decision 2026-10-04 §10.1).
+        let default = || {
+            std::env::var("HOME")
+                .map(|home| format!("{home}/.claude"))
+                .ok()
+        };
+        let against_dir = status
+            .dir
+            .clone()
+            .or(last_dir)
+            .or_else(default)
+            .unwrap_or_default();
+        let home = home_dir().ok();
+        let against = crate::found::Against {
+            claude_dir: std::path::Path::new(&against_dir),
+            home: home.as_deref(),
+            mappings: &status.mappings,
+        };
+        status.notice = crate::found::notice_shown(&notices, &against, &crate::found::Remembered);
+    }
+    Ok(status)
 }
 
-/// An install from before mappings synced everything it found. Keep that
-/// scope on upgrade, rather than silently stopping its sync: the scope is
-/// only ever narrowed by its owner.
-pub fn keep_earlier_scope(state: &AppState) -> Result<(), ApiError> {
+/// A person has seen the notice of what stopped syncing (decision
+/// 2026-10-04 §10.1): it is taken away, every record of it. This is the
+/// one request that takes it away. It counts no change of settings: a
+/// cycle that is running goes on, and what a report was made under is
+/// still what stands. With no notice stored it does nothing, and answers
+/// as done.
+pub async fn seen(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if cordelia_storage::first_start::clear_notices(&db)? {
+            tracing::info!("sync: the notice of what stopped syncing was seen, and is put away");
+        }
+    }
+    Ok(HttpResponse::Ok().json(status(&state)?))
+}
+
+/// What is stored as the scope: that only mapped folders sync. There is
+/// no other scope (decision 2026-10-04 §10.1).
+const SCOPE_OFF: &str = "off";
+
+/// What a request that asks for everything found to sync is told. The
+/// command line says the same before it sends anything.
+pub const EVERYTHING_FOUND_IS_REFUSED: &str = "syncing everything found is no more: only mapped \
+    folders sync, and nothing was changed. `cordelia sync status` lists what is found on this \
+    machine, with the command that maps each folder (`cordelia sync map <folder>`).";
+
+/// The stored scope is off whenever sync is on (decision 2026-10-04
+/// §10.1): a node writes it so when it starts with sync on, whatever was
+/// stored, and where nothing was. Returns whether it wrote. With sync off
+/// nothing is written: the request that turns sync on writes it
+/// ([`set_claude`]).
+///
+/// Nothing reads the scope to say what syncs. It is written for what
+/// reads the settings as an earlier version did: there, a directory that
+/// is set with no scope stored is a scope that is on.
+///
+/// A node whose first start on this version is still to be made does not
+/// ask this: the step of the first start reads the scope as it is
+/// stored, and writes it off itself.
+pub fn scope_off_at_start(state: &AppState) -> Result<bool, ApiError> {
     let db = state
         .db
         .lock()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    if meta::get(&db, meta::SYNC_CLAUDE_DIR)?.is_some()
-        && meta::get(&db, meta::SYNC_CLAUDE_ALL)?.is_none()
-    {
-        meta::set(&db, meta::SYNC_CLAUDE_ALL, "on")?;
-        tracing::info!(
-            "sync: keeping the earlier scope (everything found); `cordelia sync claude --mapped-only` narrows it"
-        );
+    if meta::get(&db, meta::SYNC_CLAUDE_DIR)?.is_none() {
+        return Ok(false);
     }
-    Ok(())
+    let stored = meta::get(&db, meta::SYNC_CLAUDE_ALL)?;
+    if stored.as_deref() == Some(SCOPE_OFF) {
+        return Ok(false);
+    }
+    meta::set(&db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
+    tracing::warn!(
+        "sync: what was stored said that everything found on this machine syncs. Only mapped \
+         folders sync: `cordelia sync status` lists what is found, with the command that maps \
+         each"
+    );
+    Ok(true)
 }
 
 /// A name a folder can sync under: `~` for home memory, or 1 to 200
@@ -153,20 +235,16 @@ fn clean_path(path: &str) -> Option<String> {
     })
 }
 
-/// An exclusion as it is stored: a folder (an absolute path) that is never
-/// found by `all`, or a project name or prefix in its one spelling
-/// (`cordelia_core::sync_name::tidy`), which is the spelling a project is
-/// found under. `None` for what is neither: a name of which nothing is
-/// left, or a path with `..` in it.
+/// An exclusion as it is stored, for a panel that still sends a list of
+/// them: a folder (an absolute path), or a project name or prefix in its
+/// one spelling (`cordelia_core::sync_name::tidy`). `None` for what is
+/// neither: a name of which nothing is left, or a path with `..` in it.
+/// Nothing reads the list to say what syncs (decision 2026-10-04 §10.1).
 ///
 /// A folder keeps a space at the end of its name: a folder's name can end
-/// in one, and what is stored is the text a directory is compared with.
-/// Its separators are tidied. So a list that is sent back as it was
-/// stored is stored as it was.
-///
-/// The command line uses this too, so that what `include` looks for in
-/// the list is spelled as the list spells it.
-pub fn clean_exclusion(entry: &str) -> Option<String> {
+/// in one. Its separators are tidied. So a list that is sent back as it
+/// was stored is stored as it was.
+fn clean_exclusion(entry: &str) -> Option<String> {
     if entry.starts_with('/') {
         return clean_path(entry);
     }
@@ -197,11 +275,9 @@ pub fn memory_folder(claude_dir: &str, folder: &str) -> String {
 ///
 /// A folder that stops syncing starts afresh if it syncs again: what it
 /// lost in between is fetched back, never sent as deletes (decision
-/// 2026-09-30 §4.5). A handler knows which mapping it removes. It does not
-/// know which folders a narrower scope no longer finds: that is known only
-/// to a cycle. So every folder that is not mapped forgets, the folder of a
-/// mapping just removed among them. A folder that is found and goes on
-/// syncing pays for that with a merge it did not need.
+/// 2026-09-30 §4.5). Only a mapped folder syncs (decision 2026-10-04
+/// §10.1), so every folder that is not mapped forgets: the folder of a
+/// mapping just removed among them.
 ///
 /// It is done here, by the handler and under the lock it holds, so that it
 /// is true by the time the command answers.
@@ -224,10 +300,22 @@ fn forget_what_is_not_mapped(db: &rusqlite::Connection, claude_dir: &str) -> Res
 /// `home` is the home directory, when it is known.
 ///
 /// A setting that is not given keeps its stored value, so running it again
-/// changes nothing. `reset` puts the directory, scope, home and exclude
-/// settings back to their defaults (declared mappings stay). When first
-/// turned on, only declared mappings sync. Turning home memory off also
-/// unmaps the home directory, whatever name it has.
+/// changes nothing. Only declared mappings sync (decision 2026-10-04
+/// §10.1):
+///
+/// - **A request that turns sync on, or leaves it on, and asks for
+///   everything found (`all: true`) is refused whole.** Nothing is
+///   written, and no change is counted, whatever else it carries. A
+///   request that turns sync off is never refused for it.
+/// - `all: false` is taken: it is the only scope there is, and the
+///   stored scope is written off whatever is asked.
+/// - `reset` puts the Claude Code directory back to its default, and
+///   touches nothing else: declared mappings stay, and so do the stored
+///   list of exclusions and the switch for home memory.
+/// - An `exclude` list and the `home` switch are stored as they were,
+///   for a panel that still sends them: nothing reads either to say what
+///   syncs. Turning home memory off also unmaps the home directory,
+///   whatever name it has.
 pub fn set_claude(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -235,6 +323,11 @@ pub fn set_claude(
     home: Option<&std::path::Path>,
 ) -> Result<(), ApiError> {
     if body.enabled {
+        // Refused before anything is read or written, and before the
+        // change is counted: a cycle that is running goes on.
+        if body.all == Some(true) {
+            return Err(ApiError::BadRequest(EVERYTHING_FOUND_IS_REFUSED.into()));
+        }
         let stored = meta::get(db, meta::SYNC_CLAUDE_DIR)?;
         // The directory in use, or the one in use when sync was last on.
         let remembered = match &stored {
@@ -261,32 +354,27 @@ pub fn set_claude(
         // Counted before anything is written (see `SyncControl::changed`).
         control.changed(db);
 
-        // The scope is stored before the directory that turns sync on, so
-        // that sync is never on with its scope left to be implied.
-        let was_all = meta::get(db, meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on");
-        let all = body.all.unwrap_or(was_all && !body.reset);
-        if all != was_all {
-            tracing::info!(all, "sync: scope changed");
-        }
-        meta::set(db, meta::SYNC_CLAUDE_ALL, if all { "on" } else { "off" })?;
-        // Whether anything found by `all` may have stopped syncing. It is
-        // judged against what was set before this request: a reset with
-        // the same setting given again narrows nothing.
-        let mut narrowed = was_all && !all;
+        // The stored scope is off whenever sync is on (decision
+        // 2026-10-04 §10.1): it is written so at every request that
+        // turns sync on or leaves it on, whatever was stored. It is
+        // written before the directory that turns sync on, and the key
+        // is never removed: an earlier version reads a directory that is
+        // set, with no scope stored, as a scope that is on.
+        meta::set(db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
+        // Whether a folder stopped syncing by this request: the home
+        // directory's, where home memory is turned off and it was mapped.
+        // Nothing else that a request can set says what syncs.
+        let mut unmapped = false;
         let excluded_before = exclusions(db)?;
         let home_was = meta::get(db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
 
-        if body.reset {
-            meta::remove(db, meta::SYNC_CLAUDE_EXCLUDE)?;
-            meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
-            tracing::info!("sync: exclusions and the home setting reset");
-        }
+        // Stored as before, for a panel that still sends one: nothing
+        // reads the list to say what syncs.
         if let Some(exclude) = &body.exclude {
             let cleaned: Vec<String> = exclude.iter().filter_map(|e| clean_exclusion(e)).collect();
             if cleaned != excluded_before {
                 tracing::info!(exclude = ?cleaned, "sync: exclusions changed");
             }
-            narrowed |= cleaned.iter().any(|e| !excluded_before.contains(e));
             store_exclusions(db, &cleaned)?;
         }
         if let Some(on) = body.home {
@@ -296,28 +384,26 @@ pub fn set_claude(
             if on {
                 meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
             } else {
-                // Off means off: not found by `all`, and not mapped,
-                // whatever name the home directory was mapped under. Its
-                // folder then forgets with the rest that is not mapped,
-                // below: the setting was on if it was mapped, since
-                // mapping it turns the setting on.
+                // Off means off: the home directory is not mapped,
+                // whatever name it was mapped under. Its folder then
+                // forgets with the rest that is not mapped, below.
                 meta::set(db, meta::SYNC_CLAUDE_HOME, "off")?;
-                narrowed |= home_was;
                 let mut list = mappings(db)?;
                 if let Some(home) = home
                     && let Some(mapping) = unmap_home(&mut list, home)
                 {
                     store_mappings(db, &list)?;
+                    unmapped = true;
                     tracing::info!(name = %mapping.name, "sync: home memory unmapped");
                 }
             }
         }
 
-        // What is no longer found starts afresh if it is found again.
-        // When the Claude Code directory changes, every folder does. The
-        // directory is the string that is stored: the adapter is started
-        // again for a new spelling of the same path, and records what its
-        // folders agree under that.
+        // A folder that is mapped no longer starts afresh if it is mapped
+        // again. When the Claude Code directory changes, every folder
+        // does. The directory is the string that is stored: the adapter
+        // is started again for a new spelling of the same path, and
+        // records what its folders agree under that.
         //
         // Nothing is agreed while sync is off. Turning it off forgets, and
         // so does turning it on, for whatever was left: an older version
@@ -331,7 +417,7 @@ pub fn set_claude(
                     "sync: every folder forgot what it had agreed"
                 );
             }
-        } else if narrowed {
+        } else if unmapped {
             forget_what_is_not_mapped(db, &dir)?;
         }
 
@@ -340,19 +426,6 @@ pub fn set_claude(
         }
         meta::set(db, meta::SYNC_CLAUDE_DIR, &dir)?;
         meta::remove(db, meta::SYNC_CLAUDE_LAST_DIR)?;
-
-        // A home directory that is found, and not mapped, syncs as `~`.
-        // That is then the name it has, to be put back under after an off.
-        if let Some(home) = home
-            && all
-            && meta::get(db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off")
-            && !mappings(db)?.iter().any(|m| is_home_mapping(m, home))
-            && !exclusions(db)?
-                .iter()
-                .any(|e| std::path::Path::new(e) == home)
-        {
-            meta::set(db, meta::SYNC_CLAUDE_HOME_NAME, HOME_NAME)?;
-        }
     } else {
         control.changed(db);
         if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
@@ -596,39 +669,87 @@ fn home_dir() -> Result<std::path::PathBuf, ApiError> {
     Ok(home.canonicalize().unwrap_or(home))
 }
 
-/// What `POST /api/v1/sync/map` does, with the database lock held: declare
-/// that Claude's memory for a folder syncs under a name.
+/// What `POST /api/v1/sync/map` does, for a caller that holds the
+/// database's lock throughout: declare that Claude's memory for a folder
+/// syncs under a name ([`add_mapping_looked`]), after the check of what
+/// was found for the folder's directory ([`map_asked`], [`map_looked`]).
 ///
-/// The folder is taken as given: the adapter syncs the Claude Code folder
-/// named after it and no other. (Claude Code keeps one memory per git
-/// repository, under its main working tree; `cordelia sync map` resolves
-/// a folder to that before calling this.) Mapping a folder ends any
-/// exclusion of it. Mapping the home directory, under any name, turns the
-/// home setting on, and that name is the one it is put back under after
-/// home memory has been turned off.
+/// The node's own route asks the disk and git with the lock let go
+/// ([`map`]). This is for a caller that has no other holder to keep
+/// waiting.
 pub fn add_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
     body: &SyncMapRequest,
     home_dir: &std::path::Path,
 ) -> Result<(), ApiError> {
-    if meta::get(db, meta::SYNC_CLAUDE_DIR)?.is_none() {
+    let asked = map_asked(control, db, body, home_dir)?;
+    let looked = asked.as_ref().map(|asked| map_looked(asked, home_dir));
+    add_mapping_looked(control, db, body, home_dir, looked.as_ref())
+}
+
+/// Declare that Claude's memory for a folder syncs under a name, with the
+/// database lock held. `looked` is what the check of what was found said
+/// for this mapping ([`map_looked`]), where one was made.
+///
+/// The folder is taken as given: the adapter syncs the Claude Code folder
+/// named after it and no other. (Claude Code keeps one memory per git
+/// repository, under its main working tree; `cordelia sync map` resolves
+/// a folder to that before calling this.) Mapping the home directory,
+/// under any name, turns the home setting on, and that name is the one it
+/// is put back under after home memory has been turned off.
+///
+/// **The folder that a mapping adds forgets what it had agreed** (decision
+/// 2026-10-04 §10.1): whatever an earlier version, or a cycle that was
+/// stopped, left of it. So a folder that is mapped always merges: it
+/// meets its channel as on any first sync, and nothing that it lost while
+/// it did not sync is sent as a delete. Mapping what is already mapped
+/// adds nothing, and forgets nothing.
+///
+/// **A mapping is added only with its check, made under the settings as
+/// they stand.** The check is of this folder, under this Claude Code
+/// directory, at this count of settings commands: where a setting has
+/// changed since it was made, or none was made, nothing is mapped, and
+/// the request says to run it again.
+pub fn add_mapping_looked(
+    control: &SyncControl,
+    db: &rusqlite::Connection,
+    body: &SyncMapRequest,
+    home_dir: &std::path::Path,
+    looked: Option<&MapLooked>,
+) -> Result<(), ApiError> {
+    let Some(claude_dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? else {
         return Err(ApiError::BadRequest(
             "sync is off: turn it on with `cordelia sync claude` first".into(),
         ));
-    }
+    };
     let mut list = mappings(db)?;
     let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
+    if let Some(mapping) = &checked {
+        let of_this = |looked: &&MapLooked| {
+            looked.generation == control.generation_under(db)
+                && looked.claude_dir == claude_dir
+                && looked.folder == mapping.folder
+        };
+        match looked.filter(of_this) {
+            Some(looked) => {
+                if let Some(why) = &looked.refused {
+                    return Err(ApiError::BadRequest(why.clone()));
+                }
+            }
+            None => return Err(ApiError::BadRequest(SETTINGS_CHANGED_UNDER_MAP.into())),
+        }
+    }
     control.changed(db);
     if let Some(mapping) = checked {
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping added");
-        let excluded = exclusions(db)?;
-        if excluded.contains(&mapping.folder) {
-            let kept: Vec<String> = excluded
-                .into_iter()
-                .filter(|e| *e != mapping.folder)
-                .collect();
-            store_exclusions(db, &kept)?;
+        let forgotten =
+            sync_state::forget_folder(db, &memory_folder(&claude_dir, &mapping.folder))?;
+        if forgotten > 0 {
+            tracing::info!(
+                files = forgotten,
+                "sync: the folder that is mapped forgot what it had agreed"
+            );
         }
         if is_home_mapping(&mapping, home_dir) {
             meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
@@ -641,8 +762,210 @@ pub fn add_mapping(
     Ok(())
 }
 
+/// What a mapping is refused with where a setting changed between its
+/// check and the moment it would be stored.
+pub const SETTINGS_CHANGED_UNDER_MAP: &str = "the sync settings changed while this mapping was \
+    being checked: nothing was mapped. Run it again.";
+
+/// The folders that were found and are not mapped, as the last stored
+/// report lists them, and the folders that a stored notice names: each as
+/// Claude Code's folder, its directory, and the name it has. A folder
+/// with no directory is left out. Where a notice names a folder again,
+/// the later directory and name stand.
+fn found_and_named(
+    db: &rusqlite::Connection,
+) -> Result<Vec<(String, String, Option<String>)>, ApiError> {
+    let mut out = Vec::new();
+    let report: Option<serde_json::Value> =
+        meta::get(db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+    for entry in report
+        .iter()
+        .flat_map(|r| r["unmapped"].as_array())
+        .flatten()
+    {
+        // Its directory is under `cwd` where `map` would sync the folder,
+        // and under `directory` where it would not.
+        let directory = text(&entry["cwd"]).or_else(|| text(&entry["directory"]));
+        if let (Some(folder), Some(directory)) = (text(&entry["folder"]), directory) {
+            out.push((folder, directory, text(&entry["name"])));
+        }
+    }
+    for named in crate::found::named_in(&cordelia_storage::first_start::notices(db)?) {
+        if let Some(directory) = named.cwd {
+            out.push((named.folder, directory, named.name));
+        }
+    }
+    Ok(out)
+}
+
+/// What the check of a mapping goes by, as it is read with the database's
+/// lock held ([`map_asked`]): everything that is then asked of the disk
+/// and of git with the lock let go ([`map_looked`]).
+#[derive(Debug, Clone)]
+pub struct MapAsked {
+    /// The count of settings commands that it was read under.
+    generation: u64,
+    /// The Claude Code directory that is set.
+    claude_dir: String,
+    /// The mapping that would be stored.
+    mapping: SyncMapping,
+    /// The mappings that are declared.
+    mappings: Vec<SyncMapping>,
+    /// What was found, and what a notice names ([`found_and_named`]).
+    entries: Vec<(String, String, Option<String>)>,
+    /// Whether a report of a cycle is stored: what was found is read
+    /// from it. Where none is, the node looks itself.
+    report_stored: bool,
+}
+
+/// What the check of a mapping said ([`map_looked`]): why it is refused,
+/// where it is, for one folder under one Claude Code directory, at one
+/// count of settings commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapLooked {
+    generation: u64,
+    claude_dir: String,
+    folder: String,
+    /// Why the mapping is refused, where it would sync another folder
+    /// than one that was found for its directory.
+    pub refused: Option<String>,
+}
+
+/// Read what the check of the mapping that `body` asks for goes by, with
+/// the database's lock held (decision 2026-10-04 §10.1). `None` where
+/// there is nothing to check: sync is off, the request is refused for a
+/// reason of its own, or it declares what is declared already. Whoever
+/// stores the mapping says which ([`add_mapping_looked`]).
+pub fn map_asked(
+    control: &SyncControl,
+    db: &rusqlite::Connection,
+    body: &SyncMapRequest,
+    home_dir: &std::path::Path,
+) -> Result<Option<MapAsked>, ApiError> {
+    let Some(claude_dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? else {
+        return Ok(None);
+    };
+    let mappings = mappings(db)?;
+    let Ok(Some(mapping)) = check_mapping(body, home_dir, &mappings) else {
+        return Ok(None);
+    };
+    Ok(Some(MapAsked {
+        generation: control.generation_under(db),
+        claude_dir,
+        mapping,
+        mappings,
+        entries: found_and_named(db)?,
+        report_stored: meta::get(db, meta::SYNC_CLAUDE_REPORT)?.is_some(),
+    }))
+}
+
+/// Why the mapping that was asked for is refused, where it would sync
+/// another folder than one that was found, or that a notice names, with
+/// the directory it gives (decision 2026-10-04 §10.1): `map` checks
+/// whenever it is run, however the request was come by
+/// ([`crate::found::in_the_way`]). The reason is the one that stands in
+/// the place of a command for that folder, as the one function gives it.
+///
+/// **It asks the disk and git, and is called with the database's lock let
+/// go:** git may take its time, and nothing else waits on it then.
+///
+/// **Where no report of a cycle is stored, it looks at what is found for
+/// the directory itself** ([`crate::found::found_for`]): a request that
+/// changes a setting removes the report, and until the next cycle stores
+/// one there would be nothing to check against. A command waits for a
+/// report; a panel does not.
+pub fn map_looked(asked: &MapAsked, home_dir: &std::path::Path) -> MapLooked {
+    use crate::found;
+    use std::path::Path;
+
+    let claude_dir = Path::new(&asked.claude_dir);
+    let given = Path::new(&asked.mapping.folder);
+    let refused = || -> Option<String> {
+        let would_sync = found::claude_folder(claude_dir, given)?;
+        let to_map = found::ToMap {
+            given,
+            would_sync: &would_sync,
+            claude_dir,
+        };
+        // What was found is read from the last cycle's report, which
+        // every request that changes a setting removes. Where none is
+        // stored, the node looks at what is found for this directory
+        // itself, before it answers.
+        let mut entries = asked.entries.clone();
+        if !asked.report_stored {
+            let looked = found::found_for(claude_dir, given, &found::ThisMachine);
+            entries.extend(
+                looked
+                    .into_iter()
+                    .map(|(folder, directory)| (folder, directory, None)),
+            );
+        }
+        let entries = &entries;
+        let pairs = entries
+            .iter()
+            .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
+        let (folder, recorded) = found::in_the_way(&to_map, pairs, &found::ThisMachine)?;
+        let name = entries
+            .iter()
+            .find(|(of, directory, _)| of == folder && directory == recorded)
+            .and_then(|(_, _, name)| name.as_deref());
+        // The folder is asked with its directory as it was recorded:
+        // where that is a link, the reason says so.
+        let folder_asked = found::Asked {
+            folder: Path::new(folder),
+            directory: Some(Path::new(recorded)),
+            name,
+        };
+        let against = found::Against {
+            claude_dir,
+            home: Some(home_dir),
+            mappings: &asked.mappings,
+        };
+        let reason = match found::would_map(&folder_asked, &against, &found::ThisMachine) {
+            found::Maps::No(why) => Some(why.says()),
+            _ => None,
+        };
+        Some(found::map_refused(
+            &to_map,
+            folder,
+            reason.as_deref(),
+            &found::ThisMachine,
+        ))
+    };
+    MapLooked {
+        generation: asked.generation,
+        claude_dir: asked.claude_dir.clone(),
+        folder: asked.mapping.folder.clone(),
+        refused: refused(),
+    }
+}
+
+/// How many times `map` reads, looks and comes back to store a mapping
+/// before it gives up: each time a setting changed while it looked.
+const MAP_TRIES: usize = 3;
+
 /// Declare that Claude's memory for a folder syncs under a name (see
-/// [`add_mapping`]).
+/// [`add_mapping_looked`]).
+///
+/// **The disk and git are asked first, and then the database's lock is
+/// taken** (decision 2026-10-04 §10.1): what the check goes by is read
+/// under a short hold of the lock ([`map_asked`]), the check is made with
+/// the lock let go ([`map_looked`]), and the mapping is stored under a
+/// second hold, where no setting has changed in between. Where one has,
+/// the check is made again, a few times; and then the request is refused,
+/// with nothing mapped.
+///
+/// **A device that comes to sync a name carries it first** (decision
+/// 2026-10-04 §7.3). Where the mapping has the device hold a name that
+/// it did not hold, and it still holds the secret of a generation that
+/// it left, the name's channel in those generations is read at the
+/// relays before this answers, and what keys that count signed there is
+/// carried, where the new channel holds nothing for the name
+/// ([`crate::carrying::carry_name`]). The folder's first cycle waits for
+/// that ([`crate::state::OwnChannels::carrying`]), so that what it
+/// publishes is written over what was carried. The answer says what was
+/// carried.
 pub async fn map(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -650,16 +973,83 @@ pub async fn map(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
     let home_dir = home_dir()?;
-    {
-        let db = state
+    let lock = || {
+        state
             .db
             .lock()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    };
+    let mut carries_first: Vec<(String, [u8; 32])> = Vec::new();
+    for tried in 1..=MAP_TRIES {
+        let asked = map_asked(&state.sync_control, &*lock()?, &body, &home_dir)?;
+        let looked = asked.as_ref().map(|asked| map_looked(asked, &home_dir));
+        let db = lock()?;
+        let moved =
+            |looked: &MapLooked| looked.generation != state.sync_control.generation_under(&db);
+        if looked.as_ref().is_some_and(moved) && tried < MAP_TRIES {
+            continue;
+        }
         let before = mapped_names(&db)?;
-        add_mapping(&state.sync_control, &db, &body, &home_dir)?;
+        add_mapping_looked(&state.sync_control, &db, &body, &home_dir, looked.as_ref())?;
         names_follow(&state, &db, &before);
+        carries_first = carries_first_for(&state, &db, &before);
+        break;
     }
-    Ok(HttpResponse::Ok().json(status(&state)?))
+    // The carry, with the lock let go: it waits on the relays.
+    let mut carried = None;
+    for (name, channel) in carries_first {
+        let done = crate::carrying::carry_name(&state, &name, true).await;
+        state.own_channels.carried(&channel);
+        match done {
+            Ok(done) => carried = Some(done.says(&name)),
+            Err(error) => {
+                tracing::warn!(%error, "sync: the name that was mapped could not be carried")
+            }
+        }
+    }
+    let mut status = status(&state)?;
+    status.carried = carried;
+    Ok(HttpResponse::Ok().json(status))
+}
+
+/// The names that a mapping has this device hold anew, each with the ID
+/// of its channel, where the device carries a name before its folder's
+/// first cycle (decision 2026-10-04 §7.3): it has applied a statement,
+/// and still holds the secret of a generation that it left. `before` is
+/// the names its folders were mapped to before the mapping.
+///
+/// The folder's first cycle is held back for each from here on
+/// ([`crate::state::OwnChannels::carrying`]), under the hold of the
+/// database's lock that the mapping was stored under: no cycle runs
+/// between the two.
+fn carries_first_for(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    before: &[String],
+) -> Vec<(String, [u8; 32])> {
+    use cordelia_storage::person as held_rows;
+    let applied = matches!(
+        crate::at_relays::stands(db),
+        Ok(crate::at_relays::Stands::Applied)
+    );
+    let left_one = held_rows::secrets(db)
+        .is_ok_and(|secrets| secrets.iter().any(|secret| secret.left_at.is_some()));
+    if !applied || !left_one {
+        return Vec::new();
+    }
+    let mut anew = Vec::new();
+    for name in mapped_names(db).unwrap_or_default() {
+        if before.contains(&name) {
+            continue;
+        }
+        if let Ok(Some(channel)) = held_rows::channel_of_name(db, &name) {
+            state
+                .own_channels
+                .carrying(&channel, std::time::Instant::now());
+            anew.push((name, channel));
+        }
+    }
+    anew
 }
 
 // ── POST /api/v1/sync/unmap ────────────────────────────────────────
@@ -670,10 +1060,9 @@ pub async fn map(
 /// Its files stay where they are, and the name stays with this person's
 /// other devices. What the folder had agreed with its channel is forgotten,
 /// so that mapped again it merges, and nothing it lost in between is sent
-/// as a delete. The folder is also excluded, so that a device set to sync
-/// everything it finds does not pick it up again under another name; it
-/// syncs again when it is mapped again. That exclusion is a narrowing like
-/// any other (see [`forget_what_is_not_mapped`]).
+/// as a delete ([`forget_what_is_not_mapped`]). Nothing else is written
+/// of it: a folder that is not mapped does not sync, and needs no
+/// exclusion to stay out (decision 2026-10-04 §10.1).
 pub fn remove_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -690,18 +1079,11 @@ pub fn remove_mapping(
         )));
     }
     control.changed(db);
-    let mut excluded = exclusions(db)?;
     for mapping in &gone {
-        if !excluded.contains(&mapping.folder) {
-            excluded.push(mapping.folder.clone());
-        }
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping removed");
     }
-    store_exclusions(db, &excluded)?;
     store_mappings(db, &kept)?;
-    // The folder forgets, and so does whatever else is not mapped: the
-    // exclusion also keeps out anything found for the same directory (a
-    // Claude Code folder laid out by hand can name it).
+    // The folder forgets, and so does whatever else is not mapped.
     if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
         forget_what_is_not_mapped(db, &dir)?;
     }
@@ -1176,61 +1558,148 @@ mod tests {
         assert_eq!(remembered(&s).len(), 3);
     }
 
-    /// Narrowing what is found (`all` turned off, an exclusion added, home
-    /// memory turned off, a folder unmapped and so kept out) stops folders
-    /// the handler cannot name: which folders are found is known only to a
-    /// cycle. So every folder that is not mapped forgets, and mapped
-    /// folders do not. A request that narrows nothing forgets nothing. A
-    /// change of the Claude Code directory moves every folder, so all of
-    /// them forget.
+    /// A mapping is stored only with its check, made under the settings
+    /// as they stand (decision 2026-10-04 §10.1). The check asks the disk
+    /// and git, and is made with the database's lock let go: it is of
+    /// one folder, under one Claude Code directory, at one count of
+    /// settings commands. Where a setting has changed since, or the
+    /// check is of another folder, or there is none, nothing is mapped
+    /// and nothing is counted; and what the check refused is refused.
     #[test]
-    fn test_a_narrower_scope_forgets_what_was_found() {
+    fn test_a_mapping_is_stored_only_with_its_check_under_the_settings_as_they_stand() {
+        let s = Settings::on();
+        let home = std::path::Path::new(HOME);
+        let body = request("/home/sam/code/app", "app", false);
+        let asked =
+            |s: &Settings, body: &SyncMapRequest| map_asked(&s.control, &s.db, body, home).unwrap();
+        let store = |s: &Settings, body: &SyncMapRequest, looked: Option<&MapLooked>| {
+            add_mapping_looked(&s.control, &s.db, body, home, looked)
+        };
+        let refused = |s: &Settings, body: &SyncMapRequest, looked: Option<&MapLooked>| {
+            let before = s.control.generation();
+            let why = store(s, body, looked).unwrap_err().to_string();
+            assert!(mappings(&s.db).unwrap().is_empty(), "{why}");
+            assert_eq!(s.control.generation(), before, "{why}");
+            why
+        };
+
+        // The check is read under the lock, and made without the
+        // database: it is handed nothing of it.
+        let read = asked(&s, &body).expect("something to check");
+        let looked = map_looked(&read, home);
+        assert_eq!(looked.refused, None);
+        // With no check: nothing is mapped.
+        assert!(refused(&s, &body, None).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // A check of another folder is no check of this one.
+        let other = request("/home/sam/code/lib", "lib", false);
+        let of_another = map_looked(&asked(&s, &other).unwrap(), home);
+        assert!(refused(&s, &body, Some(&of_another)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // A setting changes between the check and the store: the check
+        // is of settings that stand no longer.
+        s.control.changed(&s.db);
+        assert!(refused(&s, &body, Some(&looked)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // So too where the Claude Code directory is another now.
+        let read = asked(&s, &body).unwrap();
+        let looked = map_looked(&read, home);
+        s.claude(serde_json::json!({ "dir": "/home/sam/.claude-two" }));
+        let mut of_this_count = looked.clone();
+        of_this_count.generation = s.control.generation();
+        assert!(refused(&s, &body, Some(&of_this_count)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // What the check refused is refused, in its words.
+        let read = asked(&s, &body).unwrap();
+        let mut said_no = map_looked(&read, home);
+        said_no.refused = Some("another folder was found for it".into());
+        assert!(refused(&s, &body, Some(&said_no)).contains("another folder was found for it"));
+        // And a check made under the settings as they stand is stored.
+        let looked = map_looked(&asked(&s, &body).unwrap(), home);
+        store(&s, &body, Some(&looked)).unwrap();
+        assert_eq!(mappings(&s.db).unwrap().len(), 1);
+
+        // Nothing to check: sync off, a request that is refused for a
+        // reason of its own, and a mapping that is declared already. The
+        // store says which, with or without a check.
+        assert!(asked(&s, &body).is_none());
+        store(&s, &body, None).unwrap();
+        let outside = request("/srv/app", "app", false);
+        assert!(asked(&s, &outside).is_none());
+        let why = store(&s, &outside, None).unwrap_err().to_string();
+        assert!(why.contains("outside the home directory"), "{why}");
+        s.claude(serde_json::json!({ "enabled": false }));
+        assert!(asked(&s, &other).is_none());
+        let why = store(&s, &other, None).unwrap_err().to_string();
+        assert!(why.contains("sync is off"), "{why}");
+    }
+
+    /// A folder that a mapping adds forgets what it had agreed, whatever
+    /// was left of it (decision 2026-10-04 §10.1): so it always merges.
+    /// No other folder forgets for it. Mapping what is already mapped
+    /// adds nothing, and forgets nothing: nor does a mapping that is
+    /// refused.
+    #[test]
+    fn test_a_folder_that_is_mapped_forgets_what_it_had_agreed() {
+        let s = Settings::on();
+        s.map("/home/sam/Work", "work");
+        // What an earlier version, or a cycle that was stopped, left.
+        let left = ["/home/sam/notes", "/home/sam/Work", "/home/sam/other"];
+        left.iter().for_each(|folder| s.agreed(folder));
+        s.map("/home/sam/notes", "lab");
+        assert!(!s.remembers("/home/sam/notes"));
+        assert!(s.remembers("/home/sam/Work") && s.remembers("/home/sam/other"));
+
+        // It syncs, and agrees its files. Declared again, it is mapped
+        // already: nothing is added, and nothing is forgotten.
+        s.agreed("/home/sam/notes");
+        for spelled in ["/home/sam/notes", "/home/sam/notes/", "/home/sam//notes"] {
+            s.map(spelled, "lab");
+            assert!(s.remembers("/home/sam/notes"), "{spelled}");
+        }
+        // A mapping that is refused forgets nothing either: the folder
+        // under another name, and another folder under its name.
+        let home = std::path::Path::new(HOME);
+        for (folder, name) in [("/home/sam/notes", "other"), ("/home/sam/other", "lab")] {
+            let body = request(folder, name, false);
+            assert!(add_mapping(&s.control, &s.db, &body, home).is_err());
+            assert!(s.remembers("/home/sam/notes") && s.remembers("/home/sam/other"));
+        }
+        // The home directory, mapped, forgets as any folder does.
+        s.agreed(HOME);
+        s.map(HOME, "team");
+        assert!(!s.remembers(HOME));
+        assert!(s.remembers("/home/sam/notes"));
+    }
+
+    /// Only a mapping says what syncs (decision 2026-10-04 §10.1). So
+    /// what a request says of a scope, of exclusions or of home memory
+    /// stops no folder, where the home directory is not mapped, and
+    /// forgets nothing. A folder that is unmapped forgets, with every
+    /// other folder that is not mapped: whatever an earlier version left
+    /// of one. A change of the Claude Code directory moves every folder,
+    /// so all of them forget.
+    #[test]
+    fn test_only_an_unmapping_and_a_change_of_directory_forget() {
         let found = "/home/sam/code/app";
-        let kept_out = "github.com/client-co/*";
-        let narrowings = [
+        let requests = [
             serde_json::json!({ "all": false }),
-            serde_json::json!({ "exclude": [kept_out] }),
+            serde_json::json!({ "exclude": ["github.com/client-co/*"] }),
+            serde_json::json!({ "exclude": [] }),
             serde_json::json!({ "home": false }),
+            serde_json::json!({ "home": true }),
+            serde_json::json!({ "reset": true, "dir": DIR }),
+            serde_json::json!({}),
         ];
-        for narrowing in narrowings {
+        for request in requests {
             let s = Settings::on();
-            s.claude(serde_json::json!({ "all": true }));
             s.map("/home/sam/notes", "lab");
             s.agreed("/home/sam/notes");
             s.agreed(found);
-
-            // Running it again, or widening, forgets nothing.
-            s.claude(serde_json::json!({}));
-            s.claude(serde_json::json!({ "all": true, "home": true, "exclude": [] }));
-            assert!(s.remembers(found) && s.remembers("/home/sam/notes"));
-
-            s.claude(narrowing.clone());
-            assert!(!s.remembers(found), "{narrowing}");
-            assert!(s.remembers("/home/sam/notes"), "{narrowing}");
-
-            // The same request again narrows nothing more.
-            s.agreed(found);
-            s.claude(narrowing.clone());
-            assert!(s.remembers(found), "{narrowing}, again");
+            s.claude(request.clone());
+            assert!(s.remembers(found), "{request}");
+            assert!(s.remembers("/home/sam/notes"), "{request}");
+            assert_eq!(s.names(), ["lab"], "{request}");
         }
 
-        // Nor does a reset with the same settings given again, or the
-        // same exclusions in another order.
+        // Unmapping a folder forgets whatever is not mapped.
         let s = Settings::on();
-        let narrow =
-            serde_json::json!({ "all": true, "home": false, "exclude": [kept_out, "b/*"] });
-        s.claude(narrow.clone());
-        s.agreed(found);
-        let mut again = narrow.clone();
-        again["reset"] = true.into();
-        again["dir"] = DIR.into();
-        s.claude(again);
-        s.claude(serde_json::json!({ "exclude": ["b/*", kept_out] }));
-        assert!(s.remembers(found));
-
-        // Unmapping a folder keeps out whatever is found for it too.
-        let s = Settings::on();
-        s.claude(serde_json::json!({ "all": true }));
         s.map("/home/sam/notes", "lab");
         s.map("/home/sam/Work", "work");
         for folder in [found, "/home/sam/notes", "/home/sam/Work"] {
@@ -1278,31 +1747,37 @@ mod tests {
         let s = Settings::on();
         s.map(HOME, "team");
         let count = s.control.generation();
-        let body = serde_json::json!({ "enabled": true, "all": true, "home": false });
+        let other = "/home/sam/.claude-other";
+        let body = serde_json::json!({ "enabled": true, "dir": other, "home": false });
         let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
         assert!(set_claude(&s.control, &s.db, &body, None).is_err());
         assert_eq!(s.names(), ["team"]);
-        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
-        assert_ne!(all.as_deref(), Some("on"));
+        let dir = || meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(dir().as_deref(), Some(DIR));
         assert_eq!(s.control.generation(), count);
 
         // Everything else is carried out without it.
-        let body = serde_json::json!({ "enabled": true, "all": true });
+        let body = serde_json::json!({ "enabled": true, "dir": other });
         let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
         set_claude(&s.control, &s.db, &body, None).unwrap();
         assert_eq!(s.names(), ["team"]);
-        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
-        assert_eq!(all.as_deref(), Some("on"));
+        assert_eq!(dir().as_deref(), Some(other));
         assert!(s.control.generation() > count);
     }
 
-    /// The name home memory is put back under is the name it last synced
-    /// under on this device: the one it was mapped as, or `~` if it was
-    /// found and not mapped. Turning it off does not change that, and
-    /// neither does a setting that only looks as if home were found.
+    /// The name home memory is put back under is the name that the home
+    /// directory was last mapped under on this device. Turning it off
+    /// does not change that, and nothing else records one: home memory
+    /// syncs only where the home directory is mapped (decision 2026-10-04
+    /// §10.1).
     #[test]
     fn test_the_name_home_last_synced_under_is_remembered() {
         let s = Settings::on();
+        assert_eq!(s.home_name(), None);
+        // No request names it by being asked to turn sync on, or home
+        // memory on, with the home directory not mapped.
+        s.claude(serde_json::json!({ "home": true }));
+        s.claude(serde_json::json!({ "reset": true, "dir": DIR }));
         assert_eq!(s.home_name(), None);
 
         s.map(HOME, "team");
@@ -1310,32 +1785,107 @@ mod tests {
         s.claude(serde_json::json!({ "home": false }));
         assert_eq!(s.names(), Vec::<String>::new());
         assert_eq!(s.home_name().as_deref(), Some("team"));
-
-        // Everything found is turned on with home still off, and after a
-        // reset: home is not found, so it has not synced as `~`.
-        s.claude(serde_json::json!({ "all": true }));
-        s.claude(serde_json::json!({ "reset": true, "all": true, "home": false }));
+        s.claude(serde_json::json!({ "home": true }));
+        s.claude(serde_json::json!({ "reset": true, "dir": DIR }));
         assert_eq!(s.home_name().as_deref(), Some("team"));
 
-        // Mapped under another name, then unmapped: an unmapped folder
-        // stays out of what is found, so it is still that name, whatever
-        // is set afterwards.
+        // Mapped under another name, then unmapped: it is that name.
         s.map(HOME, "crew");
         s.unmap("crew");
-        s.claude(serde_json::json!({ "all": true }));
         assert_eq!(s.home_name().as_deref(), Some("crew"));
-
-        // Found, and syncing as `~`: once it is no longer kept out.
-        s.claude(serde_json::json!({ "exclude": [] }));
+        s.map(HOME, "~");
         assert_eq!(s.home_name().as_deref(), Some("~"));
-        // Turned off in the same request that stops everything found.
-        s.claude(serde_json::json!({ "all": false, "home": false }));
-        assert_eq!(s.home_name().as_deref(), Some("~"));
+    }
 
-        // Not found while it is mapped: the name is the mapping's.
+    /// The stored scope is off whenever sync is on (decision 2026-10-04
+    /// §10.1). A start with sync on writes it off, from a stored `on` and
+    /// from no scope stored with a directory set; a start with sync off
+    /// writes nothing. A request that turns sync on, or leaves it on,
+    /// writes it off over whatever is stored. And the key is never
+    /// removed: read as an earlier version reads the settings, the scope
+    /// is off from the first time sync is turned on.
+    #[test]
+    fn test_the_stored_scope_is_off_whenever_sync_is_on() {
+        use crate::several::{Machine, state_of};
+        let stored = |db: &rusqlite::Connection| meta::get(db, meta::SYNC_CLAUDE_ALL).unwrap();
+        // As an earlier version reads the settings: on where the key says
+        // so, and where a directory is set and there is no key.
+        let on_as_it_was_read = |db: &rusqlite::Connection| {
+            let dir = meta::get(db, meta::SYNC_CLAUDE_DIR).unwrap();
+            stored(db).map_or(dir.is_some(), |scope| scope == "on")
+        };
+        let set = |db: &rusqlite::Connection, dir: Option<&str>, scope: Option<&str>| {
+            for (key, value) in [(meta::SYNC_CLAUDE_DIR, dir), (meta::SYNC_CLAUDE_ALL, scope)] {
+                match value {
+                    Some(value) => meta::set(db, key, value).unwrap(),
+                    None => meta::remove(db, key).unwrap(),
+                }
+            }
+        };
+
+        // At a start.
+        let state = state_of(Machine::new(1));
+        for (dir, scope, wrote, then) in [
+            (Some(DIR), Some("on"), true, Some("off")),
+            (Some(DIR), None, true, Some("off")),
+            (Some(DIR), Some("off"), false, Some("off")),
+            (Some(DIR), Some("something else"), true, Some("off")),
+            // Sync is off: nothing is written, whatever is stored.
+            (None, Some("on"), false, Some("on")),
+            (None, None, false, None),
+        ] {
+            set(&state.db.lock().unwrap(), dir, scope);
+            assert_eq!(
+                scope_off_at_start(&state).unwrap(),
+                wrote,
+                "{dir:?} {scope:?}"
+            );
+            let db = state.db.lock().unwrap();
+            assert_eq!(stored(&db).as_deref(), then, "{dir:?} {scope:?}");
+            assert_eq!(
+                on_as_it_was_read(&db),
+                then == Some("on"),
+                "{dir:?} {scope:?}"
+            );
+        }
+
+        // At a request that turns sync on, or leaves it on.
+        for (dir, scope) in [
+            (Some(DIR), Some("on")),
+            (Some(DIR), None),
+            (None, Some("on")),
+            (None, None),
+        ] {
+            let s = Settings {
+                db: cordelia_storage::db::open_in_memory().unwrap(),
+                control: SyncControl::default(),
+            };
+            set(&s.db, dir, scope);
+            s.claude(serde_json::json!({ "dir": DIR }));
+            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{dir:?} {scope:?}");
+            assert!(!on_as_it_was_read(&s.db));
+        }
+
+        // Turned on for the first time on this version, the scope is
+        // stored, and off. Whatever is asked after, the key is there.
+        let s = Settings::on();
+        assert_eq!(stored(&s.db).as_deref(), Some("off"));
         s.map(HOME, "team");
-        s.claude(serde_json::json!({ "all": true }));
-        assert_eq!(s.home_name().as_deref(), Some("team"));
+        s.map("/home/sam/notes", "lab");
+        for request in [
+            serde_json::json!({ "reset": true }),
+            serde_json::json!({ "reset": true, "dir": DIR }),
+            serde_json::json!({ "home": false }),
+            serde_json::json!({ "all": false }),
+            serde_json::json!({ "exclude": ["x"] }),
+            serde_json::json!({ "enabled": false }),
+            serde_json::json!({ "enabled": true }),
+        ] {
+            s.claude(request.clone());
+            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{request}");
+        }
+        s.unmap("lab");
+        assert_eq!(stored(&s.db).as_deref(), Some("off"));
     }
 
     /// A handler counts its change before the first thing it writes. One
@@ -1351,9 +1901,9 @@ mod tests {
         };
         let change = |s: &Settings, which: &str| match which {
             "sync off" => claude(s, serde_json::json!({ "enabled": false })),
-            "a narrower scope" => claude(s, serde_json::json!({ "enabled": true, "all": false })),
-            // Its first write is the list of mappings; of a folder that
-            // was unmapped, the exclusion that goes; of home, its name.
+            "sync left on" => claude(s, serde_json::json!({ "enabled": true })),
+            "home memory off" => claude(s, serde_json::json!({ "enabled": true, "home": false })),
+            // Its first write is the list of mappings; of home, its name.
             "a mapping" => {
                 let body = request("/home/sam/new", "new", false);
                 add_mapping(&s.control, &s.db, &body, home)
@@ -1377,14 +1927,14 @@ mod tests {
         // written: the change is counted, once, and nothing came of it.
         for which in [
             "sync off",
-            "a narrower scope",
+            "sync left on",
+            "home memory off",
             "a mapping",
             "a mapping of a folder that was unmapped",
             "a mapping of home",
             "an unmapping",
         ] {
             let s = Settings::on();
-            s.claude(serde_json::json!({ "all": true }));
             s.map("/home/sam/notes", "lab");
             s.map("/home/sam/Work", "work");
             s.unmap("work");
@@ -1407,9 +1957,9 @@ mod tests {
         }
         // Three of them also forget, later on, and the table of what
         // folders agreed is gone: counted all the same.
-        for which in ["sync off", "a narrower scope", "an unmapping"] {
+        for which in ["sync off", "home memory off", "an unmapping"] {
             let s = Settings::on();
-            s.claude(serde_json::json!({ "all": true }));
+            s.map(HOME, "team");
             s.map("/home/sam/notes", "lab");
             let before = s.control.generation();
             s.db.execute("DROP TABLE sync_files", []).unwrap();
@@ -1436,56 +1986,56 @@ mod tests {
         assert_eq!(s.control.generation(), before);
     }
 
-    /// An exclusion is stored in the one spelling a project is found
-    /// under, however it was typed and however often it is sent: the
-    /// command tidies it, the node tidies it, and the node tidies the whole
-    /// list again each time the list changes.
+    /// A list of exclusions that a panel sends is stored, each entry in
+    /// its one spelling, however it was typed and however often it is
+    /// sent: sent back as it was stored, it is stored as it was. Nothing
+    /// reads the list to say what syncs, and nothing else writes it: not
+    /// a folder that is unmapped, and not one that is mapped (decision
+    /// 2026-10-04 §10.1).
     #[test]
-    fn test_an_exclusion_has_one_spelling() {
+    fn test_a_list_of_exclusions_is_stored_as_it_is_sent() {
         let s = Settings::on();
         let typed = ["X.GIT", " Repo.git ", "client-co/*", "/home/sam//old/"];
         let stored = ["x", "repo", "client-co/*", "/home/sam/old"];
         s.claude(serde_json::json!({ "exclude": typed }));
         assert_eq!(exclusions(&s.db).unwrap(), stored);
-        // Sent again as it is stored, as `exclude` and `include` send it.
         s.claude(serde_json::json!({ "exclude": stored }));
         assert_eq!(exclusions(&s.db).unwrap(), stored);
-        // What the command looks for in the list is what the list holds:
-        // the name as typed, tidied once by the command.
         for typed in ["X.GIT", "x.git", "X", "x.git.GIT", "x .git", "x/", "X.git/"] {
-            let looked_for = cordelia_core::sync_name::tidy(typed);
-            assert_eq!(looked_for, "x", "{typed}");
             assert_eq!(clean_exclusion(typed).as_deref(), Some("x"), "{typed}");
-            assert_eq!(clean_exclusion(&looked_for).as_deref(), Some("x"));
         }
         // Nothing left is no exclusion.
         for nothing in [".git", "  ", ".GIT.git"] {
             assert_eq!(clean_exclusion(nothing), None, "{nothing:?}");
         }
         // A name an earlier version stored with `.git` at its end is read
-        // as the name a project is found under, so the command finds it.
-        // A folder keeps a space at the end of its name: it is the text
-        // a directory is compared with.
+        // in its one spelling. A folder keeps a space at the end of its
+        // name.
         let stored = r#"["x.git","owner/repo/","/home/sam/old","/home/sam/odd "]"#;
         meta::set(&s.db, meta::SYNC_CLAUDE_EXCLUDE, stored).unwrap();
+        let read = ["x", "owner/repo", "/home/sam/old", "/home/sam/odd "];
+        assert_eq!(exclusions(&s.db).unwrap(), read);
+        // A folder that is mapped, and one that is unmapped, write
+        // nothing to the list: what is stored is as it was.
+        s.map("/home/sam/old", "old");
         assert_eq!(
-            exclusions(&s.db).unwrap(),
-            ["x", "owner/repo", "/home/sam/old", "/home/sam/odd "]
+            meta::get(&s.db, meta::SYNC_CLAUDE_EXCLUDE)
+                .unwrap()
+                .as_deref(),
+            Some(stored)
         );
-        // And it is there, as it was, after a change that writes the list
-        // again.
         s.map("/home/sam/notes", "lab");
         s.unmap("lab");
-        let after = exclusions(&s.db).unwrap();
-        assert!(after.contains(&"/home/sam/odd ".to_string()), "{after:?}");
-        // The same when the whole list is sent back as it was read, which
-        // is what `exclude` and `include` do.
-        s.claude(serde_json::json!({ "exclude": after }));
-        assert_eq!(exclusions(&s.db).unwrap(), after);
+        s.unmap("old");
         assert_eq!(
-            clean_exclusion("/home/sam/odd ").as_deref(),
-            Some("/home/sam/odd ")
+            meta::get(&s.db, meta::SYNC_CLAUDE_EXCLUDE)
+                .unwrap()
+                .as_deref(),
+            Some(stored)
         );
+        // The whole list sent back as it was read is stored so.
+        s.claude(serde_json::json!({ "exclude": read }));
+        assert_eq!(exclusions(&s.db).unwrap(), read);
         // Space before a path is not part of it; `..` is not taken.
         assert_eq!(
             clean_exclusion(" /home/sam//old/").as_deref(),
@@ -1502,6 +2052,115 @@ mod tests {
         );
     }
 
+    /// Asking for everything found to sync is refused whole (decision
+    /// 2026-10-04 §10.1): a request that turns sync on, or leaves it on,
+    /// with `all: true` changes nothing and counts no change, alone and
+    /// with a directory, a reset, home memory turned off or a list of
+    /// exclusions beside it. A request that turns sync off is never
+    /// refused for it. `all: false` is taken.
+    #[test]
+    fn test_a_request_for_everything_found_is_refused_whole() {
+        let home = std::path::Path::new(HOME);
+        let asks = |s: &Settings, body: serde_json::Value| {
+            let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
+            set_claude(&s.control, &s.db, &body, Some(home))
+        };
+        let everything = |s: &Settings| -> Vec<(String, Option<String>)> {
+            let mut stmt =
+                s.db.prepare("SELECT key, value FROM node_meta ORDER BY key")
+                    .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        let other = "/home/sam/.claude-other";
+        for sync_on in [true, false] {
+            let s = Settings::on();
+            s.map(HOME, "team");
+            s.map("/home/sam/notes", "lab");
+            s.claude(serde_json::json!({ "exclude": ["kept-out"] }));
+            // What a cycle stored, and what the folders agreed.
+            meta::set(&s.db, meta::SYNC_CLAUDE_REPORT, r#"{"folders":[]}"#).unwrap();
+            s.agreed("/home/sam/notes");
+            if !sync_on {
+                s.claude(serde_json::json!({ "enabled": false }));
+                meta::set(&s.db, meta::SYNC_CLAUDE_REPORT, r#"{"folders":[]}"#).unwrap();
+            }
+            let (before, count) = (everything(&s), s.control.generation());
+            for with in [
+                serde_json::json!({}),
+                serde_json::json!({ "dir": other }),
+                serde_json::json!({ "reset": true }),
+                serde_json::json!({ "home": false }),
+                serde_json::json!({ "exclude": [] }),
+                serde_json::json!({ "dir": other, "reset": true, "home": false, "exclude": ["x"] }),
+            ] {
+                let mut body = with.clone();
+                body["enabled"] = true.into();
+                body["all"] = true.into();
+                let refused = asks(&s, body).unwrap_err();
+                assert!(matches!(refused, ApiError::BadRequest(_)), "{with}");
+                assert!(
+                    refused.to_string().contains("only mapped folders sync"),
+                    "{refused}"
+                );
+                assert_eq!(everything(&s), before, "{with}, sync on: {sync_on}");
+                assert_eq!(s.control.generation(), count, "{with}");
+                assert_eq!(s.remembers("/home/sam/notes"), sync_on, "{with}");
+            }
+        }
+
+        // Turning sync off is never refused for it.
+        let s = Settings::on();
+        asks(&s, serde_json::json!({ "enabled": false, "all": true })).unwrap();
+        assert_eq!(meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap(), None);
+        // And the only scope there is, is taken: with sync off, and on.
+        asks(&s, serde_json::json!({ "enabled": true, "all": false })).unwrap();
+        asks(&s, serde_json::json!({ "enabled": true, "all": false })).unwrap();
+        assert_eq!(
+            meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap().as_deref(),
+            Some(DIR)
+        );
+        assert_eq!(
+            meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap().as_deref(),
+            Some("off")
+        );
+    }
+
+    /// A reset puts the Claude Code directory back to its default, and
+    /// touches nothing else: not the list of exclusions that is stored,
+    /// not the switch for home memory, and not the mappings. The switch
+    /// is stored as it is sent: off unmaps the home directory, and on
+    /// maps nothing.
+    #[test]
+    fn test_a_reset_leaves_the_stored_exclusions_and_the_home_switch() {
+        let s = Settings::on();
+        let other = "/home/sam/.claude-other";
+        let switch = |s: &Settings| meta::get(&s.db, meta::SYNC_CLAUDE_HOME).unwrap();
+        let dir = |s: &Settings| meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap();
+        s.map(HOME, "team");
+        s.map("/home/sam/notes", "lab");
+        s.claude(serde_json::json!({ "dir": other, "exclude": ["kept-out"], "home": false }));
+        assert_eq!(s.names(), ["lab"]);
+        assert_eq!(switch(&s).as_deref(), Some("off"));
+
+        s.claude(serde_json::json!({ "reset": true, "dir": DIR }));
+        assert_eq!(dir(&s).as_deref(), Some(DIR));
+        assert_eq!(exclusions(&s.db).unwrap(), ["kept-out"]);
+        assert_eq!(switch(&s).as_deref(), Some("off"));
+        assert_eq!(s.names(), ["lab"]);
+
+        // The switch turned on is stored so, and maps nothing: `cordelia
+        // sync home on` maps the home directory.
+        s.claude(serde_json::json!({ "home": true }));
+        assert_eq!(switch(&s), None);
+        assert_eq!(s.names(), ["lab"]);
+        s.claude(serde_json::json!({ "reset": true, "dir": other }));
+        assert_eq!(switch(&s), None);
+        assert_eq!(exclusions(&s.db).unwrap(), ["kept-out"]);
+    }
+
     /// Every handler counts its change, with the lock held, so that a
     /// cycle that started before it stops (see `SyncControl::changed`).
     #[test]
@@ -1513,7 +2172,7 @@ mod tests {
             assert!(now > last, "{what}");
             last = now;
         };
-        s.claude(serde_json::json!({ "all": true }));
+        s.claude(serde_json::json!({ "all": false }));
         counted(&s, "the scope");
         s.map("/home/sam/notes", "lab");
         counted(&s, "a mapping");
@@ -1523,6 +2182,65 @@ mod tests {
         counted(&s, "an unmapping");
         s.claude(serde_json::json!({ "enabled": false }));
         counted(&s, "sync off");
+    }
+
+    /// A device that comes to sync a name carries it first (decision
+    /// 2026-10-04 §7.3): a mapping names, for that, each name that the
+    /// device holds anew by it, where the device has applied a statement
+    /// and still holds the secret of a generation that it left; and the
+    /// first cycle of a folder there is held back from then. A name that
+    /// was mapped before is not carried again, and nor is anything on a
+    /// device that has left no generation, or follows no phrase.
+    #[test]
+    fn test_a_mapping_carries_first_only_a_name_that_it_holds_anew() {
+        use crate::several::{Machine, Several, state_of};
+        use cordelia_storage::person as held_rows;
+        let home = std::path::Path::new("/home/sam");
+        let maps = |state: &AppState, folder: &str, name: &str| -> Vec<String> {
+            let db = state.db.lock().unwrap();
+            let on: SyncClaudeRequest =
+                serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+            set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+            let before = mapped_names(&db).unwrap();
+            let body = request(folder, name, false);
+            add_mapping(&state.sync_control, &db, &body, home).unwrap();
+            names_follow(state, &db, &before);
+            let anew = carries_first_for(state, &db, &before);
+            anew.into_iter().map(|(name, _)| name).collect()
+        };
+        let waits = |state: &AppState, name: &str| -> bool {
+            let channel = {
+                let db = state.db.lock().unwrap();
+                held_rows::channel_of_name(&db, name).unwrap().unwrap()
+            };
+            let now = std::time::Instant::now();
+            state.own_channels.fetched_from(&channel, "relay", now);
+            !state.own_channels.first_fetch_done(&channel, now)
+        };
+
+        // Under its first statement the device has left no generation.
+        let mut s = Several::of_one_person(1);
+        s.change(0, &[0], &[]);
+        let mut first = Several::of_one_person(1);
+        let no_left = state_of(first.machines.remove(0));
+        no_left.own_channels.set_up_with(1);
+        assert!(maps(&no_left, "/home/sam/notes", "lab").is_empty());
+        assert!(!waits(&no_left, "lab"));
+
+        // It has left one: the name that it comes to hold is carried
+        // first, and its folder's first cycle waits for that.
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        assert_eq!(maps(&state, "/home/sam/notes", "lab"), ["lab"]);
+        assert!(waits(&state, "lab"));
+        // A second mapping: only the name that is new by it.
+        assert_eq!(maps(&state, "/home/sam/work", "team"), ["team"]);
+        // The same mapping again holds nothing anew.
+        assert!(maps(&state, "/home/sam/work", "team").is_empty());
+
+        // A device that follows no phrase holds no name.
+        let alone = state_of(Machine::new(7));
+        assert!(maps(&alone, "/home/sam/notes", "lab").is_empty());
     }
 
     /// What a device says of the names it syncs follows its settings
@@ -1592,13 +2310,29 @@ mod tests {
         state.own_channels.fetched_from(&lab, "relay", now);
         assert!(state.own_channels.first_fetch_done(&lab, now));
 
+        // Both names were listed before the last change, as the device
+        // noted when it applied it.
+        let noted = |db: &rusqlite::Connection| -> Vec<String> {
+            let before = held_rows::names_before(db).unwrap();
+            before.into_iter().map(|before| before.name).collect()
+        };
+        {
+            let db = state.db.lock().unwrap();
+            for name in ["lab", "team"] {
+                held_rows::note_name_before(&db, name, &state.identity.public_key(), 1).unwrap();
+            }
+        }
+
         // Unmapped: said no longer, held no more, and fetched again
-        // before a folder's first cycle there.
+        // before a folder's first cycle there. Nor is it noted any more
+        // as a name that was listed before: it is not shown as one that
+        // no device lists yet, where a person stopped it on purpose.
         unmaps(&state, "lab");
         {
             let db = state.db.lock().unwrap();
             assert_eq!(held(&db), ["team"]);
             assert_eq!(said(&state, &db), ["team"]);
+            assert_eq!(noted(&db), ["team"]);
         }
         assert!(!state.own_channels.first_fetch_done(&lab, now));
 

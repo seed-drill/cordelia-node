@@ -44,7 +44,7 @@ use cordelia_core::protocol::{
     MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS, STATEMENTS_LEFT_SAID_BELOW,
 };
 use cordelia_crypto::addition::SignedAddition;
-use cordelia_crypto::bech32::encode_public_key;
+use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
 use cordelia_crypto::change_entry;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::Value;
@@ -57,6 +57,7 @@ use cordelia_storage::acts;
 use cordelia_storage::entries;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
+use cordelia_storage::sync_state;
 
 use crate::adding::within_its_hour;
 use crate::leaving::{Among, among, left_name};
@@ -223,6 +224,12 @@ pub struct AtRelayLook {
     pub heard_since_woke: bool,
     /// The relay's last refusal for room, in words.
     pub no_room: Option<String>,
+    /// When that refusal was, in seconds, in UTC: a status counts it
+    /// only while it is recent.
+    pub no_room_at: Option<i64>,
+    /// For how long the node has been connected to the relay, by its own
+    /// clock, where it is: the node's route fills it in.
+    pub connected_secs: Option<u64>,
     /// How many entries of this device's own the relay holds in another
     /// form.
     pub another_form: usize,
@@ -248,6 +255,15 @@ pub struct Look {
     pub may_add: bool,
     /// The number of the statement applied.
     pub change: Option<u64>,
+    /// When this device applied it, in seconds, by its own clock, where
+    /// it left a generation for it and still keeps that generation's
+    /// secret: when it left. `None` on a device that has left none.
+    pub applied_at: Option<i64>,
+    /// Whether that statement removed a key that the statement which
+    /// this device held before it did not, as the device found it when
+    /// it applied the statement (decision 2026-10-04 §10.1). A renewal
+    /// removes nobody, though it lists every key removed so far.
+    pub removed_a_key: bool,
     /// What the change entry of that statement is named by, in hex: the
     /// latest that the device keeps. A command that made a change, and
     /// lost the node's answer, learns by it whether the node made it
@@ -364,6 +380,8 @@ pub fn look(
             others: 0,
             may_add: false,
             change: None,
+            applied_at: None,
+            removed_a_key: false,
             latest: None,
             phrase_words: None,
             statements_left: None,
@@ -439,6 +457,10 @@ fn of_its_person(
     };
     look.may_add = held.state == State::Applied && counting.may_add(&own);
     look.change = Some(statement.number);
+    // It left the generation before when it applied this one.
+    let left = held_rows::secrets(conn)?;
+    look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
+    look.removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?.is_some();
     look.latest = Some(hex::encode(latest_entry(conn)?.id()));
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
@@ -459,8 +481,13 @@ fn of_its_person(
             left: reader.left(conn, &device.key)?.is_some() || kept_left.contains(&device.key),
         });
     }
+    // A statement lists a removed key bare: it is shown by what this
+    // device called it, where it knew it by a label.
+    let labels = removed_labels(conn)?;
     for key in &statement.removed {
-        look.removed.push(Shown::of(key, "")?);
+        let label = labels.iter().find(|(known, _)| known == key);
+        look.removed
+            .push(Shown::of(key, label.map_or("", |(_, label)| label))?);
     }
 
     // Those added since: for each key that the statement does not list,
@@ -650,7 +677,7 @@ fn of_its_names(
         let each: Vec<String> = look
             .not_carried
             .iter()
-            .map(|file| format!("{} in {}", file.file, file.name))
+            .map(|file| format!("{} in {}", name_shown(&file.file), file.name))
             .collect();
         look.says.push(format!(
             "what this device held of {} could not be read at the last change, and was not \
@@ -660,6 +687,20 @@ fn of_its_names(
         ));
     }
     Ok(())
+}
+
+/// A file's name as far as it is put in a line that is shown (decision
+/// 2026-10-04 §16): its first characters, and a mark where it was cut.
+/// Another device may have written the name, at any length. (What a
+/// command prints of it, it prints with control characters shown as
+/// escapes.)
+pub fn name_shown(name: &str) -> String {
+    use cordelia_core::protocol::FILE_NAME_SHOWN_CHARS;
+    let mut shown: String = name.chars().take(FILE_NAME_SHOWN_CHARS).collect();
+    if shown.len() < name.len() {
+        shown.push_str("...");
+    }
+    shown
 }
 
 /// A count with its noun: `1 name`, `3 names`.
@@ -681,7 +722,8 @@ fn not_carried(conn: &Connection) -> Result<Vec<NotCarried>, PersonError> {
 /// Note the files whose record could not be carried at the statement
 /// that this device has just applied, for `cordelia devices` to say
 /// (decision 2026-10-04 §4.2). What was noted at the statement before is
-/// replaced: those files have met their channels since.
+/// replaced. A file goes from the note once it has met its channel
+/// ([`clear_not_carried_that_met`]).
 pub(crate) fn note_not_carried(
     conn: &Connection,
     files: &[(String, String)],
@@ -701,6 +743,126 @@ pub(crate) fn note_not_carried(
         .map_err(|e| PersonError::Held(format!("the files that were not carried: {e}")))?;
     meta::set(conn, meta::PERSON_NOT_CARRIED, &noted)?;
     Ok(())
+}
+
+/// What this device called each key that a statement it applied
+/// removed, where it knew the key by a label (decision 2026-10-04 §7.3,
+/// §8): a statement lists removed keys bare.
+pub fn removed_labels(conn: &Connection) -> Result<Vec<([u8; 32], String)>, PersonError> {
+    let kept: std::collections::BTreeMap<String, String> =
+        meta::get(conn, meta::PERSON_REMOVED_LABELS)?
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+    Ok(kept
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let key: [u8; 32] = hex::decode(key).ok()?.try_into().ok()?;
+            Some((key, label))
+        })
+        .collect())
+}
+
+/// Keep what this device called each of `removed`, keys that the
+/// statement it has just applied removes, beside what it kept of those
+/// removed before (decision 2026-10-04 §7.3). `statement` is that
+/// statement: a label is kept only of a key that it lists as removed, and
+/// what is kept of a key that it does not list so goes. An empty label is
+/// none.
+pub(crate) fn note_removed_labels(
+    conn: &Connection,
+    statement: &Statement,
+    removed: &[([u8; 32], String)],
+) -> Result<(), PersonError> {
+    let mut kept = removed_labels(conn)?;
+    for (key, label) in removed {
+        if !label.is_empty() && !kept.iter().any(|(known, _)| known == key) {
+            kept.push((*key, label.clone()));
+        }
+    }
+    kept.retain(|(key, _)| statement.removes(key));
+    if kept.is_empty() {
+        meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
+        return Ok(());
+    }
+    let as_kept: std::collections::BTreeMap<String, &String> = kept
+        .iter()
+        .map(|(key, label)| (hex::encode(key), label))
+        .collect();
+    let as_kept = serde_json::to_string(&as_kept)
+        .map_err(|e| PersonError::Held(format!("the labels of the removed keys: {e}")))?;
+    meta::set(conn, meta::PERSON_REMOVED_LABELS, &as_kept)?;
+    Ok(())
+}
+
+/// Keep whether the statement that this device has just applied removes
+/// a key that the statement before did not, for a status to go by
+/// (decision 2026-10-04 §10.1). What was kept at the statement before is
+/// replaced.
+pub(crate) fn note_removed_a_key(conn: &Connection, removes: bool) -> Result<(), PersonError> {
+    match removes {
+        true => meta::set(conn, meta::PERSON_REMOVED_A_KEY, "1")?,
+        false => meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?,
+    }
+    Ok(())
+}
+
+/// Drop from the note of the files that were not carried
+/// ([`note_not_carried`]) each file that has met its channel since
+/// (decision 2026-10-04 §4.2): a folder has a record of it in the channel
+/// of the name it syncs under, so the file was published there as this
+/// device's own, or took the version that the channel had. Returns how
+/// many went.
+///
+/// **A file goes only where its name is held and the file has met its
+/// channel.** A name that is not held at the end of a cycle may be one
+/// that could not be held in that cycle, for an error: its files have
+/// met nothing, and stay noted. A name that the device stops on purpose
+/// takes its files out of the note there ([`forget_not_carried_of`]).
+///
+/// The sync adapter does so at the end of a cycle. Until then the file is
+/// said in `cordelia devices` and in a status, and no longer than that:
+/// not until the next change.
+pub fn clear_not_carried_that_met(conn: &Connection) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let noted = not_carried(conn)?;
+        if noted.is_empty() {
+            return Ok(0);
+        }
+        let mut still: Vec<(String, String)> = Vec::new();
+        for file in &noted {
+            let met = match held_rows::channel_of_name(conn, &file.name)? {
+                Some(channel) => {
+                    let written = encode_channel_id(&channel)?;
+                    let recorded = sync_state::files(conn, &written)?;
+                    recorded.iter().any(|(_, key)| *key == file.file)
+                }
+                None => false,
+            };
+            if !met {
+                still.push((file.name.clone(), file.file.clone()));
+            }
+        }
+        if still.len() != noted.len() {
+            note_not_carried(conn, &still)?;
+        }
+        Ok(noted.len() - still.len())
+    })
+}
+
+/// Note no longer the files under `name` whose record could not be
+/// carried ([`note_not_carried`]): the device has stopped the name, and
+/// none of them has a channel to meet here. Returns how many went.
+pub(crate) fn forget_not_carried_of(conn: &Connection, name: &str) -> Result<usize, PersonError> {
+    let noted = not_carried(conn)?;
+    let still: Vec<(String, String)> = noted
+        .iter()
+        .filter(|file| file.name != name)
+        .map(|file| (file.name.clone(), file.file.clone()))
+        .collect();
+    if still.len() != noted.len() {
+        note_not_carried(conn, &still)?;
+    }
+    Ok(noted.len() - still.len())
 }
 
 /// What the personal channel of the generation applied says of each
@@ -1132,6 +1294,8 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                     }
                 )
             }),
+            no_room_at: relay.no_room.map(|refused| refused.at),
+            connected_secs: None,
             another_form: relay.another_form,
             refuses: relay.refuses.clone(),
         })
@@ -1330,6 +1494,8 @@ mod tests {
             std::path::Path::new("/no/such/folder"),
             "0.2.0-test",
             chrono::Utc::now(),
+            &cordelia_storage::first_start::room_not_known,
+            &mut None,
         )
         .unwrap();
         assert!(!moved_on(&fresh[0].conn).unwrap());
@@ -1567,8 +1733,10 @@ mod tests {
         assert_eq!(look.notices.len(), told_before);
     }
 
-    /// The keys that the statement removed are listed, bare: a statement
-    /// lists them so.
+    /// The keys that the statement removed are listed. A statement lists
+    /// them bare: each is shown with the label that this device knew it
+    /// by when it applied the statement that removed it (decision
+    /// 2026-10-04 §7.3), and with none on a device that never knew it.
     #[test]
     fn test_the_keys_that_the_statement_removed_are_listed() {
         let mut s = Several::of_one_person(3);
@@ -1577,8 +1745,20 @@ mod tests {
         assert_eq!(look.removed.len(), 1);
         assert_eq!(look.removed[0].key, encode_public_key(&s.key(2)).unwrap());
         assert_eq!(look.removed[0].words, fingerprint::shown(&s.key(2)));
-        assert_eq!(look.removed[0].label, "");
+        assert_eq!(look.removed[0].label, "device 2");
         assert_eq!(look.devices.len(), 2);
+        assert_eq!(
+            removed_labels(&s[0].conn).unwrap(),
+            [(s.key(2), "device 2".to_string())]
+        );
+        // The label is kept across a later change, for as long as the
+        // statement lists the key as removed.
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(seen(&s, 0).removed[0].label, "device 2");
+        // A device that leaves forgets them with everything else.
+        let now = s.tick();
+        crate::leaving::forget(&s[0].conn, &s[0].identity, false, now).unwrap();
+        assert!(removed_labels(&s[0].conn).unwrap().is_empty());
     }
 
     /// A key that the device counted before a statement, and that is in
@@ -2018,5 +2198,34 @@ mod tests {
         s.change(0, &[0], &[]);
         let look = seen(&s, 0);
         assert_eq!((look.change, look.statements_left), (Some(2), None));
+    }
+
+    /// A file's name is put in a line of the status only as far as its
+    /// first characters, with a mark where it was cut (decision
+    /// 2026-10-04 §16): another device may have written it, at any
+    /// length.
+    #[test]
+    fn test_a_files_name_is_cut_where_it_is_put_in_a_line() {
+        use cordelia_core::protocol::FILE_NAME_SHOWN_CHARS;
+        assert_eq!(FILE_NAME_SHOWN_CHARS, 120);
+        assert_eq!(name_shown("notes.md"), "notes.md");
+        // Characters are counted, and not bytes.
+        let just = "\u{e9}".repeat(FILE_NAME_SHOWN_CHARS);
+        assert_eq!(name_shown(&just), just);
+        let long = format!("{just}x.md");
+        assert_eq!(name_shown(&long), format!("{just}..."));
+
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        note_not_carried(&s[0].conn, &[("lab".into(), long.clone())]).unwrap();
+        let look = seen(&s, 0);
+        assert_eq!(look.not_carried[0].file, long);
+        let line = look
+            .says
+            .iter()
+            .find(|line| line.contains("was not carried"))
+            .expect("the look says what was not carried");
+        assert!(line.contains(&format!("{just}... in lab")), "{line}");
+        assert!(!line.contains("x.md"), "{line}");
     }
 }

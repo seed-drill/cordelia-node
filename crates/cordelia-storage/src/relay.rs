@@ -16,8 +16,8 @@
 //! a relay's to count or to drop.
 //!
 //! So each function here that writes or drops ([`take`], [`show`],
-//! [`show_short`], [`make_room`], [`sweep_unused`], [`listed_relay_says`],
-//! [`listed_relay_used`]) refuses, with
+//! [`show_short`], [`make_room`], [`sweep_unused`], [`sweep_deletes`],
+//! [`listed_relay_says`], [`listed_relay_used`]) refuses, with
 //! [`RelayError::DeviceFollowsAPhrase`], a database in which a device
 //! follows a phrase ([`crate::person::person`]), and changes nothing in
 //! it.
@@ -107,6 +107,14 @@
 //! nothing takes the database for reading alone. The same holds for the
 //! time that a relay the operator lists says.
 //!
+//! ## Old deletes
+//!
+//! An entry says in clear whether it is a delete (§2.3). [`sweep_deletes`]
+//! drops each slot in which every entry is a delete that the relay has
+//! held for 90 days, and the channel's count of its room follows. A
+//! delete that is carried at a statement is a new entry, in a new
+//! channel, so its 90 days start again there (§7.3).
+//!
 //! ## Relays that work together
 //!
 //! Relays that their operator lists together pass entries between them
@@ -130,8 +138,9 @@ use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_CHANNEL_USED_STEP_SECS,
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR,
-    RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES, entry_cost,
+    KEYED_TOMBSTONE_RETENTION_DAYS, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
+    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES,
+    entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError};
 use cordelia_crypto::proof;
@@ -657,6 +666,15 @@ pub fn used_bytes(conn: &Connection) -> Result<u64, CordeliaError> {
         |row| row.get::<_, i64>(0),
     )
     .map(|bytes| bytes.max(0) as u64)
+    .map_err(storage)
+}
+
+/// How many channels from their secrets the relay holds.
+pub fn count_held(conn: &Connection) -> Result<u64, CordeliaError> {
+    conn.query_row("SELECT COUNT(*) FROM relay_channels", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|channels| channels.max(0) as u64)
     .map_err(storage)
 }
 
@@ -1274,6 +1292,76 @@ fn swept(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, CordeliaError> {
     Ok(unused)
 }
 
+// ── Old deletes ──────────────────────────────────────────────────────
+
+/// How long a delete is held, in seconds.
+const DELETE_HELD_SECS: i64 = KEYED_TOMBSTONE_RETENTION_DAYS as i64 * 24 * 60 * 60;
+
+/// What a sweep of old deletes did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SweptDeletes {
+    /// How many entries went.
+    pub entries: usize,
+    /// The channels of which nothing is held after it: each is held no
+    /// more.
+    pub channels: Vec<[u8; 32]>,
+}
+
+/// Drop each slot in which every entry that the relay holds is a delete
+/// that it has held for 90 days (decision 2026-10-04 §2.3, §7.3): at
+/// `now`, the relay's time in seconds. An entry says in clear whether it
+/// is a delete, and a relay reads nothing else of it.
+///
+/// A relay holds no list of who counts, and stores what any holder of a
+/// channel's key signs. So a slot goes only where every author's entry in
+/// it is such a delete (the rule of decision 2026-09-30 §4.4): a name
+/// that one device deleted, and for which the relay holds another
+/// device's text, stays, with the delete. That costs a relay some room,
+/// and no key's delete can sweep away what another key wrote.
+///
+/// **The channel's count of its room follows:** it is what its entries
+/// are counted at once the slots have gone. A channel of which nothing is
+/// left is held no more.
+///
+/// Refused, with nothing dropped, on a database in which a device follows
+/// a phrase.
+pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, RelayError> {
+    in_one(conn, || {
+        no_device_writes(conn)?;
+        Ok(swept_deletes(conn, now)?)
+    })
+}
+
+/// [`sweep_deletes`], inside what the caller began.
+fn swept_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, CordeliaError> {
+    let by = now.saturating_sub(DELETE_HELD_SECS);
+    let mut swept = SweptDeletes::default();
+    let mut lighter: Vec<[u8; 32]> = Vec::new();
+    for (channel, slot) in entries::slots_with_a_delete_stored(conn, by)? {
+        if !entries::holds_only_deletes_stored(conn, &channel, &slot, by)? {
+            continue;
+        }
+        swept.entries += entries::remove_slot(conn, &channel, &slot)?;
+        if lighter.last() != Some(&channel) {
+            lighter.push(channel);
+        }
+    }
+    for channel in lighter {
+        let bytes = entries::channel_cost(conn, &channel)?;
+        if bytes == 0 {
+            drop_channel(conn, &channel)?;
+            swept.channels.push(channel);
+            continue;
+        }
+        conn.execute(
+            "UPDATE relay_channels SET bytes = ?2 WHERE channel_id = ?1",
+            params![channel.as_slice(), to_sql(bytes)],
+        )
+        .map_err(storage)?;
+    }
+    Ok(swept)
+}
+
 // ── As one ───────────────────────────────────────────────────────────
 
 /// A count of bytes as the database holds it.
@@ -1472,6 +1560,22 @@ mod tests {
             .unwrap()
     }
 
+    /// A delete of channel `c` that device `d` made under `name` at `rev`,
+    /// checked.
+    fn deleted(c: u16, d: u8, rev: u64, name: &str) -> CheckedEntry {
+        let inside = Inside {
+            name: name.to_string(),
+            value: Value::Delete,
+            chain: Some(Vec::new()),
+        };
+        let entry = Entry::seal(&secret(c), &device(d), rev, &inside)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(entry.delete);
+        entry
+    }
+
     /// An entry of channel `c` with a small text, that device `d` made
     /// under `notes.md` at `rev`.
     fn small(c: u16, d: u8, rev: u64) -> CheckedEntry {
@@ -1553,6 +1657,7 @@ mod tests {
             sum += cost;
         }
         assert_eq!(used_bytes(conn).unwrap(), sum);
+        assert_eq!(count_held(conn).unwrap(), rows.len() as u64);
         let with_entries: i64 = conn
             .query_row(
                 "SELECT COUNT(DISTINCT channel_id) FROM entries",
@@ -2056,6 +2161,7 @@ mod tests {
         // anything was used: nothing is dropped.
         refused(make_room(&conn, 0).map(|_| ()));
         refused(sweep_unused(&conn, NOW + 365 * DAY).map(|_| ()));
+        refused(sweep_deletes(&conn, NOW + 365 * DAY).map(|_| ()));
         // Nor is what a listed relay says kept: since when it has held a
         // channel, and when the channel was last used.
         refused(listed_relay_says(&conn, &channel(1), NOW - DAY).map(|_| ()));
@@ -4425,6 +4531,148 @@ mod tests {
         let one = paged(&conn, 3, true, mixed.next, 1);
         assert_eq!(one.entries.len(), 1);
         assert_eq!(one.entries[0].author, device(17).public_key());
+    }
+
+    // ── Old deletes ──────────────────────────────────────────────────
+
+    /// A delete that the relay has held for 90 days is dropped, and one
+    /// that it has held a second less is not (decision 2026-10-04 §2.3,
+    /// §7.3). The 90 days are counted from when the relay stored the
+    /// entry. A text is never swept. The channel's count of its room
+    /// follows what went.
+    #[test]
+    fn test_a_delete_held_for_90_days_is_dropped_and_the_channels_room_follows() {
+        assert_eq!(KEYED_TOMBSTONE_RETENTION_DAYS, 90);
+        let (conn, mut room) = relay();
+        let text = small(1, 1, 5);
+        let gone = deleted(1, 1, 3, "gone.md");
+        let late = deleted(1, 1, 3, "late.md");
+        for (entry, at) in [(&text, NOW), (&gone, NOW), (&late, NOW + DAY)] {
+            let taken = take(&conn, &mut room, entry, &from(1), at).unwrap();
+            assert_eq!(taken, Taken::Stored);
+        }
+        let cost = |entry: &CheckedEntry| entry_cost(entry.content.len());
+        let before = counted(&conn);
+        assert_eq!(before, cost(&text) + cost(&gone) + cost(&late));
+
+        // A second short of 90 days nothing goes.
+        let swept = sweep_deletes(&conn, NOW + 90 * DAY - 1).unwrap();
+        assert_eq!(swept, SweptDeletes::default());
+        assert_eq!(ids(&conn, 1), [text.id(), gone.id(), late.id()]);
+        // At 90 days the delete that was stored then goes, and the one
+        // that was stored a day later does not.
+        let swept = sweep_deletes(&conn, NOW + 90 * DAY).unwrap();
+        assert_eq!((swept.entries, swept.channels.len()), (1, 0));
+        assert_eq!(ids(&conn, 1), [text.id(), late.id()]);
+        assert_eq!(counted(&conn), before - cost(&gone));
+        let held = held_channel(&conn, &channel(1)).unwrap().unwrap();
+        assert_eq!(held.bytes, cost(&text) + cost(&late));
+        // A day on that one goes too. The text stays, however old.
+        let swept = sweep_deletes(&conn, NOW + 91 * DAY).unwrap();
+        assert_eq!((swept.entries, swept.channels.len()), (1, 0));
+        assert_eq!(ids(&conn, 1), [text.id()]);
+        assert_eq!(counted(&conn), cost(&text));
+        assert_eq!(
+            sweep_deletes(&conn, NOW + 3650 * DAY).unwrap(),
+            SweptDeletes::default()
+        );
+        assert_eq!(ids(&conn, 1), [text.id()]);
+
+        // A delete that takes the place of a text is stored when it
+        // arrives: its 90 days start then.
+        let over = deleted(1, 1, 6, "notes.md");
+        take(&conn, &mut room, &over, &from(1), NOW + 100 * DAY).unwrap();
+        assert_eq!(
+            sweep_deletes(&conn, NOW + 190 * DAY - 1).unwrap().entries,
+            0
+        );
+        // The text went when the delete took its place: the channel
+        // holds the delete alone.
+        assert_eq!(counted(&conn), cost(&over));
+    }
+
+    /// A relay holds no list of who counts, so a slot goes only where
+    /// every author's entry in it is a delete that the relay has held
+    /// for 90 days (the rule of decision 2026-09-30 §4.4). Where one
+    /// author's entry is a text the slot stays whole, at whatever
+    /// revision the delete beside it is: no key's delete sweeps away what
+    /// another key wrote. Where one of the deletes is younger the slot
+    /// stays until that one is old too. A slot goes whole.
+    #[test]
+    fn test_a_slot_goes_only_where_every_authors_entry_is_an_old_delete() {
+        let (conn, mut room) = relay();
+        let stays = [
+            deleted(1, 1, 9, "a.md"),
+            made(1, 2, 3, "a.md", "another device's text"),
+        ];
+        let waits = [deleted(1, 1, 2, "b.md"), deleted(1, 2, 3, "b.md")];
+        let goes = [deleted(1, 1, 2, "c.md"), deleted(1, 2, 9, "c.md")];
+        for entry in stays.iter().chain(&goes).chain(&waits[..1]) {
+            take(&conn, &mut room, entry, &from(1), NOW).unwrap();
+        }
+        take(&conn, &mut room, &waits[1], &from(1), NOW + 10 * DAY).unwrap();
+        counted(&conn);
+
+        let swept = sweep_deletes(&conn, NOW + 90 * DAY).unwrap();
+        assert_eq!((swept.entries, swept.channels.len()), (2, 0));
+        let left = [stays[0].id(), stays[1].id(), waits[0].id(), waits[1].id()];
+        assert_eq!(ids(&conn, 1), left);
+        counted(&conn);
+        // A second before the younger delete is 90 days old, its slot
+        // stays; then it goes whole.
+        let swept = sweep_deletes(&conn, NOW + 100 * DAY - 1).unwrap();
+        assert_eq!(swept.entries, 0);
+        let swept = sweep_deletes(&conn, NOW + 100 * DAY).unwrap();
+        assert_eq!(swept.entries, 2);
+        assert_eq!(ids(&conn, 1), [stays[0].id(), stays[1].id()]);
+        // The slot with another device's text stays for good.
+        let swept = sweep_deletes(&conn, NOW + 3650 * DAY).unwrap();
+        assert_eq!(swept, SweptDeletes::default());
+        assert_eq!(ids(&conn, 1), [stays[0].id(), stays[1].id()]);
+        counted(&conn);
+    }
+
+    /// A channel of which a sweep of old deletes leaves nothing is held
+    /// no more: the relay holds a channel exactly where it holds an entry
+    /// of it. Another channel is not touched. Taken again, the channel
+    /// is new from then.
+    #[test]
+    fn test_a_channel_of_which_a_sweep_of_deletes_leaves_nothing_is_held_no_more() {
+        let only = deleted(1, 1, 2, "hand-over");
+        let other = small(2, 1, 5);
+        // A relay that is at its cap with the two.
+        let cap = entry_cost(only.content.len()) + entry_cost(other.content.len());
+        let (conn, mut room) = relay_of(cap);
+        take(&conn, &mut room, &only, &from(1), NOW).unwrap();
+        take(&conn, &mut room, &other, &from(1), NOW).unwrap();
+        assert_eq!(held(&conn), [1, 2]);
+        let more = made(2, 1, 1, "more.md", "a small text");
+        assert_eq!(
+            take(&conn, &mut room, &more, &from(1), NOW + DAY).unwrap(),
+            Taken::Refused(Refused::NoRoom)
+        );
+
+        let swept = sweep_deletes(&conn, NOW + 90 * DAY).unwrap();
+        assert_eq!(swept.entries, 1);
+        assert_eq!(swept.channels, [channel(1)]);
+        assert_eq!(held(&conn), [2]);
+        assert_eq!(counted(&conn), entry_cost(other.content.len()));
+        // The room that the sweep gave back is room again.
+        assert_eq!(
+            take(&conn, &mut room, &more, &from(1), NOW + 90 * DAY).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(counted(&conn), cap);
+        // Taken again, it is held from then.
+        let (conn, mut room) = relay();
+        take(&conn, &mut room, &only, &from(1), NOW).unwrap();
+        assert_eq!(
+            sweep_deletes(&conn, NOW + 90 * DAY).unwrap().channels,
+            [channel(1)]
+        );
+        let again = deleted(1, 1, 3, "hand-over");
+        take(&conn, &mut room, &again, &from(1), NOW + 91 * DAY).unwrap();
+        assert_eq!(since(&conn, 1), Some(NOW + 91 * DAY));
     }
 
     // ── What nobody uses ─────────────────────────────────────────────

@@ -55,6 +55,36 @@ pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 /// at each statement applied.
 pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 
+/// Present where the statement that this device has applied removes a key
+/// that the statement it held before did not (decision 2026-10-04
+/// §10.1), as the device found it at the moment it applied the
+/// statement: a renewal removes nobody, though its list of removed keys
+/// names every key removed so far. Written at each statement applied.
+pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
+
+/// JSON array of the names that this device holds by a carry that a
+/// person asked for, or by a recovery, with no folder of its own mapped
+/// to them (decision 2026-10-04 §7.3, §9): it holds each, and lists it
+/// in the personal channel, whether or not sync is on here. A name goes
+/// from the list when the device stops it, and the list goes when the
+/// device leaves its phrase.
+pub const PERSON_NAMES_CARRIED: &str = "person.names_carried";
+
+/// Whether the look of a recovery that was made on this machine has not
+/// ended (decision 2026-10-04 §8, §9): it is set where the recovery's
+/// statement is applied, and goes when the look has carried what it
+/// takes. While it is set the machine does not write that it has sent
+/// what it carried: a recovery whose look was interrupted was cut short,
+/// and the next recovery says so.
+pub const PERSON_LOOK_PENDING: &str = "person.look_pending";
+
+/// JSON object of what this device called each key that a statement it
+/// applied removed, by the key in hex (decision 2026-10-04 §7.3): a
+/// statement lists removed keys bare, and a person names one by its
+/// label at `cordelia sync carry --from`. A key that the device never
+/// knew by a label is not in it.
+pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

@@ -13,12 +13,8 @@
 //! A folder found on disk is matched to its project by the working
 //! directory recorded in its transcripts, and that directory's git remote.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Lines read from each transcript while looking for the working directory.
-const TRANSCRIPT_SCAN_LINES: usize = 200;
 
 /// A Claude Code project folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,122 +51,15 @@ pub fn folders(claude_dir: &Path) -> Vec<Folder> {
     out
 }
 
-use cordelia_core::claude_code::FOLDER_NAME_MAX as CLAUDE_NAME_MAX;
-
-/// The name Claude Code gives the folder for a directory
-/// (`/home/sam/Work` -> `-home-sam-Work`).
-pub fn claude_folder_name(dir: &Path) -> String {
-    cordelia_core::claude_code::folder_name(&dir.to_string_lossy())
-}
-
-/// Claude Code's folder for a directory, under `claude_dir/projects`; it
-/// may not exist yet. `None` when the path is too long for its folder name
-/// to be predicted.
-pub fn claude_folder(claude_dir: &Path, dir: &Path) -> Option<PathBuf> {
-    let name = claude_folder_name(dir);
-    (name.len() <= CLAUDE_NAME_MAX).then(|| claude_dir.join("projects").join(name))
-}
-
-/// Whether `folder` is the one Claude Code names after `dir`, as opposed to
-/// a folder someone laid out by hand.
-pub fn is_claude_folder_for(folder: &Path, dir: &Path) -> bool {
-    let Some(have) = folder.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let want = claude_folder_name(dir);
-    if want.len() <= CLAUDE_NAME_MAX {
-        return have == want;
-    }
-    have.strip_prefix(&want[..CLAUDE_NAME_MAX])
-        .is_some_and(|hash| hash.starts_with('-'))
-}
-
-/// The work tree `cwd` is in and the repository's common directory (which
-/// linked worktrees share), as real paths. `None` outside a repository, or
-/// without git.
-fn git_layout(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--show-toplevel", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let (top, common) = (lines.next()?, lines.next()?);
-    // The common directory may be given relative to `cwd`.
-    Some((PathBuf::from(top), cwd.join(common).canonicalize().ok()?))
-}
-
-/// The directory whose folder holds the memory for sessions started in
-/// `cwd`. Claude Code keeps one memory per git repository, shared by its
-/// subdirectories and worktrees, in the folder of the repository's main
-/// working tree. Outside a repository (or without git) it is `cwd` itself.
-pub fn memory_root(cwd: &Path) -> PathBuf {
-    match git_layout(cwd) {
-        // A linked worktree's common directory is the main working tree's
-        // `.git`.
-        Some((_, common)) if common.file_name().is_some_and(|n| n == ".git") => common
-            .parent()
-            .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf),
-        // Anything else is taken to be its own root: see
-        // [`memory_root_is_assumed`].
-        Some((top, _)) => top,
-        None => cwd.to_path_buf(),
-    }
-}
-
-/// Whether [`memory_root`] is a guess for `cwd`: it is in a repository
-/// whose common directory is not a plain `.git`, which is a submodule or a
-/// worktree of a bare repository. Where Claude Code keeps memory for those
-/// has not been confirmed.
-pub fn memory_root_is_assumed(cwd: &Path) -> bool {
-    git_layout(cwd).is_some_and(|(_, common)| common.file_name().is_none_or(|n| n != ".git"))
-}
-
-/// Transcripts read per folder while looking for its working directory.
-const TRANSCRIPTS_SCANNED: usize = 20;
-
-/// The working directories recorded in the folder's transcripts, without
-/// repeats: the newest transcript's first. A session can move to another
-/// directory, so a folder's transcripts may name more than one.
-pub fn recorded_cwds(folder: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut transcripts: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    transcripts.sort_by_key(|t| std::cmp::Reverse(t.0));
-
-    let mut found: Vec<PathBuf> = Vec::new();
-    for (_, path) in transcripts.into_iter().take(TRANSCRIPTS_SCANNED) {
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file)
-            .lines()
-            .take(TRANSCRIPT_SCAN_LINES)
-            .map_while(Result::ok)
-        {
-            if !line.contains("\"cwd\"") {
-                continue;
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-                && let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
-                && !found.iter().any(|f| f == Path::new(cwd))
-            {
-                found.push(PathBuf::from(cwd));
-            }
-        }
-    }
-    found
-}
+// Where Claude Code keeps the memory of a directory, what it names the
+// folder, and which directories a folder's transcripts record: asked by
+// the node as well, of the folders that a notice names and of what is
+// found for a directory that is being mapped, and so kept beside the one
+// function that says whether `cordelia sync map` would sync a folder.
+pub use cordelia_api::found::{
+    claude_folder, claude_folder_name, is_claude_folder_for, memory_root, memory_root_is_assumed,
+    memory_root_known, recorded_cwds,
+};
 
 /// The working directory recorded first in the folder's newest transcript.
 pub fn recorded_cwd(folder: &Path) -> Option<PathBuf> {

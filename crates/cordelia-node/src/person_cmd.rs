@@ -7,7 +7,9 @@
 //! own** (§16; §10.1, rule 6), with the note that says how to restart
 //! it: a route of the same name may mean another thing there. `cordelia
 //! devices`, which only shows, is answered beside such a node, with the
-//! note.
+//! note. **A command that makes or asks for a recovery phrase also asks
+//! how the node stands first,** and shows no word where the node is held
+//! up (§10.1).
 //!
 //! **Every yes is asked here, at a terminal** ([`crate::terminal`]), and
 //! each command that asks refuses, before anything else, where its input
@@ -55,7 +57,10 @@ use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
 use crate::terminal::Terminal;
-use crate::{Told, api_post, api_post_told, note_another_version, refuse_another_version};
+use crate::{
+    Told, api_post, api_post_told, note_another_version, refuse_another_version,
+    refuse_before_a_phrase,
+};
 
 /// Whose words a recovery phrase is, and what it is for: said wherever
 /// one is made (decision 2026-10-04 §5).
@@ -68,7 +73,7 @@ Without the phrase a device can be added, and none can ever be removed or recove
 Nobody else holds it, and this device does not keep it: it is shown once, now.";
 
 /// What is said where a person did not say yes.
-const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
+pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
 
 /// How often the node is asked while a command waits for something to
 /// come about.
@@ -94,7 +99,7 @@ const ASKS_AGAIN: usize = 10;
 /// Refused where what answered says nothing of where the device stands
 /// (it has no `state`): that is no look of a node of this version, and
 /// nothing is read from it (decision 2026-10-04 §16).
-fn look(config_path: &str) -> anyhow::Result<Value> {
+pub(crate) fn look(config_path: &str) -> anyhow::Result<Value> {
     let seen = api_post(config_path, "/api/v1/devices/list", json!({}))?;
     if seen["state"].as_str().is_none() {
         anyhow::bail!(
@@ -106,7 +111,7 @@ fn look(config_path: &str) -> anyhow::Result<Value> {
     Ok(seen)
 }
 
-fn text<'a>(value: &'a Value, field: &str) -> &'a str {
+pub(crate) fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field].as_str().unwrap_or_default()
 }
 
@@ -119,7 +124,7 @@ fn text<'a>(value: &'a Value, field: &str) -> &'a str {
 /// `false` says that this could not be learned, and not that nothing was
 /// made: the node did not answer, or it keeps another entry so far, and
 /// may still be at work on what it was handed.
-fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
+pub(crate) fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
     let made = hex::encode(made);
     for _ in 0..ASKS_AGAIN {
         std::thread::sleep(ASK_EVERY);
@@ -138,15 +143,31 @@ fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
     false
 }
 
-fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
+pub(crate) fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
     value[field].as_array().into_iter().flatten()
+}
+
+/// A file's name, or a line that may hold one, as it is printed
+/// (decision 2026-10-04 §16): another device may have written the name.
+/// It is cut where a name is cut, and its control characters and the
+/// marks that change the direction of text are shown as escapes, as
+/// local history prints names.
+pub(crate) fn file_shown(name: &str) -> String {
+    crate::history_cmd::printable(&cordelia_api::look::name_shown(name))
+}
+
+/// Whether a row that the node shows is this device's: its key is `own`,
+/// the one in this device's key file (decision 2026-10-04 §16). Which
+/// row is this device's is never the node's word.
+fn is_own(device: &Value, own: &[u8; 32]) -> bool {
+    decode_public_key(text(device, "key")).ok() == Some(*own)
 }
 
 /// This device's key, read from its key file as `cordelia id` reads it
 /// (decision 2026-10-04 §16). What a command shows as this device, signs
 /// for and prints is this, and never the node's word of it: whatever
 /// answers at the node's address could otherwise name a key of its own.
-fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
     let mut config = Config::load(&config::expand_tilde(config_path))?;
     config.apply_env_overrides();
     let key_path = config.data_dir().join(cordelia_api::commands::KEY_FILE);
@@ -159,7 +180,7 @@ fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
 /// Refuse where `answer`, which the node gave, names another key as this
 /// device than `own`, the key in this device's key file (decision
 /// 2026-10-04 §16). An answer that names none is refused likewise.
-fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
+pub(crate) fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
     if decode_public_key(text(answer, "this_device")).ok() == Some(*own) {
         return Ok(());
     }
@@ -181,7 +202,7 @@ fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Result<()> {
 /// words where a person looks for the real ones. Quoted, with whatever
 /// would end the quotes marked, it cannot pass for anything that this
 /// command says itself.
-fn named(label: &str, key: &[u8; 32]) -> String {
+pub(crate) fn named(label: &str, key: &[u8; 32]) -> String {
     words_then(&fingerprint::shown(key), label)
 }
 
@@ -191,7 +212,7 @@ fn shown(device: &Value) -> String {
 }
 
 /// The words of a key's fingerprint, and then its label, quoted.
-fn words_then(words: &str, label: &str) -> String {
+pub(crate) fn words_then(words: &str, label: &str) -> String {
     match label.is_empty() {
         true => format!("the device ({words})"),
         false => format!("({words}) {label:?}"),
@@ -199,7 +220,7 @@ fn words_then(words: &str, label: &str) -> String {
 }
 
 /// A time in seconds, as a person reads it.
-fn time_of(at: u64) -> String {
+pub(crate) fn time_of(at: u64) -> String {
     i64::try_from(at)
         .ok()
         .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
@@ -209,7 +230,7 @@ fn time_of(at: u64) -> String {
 
 /// The name that this machine goes by, for the label of a device that a
 /// person gave none.
-fn default_label() -> String {
+pub(crate) fn default_label() -> String {
     #[cfg(unix)]
     let host = rustix::system::uname()
         .nodename()
@@ -233,7 +254,7 @@ fn default_label() -> String {
 
 /// An entry, from the hex of its bytes, checked as whatever a device is
 /// given is checked.
-fn entry_of(hex_bytes: &str) -> anyhow::Result<CheckedEntry> {
+pub(crate) fn entry_of(hex_bytes: &str) -> anyhow::Result<CheckedEntry> {
     Ok(Entry::from_wire(&hex::decode(hex_bytes)?)?.check()?)
 }
 
@@ -254,9 +275,11 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
             }
         }
     };
+    // A line may name a file, as another device wrote its name: it is
+    // printed as local history prints names.
     let says = list(seen, "says")
         .filter_map(|line| line.as_str())
-        .map(str::to_string)
+        .map(crate::history_cmd::printable)
         .collect();
     (short, says)
 }
@@ -271,7 +294,7 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
-    refuse_another_version(config_path)?;
+    refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
     let seen = look(config_path)?;
@@ -582,17 +605,21 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
     note_another_version(config_path);
     let seen = look(config_path)?;
     names_this_device(&seen, &own)?;
-    for line in devices_lines(&seen) {
+    for line in devices_lines(&seen, &own) {
         println!("{line}");
     }
     Ok(())
 }
 
-/// What `cordelia devices` prints, a line each.
-fn devices_lines(seen: &Value) -> Vec<String> {
+/// What `cordelia devices` prints, a line each. `own` is this device's
+/// key, from its key file: which row is this device's goes by it.
+fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
-    out.push(format!("This device: {}", text(seen, "this_device")));
+    out.push(format!(
+        "This device: {}",
+        encode_public_key(own).unwrap_or_default()
+    ));
     let Some(change) = change else {
         out.extend(list(seen, "says").filter_map(|line| Some(line.as_str()?.to_string())));
         return out;
@@ -611,19 +638,24 @@ fn devices_lines(seen: &Value) -> Vec<String> {
         ));
     }
     let applied = |device: &Value| match device["applied"].as_u64() {
-        _ if device["this_device"] == true => "this device".to_string(),
+        _ if is_own(device, own) => "this device".to_string(),
         // Whether it has sent what it held when it applied the change
         // (§8): it says so itself, once it has.
         Some(number) if number == change => match device["sent"] == true {
             true => format!("has applied change {change}, and has sent what it held"),
+            // A device that is lost in that state has left what it had
+            // not sent: what it had sent before comes in by command
+            // (§7.3, §8).
             false => format!(
                 "has applied change {change}, and is still sending what it held (if it is \
-                 lost now, what it had not sent is lost with it)"
+                 lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
+                 in what it had sent before)"
             ),
         },
         _ => format!(
             "has not applied change {change} yet, as far as this device has heard: adding it \
-             again from a device that has (`cordelia add-device`) hands it the change"
+             again from a device that has (`cordelia add-device`) hands it the change, and \
+             `cordelia sync carry` brings in what it had sent to the relays"
         ),
     };
     let left = |device: &Value| match device["left"] == true {
@@ -674,12 +706,12 @@ fn devices_lines(seen: &Value) -> Vec<String> {
         out.push(String::new());
         out.push("Removed keys:".into());
     }
+    // A statement lists a removed key bare: it is shown by the label
+    // that this device knew it by, where it knew it by one. That label,
+    // or the first six words of the key's fingerprint, names it at
+    // `cordelia sync carry <name> --from` (§7.3).
     for device in removed {
-        out.push(format!(
-            "  ({})  {}",
-            text(device, "words"),
-            text(device, "key")
-        ));
+        out.push(format!("  {}  {}", shown(device), text(device, "key")));
     }
     let left_out: Vec<&Value> = list(seen, "left_out").collect();
     if !left_out.is_empty() {
@@ -813,7 +845,12 @@ fn names_lines(seen: &Value) -> Vec<String> {
         .partition(|name| list(name, "by").next().is_some());
     if !ours.is_empty() {
         out.push(String::new());
-        out.push("Names that no device lists yet since the last change:".into());
+        out.push(
+            "Names that no device lists yet since the last change (`cordelia sync carry \
+             <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
+             sync it):"
+                .into(),
+        );
     }
     for name in ours {
         out.push(format!(
@@ -826,7 +863,10 @@ fn names_lines(seen: &Value) -> Vec<String> {
     if !gone.is_empty() {
         out.push(String::new());
         out.push(
-            "Names that only a device which no longer counts had synced (they stay behind):".into(),
+            "Names that only a device which no longer counts had synced (they stay behind: \
+             `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
+             phrase):"
+                .into(),
         );
     }
     for name in gone {
@@ -855,15 +895,15 @@ fn names_lines(seen: &Value) -> Vec<String> {
     for file in not_carried {
         out.push(format!(
             "  {} in {}",
-            text(file, "file"),
-            text(file, "name")
+            file_shown(text(file, "file")),
+            file_shown(text(file, "name"))
         ));
     }
     out
 }
 
 /// A count with its noun: `1 name`, `3 names`.
-fn counted(n: usize, noun: &str) -> String {
+pub(crate) fn counted(n: usize, noun: &str) -> String {
     match n {
         1 => format!("1 {noun}"),
         n => format!("{n} {noun}s"),
@@ -909,7 +949,10 @@ enum Which {
     Settle,
 }
 
-/// `cordelia remove-device <key>` (decision 2026-10-04 §7.1).
+/// `cordelia remove-device <key>` (decision 2026-10-04 §7.1). Given a
+/// key that is in no list and was not added since, it removes the key
+/// all the same, after saying what that means and a typed answer
+/// ([`refuses_a_key_it_does_not_know`], §10).
 pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
     made_at_a_terminal(config_path, || {
         let device = decode_public_key(key).map_err(|e| {
@@ -928,7 +971,7 @@ fn made_at_a_terminal(
     which: impl FnOnce() -> anyhow::Result<Which>,
 ) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
-    refuse_another_version(config_path)?;
+    refuse_before_a_phrase(config_path)?;
     change(config_path, &at, &which()?)
 }
 
@@ -1392,8 +1435,8 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                     println!(
                         "  What this device held of {} in {} could not be read, and was not \
                          carried: it meets its channel as a new file does.",
-                        text(file, "file"),
-                        text(file, "name")
+                        file_shown(text(file, "file")),
+                        file_shown(text(file, "name"))
                     );
                 }
                 println!(
@@ -1508,14 +1551,17 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         }
         let known =
             applied.lists(&goes) || handed.added.iter().any(|r| r.addition.device.key == goes);
-        if !known {
-            anyhow::bail!(
-                "that key is no device of yours that this device knows of: `cordelia devices` \
-                 lists them, each with its key."
-            );
+        match known {
+            true => {
+                println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
+                println!("  {}", handed.received_from(&goes));
+            }
+            // A key that this device knows nothing of is removed by key
+            // (decision 2026-10-04 §10): a key that is in no list is not
+            // refused by anything, and could be added by the two
+            // commands. A person who wants it refused removes it once.
+            false => refuses_a_key_it_does_not_know(at, &goes)?,
         }
-        println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
-        println!("  {}", handed.received_from(&goes));
         removed.push(goes);
     }
     let asked = questions(handed, goes);
@@ -1539,6 +1585,57 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         }
     }
     Ok(prepare_change(&handed.applied, &own, stay, &removed)?)
+}
+
+/// What `cordelia remove-device` says of a key that is in no list of the
+/// last change and was not added since (decision 2026-10-04 §10).
+const NO_DEVICE_IT_KNOWS: &str = "is no device of yours that this device knows of: it is in no \
+    list of the last change, and was not added since (`cordelia devices` lists those, each with \
+    its key).";
+
+/// What removing such a key does, said before its answer is asked.
+const REFUSED_FOR_GOOD: &str = "Removing it refuses that key for good: the change lists it among \
+    its removed keys, no device of yours adds it after that, and no later change brings it back. \
+    That is for a key that was one of your devices before every device was added again, and \
+    that is not to be added.";
+
+/// The answer that removes a key which this device does not know.
+const REFUSES_THE_KEY: &str = "refuse";
+
+/// `cordelia remove-device` was given the key `goes`, which this device
+/// knows nothing of (decision 2026-10-04 §10): it says that this is no
+/// device it knows of, and that removing it refuses that key for good,
+/// and asks a typed answer before anything else. **No answer is
+/// suggested:** pressing Enter answers nothing, and anything but the one
+/// word stops the command, with nothing made.
+///
+/// The change then goes on as any removal: the key is among the removed
+/// keys of the statement that is shown, before the yes and the phrase.
+///
+/// **A key that is no device's key at all is refused** (decision
+/// 2026-10-04 §2.2): a point under which anyone can sign, and to which
+/// nothing can be sealed, is added by nothing, so there is nothing of it
+/// to refuse, and no statement lists it.
+fn refuses_a_key_it_does_not_know(at: &Terminal, goes: &[u8; 32]) -> anyhow::Result<()> {
+    if !cordelia_crypto::identity::is_usable_public_key(goes) {
+        anyhow::bail!(
+            "that key is no device's key, and no device of yours: nothing is added under it, \
+             so there is nothing to refuse. Nothing was done."
+        );
+    }
+    println!(
+        "\nThe key ({}) {NO_DEVICE_IT_KNOWS}",
+        fingerprint::shown(goes)
+    );
+    println!("  {REFUSED_FOR_GOOD}");
+    let typed = at.answer(&format!(
+        "  Type `{REFUSES_THE_KEY}` to refuse this key for good, or anything else to stop: "
+    ))?;
+    match typed.as_deref() {
+        Some(REFUSES_THE_KEY) => Ok(()),
+        Some(_) => anyhow::bail!("That was not `{REFUSES_THE_KEY}`. Nothing was done."),
+        None => anyhow::bail!("the input ended before an answer was typed. Nothing was made."),
+    }
 }
 
 /// This device as a change will list it, where the statement applied
@@ -1627,23 +1724,20 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
     Ok(out)
 }
 
-/// Ask for the recovery phrase, and sign and seal with it what was
-/// shown. The phrase is in this function and nowhere else: it is typed
-/// with echo off, signs the statement, seals the part of the change
-/// entry that is for it, signs the entry, and is dropped, and
-/// overwritten, as this returns.
+/// Ask for the recovery phrase at the terminal: twelve words, typed with
+/// echo off. It is the one way that a command reads a phrase.
 ///
 /// A mistyped phrase is told from a wrong one: words that are no
-/// recovery phrase fail its checksum, and may be typed again. A phrase
-/// that is one, and not the one that this device follows, makes nothing.
-fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
+/// recovery phrase fail its checksum, and may be typed again, three times
+/// in all. What is given back is overwritten when it is dropped.
+pub(crate) fn typed_phrase(at: &Terminal) -> anyhow::Result<Phrase> {
     let mut tries = 0;
-    let phrase = loop {
+    loop {
         tries += 1;
         let typed =
             at.phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
         match Phrase::parse(&typed) {
-            Ok(phrase) => break phrase,
+            Ok(phrase) => return Ok(phrase),
             Err(e) if tries < PHRASE_TRIES => {
                 let why = match e {
                     PhraseError::Checksum => {
@@ -1657,7 +1751,20 @@ fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<
             }
             Err(e) => anyhow::bail!("{e}. It was mistyped: nothing was made."),
         }
-    };
+    }
+}
+
+/// Ask for the recovery phrase, and sign and seal with it what was
+/// shown. The phrase is in this function and nowhere else: it is typed
+/// with echo off, signs the statement, seals the part of the change
+/// entry that is for it, signs the entry, and is dropped, and
+/// overwritten, as this returns.
+///
+/// A mistyped phrase is told from a wrong one: words that are no
+/// recovery phrase fail its checksum, and may be typed again. A phrase
+/// that is one, and not the one that this device follows, makes nothing.
+fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
+    let phrase = typed_phrase(at)?;
     let apart = handed.apart.as_ref().map(|(_, entry, _)| entry);
     match prepared.sign(&phrase, &handed.held, apart) {
         Ok(entry) => Ok(entry),
@@ -1735,7 +1842,7 @@ pub fn change_made(config_path: &str, number: u64) -> anyhow::Result<()> {
 ///   is set up with, with every one of them connected: so a relay that
 ///   took the change and was lost before the names went does not let
 ///   the wait end.
-fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
+fn after_a_change(seen: &Value, number: u64, own: &[u8; 32]) -> (Vec<String>, usize) {
     let mut now: Vec<String> = Vec::new();
     let mut missing = 0;
     let relays: Vec<&Value> = list(seen, "relays").collect();
@@ -1805,7 +1912,7 @@ fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
     }
     // Its own word that it has sent what it carried, under this change.
     let said_sent = list(seen, "devices")
-        .filter(|device| device["this_device"] == true)
+        .filter(|device| is_own(device, own))
         .any(|device| device["applied"].as_u64() == Some(number) && device["sent"] == true);
     if !said_sent {
         missing += 1;
@@ -1813,7 +1920,7 @@ fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
             "keep this machine on: this device has not yet sent every relay what it carried".into(),
         );
     }
-    for device in list(seen, "devices").filter(|device| device["this_device"] != true) {
+    for device in list(seen, "devices").filter(|device| !is_own(device, own)) {
         let applied = device["applied"].as_u64() == Some(number);
         now.push(match (applied, device["sent"] == true) {
             (true, true) => format!(
@@ -1840,6 +1947,9 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
          has sent what it holds. This command stays until then, and says what is missing. \
          Stopping it stops nothing: the node goes on."
     );
+    // Which row is this device's goes by its key file, as the prompts
+    // go, and not by the node's word (decision 2026-10-04 §16).
+    let own = own_key(config_path)?;
     let mut said: Vec<String> = Vec::new();
     loop {
         std::thread::sleep(ASK_EVERY);
@@ -1848,7 +1958,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
             println!("This device has since applied another change: `cordelia devices` says.");
             return Ok(());
         }
-        let (now, missing) = after_a_change(&seen, number);
+        let (now, missing) = after_a_change(&seen, number, &own);
         for line in &now {
             if !said.contains(line) {
                 println!("  {line}");
@@ -1965,11 +2075,24 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
             }
         }
     }
-    api_post(config_path, "/api/v1/devices/forget", json!({}))?;
-
-    // The new key, in the place of the old one.
+    // The new key is written beside the old one first, then the node
+    // forgets, and only then does the new key take the old one's place:
+    // a device never has a node that has forgotten and no new key on the
+    // disk to go on with.
     let identity = NodeIdentity::generate()?;
-    replace_key_file(&key_path, identity.seed())?;
+    give_new_key(&key_path, identity.seed(), || {
+        let asked = api_post_told(
+            config_path,
+            "/api/v1/devices/forget",
+            json!({}),
+            Some(Duration::from_secs(30)),
+        );
+        match asked {
+            Ok(Told::Yes(_)) => Forgot::Yes,
+            Ok(Told::No { message, .. }) => Forgot::No(message),
+            Err(lost) => Forgot::NotKnown(lost.to_string()),
+        }
+    })?;
     let key = encode_public_key(&identity.public_key())?;
     let was = written.identity.entity_id.clone();
     let name = was.rsplit_once('_').map_or(was.as_str(), |(name, _)| name);
@@ -1988,39 +2111,77 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Put `seed` in the place of the key file at `path` (decision 2026-10-04
-/// §16): it is written to a file beside it, flushed, and renamed over it,
-/// so that the key file holds the old key or the new one, whole, whatever
-/// stops the command between. The file is the device's alone to read from
-/// the moment it is made. Where it cannot be written, the device keeps
-/// the key it had.
-fn replace_key_file(path: &std::path::Path, seed: &[u8; 32]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut beside = path.as_os_str().to_owned();
-    beside.push(".new");
-    let beside = std::path::PathBuf::from(beside);
-    // Made anew each time: never written through whatever was left under
-    // that name.
-    let _ = std::fs::remove_file(&beside);
-    let mut made = std::fs::OpenOptions::new();
-    made.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        made.mode(0o600);
-    }
-    let written = made
-        .open(&beside)
-        .and_then(|mut file| {
-            file.write_all(seed)?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&beside, path));
-    if let Err(e) = written {
+/// What the node answered when it was asked to forget what it holds of
+/// its person.
+enum Forgot {
+    /// It forgot.
+    Yes,
+    /// It refused, and says why: it holds what it held.
+    No(String),
+    /// Its answer was lost: it may have forgotten.
+    NotKnown(String),
+}
+
+/// Give the device whose key file is at `path` the key of `seed`, in
+/// three steps, and say what state the device is in where any of them
+/// fails (decision 2026-10-04 §5.2, §16):
+///
+/// 1. **the new key is written beside the old one** ([`write_beside`]).
+///    Where that fails nothing was changed;
+/// 2. **the node forgets** what it holds of its person (`forget`). Where
+///    it refuses, the device keeps its key and what it holds; where its
+///    answer is lost, the device keeps its key, and `cordelia devices`
+///    says whether the node forgot;
+/// 3. **the new key takes the old one's place,** by a rename, so that the
+///    key file holds the old key or the new one, whole. Where that fails
+///    the node has forgotten and the device keeps the key it had: it
+///    follows no phrase, and the command is run again.
+///
+/// The node forgets only once the new key is on the disk: a device is
+/// never left with a node that has forgotten and no new key to take.
+/// What was written beside the key file is removed wherever the new key
+/// does not take its place.
+fn give_new_key(
+    path: &std::path::Path,
+    seed: &[u8; 32],
+    forget: impl FnOnce() -> Forgot,
+) -> anyhow::Result<()> {
+    let beside = write_beside(path, seed).map_err(|e| {
+        anyhow::anyhow!(
+            "could not write the new key ({e}): nothing was changed. The key file is as it \
+             was, and this device keeps the key it had and what it holds of your devices."
+        )
+    })?;
+    let discarded = || {
         let _ = std::fs::remove_file(&beside);
+    };
+    match forget() {
+        Forgot::Yes => {}
+        Forgot::No(why) => {
+            discarded();
+            anyhow::bail!(
+                "{why}\nThe node did not forget what it holds of your devices, and the new key \
+                 was discarded: this device keeps the key it had and what it holds. Where it \
+                 said that it left, that word stands. Run `cordelia init --new-key` again."
+            );
+        }
+        Forgot::NotKnown(why) => {
+            discarded();
+            anyhow::bail!(
+                "{why}\nIt is not known whether the node forgot what it holds of your devices: \
+                 its answer was lost. The new key was discarded, and this device keeps the key \
+                 it had. `cordelia devices` says where it stands: if it follows no recovery \
+                 phrase, the node has forgotten. Either way, run `cordelia init --new-key` \
+                 again to give it a new key."
+            );
+        }
+    }
+    if let Err(e) = std::fs::rename(&beside, path) {
+        discarded();
         anyhow::bail!(
-            "could not write the new key ({e}): the key file is as it was, and this device \
-             keeps the key it had."
+            "the node has forgotten what it held of your devices, and the new key could not be \
+             put in the place of the old one ({e}): this device keeps the key it had, and \
+             follows no recovery phrase. Run `cordelia init --new-key` again."
         );
     }
     // The name is flushed too, as far as the volume can.
@@ -2030,6 +2191,35 @@ fn replace_key_file(path: &std::path::Path, seed: &[u8; 32]) -> anyhow::Result<(
         let _ = folder.sync_all();
     }
     Ok(())
+}
+
+/// Write `seed` to a file beside the key file at `path`, flushed, and
+/// return where (decision 2026-10-04 §16). The file is the device's alone
+/// to read from the moment it is made, and is made anew each time: never
+/// written through whatever was left under that name. Where it cannot be
+/// written, nothing is left beside the key file.
+fn write_beside(path: &std::path::Path, seed: &[u8; 32]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = std::path::PathBuf::from(beside);
+    let _ = std::fs::remove_file(&beside);
+    let mut made = std::fs::OpenOptions::new();
+    made.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        made.mode(0o600);
+    }
+    let written = made.open(&beside).and_then(|mut file| {
+        file.write_all(seed)?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&beside);
+        return Err(e);
+    }
+    Ok(beside)
 }
 
 #[cfg(test)]
@@ -2492,7 +2682,7 @@ mod tests {
         std::fs::write(&path, [1u8; 32]).unwrap();
         // What an earlier run left beside it is not written through.
         std::fs::write(&beside, b"left by a run that was stopped").unwrap();
-        replace_key_file(&path, &[2u8; 32]).unwrap();
+        give_new_key(&path, &[2u8; 32], || Forgot::Yes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32]);
         assert!(!beside.exists());
         #[cfg(unix)]
@@ -2508,18 +2698,103 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             let before = std::fs::metadata(&path).unwrap().ino();
             let kept_open = std::fs::File::open(&path).unwrap();
-            replace_key_file(&path, &[3u8; 32]).unwrap();
+            give_new_key(&path, &[3u8; 32], || Forgot::Yes).unwrap();
             assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
             let mut still = Vec::new();
             std::io::Read::read_to_end(&mut &kept_open, &mut still).unwrap();
             assert_eq!(still, [2u8; 32], "the old file was written into");
         }
-        // Where the folder is gone, nothing is written, and it says so.
+    }
+
+    /// `cordelia init --new-key` writes the new key beside the old one
+    /// first, then has the node forget, and only then puts the new key in
+    /// the old one's place (decision 2026-10-04 §5.2, §16). Where any of
+    /// the three fails it says what state the device is in, and nothing
+    /// is left beside the key file.
+    #[test]
+    fn a_new_key_is_on_the_disk_before_the_node_forgets_and_each_failure_says_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let beside = dir.path().join("identity.key.new");
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        let as_it_was = || {
+            assert_eq!(std::fs::read(&path).unwrap(), [1u8; 32]);
+            assert!(!beside.exists(), "something was left beside the key file");
+        };
+
+        // When the node is asked to forget, the new key is on the disk
+        // beside the old one, whole, and the key file is the old one.
+        let asked = std::cell::Cell::new(0);
+        give_new_key(&path, &[2u8; 32], || {
+            asked.set(asked.get() + 1);
+            assert_eq!(std::fs::read(&beside).unwrap(), [2u8; 32]);
+            assert_eq!(std::fs::read(&path).unwrap(), [1u8; 32]);
+            Forgot::Yes
+        })
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32]);
+        assert!(!beside.exists());
+        std::fs::write(&path, [1u8; 32]).unwrap();
+
+        // The new key cannot be written: the node is not asked to forget,
+        // and nothing was changed.
         let nowhere = dir.path().join("no-such-folder").join("identity.key");
-        let refused = replace_key_file(&nowhere, &[4u8; 32])
+        let refused = give_new_key(&nowhere, &[4u8; 32], || {
+            panic!("the node was asked to forget before the new key was written")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("could not write the new key"), "{refused}");
+        assert!(refused.contains("nothing was changed"), "{refused}");
+        assert!(refused.contains("keeps the key it had"), "{refused}");
+
+        // The node refuses to forget: the device keeps its key and what
+        // it holds.
+        let refused = give_new_key(&path, &[2u8; 32], || Forgot::No("the node is busy".into()))
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("keeps the key it had"), "{refused}");
+        assert!(refused.starts_with("the node is busy\n"), "{refused}");
+        assert!(
+            refused.contains("keeps the key it had and what it holds"),
+            "{refused}"
+        );
+        as_it_was();
+
+        // The node's answer is lost: the device keeps its key, and is
+        // told where to look.
+        let lost = give_new_key(&path, &[2u8; 32], || {
+            Forgot::NotKnown("the answer was lost".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(lost.starts_with("the answer was lost\n"), "{lost}");
+        assert!(
+            lost.contains("It is not known whether the node forgot"),
+            "{lost}"
+        );
+        assert!(lost.contains("`cordelia devices` says"), "{lost}");
+        as_it_was();
+
+        // The node forgot, and the new key cannot take the old one's
+        // place: where the key file is, there is a folder that holds
+        // something.
+        let folder = dir.path().join("a-folder.key");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("held"), "x").unwrap();
+        let not_placed = give_new_key(&folder, &[2u8; 32], || Forgot::Yes)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            not_placed.contains("the node has forgotten what it held"),
+            "{not_placed}"
+        );
+        assert!(
+            not_placed.contains("keeps the key it had, and follows no recovery phrase"),
+            "{not_placed}"
+        );
+        assert!(!dir.path().join("a-folder.key.new").exists());
+        assert!(folder.join("held").exists());
     }
 
     /// The command that a change goes on to is one that this program
@@ -2688,9 +2963,12 @@ mod tests {
     /// own word says that it has sent what it carried (decision
     /// 2026-10-04 §7.1, step 4; §8). A relay that took the change and was
     /// lost before the names went leaves three things missing, and each
-    /// alone is one.
+    /// alone is one. Which row is this device's goes by its key, from its
+    /// key file, and not by the node's word of it (§16).
     #[test]
     fn the_wait_after_a_change_ends_only_once_the_devices_own_word_says_all_is_sent() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
         let look = |not_reached: Value, waiting: Value, to_go: Value, own: Value| {
             json!({
                 "change": 3,
@@ -2700,16 +2978,18 @@ mod tests {
                 "waiting": waiting,
                 "names": { "sent": ["lab"], "to_go": to_go },
                 "devices": [
-                    { "key": "a", "label": "desktop", "words": "w", "this_device": true,
+                    { "key": written(1), "label": "desktop", "words": "w",
                       "applied": own["applied"], "sent": own["sent"] },
-                    // Another device's word is not this device's.
-                    { "key": "b", "label": "laptop", "words": "w", "applied": 3, "sent": true },
+                    // Another device's word is not this device's, though
+                    // the node should say that the row is this device's.
+                    { "key": written(2), "label": "laptop", "words": "w", "this_device": true,
+                      "applied": 3, "sent": true },
                 ],
             })
         };
         let reached = json!([{ "relay": "127.0.0.1:9474", "waits": 0 }]);
         let sent = json!({ "applied": 3, "sent": true });
-        let missing = |seen: &Value| after_a_change(seen, 3);
+        let missing = |seen: &Value| after_a_change(seen, 3, &key(1));
 
         let (lines, none) = missing(&look(json!([]), reached.clone(), json!([]), sent.clone()));
         assert_eq!(none, 0, "{lines:?}");
@@ -2803,25 +3083,36 @@ mod tests {
     #[test]
     fn devices_says_what_was_sent_and_which_names_are_not_yet_listed() {
         let shown = |label: &str| json!({ "key": "k", "label": label, "words": "w w w w" });
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        // A file's name as another device may have written it: with what
+        // would move the cursor and repaint a line, and far too long.
+        let hostile = format!("ghost\u{1b}[2K\r\u{202e}.md{}", "x".repeat(400));
         let seen = json!({
-            "this_device": "cordelia_pk1this",
+            "this_device": "cordelia_pk1another",
             "change": 2,
             "devices": [
-                { "key": "a", "label": "desktop", "words": "w", "this_device": true,
+                { "key": written(1), "label": "desktop", "words": "w",
                   "applied": 2, "sent": false },
-                { "key": "b", "label": "laptop", "words": "w", "applied": 2, "sent": true },
-                { "key": "c", "label": "tablet", "words": "w", "applied": 2, "sent": false },
-                { "key": "d", "label": "phone", "words": "w", "applied": 1, "sent": true },
+                { "key": written(2), "label": "laptop", "words": "w", "this_device": true,
+                  "applied": 2, "sent": true },
+                { "key": written(3), "label": "tablet", "words": "w", "applied": 2,
+                  "sent": false },
+                { "key": written(4), "label": "phone", "words": "w", "applied": 1,
+                  "sent": true },
             ],
             "names": { "sent": ["lab"], "to_go": ["team", "~"] },
             "names_not_listed": [
                 { "name": "old-notes", "by": [shown("laptop")], "by_gone": [], "days_left": 89 },
                 { "name": "its-own", "by": [], "by_gone": [shown("")], "days_left": 1 },
             ],
-            "not_carried": [{ "name": "lab", "file": "ghost.md" }],
+            "not_carried": [
+                { "name": "lab", "file": "ghost.md" },
+                { "name": "lab", "file": hostile },
+            ],
             "names_not_shown": 3,
         });
-        let lines = devices_lines(&seen).join("\n");
+        let lines = devices_lines(&seen, &key(1)).join("\n");
         assert!(
             lines.contains(
                 "\n3 names that cannot be shown are listed by a device: what they are called \
@@ -2829,14 +3120,24 @@ mod tests {
             ),
             "{lines}"
         );
+        // This device is the row of the key in its key file, whatever
+        // row the node says is this device's, and whatever key the node
+        // names as its own (§16).
+        assert!(
+            lines.starts_with(&format!("This device: {}\n", written(1))),
+            "{lines}"
+        );
         assert!(lines.contains("(w) \"desktop\": this device"), "{lines}");
+        assert!(!lines.contains("\"laptop\": this device"), "{lines}");
         assert!(
             lines.contains("(w) \"laptop\": has applied change 2, and has sent what it held"),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "(w) \"tablet\": has applied change 2, and is still sending what it held"
+                "(w) \"tablet\": has applied change 2, and is still sending what it held (if it \
+                 is lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
+                 in what it had sent before)"
             ),
             "{lines}"
         );
@@ -2847,27 +3148,52 @@ mod tests {
             "{lines}"
         );
         assert!(
+            lines.contains("`cordelia sync carry` brings in what it had sent to the relays"),
+            "{lines}"
+        );
+        assert!(
             lines.contains("Still to send from this device (1 name sent, 2 to go):\n  team\n  ~"),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "Names that no device lists yet since the last change:\n  old-notes: synced \
-                 before by (w w w w) \"laptop\"; what the relays hold of it can be brought in for \
-                 89 more days"
+                "Names that no device lists yet since the last change (`cordelia sync carry \
+                 <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
+                 sync it):\n  old-notes: synced before by (w w w w) \"laptop\"; what the relays \
+                 hold of it can be brought in for 89 more days"
             ),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "Names that only a device which no longer counts had synced (they stay \
-                 behind):\n  its-own: synced before by the device (w w w w); it can be brought \
+                "Names that only a device which no longer counts had synced (they stay behind: \
+                 `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
+                 phrase):\n  its-own: synced before by the device (w w w w); it can be brought \
                  in for 1 more day"
             ),
             "{lines}"
         );
         assert!(lines.contains("Not carried at the last change"), "{lines}");
         assert!(lines.contains("  ghost.md in lab"), "{lines}");
+        // A file's name is printed as local history prints names, and no
+        // more than its first characters (§16).
+        let cut = format!(
+            "  ghost\\u{{1b}}[2K\\r\\u{{202e}}.md{}... in lab",
+            "x".repeat(cordelia_core::protocol::FILE_NAME_SHOWN_CHARS - 14)
+        );
+        assert!(lines.contains(&cut), "{lines}");
+        assert!(!lines.contains('\u{1b}'), "{lines}");
+        assert!(!lines.contains('\u{202e}'), "{lines}");
+        assert_eq!(file_shown("plain.md"), "plain.md");
+        // So is a line of the status that names one.
+        let (_, says) = status_lines(&json!({
+            "short": "x",
+            "says": ["what this device held of 1 file: gh\u{1b}[2Kost.md in lab"],
+        }));
+        assert_eq!(
+            says,
+            ["what this device held of 1 file: gh\\u{1b}[2Kost.md in lab"]
+        );
 
         // With nothing to say of names, nothing is said of them.
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],

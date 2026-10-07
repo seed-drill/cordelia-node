@@ -7,7 +7,9 @@
 //! channel goes through [`take`], and the entry of a pair channel is
 //! given to [`accept`] with the key that a person typed.
 
+use std::collections::HashMap;
 use std::ops::Index;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
@@ -28,15 +30,18 @@ use cordelia_crypto::version::{self, Slot};
 use cordelia_crypto::{item_decrypt, item_encrypt};
 use cordelia_storage::db;
 use cordelia_storage::entries;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, State};
 
 use crate::adding::{Accepted, Added, accept, add_device};
+use crate::carry::{Allows, Word};
 use crate::change::make_change;
 use crate::person::{
     Applied, Held, Shown, applied_name, applied_secret, first_statement, held, hold_name,
     kept_entry, latest_entry, shown, who_counts,
 };
 use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProvedBy};
 use crate::take::{Taken, take};
 
 pub(crate) const WORDS: &str =
@@ -448,6 +453,146 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
         own_channels: Default::default(),
         held: Default::default(),
         history: Default::default(),
+    }
+}
+
+// ── A node with a network, and a stand-in for its loop ───────────────
+
+fn db(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
+    state.db.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The clock that a route goes by, in seconds.
+fn wall_clock() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// What the relay of a test holds: for each channel, its entries, as
+/// their bytes on the wire.
+pub(crate) type AtTheRelay = Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>;
+
+/// What was asked through the door: each channel, with whether the
+/// node proved its key itself.
+pub(crate) type Asked = Arc<Mutex<Vec<([u8; 32], bool)>>>;
+
+/// A node of a test: its state, with a network; what its one relay
+/// holds; and what was asked through the door, each channel with
+/// whether the node proved its key itself.
+pub(crate) struct Node {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) relay: AtTheRelay,
+    pub(crate) asked: Asked,
+    /// What the stand-in did, in order: `pass` for a whole pass, which
+    /// shows the change entry to every relay first, and `read` for a
+    /// channel read through the door.
+    pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
+    /// Whether the relay hands a channel in part, and not to its end.
+    pub(crate) in_part: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The session of the connection to the relay of a test.
+pub(crate) const SESSION: [u8; 32] = [5; 32];
+
+impl Node {
+    /// The node of `machine`, with a stand-in for its loop: asked for
+    /// a whole pass it makes one; asked through the door it answers
+    /// for its one relay, `relay`, with what that holds of the
+    /// channel.
+    pub(crate) fn of(machine: Machine) -> Self {
+        let mut state = state_of(machine);
+        state.push_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        let state = Arc::new(state);
+        let relay: AtTheRelay = Default::default();
+        let asked: Asked = Default::default();
+        let did: Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let (passes, order) = (Arc::clone(&state), Arc::clone(&did));
+        tokio::spawn(async move {
+            loop {
+                passes.own_channels.wait_asked().await;
+                let pass = passes.own_channels.whole_pass_begins();
+                order.lock().unwrap().push("pass");
+                passes.own_channels.whole_pass_ended(pass);
+            }
+        });
+        let (node, holds, log) = (Arc::clone(&state), Arc::clone(&relay), Arc::clone(&asked));
+        let order = Arc::clone(&did);
+        let in_part: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let part = Arc::clone(&in_part);
+        tokio::spawn(async move {
+            loop {
+                match node.own_channels.wait_door().await {
+                    DoorAsk::Sessions { answer } => {
+                        let _ = answer.send(vec![("relay".to_string(), Some(SESSION))]);
+                    }
+                    DoorAsk::Read {
+                        channel,
+                        by,
+                        answer,
+                        ..
+                    } => {
+                        let by_secret = matches!(by, ProvedBy::Secret(_));
+                        log.lock().unwrap().push((channel, by_secret));
+                        order.lock().unwrap().push("read");
+                        let read = match holds.lock().unwrap().get(&channel) {
+                            None => LeftRead::NotHeld,
+                            Some(entries) => LeftRead::Read {
+                                entries: entries.clone(),
+                                whole: !part.load(std::sync::atomic::Ordering::SeqCst),
+                            },
+                        };
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read,
+                        }]);
+                    }
+                }
+            }
+        });
+        Self {
+            state,
+            relay,
+            asked,
+            did,
+            in_part,
+        }
+    }
+
+    /// The relay holds `entries` of the channel whose secret is
+    /// `secret`.
+    pub(crate) fn relay_holds(&self, secret: &[u8; 32], entries: &[CheckedEntry]) {
+        let channel = derive::channel_id(secret).unwrap();
+        let wire = entries.iter().map(|entry| entry.to_wire()).collect();
+        self.relay.lock().unwrap().insert(channel, wire);
+    }
+
+    /// The text of `file` in `name`, as the node reads it.
+    pub(crate) fn text(&self, name: &str, file: &str) -> Option<String> {
+        let conn = db(&self.state);
+        match read(&conn, name, file).ok()?.slot.current?.value {
+            Value::Text(text) => Some(text),
+            other => Some(format!("{other:?}")),
+        }
+    }
+
+    /// How many entries the node's store holds.
+    pub(crate) fn stored(&self) -> i64 {
+        let conn = db(&self.state);
+        conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A word of `phrase` for `allows`, given now on this node's
+    /// device, under the change entry that it keeps.
+    pub(crate) fn word(&self, phrase: &Phrase, allows: &Allows) -> Word {
+        let under = latest_entry(&db(&self.state)).unwrap().id();
+        let own = self.state.identity.public_key();
+        Word::give(phrase, &own, &under, allows.says().unwrap(), wall_clock()).unwrap()
+    }
+
+    /// A folder of this device's is mapped to `name`.
+    pub(crate) fn maps_a_folder(&self, name: &str) {
+        let mapped = serde_json::json!([{ "folder": "/home/sam/notes", "name": name }]).to_string();
+        meta::set(&db(&self.state), meta::SYNC_CLAUDE_MAPPINGS, &mapped).unwrap();
     }
 }
 
@@ -1572,7 +1717,7 @@ mod tests {
             name: "lab".into(),
             file: "ghost.md".into(),
         };
-        assert_eq!(seen.not_carried, [ghost]);
+        assert_eq!(seen.not_carried, std::slice::from_ref(&ghost));
         assert!(
             seen.says.iter().any(|line| line.contains("ghost.md in lab")
                 && line.contains("meets its channel as a new file does")),
@@ -1587,6 +1732,55 @@ mod tests {
             meta::get(&s[0].conn, meta::PERSON_NOT_CARRIED).unwrap(),
             None
         );
+
+        // A file is said no longer once it has met its channel: a folder
+        // has a record of it in the channel of its name. Until then it
+        // stays, whatever else the folder has a record of there, and
+        // whatever a folder has a record of under that file's name in
+        // another channel. A file under a name that the device does not
+        // hold stays too: the name may be one that could not be held in
+        // this cycle, for an error. It goes where the device stops the
+        // name, on purpose.
+        let conn = &s[0].conn;
+        let noted = |conn: &rusqlite::Connection| -> Vec<NotCarried> {
+            let now = crate::several::START;
+            let seen = look(conn, &s[0].identity, &AtRelays::default(), now).unwrap();
+            seen.not_carried
+        };
+        let gone = NotCarried {
+            name: "held-no-more".into(),
+            file: "left.md".into(),
+        };
+        let note = |files: &[&NotCarried]| {
+            let files: Vec<(String, String)> = files
+                .iter()
+                .map(|file| (file.name.clone(), file.file.clone()))
+                .collect();
+            crate::look::note_not_carried(conn, &files).unwrap();
+        };
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        note(&[&ghost, &gone]);
+        let channel = written(&s[0], "lab");
+        let record = agreed(&s[0], 1, "met");
+        sync_state::save(conn, folder, &channel, "other.md", &record).unwrap();
+        sync_state::save(conn, folder, "another-channel", "ghost.md", &record).unwrap();
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        assert_eq!(noted(conn), [ghost.clone(), gone.clone()]);
+        sync_state::save(conn, folder, &channel, "ghost.md", &record).unwrap();
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 1);
+        assert_eq!(noted(conn), std::slice::from_ref(&gone));
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        assert_eq!(noted(conn), std::slice::from_ref(&gone));
+        // The name is stopped: its files are noted no longer, and those
+        // of another name are.
+        note(&[&ghost, &gone]);
+        let now = crate::several::START;
+        names::stop(conn, &s[0].identity, "held-no-more", now).unwrap();
+        assert_eq!(noted(conn), std::slice::from_ref(&ghost));
+        names::stop(conn, &s[0].identity, "lab", now).unwrap();
+        assert!(noted(conn).is_empty());
+        assert_eq!(meta::get(conn, meta::PERSON_NOT_CARRIED).unwrap(), None);
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
     }
 
     /// Each device that applies a statement writes so in the new personal
@@ -1801,6 +1995,176 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Since when names have waited to be sent (decision 2026-10-04
+    /// §10.1): the earliest time from which the first entry that waits
+    /// at one of the relays asked about has waited there. An entry waits
+    /// at a relay from the later of when the device stored it and when
+    /// that relay was last connected. Nothing where nothing waits, and
+    /// nothing where no relay is asked about.
+    #[test]
+    fn test_since_when_names_have_waited_to_be_sent() {
+        use crate::leaving::names_waiting_since;
+        let mut s = Several::of_one_person(1);
+        s.hold(&[0], "lab");
+        s.hold(&[0], "team");
+        s.write(0, "lab", "notes.md", "one");
+        s.write(0, "team", "notes.md", "one");
+        s.write(0, "team", "more.md", "two");
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
+        // Each relay with when it was last connected.
+        let since =
+            |relays: &[([u8; 32], i64)]| names_waiting_since(conn, identity, relays).unwrap();
+        // Both connected before anything was stored.
+        let long = |relays: &[[u8; 32]]| {
+            let relays: Vec<([u8; 32], i64)> = relays.iter().map(|relay| (*relay, 0)).collect();
+            since(&relays)
+        };
+        let channel = |name: &str| held_rows::channel_of_name(conn, name).unwrap().unwrap();
+        let (lab, team) = (channel("lab"), channel("team"));
+        // Each entry was stored at a time of its own.
+        let held =
+            |channel: &[u8; 32]| entries::channel_entries_after(conn, channel, 0, 8).unwrap();
+        let stored = |channel: &[u8; 32], at: &[i64]| {
+            for (held, at) in held(channel).iter().zip(at) {
+                conn.execute(
+                    "UPDATE entries SET stored_at = ?1 WHERE seq = ?2",
+                    rusqlite::params![at, held.seq],
+                )
+                .unwrap();
+            }
+        };
+        stored(&lab, &[500]);
+        stored(&team, &[300, 400]);
+
+        // The first that waits, of the earliest name.
+        assert_eq!(long(&[relay]), Some(300));
+        assert_eq!(long(&[]), None);
+        // A relay that connected after the entries were stored: they
+        // have waited there since it connected, and no longer.
+        assert_eq!(since(&[(relay, 450)]), Some(450));
+        assert_eq!(since(&[(relay, 350)]), Some(350));
+        assert_eq!(since(&[(relay, 9_000)]), Some(9_000));
+        // Of two relays, the earlier of the two times: at the one that
+        // has been there throughout, since the entry was stored.
+        assert_eq!(since(&[(relay, 9_000), (other_relay, 0)]), Some(300));
+        assert_eq!(since(&[(relay, 9_000), (other_relay, 8_000)]), Some(8_000));
+        // The first of `team` is sent: its second waits, from when it
+        // was stored.
+        kept_rows::sent(conn, &relay, &team, held(&team)[0].seq).unwrap();
+        assert_eq!(long(&[relay]), Some(400));
+        // What was stored after the relay connected waits from when it
+        // was stored.
+        assert_eq!(since(&[(relay, 350)]), Some(400));
+        assert_eq!(since(&[(relay, 450)]), Some(450));
+        // At another relay everything waits still.
+        assert_eq!(long(&[relay, other_relay]), Some(300));
+        assert_eq!(long(&[other_relay, relay]), Some(300));
+        // Everything is sent to the one: nothing waits there.
+        kept_rows::sent(conn, &relay, &team, i64::MAX / 2).unwrap();
+        assert_eq!(long(&[relay]), Some(500));
+        kept_rows::sent(conn, &relay, &lab, i64::MAX / 2).unwrap();
+        assert_eq!(long(&[relay]), None);
+        assert_eq!(since(&[(relay, 9_000)]), None);
+        // What a relay had no room for waits from when it was stored,
+        // or from when the relay connected.
+        kept_rows::refused(conn, &relay, &team, held(&team)[1].seq).unwrap();
+        assert_eq!(long(&[relay]), Some(400));
+        assert_eq!(since(&[(relay, 700)]), Some(700));
+        // The personal channel is no name: what waits of it is not said.
+        let alone = Machine::new(7);
+        assert_eq!(
+            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)]).unwrap(),
+            None
+        );
+    }
+
+    /// A look says when the device applied the change that stands: when
+    /// it left the generation before, where it left one (decision
+    /// 2026-10-04 §10.1). A status counts some things only for a time
+    /// from then.
+    #[test]
+    fn test_a_look_says_when_the_device_applied_the_change() {
+        let mut s = Several::of_one_person(2);
+        let seen = |s: &Several, n: usize| {
+            look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
+        };
+        // Under the first statement, no generation was left.
+        assert_eq!(seen(&s, 0).applied_at, None);
+        assert_eq!(seen(&s, 1).applied_at, None);
+        let change = s.change(0, &[0, 1], &[]);
+        let made = s.now;
+        assert_eq!(seen(&s, 0).applied_at, Some(made));
+        assert_eq!(seen(&s, 1).applied_at, None, "it has not applied it");
+        let later = s.tick() + 600;
+        take(&s[1].conn, &s[1].identity, &change, later).unwrap();
+        assert_eq!(seen(&s, 1).change, Some(2));
+        assert_eq!(seen(&s, 1).applied_at, Some(later));
+        // The later of two.
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(seen(&s, 0).applied_at, Some(s.now));
+        assert_eq!(seen(&s, 0).change, Some(3));
+    }
+
+    /// A look says whether the change that the device applied removed a
+    /// key that the statement before had not, as the device found it
+    /// when it applied the change (decision 2026-10-04 §10.1). A renewal
+    /// removes nobody, though its statement lists every key removed so
+    /// far: a status does not then say that a removal is not yet applied.
+    #[test]
+    fn test_a_look_says_whether_the_change_removed_a_key() {
+        let mut s = Several::of_one_person(3);
+        let seen = |s: &Several, n: usize| {
+            look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
+        };
+        let removed = |s: &Several, n: usize| {
+            let seen = seen(s, n);
+            (seen.removed_a_key, seen.removed.len())
+        };
+        // Under the first statement nobody was removed.
+        assert_eq!(removed(&s, 0), (false, 0));
+        // Device 2 is removed: on the device that made the change, and
+        // on one that applies it.
+        let removal = s.change(0, &[0, 1], &[2]);
+        assert_eq!(removed(&s, 0), (true, 1));
+        assert_eq!(removed(&s, 1), (false, 0));
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &removal, now).unwrap();
+        assert_eq!(removed(&s, 1), (true, 1));
+        // A renewal: its statement lists the key removed before, and
+        // removes nobody.
+        let renewal = s.change(0, &[0, 1], &[]);
+        assert_eq!(removed(&s, 0), (false, 1));
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+        assert_eq!(seen(&s, 1).change, Some(3));
+        assert_eq!(removed(&s, 1), (false, 1));
+        // A device that leaves its phrase keeps nothing of it.
+        s.change(0, &[0], &[1]);
+        assert_eq!(removed(&s, 0), (true, 2));
+        let now = s.tick();
+        crate::leaving::forget(&s[0].conn, &s[0].identity, false, now).unwrap();
+        assert_eq!(
+            meta::get(&s[0].conn, meta::PERSON_REMOVED_A_KEY).unwrap(),
+            None
+        );
+    }
+
+    /// A device that applies a removal after it was behind sees the key
+    /// removed against the statement it held (decision 2026-10-04 §10.1):
+    /// where it comes to a renewal that was made after a removal it never
+    /// applied, a key was removed since what it held.
+    #[test]
+    fn test_a_device_that_was_behind_sees_a_key_removed_since_what_it_held() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let renewal = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+        let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
+        assert_eq!((seen.change, seen.removed_a_key), (Some(3), true));
     }
 
     /// What another device wrote as a name and is none is not shown by a

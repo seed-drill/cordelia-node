@@ -541,9 +541,10 @@ impl Row {
 /// - on a device that is alone under a phrase with sync on;
 /// - where the device stands in another row now than the yes was for:
 ///   the command asks again ([`PersonError::ChangedSincePrompt`]);
-/// - a ninth key, where the device keeps eight. A key that it keeps
-///   already is typed again in its place. What was typed more than a day
-///   ago is forgotten first.
+/// - a ninth key, where eight are within their hour. A key that is
+///   within its hour is typed again in its place. One whose hour has
+///   gone holds no place: it is kept for a day only to say what became
+///   of it, and what was typed more than a day ago is forgotten first.
 pub fn type_key(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -566,8 +567,14 @@ pub fn type_key(
         }
         // What became of a key typed long ago is kept no longer.
         acts::forget_typed_keys(conn, now - TYPED_KEY_KEPT_SECS)?;
+        // The bound is on the keys that still read their pair channel:
+        // those within their hour.
         let kept = acts::typed_keys(conn)?;
-        if kept.len() >= MAX_TYPED_KEYS && !kept.iter().any(|typed| typed.key == *key) {
+        let within: Vec<&acts::TypedKey> = kept
+            .iter()
+            .filter(|typed| now - typed.typed_at < PAIR_KEY_TYPED_SECS)
+            .collect();
+        if within.len() >= MAX_TYPED_KEYS && !within.iter().any(|typed| typed.key == *key) {
             return Err(PersonError::TooManyTypedKeys);
         }
         acts::type_key(conn, key, stood.name(), now)?;
@@ -1243,6 +1250,10 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     sync_state::forget_folders_except(conn, &[])?;
     held_rows::forget_names_before(conn, None)?;
     meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
+    meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?;
+    meta::remove(conn, meta::PERSON_NAMES_CARRIED)?;
+    meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
+    meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     Ok(())
 }
 
@@ -2141,40 +2152,78 @@ mod tests {
         assert!(acts::typed_keys(&on.conn).unwrap().is_empty());
     }
 
-    /// A device keeps at most eight typed keys, and a ninth is refused
-    /// (decision 2026-10-04 §16). A key that it keeps is typed again in
-    /// its place, and one that was typed more than a day ago makes room.
+    /// A device keeps at most eight typed keys that are within their
+    /// hour, and a ninth is refused (decision 2026-10-04 §16). A key that
+    /// is within its hour is typed again in its place. One whose hour
+    /// has gone holds no place, though it is kept for a day to say what
+    /// became of it; and one that was typed more than a day ago is
+    /// forgotten.
     #[test]
     fn test_a_device_keeps_eight_typed_keys_and_refuses_a_ninth() {
+        use cordelia_core::protocol::{PAIR_KEY_TYPED_SECS, TYPED_KEY_KEPT_SECS};
         let s = Several::new(1);
         let (on, now) = (&s[0], s.now);
         let key = |n: u16| crate::several::identity_of(100 + n).public_key();
         let types =
             |n: u16, at: i64| type_key(&on.conn, &on.identity, &key(n), Row::NoPhrase, false, at);
+        let kept = || acts::typed_keys(&on.conn).unwrap().len();
         for n in 0..8 {
             types(n, now + i64::from(n)).unwrap();
         }
-        assert!(matches!(
-            types(8, now + 8),
-            Err(PersonError::TooManyTypedKeys)
-        ));
-        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
+        let refused = types(8, now + 8).unwrap_err();
+        assert!(matches!(refused, PersonError::TooManyTypedKeys));
+        assert!(
+            refused
+                .to_string()
+                .contains("each holds its place for an hour from when it was typed"),
+            "{refused}"
+        );
+        assert_eq!(kept(), 8);
         assert_eq!(acts::typed_key(&on.conn, &key(8)).unwrap(), None);
         // One of the eight, typed again.
         types(3, now + 9).unwrap();
         let again = acts::typed_key(&on.conn, &key(3)).unwrap().unwrap();
         assert_eq!(again.typed_at, now + 9);
-        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
-        // A day after the first was typed it is kept no longer, and
-        // there is room for one.
-        let a_day_on = now + cordelia_core::protocol::TYPED_KEY_KEPT_SECS + 1;
-        types(8, a_day_on).unwrap();
-        assert_eq!(acts::typed_keys(&on.conn).unwrap().len(), 8);
-        assert_eq!(acts::typed_key(&on.conn, &key(0)).unwrap(), None);
+        assert_eq!(kept(), 8);
+
+        // Until the hour of the first has gone there is no room: at its
+        // last second a ninth is refused still.
+        let an_hour_on = now + PAIR_KEY_TYPED_SECS;
         assert!(matches!(
-            types(9, a_day_on),
+            types(8, an_hour_on - 1),
             Err(PersonError::TooManyTypedKeys)
         ));
+        // The hour of the first has gone: it holds no place, and a ninth
+        // key is taken. The first is kept all the same, to say what
+        // became of it.
+        types(8, an_hour_on).unwrap();
+        assert_eq!(kept(), 9);
+        assert!(acts::typed_key(&on.conn, &key(0)).unwrap().is_some());
+        // Eight are within their hour again (1, 2, and 4 to 8, and 3):
+        // another is refused, and so is the first, typed again, which
+        // would be a ninth.
+        for n in [9, 0] {
+            assert!(
+                matches!(types(n, an_hour_on), Err(PersonError::TooManyTypedKeys)),
+                "{n}"
+            );
+        }
+        // Five seconds on, the hours of five more have gone (1, 2, 4 and
+        // 5; 3 was typed again later): there is room for four.
+        for n in [9, 10, 11, 0] {
+            types(n, an_hour_on + 5).unwrap();
+        }
+        assert!(matches!(
+            types(12, an_hour_on + 5),
+            Err(PersonError::TooManyTypedKeys)
+        ));
+        assert_eq!(kept(), 12);
+
+        // A day after it was typed a key is kept no longer.
+        let a_day_on = now + TYPED_KEY_KEPT_SECS + 2;
+        types(12, a_day_on).unwrap();
+        assert_eq!(acts::typed_key(&on.conn, &key(1)).unwrap(), None);
+        assert!(acts::typed_key(&on.conn, &key(2)).unwrap().is_some());
     }
 
     /// A hand-over that is refused spends no key: what became of it is

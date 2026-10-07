@@ -74,7 +74,7 @@ pub const KEY_FILE: &str = "identity.key";
 /// node is to be started again: until then it makes nothing for a
 /// command, under a key that is the device's no longer. A node whose
 /// directory holds no key file has the key it was given, and is asked.
-fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
+pub(crate) fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     auth::check_bearer(req, state)?;
     let on_disk = std::fs::read(state.home_dir.join(KEY_FILE))
         .ok()
@@ -92,7 +92,7 @@ fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
 /// A refusal, as the API answers it: what a person did that is refused is
 /// a bad request, what changed under a prompt is a conflict, and what the
 /// device could not read or write is the node's own failure.
-fn refused(e: PersonError) -> ApiError {
+pub(crate) fn refused(e: PersonError) -> ApiError {
     match &e {
         PersonError::ChangedSincePrompt => ApiError::Conflict(says(&e)),
         PersonError::Storage(_) | PersonError::Held(_) | PersonError::Crypto(_) => {
@@ -230,6 +230,25 @@ fn not_reached(state: &AppState, at: &crate::state::AtRelays) -> Vec<String> {
         .collect()
 }
 
+/// The relays that this node is connected to now, each by its node key
+/// and by when it was last connected, in seconds, at `now`: the node
+/// counts for how long each has been connected by its own clock, which
+/// does not run while the machine sleeps.
+fn relays_reached_since(state: &AppState, now: i64) -> Vec<([u8; 32], i64)> {
+    let peers = state.peers.read().unwrap_or_else(|e| e.into_inner());
+    peers
+        .iter()
+        .filter(|peer| peer.role == "relay")
+        .filter_map(|peer| {
+            let connected_for = i64::try_from(peer.connected_secs).unwrap_or(i64::MAX);
+            Some((
+                decode_public_key(&peer.key).ok()?,
+                now.saturating_sub(connected_for),
+            ))
+        })
+        .collect()
+}
+
 /// How many of this device's own channels have something that waits to
 /// be sent to a relay the node is connected to: the most that wait at
 /// any one of them. None on a node that follows no phrase, and none
@@ -254,12 +273,19 @@ fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
         .into_iter()
         .map(|(_, key)| key)
         .collect();
-    let names = leaving::names_to_go(&db(state), &state.identity, &relays).map_err(refused)?;
+    let reached_since = relays_reached_since(state, now());
+    let conn = db(state);
+    let names = leaving::names_to_go(&conn, &state.identity, &relays).map_err(refused)?;
+    // Since when the first of what is still to go has waited: at each
+    // relay, from the later of when it was stored and when that relay
+    // was last connected.
+    let since =
+        leaving::names_waiting_since(&conn, &state.identity, &reached_since).map_err(refused)?;
     let (to_go, sent): (Vec<_>, Vec<_>) = names.into_iter().partition(|(_, to_go)| *to_go);
     let named = |names: Vec<(String, bool)>| -> Vec<String> {
         names.into_iter().map(|(name, _)| name).collect()
     };
-    Ok(json!({ "sent": named(sent), "to_go": named(to_go) }))
+    Ok(json!({ "sent": named(sent), "to_go": named(to_go), "to_go_since": since }))
 }
 
 /// The files whose record a change could not carry, as an answer lists
@@ -286,6 +312,17 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
         (seen, sync_is_on(&conn)?, folders_mapped(&conn)?)
     };
     let mut answer = serde_json::to_value(&seen).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // For how long each relay has been connected, by the node's own
+    // clock: a status counts a relay that does not hold the latest
+    // change only once it has been connected for some minutes (decision
+    // 2026-10-04 §10.1).
+    let at_now = std::time::Instant::now();
+    for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+        let connected = relay["relay"]
+            .as_str()
+            .and_then(|name| state.own_channels.connected_for(name, at_now));
+        relay["connected_secs"] = connected.map(|connected| connected.as_secs()).into();
+    }
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
     answer["waiting"] = waiting(&state)?.into();
@@ -537,11 +574,16 @@ pub async fn phrase_make(
     // It counts as a change of settings, and waits for a sync cycle that
     // is running to stop: the device's folders forget what they had
     // agreed where a phrase is replaced, and nothing of a cycle that
-    // began before is published or recorded after (§4.2, §5.2).
+    // began before is published or recorded after (§4.2, §5.2). Where a
+    // phrase was replaced the device has left one: the node keeps no
+    // note of which relays had handed its channels.
     let applied = state
-        .as_a_change(|conn| {
-            leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
-        })
+        .as_a_leaving(
+            |conn| {
+                leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
+            },
+            |applied| applied.is_ok(),
+        )
         .map_err(refused)?;
     state.own_channels.written();
     state.own_channels.ask_whole();
@@ -614,9 +656,13 @@ pub async fn forget(
 ) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
     // As a change of settings: its folders forget what they had agreed,
-    // and no cycle that began before records anything after.
+    // and no cycle that began before records anything after. The node
+    // keeps no note of which relays had handed the channels it held.
     let forgot = state
-        .as_a_change(|conn| leaving::forget(conn, &state.identity, false, now()))
+        .as_a_leaving(
+            |conn| leaving::forget(conn, &state.identity, false, now()),
+            |forgot| matches!(forgot, Ok(true)),
+        )
         .map_err(refused)?;
     Ok(HttpResponse::Ok().json(json!({ "forgot": forgot })))
 }
@@ -633,7 +679,7 @@ pub struct PrepareRequest {
 /// What became of something that a command had the node do, and waited
 /// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Waited {
+pub(crate) enum Waited {
     /// One that began after the asking ended, and went to its end.
     Done,
     /// One that began after the asking ended early: it did not do all
@@ -658,7 +704,7 @@ enum Waited {
 /// reads on. (A device in a fork has no leave anywhere, and is not asked
 /// again.) A node with no network has nobody to ask, and nothing is
 /// waited for.
-async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
+pub(crate) async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
     if state.push_tx.is_none() {
         return Waited::Done;
     }
@@ -1172,6 +1218,20 @@ mod tests {
         s.write(0, "lab", "notes.md", "one");
         s.write(0, "team", "notes.md", "one");
         let state = state_of(s.machines.remove(0));
+        // The names, and since when the first of what is still to go has
+        // waited: a time where something waits, and none where nothing
+        // does.
+        let names_sent = |state: &AppState| -> Result<serde_json::Value, ApiError> {
+            let mut names = super::names_sent(state)?;
+            let since = names
+                .as_object_mut()
+                .unwrap()
+                .remove("to_go_since")
+                .unwrap();
+            let waits = !names["to_go"].as_array().unwrap().is_empty();
+            assert_eq!(since.as_i64().is_some(), waits, "{names}: {since}");
+            Ok(names)
+        };
         // No relay is connected: nothing is known to wait anywhere.
         assert_eq!(channels_waiting(&state), 0);
         assert_eq!(
@@ -1205,12 +1265,31 @@ mod tests {
             names_sent(&state).unwrap(),
             json!({ "sent": [], "to_go": ["lab", "team"] })
         );
+        // Since when: at a relay, from the later of when the entry was
+        // stored and when that relay was last connected (decision
+        // 2026-10-04 §10.1). These relays connected a second ago, long
+        // after the entries were stored: they have waited a second.
+        let since = |state: &AppState| super::names_sent(state).unwrap()["to_go_since"].clone();
+        let stored_at = 1_000;
+        db(&state)
+            .execute("UPDATE entries SET stored_at = ?1", [stored_at])
+            .unwrap();
+        let a_moment_ago = since(&state).as_i64().unwrap();
+        assert!(
+            (now() - 5..=now()).contains(&a_moment_ago),
+            "{a_moment_ago}"
+        );
+        // One of them has been connected since before they were stored:
+        // there they have waited since then.
+        state.peers.write().unwrap()[1].connected_secs = (now() - stored_at + 60) as u64;
+        assert_eq!(since(&state), json!(stored_at));
         // A peer that is no relay is not asked about.
         let mut peers = state.peers.write().unwrap();
         peers[0].role = "node".into();
         peers[1].role = "node".into();
         drop(peers);
         assert_eq!(channels_waiting(&state), 0);
+        assert!(since(&state).is_null());
     }
 
     /// A command that makes a change is handed the names that the

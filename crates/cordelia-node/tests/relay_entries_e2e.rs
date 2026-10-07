@@ -1044,6 +1044,33 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
     let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
     assert_eq!(stats["storage_used_bytes"], entry_cost(64), "{stats}");
     assert_eq!(stats["storage_max_bytes"], 3 * SMALL, "{stats}");
+    // It says this kind's beside it, against the cap of its own: an
+    // operator sees the room of the channels from their secrets.
+    assert_eq!(
+        stats["entries"],
+        serde_json::json!({
+            "storage_used_bytes": 3 * SMALL,
+            "storage_max_bytes": 3 * SMALL,
+            "channels_held": 3,
+            "entries_stored": 3,
+            "content_bytes_stored": 3 * 256,
+        }),
+        "{stats}"
+    );
+    let plain = relay.cli(&["stats"]);
+    assert!(
+        plain.contains(
+            "Storage:          1.1 KB in use of 3.8 KB allowed, by channels of the older kind"
+        ),
+        "{plain}"
+    );
+    assert!(
+        plain.contains(
+            "                  3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
+             (3 held, 3 entries)"
+        ),
+        "{plain}"
+    );
 
     // The older kind is filled to its own cap, by its own rule: a write
     // that takes it over drops its newest channel. This kind's channels

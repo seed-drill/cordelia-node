@@ -10,7 +10,8 @@ use std::time::Duration;
 use actix_web::{App, test, web};
 use serde_json::{Value, json};
 
-use cordelia_api::change::prepare_change;
+use cordelia_api::carry::{Allows, Word};
+use cordelia_api::change::{prepare_change, prepare_recovery, read_with};
 use cordelia_api::person::first_entry;
 use cordelia_api::state::AppState;
 use cordelia_crypto::addition::SignedAddition;
@@ -18,7 +19,7 @@ use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::entry::Entry;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::Phrase;
-use cordelia_crypto::statement::SignedStatement;
+use cordelia_crypto::statement::{Device, SignedStatement};
 use cordelia_storage::at_relays as kept_rows;
 
 const TOKEN: &str = "test-token-secret";
@@ -245,6 +246,65 @@ async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
     assert_eq!(woken(&state).await, (false, false));
 }
 
+/// A device that leaves the phrase it follows keeps no note of which
+/// relays had handed its channels (decision 2026-10-04 §6): its store
+/// holds nothing of them, and its folders have forgotten what they had
+/// agreed. Where it comes back to the generation it left, in the same run
+/// of the node, a folder's first cycle waits until its channel was
+/// fetched again, and does not publish every file a second time. So it is
+/// where a phrase is replaced, and where the device forgets its person.
+#[actix_web::test]
+async fn test_a_device_that_leaves_its_phrase_keeps_no_note_of_what_was_fetched() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    state.own_channels.set_up_with(1);
+    let channel = [8u8; 32];
+    let noted = std::time::Instant::now();
+    let fetched = |state: &AppState| state.own_channels.first_fetch_done(&channel, noted);
+    let note = |state: &AppState| state.own_channels.fetched_from(&channel, "relay", noted);
+
+    // A phrase is made on a device that follows none: it leaves nothing.
+    let (status, said) = makes_the_phrase!(app, state);
+    assert_eq!((status, &said["change"]), (200, &json!(1)), "{said}");
+    note(&state);
+    assert!(fetched(&state));
+    // A request that is refused leaves nothing either: the device is
+    // alone under a phrase, and the yes was for a device that follows
+    // none.
+    let (status, said) = makes_the_phrase!(app, state);
+    assert_eq!(status, 409, "{said}");
+    assert!(fetched(&state));
+
+    // The phrase is replaced: the device has left the one it followed.
+    let other = Phrase::generate().unwrap();
+    let made = first_entry(&other, &state.identity.public_key(), "laptop").unwrap();
+    let body = json!({
+        "entry": hex::encode(made.entry.to_wire()),
+        "statement_key": hex::encode(made.statement_key),
+        "from": "alone",
+    });
+    let (status, said) = asks!(app, "/api/v1/phrase/make", body);
+    assert_eq!((status, &said["change"]), (200, &json!(1)), "{said}");
+    assert!(!fetched(&state));
+
+    // The device forgets what it holds of its person, as one that is
+    // given a new key does. Asked again, it follows no phrase and has
+    // nothing to leave.
+    note(&state);
+    let (status, said) = asks!(app, "/api/v1/devices/forget", json!({}));
+    assert_eq!((status, &said["forgot"]), (200, &json!(true)), "{said}");
+    assert!(!fetched(&state));
+    note(&state);
+    let (status, said) = asks!(app, "/api/v1/devices/forget", json!({}));
+    assert_eq!((status, &said["forgot"]), (200, &json!(false)), "{said}");
+    assert!(fetched(&state));
+}
+
 /// Before a change is prepared the node is asked for a whole pass, and
 /// what it hands over is handed once a pass that began after that has
 /// ended: the device has shown its change entry to each relay, and
@@ -344,7 +404,250 @@ fn routes() -> Vec<(&'static str, Value)> {
             "/api/v1/change/make",
             json!({ "entry": "00", "over": "00" }),
         ),
+        ("/api/v1/carry", json!({ "name": "lab" })),
+        ("/api/v1/carry/from/look", json!({ "name": "lab" })),
+        ("/api/v1/carry/from", json!({ "word": no_word() })),
+        ("/api/v1/carry/phrase/look", json!({ "name": "lab" })),
+        (
+            "/api/v1/carry/read",
+            json!({ "channel": "00", "proofs": [] }),
+        ),
+        ("/api/v1/carry/read/part", json!({ "read": 1, "from": 0 })),
+        (
+            "/api/v1/carry/handed",
+            json!({ "word": no_word(), "versions": [] }),
+        ),
+        ("/api/v1/recover/look", json!({})),
+        (
+            "/api/v1/recover/make",
+            json!({ "entry": "00", "statement_key": "00", "left": [], "word": no_word() }),
+        ),
+        ("/api/v1/recover/progress", json!({})),
     ]
+}
+
+/// A word that nobody gave, as a request carries one.
+fn no_word() -> Value {
+    json!({ "what": "", "until": 0, "signature": "" })
+}
+
+/// A carry that a person asks for, at the route (decision 2026-10-04
+/// §7.3). It is refused on a device that follows no phrase, and for what
+/// is no name. A device that has left no generation has nothing to read,
+/// and says so, with nothing held. One that has left one comes to hold
+/// the name, and lists it, so that its new channel is fetched and what
+/// is carried is sent; with no network it reads nothing, of no relay,
+/// and says that it did not read to the end.
+#[actix_web::test]
+async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_was_left() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let carry = json!({ "name": "lab" });
+    // No phrase.
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string().contains("follows no recovery phrase"),
+        "{said}"
+    );
+
+    // Under its first statement: no generation was left.
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    woken(&state).await;
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 200, "{said}");
+    assert!(
+        said["nothing"]
+            .as_str()
+            .unwrap()
+            .contains("holds the secret of no generation that it left"),
+        "{said}"
+    );
+    assert_eq!(said["held_anew"], false);
+    let held = |state: &AppState| {
+        let db = state.db.lock().unwrap();
+        cordelia_storage::person::channel_of_name(&db, "lab").unwrap()
+    };
+    assert_eq!(held(&state), None);
+    assert_eq!(woken(&state).await, (false, false));
+
+    // A change is made: the device has left a generation.
+    let (_, handed) = asks!(app, "/api/v1/change/prepare", json!({}));
+    let applied =
+        SignedStatement::from_bytes(&hex::decode(handed["statement"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let kept = Entry::from_wire(&hex::decode(handed["entry"].as_str().unwrap()).unwrap())
+        .unwrap()
+        .check()
+        .unwrap();
+    let own = state.identity.public_key();
+    let phrase = Phrase::parse(WORDS).unwrap();
+    let entry = prepare_change(&applied, &own, applied.statement.devices.clone(), &[])
+        .unwrap()
+        .sign(&phrase, &kept, None)
+        .unwrap();
+    let body = json!({ "entry": hex::encode(entry.to_wire()), "over": handed["over"] });
+    let (status, made) = asks!(app, "/api/v1/change/make", body);
+    assert_eq!(status, 200, "{made}");
+    woken(&state).await;
+
+    // What is no name is refused, with nothing held.
+    let (status, said) = asks!(app, "/api/v1/carry", json!({ "name": "Not A Name" }));
+    assert_eq!(status, 400, "{said}");
+
+    // The name: it is held and listed, the node is woken to send that,
+    // and each generation that was left is said, with what was read
+    // there: nothing, of no relay.
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["name"], "lab");
+    assert_eq!(said["held_anew"], true);
+    assert_eq!(said["carried"], 0);
+    assert_eq!(said["read_all"], false);
+    assert!(said["nothing"].is_null(), "{said}");
+    assert_eq!(
+        said["generations"],
+        json!([{ "number": 1, "relays": [], "by_other_keys": 0 }])
+    );
+    assert!(held(&state).is_some());
+    assert!(woken(&state).await.0);
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    let names: Vec<&str> = seen["names"]["sent"]
+        .as_array()
+        .into_iter()
+        .chain(seen["names"]["to_go"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(names, ["lab"]);
+    // Asked again, the name is held already.
+    let (_, said) = asks!(app, "/api/v1/carry", carry);
+    assert_eq!(said["held_anew"], false);
+}
+
+/// A recovery, at the routes (decision 2026-10-04 §9, steps 4 and 5).
+/// The node is handed the change entry that the command made, the
+/// phrase's statement key, the secret of the generation recovered from,
+/// and the phrase's word for the look. It applies the statement, and is
+/// woken: to show the change entry to every relay at once, and to send
+/// the names. The look is begun, goes on after the route has answered,
+/// and what it found is read at the route for that. A word that does not
+/// hold makes nothing, and a recovery is made once.
+#[actix_web::test]
+async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, said) = asks!(app, "/api/v1/recover/look", json!({}));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["follows_a_phrase"], false);
+    assert_eq!(
+        said["this_device"],
+        encode_public_key(&state.identity.public_key()).unwrap()
+    );
+    assert_eq!(said["sessions"], json!([]));
+    let (_, said) = asks!(app, "/api/v1/recover/progress", json!({}));
+    assert!(said["look"].is_null(), "{said}");
+
+    // What the command makes with the phrase: the statement after the
+    // first one of a device that is gone, with this machine alone.
+    let phrase = Phrase::parse(WORDS).unwrap();
+    let gone = NodeIdentity::generate().unwrap().public_key();
+    let first = first_entry(&phrase, &gone, "laptop").unwrap();
+    let (statement, for_phrase) = read_with(&phrase, &first.entry).unwrap();
+    let own = state.identity.public_key();
+    let maker = Device::new(own, "new").unwrap();
+    let entry = prepare_recovery(&statement, None, maker, &[gone])
+        .unwrap()
+        .sign(&phrase, &first.entry, None)
+        .unwrap();
+    let allows = Allows::Look {
+        names: vec!["lab".into()],
+        takes: vec![hex::encode(gone)],
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let word = Word::give(&phrase, &own, &entry.id(), allows.says().unwrap(), now).unwrap();
+    let body = json!({
+        "entry": hex::encode(entry.to_wire()),
+        "statement_key": hex::encode(first.statement_key),
+        "left": [{ "number": 1, "secret": hex::encode(for_phrase.secret) }],
+        "gone": [{ "key": hex::encode(gone), "label": "laptop" }],
+        "still_have": [],
+        "word": word,
+    });
+
+    // A word whose text was changed after it was signed: nothing is made.
+    let mut changed = body.clone();
+    changed["word"]["what"] = Allows::Look {
+        names: vec!["lab".into(), "another".into()],
+        takes: vec![hex::encode(gone)],
+    }
+    .says()
+    .unwrap()
+    .into();
+    let (status, said) = asks!(app, "/api/v1/recover/make", changed);
+    assert_eq!(status, 400, "{said}");
+    assert!(said.to_string().contains("does not hold here"), "{said}");
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(seen["state"], "no_phrase");
+    assert_eq!(woken(&state).await, (false, false));
+
+    // The recovery.
+    let (status, made) = asks!(app, "/api/v1/recover/make", body.clone());
+    assert_eq!(status, 200, "{made}");
+    assert_eq!(made["change"], 2);
+    // The node is woken, to show the change entry to every relay at
+    // once, before anything is carried.
+    assert_eq!(woken(&state).await, (true, true));
+    // The look was begun, and ends: with no network it reaches no relay.
+    let mut found = Value::Null;
+    for _ in 0..100 {
+        let (_, said) = asks!(app, "/api/v1/recover/progress", json!({}));
+        found = said["look"].clone();
+        if found["finished"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(found["finished"], true, "{found}");
+    assert_eq!((&found["change"], &found["names"]), (&json!(2), &json!(1)));
+    assert_eq!(found["carried"], 0);
+    assert_eq!(found["not_read"][0]["read"], "no relay was reached");
+
+    // The machine follows the phrase, alone; the key that is gone is
+    // removed, and shown by its label; and the name is held and listed.
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(
+        (&seen["state"], &seen["change"]),
+        (&json!("applied"), &json!(2))
+    );
+    assert_eq!(seen["among"], "alone");
+    assert_eq!(seen["removed"][0]["label"], "laptop");
+    let names: Vec<&str> = seen["names"]["sent"]
+        .as_array()
+        .into_iter()
+        .chain(seen["names"]["to_go"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(names, ["lab"]);
+    // It is made once.
+    let (status, said) = asks!(app, "/api/v1/recover/make", body);
+    assert_eq!(status, 400, "{said}");
+    assert!(said.to_string().contains("already follows"), "{said}");
 }
 
 /// Once a device was given a new key, the node that still runs under the
@@ -409,6 +712,83 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
     assert_eq!((status, &seen["state"]), (200, &json!("applied")), "{seen}");
 }
 
+/// What a look says for the level that a status shows (decision
+/// 2026-10-04 §10.1): for each relay, for how long the node has been
+/// connected to it, by the node's own clock, and when it last refused
+/// something for room; when this device applied the change; and since
+/// when the first of what it has still to send has waited.
+#[actix_web::test]
+async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
+    use cordelia_api::state::{AtRelay, AtRelays, NoRoom};
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    let at = |relay: &str, no_room: Option<NoRoom>| AtRelay {
+        relay: relay.into(),
+        holds_latest: Some(false),
+        heard_since_woke: true,
+        no_room,
+        another_form: 0,
+        refuses: None,
+    };
+    let refused = NoRoom {
+        at: 1_790_000_000,
+        over_allowance: true,
+        of_the_change: false,
+    };
+    state.own_channels.say(AtRelays {
+        relays: vec![
+            at("relay.example:9474", Some(refused)),
+            at("other.example:9474", None),
+        ],
+        cannot_go_on: None,
+    });
+    let now = std::time::Instant::now();
+    let earlier = now.checked_sub(Duration::from_secs(400)).unwrap();
+    state
+        .own_channels
+        .relays_connected(&["relay.example:9474"], earlier);
+    state
+        .own_channels
+        .relays_connected(&["relay.example:9474"], now);
+
+    let (status, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(status, 200, "{seen}");
+    let relays = seen["relays"].as_array().unwrap();
+    assert_eq!(relays.len(), 2, "{seen}");
+    // Connected for some minutes, and refused for room at a time.
+    assert_eq!(relays[0]["relay"], "relay.example:9474");
+    let connected = relays[0]["connected_secs"].as_u64().unwrap();
+    assert!((400..460).contains(&connected), "{connected}");
+    assert_eq!(relays[0]["no_room_at"], 1_790_000_000);
+    assert!(relays[0]["no_room"].is_string(), "{seen}");
+    assert_eq!(relays[0]["holds_latest"], false);
+    // Not connected, and never refused.
+    assert!(relays[1]["connected_secs"].is_null(), "{seen}");
+    assert!(relays[1]["no_room_at"].is_null(), "{seen}");
+    // Under its first statement the device has left no generation.
+    assert_eq!(seen["change"], 1);
+    assert!(seen["applied_at"].is_null(), "{seen}");
+    assert!(seen.as_object().unwrap().contains_key("applied_at"));
+    // And it removed nobody.
+    assert_eq!(seen["removed_a_key"], false, "{seen}");
+    // Nothing waits to be sent: no time since when.
+    assert_eq!(seen["names"]["to_go"], json!([]));
+    assert!(seen["names"]["to_go_since"].is_null(), "{seen}");
+    assert!(
+        seen["names"]
+            .as_object()
+            .unwrap()
+            .contains_key("to_go_since")
+    );
+}
+
 /// Every request that a personal node's API takes with a body, each with
 /// one that it reads.
 fn requests_of_a_device() -> Vec<(&'static str, Value)> {
@@ -432,6 +812,7 @@ fn requests_of_a_device() -> Vec<(&'static str, Value)> {
         ),
         ("/api/v1/sync/unmap", json!({ "folder": "/home/sam/notes" })),
         ("/api/v1/sync/status", json!({})),
+        ("/api/v1/sync/seen", json!({})),
         ("/api/v1/history/list", json!({})),
         ("/api/v1/history/show", json!({ "id": "00000000000abc" })),
         (
@@ -620,7 +1001,11 @@ async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_i
     assert_eq!(state.sync_control.generation(), generation);
     assert_eq!(woken(&state).await, (false, false));
     // The first start is not tried on it.
-    assert!(!cordelia_api::first_start::take(&state, "0.2.0-test"));
+    assert!(!cordelia_api::first_start::take(
+        &state,
+        "0.2.0-test",
+        &cordelia_storage::first_start::room_not_known
+    ));
     assert_eq!(state.held.why(), Some(Held::LaterDatabase(why.into())));
 
     let get = test::TestRequest::get()

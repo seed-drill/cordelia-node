@@ -174,6 +174,48 @@ pub fn prepare_settlement(
     })
 }
 
+/// Prepare the statement that a recovery makes (decision 2026-10-04 §9,
+/// step 4), with no phrase: a new secret, and the statement after `from`,
+/// the one that is recovered from, in the bytes that will be signed. It
+/// lists `maker`, the machine that recovers, as its only device, and as
+/// removed every key in `removed`: each device that the person said is
+/// gone. **A device of `from` that is in neither is one the person still
+/// has:** it is in no list, and is added again by hand, with its key
+/// read from the device itself (§9, step 6).
+///
+/// Where `apart` is given, a statement that is not on the chain of
+/// `from` was found beside it: the statement that is made settles the
+/// two (§4.5), and lists as removed every key that either removed.
+///
+/// Refused: whatever a statement refuses, a maker that `from` or `apart`
+/// lists as removed among it.
+pub fn prepare_recovery(
+    from: &SignedStatement,
+    apart: Option<&SignedStatement>,
+    maker: Device,
+    removed: &[[u8; 32]],
+) -> Result<Prepared, PersonError> {
+    let secret = Zeroizing::new(statement::new_secret()?);
+    let key = maker.key;
+    let made = match apart {
+        None => from.statement.next(key, &secret, vec![maker], removed)?,
+        Some(apart) => Statement::settle(
+            &from.statement,
+            &apart.statement,
+            key,
+            &secret,
+            vec![maker],
+            removed,
+        )?,
+    };
+    Ok(Prepared {
+        applied: from.clone(),
+        apart: apart.cloned(),
+        bytes: made.to_bytes()?,
+        secret,
+    })
+}
+
 /// Make the change that follows the statement `applied` (decision
 /// 2026-10-04 §4.5, §7.1): a removal, or a renewal where `removed` is
 /// empty.
@@ -277,6 +319,29 @@ fn opened(
         change_entry::open_statement(entry, &phrase_key, &channel, &*phrase.statement_key()?)?;
     let for_phrase =
         change_entry::open_for_phrase(entry, &phrase_key, &channel, &*phrase.seal_key()?)?;
+    Ok((statement, for_phrase))
+}
+
+/// A change entry of this phrase, read with the phrase (decision
+/// 2026-10-04 §4.6, §9): its statement, and its part for the phrase, which
+/// holds the statement's secret and the secrets of the generations before
+/// it, as many as eight, the newest first, each with its statement's
+/// number. It is what a command reads that was typed the phrase: for a
+/// carry from a generation whose secret the device never held (§7.3), and
+/// for a recovery.
+///
+/// Refused: an entry that is not this phrase's; a statement whose
+/// signature does not hold; and a secret that does not open to the
+/// statement's commitment.
+pub fn read_with(
+    phrase: &Phrase,
+    entry: &CheckedEntry,
+) -> Result<(SignedStatement, ForPhrase), PersonError> {
+    let (statement, for_phrase) = opened(phrase, entry)?;
+    statement.verify()?;
+    if !statement.statement.commits_to(&for_phrase.secret) {
+        return Err(PersonError::SecretNotCommitted);
+    }
     Ok((statement, for_phrase))
 }
 

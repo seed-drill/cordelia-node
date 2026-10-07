@@ -19,9 +19,9 @@
 //! stand-in has handed it the name's channel, as it does on a node that
 //! has relays (decision 2026-10-04 §6).
 //!
-//! Most tests sync everything found (`--all`), which is how discovery is
-//! exercised; the tests from `nothing_syncs_until_a_folder_is_mapped` on
-//! cover declared mappings, the default.
+//! Only what is mapped syncs (decision 2026-10-04 §10.1): each test maps
+//! the folders it syncs, and what is found beside them is listed and never
+//! synced.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -309,6 +309,16 @@ fn settle(a: &mut Device, b: &mut Device) {
     }
 }
 
+/// Store a cycle's report as the node's loop does after each cycle: what
+/// `cordelia sync status` shows, and what `map` reads of what was found.
+fn store_report(d: &Device, report: &cordelia_sync::claude::CycleReport) {
+    set_meta(
+        d,
+        meta::SYNC_CLAUDE_REPORT,
+        &serde_json::to_string(report).unwrap(),
+    );
+}
+
 /// Set a per-device sync setting in node metadata.
 fn set_meta(d: &Device, key: &str, value: &str) {
     let db = d.state.db.lock().unwrap();
@@ -352,13 +362,16 @@ fn paired_explicit() -> (Device, Device) {
     (a.sync_on(), b.sync_on())
 }
 
-/// Two paired devices that sync everything they find (`--all`).
-fn paired() -> (Device, Device) {
+/// Two paired devices that each map their home directory, under `~`:
+/// home memory syncs between them. Returns the two, and the memory folder
+/// of each.
+fn paired() -> (Device, Device, PathBuf, PathBuf) {
     let (a, b) = paired_explicit();
+    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
     for d in [&a, &b] {
-        set_meta(d, meta::SYNC_CLAUDE_ALL, "on");
+        map(d, &d.home.clone(), "~");
     }
-    (a, b)
+    (a, b, a_mem, b_mem)
 }
 
 /// The names that a device's folders are mapped to.
@@ -386,9 +399,8 @@ fn map(d: &Device, folder: &Path, name: &str) {
 
 /// Remove a mapping on a device, as `cordelia sync unmap` does, through
 /// the node's own handler: the folder forgets what it had agreed with its
-/// channel, and is also excluded, so nothing picks it up under another
-/// name. The device says no longer that it syncs the name, and holds it
-/// no more.
+/// channel. The device says no longer that it syncs the name, and holds
+/// it no more.
 fn unmap(d: &Device, folder: &Path) {
     let request = cordelia_api::types::SyncUnmapRequest {
         folder: folder.display().to_string(),
@@ -565,9 +577,7 @@ const PROJECT: &str = "github.com/seed-drill/cordelia-node";
 
 #[test]
 fn home_memory_syncs_both_ways() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
 
     std::fs::write(a_mem.join("user_role.md"), "Prefers short answers.\n").unwrap();
     settle(&mut a, &mut b);
@@ -595,14 +605,18 @@ fn home_memory_syncs_both_ways() {
 
 #[test]
 fn project_memory_follows_the_repo_not_the_path() {
-    let (mut a, mut b) = paired();
-    // Same repository, different paths, so different Claude folder names.
-    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
+    let (mut a, mut b, a_home, b_home) = paired();
+    // Same repository, different paths, so different Claude folder names:
+    // each device maps its clone to the one name.
+    let (a_repo, b_repo) = (a.clone_at("Work/cordelia-node"), b.clone_at("src/cn"));
+    let a_mem = a.claude_folder(&a_repo);
+    let b_mem = b.claude_folder(&b_repo);
     assert_ne!(
         a_mem.parent().unwrap().file_name(),
         b_mem.parent().unwrap().file_name()
     );
+    map(&a, &a_repo, PROJECT);
+    map(&b, &b_repo, PROJECT);
 
     std::fs::write(a_mem.join("decision.md"), "Invite-only channels only.\n").unwrap();
     settle(&mut a, &mut b);
@@ -622,7 +636,6 @@ fn project_memory_follows_the_repo_not_the_path() {
     assert_eq!(project.channel_id, Some(channel_of(&mut a, PROJECT)));
 
     // Home memory does not leak into the project folder, or vice versa.
-    let (a_home, b_home) = (a.home_memory(), b.home_memory());
     std::fs::write(a_home.join("personal.md"), "home only\n").unwrap();
     settle(&mut a, &mut b);
     assert_eq!(read(&b_mem, "personal.md"), None);
@@ -632,9 +645,7 @@ fn project_memory_follows_the_repo_not_the_path() {
 
 #[test]
 fn concurrent_edits_leave_a_conflict_file_everywhere() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("notes.md"), "base\n").unwrap();
     settle(&mut a, &mut b);
 
@@ -687,9 +698,7 @@ fn concurrent_edits_leave_a_conflict_file_everywhere() {
 
 #[test]
 fn memory_index_merges_instead_of_conflicting() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("MEMORY.md"), "- [Base](base.md) — shared\n").unwrap();
     settle(&mut a, &mut b);
 
@@ -756,8 +765,7 @@ fn apart(
     b_does: &[Option<&str>],
     a_does: &[Option<&str>],
 ) -> (Device, Device, PathBuf, PathBuf) {
-    let (mut a, mut b) = paired();
-    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join(name), base).unwrap();
     settle(&mut a, &mut b);
     assert_eq!(read(&b_mem, name).as_deref(), Some(base));
@@ -873,9 +881,7 @@ fn an_index_overtaken_by_two_edits_is_kept_whole_beside_it() {
 /// of a new file's entry, and is read from its own signer alone.
 #[test]
 fn only_memory_entries_say_what_they_were_written_after() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
     settle(&mut a, &mut b);
     std::fs::write(b_mem.join("notes.md"), "two\n").unwrap();
@@ -920,9 +926,7 @@ fn only_memory_entries_say_what_they_were_written_after() {
 
 #[test]
 fn keys_that_are_not_safe_file_names_are_never_written() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("ok.md"), "fine\n").unwrap();
     settle(&mut a, &mut b);
 
@@ -960,7 +964,6 @@ fn keys_that_are_not_safe_file_names_are_never_written() {
 #[test]
 fn folders_without_a_repository_are_reported_not_synced() {
     let mut a = Device::new().with_phrase().sync_on();
-    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
     let scratch = a.home.join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let mem = a.claude_folder(&scratch);
@@ -975,17 +978,19 @@ fn folders_without_a_repository_are_reported_not_synced() {
     assert!(report.available.is_empty());
 }
 
-/// A device with no folder for a project has nothing of it: it does not
+/// A device that does not map a project has nothing of it: it does not
 /// hold the name, and its store takes no entry of the name's channel,
 /// though a relay hands it every one. (Every device of a person can
 /// derive the channel of every name. What keeps a project's memory off a
 /// device is that the device neither fetches nor stores it.)
 #[test]
 fn a_device_without_the_project_holds_nothing_of_it() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
+    let (mut a, mut b, _, _) = paired();
+    let a_repo = a.clone_at("Work/cordelia-node");
+    let a_mem = a.claude_folder(&a_repo);
     std::fs::write(a_mem.join("decision.md"), "Invite-only channels only.\n").unwrap();
-    b.home_memory(); // B works only in its home folder: no clone of the project
+    map(&a, &a_repo, PROJECT);
+    // B syncs only its home memory: it does not map the project.
     settle(&mut a, &mut b);
 
     let report = a.cycle();
@@ -1012,9 +1017,15 @@ fn a_device_without_the_project_holds_nothing_of_it() {
         "B holds nothing of a project it does not have"
     );
 
-    // Once B clones the project it has the project's channel, and the
-    // memory arrives.
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
+    // B clones the project, and Claude Code runs there: it is found, and
+    // still nothing of it is held. Once B maps its clone it has the
+    // project's channel, and the memory arrives.
+    let b_repo = b.clone_at("src/cn");
+    let b_mem = b.claude_folder(&b_repo);
+    settle(&mut a, &mut b);
+    assert!(!holds(&b, &channel), "found is not mapped");
+    assert_eq!(read(&b_mem, "decision.md"), None);
+    map(&b, &b_repo, PROJECT);
     settle(&mut a, &mut b);
     assert_eq!(
         read(&b_mem, "decision.md").as_deref(),
@@ -1023,90 +1034,7 @@ fn a_device_without_the_project_holds_nothing_of_it() {
     assert_eq!(channel_of(&mut b, PROJECT), channel);
 }
 
-#[test]
-fn excluded_projects_never_sync() {
-    let (mut a, mut b) = paired();
-    set_meta(
-        &a,
-        meta::SYNC_CLAUDE_EXCLUDE,
-        r#"["github.com/seed-drill/*"]"#,
-    );
-    let a_mem = a.claude_folder(&a.clone_at("Work/cordelia-node"));
-    std::fs::write(a_mem.join("secret.md"), "stays on this machine\n").unwrap();
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
-    settle(&mut a, &mut b);
-
-    let report = a.cycle();
-    assert_eq!(
-        report.excluded,
-        vec!["github.com/seed-drill/cordelia-node".to_string()]
-    );
-    assert_eq!(read(&b_mem, "secret.md"), None);
-}
-
-/// A project is kept off a device by its name, however its remote and the
-/// exclusion spell the ending: both are read in one spelling. An earlier
-/// version found a project whose remote ended `.GIT` under a name that
-/// ended `.git`, and stored an exclusion sent to it with that ending.
-#[test]
-fn a_project_is_excluded_however_its_ending_is_spelled() {
-    let name = "github.com/client-co/plans";
-    for (remote, stored) in [
-        // The remote's ending in capitals, the exclusion as it is typed
-        // today.
-        (
-            "git@github.com:Client-Co/Plans.GIT",
-            r#"["github.com/client-co/plans"]"#,
-        ),
-        // An exclusion as an earlier version stored it.
-        (
-            "git@github.com:client-co/plans.git",
-            r#"["github.com/client-co/plans.git"]"#,
-        ),
-        (
-            "git@github.com:client-co/plans.GIT",
-            r#"["github.com/client-co/plans.git"]"#,
-        ),
-        // A prefix, and an ending given twice.
-        (
-            "https://github.com/client-co/plans.git.GIT/",
-            r#"["GitHub.com/Client-Co/*"]"#,
-        ),
-    ] {
-        let mut a = Device::new().with_phrase().sync_on();
-        set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
-        set_meta(&a, meta::SYNC_CLAUDE_EXCLUDE, stored);
-        let memory = a.claude_folder(&a.clone_of("Work/plans", remote));
-        std::fs::write(memory.join("secret.md"), "stays on this machine\n").unwrap();
-
-        let report = a.cycle();
-        assert_eq!(report.excluded, vec![name.to_string()], "{remote} {stored}");
-        assert!(report.folders.is_empty(), "{remote} {stored}");
-    }
-}
-
-#[test]
-fn home_memory_can_be_left_off_a_device() {
-    let (mut a, mut b) = paired();
-    set_meta(&b, meta::SYNC_CLAUDE_HOME, "off");
-    let a_home = a.home_memory();
-    let b_home = b.home_memory();
-    std::fs::write(a_home.join("user_role.md"), "general profile\n").unwrap();
-    std::fs::write(b_home.join("lab_notes.md"), "lab only\n").unwrap();
-    settle(&mut a, &mut b);
-
-    assert_eq!(
-        read(&b_home, "user_role.md"),
-        None,
-        "B does not receive home memory"
-    );
-    assert_eq!(read(&a_home, "lab_notes.md"), None, "nor send it");
-    assert!(b.cycle().excluded.contains(&"~".to_string()));
-    let channel = channel_of(&mut a, "~");
-    assert!(!holds(&b, &channel), "B holds nothing of home memory");
-}
-
-// ── Declared mappings (the default: nothing syncs until it is mapped) ──
+// ── Nothing syncs until it is mapped ───────────────────────────────────
 
 #[test]
 fn nothing_syncs_until_a_folder_is_mapped() {
@@ -1175,6 +1103,80 @@ fn nothing_syncs_until_a_folder_is_mapped() {
     assert_eq!(read(&b_home, "user_role.md"), None);
     assert_eq!(read(&b_home, "idea.md"), None);
     assert!(b.cycle().available.is_empty());
+}
+
+/// Only what is mapped syncs (decision 2026-10-04 §10.1). A folder that
+/// is found and not mapped is never a target of a cycle, whatever is
+/// stored of a scope, of exclusions and of a switch for home memory: the
+/// adapter reads none of them. The device holds no name for it, says of
+/// it to no other device that it syncs it, and publishes nothing of it.
+#[test]
+fn what_is_found_is_never_synced_whatever_is_stored_of_a_scope() {
+    for scope in [Some("on"), Some("off"), None] {
+        let mut a = Device::new().with_phrase().sync_on();
+        match scope {
+            Some(scope) => set_meta(&a, meta::SYNC_CLAUDE_ALL, scope),
+            None => {
+                let db = a.state.db.lock().unwrap();
+                meta::remove(&db, meta::SYNC_CLAUDE_ALL).unwrap();
+            }
+        }
+        // What an earlier version stored, each way round: read by nothing.
+        if scope == Some("on") {
+            set_meta(&a, meta::SYNC_CLAUDE_HOME, "off");
+            set_meta(&a, meta::SYNC_CLAUDE_EXCLUDE, r#"["lab-notes"]"#);
+        }
+        let home = a.home_memory();
+        std::fs::write(home.join("user_role.md"), "stays here\n").unwrap();
+        let repo = a.clone_at("Work/cordelia-node");
+        let in_repo = a.claude_folder(&repo);
+        std::fs::write(in_repo.join("decision.md"), "stays here too\n").unwrap();
+        let notes = a.plain_dir("notes");
+        let mem = a.claude_folder(&notes);
+        std::fs::write(mem.join("idea.md"), "a thought\n").unwrap();
+        map(&a, &notes, "lab-notes");
+
+        let report = a.cycle();
+        let targets: Vec<(&str, bool)> = report
+            .folders
+            .iter()
+            .map(|f| (f.project.as_str(), f.mapped))
+            .collect();
+        assert_eq!(targets, [("lab-notes", true)], "{scope:?}");
+        assert!(report.excluded.is_empty(), "{scope:?}");
+        let mut found: Vec<Option<&str>> =
+            report.unmapped.iter().map(|u| u.name.as_deref()).collect();
+        found.sort();
+        assert_eq!(found, [Some(PROJECT), Some("~")], "{scope:?}");
+
+        // The one name is held and said. Of what was found: no name, no
+        // word, and no entry in the channel that each would have.
+        let db = a.state.db.lock().unwrap();
+        let held: Vec<String> = held_rows::names(&db)
+            .unwrap()
+            .into_iter()
+            .map(|held| held.name)
+            .collect();
+        assert_eq!(held, ["lab-notes"], "{scope:?}");
+        let said = names::said_here(&db, &a.state.identity).unwrap();
+        assert_eq!(said.into_iter().collect::<Vec<_>>(), ["lab-notes"]);
+        let person = held_rows::applied_secret(&db).unwrap().unwrap();
+        for name in ["~", PROJECT] {
+            let secret = derive::own_secret(&person.secret, name).unwrap();
+            let channel = derive::channel_id(&secret).unwrap();
+            let stored = stored::channel_entries_after(&db, &channel, 0, 10).unwrap();
+            assert!(stored.is_empty(), "{scope:?}: {name}");
+        }
+        let published = stored::channel_entries_after(
+            &db,
+            &held_rows::channel_of_name(&db, "lab-notes")
+                .unwrap()
+                .unwrap(),
+            0,
+            10,
+        );
+        assert_eq!(published.unwrap().len(), 1, "{scope:?}");
+    }
 }
 
 #[test]
@@ -1258,20 +1260,22 @@ fn memory_is_kept_per_repository_not_per_folder() {
     // One thing to map: the repository, not the subdirectory.
     assert_eq!(
         a.cycle().unmapped,
-        vec![cordelia_sync::claude::Found {
+        vec![cordelia_api::found::Entry {
             folder: a.folder_of(&a_repo).display().to_string(),
             cwd: Some(a_repo.display().to_string()),
             name: Some(PROJECT.to_string()),
+            mappable: true,
+            ..Default::default()
         }]
     );
     map(&a, &a_repo, PROJECT);
 
-    // B syncs everything it finds, and has only run in a subdirectory too.
-    set_meta(&b, meta::SYNC_CLAUDE_ALL, "on");
+    // B has only run in a subdirectory too, and maps its repository.
     let b_repo = b.clone_at("src/cn");
     let b_sub = b_repo.join("docs");
     std::fs::create_dir_all(&b_sub).unwrap();
     let b_sub_folder = b.session_in(&b_sub);
+    map(&b, &b_repo, PROJECT);
     settle(&mut a, &mut b);
 
     // The memory arrives where Claude Code reads it: the repository's
@@ -1324,16 +1328,23 @@ fn a_mapping_syncs_the_folder_named_after_it_and_no_other() {
 /// A tree laid out by hand, as some installs used to limit what syncs
 /// before mappings existed: folders with any name, each holding a `*.jsonl`
 /// that names a working directory and a `memory` link to the real folder.
-/// With `--all` it keeps working: the link is followed, and what is
-/// outside the tree does not sync.
+/// With sync pointed at the tree, what is in it is found and listed, and
+/// nothing of it syncs (decision 2026-10-04 §10.1): not under the name of
+/// the repository that its transcript records, and not when that
+/// repository's directory is mapped, which syncs the folder that Claude
+/// Code names after the directory and no other.
+///
+/// It is listed as what it is: a layout that cannot be mapped, with its
+/// directory under another key than `cwd`, so that nothing offers a
+/// command or a switch for it. And `map` itself, given the directory that
+/// the tree records, is refused with that reason while the node lists the
+/// tree: it would sync another folder than the one that was found.
 #[test]
-fn a_tree_laid_out_by_hand_still_syncs_with_all() {
-    let (mut a, mut b) = paired();
+fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
+    let (mut a, mut b) = paired_explicit();
     let a_repo = a.clone_at("Work/cordelia-node");
     let real = a.claude_folder(&a.plain_dir("Work"));
     std::fs::write(real.join("decision.md"), "Invite-only channels only.\n").unwrap();
-    let a_home = a.home_memory();
-    std::fs::write(a_home.join("private.md"), "outside the tree\n").unwrap();
 
     let tree = a.home.join(".cordelia/scope");
     let entry = tree.join("projects/workspace");
@@ -1349,26 +1360,276 @@ fn a_tree_laid_out_by_hand_still_syncs_with_all() {
     .unwrap();
     // Sync is pointed at the tree, as `cordelia sync claude --dir` does.
     set_meta(&a, meta::SYNC_CLAUDE_DIR, &tree.display().to_string());
-    a.adapter = ClaudeAdapter::new(tree, a.home.clone(), &a.pk());
+    a.adapter = ClaudeAdapter::new(tree.clone(), a.home.clone(), &a.pk());
 
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
-    let b_home = b.home_memory();
+    let b_repo = b.clone_at("src/cn");
+    let b_mem = b.claude_folder(&b_repo);
+    map(&b, &b_repo, PROJECT);
     settle(&mut a, &mut b);
+    assert_eq!(read(&b_mem, "decision.md"), None);
+    let report = a.cycle();
+    assert!(report.folders.is_empty(), "{:?}", report.folders);
     assert_eq!(
-        read(&b_mem, "decision.md").as_deref(),
-        Some("Invite-only channels only.\n")
+        report.unmapped,
+        vec![cordelia_api::found::Entry {
+            folder: entry.display().to_string(),
+            cwd: None,
+            directory: Some(a_repo.display().to_string()),
+            name: Some(PROJECT.to_string()),
+            why_not: Some("laid_out_by_hand"),
+            says: Some(
+                "this layout cannot be mapped: Claude Code did not name the folder after its \
+                 directory"
+                    .into()
+            ),
+            ..Default::default()
+        }]
     );
-    assert_eq!(read(&b_home, "private.md"), None);
+    assert!(!holds(&a, &channel_of(&mut b, PROJECT)));
 
-    // And back, through the link, into the real folder.
+    // `map`, given the directory that the tree records, while the node
+    // lists the tree (its loop stores each cycle's report): refused with
+    // the reason, and no mapping is stored.
+    store_report(&a, &report);
+    let request = cordelia_api::types::SyncMapRequest {
+        folder: a_repo.display().to_string(),
+        name: PROJECT.into(),
+        home: false,
+    };
+    let generation = a.state.sync_control.generation();
+    let refused = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        refused.contains("this layout cannot be mapped"),
+        "{refused}"
+    );
+    assert!(refused.contains(&entry.display().to_string()), "{refused}");
+    assert!(refused.contains("nothing was mapped"), "{refused}");
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+    assert_eq!(a.state.sync_control.generation(), generation);
+    assert!(a.cycle().folders.is_empty());
+
+    // Where the node has no report to read (a setting was changed, and
+    // no cycle has run since), it looks at what is found for the
+    // directory itself: the request is refused all the same.
+    {
+        let db = a.state.db.lock().unwrap();
+        meta::remove(&db, meta::SYNC_CLAUDE_REPORT).unwrap();
+    }
+    let refused = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        refused.contains("this layout cannot be mapped"),
+        "{refused}"
+    );
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+
+    // The folder that Claude Code names after the repository's
+    // directory, under the directory that is set, is made: the
+    // repository's directory is then mapped. That syncs that folder,
+    // which is another than the tree's. Nothing that the tree holds
+    // leaves.
+    let named_after_it = cordelia_sync::discover::claude_folder(&tree, &a_repo).unwrap();
+    std::fs::create_dir_all(&named_after_it).unwrap();
+    map(&a, &a_repo, PROJECT);
     std::fs::write(b_mem.join("reply.md"), "from b\n").unwrap();
     settle(&mut a, &mut b);
-    assert_eq!(read(&real, "reply.md").as_deref(), Some("from b\n"));
+    assert_eq!(read(&b_mem, "decision.md"), None);
+    assert_eq!(read(&real, "reply.md"), None);
+    assert_eq!(
+        read(&named_after_it.join("memory"), "reply.md").as_deref(),
+        Some("from b\n")
+    );
     let link = entry.join("memory").symlink_metadata().unwrap();
     assert!(link.file_type().is_symlink(), "the link is left as it is");
+}
+
+/// `map` compares directories by their real paths, as it takes the one
+/// it is given (decision 2026-10-04 §10.1). A folder that was found for a
+/// link to a directory has that directory: `map`, given the real
+/// directory, is refused while the folder that it would sync is not
+/// there, with the reason that the folder is listed with. Once Claude
+/// Code's own folder for the real directory is there, the same request
+/// maps it.
+#[test]
+fn map_is_refused_for_the_real_directory_of_a_folder_found_through_a_link() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let real = a.plain_dir("kept/real");
+    let link = a.home.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let of_the_link = a.claude_folder(&link);
+    std::fs::write(of_the_link.join("kept.md"), "written through the link\n").unwrap();
+    let report = a.cycle();
+    store_report(&a, &report);
+
+    let request = cordelia_api::types::SyncMapRequest {
+        folder: real.display().to_string(),
+        name: "real".into(),
+        home: false,
+    };
+    let map = |a: &Device| {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+    };
+    let refused = map(&a).unwrap_err().to_string();
+    assert!(
+        refused.contains("its directory is reached through a link"),
+        "{refused}"
+    );
+    let folder = a.folder_of(&link).display().to_string();
+    assert!(refused.contains(&folder), "{refused}");
+    assert!(refused.contains("which is not there"), "{refused}");
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+
+    // A session in the real directory makes its own folder: the same
+    // request maps that folder.
+    a.session_in(&real);
+    let report = a.cycle();
+    store_report(&a, &report);
+    map(&a).unwrap();
+    assert_eq!(mapped(&a.state.db.lock().unwrap()).len(), 1);
+}
+
+/// What is found is listed with whether `cordelia sync map` would sync
+/// that folder, and why not where it would not (decision 2026-10-04
+/// §10.1): each kind of folder, as the adapter finds it on disk. An entry
+/// carries its directory under `cwd` only where `map` would sync its
+/// folder.
+#[test]
+fn what_is_found_says_whether_map_would_sync_it() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let shown = |path: &Path| path.display().to_string();
+    // A git project, mapped: its folder syncs, and is not listed.
+    let repo = a.clone_at("Work/cordelia-node");
+    a.claude_folder(&repo);
+    map(&a, &repo, PROJECT);
+    // A second clone of it: found under the name that the first is
+    // mapped under, so it needs a name of its own.
+    let second = a.clone_at("src/cn");
+    a.session_in(&second);
+    // A project of its own, under its remote's name.
+    let other = a.clone_of("Work/other", "git@github.com:seed-drill/other.git");
+    a.session_in(&other);
+    // A folder that is no git project: under a name that is given.
+    let notes = a.plain_dir("notes");
+    a.claude_folder(&notes);
+    // The home directory's own folder.
+    a.home_memory();
+    // A directory outside the home directory.
+    let outside = a.home.parent().unwrap().join("elsewhere/app");
+    std::fs::create_dir_all(&outside).unwrap();
+    a.claude_folder(&outside);
+    // A directory that is gone.
+    let gone = a.home.join("was-here");
+    a.claude_folder(&gone);
+    // A folder with memory and no transcript: no directory is known.
+    let unknown = a.home.join(".claude/projects/-home-nobody-knows");
+    std::fs::create_dir_all(unknown.join("memory")).unwrap();
+    // A directory that a session recorded through a link: `map` takes a
+    // directory by its real path, and would sync the folder of that.
+    let real = a.plain_dir("kept/real");
+    let link = a.home.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    a.claude_folder(&link);
+    // Two folders laid out by hand: one whose transcript records the
+    // home directory, and one that records the mapped repository.
+    let by_hand = |name: &str, records: &Path| {
+        let folder = a.home.join(".claude/projects").join(name);
+        std::fs::create_dir_all(folder.join("memory")).unwrap();
+        let line = format!("{{\"cwd\":{:?}}}\n", shown(records));
+        std::fs::write(folder.join("scope.jsonl"), line).unwrap();
+        folder
+    };
+    let tree_of_home = by_hand("everything", &a.home);
+    let tree_of_repo = by_hand("workspace", &repo);
+
     let report = a.cycle();
     assert_eq!(report.folders.len(), 1, "{:?}", report.folders);
-    assert_eq!(report.folders[0].project, PROJECT);
+    let entry = |folder: &Path| {
+        let of = shown(folder);
+        let found = report.unmapped.iter().find(|entry| entry.folder == of);
+        found.unwrap_or_else(|| panic!("{of} is not listed: {:?}", report.unmapped))
+    };
+    // What `map` would sync has its directory under `cwd`.
+    let own = entry(&a.folder_of(&other));
+    assert!(own.mappable && !own.needs_name && !own.home, "{own:?}");
+    assert_eq!(own.cwd, Some(shown(&other)));
+    assert_eq!(own.name.as_deref(), Some("github.com/seed-drill/other"));
+    assert_eq!((own.why_not, own.says.as_deref()), (None, None));
+
+    let named = entry(&a.folder_of(&notes));
+    assert!(named.mappable && named.needs_name, "{named:?}");
+    assert_eq!(named.cwd, Some(shown(&notes)));
+    assert_eq!(
+        named.says.as_deref(),
+        Some("needs a name (not a git project)")
+    );
+
+    let clone = entry(&a.folder_of(&second));
+    assert!(clone.mappable && clone.needs_name, "{clone:?}");
+    assert_eq!(clone.name.as_deref(), Some(PROJECT));
+    assert_eq!(
+        clone.says,
+        Some(format!(
+            "needs another name (its own is mapped from {})",
+            shown(&repo)
+        ))
+    );
+
+    let home = entry(&a.folder_of(&a.home));
+    assert!(home.mappable && home.home && !home.needs_name, "{home:?}");
+    assert_eq!(home.cwd, Some(shown(&a.home)));
+    assert_eq!(home.name.as_deref(), Some("~"));
+
+    // What it would not sync has no `cwd`, and says why.
+    for (folder, directory, why) in [
+        (a.folder_of(&outside), Some(&outside), "outside_home"),
+        (a.folder_of(&gone), Some(&gone), "directory_gone"),
+        (unknown.clone(), None, "no_directory"),
+        (a.folder_of(&link), Some(&link), "through_a_link"),
+        (tree_of_home.clone(), Some(&a.home), "laid_out_by_hand"),
+        (tree_of_repo.clone(), Some(&repo), "laid_out_by_hand"),
+    ] {
+        let listed = entry(&folder);
+        assert!(!listed.mappable && !listed.mapped, "{listed:?}");
+        assert_eq!(listed.cwd, None, "{listed:?}");
+        assert_eq!(listed.directory, directory.map(|dir| shown(dir)));
+        assert_eq!(listed.why_not, Some(why), "{listed:?}");
+        assert!(listed.says.is_some(), "{listed:?}");
+    }
+    // The tree that records the home directory is a tree, and not home.
+    assert!(!entry(&tree_of_home).home);
+    assert_eq!(report.unmapped.len(), 10, "{:?}", report.unmapped);
+    let through = entry(&a.folder_of(&link)).says.clone().unwrap();
+    assert!(
+        through.contains(&format!("syncs the folder of {}", shown(&real))),
+        "{through}"
+    );
+
+    // A node whose `HOME` is not set maps nothing: no entry has a `cwd`.
+    a.adapter = ClaudeAdapter::new(a.home.join(".claude"), PathBuf::new(), &a.pk());
+    let report = a.cycle();
+    assert_eq!(report.folders.len(), 1, "what is mapped still syncs");
+    assert!(!report.unmapped.is_empty());
+    for listed in &report.unmapped {
+        assert_eq!(listed.cwd, None, "{listed:?}");
+        assert!(!listed.mappable, "{listed:?}");
+    }
+    let of = |folder: &Path| {
+        let of = shown(folder);
+        let found = report.unmapped.iter().find(|entry| entry.folder == of);
+        found.and_then(|entry| entry.why_not)
+    };
+    assert_eq!(of(&a.folder_of(&other)), Some("home_not_set"));
+    assert_eq!(of(&tree_of_repo), Some("laid_out_by_hand"));
 }
 
 #[test]
@@ -1424,6 +1685,25 @@ fn what_other_devices_sync_is_what_they_sync_now() {
     claude(&a, serde_json::json!({ "enabled": false }));
     relay(&a, &b);
     assert!(b.cycle().available.is_empty());
+
+    // A name that A holds by a carry that a person asked for has no
+    // folder on A, and is listed all the same (decision 2026-10-04
+    // §7.3): a cycle does not stop it for want of one, with sync on.
+    claude(&a, serde_json::json!({}));
+    {
+        let db = a.state.db.lock().unwrap();
+        names::hold_for_a_carry(&db, &a.state.identity, "brought", now()).unwrap();
+    }
+    settle(&mut a, &mut b);
+    assert_eq!(
+        b.cycle().available,
+        vec!["brought".to_string(), "lab-notes".to_string()]
+    );
+    let held = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_storage::person::channel_of_name(&db, "brought").unwrap()
+    };
+    assert!(held.is_some(), "the name is still held after its cycles");
 }
 
 #[test]
@@ -1514,9 +1794,7 @@ fn a_folder_that_fails_is_reported_and_the_others_still_sync() {
 /// version of one file is written through, so that file cannot be written.
 #[test]
 fn a_file_that_fails_is_an_error_of_the_cycle_and_the_folder_still_syncs() {
-    let (mut a, mut b) = paired();
-    let a_mem = a.home_memory();
-    let b_mem = b.home_memory();
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("a.md"), "base\n").unwrap();
     std::fs::write(a_mem.join("z.md"), "base\n").unwrap();
     settle(&mut a, &mut b);
@@ -1661,6 +1939,185 @@ fn a_folder_taken_out_and_put_back_at_once_does_not_replay_what_it_lost() {
     assert_eq!(read(&b_mem, "x.md").as_deref(), Some("kept\n"));
 }
 
+/// A name that is stopped and held again in one generation of the
+/// settings, with a file lost in between: the device holds nothing of the
+/// name's channel once it has stopped the name, and neither does a folder
+/// keep a record of what it had agreed there. So the folder that comes
+/// back has no record in the channel. It waits for the channel to be
+/// fetched and meets it as on any first sync: the file is fetched back,
+/// and nothing is published as a delete (decision 2026-10-04 §6).
+#[test]
+fn a_name_stopped_and_held_again_in_one_generation_deletes_nothing() {
+    let (mut a, mut b) = paired_explicit();
+    // Each node is set up with one relay, the stand-in: a folder with no
+    // record in a channel waits until the stand-in has handed it.
+    for d in [&a, &b] {
+        d.state.own_channels.set_up_with(1);
+    }
+    let a_one = a.plain_dir("one");
+    let a_mem = a.claude_folder(&a_one);
+    std::fs::write(a_mem.join("x.md"), "kept\n").unwrap();
+    std::fs::write(a_mem.join("y.md"), "stays\n").unwrap();
+    map(&a, &a_one, "one");
+    let b_one = b.plain_dir("one");
+    let b_mem = b.folder_of(&b_one).join("memory");
+    map(&b, &b_one, "one");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    let channel = channel_of(&mut a, "one");
+    let folder = a_mem.display().to_string();
+    let recorded = |d: &Device| {
+        let db = d.state.db.lock().unwrap();
+        cordelia_storage::sync_state::load(&db, &folder, &channel)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(recorded(&a), 2);
+
+    // The name is stopped, as a cycle stops a name that this device said
+    // it syncs and that it finds no folder for; and no setting changes.
+    let generation = a.state.sync_control.generation();
+    {
+        let db = a.state.db.lock().unwrap();
+        let stopped = names::stop(&db, &a.state.identity, "one", now()).unwrap();
+        let stopped = stopped.expect("the device held the name");
+        a.state.own_channels.forget_fetched(&stopped);
+    }
+    assert_eq!(recorded(&a), 0, "what the folder agreed went with the name");
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+
+    // Its folder is mapped still: the next cycle holds the name again. It
+    // waits for the channel, and publishes nothing meanwhile.
+    let waits = a.cycle().folders.remove(0);
+    assert!(waits.waiting, "{waits:?}");
+    assert_eq!(a.state.sync_control.generation(), generation);
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "x.md").as_deref(), Some("kept\n"));
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "one", "x.md"),
+            Some((1, Value::Text("kept\n".into()))),
+            "nothing was published over the file"
+        );
+    }
+    // The file that was there all along is agreed again as it is: it is
+    // not published a second time.
+    assert_eq!(
+        version_of(&a, "one", "y.md"),
+        Some((1, Value::Text("stays\n".into())))
+    );
+    assert_eq!(entries_of(&a, "one", "y.md").len(), 1);
+    assert_eq!(recorded(&a), 2);
+}
+
+/// A file whose record a change could not carry is said, in `cordelia
+/// devices` and in a status, until it has met its channel (decision
+/// 2026-10-04 §4.2): a cycle that leaves its folder with a record of it
+/// there takes it from what is said. A file that has not met its channel
+/// yet stays.
+#[test]
+fn a_file_that_was_not_carried_is_said_until_it_has_met_its_channel() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let one = a.plain_dir("one");
+    let mem = a.claude_folder(&one);
+    std::fs::write(mem.join("x.md"), "here\n").unwrap();
+    map(&a, &one, "one");
+    let not_carried = |d: &Device| -> Vec<String> {
+        let db = d.state.db.lock().unwrap();
+        let seen = cordelia_api::look::look(&db, &d.state.identity, &Default::default(), now());
+        let files = seen.unwrap().not_carried;
+        files.into_iter().map(|file| file.file).collect()
+    };
+    // As the device notes them when it applies a statement: one file
+    // that its folder has, and one that is too large to meet anything.
+    let big = "x".repeat(cordelia_sync::claude::MAX_FILE_BYTES + 1);
+    std::fs::write(mem.join("large.md"), big).unwrap();
+    set_meta(
+        &a,
+        meta::PERSON_NOT_CARRIED,
+        r#"[{"name":"one","file":"x.md"},{"name":"one","file":"large.md"}]"#,
+    );
+    assert_eq!(not_carried(&a), ["x.md", "large.md"]);
+
+    let report = a.cycle();
+    assert_eq!(report.folders[0].published, 1, "{report:?}");
+    assert_eq!(not_carried(&a), ["large.md"]);
+}
+
+/// A folder that is mapped always merges (decision 2026-10-04 §10.1):
+/// `map` forgets what the folder it adds had agreed, whatever was left of
+/// it. Here a folder synced a name, and what it had agreed is left in
+/// place while it is not mapped, as an earlier version leaves it. A file
+/// is lost meanwhile. It is mapped under the name it synced under, and
+/// `map` is the first thing that happens: nothing is sent as a delete,
+/// and the file comes back.
+///
+/// Mapping what is already mapped forgets nothing: a file that is deleted
+/// then is deleted on the other device, as a delete in a folder that
+/// syncs is.
+#[test]
+fn a_folder_that_is_mapped_merges_whatever_was_left_of_what_it_agreed() {
+    let (mut a, mut b) = paired_explicit();
+    let a_one = a.plain_dir("one");
+    let a_mem = a.claude_folder(&a_one);
+    std::fs::write(a_mem.join("x.md"), "kept\n").unwrap();
+    std::fs::write(a_mem.join("y.md"), "stays\n").unwrap();
+    map(&a, &a_one, "one");
+    let b_one = b.plain_dir("one");
+    let b_mem = b.folder_of(&b_one).join("memory");
+    map(&b, &b_one, "one");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+
+    // What the folder agreed, as its rows have it.
+    let channel = channel_of(&mut a, "one");
+    let folder = a_mem.display().to_string();
+    let rows = |d: &Device| {
+        let db = d.state.db.lock().unwrap();
+        cordelia_storage::sync_state::load(&db, &folder, &channel).unwrap()
+    };
+    let agreed = rows(&a);
+    assert_eq!(agreed.len(), 2);
+
+    // It is unmapped, and its rows are put back as they were: what a
+    // version that did not forget would have left. A file is lost.
+    unmap(&a, &a_one);
+    assert!(rows(&a).is_empty());
+    {
+        let db = a.state.db.lock().unwrap();
+        for (file, record) in &agreed {
+            cordelia_storage::sync_state::save(&db, &folder, &channel, file, record).unwrap();
+        }
+    }
+    assert_eq!(rows(&a), agreed);
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+
+    // Mapped again, under the name it synced under, before any cycle.
+    map(&a, &a_one, "one");
+    assert!(rows(&a).is_empty(), "`map` forgot what was left");
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "x.md").as_deref(), Some("kept\n"));
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "one", "x.md"),
+            Some((1, Value::Text("kept\n".into()))),
+            "nothing was published over the file"
+        );
+    }
+
+    // Mapped already: declared again, what it agreed stays, and a delete
+    // made in it is a delete.
+    assert_eq!(rows(&a).len(), 2);
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+    map(&a, &a_one, "one");
+    assert_eq!(rows(&a).len(), 2, "mapping what is mapped forgot nothing");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["y.md"]);
+    assert_eq!(files(&a_mem), ["y.md"]);
+}
+
 /// Whether sync is on is a setting like the others. A cycle reads it with
 /// the rest, under the lock: turned off, there is nothing for it to do,
 /// even if the loop that started it saw sync on a moment before.
@@ -1724,8 +2181,8 @@ fn a_cycle_runs_only_for_the_directory_that_is_set() {
     assert_eq!(a.cycle().folders[0].published, 1);
 }
 
-/// Unmapped (or home turned off, or the scope narrowed), emptied, and
-/// mapped again: the folder starts afresh. What it lost in between is not
+/// Unmapped (or home memory turned off), emptied, and mapped again: the
+/// folder starts afresh. What it lost in between is not
 /// sent to the other devices as deletes.
 #[test]
 fn mapping_a_folder_again_does_not_replay_what_it_lost() {
@@ -1774,90 +2231,6 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md"]);
 }
 
-#[test]
-fn narrowing_the_scope_and_widening_it_again_deletes_nothing() {
-    let (mut a, mut b) = paired();
-    // A folder that is found again has no record in its channel, and the
-    // device held the name no more while it was out: its first cycle
-    // waits until the channel was fetched from a relay (decision
-    // 2026-10-04 §6). So each node is set up with one relay here, the
-    // stand-in, as a node that hears from other devices is.
-    for d in [&a, &b] {
-        d.state.own_channels.set_up_with(1);
-    }
-    let a_home = a.home_memory();
-    let b_home = b.home_memory();
-    std::fs::write(a_home.join("profile.md"), "general profile\n").unwrap();
-    settle(&mut a, &mut b);
-    assert_eq!(files(&b_home), ["profile.md"]);
-
-    // A goes back to mapped folders only (it has none), loses its copy,
-    // then syncs everything it finds again. The same when home memory is
-    // turned off and on, and when it is kept out and let in again. Each
-    // is set as the command sets it, through the node's handler, and no
-    // cycle runs between the narrowing and the loss: it is the handler
-    // that has forgotten what the folder agreed, by the time it answers.
-    // (A cycle does run while the scope is narrow, further down, to show
-    // that the folder is out.)
-    let home = a.home.display().to_string();
-    for (narrower, wider) in [
-        (
-            serde_json::json!({ "all": false }),
-            serde_json::json!({ "all": true }),
-        ),
-        (
-            serde_json::json!({ "home": false }),
-            serde_json::json!({ "home": true }),
-        ),
-        (
-            serde_json::json!({ "exclude": [home] }),
-            serde_json::json!({ "exclude": [] }),
-        ),
-    ] {
-        claude(&a, narrower.clone());
-        std::fs::remove_file(a_home.join("profile.md")).unwrap();
-        claude(&a, wider.clone());
-        settle(&mut a, &mut b);
-        assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
-        assert_eq!(files(&a_home), ["profile.md"], "{narrower}");
-
-        // And while it is narrow, home memory does not sync: a file made
-        // here stays here until the scope is widened again.
-        claude(&a, narrower.clone());
-        std::fs::write(a_home.join("while-narrow.md"), "kept here\n").unwrap();
-        settle(&mut a, &mut b);
-        assert_eq!(
-            files(&b_home),
-            ["profile.md"],
-            "{narrower}: it does not sync"
-        );
-        claude(&a, wider);
-        settle(&mut a, &mut b);
-        assert_eq!(
-            files(&b_home),
-            ["profile.md", "while-narrow.md"],
-            "{narrower}"
-        );
-        std::fs::remove_file(a_home.join("while-narrow.md")).unwrap();
-        settle(&mut a, &mut b);
-        assert_eq!(files(&b_home), ["profile.md"], "{narrower}");
-    }
-
-    // A folder can also stop being found with no command having stopped
-    // it (its transcripts have gone, say). Then no handler forgot for it.
-    // The first cycle that no longer finds it does. The scope is written
-    // behind the handler's back here, to stand for that.
-    set_meta(&a, meta::SYNC_CLAUDE_ALL, "off");
-    settle(&mut a, &mut b);
-    std::fs::remove_file(a_home.join("profile.md")).unwrap();
-    settle(&mut a, &mut b);
-    assert_eq!(files(&a_home), [""; 0], "it does not sync");
-    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
-    settle(&mut a, &mut b);
-    assert_eq!(files(&b_home), ["profile.md"]);
-    assert_eq!(files(&a_home), ["profile.md"]);
-}
-
 /// A mapped folder whose memory directory is gone (its disk is not
 /// attached, or it was moved aside) is an error to show, never a reason to
 /// delete the memory everywhere else.
@@ -1895,15 +2268,19 @@ fn a_memory_folder_that_goes_missing_deletes_nothing() {
     assert_eq!(files(&b_mem), ["one.md", "three.md"]);
 }
 
-/// On a device that syncs everything it finds, an unmapped folder stays
-/// out: it is not picked up again under the name discovery would give it.
+/// A folder that is unmapped stops syncing, and stays out: it is not
+/// picked up again under the name that its repository would give it,
+/// which another device syncs. It is listed, with that name, so that a
+/// person can map it again.
 #[test]
-fn an_unmapped_folder_stays_out_when_everything_found_syncs() {
-    let (mut a, mut b) = paired();
+fn an_unmapped_folder_stays_out_and_is_listed() {
+    let (mut a, mut b) = paired_explicit();
     let a_repo = a.clone_at("Work/cordelia-node");
     let a_mem = a.claude_folder(&a_repo);
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
+    let b_repo = b.clone_at("src/cn");
+    let b_mem = b.claude_folder(&b_repo);
     std::fs::write(b_mem.join("shared.md"), "the project's memory\n").unwrap();
+    map(&b, &b_repo, PROJECT);
 
     // A keeps its copy of the project apart, under a name of its own.
     map(&a, &a_repo, "kept-apart");
@@ -1920,28 +2297,24 @@ fn an_unmapped_folder_stays_out_when_everything_found_syncs() {
     assert_eq!(files(&b_mem), ["shared.md"]);
     let report = a.cycle();
     assert!(report.folders.is_empty(), "{:?}", report.folders);
-    assert_eq!(
-        report.unmapped,
-        vec![cordelia_sync::claude::Found {
-            folder: a.folder_of(&a_repo).display().to_string(),
-            cwd: Some(a_repo.display().to_string()),
-            name: Some(PROJECT.to_string()),
-        }],
-        "listed, so it can be mapped again"
-    );
+    assert_eq!(report.unmapped.len(), 1, "{:?}", report.unmapped);
+    let found = &report.unmapped[0];
+    assert_eq!(found.folder, a.folder_of(&a_repo).display().to_string());
+    assert_eq!(found.name.as_deref(), Some(PROJECT));
+    assert_eq!(report.available, vec![PROJECT.to_string()]);
 }
 
 /// A session can move to another directory, so a transcript in one folder
 /// can start in another. A folder Claude Code named is believed only about
-/// the directory it is named after.
+/// the directory it is named after: it is listed as that directory's
+/// memory, and never as the memory of the directory that its newest
+/// transcript starts in.
 #[test]
 fn a_claude_folder_is_believed_only_about_its_own_directory() {
-    let (mut a, mut b) = paired();
+    let mut a = Device::new().with_phrase().sync_on();
     let a_repo = a.clone_at("Work/cordelia-node");
     let a_home = a.home_memory();
     std::fs::write(a_home.join("profile.md"), "general profile\n").unwrap();
-    let b_mem = b.claude_folder(&b.clone_at("src/cn"));
-    let b_home = b.home_memory();
 
     // The newest transcript in A's home folder starts in the repository.
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1951,26 +2324,23 @@ fn a_claude_folder_is_believed_only_about_its_own_directory() {
         format!("{{\"cwd\":{:?}}}\n", a_repo.display().to_string()),
     )
     .unwrap();
-    settle(&mut a, &mut b);
-    assert_eq!(
-        files(&b_mem),
-        Vec::<String>::new(),
-        "not the project's memory"
-    );
-    assert_eq!(files(&b_home), ["profile.md"], "still home memory");
+    let report = a.cycle();
+    assert_eq!(report.unmapped.len(), 1, "{:?}", report.unmapped);
+    let found = &report.unmapped[0];
+    assert_eq!(found.folder, home_folder.display().to_string());
+    assert_eq!(found.name.as_deref(), Some("~"), "still home memory");
 
-    // With only that transcript, nothing says whose folder it is: it does
-    // not sync at all, rather than sync as the repository's.
+    // With only that transcript, nothing says whose folder it is: it is
+    // listed with no directory and no name, rather than as the
+    // repository's.
     std::fs::remove_file(home_folder.join("session.jsonl")).unwrap();
     a.adapter = ClaudeAdapter::new(a.home.join(".claude"), a.home.clone(), &a.pk());
-    std::fs::write(a_home.join("later.md"), "more\n").unwrap();
-    settle(&mut a, &mut b);
-    assert_eq!(files(&b_mem), Vec::<String>::new());
-    assert_eq!(files(&b_home), ["profile.md"]);
     let report = a.cycle();
     assert!(report.folders.is_empty(), "{:?}", report.folders);
     assert_eq!(report.unmapped.len(), 1);
-    assert_eq!(report.unmapped[0].cwd, None);
+    assert_eq!(report.unmapped[0].folder, home_folder.display().to_string());
+    assert_eq!(report.unmapped[0].name, None);
+    assert_eq!(report.unsynced, vec![home_folder.display().to_string()]);
 }
 
 /// Two devices of one person both start syncing home memory before
@@ -1982,9 +2352,7 @@ fn a_claude_folder_is_believed_only_about_its_own_directory() {
 /// kept beside it.
 #[test]
 fn two_devices_starting_at_once_are_in_one_channel_with_every_file_on_both() {
-    let (mut a, mut b) = paired();
-    let a_home = a.home_memory();
-    let b_home = b.home_memory();
+    let (mut a, mut b, a_home, b_home) = paired();
     std::fs::write(a_home.join("same.md"), "the same on both\n").unwrap();
     std::fs::write(b_home.join("same.md"), "the same on both\n").unwrap();
     std::fs::write(a_home.join("only_a.md"), "from a\n").unwrap();
@@ -2124,8 +2492,7 @@ fn a_repository_appearing_above_a_mapped_folder_is_reported() {
 /// it. When the file fits again, it syncs again.
 #[test]
 fn a_file_that_grows_too_large_is_left_alone_and_deleted_nowhere() {
-    let (mut a, mut b) = paired();
-    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("notes.md"), "small\n").unwrap();
     settle(&mut a, &mut b);
     assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("small\n"));
@@ -2167,8 +2534,7 @@ fn a_file_that_grows_too_large_is_left_alone_and_deleted_nowhere() {
 /// and deleted nowhere. A text is counted as it is, whatever is in it.
 #[test]
 fn a_file_that_does_not_fit_with_its_name_is_left_alone_too() {
-    let (mut a, mut b) = paired();
-    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("long.md"), "small\n").unwrap();
     settle(&mut a, &mut b);
 
@@ -2195,8 +2561,7 @@ fn a_file_that_does_not_fit_with_its_name_is_left_alone_too() {
 #[cfg(unix)]
 #[test]
 fn a_file_replaced_by_a_link_is_deleted_nowhere() {
-    let (mut a, mut b) = paired();
-    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let (mut a, mut b, a_mem, b_mem) = paired();
     std::fs::write(a_mem.join("notes.md"), "kept\n").unwrap();
     settle(&mut a, &mut b);
     assert_eq!(read(&b_mem, "notes.md").as_deref(), Some("kept\n"));
@@ -2224,8 +2589,7 @@ fn history_on(d: &Device, max_bytes: u64) -> cordelia_storage::history::Store {
 #[test]
 fn a_cycle_waits_for_its_turn() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (mut a, _b) = paired();
-    let a_mem = a.home_memory();
+    let (mut a, _b, a_mem, _) = paired();
     std::fs::write(a_mem.join("notes.md"), "one\n").unwrap();
     let Device { state, adapter, .. } = &mut a;
     let state = &*state;
@@ -2255,8 +2619,7 @@ fn a_cycle_waits_for_its_turn() {
 /// device holds passes its size by what one cycle keeps, and by no more.
 #[test]
 fn a_cycle_that_keeps_enough_sweeps_local_history() {
-    let (mut a, mut b) = paired();
-    let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    let (mut a, mut b, a_mem, b_mem) = paired();
     let text = |n: usize| format!("{n}{}\n", "x".repeat(1000));
     std::fs::write(a_mem.join("notes.md"), text(0)).unwrap();
     settle(&mut a, &mut b);
@@ -2295,16 +2658,15 @@ fn a_cycle_that_keeps_enough_sweeps_local_history() {
 #[test]
 fn a_device_that_follows_no_phrase_publishes_nothing_until_it_makes_one() {
     let mut a = Device::new().sync_on();
-    set_meta(&a, meta::SYNC_CLAUDE_ALL, "on");
     let home = a.home_memory();
     std::fs::write(home.join("user_role.md"), "Prefers short answers.\n").unwrap();
     let notes = a.plain_dir("notes");
     let mem = a.claude_folder(&notes);
     std::fs::write(mem.join("idea.md"), "a thought\n").unwrap();
+    map(&a, &a.home.clone(), "~");
     map(&a, &notes, "lab-notes");
 
-    // Its folders are listed, the one that is mapped and the one that is
-    // found, and nothing was done for either.
+    // Its folders are listed, and nothing was done for either.
     let listed = |report: &cordelia_sync::claude::CycleReport| -> Vec<(String, bool)> {
         let mut listed: Vec<(String, bool)> = report
             .folders
@@ -2314,7 +2676,7 @@ fn a_device_that_follows_no_phrase_publishes_nothing_until_it_makes_one() {
         listed.sort();
         listed
     };
-    let both = [("lab-notes".to_string(), true), ("~".to_string(), false)];
+    let both = [("lab-notes".to_string(), true), ("~".to_string(), true)];
     let report = a.cycle();
     assert_eq!(
         report.publishes_nothing.as_deref(),
@@ -2393,10 +2755,10 @@ fn first_sync(
     let mut a = Device::new().with_phrase().sync_on();
     let mut b = Device::new().sync_on();
     b.state.own_channels.set_up_with(1);
-    for d in [&a, &b] {
-        set_meta(d, meta::SYNC_CLAUDE_ALL, "on");
-    }
     let (a_mem, b_mem) = (a.home_memory(), b.home_memory());
+    for d in [&a, &b] {
+        map(d, &d.home.clone(), "~");
+    }
     for (mem, texts) in [(&a_mem, on_first), (&b_mem, on_second)] {
         for (name, text) in texts {
             std::fs::write(mem.join(name), text).unwrap();

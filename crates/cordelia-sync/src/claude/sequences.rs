@@ -66,16 +66,14 @@
 //! What the sequences do not vary: what one device passes to another
 //! arrives in the order it was stored.
 //!
-//! **How much is run.** A device checks the two signatures of every entry
-//! each time it reads a slot. In a test build that takes most of a
-//! cycle's time, and a sequence of some seventy steps takes seconds. So by
-//! default a part is run: one generated sequence for two devices and one
-//! for three; and the written sequences, without those that vary
-//! another, each with one seed and at most one mix of kinds. The checks
-//! that a good part of the generated sequences reach a rule are made
-//! only where everything is run, which `CORDELIA_SEQUENCES=12` does
-//! ([`sequences`], [`everything`]). A written sequence is run once for
-//! each kind of world, whichever tests ask about it ([`came`]).
+//! **How much is run.** Twelve generated sequences for each of two, three
+//! and four devices, or as many as `CORDELIA_SEQUENCES` says
+//! ([`sequences`]); and every written sequence, with each of its seeds and
+//! every mix of kinds. The checks that a good part of the generated
+//! sequences reach a rule are made over whatever is run. A device checks
+//! the two signatures of every entry each time it reads a slot, which in a
+//! test build is most of a cycle's time: so a written sequence is run once
+//! for each kind of world, whichever tests ask about it ([`came`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -1576,48 +1574,24 @@ fn heard(n: usize) -> Vec<Step> {
 }
 
 /// How many generated sequences are run for each number of devices:
-/// `CORDELIA_SEQUENCES`, or a number that keeps the tests short.
-///
-/// A device checks both signatures of every entry each time it reads a
-/// slot, and in a test build that is most of what a cycle takes. So the
-/// number that keeps the tests short is one, and below [`EVERYTHING`]
-/// only a part of the written sequences, of their seeds and of the mixes
-/// of kinds is run ([`everything`]). `CORDELIA_SEQUENCES=12` runs all of
-/// it.
+/// `CORDELIA_SEQUENCES`, or twelve. Every written sequence is run whatever
+/// it says, with each of its seeds and every mix of kinds, and the checks
+/// that the generated sequences reach a rule are made over however many
+/// are run.
 fn sequences() -> u64 {
     std::env::var("CORDELIA_SEQUENCES")
         .ok()
         .and_then(|n| n.parse().ok())
-        .unwrap_or(1)
-}
-
-/// The number of generated sequences from which everything is run.
-const EVERYTHING: u64 = 12;
-
-/// Whether everything is run: every written sequence, with every seed
-/// and every mix of kinds, as well as that many generated ones.
-fn everything() -> bool {
-    sequences() >= EVERYTHING
+        .unwrap_or(12)
 }
 
 /// The numbers of devices that generated sequences are made for: two,
-/// three and four, and two and three where not everything is run.
-fn devices() -> std::ops::RangeInclusive<usize> {
-    match everything() {
-        true => 2..=4,
-        false => 2..=3,
-    }
-}
+/// three and four.
+const DEVICES: std::ops::RangeInclusive<usize> = 2..=4;
 
 /// The seeds that a written sequence is run with: 2 and 3, which decide
-/// every tie between two texts that steps wrote the two ways round. One
-/// of the two, by the sequence's name, where not everything is run.
-fn seeds_of(name: &str) -> Vec<u64> {
-    match everything() {
-        true => vec![2, 3],
-        false => vec![2 + u64::from(cordelia_crypto::sha256(name.as_bytes())[0] & 1)],
-    }
-}
+/// every tie between two texts that steps wrote the two ways round.
+const SEEDS: [u64; 2] = [2, 3];
 
 /// What a world was once everything in it had met.
 struct AtRest {
@@ -1778,22 +1752,10 @@ fn run_with_history(n: usize, seed: u64, steps: &[Step], on: bool) -> (Vec<Vec<H
 /// device has the same files, the same conflict files, the same versions
 /// of the channel's and the same records. And with history on texts are
 /// kept, so that the two runs are not the same for having done nothing.
-/// (Where not everything is run: three of the written sequences, and one
-/// generated sequence.)
 #[test]
 fn local_history_changes_nothing_in_what_sync_does() {
     let mut sequences = all_written();
-    let mut devices = devices();
-    if !everything() {
-        let asked = [
-            "the index overtaken",
-            NOT_YET_PUBLISHED,
-            TWO_AT_ONE_REVISION,
-        ];
-        sequences.retain(|(name, ..)| asked.contains(&name.as_str()));
-        devices = 3..=3;
-    }
-    for n in devices {
+    for n in DEVICES {
         for seed in 1..=self::sequences().min(3) {
             let mut dice = Dice(seed * 7919 + n as u64);
             let mut steps = dice.steps(n, 60, true);
@@ -1807,7 +1769,7 @@ fn local_history_changes_nothing_in_what_sync_does() {
         }
     }
     for (name, n, steps) in sequences {
-        for seed in seeds_of(&name) {
+        for seed in SEEDS {
             let (off, none) = run_with_history(n, seed, &steps, false);
             let (on, kept) = run_with_history(n, seed, &steps, true);
             assert_eq!(none, 0, "{name}");
@@ -1855,23 +1817,10 @@ fn compared(
 
 /// The mixes of devices as built and as before that a written sequence
 /// for `n` devices is run with, each as the bits of a number, besides
-/// every device as built: every other mix with a device as built, where
-/// everything is run. Otherwise one, and none for four devices: every
-/// other device as built, the first of them with one seed and the second
-/// with the next.
-fn mixes(n: usize, seed: u64) -> Vec<u32> {
+/// every device as built: every other mix with a device as built.
+fn mixes(n: usize) -> Vec<u32> {
     let all = (1u32 << n) - 1;
-    if everything() {
-        return (1..all).collect();
-    }
-    let every_other = match seed % 2 {
-        0 => 0b0101 & all,
-        _ => 0b1010 & all,
-    };
-    match n {
-        4 => Vec::new(),
-        _ => vec![every_other],
-    }
+    (1..all).collect()
 }
 
 /// The kinds of `n` devices in a mix: as built where its bit is set.
@@ -1880,15 +1829,6 @@ fn kinds_of(n: usize, mix: u32) -> Vec<Kind> {
         .map(|d| if mix & (1 << d) != 0 { Built } else { Before })
         .collect()
 }
-
-/// The names of the written sequences that are left out where not
-/// everything is run: each varies another, and takes as long as it.
-const VARIANTS: [&str; 4] = [
-    "a text overtaken by a delete",
-    "a file with no extension",
-    "a change heard late, a delete",
-    "a change heard late, the index",
-];
 
 /// The written sequences: each makes the rule fire, and then goes on.
 fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
@@ -1950,7 +1890,7 @@ fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
     again.extend([Edit(2, "a.md"), Cycle(2)]);
     again.extend(sync(3));
 
-    let mut all = vec![
+    vec![
         ("a text overtaken", 4, overtaken("a.md", Edit(0, "a.md"))),
         (
             "a text overtaken by a delete",
@@ -1962,11 +1902,7 @@ fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
         ("a tie beside a higher revision", 3, tie),
         ("a tie written over by a device that holds both", 3, whole),
         ("written again after a delete", 3, again),
-    ];
-    if !everything() {
-        all.retain(|(name, ..)| !VARIANTS.contains(name));
-    }
-    all
+    ]
 }
 
 /// The names of the written sequences through a change that a test asks
@@ -2047,9 +1983,6 @@ fn written_through_a_change() -> Vec<(String, usize, Vec<Step>)> {
     all.push((format!("{HEARD_LATE}, an edit"), 2, late(Edit(1, file))));
     all.push((format!("{HEARD_LATE}, a delete"), 2, late(Delete(1, file))));
     all.push((format!("{HEARD_LATE}, the index"), 2, late(Line(1))));
-    if !everything() {
-        all.retain(|(name, ..)| !VARIANTS.contains(&name.as_str()));
-    }
     all
 }
 
@@ -2068,11 +2001,11 @@ fn every_file_is_as_it_was_before_in_the_written_sequences() {
     for (name, n, steps) in all_written() {
         // Each tie both ways: the two seeds decide every tie between two
         // texts that steps wrote the other way from each other.
-        for seed in seeds_of(&name) {
+        for seed in SEEDS {
             let before = all(Before, &name, n, seed, &steps);
             let built = all(Built, &name, n, seed, &steps);
             compared(&before.had, &built.had, &[Built; 4][..n], seed, &steps);
-            for mix in mixes(n, seed) {
+            for mix in mixes(n) {
                 let kinds = kinds_of(n, mix);
                 eprintln!("{name}: {kinds:?}, seed {seed}");
                 let mixed = came(&name, &kinds, seed, &steps, Until::Steps);
@@ -2083,16 +2016,17 @@ fn every_file_is_as_it_was_before_in_the_written_sequences() {
 }
 
 /// The property, over generated sequences of two, three and four devices
-/// ([`devices`]), every other one with changes of the person's devices
-/// among its steps. Where everything is run, the rule makes a difference
-/// in a good part of them: a generator that stopped reaching it would
-/// leave the property true of nothing. And the sequences with changes
-/// reach each of the five cases of what the plan does after one.
+/// ([`DEVICES`]), every other one with changes of the person's devices
+/// among its steps. The rule makes a difference in a good part of them: a
+/// generator that stopped reaching it would leave the property true of
+/// nothing. And the sequences with changes reach each of the five cases
+/// of what the plan does after one. Both are checked over however many
+/// sequences are run.
 #[test]
 fn every_file_is_as_it_was_before_in_generated_sequences() {
     let (mut run_all, mut fired) = (0, 0);
     let mut reached = [0; 5];
-    for n in devices() {
+    for n in DEVICES {
         for seed in 1..=sequences() {
             let mut dice = Dice(seed * 7919 + n as u64);
             let mut steps = dice.steps(n, 60, false);
@@ -2117,13 +2051,11 @@ fn every_file_is_as_it_was_before_in_generated_sequences() {
         }
     }
     eprintln!("the rule fired in {fired} of {run_all}; the five cases were met {reached:?} times");
-    if everything() {
-        assert!(
-            3 * fired >= run_all,
-            "the rule fired in {fired} of {run_all}"
-        );
-        assert!(reached.iter().all(|times| *times > 0), "{reached:?}");
-    }
+    assert!(
+        3 * fired >= run_all,
+        "the rule fired in {fired} of {run_all}"
+    );
+    assert!(reached.iter().all(|times| *times > 0), "{reached:?}");
 }
 
 /// The written sequences do make the rule fire: each run with every
@@ -2135,7 +2067,7 @@ fn the_written_sequences_make_the_rule_fire() {
     // From the last: the test of the property asks about the same runs
     // from the first, and each then finds the other's made.
     for (name, n, steps) in written().into_iter().rev() {
-        for seed in seeds_of(name) {
+        for seed in SEEDS {
             let copies = |kind: Kind| -> usize {
                 let came = all(kind, name, n, seed, &steps);
                 let last = came.had.last().unwrap();
@@ -2157,7 +2089,7 @@ fn no_text_is_lost_that_nobody_let_go_of() {
     let middle = written.len() / 2;
     written.rotate_left(middle);
     for (name, n, steps) in written {
-        for seed in seeds_of(&name) {
+        for seed in SEEDS {
             let came = all(Built, &name, n, seed, &steps);
             let lost = &came.met().lost;
             assert!(lost.is_empty(), "seed {seed}: {lost:?} after {steps:?}");
@@ -2165,7 +2097,7 @@ fn no_text_is_lost_that_nobody_let_go_of() {
             assert_eq!(came.met().gone, 0, "{name}");
         }
     }
-    for n in devices() {
+    for n in DEVICES {
         for seed in 1..=2 * sequences() {
             let mut dice = Dice(seed * 104_729 + n as u64);
             let mut steps = dice.steps(n, 60, true);
@@ -2265,13 +2197,12 @@ fn a_tie_and_then_a_removal() -> Vec<Step> {
 /// edit would have replaced the text with nothing kept, and it would have
 /// been in no file anywhere. (The tie is between two texts that steps
 /// wrote, so it goes the one way with one seed and the other with the
-/// next: the sequence is run with two seeds, or with four such pairs.)
+/// next: the sequence is run with four such pairs of seeds.)
 #[test]
 fn a_text_is_kept_through_a_removal() {
     let (until, then) = a_removal_and_then_a_tie();
     let mut kept = 0;
-    let seeds = if everything() { 8 } else { 2 };
-    for seed in 0..seeds {
+    for seed in 0..8 {
         let mut world = World::new(&[Built; 4], seed);
         for step in &until {
             world.run(step);
@@ -2374,19 +2305,18 @@ fn the_rule_changes_no_file_through_a_removal() {
     first.extend(sync_the_rest(4));
     let mut second = a_tie_and_then_a_removal();
     second.extend(sync_the_rest(3));
-    let seeds = if everything() { 4 } else { 2 };
     let sequences = [
         ("a removal and then a tie", 4, &first),
         ("a tie and then a removal", 3, &second),
     ];
     for (name, n, steps) in sequences {
         let mut made_a_difference = 0;
-        for seed in 0..seeds {
+        for seed in 0..4 {
             let before = came(name, &vec![Before; n], seed, steps, Until::Steps);
             let built = came(name, &vec![Built; n], seed, steps, Until::Steps);
             let more = compared(&before.had, &built.had, &[Built; 4][..n], seed, steps);
             made_a_difference += usize::from(more);
-            for mix in mixes(n, seed) {
+            for mix in mixes(n) {
                 let kinds = kinds_of(n, mix);
                 let mixed = came(name, &kinds, seed, steps, Until::Steps);
                 compared(&before.had, &mixed.had, &kinds, seed, steps);
@@ -2569,7 +2499,7 @@ fn the_written_sequences_through_a_change_meet_the_five_cases() {
             _ => &[1, 3],
         };
         for kind in [Built, Before] {
-            for seed in seeds_of(&name) {
+            for seed in SEEDS {
                 let came = all(kind, &name, n, seed, &steps);
                 for case in cases {
                     let times = came.reached[case - 1];
@@ -2847,11 +2777,6 @@ fn written_for_lines() -> Vec<(String, usize, Vec<Step>)> {
     beside.push(Minute(0));
     beside.extend(sync(3));
     all.push((BESIDE.to_string(), 3, beside));
-    if !everything() {
-        all.retain(|(name, ..)| {
-            RUN_ALWAYS.contains(&name.as_str()) || name == &deleted_apart(true, true)
-        });
-    }
     all
 }
 
@@ -2881,20 +2806,11 @@ const BESIDE: &str = "a version beside";
 /// deleted for the device that merges.)
 const BACK_BY_A_MERGE: [&str; 4] = [TWO_TIES, FILE_FIRST, OWN_LINE, A_THIRD];
 
-/// The written sequences that are run where not everything is, with the
-/// first of those in which a memory is deleted and edited apart: one for
-/// each thing that a test asks of a sequence by its name.
-const RUN_ALWAYS: [&str; 5] = [TWO_DELETED, OVERTAKEN, TWO_TIES, INDEX_FIRST, BESIDE];
-
 /// The seeds the written sequences for the index line run with: four
 /// pairs, each pair deciding every tie between two texts that steps wrote
 /// the two ways round, and the pairs deciding them apart from each other.
-/// The first seed alone, where not everything is run ([`everything`]).
-fn seeds() -> Vec<u64> {
-    match everything() {
-        true => vec![2, 3, 4, 5, 6, 7, 8, 9],
-        false => vec![2],
-    }
+fn seeds() -> [u64; 8] {
+    [2, 3, 4, 5, 6, 7, 8, 9]
 }
 
 /// What a world of devices of `kinds` came to over a sequence for the
@@ -3051,11 +2967,11 @@ fn a_line_that_is_due_goes_back(name: &str, n: usize, seed: u64, steps: &[Step])
 }
 
 /// The generated sequences for the index line, each with its name: for
-/// two, three and four devices ([`devices`]), every other one with
+/// two, three and four devices ([`DEVICES`]), every other one with
 /// changes of the person's devices among its steps.
 fn generated_for_lines() -> Vec<(String, usize, u64, Vec<Step>)> {
     let mut all = Vec::new();
-    for n in devices() {
+    for n in DEVICES {
         for seed in 1..=sequences() {
             let mut dice = Dice(seed * 15_485_863 + n as u64);
             let mut steps = dice.line_steps(n, 50);
@@ -3105,8 +3021,8 @@ fn a_put_back_loses_no_line() {
 
 /// Property C: where a memory is back and its line is due, the line goes
 /// back. And the sequences reach the rule: in each written one that can,
-/// and, where everything is run, in a good part of the generated ones, a
-/// line is put back. Without that the three properties could be true of
+/// and in a good part of the generated ones, however many are run, a line
+/// is put back. Without that the three properties could be true of
 /// nothing.
 #[test]
 fn a_memory_that_is_back_is_listed() {
@@ -3132,9 +3048,10 @@ fn a_memory_that_is_back_is_listed() {
         reached += usize::from(a_line_that_is_due_goes_back(&name, n, seed, &steps));
     }
     eprintln!("a line went back in {reached} of {run} generated sequences");
-    if everything() {
-        assert!(4 * reached >= run, "a line went back in {reached} of {run}");
-    }
+    // With none run, a quarter of none would be reached, and the check
+    // would say nothing.
+    assert!(run > 0, "no generated sequence was run");
+    assert!(4 * reached >= run, "a line went back in {reached} of {run}");
 }
 
 /// The written sequences end as they should: every device has the memory
@@ -3146,8 +3063,8 @@ fn a_memory_deleted_here_and_edited_there_is_listed_once_everywhere() {
             let mut each = vec![vec![Built; n]];
             // The other devices without the change: the device that
             // deleted puts the line back all the same. (Two devices
-            // deleted it: both have the change.) Where everything is run.
-            if everything() && name != TWO_DELETED {
+            // deleted it: both have the change.)
+            if name != TWO_DELETED {
                 let mut kinds = vec![Lineless; n];
                 kinds[0] = Built;
                 each.push(kinds);
@@ -3172,9 +3089,7 @@ fn a_memory_deleted_here_and_edited_there_is_listed_once_everywhere() {
 /// The written sequence with a tie on the file and a tie on the index
 /// runs with each way the two can go, over its seeds. The file's tie is
 /// between a delete and a text, and has one way: a text beats a delete.
-/// The index's has two: the properties above are asked of both where
-/// everything is run. (Two seeds are enough to show the two ways, and are
-/// run here whatever else is.)
+/// The index's has two: the properties above are asked of both.
 #[test]
 fn the_two_ties_go_each_way_they_can() {
     let (name, n, steps) = written_for_lines()
@@ -3182,8 +3097,7 @@ fn the_two_ties_go_each_way_they_can() {
         .find(|(name, ..)| name == TWO_TIES)
         .unwrap();
     let mut ways = BTreeSet::new();
-    let seeds = if everything() { seeds() } else { vec![2, 3] };
-    for seed in seeds {
+    for seed in seeds() {
         let came = for_lines(&name, &vec![Built; n], seed, &steps);
         let won = |name: &str| -> Vec<bool> {
             let ties = came.met().ties.iter().filter(|(tied, _)| tied == name);

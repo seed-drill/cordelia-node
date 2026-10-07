@@ -385,12 +385,33 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
         (relays.len() == 1 && relays[0]["state"] == "unreachable").then_some(())
     });
     assert!(has_hot_peer(&a).is_none(), "no relay yet, so no peer");
+    // The node says for how long no relay has been connected, by its
+    // own clock (decision 2026-10-04 §10.1): the status line goes by it.
+    let no_relay_secs = |n: &Node| n.get("/api/v1/status").unwrap()["no_relay_secs"].clone();
+    let first = wait_for("a says since when it has no relay", &[&a], 30, || {
+        no_relay_secs(&a).as_u64()
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let later = no_relay_secs(&a).as_u64().unwrap();
+    assert!(later > first && later < 120, "{first} then {later}");
+    // `cordelia status --json` carries it as the node says it.
+    assert!(state(&a)["no_relay_secs"].as_u64() >= Some(later));
 
     relay.start();
     wait_for("relay healthy", &[&relay, &a], 30, || healthy(&relay));
     wait_for("a reaches the relay by name", &[&relay, &a], 60, || {
         has_hot_peer(&a)
     });
+    // With a relay connected, it says none.
+    wait_for(
+        "a says that a relay is connected",
+        &[&relay, &a],
+        30,
+        || no_relay_secs(&a).is_null().then_some(()),
+    );
+    let said = state(&a);
+    assert!(said["no_relay_secs"].is_null(), "{said}");
+    assert!(said.as_object().unwrap().contains_key("no_relay_secs"));
 }
 
 /// The peers `n` is connected to, by key.
@@ -1522,9 +1543,20 @@ fn a_command_asks_no_address_but_the_nodes_own() {
             said["not_asked"].as_str().unwrap().contains(&named),
             "{said}"
         );
+        // A node that was not asked has a state of its own, and no
+        // level: the bar is drawn as it was before there was a level,
+        // `active` with `attention`, and the line in red.
+        assert!(said["level"].is_null(), "{said}");
         let out = n.command_given(&given, &["status", "--waybar"]);
         let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(said["class"][0], "attention", "{said}");
+        assert_eq!(
+            said["class"],
+            serde_json::json!(["attention", "active"]),
+            "{said}"
+        );
+        let out = n.command_given(&given, &["status", "--line"]);
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.contains("▲ memory: node not asked"), "{line}");
         let tooltip = said["tooltip"].as_str().unwrap();
         assert!(
             tooltip.contains("not asked") && tooltip.contains(&named),
@@ -1821,18 +1853,37 @@ fn claude_memory_syncs_between_two_machines() {
         "cordelia sync map ~ --home",
         "cordelia sync map ~/Work/cordelia-node",
         "cordelia sync map ~/notes <name>",
-        "Scope: mapped folders only.",
+        "Only mapped folders sync.",
     ] {
         assert!(
             found.contains(expected),
             "missing {expected:?} in:\n{found}"
         );
     }
+    // Nothing is mapped: the state is off. What is about a person's
+    // devices holds all the same (decision 2026-10-04 §10.1): the device
+    // that was added, and that nobody has cleared, is amber on each of
+    // the two, and the line says it.
+    for n in [&a, &b] {
+        let s = state(n);
+        assert_eq!(s["state"], "off", "{s}");
+        assert_eq!(s["level"], "amber", "{s}");
+        assert_eq!(
+            s["summary"], "memory: 1 device added, not yet cleared",
+            "{s}"
+        );
+        assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
+    }
     let s = state(&a);
-    assert_eq!(s["state"], "off", "{s}");
-    assert_eq!(s["summary"], "memory: nothing mapped", "{s}");
     assert_eq!(s["sync"]["all"], false, "{s}");
-    assert_eq!(s["sync"]["unmapped"].as_array().unwrap().len(), 3, "{s}");
+    // Each is carried with whether `cordelia sync map` would sync it:
+    // all three would, and so each has its directory under `cwd`.
+    let unmapped = s["sync"]["unmapped"].as_array().unwrap();
+    assert_eq!(unmapped.len(), 3, "{s}");
+    for found in unmapped {
+        assert_eq!(found["mappable"], true, "{found}");
+        assert!(found["cwd"].is_string(), "{found}");
+    }
 
     // What cannot be mapped by accident, or by a slip.
     let said = a.refused(&["sync", "map", &path(&a.home())]);
@@ -1989,8 +2040,38 @@ fn claude_memory_syncs_between_two_machines() {
         assert!(s["sync"]["last_change_at"].is_string(), "{s}");
         assert_eq!(s["outbox_waiting"], 0, "{s}");
     }
+    // The level (decision 2026-10-04 §10.1). A device was added since
+    // the last change, and nobody has cleared it: that is amber on each
+    // device, with a mark of its own in the line and a class of its own
+    // in the bar, and the state is as it was.
+    for n in [&a, &b] {
+        let s = state(n);
+        assert_eq!(
+            (&s["state"], &s["level"]),
+            (&serde_json::json!("synced"), &serde_json::json!("amber"))
+        );
+        assert_eq!(s["summary"], "memory: 1 device added, not yet cleared");
+        assert_eq!(s["holds"][0]["what"], "added", "{s}");
+        assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
+    }
     let line = a.cli(&["status", "--line"]);
-    assert!(line.contains("memory synced"), "{line}");
+    assert!(line.contains("◆ memory: 1 device added"), "{line}");
+    let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(
+        bar["class"],
+        serde_json::json!(["synced", "amber"]),
+        "{bar}"
+    );
+    // Cleared on a device, nothing holds there: no level.
+    for n in [&a, &b] {
+        clears_what_it_tells(n);
+        let s = state(n);
+        assert!(s["level"].is_null(), "{s}");
+        assert_eq!(s["holds"], serde_json::json!([]), "{s}");
+        assert_eq!(s["summary"], "memory synced", "{s}");
+    }
+    let line = a.cli(&["status", "--line"]);
+    assert!(line.contains("● memory synced"), "{line}");
     let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
     assert_eq!(bar["class"], "synced", "{bar}");
     assert!(
@@ -2031,66 +2112,75 @@ fn claude_memory_syncs_between_two_machines() {
     assert_eq!(project["failed_more"], 0, "{snapshot}");
 
     // One setting changes at a time; the others stay as they were. Turning
-    // home memory off unmaps it; a mapped folder is unmapped, not excluded.
+    // home memory off unmaps it.
     a.cli(&["sync", "home", "off"]);
-    a.cli(&["sync", "exclude", "github.com/Client-Co/App.git"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], false, "{s}");
     assert_eq!(mapped_names(&s), [PROJECT, "lab-notes"], "{s}");
-    assert_eq!(
-        s["sync"]["exclude"],
-        serde_json::json!(["github.com/client-co/app"])
-    );
     assert_eq!(s["sync"]["enabled"], true);
-    let said = a.refused(&["sync", "exclude", "lab-notes"]);
-    assert!(said.contains("cordelia sync unmap lab-notes"), "{said}");
-    a.cli(&["sync", "include", "github.com/client-co/app"]);
-    // A name has one spelling, so what excludes a project includes it
-    // again, typed the same way: with its ending in capitals too, and
-    // whichever command stored it.
-    let exclude_by: [&[&str]; 2] = [
-        &["sync", "exclude", "Client-Co/App.GIT"],
-        &["sync", "claude", "--exclude", "Client-Co/App.GIT"],
-    ];
-    for exclude in exclude_by {
-        a.cli(exclude);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!(["client-co/app"]),
-            "{exclude:?}"
-        );
-        a.cli(&["sync", "include", "Client-Co/App.GIT"]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!([]),
-            "{exclude:?}"
-        );
-    }
-    // A remote that is pasted is the name the project is found under,
-    // and what is left of nothing is refused, not stored.
-    for remote in [
-        "https://github.com/Client-Co/App.git",
-        "git@github.com:client-co/app.GIT",
+
+    // What is no more is refused, with what to do instead, and changes
+    // nothing: everything found does not sync, and there is nothing left
+    // to exclude (decision 2026-10-04 §10.1).
+    let generation = a.post("/api/v1/sync/status", serde_json::json!({}))["generation"].clone();
+    let dir = path(&a.home().join(".claude"));
+    for everything in [
+        &["sync", "claude", "--all"][..],
+        &["sync", "claude", "--all", "--dir", &dir],
+        &["sync", "claude", "--all", "--reset"],
+        &["sync", "claude", "--all", "--no-home"],
     ] {
-        a.cli(&["sync", "exclude", remote]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!(["github.com/client-co/app"]),
-            "{remote}"
-        );
-        a.cli(&["sync", "include", remote]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!([]),
-            "{remote}"
-        );
+        let said = a.refused(everything);
+        assert!(said.contains("only mapped folders sync"), "{said}");
+        assert!(said.contains("cordelia sync map <folder>"), "{said}");
     }
-    let said = a.refused(&["sync", "exclude", ".GIT"]);
-    assert!(said.contains("is not a project's name"), "{said}");
+    for exclusion in [
+        &["sync", "exclude", "github.com/Client-Co/App.git"][..],
+        &["sync", "exclude", "lab-notes"],
+        &["sync", "include", "github.com/client-co/app"],
+        &["sync", "claude", "--exclude", "Client-Co/App.GIT"],
+    ] {
+        let said = a.refused(exclusion);
+        assert!(said.contains("nothing left to exclude"), "{said}");
+        assert!(said.contains("cordelia sync unmap <folder>"), "{said}");
+    }
+    let s = state(&a);
+    assert_eq!(s["sync"]["all"], false, "{s}");
+    assert_eq!(s["sync"]["exclude"], serde_json::json!([]), "{s}");
+    assert_eq!(s["sync"]["home"], false, "{s}");
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes"], "{s}");
+    let after = a.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(after["generation"], generation, "nothing was sent: {after}");
+    // The node refuses the same, from whoever asks it: a panel that is
+    // not yet brought up to date. Nothing is changed, and no change is
+    // counted.
+    let asks: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut answer = asks
+        .post(&format!("http://127.0.0.1:{}/api/v1/sync/claude", a.http))
+        .header("Authorization", &format!("Bearer {}", a.token()))
+        .send_json(serde_json::json!({ "enabled": true, "all": true, "home": true }))
+        .unwrap();
+    assert_eq!(answer.status().as_u16(), 400);
+    let asked: serde_json::Value = answer.body_mut().read_json().unwrap();
+    let refused = asked["error"]["message"].as_str().unwrap_or_default();
+    assert!(refused.contains("only mapped folders sync"), "{asked}");
+    let after = a.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(after["generation"], generation, "{after}");
+    assert_eq!(after["home"], false, "{after}");
+    // `--mapped-only` is taken, and says that it is the only scope.
+    let out = a.cli(&["sync", "claude", "--mapped-only"]);
+    assert!(out.starts_with("No settings changed.\n"), "{out}");
+    assert!(
+        out.contains("Only mapped folders sync: that is the only scope there is."),
+        "{out}"
+    );
     a.cli(&["sync", "home", "on"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], true, "{s}");
-    assert_eq!(s["sync"]["exclude"], serde_json::json!([]));
     assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
 
     // Turning sync on again changes nothing: not the directory (which is
@@ -2126,23 +2216,9 @@ fn claude_memory_syncs_between_two_machines() {
     );
     let said = a.refused(&["sync", "unmap", "lab-notes"]);
     assert!(said.contains("not mapped on this device"), "{said}");
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!([path(&a_notes)]),
-        "an unmapped folder stays out until it is mapped again"
-    );
-    // `--exclude` replaces the names in the list and keeps a folder that
-    // was unmapped, and `include` of the name leaves the folder too.
-    a.cli(&["sync", "claude", "--exclude", "Client-Co/App.GIT"]);
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!(["client-co/app", path(&a_notes)])
-    );
-    a.cli(&["sync", "include", "client-co/app"]);
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!([path(&a_notes)])
-    );
+    // An unmapped folder does not sync, and needs no exclusion to stay
+    // out: nothing is written of it.
+    assert_eq!(state(&a)["sync"]["exclude"], serde_json::json!([]));
     a.cli(&["sync", "unmap", &path(&sub)]);
     assert_eq!(mapped_names(&state(&a)), ["~"]);
     a.cli(&["sync", "map", &path(&a_repo)]);
@@ -2429,34 +2505,14 @@ fn home_memory_syncs_under_any_name() {
     assert!(out.contains("as crew."), "{out}");
     assert_eq!(mapped_names(&state(&a)), ["crew", "lab"]);
 
-    // Found, and not mapped: where everything found syncs, home syncs as
-    // `~`. Turned off and on again it is `~`, not a name it once had.
-    // (Home is unmapped here by its folder, as the two steps that `map`
-    // gives for a home mapped under another name spell it.)
+    // Home is unmapped by its folder, as the two steps that `map` gives
+    // for a home mapped under another name spell it, and mapped again
+    // under the name it had before.
     let out = a.cli(&["sync", "unmap", "~"]);
     assert!(
         out.contains("No longer synced from this device: ~ (crew)."),
         "{out}"
     );
-    a.cli(&["sync", "claude", "--all"]);
-    a.cli(&["sync", "include", &path(&a.home())]);
-    wait_for("a's home is found, and syncs as ~", &all, 120, || {
-        state(&a)["sync"]["projects"]
-            .as_array()?
-            .iter()
-            .any(|p| p["project"] == "~" && p["mapped"] == false && p["channel"].is_string())
-            .then_some(())
-    });
-    a.cli(&["sync", "home", "off"]);
-    assert_eq!(state(&a)["sync"]["home_name"], "~");
-    let out = a.cli(&["sync", "home", "on"]);
-    assert!(
-        out.contains("Home-folder memory syncs on this device."),
-        "{out}"
-    );
-    assert_eq!(mapped_names(&state(&a)), ["lab", "~"]);
-    a.cli(&["sync", "claude", "--mapped-only"]);
-    a.cli(&["sync", "unmap", "~"]);
     a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
 
     // A home directory that is itself a git repository: Claude Code keeps
@@ -3017,12 +3073,19 @@ fn swarm_key_files(n: &Node) -> Vec<String> {
 /// for itself each time it started, up to 0.2.0-alpha.7, as that version
 /// made it: its row, the node as its owner, and its key file. Its ID
 /// holds the node's entity ID. Returns the ID.
+///
+/// A database of this version refuses a new row of the older kind, from
+/// its first start on (decision 2026-10-04 §10.1). Where the node has
+/// started, the test takes that guard away first: it puts the row where
+/// nothing of this version would.
 fn swarm_channel_as_an_earlier_version_made_it(n: &Node) -> String {
     let id = cordelia_storage::naming::swarm_channel_id(&entity_id(n));
     let pk = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
     let psk = cordelia_crypto::generate_psk().unwrap();
     let now = "2026-10-01T00:00:00+00:00";
     let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    cordelia_storage::first_start::remove_guard(&db).unwrap();
     db.execute(
         "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
          VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",

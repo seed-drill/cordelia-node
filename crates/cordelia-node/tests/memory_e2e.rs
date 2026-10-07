@@ -257,13 +257,23 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
             (s["summary"] == "memory: 1 conflict").then_some(())
         });
     }
-    // With the copy merged away on one device, both are synced.
+    // With the copy merged away on one device, both are synced. Each
+    // still tells of the device that was added, which nobody has
+    // cleared: that is amber, and says so (decision 2026-10-04 §10.1).
     std::fs::remove_file(a_mem.join(&copies[0])).unwrap();
     for n in [&a, &b] {
         wait_for("the device is synced", &all, 90, || {
             let s = state(n);
-            (s["state"] == "synced" && s["summary"] == "memory synced").then_some(())
+            (s["state"] == "synced" && s["level"] == "amber").then_some(())
         });
+        assert_eq!(
+            state(n)["summary"],
+            "memory: 1 device added, not yet cleared"
+        );
+        clears_what_it_tells(n);
+        let s = state(n);
+        assert!(s["level"].is_null(), "{s}");
+        assert_eq!(s["summary"], "memory synced", "{s}");
     }
     assert_eq!(files(&a_mem), files(&b_mem));
     assert_eq!(files(&a_mem).len(), 4);
@@ -495,6 +505,341 @@ fn an_edit_made_before_a_device_heard_of_a_change_arrives_as_an_edit_of_the_carr
     assert!(conflict_files(&a_mem).is_empty(), "{:?}", files(&a_mem));
     assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
     assert_eq!(files(&a_mem), files(&b_mem));
+}
+
+/// A relay of the test's own, under a name of its own, started.
+fn relay_named(name: &'static str) -> Node {
+    let mut relay = node(name, "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    relay
+}
+
+/// A device that is set up with each of `relays`, started, and connected
+/// to each of them.
+fn device_at(name: &'static str, relays: &[&Node]) -> Node {
+    let at: Vec<(String, Option<String>)> = relays
+        .iter()
+        .map(|relay| (format!("127.0.0.1:{}", relay.p2p), None))
+        .collect();
+    let mut device = node_with_relays(name, "personal", &at);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    connected_to_each(&device, relays.len());
+    device
+}
+
+/// Wait until `device` is connected to each of the `relays` relays that
+/// it is set up with.
+fn connected_to_each(device: &Node, relays: usize) {
+    wait_for("the device reaches its relays", &[device], 90, || {
+        let set_up = relays_of(device);
+        (set_up.len() == relays && set_up.iter().all(|relay| relay["state"] == "connected"))
+            .then_some(())
+    });
+}
+
+/// Whether the store of `relay` holds the change entry numbered `number`
+/// of the phrase that `device` follows: the two databases are read
+/// beside their nodes. The change entry is the one entry of the phrase's
+/// channel, and its revision is the statement's number (decision
+/// 2026-10-04 §4.6).
+fn holds_the_change(relay: &Node, device: &Node, number: u64) -> bool {
+    let beside = |node: &Node| {
+        let conn = rusqlite::Connection::open_with_flags(
+            node.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        conn
+    };
+    let channel: Vec<u8> = beside(device)
+        .query_row("SELECT phrase_channel FROM person", [], |row| row.get(0))
+        .unwrap();
+    beside(relay)
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE channel_id = ?1 AND rev = ?2)",
+            rusqlite::params![channel, number as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// What a remaining device, a removed device and two relays are before
+/// the remaining device comes back (decision 2026-10-04 §4.6, §7.4).
+struct LateWrite {
+    /// The relay that holds the change, and the relay that the change
+    /// has not reached: it holds what the removed device wrote since.
+    has: Node,
+    lacks: Node,
+    /// The device that made the removal, stopped; the one that remains,
+    /// stopped since before the removal; and the removed one, running,
+    /// which has not heard.
+    desktop: Node,
+    laptop: Node,
+    tablet: Node,
+    desktop_memory: PathBuf,
+    laptop_memory: PathBuf,
+    /// The files that the devices held when they were last in step.
+    before: Vec<(String, String)>,
+}
+
+/// What the removed device wrote after its removal: an edit of a file
+/// that every device has, and a new file.
+const LATE_EDIT: &str = "the second, as the tablet wrote it after it was removed\n";
+const LATE_FILE: &str = "new on the tablet after it was removed\n";
+const AS_THE_DESKTOP_WROTE_IT: &str = "the second, as the desktop wrote it\n";
+
+/// Three devices of one person sync the name `lab`. The desktop and the
+/// laptop are set up with two relays, and the tablet with one of them.
+/// The laptop is turned off. The tablet's relay is stopped, and the
+/// desktop removes the tablet: the change reaches the other relay, and
+/// the desktop is then turned off, so that it tells the tablet's relay
+/// nothing. That relay comes back. The tablet, which has not heard and
+/// cannot, edits a file and writes a new one, in the channel that the
+/// desktop has left, and its relay holds both.
+fn a_removed_device_writes_late_while_another_is_off() -> LateWrite {
+    let has = relay_named("has");
+    let mut lacks = relay_named("lacks");
+    let mut desktop = device_at("a", &[&has, &lacks]);
+    let mut laptop = device_at("b", &[&has, &lacks]);
+    let tablet = device_at("c", &[&lacks]);
+    let (a_notes, a_mem) = notes_of(&desktop);
+    let (b_notes, b_mem) = notes_of(&laptop);
+    let (c_notes, c_mem) = notes_of(&tablet);
+    let words = {
+        let all = [&has, &lacks, &desktop, &laptop, &tablet];
+        let words = three_that_sync(
+            [&desktop, &laptop, &tablet],
+            [&a_mem, &b_mem, &c_mem],
+            [&a_notes, &b_notes, &c_notes],
+            &[
+                ("first.md", "the first, as the desktop wrote it\n"),
+                ("second.md", AS_THE_DESKTOP_WROTE_IT),
+                ("MEMORY.md", "- [first](first.md)\n- [second](second.md)\n"),
+            ],
+            &all,
+        );
+        for device in [&desktop, &laptop, &tablet] {
+            wait_for("each device has sent what it holds", &all, 120, || {
+                has_sent_everything(device)
+            });
+        }
+        words
+    };
+    let before = files(&a_mem);
+
+    // The laptop is off, and the tablet's relay is down, while the
+    // desktop removes the tablet: the change reaches one relay.
+    laptop.stop();
+    lacks.stop();
+    {
+        let mut at = removes(&desktop, &key_of(&tablet), &["stays"], &words);
+        at.says("The change is made (change 2)");
+        // The relay's own store is asked, and not the desktop's status:
+        // what a device says of a relay is what the relay last answered,
+        // and the desktop is turned off as soon as the relay holds it.
+        wait_for("the relay holds the change", &[&has, &desktop], 90, || {
+            holds_the_change(&has, &desktop, 2).then_some(())
+        });
+    }
+    desktop.stop();
+
+    // The tablet's relay is back, and has not heard of the change. Nor
+    // has the tablet: it writes on, in the channel that was left.
+    lacks.start();
+    wait_for("relay healthy", &[&lacks], 30, || healthy(&lacks));
+    connected_to_each(&tablet, 1);
+    std::fs::write(c_mem.join("second.md"), LATE_EDIT).unwrap();
+    std::fs::write(c_mem.join("late.md"), LATE_FILE).unwrap();
+    let all = [&lacks, &tablet];
+    wait_for("the tablet has published what it wrote", &all, 90, || {
+        let held = held(&tablet);
+        let late = held.iter().any(|(key, _, _)| key == "late.md");
+        let edit = held
+            .iter()
+            .any(|(key, _, text)| key == "second.md" && text.as_deref() == Some(LATE_EDIT));
+        (late && edit).then_some(())
+    });
+    wait_for("the tablet has sent what it wrote", &all, 90, || {
+        has_sent_everything(&tablet)
+    });
+    assert_eq!(person_of(&tablet)["state"], "applied");
+    LateWrite {
+        has,
+        lacks,
+        desktop,
+        laptop,
+        tablet,
+        desktop_memory: a_mem,
+        laptop_memory: b_mem,
+        before,
+    }
+}
+
+/// A device that was off during a removal comes back, and reaches a relay
+/// that holds the change and a relay that holds what the removed device
+/// wrote since, in the channel that was left (decision 2026-10-04 §4.6).
+/// Its first act at each relay is the show, and it takes nothing until
+/// each has answered: so it applies the change, and never takes what the
+/// removed device wrote late. Its files are as they were, and nothing is
+/// beside them.
+#[test]
+fn a_device_that_was_off_during_a_removal_applies_it_before_it_takes_a_late_write() {
+    let LateWrite {
+        has,
+        lacks,
+        mut desktop,
+        mut laptop,
+        tablet,
+        desktop_memory,
+        laptop_memory,
+        before,
+    } = a_removed_device_writes_late_while_another_is_off();
+
+    laptop.start();
+    let all = [&has, &lacks, &laptop, &tablet];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    has_applied(&laptop, 2, &all);
+    // It shows the change to the other relay, which hands it to the
+    // tablet: the tablet hears that it was removed. So the laptop has
+    // been at the relay that holds what the tablet wrote late.
+    wait_for("the tablet hears that it was removed", &all, 120, || {
+        (person_of(&tablet)["state"] == "removed").then_some(())
+    });
+    wait_for("the laptop has sent what it holds", &all, 120, || {
+        has_sent_everything(&laptop)
+    });
+    assert_eq!(files(&laptop_memory), before);
+
+    // The desktop comes back, and the two go on syncing. In all that
+    // time nothing of what the tablet wrote late has reached either.
+    desktop.start();
+    let all = [&has, &lacks, &desktop, &laptop, &tablet];
+    wait_for("the desktop is healthy", &all, 30, || healthy(&desktop));
+    std::fs::write(
+        desktop_memory.join("after.md"),
+        "new on the desktop after the removal\n",
+    )
+    .unwrap();
+    wait_for(
+        "the desktop's new file reaches the laptop",
+        &all,
+        120,
+        || laptop_memory.join("after.md").exists().then_some(()),
+    );
+    for memory in [&desktop_memory, &laptop_memory] {
+        let now = files(memory);
+        assert_eq!(now.len(), before.len() + 1, "{now:?}");
+        assert!(!memory.join("late.md").exists());
+        assert_eq!(
+            read(&memory.join("second.md")).as_deref(),
+            Some(AS_THE_DESKTOP_WROTE_IT)
+        );
+        assert!(conflict_files(memory).is_empty(), "{now:?}");
+    }
+}
+
+/// The same device, where the only relay it reaches when it comes back is
+/// one that the change has not reached (decision 2026-10-04 §7.4, and
+/// property 2): it cannot tell "nothing has changed" from "this relay
+/// has not been told". It takes what the removed device wrote late, as
+/// it takes any device's. When it hears of the removal it keeps that: it
+/// carries each version as its own. A device that had applied the removal
+/// takes each from there, and where a version differs from what its own
+/// file held, its own text is kept beside the file.
+#[test]
+fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_keeps_it() {
+    let LateWrite {
+        mut has,
+        lacks,
+        mut desktop,
+        mut laptop,
+        tablet,
+        desktop_memory,
+        laptop_memory,
+        before,
+    } = a_removed_device_writes_late_while_another_is_off();
+
+    // The relay that holds the change is out of reach when the laptop
+    // comes back. Once it has waited for that relay as long as a device
+    // that wakes waits, it goes on at the other, and takes what is there.
+    has.stop();
+    laptop.start();
+    {
+        let all = [&lacks, &laptop, &tablet];
+        wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+        wait_for(
+            "the laptop takes what the tablet wrote late",
+            &all,
+            180,
+            || {
+                let edit = read(&laptop_memory.join("second.md"));
+                let late = read(&laptop_memory.join("late.md"));
+                (edit.as_deref() == Some(LATE_EDIT) && late.as_deref() == Some(LATE_FILE))
+                    .then_some(())
+            },
+        );
+        assert_eq!(person_of(&laptop)["change"], 1);
+        // It took each as an edit of what it held: nothing is beside it.
+        assert!(conflict_files(&laptop_memory).is_empty());
+    }
+
+    // The other relay is back: the laptop hears of the removal, applies
+    // it, and keeps what it took.
+    has.start();
+    {
+        let all = [&has, &lacks, &laptop, &tablet];
+        wait_for("relay healthy", &all, 30, || healthy(&has));
+        has_applied(&laptop, 2, &all);
+        wait_for("the laptop has sent what it carried", &all, 150, || {
+            has_sent_everything(&laptop)
+        });
+    }
+    let carried = held(&laptop);
+    let text_of = |name: &str| {
+        let entry = carried.iter().find(|(key, _, _)| key == name);
+        entry.and_then(|(_, _, text)| text.clone())
+    };
+    assert_eq!(text_of("second.md").as_deref(), Some(LATE_EDIT));
+    assert_eq!(text_of("late.md").as_deref(), Some(LATE_FILE));
+    assert_eq!(
+        read(&laptop_memory.join("second.md")).as_deref(),
+        Some(LATE_EDIT)
+    );
+    assert!(conflict_files(&laptop_memory).is_empty());
+
+    // The desktop, which had applied the removal and never took what the
+    // tablet wrote late, takes each version from the laptop's carry: the
+    // new file as a new file, and the edit with its own text beside it.
+    desktop.start();
+    let all = [&has, &lacks, &desktop, &laptop, &tablet];
+    wait_for("the desktop is healthy", &all, 30, || healthy(&desktop));
+    wait_for(
+        "the desktop takes what the laptop carried",
+        &all,
+        180,
+        || {
+            let edit = read(&desktop_memory.join("second.md"));
+            let late = read(&desktop_memory.join("late.md"));
+            (edit.as_deref() == Some(LATE_EDIT) && late.as_deref() == Some(LATE_FILE)).then_some(())
+        },
+    );
+    let copies = conflict_files(&desktop_memory);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert!(copies[0].starts_with("second.conflict-"), "{copies:?}");
+    assert_eq!(
+        read(&desktop_memory.join(&copies[0])).as_deref(),
+        Some(AS_THE_DESKTOP_WROTE_IT)
+    );
+    // The copy is a file like any other, and reaches the laptop: the two
+    // folders hold the same files, and one more than before but for it.
+    wait_for("the two folders hold the same files", &all, 150, || {
+        (files(&desktop_memory) == files(&laptop_memory)).then_some(())
+    });
+    assert_eq!(files(&desktop_memory).len(), before.len() + 2);
 }
 
 /// After a change, the command says that this machine may be closed only

@@ -658,6 +658,12 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 /// than this, every node drops the key's whole slot history. A device
 /// offline for longer than this can bring a deleted file back with a stale
 /// edit; 90 days covers a laptop left in a drawer for a season.
+///
+/// It is also how long a delete is held among the entries of a channel
+/// from its secret, at a relay and in a device's own store (decision
+/// 2026-10-04 §2.3, §7.3), counted from when the node stored the entry:
+/// a delete that is carried at a statement is a new entry, and starts
+/// again.
 pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
 
 /// The index line of a memory that a device deleted (decision 2026-09-30
@@ -1125,10 +1131,12 @@ pub const HAND_OVER_NAME: &str = "hand-over";
 /// was handed long ago is not taken for what a person means now.
 pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
 
-/// The most keys typed at `cordelia accept` that a device keeps: eight
-/// (decision 2026-10-04 §16). A ninth is refused. Each is a pair channel
-/// that the device asks its relays for, for its hour, and a key with
-/// which a hand-over could be taken.
+/// The most keys typed at `cordelia accept` that are within their hour
+/// on a device at one time: eight (decision 2026-10-04 §16). A ninth is
+/// refused. Each is a pair channel that the device asks its relays for,
+/// for its hour, and a key with which a hand-over could be taken. A key
+/// whose hour has gone holds no place: it is kept only to say what
+/// became of it (TYPED_KEY_KEPT_SECS).
 pub const MAX_TYPED_KEYS: usize = 8;
 
 /// How long a device keeps a key that was typed at `cordelia accept`, to
@@ -1253,9 +1261,10 @@ pub const MAX_CHANNELS_PROVED_ON_A_CONNECTION: usize = MAX_CHANNELS_ASKED_OF_A_P
 
 /// The protocol byte of a stream on which a connection shows an entry, and
 /// is answered with what the receiver holds (decision 2026-10-04 §2.4,
-/// item 5). The four streams of entries begin at 0x10, apart from the
-/// eight of the older kind: a peer that does not know them refuses the
-/// stream, and reads none of them as one of its own.
+/// item 5). The five streams of entries are 0x10 to 0x14, apart from the
+/// eight of the older kind: show, prove, pull and push, and the one
+/// between relays that work together. A peer that does not know them
+/// refuses the stream, and reads none of them as one of its own.
 pub const PROTOCOL_ENTRY_SHOW: u8 = 0x10;
 
 /// The protocol byte of a stream on which a connection proves that it
@@ -1535,8 +1544,122 @@ pub const RECEIVED_LAST_WEEK_SECS: i64 = 7 * RECEIVED_LAST_DAY_SECS;
 // local history keeps by default.
 const _: () = assert!(RECEIVED_LAST_WEEK_SECS <= HISTORY_DAYS as i64 * 24 * 60 * 60);
 
+/// How long a thing that will pass by itself has lasted before the status
+/// line shows it as amber (decision 2026-10-04 §10.1): no relay
+/// connected; a relay that is connected and does not hold the latest
+/// change; and, after a change, names that are not yet in the new
+/// generation or not yet sent. Five minutes: a machine that wakes, a
+/// relay that restarts and a device that has just applied a change are
+/// each through it in less, and what lasts longer is worth a person's
+/// knowing. The first two are counted by the node's own clock, which
+/// does not run while the machine sleeps.
+pub const STATUS_AMBER_WAIT_SECS: u64 = 300;
+
+/// For how many days after a device applied a removal the status line
+/// shows as amber that some device has not applied it (decision
+/// 2026-10-04 §8, §10.1). After that it is said in `cordelia devices`
+/// only: a device that lies in a drawer does not keep every status line
+/// amber for good.
+pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
+
+/// For how long after a relay refused something for room, or for the
+/// address's allowance, the status line takes it that the relay still
+/// refuses (decision 2026-10-04 §10.1). A device keeps the time of a
+/// relay's last refusal, and offers again what was refused after a wait
+/// that doubles up to OUTBOX_REFUSED_RETRY_MAX_SECS: a relay that still
+/// refuses has refused again within twice that, and one that has not has
+/// taken what it was offered, or was offered nothing more.
+pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// The most characters of a file's name that a command prints, and that
+/// the node puts in a line of its status (decision 2026-10-04 §16):
+/// another device may have written the name, and a name may be as long
+/// as an entry's text. What is cut is marked as cut.
+pub const FILE_NAME_SHOWN_CHARS: usize = 120;
+
+/// How long a personal node waits before it tries its first start on
+/// this version again, after a try that failed (decision 2026-10-04
+/// §10.1): the sync cycle's five seconds after the first, and twice as
+/// long after each further one, up to FIRST_START_RETRY_MAX_SECS. A
+/// start that cannot succeed (no room for the copy, no leave to write)
+/// does not write its copy again every five seconds.
+pub const FIRST_START_RETRY_BASE_SECS: u64 = 5;
+
+/// The longest that a personal node waits between two tries at its first
+/// start on this version (decision 2026-10-04 §10.1): ten minutes, the
+/// longest wait before anything a relay refused is offered again
+/// (OUTBOX_REFUSED_RETRY_MAX_SECS). A person who has made room is not
+/// kept waiting for longer than that, and need not restart the node.
+pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// How much before its wait has passed a try at the first start is still
+/// made (decision 2026-10-04 §10.1): one second. A try is made when a
+/// sync cycle would have run, and the first wait is a cycle long: without
+/// this, the timer's own jitter would put every try off by a whole cycle.
+pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
+
+// ── A carry that a person asks for, and a recovery ──────────────────
+
+/// How long a carry by command reads one name at the relays, at most
+/// (decision 2026-10-04 §7.3): the fetch of the new channel, and then the
+/// name's channel in each generation that the device left. What was not
+/// read to its end by then is said, and the command can be run again.
+/// Derived: as long as the fetch before a change, CHANGE_FETCH_MAX_SECS.
+pub const CARRY_READ_MAX_SECS: u64 = CHANGE_FETCH_MAX_SECS;
+
+/// How long a channel that a carry is being made into holds back the
+/// first cycle of a folder that has just been mapped to its name, at
+/// most (decision 2026-10-04 §7.3): a device that comes to sync a name
+/// carries it first. A carry that never says it has ended holds nothing
+/// up for longer than this.
+/// Derived: a little longer than the carry may read, CARRY_READ_MAX_SECS.
+pub const CARRY_FIRST_MAX_SECS: u64 = CARRY_READ_MAX_SECS + 60;
+
+/// How many words of a key's fingerprint name a removed key at `cordelia
+/// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
+/// 66 bits. A statement lists removed keys bare, so a machine that never
+/// knew a device has no label for it.
+pub const CARRY_FROM_WORDS: usize = 6;
+
+/// The label under which the phrase's signing key signs a person's word
+/// for a carry (decision 2026-10-04 §7.3, §9): which name, which keys
+/// that do not count, and which files above a version that is held. A
+/// signature under it is no statement and no entry.
+pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
+
+/// How long a person's word for a carry stands (decision 2026-10-04
+/// §7.3): ten minutes from when the phrase signed it. The command hands
+/// it to the node at once; a word that is found later is no word.
+pub const CARRY_WORD_SECS: i64 = 10 * 60;
+
+/// The most bytes of entries that the node hands a command in one answer
+/// (decision 2026-10-04 §7.3, §9), where the command reads a channel
+/// whose secret the node does not hold: a channel may hold more than one
+/// answer of the local API carries, so it is handed a part at a time. An
+/// entry over the bound is handed alone.
+/// Derived: half of what one message of the wire holds, MAX_MESSAGE_BYTES.
+pub const CARRY_PART_MAX_BYTES: usize = MAX_MESSAGE_BYTES as usize / 2;
+
+/// The most names a recovery carries (decision 2026-10-04 §9): a device
+/// that is gone listed names too, and can have listed any number of its
+/// own. The names it leaves are named.
+pub const RECOVERY_MAX_NAMES: usize = 1_024;
+
+/// The most devices a recovery shows at its prompt, of the statement's
+/// and of those added since (decision 2026-10-04 §9). Beyond it the
+/// command says how many it could not show, and the look takes nothing
+/// from those.
+pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
+
+/// The most secrets of generations before its own that a machine which
+/// recovers is handed, and keeps as a device keeps a secret it left
+/// (decision 2026-10-04 §3, §9): the one of the generation it recovered
+/// from, and as many before it as a change entry gives the phrase.
+/// Derived: MAX_EARLIER_SECRETS and one.
+pub const RECOVERY_MAX_LEFT_SECRETS: usize = MAX_EARLIER_SECRETS + 1;
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 23] = [
+pub const LABELS: [&[u8]; 24] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1560,6 +1683,7 @@ pub const LABELS: [&[u8]; 23] = [
     LABEL_CHANNEL_PROOF,
     LABEL_SESSION_VALUE,
     LABEL_FINGERPRINT,
+    LABEL_CARRY_WORD,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2165,7 +2289,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 23);
+        assert_eq!(LABELS.len(), 24);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2200,6 +2324,32 @@ mod tests {
         const { assert!(TYPED_KEY_KEPT_SECS > PAIR_KEY_TYPED_SECS) };
     }
 
+    /// What a carry that a person asks for, and a recovery, go by
+    /// (decision 2026-10-04 §7.3, §9).
+    #[test]
+    fn test_a_carry_by_command_and_a_recovery_decision_2026_10_04_7_3_and_9() {
+        assert_eq!(CARRY_READ_MAX_SECS, 120);
+        assert_eq!(CARRY_FIRST_MAX_SECS, 180);
+        // The first cycle waits for longer than the carry may read.
+        const { assert!(CARRY_FIRST_MAX_SECS > CARRY_READ_MAX_SECS) };
+        assert_eq!(CARRY_FROM_WORDS, 6);
+        // More words than a device is shown by, and within the hash.
+        const { assert!(CARRY_FROM_WORDS > FINGERPRINT_WORDS_SHOWN) };
+        const { assert!(CARRY_FROM_WORDS * 11 <= 256) };
+        assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
+        assert!(LABELS.contains(&LABEL_CARRY_WORD));
+        assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
+        // A part holds an entry of any size that a channel carries.
+        const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };
+        assert_eq!(RECOVERY_MAX_NAMES, 1_024);
+        assert_eq!(RECOVERY_MAX_DEVICES_SHOWN, 256);
+        assert_eq!(RECOVERY_MAX_LEFT_SECRETS, 9);
+        // A recovery shows every device that a reader may count, and
+        // every record that it may keep as not counted beside them.
+        const { assert!(RECOVERY_MAX_DEVICES_SHOWN >= MAX_COUNTED_DEVICES) };
+    }
+
     /// What the sync adapter goes by in a channel from its secret: how
     /// long a folder's first cycle waits for the relays after the first
     /// has handed its channel, what a device adds to its word once it has
@@ -2217,6 +2367,36 @@ mod tests {
         assert_eq!(RECEIVED_LAST_WEEK_SECS, 604_800);
         // A file's text and its name are bounded by the one constant.
         assert_eq!(MAX_ENTRY_NAME_AND_VALUE_BYTES, 61_440);
+    }
+
+    /// What the status line goes by for its level (decision 2026-10-04
+    /// §8, §10.1): the five minutes that a passing thing has lasted
+    /// before it is amber, the seven days for which a removal that some
+    /// device has not applied is, and for how long a relay's refusal for
+    /// room is taken to stand.
+    #[test]
+    fn test_the_level_of_the_status_line_decision_2026_10_04_10_1() {
+        assert_eq!(STATUS_AMBER_WAIT_SECS, 300);
+        assert_eq!(REMOVAL_NOT_APPLIED_SHOWN_DAYS, 7);
+        assert_eq!(NO_ROOM_STANDS_SECS, 1_200);
+        assert_eq!(NO_ROOM_STANDS_SECS, 2 * OUTBOX_REFUSED_RETRY_MAX_SECS);
+        // A device that wakes has heard from its relays, or given them
+        // up, well within the wait.
+        const { assert!(WAKE_WAIT_SECS * 2 < STATUS_AMBER_WAIT_SECS) };
+        // A removal is shown for less long than the secret it left is
+        // kept, so the time that it was applied is still known.
+        const { assert!(REMOVAL_NOT_APPLIED_SHOWN_DAYS < LEFT_SECRET_KEPT_DAYS) };
+    }
+
+    /// The waits between the tries at a first start that keeps failing
+    /// (decision 2026-10-04 §10.1): from five seconds to ten minutes.
+    #[test]
+    fn test_the_tries_at_a_first_start_back_off_decision_2026_10_04_10_1() {
+        assert_eq!(FIRST_START_RETRY_BASE_SECS, 5);
+        assert_eq!(FIRST_START_RETRY_MAX_SECS, 600);
+        assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
+        assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
+        const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
     }
 
     /// The value that a proof is made over is exported from a TLS session
@@ -2326,8 +2506,9 @@ mod tests {
         }
     }
 
-    /// The four streams of entries have bytes of their own, each another,
-    /// and none of them one of the eight that the older kind has.
+    /// Four of the five streams of entries (the fifth, between relays
+    /// that work together, has a test of its own): each has a byte of its
+    /// own, and none of them is one of the eight that the older kind has.
     #[test]
     fn test_the_streams_of_entries_decision_2026_10_04_2_4() {
         assert_eq!(PROTOCOL_ENTRY_SHOW, 0x10);

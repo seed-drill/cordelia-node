@@ -1082,19 +1082,33 @@ fn key_bytes_of(n: &Node) -> [u8; 32] {
 /// though its database holds one (decision 2026-10-04 §10): a personal
 /// node carries no channel of that kind. Its store is given a group
 /// channel that it is a member of, with an item of its own that no relay
-/// has taken, as an earlier version would have left them. It follows a
-/// phrase, so it does talk to its relay: of its own channels, on the
-/// streams of entries. It announces no channel, asks for none, and
-/// pushes no item, however long the relay listens.
+/// has taken, as a build from before the first start on this version
+/// left them: on a device that follows a phrase, in a database with no
+/// mark, whose start writes the mark and steps nothing (§10.1). So the
+/// rows are there while the node runs. It follows a phrase, so it does
+/// talk to its relay: of its own channels, on the streams of entries. It
+/// announces no channel, asks for none, and pushes no item, however long
+/// the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
+    use cordelia_storage::{channels, first_start, items, meta};
     let relay = stand_in_relay();
     let mut a = node("a", "personal", Some(relay.port));
     let own = key_bytes_of(&a);
     let group = "grp_550e8400-e29b-41d4-a716-446655440000";
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    makes_a_phrase(&a, "desktop");
+    wait_for("the device talks to its relay", &[&a], 60, || {
+        (!relay.heard().is_empty()).then_some(())
+    });
+    a.stop();
     {
-        use cordelia_storage::{channels, items};
         let db = cordelia_storage::db::open(&a.data_dir().join("cordelia.db")).unwrap();
+        // No mark, and no guard, as such a build left the database.
+        assert!(first_start::remove_guard(&db).unwrap());
+        meta::remove(&db, meta::FIRST_START).unwrap();
         channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
         channels::add_member(&db, group, &own, "owner").unwrap();
         let blob = b"what an earlier version sealed".to_vec();
@@ -1114,24 +1128,40 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
             rev: None,
         };
         assert!(items::insert_item(&db, &item).unwrap());
-        // It is what the older outbox, fetch and announcement would each
-        // have gone by.
-        assert_eq!(items::outbox_len(&db, &own).unwrap(), 1);
-        assert_eq!(channels::list_for_entity(&db, &own).unwrap().len(), 1);
     }
+    // What the older outbox, fetch and announcement would each have gone
+    // by: it is there while the node runs.
+    let held = |a: &Node| {
+        let db = rusqlite::Connection::open_with_flags(
+            a.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        (
+            items::outbox_len(&db, &own).unwrap(),
+            channels::list_for_entity(&db, &own).unwrap().len(),
+            first_start::mark(&db).unwrap().map(|mark| mark.stepped),
+        )
+    };
+    assert_eq!(held(&a), (1, 1, None));
+    let before = relay.streams.lock().unwrap().len();
     a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
-    makes_a_phrase(&a, "desktop");
-    wait_for("the device talks to its relay", &[&a], 60, || {
-        (!relay.heard().is_empty()).then_some(())
+    wait_for("node healthy again", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay again", &[&a], 60, || {
+        has_hot_peer(&a)
     });
+    wait_for("the device talks to its relay again", &[&a], 60, || {
+        (relay.streams.lock().unwrap().len() > before).then_some(())
+    });
+    // The start wrote the mark, and stepped nothing: the rows are there.
+    assert_eq!(held(&a), (1, 1, Some(false)));
 
     // Long enough for each of the three: an announcement goes when a
     // peer is promoted and when a node connects, a fetch is made every
     // ten seconds, and the outbox was flushed every two.
     tokio::time::sleep(std::time::Duration::from_secs(25)).await;
-    let opened = relay.streams.lock().unwrap().clone();
+    let opened = relay.streams.lock().unwrap()[before..].to_vec();
     assert!(!opened.is_empty());
     for older in [
         Protocol::ChannelAnnounce,
@@ -1149,6 +1179,7 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         let status = a.get("/api/v1/status")?;
         (status["outbox_waiting"] == 0).then_some(())
     });
+    assert_eq!(held(&a), (1, 1, Some(false)));
 }
 
 /// T2. A stranger who knows a channel's ID and has seen one of its entries

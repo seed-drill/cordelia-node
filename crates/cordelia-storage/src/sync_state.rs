@@ -84,6 +84,34 @@ fn blob(row: &rusqlite::Row, column: usize) -> rusqlite::Result<Option<Vec<u8>>>
     })
 }
 
+/// Whether a folder's record names a text of the file `key` in
+/// `channel_id`: some folder agreed a text there, and has not agreed
+/// since that the file is deleted.
+pub fn names_a_text(conn: &Connection, channel_id: &str, key: &str) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_files
+                       WHERE channel_id = ?1 AND key = ?2 AND hash IS NOT NULL)",
+        params![channel_id, key],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// Forget each folder's record that the file `key` is deleted in
+/// `channel_id`: the delete that it was agreed with is held no more.
+/// A record of a text is left as it is. Returns how many went.
+pub fn forget_deleted(
+    conn: &Connection,
+    channel_id: &str,
+    key: &str,
+) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM sync_files WHERE channel_id = ?1 AND key = ?2 AND hash IS NULL",
+        params![channel_id, key],
+    )
+    .map_err(storage)
+}
+
 /// Everything `folder` agreed with `channel_id`, by key.
 pub fn load(
     conn: &Connection,
@@ -301,6 +329,26 @@ pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaE
         .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
+/// Forget what every folder agreed with `channel_id`, with its records of
+/// index lines there ([`crate::index_lines`]). Returns the number of keys
+/// forgotten.
+///
+/// A device that holds a name no more keeps nothing of the name's channel:
+/// a folder that comes to sync the name again meets the channel as on any
+/// first sync, and what it lost in between is not taken for deletes.
+pub fn forget_channel(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM index_lines WHERE channel_id = ?1",
+        params![channel_id],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM sync_files WHERE channel_id = ?1",
+        params![channel_id],
+    )
+    .map_err(storage)
+}
+
 /// Forget what every folder agreed, with every channel, except the folders
 /// in `keep`. Returns the number of keys forgotten.
 pub fn forget_folders_except(conn: &Connection, keep: &[String]) -> Result<usize, CordeliaError> {
@@ -338,6 +386,43 @@ mod tests {
                 signer: [rev as u8; 16],
             }]),
         }
+    }
+
+    /// Whether a folder's record names a text of a file is asked of every
+    /// folder's record of that file in that channel: a record that the
+    /// file is deleted names none. And the records that a file is deleted
+    /// are forgotten alone: a record of a text stays, and so does every
+    /// record of another file or another channel.
+    #[test]
+    fn test_a_record_of_a_delete_names_no_text_and_is_forgotten_alone() {
+        let conn = db::open_in_memory().unwrap();
+        let (text, deleted) = (agreed(Some([7; 32]), 2, 1), agreed(None, 3, 1));
+        save(&conn, "/one", "ch_a", "gone.md", &deleted).unwrap();
+        save(&conn, "/two", "ch_a", "gone.md", &text).unwrap();
+        save(&conn, "/one", "ch_a", "other.md", &deleted).unwrap();
+        save(&conn, "/one", "ch_b", "gone.md", &deleted).unwrap();
+
+        assert!(names_a_text(&conn, "ch_a", "gone.md").unwrap());
+        // A record of a delete alone names no text: in another channel,
+        // and for another file.
+        assert!(!names_a_text(&conn, "ch_b", "gone.md").unwrap());
+        assert!(!names_a_text(&conn, "ch_a", "other.md").unwrap());
+        assert!(!names_a_text(&conn, "ch_a", "no-such.md").unwrap());
+
+        // The record of the delete goes, and the record of the text
+        // stays, with every other record.
+        assert_eq!(forget_deleted(&conn, "ch_a", "gone.md").unwrap(), 1);
+        assert_eq!(forget_deleted(&conn, "ch_a", "gone.md").unwrap(), 0);
+        assert_eq!(
+            files(&conn, "ch_a").unwrap(),
+            [
+                ("/one".to_string(), "other.md".to_string()),
+                ("/two".to_string(), "gone.md".to_string())
+            ]
+        );
+        assert_eq!(load(&conn, "/two", "ch_a").unwrap()["gone.md"], text);
+        assert_eq!(files(&conn, "ch_b").unwrap().len(), 1);
+        assert!(names_a_text(&conn, "ch_a", "gone.md").unwrap());
     }
 
     #[test]
@@ -405,6 +490,40 @@ mod tests {
         assert!(load(&conn, "/other", "ch_a").unwrap().is_empty());
         assert_eq!(forget_except(&conn, &keep).unwrap(), 0);
         assert_eq!(forget_except(&conn, &[]).unwrap(), 1);
+    }
+
+    /// Every folder forgets what it agreed with one channel, with its
+    /// records of index lines there, and nothing of another channel goes.
+    #[test]
+    fn test_forget_by_channel() {
+        let conn = db::open_in_memory().unwrap();
+        for (folder, channel, key) in [
+            ("/m", "ch_a", "notes.md"),
+            ("/m", "ch_a", "gone.md"),
+            ("/other", "ch_a", "x.md"),
+            ("/m", "ch_b", "notes.md"),
+        ] {
+            save(&conn, folder, channel, key, &agreed(Some([7; 32]), 2, 1)).unwrap();
+        }
+        crate::index_lines::line_removed(&conn, "/m", "ch_a", "notes.md", "- a line", 7).unwrap();
+        crate::index_lines::line_removed(&conn, "/lines-only", "ch_a", "y.md", "- a line", 7)
+            .unwrap();
+        crate::index_lines::line_removed(&conn, "/m", "ch_b", "notes.md", "- other", 7).unwrap();
+        let lines = |channel: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM index_lines WHERE channel_id = ?1",
+                [channel],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(forget_channel(&conn, "ch_a").unwrap(), 3);
+        assert!(!any(&conn, "/m", "ch_a").unwrap());
+        assert!(!any(&conn, "/other", "ch_a").unwrap());
+        assert_eq!((lines("ch_a"), lines("ch_b")), (0, 1));
+        assert_eq!(load(&conn, "/m", "ch_b").unwrap().len(), 1);
+        assert_eq!(forget_channel(&conn, "ch_a").unwrap(), 0);
     }
 
     /// A record keeps the hash, the revision, the signer and the chain of

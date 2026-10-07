@@ -13,6 +13,12 @@
 //! a relay for the channels of its own ([`at_relays`]), which the node
 //! asks when it has leave to use a connection.
 //!
+//! What a relay holds of a generation that was left comes in only where
+//! a person asks: the one function that judges a version for such a
+//! carry, and a person's word for it, given with the phrase ([`carry`]);
+//! the node's half of `cordelia sync carry` ([`carrying`]); and recovery,
+//! on a machine that follows no phrase ([`recover`]).
+//!
 //! The commands a person types reach those through the routes of
 //! [`commands`]. The sync adapter reads and publishes through [`publish`],
 //! says which names a device syncs through [`names`], and a device's
@@ -26,11 +32,14 @@
 pub mod adding;
 pub mod at_relays;
 pub mod auth;
+pub mod carry;
+pub mod carrying;
 pub mod change;
 pub mod commands;
 pub mod entries;
 pub mod error;
 pub mod first_start;
+pub mod found;
 pub mod handlers;
 pub mod history;
 pub mod leaving;
@@ -39,9 +48,11 @@ pub mod look;
 pub mod names;
 pub mod person;
 pub mod publish;
+pub mod recover;
 #[cfg(test)]
 mod several;
 pub mod state;
+pub mod swept;
 pub mod sync;
 pub mod take;
 pub mod types;
@@ -131,6 +142,34 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/prepare", web::post().to(commands::change_prepare))
             .route("/make", web::post().to(commands::change_make)),
     );
+    // A carry that a person asks for (decision 2026-10-04 §7.3): of one
+    // name, from the generations that the device left.
+    // With the recovery phrase, which the command is typed and the node
+    // never sees: what a removed key signed (`/from`), and what the
+    // command read in a generation that this device never held
+    // (`/phrase/look`, `/read`, `/handed`). What comes in by those comes
+    // in under a word that the phrase signed.
+    cfg.service(
+        web::scope("/api/v1/carry")
+            .route("", web::post().to(carrying::carry))
+            .route("/from/look", web::post().to(carrying::from_look))
+            .route("/from", web::post().to(carrying::from_take))
+            .route("/phrase/look", web::post().to(carrying::phrase_look))
+            .route("/read", web::post().to(carrying::read_proved))
+            .route("/read/part", web::post().to(carrying::read_part))
+            .route("/handed", web::post().to(carrying::handed_take)),
+    );
+
+    // Recovery (decision 2026-10-04 §9): the phrase is typed at the
+    // command, which hands the node the change entry that it made, the
+    // secrets of the generations before, which the machine keeps, and a
+    // word for the look.
+    cfg.service(
+        web::scope("/api/v1/recover")
+            .route("/look", web::post().to(recover::look))
+            .route("/make", web::post().to(recover::make))
+            .route("/progress", web::post().to(recover::progress)),
+    );
 
     // Sync adapters (decision 2026-09-30-agent-memory-sync §4.5)
     cfg.service(
@@ -138,7 +177,8 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/claude", web::post().to(sync::claude))
             .route("/map", web::post().to(sync::map))
             .route("/unmap", web::post().to(sync::unmap))
-            .route("/status", web::post().to(sync::sync_status)),
+            .route("/status", web::post().to(sync::sync_status))
+            .route("/seen", web::post().to(sync::seen)),
     );
     // Local history (decision 2026-09-30-agent-memory-sync §4.5b)
     cfg.service(

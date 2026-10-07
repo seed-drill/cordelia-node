@@ -2813,6 +2813,17 @@ pub async fn p2p_loop(
                 device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
             }
 
+            // A command's work asked something through the door for a
+            // carry: a channel of a generation that the device has left
+            // or never followed, read at each relay (decision 2026-10-04
+            // §7.3, §9). Off the select loop: it waits on the relays.
+            ask = state.own_channels.wait_door(), if device_entries.is_some() => {
+                if let Some(device) = device_entries.clone() {
+                    let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr);
+                    tokio::spawn(async move { device.door(&relays, ask).await });
+                }
+            }
+
             // ── Entries of channels from their secrets, on a relay ────
             // What nobody uses goes after 90 days (decision 2026-10-04
             // §2.5). Off the select loop: it writes under the db lock.
@@ -2841,25 +2852,38 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Keyed tombstone GC (§4.4) ─────────────────────────────
-            // Of the older kind's items, on the nodes that carry them. No
-            // such node holds a channel's member list, so it sweeps a key
-            // only when every author has deleted it.
-            _ = gc_interval.tick(), if carries_older_kind(&node_role) => {
-                let gc_state = state.clone();
-                let members_known = false;
-                tokio::task::spawn_blocking(move || {
-                    let Ok(db) = gc_state.db.lock() else { return };
-                    match cordelia_storage::items::gc_keyed_tombstones(
-                        &db,
-                        cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
-                        members_known,
-                    ) {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
-                        Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
-                    }
-                });
+            // ── Old deletes (§4.4; decision 2026-10-04 §2.3, §7.3) ────
+            // One timer, and one length of time, for both kinds. Off the
+            // select loop: each writes under the db lock.
+            _ = gc_interval.tick() => {
+                // Of the older kind's items, on the nodes that carry
+                // them. No such node holds a channel's member list, so it
+                // sweeps a key only when every author has deleted it.
+                if carries_older_kind(&node_role) {
+                    let gc_state = state.clone();
+                    let members_known = false;
+                    tokio::task::spawn_blocking(move || {
+                        let Ok(db) = gc_state.db.lock() else { return };
+                        match cordelia_storage::items::gc_keyed_tombstones(
+                            &db,
+                            cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+                            members_known,
+                        ) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
+                            Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
+                        }
+                    });
+                }
+                // Of the entries of channels from their secrets: a relay
+                // sweeps what it holds, and a device its own store.
+                if let Some(entries) = relay_entries.clone() {
+                    let sweep_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.sweep_deletes(&sweep_state.db));
+                }
+                if let Some(device) = device_entries.clone() {
+                    tokio::task::spawn_blocking(move || device.sweep_deletes());
+                }
             }
 
             // ── Push retry processing ─────────────────────────────────
@@ -3768,6 +3792,16 @@ fn publish_relays(
     let list = relay_snapshots(set_up, resolved, tries, &|relay| {
         relay_connected(conn_mgr, relay)
     });
+    // Which of them are connected now: the node keeps since when each
+    // has been, and since when none has, by its own clock.
+    let connected: Vec<&str> = list
+        .iter()
+        .filter(|relay| relay.state == "connected")
+        .map(|relay| relay.host.as_str())
+        .collect();
+    state
+        .own_channels
+        .relays_connected(&connected, std::time::Instant::now());
     if let Ok(mut current) = state.relays.write()
         && *current != list
     {
