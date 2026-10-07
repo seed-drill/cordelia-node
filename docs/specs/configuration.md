@@ -146,11 +146,18 @@ Anti-entropy sync intervals, tombstone retention, and batch sizing for the Item-
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `sync_interval_realtime_secs` | integer | `60` | > 0 | Anti-entropy pull interval for realtime channels (seconds). Items also arrive via push, so this is a consistency backstop. | network-protocol.md SS12.3 |
+| `sync_interval_realtime_secs` | integer | `10` | > 0 | Anti-entropy pull interval for realtime channels (seconds): `REALTIME_SYNC_INTERVAL_SECS` in `protocol.rs`, twice the interval at which a relay passes on what it took. Items also arrive via push, so this is a consistency backstop. | network-protocol.md SS12.3 |
 | `sync_interval_batch_secs` | integer | `900` | > 0 | Anti-entropy pull interval for batch channels (seconds). 15 minutes default. | network-protocol.md SS12.3 |
 | `tombstone_retention_days` | integer | `7` | > 0 | Days to retain tombstoned items before physical deletion. Must be long enough for all peers to observe the tombstone. | network-protocol.md SS12.3 |
 | `max_batch_size` | integer | `100` | 1-10000 | Maximum items per FetchRequest/PushPayload message. | network-protocol.md SS9.2, SS12.3 |
 | `relay_ask_again_secs` | integer | `600` | 1-86400 (a value outside is taken as the nearest) | Relays only. How long a relay waits before it asks a device again which channels it holds, and before it takes again a channel it dropped to make room. | parameter-rationale.md SS4 |
+
+> **v1 status.** The defaults are those of `ReplicationConfig` in
+> `crates/cordelia-core/src/config.rs`, each a constant of `protocol.rs`. Of
+> this section a node acts on `relay_ask_again_secs` alone. Its pull runs
+> every `REALTIME_SYNC_INTERVAL_SECS` (10 seconds) whatever
+> `sync_interval_realtime_secs` is set to, and the other three keys are read
+> from the file and used by nothing.
 
 ### 2.6 `[limits]`
 
@@ -295,7 +302,7 @@ clear_failure_delay_secs = 120             # Clear failure count after being Hot
 
 # --- Replication ---
 [replication]
-sync_interval_realtime_secs = 60           # Anti-entropy interval for realtime channels
+sync_interval_realtime_secs = 10           # Anti-entropy interval for realtime channels
 sync_interval_batch_secs = 900             # Anti-entropy interval for batch channels (15 min)
 tombstone_retention_days = 7               # Days to keep tombstones
 max_batch_size = 100                       # Items per FetchRequest/PushPayload
