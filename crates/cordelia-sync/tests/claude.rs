@@ -1766,6 +1766,79 @@ fn a_file_that_was_not_carried_is_said_until_it_has_met_its_channel() {
     assert_eq!(not_carried(&a), ["large.md"]);
 }
 
+/// A folder that is mapped always merges (decision 2026-10-04 §10.1):
+/// `map` forgets what the folder it adds had agreed, whatever was left of
+/// it. Here a folder synced a name, and what it had agreed is left in
+/// place while it is not mapped, as an earlier version leaves it. A file
+/// is lost meanwhile. It is mapped under the name it synced under, and
+/// `map` is the first thing that happens: nothing is sent as a delete,
+/// and the file comes back.
+///
+/// Mapping what is already mapped forgets nothing: a file that is deleted
+/// then is deleted on the other device, as a delete in a folder that
+/// syncs is.
+#[test]
+fn a_folder_that_is_mapped_merges_whatever_was_left_of_what_it_agreed() {
+    let (mut a, mut b) = paired_explicit();
+    let a_one = a.plain_dir("one");
+    let a_mem = a.claude_folder(&a_one);
+    std::fs::write(a_mem.join("x.md"), "kept\n").unwrap();
+    std::fs::write(a_mem.join("y.md"), "stays\n").unwrap();
+    map(&a, &a_one, "one");
+    let b_one = b.plain_dir("one");
+    let b_mem = b.folder_of(&b_one).join("memory");
+    map(&b, &b_one, "one");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+
+    // What the folder agreed, as its rows have it.
+    let channel = channel_of(&mut a, "one");
+    let folder = a_mem.display().to_string();
+    let rows = |d: &Device| {
+        let db = d.state.db.lock().unwrap();
+        cordelia_storage::sync_state::load(&db, &folder, &channel).unwrap()
+    };
+    let agreed = rows(&a);
+    assert_eq!(agreed.len(), 2);
+
+    // It is unmapped, and its rows are put back as they were: what a
+    // version that did not forget would have left. A file is lost.
+    unmap(&a, &a_one);
+    assert!(rows(&a).is_empty());
+    {
+        let db = a.state.db.lock().unwrap();
+        for (file, record) in &agreed {
+            cordelia_storage::sync_state::save(&db, &folder, &channel, file, record).unwrap();
+        }
+    }
+    assert_eq!(rows(&a), agreed);
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+
+    // Mapped again, under the name it synced under, before any cycle.
+    map(&a, &a_one, "one");
+    assert!(rows(&a).is_empty(), "`map` forgot what was left");
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "x.md").as_deref(), Some("kept\n"));
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "one", "x.md"),
+            Some((1, Value::Text("kept\n".into()))),
+            "nothing was published over the file"
+        );
+    }
+
+    // Mapped already: declared again, what it agreed stays, and a delete
+    // made in it is a delete.
+    assert_eq!(rows(&a).len(), 2);
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+    map(&a, &a_one, "one");
+    assert_eq!(rows(&a).len(), 2, "mapping what is mapped forgot nothing");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["y.md"]);
+    assert_eq!(files(&a_mem), ["y.md"]);
+}
+
 /// Whether sync is on is a setting like the others. A cycle reads it with
 /// the rest, under the lock: turned off, there is nothing for it to do,
 /// even if the loop that started it saw sync on a moment before.

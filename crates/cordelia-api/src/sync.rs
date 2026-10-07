@@ -620,22 +620,37 @@ fn home_dir() -> Result<std::path::PathBuf, ApiError> {
 /// a folder to that before calling this.) Mapping the home directory,
 /// under any name, turns the home setting on, and that name is the one it
 /// is put back under after home memory has been turned off.
+///
+/// **The folder that a mapping adds forgets what it had agreed** (decision
+/// 2026-10-04 §10.1): whatever an earlier version, or a cycle that was
+/// stopped, left of it. So a folder that is mapped always merges: it
+/// meets its channel as on any first sync, and nothing that it lost while
+/// it did not sync is sent as a delete. Mapping what is already mapped
+/// adds nothing, and forgets nothing.
 pub fn add_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
     body: &SyncMapRequest,
     home_dir: &std::path::Path,
 ) -> Result<(), ApiError> {
-    if meta::get(db, meta::SYNC_CLAUDE_DIR)?.is_none() {
+    let Some(claude_dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? else {
         return Err(ApiError::BadRequest(
             "sync is off: turn it on with `cordelia sync claude` first".into(),
         ));
-    }
+    };
     let mut list = mappings(db)?;
     let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
     control.changed(db);
     if let Some(mapping) = checked {
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping added");
+        let forgotten =
+            sync_state::forget_folder(db, &memory_folder(&claude_dir, &mapping.folder))?;
+        if forgotten > 0 {
+            tracing::info!(
+                files = forgotten,
+                "sync: the folder that is mapped forgot what it had agreed"
+            );
+        }
         if is_home_mapping(&mapping, home_dir) {
             meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
             meta::set(db, meta::SYNC_CLAUDE_HOME_NAME, &mapping.name)?;
@@ -1172,6 +1187,44 @@ mod tests {
         agree(&s);
         s.claude(serde_json::json!({}));
         assert_eq!(remembered(&s).len(), 3);
+    }
+
+    /// A folder that a mapping adds forgets what it had agreed, whatever
+    /// was left of it (decision 2026-10-04 §10.1): so it always merges.
+    /// No other folder forgets for it. Mapping what is already mapped
+    /// adds nothing, and forgets nothing: nor does a mapping that is
+    /// refused.
+    #[test]
+    fn test_a_folder_that_is_mapped_forgets_what_it_had_agreed() {
+        let s = Settings::on();
+        s.map("/home/sam/Work", "work");
+        // What an earlier version, or a cycle that was stopped, left.
+        let left = ["/home/sam/notes", "/home/sam/Work", "/home/sam/other"];
+        left.iter().for_each(|folder| s.agreed(folder));
+        s.map("/home/sam/notes", "lab");
+        assert!(!s.remembers("/home/sam/notes"));
+        assert!(s.remembers("/home/sam/Work") && s.remembers("/home/sam/other"));
+
+        // It syncs, and agrees its files. Declared again, it is mapped
+        // already: nothing is added, and nothing is forgotten.
+        s.agreed("/home/sam/notes");
+        for spelled in ["/home/sam/notes", "/home/sam/notes/", "/home/sam//notes"] {
+            s.map(spelled, "lab");
+            assert!(s.remembers("/home/sam/notes"), "{spelled}");
+        }
+        // A mapping that is refused forgets nothing either: the folder
+        // under another name, and another folder under its name.
+        let home = std::path::Path::new(HOME);
+        for (folder, name) in [("/home/sam/notes", "other"), ("/home/sam/other", "lab")] {
+            let body = request(folder, name, false);
+            assert!(add_mapping(&s.control, &s.db, &body, home).is_err());
+            assert!(s.remembers("/home/sam/notes") && s.remembers("/home/sam/other"));
+        }
+        // The home directory, mapped, forgets as any folder does.
+        s.agreed(HOME);
+        s.map(HOME, "team");
+        assert!(!s.remembers(HOME));
+        assert!(s.remembers("/home/sam/notes"));
     }
 
     /// Only a mapping says what syncs (decision 2026-10-04 §10.1). So
