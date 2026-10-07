@@ -127,13 +127,23 @@ It runs hardened:
 ## 5. Watch it
 
 `docker exec cordelia-relay1 cordelia stats` (add `--json` for tools) shows
-what the relay holds of the older kind of channel and how much it is used,
-as counts only:
+what the relay holds and how much it is used, as counts only:
 
-- items stored and their encrypted size, and the database size;
-- how much storage is in use and how much is allowed (`Storage:`);
+- the database size;
+- **the room of each kind of channel, each against its cap** (`Storage:`,
+  two lines):
+  ```
+  Storage:          2.0 KB in use of 16.0 MB allowed, by channels of the older kind
+                    3.0 MB in use of 16.0 MB allowed, by channels from their secrets (2 held, 1 entry)
+  ```
+  The second line also says how many channels from their secrets the relay
+  holds, and how many entries. With `--json` the older kind is
+  `storage_used_bytes` and `storage_max_bytes`, and the channels from their
+  secrets are the same two under `entries`, with `channels_held`,
+  `entries_stored` and `content_bytes_stored`;
+- items of the older kind stored, and their encrypted size (`Stored:`);
 - distinct peers seen in the last day and week, relays counted apart;
-- channels that received an item in the last day and week.
+- channels of the older kind that received an item in the last day and week.
 
 **Storage: two caps of one size.** `max_storage_bytes` (under `[node]` in
 the relay's config; 1 GiB if not set) is the most a relay holds of each kind
@@ -146,8 +156,8 @@ volume room for that, and for the database's own overhead.
 **What is counted.** Each entry counts as its encrypted content and 1 KB,
 for both kinds, and not as the pages of the database. So an entry that
 replaces one of its size changes nothing, and the figure falls when a
-channel is dropped, where the file does not shrink. `Storage:` in `cordelia
-stats` is that figure for the older kind.
+channel is dropped, where the file does not shrink. The two lines of
+`Storage:` in `cordelia stats` are that figure for each kind.
 
 **At a cap, for a channel from its secret,** a relay favours the channels
 it has held longest:
@@ -163,6 +173,24 @@ it has held longest:
   channels an hour;
 - a channel whose key nobody has proved, and of which nobody has shown an
   entry that the relay holds, for 90 days is dropped.
+
+**Old deletes are swept.** An entry says in clear whether it is a delete,
+and a relay reads nothing else of it. Once an hour a relay drops each slot
+in which every entry that it holds, of every author, is a delete that it has
+held for 90 days (decision 2026-10-04 §2.3):
+
+- a slot in which one device's delete stands beside another device's text
+  stays whole, since a relay has no list of who counts: no key's delete
+  sweeps away what another key wrote;
+- the channel's room follows, so the second line of `Storage:` falls, and a
+  channel of which nothing is left is held no more;
+- a delete that a device carries at a change of its person's devices is a
+  new entry, in a new channel: its 90 days start again there;
+- the log says how many entries went ("swept the deletes that this relay
+  has held for 90 days").
+
+The older kind's deleted keys are collected on the same hourly timer, after
+the same 90 days, as before.
 
 **At its cap, for the older kind,** a relay takes no channel it does not
 already hold, and a write that takes it over makes it drop the channels it
@@ -219,8 +247,20 @@ Before you upgrade a relay:
 The schema's steps are run when the relay starts, and change no row that is
 there. A relay makes no copy of its database and takes no step that empties
 what it holds of the older kind: that is what a personal node does at its
-first start on this version, and only a personal node. After the upgrade, `Storage:` in `cordelia stats` shows what
-the older kind is counted at.
+first start on this version, and only a personal node. After the upgrade,
+`Storage:` in `cordelia stats` shows what each kind is counted at, each
+against its cap.
+
+- **A data directory is one node's.** A relay takes a lock on its data
+  directory when it starts (a file in it, `node.lock`). A second node that
+  is started on the same volume says that another is running there, changes
+  nothing, and stops.
+- **A database from a later version is refused.** A relay that finds its
+  database at a later schema version than its own names both versions,
+  changes nothing, and stops: install the later version again.
+- A relay that is started on a database which a personal node has used
+  removes the guard that the personal node set there (a trigger that refuses
+  a new channel of the older kind), and says so in its log.
 
 The identity stays on the `cordelia-relay1-data` volume. Do not delete that
 volume, and keep a copy of the key somewhere safe. Devices know a relay by
