@@ -1225,6 +1225,19 @@ fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
     );
     let status = status_of(&device);
     assert_eq!(status["sync"]["all"], false, "{status}");
+    // The log says it, once, with how many: a person who reads the log
+    // of the start that stopped them is told there too.
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(
+        log.matches("sync: 2 folders stopped syncing on this device")
+            .count(),
+        1,
+        "{log}"
+    );
+    let warned = log
+        .lines()
+        .find(|line| line.contains("folders stopped syncing on this device"));
+    assert!(warned.is_some_and(|line| line.contains("WARN")), "{log}");
     // The report that the notice was made from is removed: a cycle of
     // this version has stored its own since, or none has run yet.
     let report = meta::get(&conn, meta::SYNC_CLAUDE_REPORT).unwrap();

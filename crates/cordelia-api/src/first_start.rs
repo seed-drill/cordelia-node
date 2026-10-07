@@ -191,13 +191,21 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
                     "first start on this version: nothing of the older kind is held, and \
                      the mark is written"
                 ),
-                Done::Stepped { copy, notice } => tracing::info!(
-                    copy = %copy.display(),
-                    notice = notice.is_some(),
-                    "first start on this version: the database was copied and moved on; this \
-                     device follows no recovery phrase, and is added again with `cordelia \
-                     phrase` here or `cordelia accept`"
-                ),
+                Done::Stepped { copy, notice } => {
+                    tracing::info!(
+                        copy = %copy.display(),
+                        notice = notice.is_some(),
+                        "first start on this version: the database was copied and moved on; \
+                         this device follows no recovery phrase, and is added again with \
+                         `cordelia phrase` here or `cordelia accept`"
+                    );
+                    // Folders stopped syncing with this step: it is said
+                    // here, once, with how many. A status says it until a
+                    // person has seen it.
+                    if let Some(notice) = notice {
+                        tracing::warn!("{}", folders_stopped_says(notice));
+                    }
+                }
             }
             let key_files = started.key_files;
             if key_files.removed > 0 {
@@ -248,6 +256,23 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
             state.held.hold(Held::FirstStart(says));
             false
         }
+    }
+}
+
+/// What the log says, once, where the step of the first start leaves a
+/// notice (decision 2026-10-04 §10.1): how many folders stopped syncing,
+/// or that which did is not known, and where they are listed.
+pub fn folders_stopped_says(notice: &first_start::Notice) -> String {
+    let listed = "only mapped folders sync, and they had synced because everything found did. \
+                  `cordelia sync status` lists them, with the command that maps each";
+    match notice.folders.as_ref().map(Vec::len) {
+        Some(1) => format!("sync: 1 folder stopped syncing on this device: {listed}"),
+        Some(n) => format!("sync: {n} folders stopped syncing on this device: {listed}"),
+        None => "sync: folders stopped syncing on this device, and which is not known (no \
+                 report of the last cycle was kept): only mapped folders sync, and they had \
+                 synced because everything found did. `cordelia sync status` lists what is \
+                 found, with the command that maps each folder"
+            .to_string(),
     }
 }
 
@@ -613,6 +638,49 @@ mod tests {
         assert_eq!(asked.get(), copies, "the copy was made again");
         assert_eq!(copies_in(dir.path()), ["before-0.2.0-test"]);
         assert_eq!(channels(&state), 0);
+    }
+
+    /// What the log says where the step of the first start leaves a
+    /// notice (decision 2026-10-04 §10.1): how many folders stopped
+    /// syncing, one said as one, or that which did is not known; and
+    /// where they are listed.
+    #[test]
+    fn test_the_log_says_how_many_folders_stopped_at_the_first_start() {
+        use cordelia_storage::first_start::{Notice, StoppedFolder};
+        let notice = |folders: Option<usize>| Notice {
+            at: "2026-10-07T08:00:00+00:00".into(),
+            dir: Some("/home/sam/.claude".into()),
+            folders: folders.map(|n| {
+                (0..n)
+                    .map(|i| StoppedFolder {
+                        folder: format!("/home/sam/.claude/projects/-f{i}"),
+                        cwd: None,
+                        name: None,
+                    })
+                    .collect()
+            }),
+        };
+        let one = folders_stopped_says(&notice(Some(1)));
+        assert!(
+            one.starts_with("sync: 1 folder stopped syncing on this device: only mapped"),
+            "{one}"
+        );
+        let three = folders_stopped_says(&notice(Some(3)));
+        assert!(
+            three.starts_with("sync: 3 folders stopped syncing on this device: only mapped"),
+            "{three}"
+        );
+        for says in [&one, &three] {
+            assert!(says.contains("`cordelia sync status` lists them"), "{says}");
+        }
+        let not_known = folders_stopped_says(&notice(None));
+        assert!(
+            not_known.starts_with(
+                "sync: folders stopped syncing on this device, and which is not known"
+            ),
+            "{not_known}"
+        );
+        assert!(not_known.contains("lists what is found"), "{not_known}");
     }
 
     /// Key files of the older channels that no copy holds are left in
