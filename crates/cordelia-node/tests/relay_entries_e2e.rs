@@ -1982,18 +1982,20 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
         );
     }
 
-    // Nor does it answer on a stream of the older kind of channel, which
-    // a personal node carries no longer (decision 2026-10-04 §10): it
-    // serves no sync of one, and takes no push of one.
+    // Of the older kind of channel, which a personal node carries no
+    // longer (decision 2026-10-04 §10, §10.1), it answers a sync with
+    // nothing, as a device that holds no such channel would: the channel
+    // that is asked for holds nothing. It takes no push of that kind.
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     codec::write_protocol_byte(&mut send, Protocol::ItemSync)
         .await
         .unwrap();
     let older = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let page =
-        cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, older, 0, 10).await;
+    let page = cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, older, 0, 10)
+        .await
+        .expect("a personal node answers a sync of the older kind, with nothing");
     assert!(
-        page.is_err(),
+        page.items.is_empty() && !page.has_more && page.last_seq.is_none(),
         "a personal node served a sync of the older kind: {page:?}"
     );
     let pushed = ask_on(
