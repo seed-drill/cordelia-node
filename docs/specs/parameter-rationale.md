@@ -1092,7 +1092,7 @@ labels of exporters do (RFC 5705 §4).
 | `LABEL_FINGERPRINT` | `cordelia v2 fingerprint` | A key's fingerprint (a hash) |
 | `LABEL_CARRY_WORD` | `cordelia v2 carry word` | The phrase's signature on a person's word for a carry: which name, which keys that do not count, and which files above a version that is held (decision §7.3, §9). A signature under it is no statement and no entry |
 
-`LABELS` is all 24, for the test that sets one against another.
+`LABELS` is all 25, for the test that sets one against another.
 
 #### FINGERPRINT_WORDS_SHOWN = 4
 
@@ -1609,6 +1609,64 @@ is marked as cut.
 
 **Why 120:** neither the code nor the record gives a reason for the number;
 no measurement behind it yet.
+
+#### LEFT_PROOFS_MARGIN_SHARE = 64
+
+**Rationale:** A relay remembers the proofs of 1,024 channels for one
+connection (`MAX_CHANNELS_PROVED_ON_A_CONNECTION`), and a read of a generation
+that was left spends one for each channel it reads there. The read keeps back
+as many places as the device has channels of its own that are not yet proved on
+that connection, and a margin of one place in sixty-four (16 of 1,024), for a
+name that the device comes to hold while the read goes on and for the pair
+channel of a device that is being added (decision §16).
+
+**Never more than half:** a device with more channels of its own than half a
+connection's places shares the connection half and half, and the read has the
+connection made again as often as it needs. Where no place is left, the
+connection is made again and the read goes on from where it was.
+
+**Why one in sixty-four:** chosen with the bound it divides; no measurement
+behind it yet.
+
+#### CARRY_PROOFS_MADE_AGAIN = 2
+
+**Rationale:** A proof holds on the connection whose session it was made over.
+Where the node says that a connection has changed since a command made its
+proofs, the command asks for the sessions again and makes the proofs anew, at
+most twice for one channel. After the second time it says which relay it could
+not read (decision §16). A relay that was not read is never said to hold
+nothing.
+
+**Why twice:** enough for a connection that was made again once while a person
+answered prompts, and once more; no measurement behind it yet.
+
+#### LABEL_CARRY_BATCH = `cordelia v2 carry batch`
+
+**Rationale:** The label under which the key of one run of a command signs a
+batch of versions that it hands the node on the phrase's word: the batch's
+number, and the hash of its versions as they are handed (decision §16). The
+word names that key, the command makes it for the one run, and the node takes
+each number once. A signature under this label is no word, no statement and no
+entry.
+
+#### LOCAL_API_BODY_MAX_BYTES = 2 MB
+
+**Rationale:** The most bytes of one request's body that the local API of a
+device reads as JSON. A body over it is refused and is not read.
+
+**Why 2 MB:** room for one version of the largest size that an entry holds,
+with every byte of its name and its text written as six (the most that JSON
+makes of one) and every byte of its chain as four, beside a batch at its bound
+(`CARRY_HANDED_MAX_BYTES`), the word and the batch's signature. A test in
+`protocol.rs` holds that sum under the bound.
+
+#### CARRY_HANDED_MAX_BYTES = 512 KB
+
+**Derivation:** A quarter of `LOCAL_API_BODY_MAX_BYTES`. The most bytes of
+versions that a command hands the node in one request, each counted as it is
+written in the request's body, with its chain and with its name and text as
+they are escaped there (decision §7.3). A version over the bound is handed
+alone.
 
 ### 12.10 The Status Line
 

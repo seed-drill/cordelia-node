@@ -178,7 +178,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_ENTRY_NAME_AND_VALUE_BYTES` | 60KB | parameter-rationale.md §12.4 |
 | `ENTRY_CLEAR_BYTES`, `ENTRY_WIRE_OVERHEAD_BYTES`, `MAX_ENTRY_WIRE_BYTES` | 233, 237, 65,773 (derived) | parameter-rationale.md §12.4 |
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
-| `LABEL_*` (24 of them, all in `LABELS`; `LABEL_CARRY_WORD` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (25 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -210,6 +210,8 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
+| `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |
+| `LOCAL_API_BODY_MAX_BYTES`, `CARRY_HANDED_MAX_BYTES` | 2MB, 512KB (derived) | parameter-rationale.md §12.9 |
 | `RECOVERY_MAX_NAMES`, `RECOVERY_MAX_DEVICES_SHOWN`, `RECOVERY_MAX_LEFT_SECRETS` | 1024, 256, 9 (derived) | parameter-rationale.md §12.9 |
 | `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |

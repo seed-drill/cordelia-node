@@ -1164,6 +1164,42 @@ never held, comes in only under **a word that the phrase signed:**
 | `POST /api/v1/recover/make` | `{ "entry": "<hex>", "statement_key": "<hex>", "left": [{ "number": 3, "secret": "<hex>" }], "gone": [{ "key": "<hex>", "label": "laptop" }], "still_have": [], "word": { ... } }`: the node's half of a recovery, in one transaction. `entry` is the change entry of the recovery's statement, which the command made; `left` the secrets of the generation recovered from and of those before it, which the machine keeps as a device keeps a secret it left; `gone` the keys that the statement newly removes, and `still_have` the devices that the person still has, each with the label it was shown by; and `word` the phrase's word for the look, under this very entry. The statement is applied, the names of the look are listed in the new personal channel, and the node is woken: it shows the change entry to every relay before anything is carried. Answers `{ "change": <number> }`. The look is begun, and goes on after the answer |
 | `POST /api/v1/recover/progress` | `{ "look": ... }`: how far the look is. While it runs: `change`, `finished: false`, `names` (how many it reads) and `read` (how many it has read). Once it has ended, also `carried` and `carried_names`; `held` and `higher`; `ties`; `not_read`, each name that could not be read to its end, with the `change` (the generation), the `relay` and how it was `read`; `failed`; and `lacking`, for each removed key how many `versions` that key signed in what was read that the new channels lack, with the `names` they are in, its `key` and its `label`. `null` where this node has made no look since it started: one that was interrupted is not taken up again by itself |
 
+**What binds what a command hands the node** (decision 2026-10-04 §16):
+
+- **A word is taken once.** The node keeps a taken word's signature until the
+  word is void (ten minutes), and refuses it a second time.
+- **A batch is signed by the key of its run.** The word names a key that the
+  command makes for that one run. `POST /api/v1/carry/handed` takes
+  `{ "word", "number", "signature", "versions" }`: the signature is that key's,
+  under a label of its own (`cordelia v2 carry batch`), over the batch's number
+  and the hash of its versions as they are handed, and the node takes each
+  number once. A version at a revision that no entry may have under the
+  applied statement refuses the batch whole. A batch holds 512 KB of versions
+  at most (`CARRY_HANDED_MAX_BYTES`), and the body of any request to a device's
+  routes 2 MB (`LOCAL_API_BODY_MAX_BYTES`): a larger body is refused and not
+  read.
+- **A proof goes with its session.** `POST /api/v1/carry/sessions` answers
+  each relay that the device is set up with and the value of its connection's
+  session, as `/recover/look` does. Each proof in `/carry/read` carries the
+  `session` it was made over. Where the connection has changed since, that
+  relay is answered "not read: the connection changed", and the command makes
+  its proofs again (twice at most, `CARRY_PROOFS_MADE_AGAIN`); where a
+  connection has no place left for a proof it is "not read: no room left for a
+  proof", and the node makes the connection again. Neither is ever "the relay
+  holds none".
+- **Nothing is taken where the new channel was not fetched whole.**
+  `/carry/from/look` answers `new_read`, whether it was; a recovery's progress
+  answers `new_not_read`. Keys in both carry `by_words`, how to name them to
+  `--from` where a label would not tell them apart (a key written whole is
+  taken too).
+- **A recovery that could not show every row** hands `not_shown` to
+  `/recover/make`, the keys it did not show, and `/devices/list` then carries
+  each as left out with its `key`. A name that a carry or a recovery brought in
+  and has not yet sent is in `/devices/list` as `carried_to_go`, with
+  `carried_to_go_since`.
+- **`POST /api/v1/sync/unmap`** with a name that no folder maps and that a carry
+  holds lets go of it, and answers `let_go`.
+
 ---
 
 ### 3.18 Sync, and a Node That Is Held Up
