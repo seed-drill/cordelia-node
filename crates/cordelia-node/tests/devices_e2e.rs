@@ -2429,34 +2429,14 @@ fn home_memory_syncs_under_any_name() {
     assert!(out.contains("as crew."), "{out}");
     assert_eq!(mapped_names(&state(&a)), ["crew", "lab"]);
 
-    // Found, and not mapped: where everything found syncs, home syncs as
-    // `~`. Turned off and on again it is `~`, not a name it once had.
-    // (Home is unmapped here by its folder, as the two steps that `map`
-    // gives for a home mapped under another name spell it.)
+    // Home is unmapped by its folder, as the two steps that `map` gives
+    // for a home mapped under another name spell it, and mapped again
+    // under the name it had before.
     let out = a.cli(&["sync", "unmap", "~"]);
     assert!(
         out.contains("No longer synced from this device: ~ (crew)."),
         "{out}"
     );
-    a.cli(&["sync", "claude", "--all"]);
-    a.cli(&["sync", "include", &path(&a.home())]);
-    wait_for("a's home is found, and syncs as ~", &all, 120, || {
-        state(&a)["sync"]["projects"]
-            .as_array()?
-            .iter()
-            .any(|p| p["project"] == "~" && p["mapped"] == false && p["channel"].is_string())
-            .then_some(())
-    });
-    a.cli(&["sync", "home", "off"]);
-    assert_eq!(state(&a)["sync"]["home_name"], "~");
-    let out = a.cli(&["sync", "home", "on"]);
-    assert!(
-        out.contains("Home-folder memory syncs on this device."),
-        "{out}"
-    );
-    assert_eq!(mapped_names(&state(&a)), ["lab", "~"]);
-    a.cli(&["sync", "claude", "--mapped-only"]);
-    a.cli(&["sync", "unmap", "~"]);
     a.cli(&["sync", "map", &path(&a.home()), "team", "--home"]);
 
     // A home directory that is itself a git repository: Claude Code keeps

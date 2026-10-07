@@ -1197,13 +1197,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // setting takes effect at once: it wakes the loop, and a cycle
         // that was already running stops (see `SyncControl`).
         if config.network.role == "personal" {
-            // Nothing is written of the settings while the first start is
-            // still to be made: the step reads the scope as it is stored.
-            if state.held.why().is_none()
-                && let Err(e) = cordelia_api::sync::keep_earlier_scope(&state)
-            {
-                tracing::warn!(error = %e, "sync: could not read the stored scope");
-            }
             tokio::spawn(run_sync_loop(state.clone()));
         }
 

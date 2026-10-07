@@ -13,11 +13,13 @@
 //! nothing: what is in its folders stays on the machine, and the cycle's
 //! report says so (decision 2026-10-04 §5.2).
 //!
-//! - With declared mappings only (the default), nothing else syncs. Other
-//!   memory found on the machine is reported, with the name each would
-//!   get, so it can be mapped.
-//! - With `all` on, everything found syncs as well: home, and each git
-//!   project under its normalised remote, minus the excluded ones.
+//! **Only what is mapped syncs** (decision 2026-10-04 §10.1): a cycle's
+//! targets are the mappings and nothing else. Other memory found on the
+//! machine is listed in the cycle's report, with the name each would get,
+//! so that a person can map it. What is found is never synced: no name is
+//! held for it, and it is named to no other device. The adapter reads no
+//! stored scope, no list of exclusions and no switch for home memory:
+//! none of them says what syncs.
 //!
 //! A mapped folder syncs exactly the Claude Code folder named after it
 //! ([`discover::claude_folder`]), never one chosen by reading transcripts:
@@ -90,7 +92,9 @@ pub struct FolderReport {
     pub cwd: Option<String>,
     /// The name it syncs under.
     pub project: String,
-    /// Declared with `cordelia sync map`, as opposed to found by `all`.
+    /// Always true: only a folder that is mapped syncs (decision
+    /// 2026-10-04 §10.1). It is kept for whoever reads a report as an
+    /// earlier version wrote it.
     pub mapped: bool,
     pub channel_id: Option<String>,
     /// Waiting for the name's channel to be fetched from a relay: the
@@ -201,7 +205,7 @@ struct Activity {
     published: Option<String>,
 }
 
-/// Memory found on this machine that does not sync.
+/// Memory found on this machine that is not mapped, and so does not sync.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Found {
     /// Claude Code's folder for it.
@@ -218,13 +222,15 @@ pub struct Found {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CycleReport {
     pub folders: Vec<FolderReport>,
-    /// Folders found on this machine that do not sync: not mapped, or,
-    /// with `all` on, neither home nor a git project.
+    /// Folders found on this machine that hold memory, or may be sent
+    /// some, and are not mapped: none of them syncs.
     pub unmapped: Vec<Found>,
     /// The folders in `unmapped` that have no name to sync under (neither
     /// home nor a git project).
     pub unsynced: Vec<String>,
-    /// With `all` on: names found but excluded on this device.
+    /// Always empty: nothing that is found syncs, so nothing is kept out
+    /// of it. It is kept for whoever reads a report as an earlier version
+    /// wrote it.
     pub excluded: Vec<String>,
     /// Names this person's other devices sync that this device does not,
     /// sorted.
@@ -255,17 +261,12 @@ pub struct Mapping {
     pub name: String,
 }
 
-/// Per-device sync settings, kept in node metadata.
+/// Per-device sync settings, kept in node metadata: what a cycle reads.
+/// The mappings say what syncs, and nothing else does (decision
+/// 2026-10-04 §10.1): the stored scope, the list of exclusions and the
+/// switch for home memory are not read.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// Sync every folder found as well as the declared mappings.
-    pub all: bool,
-    /// With `all`: what this device never syncs. A name, where a trailing
-    /// `*` matches a prefix (`github.com/client-co/*`); or a folder (an
-    /// absolute path), which is how an unmapped folder stays unsynced.
-    pub exclude: Vec<String>,
-    /// With `all`: whether home memory syncs on this device.
-    pub home: bool,
     pub mappings: Vec<Mapping>,
     /// The Claude Code directory sync is on for; `None` when sync is off.
     pub dir: Option<String>,
@@ -277,52 +278,18 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Read from node metadata: `sync.claude.all`, `.mappings`, `.exclude`,
-    /// `.home` and `.dir`, with the count of changes to them.
+    /// Read from node metadata: `sync.claude.mappings` and `.dir`, with
+    /// the count of changes to them.
     pub fn load(state: &AppState) -> Result<Self, CordeliaError> {
         let db = lock(state)?;
         let json = |key: &str| -> Result<Option<String>, CordeliaError> { meta::get(&db, key) };
         Ok(Self {
-            all: json(meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on"),
-            exclude: json(meta::SYNC_CLAUDE_EXCLUDE)?
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default(),
-            home: json(meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off"),
             mappings: json(meta::SYNC_CLAUDE_MAPPINGS)?
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default(),
             dir: json(meta::SYNC_CLAUDE_DIR)?,
             generation: state.sync_control.generation_under(&db),
         })
-    }
-
-    /// With `all` on: whether this device leaves `project` out by name.
-    pub fn excludes(&self, project: &Project) -> bool {
-        match project {
-            Project::Home => !self.home,
-            Project::Repo(remote) => self
-                .exclude
-                .iter()
-                .filter(|entry| !entry.starts_with('/'))
-                .any(|pattern| {
-                    // In the spelling a project is found under. The node
-                    // stores it so; an earlier version could store one
-                    // that ended in `.git`.
-                    let pattern = cordelia_core::sync_name::tidy(pattern);
-                    match pattern.strip_suffix('*') {
-                        Some(prefix) => remote.starts_with(prefix),
-                        None => *remote == pattern,
-                    }
-                }),
-        }
-    }
-
-    /// With `all` on: whether the folder `dir` was taken out of the sync on
-    /// this device (it was unmapped), whatever name it would sync under.
-    pub fn declines(&self, dir: &Path) -> bool {
-        self.exclude
-            .iter()
-            .any(|entry| entry.starts_with('/') && Path::new(entry) == dir)
     }
 }
 
@@ -334,13 +301,13 @@ fn name_of(project: &Project) -> String {
     }
 }
 
-/// One folder to sync this cycle.
+/// One folder to sync this cycle: a mapped one.
 struct Target {
     /// Claude Code's folder.
     dir: PathBuf,
-    cwd: Option<String>,
+    /// The directory that is mapped.
+    cwd: String,
     name: String,
-    mapped: bool,
 }
 
 /// What a Claude Code folder's transcripts say about it.
@@ -526,8 +493,7 @@ impl ClaudeAdapter {
         found
     }
 
-    /// Run one sync cycle: the declared mappings, and with `all` on,
-    /// everything else found.
+    /// Run one sync cycle: the declared mappings, and nothing else.
     pub fn run_cycle(&mut self, state: &AppState) -> CycleReport {
         match Settings::load(state) {
             Ok(settings) => self.run_cycle_under(state, settings),
@@ -586,7 +552,8 @@ impl ClaudeAdapter {
             .unwrap_or(false);
         report.publishes_nothing = publishes_nothing(stands, moved_on);
 
-        // What to sync: declared mappings first.
+        // What to sync: the declared mappings, and nothing else (decision
+        // 2026-10-04 §10.1).
         let mut targets: Vec<Target> = Vec::new();
         let mut claimed: HashSet<PathBuf> = HashSet::new();
         for mapping in &settings.mappings {
@@ -606,48 +573,32 @@ impl ClaudeAdapter {
             claimed.insert(dir.clone());
             targets.push(Target {
                 dir,
-                cwd: Some(mapping.folder.clone()),
+                cwd: mapping.folder.clone(),
                 name: mapping.name.clone(),
-                mapped: true,
             });
         }
 
-        // Then everything else on disk: synced with `all`, reported without.
-        // A folder that was unmapped stays out either way, under any name.
+        // Everything else on disk is listed, and never synced: it is no
+        // target, no name is held for it, and nothing says of it to the
+        // person's other devices that this one syncs it.
         for candidate in self.candidates(&claimed) {
             let label = candidate.dir.display().to_string();
-            let declined = candidate
-                .cwd
-                .as_deref()
-                .is_some_and(|dir| settings.declines(dir));
             let cwd = candidate.cwd.map(|c| c.display().to_string());
-            match candidate.project {
-                Some(project) if settings.all && !declined && settings.excludes(&project) => {
-                    report.excluded.push(name_of(&project));
-                }
-                Some(project) if settings.all && !declined => targets.push(Target {
-                    dir: candidate.dir,
-                    cwd,
-                    name: name_of(&project),
-                    mapped: false,
-                }),
-                project => {
-                    if project.is_none() {
-                        report.unsynced.push(label.clone());
-                    }
-                    report.unmapped.push(Found {
-                        folder: label,
-                        cwd,
-                        name: project.as_ref().map(name_of),
-                    });
-                }
+            if candidate.project.is_none() {
+                report.unsynced.push(label.clone());
             }
+            report.unmapped.push(Found {
+                folder: label,
+                cwd,
+                name: candidate.project.as_ref().map(name_of),
+            });
         }
 
-        // The names this device syncs: each is held, and said in the
-        // personal channel, where its folder is reached below. A name
-        // that is mapped stays one of them whatever became of its folder.
-        let mut wanted: BTreeSet<String> = settings
+        // The names this device syncs are those its folders are mapped
+        // to: each is held, and said in the personal channel, where its
+        // folder is reached below. A name that is mapped stays one of
+        // them whatever became of its folder.
+        let wanted: BTreeSet<String> = settings
             .mappings
             .iter()
             .map(|mapping| mapping.name.clone())
@@ -667,7 +618,6 @@ impl ClaudeAdapter {
             }
             let label = target.dir.display().to_string();
             let memory = target.dir.join("memory");
-            wanted.insert(target.name.clone());
             let folder = memory.display().to_string();
             let result = match stands {
                 // Nothing syncs: the folder is listed, and left as it is.
@@ -722,17 +672,15 @@ impl ClaudeAdapter {
                 .errors
                 .extend(failed_as_errors(&memory, &r.failed, r.failed_more));
             // A repository created above a mapped folder moves its memory.
-            if target.mapped
-                && r.error.is_none()
-                && let Some(mapped) = target.cwd.as_deref()
-                && let Some(root) = self.moved_to(mapped)
+            if r.error.is_none()
+                && let Some(root) = self.moved_to(&target.cwd)
             {
                 let moved = format!(
                     "Claude Code now keeps this folder's memory with {}, a git repository \
                      that contains it: unmap it, and map that instead",
                     root.display()
                 );
-                report.errors.push(format!("{mapped}: {moved}"));
+                report.errors.push(format!("{}: {moved}", target.cwd));
                 r.error = Some(moved);
             }
             let seen = activity
@@ -748,9 +696,9 @@ impl ClaudeAdapter {
             r.last_pulled_at = seen.pulled.clone();
             r.last_published_at = seen.published.clone();
             r.folder = label;
-            r.cwd = target.cwd;
+            r.cwd = Some(target.cwd);
             r.project = target.name;
-            r.mapped = target.mapped;
+            r.mapped = true;
             let stopped = r.stopped;
             report.folders.push(r);
             if stopped {
@@ -970,11 +918,12 @@ pub fn withdraw(state: &AppState, generation: u64) -> Result<bool, CordeliaError
 /// speaks only for itself: a word is read only from the key that signed
 /// it, of keys that count, and only where its name could be mapped.
 ///
-/// A name that this device said it syncs and that is not in `wanted` was
-/// found by `all` and is found no longer: the device says so no longer,
-/// and holds the name no more ([`said_names::stop`]). Nothing is written
-/// if the settings are no longer those of `generation`: the names were
-/// worked out from settings that have since been replaced.
+/// A name that this device said it syncs and that is not in `wanted` is
+/// mapped no longer, and the command that unmapped it could not write so:
+/// the device says so no longer, and holds the name no more
+/// ([`said_names::stop`]). Nothing is written if the settings are no
+/// longer those of `generation`: the names were worked out from settings
+/// that have since been replaced.
 fn exchange_names(
     state: &AppState,
     wanted: &BTreeSet<String>,

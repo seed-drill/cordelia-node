@@ -1595,36 +1595,6 @@ async fn test_sync_settings_survive_being_turned_on_again() {
     );
 }
 
-#[actix_web::test]
-async fn test_an_install_from_before_mappings_keeps_its_scope() {
-    use cordelia_storage::meta;
-    let state = test_state();
-    let get = |key: &str| {
-        let db = state.db.lock().unwrap();
-        meta::get(&db, key).unwrap()
-    };
-
-    // Sync was never on: nothing to keep.
-    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
-    assert_eq!(get(meta::SYNC_CLAUDE_ALL), None);
-
-    // On, from before the scope was stored: everything found, as before.
-    {
-        let db = state.db.lock().unwrap();
-        meta::set(&db, meta::SYNC_CLAUDE_DIR, "/home/x/.claude").unwrap();
-    }
-    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
-    assert_eq!(get(meta::SYNC_CLAUDE_ALL).as_deref(), Some("on"));
-
-    // A scope its owner chose is never widened.
-    {
-        let db = state.db.lock().unwrap();
-        meta::set(&db, meta::SYNC_CLAUDE_ALL, "off").unwrap();
-    }
-    cordelia_api::sync::keep_earlier_scope(&state).unwrap();
-    assert_eq!(get(meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
-}
-
 /// Local history over HTTP (decision 2026-09-30 §4.5b): none of its four
 /// endpoints answers without the node's token, and a restore or a drop
 /// that is refused does nothing. With the token a kept text is listed,
