@@ -2640,6 +2640,124 @@ mod tests {
         );
     }
 
+    /// **A statement made on a remaining device while a recovery is made
+    /// from the statement before it** (decision 2026-10-04 §4.5, §9). The
+    /// person still has device 0, and recovers on a new machine all the
+    /// same, from the change that the relays hold. Before the recovery's
+    /// statement is made, device 0 makes a statement of its own: the two
+    /// have one number, and neither is on the other's chain.
+    ///
+    /// **Whichever of the two is answered with the other's is in a
+    /// fork,** and keeps both entries. **The settlement, made with the
+    /// phrase on either of them, ends it:** that device applies it, and
+    /// so does the other when it is shown it. The key that both removed
+    /// stays removed.
+    #[actix_web::test]
+    async fn test_a_statement_made_while_a_recovery_is_made_is_a_fork_and_is_settled() {
+        use crate::change::make_settlement;
+        use crate::person::{Applied, Shown as Answered, shown};
+        for settled_on_the_new_machine in [true, false] {
+            let gone = two_gone();
+            let from = candidate(&gone.s[0].latest());
+            let node = new_machine(9, &gone);
+            let new = &node.state;
+            // The recovery is prepared from change 2: device 0 is one
+            // that the person still has, and device 1 is lost.
+            let answers = [Answer::Have, Answer::Lost];
+            let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+            // Meanwhile device 0, which remains, makes a statement: it
+            // removes device 1 itself.
+            let mut s = gone.s;
+            let theirs = s.change(0, &[0], &[1]);
+            // The recovery is made, from the statement before that one.
+            let (number, _) = follows(&node, &made).unwrap();
+            assert_eq!((number, s[0].number()), (3, 3));
+            assert_ne!(made.entry.id(), theirs.id());
+
+            // The new machine is answered with device 0's, and device 0
+            // with the new machine's: each is in a fork, and keeps both.
+            let at = s.tick();
+            let answered = shown(&db(new), &new.identity, &theirs, at).unwrap();
+            assert_eq!(answered, Answered::Fork);
+            let on = &s[0];
+            let answered = shown(&on.conn, &on.identity, &made.entry, at).unwrap();
+            assert_eq!(answered, Answered::Fork);
+            let stands = || person::held(&db(new)).unwrap().unwrap();
+            let kept = |which: Kept| {
+                let entry = held_rows::change_entry(&db(new), which).unwrap();
+                entry.map(|entry| entry.check().unwrap())
+            };
+            assert_eq!((stands().state, on.state()), (State::Fork, State::Fork));
+            assert_eq!(
+                (
+                    kept(Kept::Latest).unwrap().id(),
+                    kept(Kept::Apart).unwrap().id()
+                ),
+                (made.entry.id(), theirs.id())
+            );
+            assert_eq!(
+                (on.latest().id(), on.apart().unwrap().id()),
+                (theirs.id(), made.entry.id())
+            );
+
+            // The settlement, with the phrase, on the one or on the
+            // other: both devices stay.
+            let own = new.identity.public_key();
+            let stay = vec![on.listed(), Device::new(own, "new machine").unwrap()];
+            let settlement = match settled_on_the_new_machine {
+                true => make_settlement(
+                    &phrase(),
+                    &stands().statement,
+                    &kept(Kept::Latest).unwrap(),
+                    &kept(Kept::Apart).unwrap(),
+                    &own,
+                    stay,
+                    &[],
+                ),
+                false => make_settlement(
+                    &phrase(),
+                    &on.held().statement,
+                    &on.latest(),
+                    &on.apart().unwrap(),
+                    &on.key(),
+                    stay,
+                    &[],
+                ),
+            }
+            .unwrap();
+            assert_eq!(settlement.rev, 4);
+            let applied = |answered: Answered| {
+                assert!(
+                    matches!(
+                        answered,
+                        Answered::Applied(Applied {
+                            number: 4,
+                            left: Some(3),
+                            ..
+                        })
+                    ),
+                    "{answered:?}"
+                );
+            };
+            let at = s.tick();
+            let on = &s[0];
+            applied(shown(&db(new), &new.identity, &settlement, at).unwrap());
+            applied(shown(&on.conn, &on.identity, &settlement, at).unwrap());
+            // Neither is in a fork, each keeps the settlement alone, and
+            // the key that both had removed is removed still.
+            assert_eq!(
+                (stands().state, on.state()),
+                (State::Applied, State::Applied)
+            );
+            assert_eq!((kept(Kept::Apart), on.apart()), (None, None));
+            assert_eq!(kept(Kept::Latest).unwrap().id(), settlement.id());
+            assert_eq!(on.latest().id(), settlement.id());
+            let listed = stands().statement.statement;
+            assert!(listed.removes(&s.key(1)));
+            assert!(listed.lists(&s.key(0)) && listed.lists(&own));
+        }
+    }
+
     /// A recovery whose look was interrupted was cut short (decision
     /// 2026-10-04 §8, §9): the machine never writes, under that
     /// statement, that it has sent what it carried, however much it has
