@@ -7,10 +7,6 @@
 //! had agreed, and it reads none of the older channels, keys or rows
 //! again.
 //!
-//! **A copy first** ([`copy`]): the database, as its opening left it, and
-//! the key files of the older channels, into a folder beside them named
-//! `before-<version>`. Nothing of the node's own is changed by it.
-//!
 //! 1. **A copy first** ([`copy`]): the database, as its opening left it,
 //!    and the key files of the older channels, into a folder beside them
 //!    named `before-<version>`. Where the copy cannot be made the step is
@@ -23,17 +19,77 @@
 //!    off; a guard is set against a version that does not know of the
 //!    step ([`GUARD`]); and the mark is written ([`Mark`]).
 //!
+//! What stays: the counters, the device's settings and mappings, what the
+//! node keeps for its usage counts, and everything that a later step of
+//! the schema added.
+//!
 //! Nothing here reads or writes a memory folder, the device's key file,
 //! its token or its configuration; local history, which is in files of
 //! its own, is not touched either.
+//!
+//! A relay and a bootnode make no copy and take no step: their databases
+//! are stepped as any version steps them, and they go on carrying the
+//! older kind. A relay that is started on a database which a personal
+//! node stepped removes the guard ([`remove_guard`]).
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
+use serde::{Deserialize, Serialize};
 
-use crate::schema;
+use cordelia_core::CordeliaError;
 
-// ── The key files of the older channels ──────────────────────────────
+use crate::{meta, schema};
+
+fn storage(e: rusqlite::Error) -> CordeliaError {
+    CordeliaError::Storage(e.to_string())
+}
+
+// ── What is of the older kind ────────────────────────────────────────
+
+/// The tables of the older kind of channel that a device holds, each of
+/// which the step empties (decision 2026-10-04 §10.1): the members of its
+/// channels, their keys as the database held them, the peers of its
+/// direct channels, the items it held (what waited to be sent among
+/// them), the search index of what was published through the local API,
+/// the invitations, what it had offered the members of its channels, the
+/// trust of other devices' keys with the labels it gave them, and the
+/// channels themselves, of every type.
+///
+/// They are in an order in which a row goes before the row it refers to.
+pub const OLDER_TABLES: [&str; 9] = [
+    "channel_members",
+    "channel_keys",
+    "dm_peers",
+    "items",
+    "search_content",
+    "invites",
+    "state_offers",
+    "trusted_keys",
+    "channels",
+];
+
+/// What every folder had agreed with its channel, and the records kept
+/// for index lines: the step empties both (decision 2026-10-04 §10, step
+/// 3). The tables stay, since a folder agrees with a channel from the
+/// person's secret in the same ones.
+pub const AGREED_TABLES: [&str; 2] = ["sync_files", "index_lines"];
+
+/// The key under which a node of the older kind noted the device whose
+/// offer of its personal channel it had decided to take. Nothing in this
+/// version writes it.
+pub const ACCEPTED_PERSONAL_FROM: &str = "membership.accepted_personal_from";
+
+/// What a node noted of the older kind for itself, each of which the step
+/// removes (decision 2026-10-04 §10.1): its personal channel, whom it
+/// accepted, and when it last synced (the time of the last change, and
+/// the times for each name).
+pub const OLDER_KEYS: [&str; 4] = [
+    meta::PERSONAL_CHANNEL_ID,
+    ACCEPTED_PERSONAL_FROM,
+    meta::SYNC_CLAUDE_LAST_CHANGE,
+    meta::SYNC_CLAUDE_ACTIVITY,
+];
 
 /// The folder, beside the database, of the key files of the older
 /// channels.
@@ -66,6 +122,44 @@ pub fn older_key_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     found.sort();
     Ok(found)
+}
+
+// ── The mark ─────────────────────────────────────────────────────────
+
+/// How the mark begins where the step was made, before the version.
+const STEPPED: &str = "stepped by ";
+
+/// How the mark begins where there was nothing to step, before the
+/// version.
+const NOTHING_TO_STEP: &str = "nothing to step, marked by ";
+
+/// The mark that the first start on this version is done (decision
+/// 2026-10-04 §10.1). Any mark means done, in this version and in every
+/// later one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    /// Whether the step was made: the node held something of the older
+    /// kind, and followed no phrase. Where it was not, the mark was
+    /// written and nothing else.
+    pub stepped: bool,
+    /// The version that wrote the mark.
+    pub version: String,
+}
+
+/// The mark, where the database has one. A mark that is not in either
+/// form is still a mark: it is read as one of a start that had nothing to
+/// step, by a version that is what the mark says.
+pub fn mark(conn: &Connection) -> Result<Option<Mark>, CordeliaError> {
+    Ok(meta::get(conn, meta::FIRST_START)?.map(|value| {
+        let (stepped, version) = match value.strip_prefix(STEPPED) {
+            Some(version) => (true, version),
+            None => (false, value.strip_prefix(NOTHING_TO_STEP).unwrap_or(&value)),
+        };
+        Mark {
+            stepped,
+            version: version.to_string(),
+        }
+    }))
 }
 
 // ── The copy ─────────────────────────────────────────────────────────
@@ -264,6 +358,267 @@ fn make_copy(conn: &Connection, data_dir: &Path, version: &str) -> Result<PathBu
 pub fn copy(conn: &Connection, data_dir: &Path, version: &str) -> Result<PathBuf, NotCopied> {
     let room_needed = room_needed(conn, data_dir);
     make_copy(conn, data_dir, version).map_err(|why| NotCopied { why, room_needed })
+}
+
+// ── The notice ───────────────────────────────────────────────────────
+
+/// A folder that synced because everything found did, and syncs no
+/// longer: the three things the stored report had for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedFolder {
+    /// Claude Code's folder for it.
+    pub folder: String,
+    /// The directory it belongs to, where the report had one.
+    pub cwd: Option<String>,
+    /// The name it synced under, where the report had one.
+    pub name: Option<String>,
+}
+
+/// What a device whose stored scope was on is told, once for each time
+/// it was stored (decision 2026-10-04 §10.1): the date, the Claude Code
+/// directory it was made under, and the folders that stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    /// When it was stored (RFC 3339).
+    pub at: String,
+    /// The Claude Code directory that sync was on for, or last was.
+    pub dir: Option<String>,
+    /// Each folder that the last stored report showed as syncing without
+    /// a mapping. `None` where that is not known: there was no stored
+    /// report, or it could not be read, or it was of a cycle that failed
+    /// before it came to a folder. The notice then has the date alone.
+    pub folders: Option<Vec<StoppedFolder>>,
+}
+
+/// What the last stored report shows of the folders that synced without
+/// a mapping.
+#[derive(Debug, PartialEq, Eq)]
+enum Reported {
+    /// There is no report, or it cannot be read, or it has no folders
+    /// and has errors.
+    NotKnown,
+    /// It has no folders and no errors, or every folder in it is mapped:
+    /// nothing stopped.
+    Nothing,
+    /// These stopped.
+    Folders(Vec<StoppedFolder>),
+}
+
+/// Read a report as the released version stored it, as plain JSON and
+/// through no type of the sync adapter's: an object with the folders of
+/// the cycle under `folders`, each an object with Claude Code's folder
+/// under `folder`, the directory under `cwd`, the name under `project`,
+/// and whether it was mapped under `mapped`; and the cycle's errors under
+/// `errors`.
+///
+/// Every folder that is not said to be mapped counts, whatever else the
+/// report says of it: one that was waiting, one that had failed, and one
+/// of a report from before mappings, which has no `mapped` and no
+/// directory. A report that is not in this form cannot be read, and is as
+/// none.
+fn reported(stored: Option<&str>) -> Reported {
+    use serde_json::Value;
+    let Some(Ok(Value::Object(report))) = stored.map(serde_json::from_str::<Value>) else {
+        return Reported::NotKnown;
+    };
+    let Some(Value::Array(folders)) = report.get("folders") else {
+        return Reported::NotKnown;
+    };
+    if folders.is_empty() {
+        let failed = report
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty());
+        return match failed {
+            true => Reported::NotKnown,
+            false => Reported::Nothing,
+        };
+    }
+    let mut stopped = Vec::new();
+    for folder in folders {
+        let text = |key: &str| folder.get(key).and_then(Value::as_str).map(str::to_string);
+        let Some(claude_folder) = text("folder") else {
+            return Reported::NotKnown;
+        };
+        if folder.get("mapped").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        stopped.push(StoppedFolder {
+            folder: claude_folder,
+            cwd: text("cwd"),
+            name: text("project"),
+        });
+    }
+    match stopped.is_empty() {
+        true => Reported::Nothing,
+        false => Reported::Folders(stopped),
+    }
+}
+
+/// The notice that the step stores, where it stores one: for a device
+/// whose stored scope is on, or absent with a directory set, whether
+/// sync is on or off. (The last directory that is kept while sync is off
+/// is no directory set.) None where the report shows that nothing
+/// stopped.
+fn notice_for(
+    conn: &Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Notice>, CordeliaError> {
+    let dir = meta::get(conn, meta::SYNC_CLAUDE_DIR)?;
+    let scope_was_on = match meta::get(conn, meta::SYNC_CLAUDE_ALL)? {
+        Some(scope) => scope == "on",
+        None => dir.is_some(),
+    };
+    if !scope_was_on {
+        return Ok(None);
+    }
+    let report = meta::get(conn, meta::SYNC_CLAUDE_REPORT)?;
+    let folders = match reported(report.as_deref()) {
+        Reported::Nothing => return Ok(None),
+        Reported::NotKnown => None,
+        Reported::Folders(folders) => Some(folders),
+    };
+    let dir = match dir {
+        Some(dir) => Some(dir),
+        None => meta::get(conn, meta::SYNC_CLAUDE_LAST_DIR)?,
+    };
+    Ok(Some(Notice {
+        at: now.to_rfc3339(),
+        dir,
+        folders,
+    }))
+}
+
+/// The notices that are stored, oldest first. What is stored and cannot
+/// be read is as none.
+pub fn notices(conn: &Connection) -> Result<Vec<Notice>, CordeliaError> {
+    Ok(meta::get(conn, meta::SYNC_CLAUDE_NOTICE)?
+        .and_then(|stored| serde_json::from_str(&stored).ok())
+        .unwrap_or_default())
+}
+
+/// Store `notice` after those that are stored: a later record is added,
+/// and none is replaced.
+fn store_notice(conn: &Connection, notice: &Notice) -> Result<(), CordeliaError> {
+    let mut all = notices(conn)?;
+    all.push(notice.clone());
+    let json = serde_json::to_string(&all).map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    meta::set(conn, meta::SYNC_CLAUDE_NOTICE, &json)
+}
+
+// ── The guard ────────────────────────────────────────────────────────
+
+/// The name of the guard against a version that does not know of the
+/// step (decision 2026-10-04 §10.1): a trigger on the older kind's table
+/// of channels, which refuses every new row.
+pub const GUARD: &str = "moved_on_takes_no_channel";
+
+/// What the guard says: that the database was moved on, by which
+/// version, and where the copy is.
+pub fn guard_words(version: &str) -> String {
+    format!(
+        "this database was moved on by Cordelia {version} and takes no channel of this kind: \
+         a version from before that cannot use it. The copy of the database from before is in \
+         the folder {} beside it.",
+        copy_name(version)
+    )
+}
+
+/// The statement that sets the guard.
+fn guard_sql(version: &str) -> String {
+    format!(
+        "CREATE TRIGGER {GUARD} BEFORE INSERT ON channels BEGIN
+             SELECT RAISE(ABORT, '{}');
+         END;",
+        guard_words(version).replace('\'', "''")
+    )
+}
+
+/// Remove the guard, where the database has it. Returns whether it had.
+/// A relay does so when it starts: the guard is a device's, and a relay
+/// goes on taking channels of the older kind (decision 2026-10-04
+/// §10.1). Where there is none, nothing is written.
+pub fn remove_guard(conn: &Connection) -> Result<bool, CordeliaError> {
+    let there: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1)",
+            params![GUARD],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if there {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {GUARD};"))
+            .map_err(storage)?;
+    }
+    Ok(there)
+}
+
+// ── The step ─────────────────────────────────────────────────────────
+
+/// What the step did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stepped {
+    /// How many rows went from the tables it empties.
+    pub rows: usize,
+    /// The notice it stored, where it stored one.
+    pub notice: Option<Notice>,
+}
+
+/// The step, in one transaction: all of it or none (decision 2026-10-04
+/// §10.1). `version` is the version that makes it, and `now` the date of
+/// a notice.
+///
+/// - Every folder forgets what it had agreed, and the records kept for
+///   index lines go with it ([`AGREED_TABLES`]).
+/// - Every row of the older kind that a device holds is emptied
+///   ([`OLDER_TABLES`], and the search index with its content), and what
+///   the node noted of the older kind for itself is removed
+///   ([`OLDER_KEYS`]). The counters stay, and so do the device's settings
+///   and its mappings.
+/// - Where the stored scope is on, or absent with a directory set, the
+///   notice is stored ([`Notice`]): made from the report as it is
+///   stored, before that is removed.
+/// - The stored report is removed, and the scope is written off.
+/// - The guard is set ([`GUARD`]).
+/// - The mark is written, with the version.
+///
+/// Where any of it fails, the transaction is undone and nothing of the
+/// step is left. It is made once: on a database that has the guard, it
+/// fails there.
+pub fn step(
+    conn: &Connection,
+    version: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Stepped, CordeliaError> {
+    let batch =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+    let notice = notice_for(&batch, now)?;
+    let mut rows = 0;
+    for table in AGREED_TABLES.iter().chain(&OLDER_TABLES) {
+        rows += batch
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(storage)?;
+    }
+    // The index itself, once its content is gone: none of its words stay.
+    batch
+        .execute(
+            "INSERT INTO search_fts(search_fts) VALUES('delete-all')",
+            [],
+        )
+        .map_err(storage)?;
+    for key in OLDER_KEYS {
+        meta::remove(&batch, key)?;
+    }
+    if let Some(notice) = &notice {
+        store_notice(&batch, notice)?;
+    }
+    meta::remove(&batch, meta::SYNC_CLAUDE_REPORT)?;
+    meta::set(&batch, meta::SYNC_CLAUDE_ALL, "off")?;
+    batch.execute_batch(&guard_sql(version)).map_err(storage)?;
+    meta::set(&batch, meta::FIRST_START, &format!("{STEPPED}{version}"))?;
+    batch.commit().map_err(storage)?;
+    Ok(Stepped { rows, notice })
 }
 
 // ── A node of the released version, for tests ────────────────────────
@@ -478,6 +833,12 @@ mod tests {
     /// The version that makes the copy, and the step, in these tests.
     const VERSION: &str = "0.2.0-test";
 
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-07T08:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     /// A node's folder with a database and key files in the released
     /// version's form ([`released`]), and beside them what a node keeps
     /// there that is no part of this: the device's key, its token, and a
@@ -505,6 +866,10 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    fn key(conn: &Connection, key: &str) -> Option<String> {
+        meta::get(conn, key).unwrap()
     }
 
     /// Everything a database holds, as far as these tests tell it apart:
@@ -848,5 +1213,388 @@ mod tests {
         // No folder of channel keys is no key file.
         let none = tempfile::tempdir().unwrap();
         assert!(older_key_files(none.path()).unwrap().is_empty());
+    }
+
+    // ── The step ─────────────────────────────────────────────────────
+
+    fn has_guard(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+            params![GUARD],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A new row in the older kind's table of channels.
+    fn new_channel(conn: &Connection, id: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES (?1, 'group', 'realtime', 'invite_only', X'AA', '2026-10-07', '2026-10-07')",
+            params![id],
+        )
+    }
+
+    /// The step empties every table and key of the older kind, each by
+    /// its name, and what a folder agreed with the records for index
+    /// lines; and it keeps the counters, what was seen of peers, and the
+    /// settings (decision 2026-10-04 §10.1). Every table that the
+    /// released version has is one that the step empties or one that it
+    /// keeps: there is no third kind.
+    #[test]
+    fn each_table_and_key_of_the_older_kind_is_emptied_by_its_name() {
+        const EMPTIED: [&str; 11] = [
+            "channels",
+            "channel_members",
+            "channel_keys",
+            "dm_peers",
+            "items",
+            "search_content",
+            "invites",
+            "state_offers",
+            "trusted_keys",
+            "sync_files",
+            "index_lines",
+        ];
+        const KEPT: [&str; 3] = ["counters", "node_meta", "peer_sightings"];
+        const KEYS_REMOVED: [&str; 5] = [
+            "personal_channel_id",
+            "membership.accepted_personal_from",
+            "sync.claude.last_change",
+            "sync.claude.activity",
+            "sync.claude.report",
+        ];
+        const KEYS_KEPT: [&str; 6] = [
+            "sync.claude.dir",
+            "sync.claude.mappings",
+            "sync.claude.exclude",
+            "sync.claude.home",
+            "sync.claude.home_name",
+            "usage.sighting_secret",
+        ];
+
+        // The tables of the released version, by its own schema: but for
+        // the search index's own, which hold what its content holds.
+        let dir = tempfile::tempdir().unwrap();
+        let as_released = released::database(&dir.path().join("as-released.db")).unwrap();
+        let tables: Vec<String> = as_released
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                   AND name NOT LIKE 'search_fts%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut listed: Vec<&str> = EMPTIED.iter().chain(&KEPT).copied().collect();
+        listed.sort();
+        assert_eq!(tables, listed);
+        // The lists in the code are these, and no other.
+        let mut in_code: Vec<&str> = OLDER_TABLES.iter().chain(&AGREED_TABLES).copied().collect();
+        in_code.sort();
+        let mut emptied = EMPTIED.to_vec();
+        emptied.sort();
+        assert_eq!(in_code, emptied);
+        let mut keys_in_code = OLDER_KEYS.to_vec();
+        keys_in_code.push(meta::SYNC_CLAUDE_REPORT);
+        assert_eq!(keys_in_code, KEYS_REMOVED);
+
+        let (_dir, conn) = released_node(|_| {});
+        let kept: Vec<i64> = KEPT.iter().map(|table| rows(&conn, table)).collect();
+        for table in EMPTIED {
+            assert!(rows(&conn, table) > 0, "{table} holds no row to begin with");
+        }
+        for name in KEYS_REMOVED.iter().chain(&KEYS_KEPT) {
+            assert!(
+                key(&conn, name).is_some(),
+                "{name} is not set to begin with"
+            );
+        }
+        let values: Vec<Option<String>> = KEYS_KEPT.iter().map(|name| key(&conn, name)).collect();
+        // How many pages of words the search index keeps in its own
+        // store: every row there but the two it keeps of itself.
+        let pages_of_the_index = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_fts_data WHERE id > 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(found_in_search(&conn, "tuesday"), 1);
+        assert!(pages_of_the_index() > 0);
+
+        let stepped = step(&conn, VERSION, now()).unwrap();
+        assert!(stepped.rows >= EMPTIED.len(), "{stepped:?}");
+        for table in EMPTIED {
+            assert_eq!(rows(&conn, table), 0, "{table}");
+        }
+        for name in KEYS_REMOVED {
+            assert_eq!(key(&conn, name), None, "{name}");
+        }
+        // No word of what was published stays in the search index: none
+        // is found there, and none is in what the index is kept in.
+        assert_eq!(found_in_search(&conn, "tuesday"), 0);
+        assert_eq!(pages_of_the_index(), 0);
+        for (table, before) in KEPT.iter().zip(&kept) {
+            // The table of what the node notes for itself loses the keys
+            // that are removed, and gains the mark.
+            let after = rows(&conn, table);
+            match *table {
+                "node_meta" => assert_eq!(after, before - KEYS_REMOVED.len() as i64 + 1),
+                _ => assert_eq!(after, *before, "{table}"),
+            }
+        }
+        let after: Vec<Option<String>> = KEYS_KEPT.iter().map(|name| key(&conn, name)).collect();
+        assert_eq!(after, values);
+        // The counter of arrival order stays where it was, and the counts
+        // of what the table of items holds follow its rows.
+        let counted = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT value FROM counters WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(counted("item_seq"), 42);
+        assert_eq!((counted("item_count"), counted("item_bytes")), (0, 0));
+        // The scope is written off, and the mark says which version made
+        // the step.
+        assert_eq!(key(&conn, meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
+        assert_eq!(
+            mark(&conn).unwrap(),
+            Some(Mark {
+                stepped: true,
+                version: VERSION.into()
+            })
+        );
+    }
+
+    /// The step, with `scope` stored (or none), sync on or off, and
+    /// `report` stored (or none): the notice it stored.
+    fn notice_of(scope: Option<&str>, sync_on: bool, report: Option<&str>) -> Option<Notice> {
+        let (_dir, conn) = released_node(|conn| {
+            match scope {
+                Some(scope) => meta::set(conn, meta::SYNC_CLAUDE_ALL, scope).unwrap(),
+                None => meta::remove(conn, meta::SYNC_CLAUDE_ALL).unwrap(),
+            }
+            if !sync_on {
+                let dir = meta::get(conn, meta::SYNC_CLAUDE_DIR).unwrap().unwrap();
+                meta::set(conn, meta::SYNC_CLAUDE_LAST_DIR, &dir).unwrap();
+                meta::remove(conn, meta::SYNC_CLAUDE_DIR).unwrap();
+            }
+            match report {
+                Some(report) => meta::set(conn, meta::SYNC_CLAUDE_REPORT, report).unwrap(),
+                None => meta::remove(conn, meta::SYNC_CLAUDE_REPORT).unwrap(),
+            }
+        });
+        let notice = step(&conn, VERSION, now()).unwrap().notice;
+        // Whatever was stored, the scope is off afterwards, and the
+        // report is removed.
+        assert_eq!(key(&conn, meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
+        assert_eq!(key(&conn, meta::SYNC_CLAUDE_REPORT), None);
+        // What is stored is what the step says it stored.
+        let stored: Vec<Notice> = notice.clone().into_iter().collect();
+        assert_eq!(notices(&conn).unwrap(), stored);
+        notice
+    }
+
+    /// With the scope stored on, the notice names what the last report
+    /// showed as syncing without a mapping, with sync on and with it off
+    /// (decision 2026-10-04 §10.1): the date, the Claude Code directory,
+    /// and each such folder with its directory and its name. A scope
+    /// that is absent with a directory set is on. With the scope off, or
+    /// absent with sync off, nothing is stored.
+    #[test]
+    fn a_device_whose_scope_was_on_is_left_a_notice_of_what_stopped() {
+        let report = Some(released::REPORT);
+        let stopped = |folder: &str, cwd: &str, name: &str| StoppedFolder {
+            folder: folder.into(),
+            cwd: Some(cwd.into()),
+            name: Some(name.into()),
+        };
+        // The two folders that the released version's report shows as
+        // syncing without a mapping: not the one that is mapped, and not
+        // the one that was found and did not sync.
+        let told = Notice {
+            at: "2026-10-07T08:00:00+00:00".into(),
+            dir: Some("/home/sam/.claude".into()),
+            folders: Some(vec![
+                stopped(
+                    "/home/sam/.claude/projects/-home-sam-work-tools",
+                    "/home/sam/work/tools",
+                    "github.com/sam/tools",
+                ),
+                stopped("/home/sam/.claude/projects/-home-sam", "/home/sam", "~"),
+            ]),
+        };
+        assert_eq!(notice_of(Some("on"), true, report), Some(told.clone()));
+        assert_eq!(notice_of(Some("on"), false, report), Some(told.clone()));
+        assert_eq!(notice_of(None, true, report), Some(told));
+        assert_eq!(notice_of(None, false, report), None);
+        assert_eq!(notice_of(Some("off"), true, report), None);
+        assert_eq!(notice_of(Some("off"), false, report), None);
+    }
+
+    /// A report that cannot be read is as none, and the notice then has
+    /// the date alone: so has one of a cycle that failed before it came
+    /// to a folder. Where the report shows that nothing synced without a
+    /// mapping, nothing stopped, and no notice is stored (decision
+    /// 2026-10-04 §10.1).
+    #[test]
+    fn a_report_that_cannot_be_read_leaves_a_notice_with_the_date_alone() {
+        let the_date_alone = Some(Notice {
+            at: "2026-10-07T08:00:00+00:00".into(),
+            dir: Some("/home/sam/.claude".into()),
+            folders: None,
+        });
+        for unread in [
+            None,
+            Some(""),
+            Some("{\"folders\":[{\"folder\":\"/a\""),
+            Some("[]"),
+            Some("{}"),
+            Some("{\"folders\":7,\"errors\":[]}"),
+            Some("{\"folders\":[7],\"errors\":[]}"),
+            Some("{\"folders\":[{\"project\":\"a\"}],\"errors\":[]}"),
+            Some("{\"folders\":[],\"errors\":[\"the folder could not be listed\"]}"),
+        ] {
+            let stored = notice_of(Some("on"), true, unread);
+            assert_eq!(stored, the_date_alone, "{unread:?}");
+        }
+        for nothing_stopped in [
+            "{\"folders\":[],\"errors\":[]}",
+            "{\"folders\":[]}",
+            "{\"folders\":[{\"folder\":\"/a\",\"mapped\":true}],\"errors\":[\"x\"]}",
+        ] {
+            let stored = notice_of(Some("on"), true, Some(nothing_stopped));
+            assert_eq!(stored, None, "{nothing_stopped}");
+        }
+        // A report from before mappings has no `mapped` and no directory
+        // for a folder: every folder in it counts.
+        let before_mappings = "{\"folders\":[{\"folder\":\"/a\",\"project\":\"one\"},\
+                               {\"folder\":\"/b\",\"project\":\"two\",\"waiting\":true}]}";
+        let stored = notice_of(Some("on"), true, Some(before_mappings)).unwrap();
+        let named = |folder: &str, name: &str| StoppedFolder {
+            folder: folder.into(),
+            cwd: None,
+            name: Some(name.into()),
+        };
+        assert_eq!(
+            stored.folders,
+            Some(vec![named("/a", "one"), named("/b", "two")])
+        );
+    }
+
+    /// A notice is one record for each time it was stored: a later one
+    /// is added, and none is replaced. What is stored and cannot be read
+    /// is as none.
+    #[test]
+    fn a_later_notice_is_added_and_none_is_replaced() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(notices(&conn).unwrap().is_empty());
+        meta::set(&conn, meta::SYNC_CLAUDE_NOTICE, "not a list").unwrap();
+        assert!(notices(&conn).unwrap().is_empty());
+        let notice = |at: &str| Notice {
+            at: at.into(),
+            dir: None,
+            folders: None,
+        };
+        store_notice(&conn, &notice("one")).unwrap();
+        store_notice(&conn, &notice("two")).unwrap();
+        assert_eq!(notices(&conn).unwrap(), [notice("one"), notice("two")]);
+    }
+
+    /// A step that fails half way leaves nothing of it: every row and
+    /// key is as it was, no notice is stored, and there is no guard and
+    /// no mark (decision 2026-10-04 §10.1).
+    #[test]
+    fn a_step_that_fails_half_way_leaves_nothing_of_it() {
+        let (_dir, conn) = released_node(|conn| {
+            meta::set(conn, meta::SYNC_CLAUDE_ALL, "on").unwrap();
+            // The table that the step empties last but one refuses.
+            conn.execute_batch(
+                "CREATE TRIGGER no_row BEFORE DELETE ON trusted_keys BEGIN
+                     SELECT RAISE(ABORT, 'this row stays');
+                 END;",
+            )
+            .unwrap();
+        });
+        let before = everything(&conn);
+
+        let failed = step(&conn, VERSION, now()).unwrap_err().to_string();
+        assert!(failed.contains("this row stays"), "{failed}");
+        assert!(conn.is_autocommit());
+        assert_eq!(everything(&conn), before);
+        assert_eq!(found_in_search(&conn, "tuesday"), 1);
+        assert!(notices(&conn).unwrap().is_empty());
+        assert_eq!(mark(&conn).unwrap(), None);
+        assert!(!has_guard(&conn));
+
+        conn.execute_batch("DROP TRIGGER no_row").unwrap();
+        let stepped = step(&conn, VERSION, now()).unwrap();
+        assert!(stepped.notice.is_some());
+        assert_eq!(rows(&conn, "channels"), 0);
+    }
+
+    /// The guard: once the step is made, a new row in the older kind's
+    /// table of channels is refused, with words that say the database
+    /// was moved on and where the copy is. A relay's start removes it
+    /// (decision 2026-10-04 §10.1).
+    #[test]
+    fn the_guard_refuses_a_new_channel_with_its_words_until_a_relay_removes_it() {
+        let (dir, conn) = released_node(|_| {});
+        assert!(new_channel(&conn, "grp_before").is_ok());
+        assert!(!has_guard(&conn));
+        assert!(!remove_guard(&conn).unwrap());
+        step(&conn, "0.2.0-it's", now()).unwrap();
+        assert!(has_guard(&conn));
+
+        let refused = new_channel(&conn, "grp_after").unwrap_err().to_string();
+        let words = guard_words("0.2.0-it's");
+        assert!(refused.contains(&words), "{refused}");
+        assert!(
+            words.contains("was moved on by Cordelia 0.2.0-it's"),
+            "{words}"
+        );
+        assert!(
+            words.contains("in the folder before-0.2.0-it-s beside it"),
+            "{words}"
+        );
+        assert_eq!(rows(&conn, "channels"), 0);
+        // A connection that opens the database afterwards meets it too.
+        let other = Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert!(new_channel(&other, "grp_other").is_err());
+        // The step is made once: where the guard is, it fails there.
+        assert!(step(&conn, VERSION, now()).is_err());
+
+        assert!(remove_guard(&conn).unwrap());
+        assert!(!has_guard(&conn));
+        assert!(new_channel(&conn, "grp_after").is_ok());
+        assert!(!remove_guard(&conn).unwrap());
+    }
+
+    /// A mark says whether the step was made, and which version wrote
+    /// it. A mark in another form is still a mark.
+    #[test]
+    fn a_mark_in_any_form_is_a_mark() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(mark(&conn).unwrap(), None);
+        let read = |value: &str| {
+            meta::set(&conn, meta::FIRST_START, value).unwrap();
+            let mark = mark(&conn).unwrap().unwrap();
+            (mark.stepped, mark.version)
+        };
+        assert_eq!(read("stepped by 0.3.0"), (true, "0.3.0".to_string()));
+        assert_eq!(
+            read("nothing to step, marked by 0.3.0"),
+            (false, "0.3.0".to_string())
+        );
+        assert_eq!(read("done"), (false, "done".to_string()));
+        assert_eq!(read(""), (false, String::new()));
     }
 }

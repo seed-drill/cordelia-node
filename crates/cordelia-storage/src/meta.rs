@@ -55,6 +55,17 @@ pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 /// at each statement applied.
 pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 
+/// The mark that the first start on a version that carries no channel of
+/// the older kind is done, with whether the step was made and the version
+/// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).
+pub const FIRST_START: &str = "first_start.done";
+
+/// JSON array of what a device whose stored scope was on has been told:
+/// one record for each time, with the date, the Claude Code directory and
+/// the folders that stopped syncing (`crate::first_start::Notice`,
+/// decision 2026-10-04 §10.1).
+pub const SYNC_CLAUDE_NOTICE: &str = "sync.claude.notice";
+
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])
