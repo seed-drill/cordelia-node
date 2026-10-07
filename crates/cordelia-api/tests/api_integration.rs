@@ -1604,6 +1604,200 @@ async fn test_sync_settings_survive_being_turned_on_again() {
     );
 }
 
+/// A status says that the scope is off, whatever is stored: only mapped
+/// folders sync (decision 2026-10-04 §10.1). With sync on and with it
+/// off, and with the key stored as on, as anything else, or not at all.
+#[actix_web::test]
+async fn test_a_status_says_that_the_scope_is_off_whatever_is_stored() {
+    use cordelia_storage::meta;
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    for on in [false, true] {
+        if on {
+            let db = state.db.lock().unwrap();
+            meta::set(&db, meta::SYNC_CLAUDE_DIR, "/srv/claude").unwrap();
+        }
+        for stored in [Some("on"), Some("off"), Some("true"), None] {
+            {
+                let db = state.db.lock().unwrap();
+                match stored {
+                    Some(stored) => meta::set(&db, meta::SYNC_CLAUDE_ALL, stored).unwrap(),
+                    None => meta::remove(&db, meta::SYNC_CLAUDE_ALL).unwrap(),
+                }
+            }
+            let (code, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+            assert_eq!(code, 200, "{body}");
+            assert_eq!(body["enabled"], on);
+            assert_eq!(body["all"], false, "{stored:?}: {body}");
+        }
+    }
+}
+
+/// `map` checks when it is run (decision 2026-10-04 §10.1). Where a
+/// folder that the node lists as found, or that a notice names, has the
+/// directory that is given, and is another folder than the one `map`
+/// would sync, the request is refused with the reason: it stores no
+/// mapping and counts no change. For a folder that it would sync, it
+/// maps.
+#[actix_web::test]
+async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found() {
+    use cordelia_storage::meta;
+    let home = real_home();
+    let claude = format!("{home}/.claude-of-a-test");
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "dir": claude })
+    );
+    assert_eq!(code, 200, "{body}");
+
+    // What a cycle stored of what it found: a tree laid out by hand that
+    // records one directory, and Claude Code's own folder for another.
+    let by_hand = format!("{claude}/projects/workspace");
+    let tree_dir = format!("{home}/code/app");
+    let own_dir = format!("{home}/code/lib");
+    let own = cordelia_api::found::claude_folder(
+        std::path::Path::new(&claude),
+        std::path::Path::new(&own_dir),
+    )
+    .unwrap();
+    let report = json!({
+        "folders": [],
+        "unmapped": [
+            { "folder": by_hand, "cwd": null, "directory": tree_dir, "name": "github.com/o/app",
+              "mappable": false, "why_not": "laid_out_by_hand" },
+            { "folder": own, "cwd": own_dir, "name": null, "mappable": true, "needs_name": true },
+        ],
+    });
+    let store_report = || {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_REPORT, &report.to_string()).unwrap();
+    };
+    store_report();
+    let generation = state.sync_control.generation();
+
+    // The directory that the tree records: `map` would sync Claude
+    // Code's own folder for it, which is not the folder that was found.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": tree_dir, "name": "github.com/o/app" })
+    );
+    assert_eq!(code, 400, "{body}");
+    let said = body.to_string();
+    assert!(said.contains("this layout cannot be mapped"), "{said}");
+    assert!(said.contains(&by_hand), "{said}");
+    assert!(said.contains("nothing was mapped"), "{said}");
+    assert_eq!(state.sync_control.generation(), generation);
+    let (_, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+    assert_eq!(body["mappings"], json!([]));
+    assert!(!body["report"].is_null(), "the report is as it was: {body}");
+
+    // The folder that it would sync is mapped.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": own_dir, "name": "lib" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body["mappings"],
+        json!([{ "folder": own_dir, "name": "lib" }])
+    );
+
+    // A folder that a notice names, which synced under another Claude
+    // Code directory: its directory is refused too, while the notice is
+    // stored. A later record of the notice stands for a folder that is
+    // named again.
+    let elsewhere = format!("{home}/.claude-of-another-test/projects/-somewhere-notes");
+    let notes = format!("{home}/notes");
+    let notice = json!([
+        { "at": "2026-10-05T00:00:00Z", "dir": format!("{home}/.claude-of-another-test"),
+          "folders": [{ "folder": elsewhere, "cwd": format!("{home}/old-notes"), "name": null }] },
+        { "at": "2026-10-06T00:00:00Z", "dir": format!("{home}/.claude-of-another-test"),
+          "folders": [{ "folder": elsewhere, "cwd": notes, "name": null }] },
+    ]);
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_NOTICE, &notice.to_string()).unwrap();
+    }
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": notes, "name": "notes" })
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("it is not under the Claude Code directory that sync is set to"),
+        "{body}"
+    );
+    // The directory that its earlier record had is not its directory now.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": format!("{home}/old-notes"), "name": "old-notes" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 2);
+}
+
+/// The node's status says for how long no relay has been connected, by
+/// its own clock (decision 2026-10-04 §10.1): nothing before the node
+/// has looked, nothing while one is connected, and a number of seconds
+/// from when it first found none.
+#[actix_web::test]
+async fn test_the_status_says_for_how_long_no_relay_has_been_connected() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let status = || async {
+        let req = test::TestRequest::get()
+            .uri("/api/v1/status")
+            .insert_header(auth_header())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        body
+    };
+    let body = status().await;
+    assert!(body.as_object().unwrap().contains_key("no_relay_secs"));
+    assert!(body["no_relay_secs"].is_null(), "{body}");
+
+    let now = std::time::Instant::now();
+    let earlier = now
+        .checked_sub(std::time::Duration::from_secs(400))
+        .unwrap();
+    state.own_channels.relays_connected(&[], earlier);
+    let secs = status().await["no_relay_secs"].as_u64().unwrap();
+    assert!((400..460).contains(&secs), "{secs}");
+
+    state
+        .own_channels
+        .relays_connected(&["relay.example:9474"], now);
+    assert!(status().await["no_relay_secs"].is_null());
+    state.own_channels.relays_connected(&[], now);
+    let secs = status().await["no_relay_secs"].as_u64().unwrap();
+    assert!(secs < 60, "{secs}");
+}
+
 /// Local history over HTTP (decision 2026-09-30 §4.5b): none of its four
 /// endpoints answers without the node's token, and a restore or a drop
 /// that is refused does nothing. With the token a kept text is listed,

@@ -79,7 +79,8 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
     Ok(SyncStatusResponse {
         enabled: dir.is_some(),
         dir,
-        all: meta::get(&db, meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on"),
+        // Whatever is stored: only mapped folders sync.
+        all: false,
         mappings: mappings(&db)?,
         exclude: exclusions(&db)?,
         home,
@@ -640,6 +641,11 @@ pub fn add_mapping(
     };
     let mut list = mappings(db)?;
     let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
+    if let Some(mapping) = &checked
+        && let Some(why) = maps_another_folder(db, &claude_dir, mapping, home_dir, &list)?
+    {
+        return Err(ApiError::BadRequest(why));
+    }
     control.changed(db);
     if let Some(mapping) = checked {
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping added");
@@ -660,6 +666,92 @@ pub fn add_mapping(
         meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
     }
     Ok(())
+}
+
+/// The folders that were found and are not mapped, as the last stored
+/// report lists them, and the folders that a stored notice names: each as
+/// Claude Code's folder, its directory, and the name it has. A folder
+/// with no directory is left out. Where a notice names a folder again,
+/// the later directory and name stand.
+fn found_and_named(
+    db: &rusqlite::Connection,
+) -> Result<Vec<(String, String, Option<String>)>, ApiError> {
+    let mut out = Vec::new();
+    let report: Option<serde_json::Value> =
+        meta::get(db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+    for entry in report
+        .iter()
+        .flat_map(|r| r["unmapped"].as_array())
+        .flatten()
+    {
+        // Its directory is under `cwd` where `map` would sync the folder,
+        // and under `directory` where it would not.
+        let directory = text(&entry["cwd"]).or_else(|| text(&entry["directory"]));
+        if let (Some(folder), Some(directory)) = (text(&entry["folder"]), directory) {
+            out.push((folder, directory, text(&entry["name"])));
+        }
+    }
+    for named in crate::found::named_in(&cordelia_storage::first_start::notices(db)?) {
+        if let Some(directory) = named.cwd {
+            out.push((named.folder, directory, named.name));
+        }
+    }
+    Ok(out)
+}
+
+/// Why `mapping` is refused, where it would sync another folder than one
+/// that was found, or that a notice names, with the directory it gives
+/// (decision 2026-10-04 §10.1): `map` checks whenever it is run, however
+/// the request was come by ([`crate::found::in_the_way`]). The reason is
+/// the one that stands in the place of a command for that folder, as the
+/// one function gives it.
+fn maps_another_folder(
+    db: &rusqlite::Connection,
+    claude_dir: &str,
+    mapping: &SyncMapping,
+    home_dir: &std::path::Path,
+    mappings: &[SyncMapping],
+) -> Result<Option<String>, ApiError> {
+    use crate::found;
+    use std::path::Path;
+
+    let claude_dir = Path::new(claude_dir);
+    let given = Path::new(&mapping.folder);
+    let Some(would_sync) = found::claude_folder(claude_dir, given) else {
+        return Ok(None);
+    };
+    let entries = found_and_named(db)?;
+    let pairs = entries
+        .iter()
+        .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
+    let Some(folder) = found::in_the_way(given, &would_sync, pairs) else {
+        return Ok(None);
+    };
+    let name = entries
+        .iter()
+        .find(|(of, directory, _)| of == folder && Path::new(directory) == given)
+        .and_then(|(_, _, name)| name.as_deref());
+    let asked = found::Asked {
+        folder: Path::new(folder),
+        directory: Some(given),
+        name,
+    };
+    let against = found::Against {
+        claude_dir,
+        home: Some(home_dir),
+        mappings,
+    };
+    let reason = match found::would_map(&asked, &against, &found::ThisMachine) {
+        found::Maps::No(why) => Some(why.says()),
+        _ => None,
+    };
+    Ok(Some(found::map_refused(
+        given,
+        &would_sync,
+        folder,
+        reason.as_deref(),
+    )))
 }
 
 /// Declare that Claude's memory for a folder syncs under a name (see

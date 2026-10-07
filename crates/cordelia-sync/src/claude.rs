@@ -64,6 +64,8 @@ use crate::discover::{self, Project};
 use crate::memory_md;
 use crate::names;
 use crate::plan::{self, Action, Agreed, Content, Counting, Remote};
+use cordelia_api::found;
+use cordelia_api::types::SyncMapping;
 
 /// Seconds between sync cycles.
 pub const CYCLE_SECS: u64 = 5;
@@ -205,26 +207,16 @@ struct Activity {
     published: Option<String>,
 }
 
-/// Memory found on this machine that is not mapped, and so does not sync.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct Found {
-    /// Claude Code's folder for it.
-    pub folder: String,
-    /// The directory to map to sync it, when its transcripts say: the
-    /// directory it belongs to, or the repository that directory is in.
-    pub cwd: Option<String>,
-    /// The name it would sync under: `~` for home, the normalised remote
-    /// for a git project, nothing for any other folder (it needs a name).
-    pub name: Option<String>,
-}
-
 /// What one cycle did.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CycleReport {
     pub folders: Vec<FolderReport>,
     /// Folders found on this machine that hold memory, or may be sent
-    /// some, and are not mapped: none of them syncs.
-    pub unmapped: Vec<Found>,
+    /// some, and are not mapped: none of them syncs. Each says whether
+    /// `cordelia sync map` would sync that folder, and why not where it
+    /// would not; its directory is under `cwd` only where it would
+    /// (decision 2026-10-04 §10.1).
+    pub unmapped: Vec<found::Entry>,
     /// The folders in `unmapped` that have no name to sync under (neither
     /// home nor a git project).
     pub unsynced: Vec<String>,
@@ -320,6 +312,10 @@ enum Seen {
         dir: PathBuf,
         root: PathBuf,
         project: Option<Project>,
+        /// Whether git could be run to say which repository the
+        /// directory is in. Where it could not, `root` is the directory
+        /// itself, and a repository above it is not known of.
+        git: bool,
     },
     /// Claude Code's own folder, for a directory in a repository whose
     /// folder name cannot be predicted: nothing to sync from here.
@@ -336,9 +332,32 @@ enum Seen {
 struct Candidate {
     /// Claude Code's folder holding the memory, or due to.
     dir: PathBuf,
-    /// The directory to map to sync it.
+    /// The directory it belongs to: the one its sessions started in, or
+    /// the repository that directory is in.
     cwd: Option<PathBuf>,
     project: Option<Project>,
+    /// Whether git could be run when the folder's transcripts were read.
+    git: bool,
+}
+
+/// What the adapter read of a found folder's directory when it last
+/// looked at the folder's transcripts ([`ClaudeAdapter::seen`]): it
+/// answers [`found::would_map`] from that, so that a cycle asks git no
+/// more often than it did. The directory it is asked about is the one the
+/// lookup gave as holding the memory, so where git ran it is its own
+/// root.
+struct Looked {
+    git: bool,
+}
+
+impl found::Machine for Looked {
+    fn is_dir(&self, dir: &Path) -> bool {
+        dir.is_dir()
+    }
+
+    fn memory_root(&self, dir: &Path) -> Option<PathBuf> {
+        self.git.then(|| dir.to_path_buf())
+    }
 }
 
 /// The adapter for one Claude Code directory (`~/.claude`).
@@ -424,7 +443,9 @@ impl ClaudeAdapter {
             .find(|cwd| discover::is_claude_folder_for(folder, cwd));
         let seen = match own {
             Some(cwd) => {
-                let root = discover::memory_root(cwd);
+                let known = discover::memory_root_known(cwd);
+                let git = known.is_some();
+                let root = known.unwrap_or_else(|| cwd.clone());
                 let dir = if root == *cwd {
                     Some(folder.to_path_buf())
                 } else {
@@ -435,6 +456,7 @@ impl ClaudeAdapter {
                         project: self.project(&root),
                         dir,
                         root,
+                        git,
                     },
                     None => Seen::OwnElsewhere,
                 })
@@ -457,21 +479,29 @@ impl ClaudeAdapter {
         for folder in discover::folders(&self.claude_dir) {
             let holds_memory = folder.memory_dir.is_dir();
             let candidate = match self.seen(&folder.dir) {
-                Some(Seen::Own { dir, root, project }) => Candidate {
+                Some(Seen::Own {
+                    dir,
+                    root,
+                    project,
+                    git,
+                }) => Candidate {
                     dir,
                     cwd: Some(root),
                     project,
+                    git,
                 },
                 Some(Seen::ByHand { cwd, project }) if holds_memory => Candidate {
                     dir: folder.dir,
                     cwd: Some(cwd),
                     project,
+                    git: true,
                 },
                 // No transcripts: all that is known is that it holds memory.
                 None if holds_memory => Candidate {
                     dir: folder.dir,
                     cwd: None,
                     project: None,
+                    git: true,
                 },
                 _ => continue,
             };
@@ -580,18 +610,38 @@ impl ClaudeAdapter {
 
         // Everything else on disk is listed, and never synced: it is no
         // target, no name is held for it, and nothing says of it to the
-        // person's other devices that this one syncs it.
-        for candidate in self.candidates(&claimed) {
-            let label = candidate.dir.display().to_string();
-            let cwd = candidate.cwd.map(|c| c.display().to_string());
+        // person's other devices that this one syncs it. Each is listed
+        // with whether `cordelia sync map` would sync that folder, as the
+        // one function says it ([`found::would_map`]).
+        let declared: Vec<SyncMapping> = settings
+            .mappings
+            .iter()
+            .map(|mapping| SyncMapping {
+                folder: mapping.folder.clone(),
+                name: mapping.name.clone(),
+            })
+            .collect();
+        let candidates = self.candidates(&claimed);
+        let against = found::Against {
+            claude_dir: &self.claude_dir,
+            // A node whose `HOME` is not set is given an empty path.
+            home: (!self.home.as_os_str().is_empty()).then_some(self.home.as_path()),
+            mappings: &declared,
+        };
+        for candidate in candidates {
             if candidate.project.is_none() {
-                report.unsynced.push(label.clone());
+                report.unsynced.push(candidate.dir.display().to_string());
             }
-            report.unmapped.push(Found {
-                folder: label,
-                cwd,
-                name: candidate.project.as_ref().map(name_of),
-            });
+            let name = candidate.project.as_ref().map(name_of);
+            let asked = found::Asked {
+                folder: &candidate.dir,
+                directory: candidate.cwd.as_deref(),
+                name: name.as_deref(),
+            };
+            let looked = Looked { git: candidate.git };
+            report
+                .unmapped
+                .push(found::Entry::of(&asked, &against, &looked));
         }
 
         // The names this device syncs are those its folders are mapped
@@ -4952,6 +5002,46 @@ mod tests {
         assert_eq!(p.read(&long).as_deref(), Some("theirs\n"));
         let copy = names::conflict_name(&long, "abcd");
         assert_eq!(p.read(&copy).as_deref(), Some("mine\n"));
+    }
+
+    /// Where the node cannot run git, no found entry carries its
+    /// directory under `cwd` (decision 2026-10-04 §10.1): the repository
+    /// that the directory may be in is not known, and whoever has git
+    /// would map the repository above it. The adapter answers the one
+    /// function from what it read when it looked at the folder.
+    #[test]
+    fn test_a_folder_found_where_git_cannot_be_run_has_no_cwd() {
+        use found::Machine;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let notes = home.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let claude = home.join(".claude");
+        let folder = found::claude_folder(&claude, &notes).unwrap();
+        let entry = |git: bool| {
+            let asked = found::Asked {
+                folder: &folder,
+                directory: Some(&notes),
+                name: Some("lab"),
+            };
+            let against = found::Against {
+                claude_dir: &claude,
+                home: Some(&home),
+                mappings: &[],
+            };
+            found::Entry::of(&asked, &against, &Looked { git })
+        };
+        let with_git = entry(true);
+        assert!(with_git.mappable, "{with_git:?}");
+        assert_eq!(with_git.cwd, Some(notes.display().to_string()));
+        let without = entry(false);
+        assert!(!without.mappable, "{without:?}");
+        assert_eq!(without.cwd, None);
+        assert_eq!(without.directory, Some(notes.display().to_string()));
+        assert_eq!(without.why_not, Some("git_not_run"));
+        // The directory is asked of the disk each time.
+        assert!(Looked { git: true }.is_dir(&notes));
+        assert!(!Looked { git: true }.is_dir(&home.join("gone")));
     }
 
     /// A cycle's errors name the files of a folder that failed, each with

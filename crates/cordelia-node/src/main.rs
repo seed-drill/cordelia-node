@@ -875,7 +875,6 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {
         let report = &sync["report"];
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
-        out.facts.sync_all = sync["all"].as_bool().unwrap_or(false);
         out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
         out.facts.moved_on = sync["moved_on"].as_bool().unwrap_or(false);
         out.facts.report_age_secs = report["at"]
@@ -2801,6 +2800,12 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 println!();
                 since = None;
             } else {
+                // `map` checks when it is run: it is not sent where it
+                // would sync another folder than one that was found
+                // (decision 2026-10-04 §10.1).
+                if let Some(why) = map_would_sync_another(&given, &root, &settings) {
+                    anyhow::bail!("{why}");
+                }
                 // Home memory syncs only when it is asked for, and by
                 // naming the home directory itself: never by a slip, and
                 // never because a folder inside it was named.
@@ -3226,6 +3231,150 @@ fn print_columns(rows: &[Vec<String>]) {
     }
 }
 
+/// The command that maps a folder which was found, or a reason in its
+/// place: one row of the list of what is found and not syncing, from the
+/// entry as the node carries it (decision 2026-10-04 §10.1).
+///
+/// **A command is printed only where it maps what was found:** where the
+/// entry says that `cordelia sync map`, given its directory, would sync
+/// that folder. Otherwise the reason stands in its place. For a memory
+/// tree laid out by hand there is no command at all: the row says that
+/// the layout cannot be mapped, and where the memory is.
+///
+/// `home_name` is the name home memory last had on this device, and
+/// `available` the names that this person's other devices sync.
+fn found_row(
+    found: &serde_json::Value,
+    home_name: Option<&str>,
+    available: &[String],
+) -> Vec<String> {
+    use cordelia_sync::claude::HOME_NAME;
+    let folder = found["folder"].as_str().unwrap_or_default();
+    let name = found["name"].as_str();
+    let says = found["says"].as_str();
+    let is = |key: &str| found[key].as_bool() == Some(true);
+    let Some(cwd) = found["cwd"].as_str().filter(|_| is("mappable")) else {
+        if found["why_not"].as_str() == Some("laid_out_by_hand") {
+            return vec![
+                format!("{}/memory", short_path(folder)),
+                "this layout cannot be mapped".to_string(),
+            ];
+        }
+        // An entry that says nothing of whether it can be mapped is from
+        // a node that does not say: no command is made up for it.
+        let reason = says.unwrap_or(
+            "the node does not say whether `cordelia sync map` would sync it: restart the node",
+        );
+        return match found["directory"].as_str().or(found["cwd"].as_str()) {
+            Some(directory) => vec![
+                short_path(directory),
+                name.map_or_else(|| "not a git project".to_string(), sync_label),
+                reason.to_string(),
+            ],
+            None => vec![short_path(folder), reason.to_string()],
+        };
+    };
+    let (mut what, command) = if is("home") {
+        // Under the name it last had here, if it had another: mapped as
+        // `~` it would go to another channel.
+        match home_name {
+            Some(last) if last != HOME_NAME => (
+                format!("{} (last synced as {last})", sync_label(HOME_NAME)),
+                "cordelia sync home on".to_string(),
+            ),
+            _ => (
+                sync_label(HOME_NAME),
+                "cordelia sync map ~ --home".to_string(),
+            ),
+        }
+    } else if is("needs_name") {
+        (
+            says.unwrap_or("needs a name").to_string(),
+            format!("cordelia sync map {} <name>", shell_arg(cwd)),
+        )
+    } else {
+        (
+            name.unwrap_or_default().to_string(),
+            format!("cordelia sync map {}", shell_arg(cwd)),
+        )
+    };
+    // Not said of a home that last synced under another name: what the
+    // other devices sync is `~`, and turning home on here would not join
+    // that.
+    if name.is_some_and(|name| available.iter().any(|other| other == name))
+        && !command.ends_with("sync home on")
+    {
+        what.push_str(" (your other devices sync it)");
+    }
+    vec![short_path(cwd), what, command]
+}
+
+/// The folders that the node lists as found and not syncing, and those
+/// that its notice names, from its status: each as Claude Code's folder,
+/// its directory, and the reason that stands in the place of a command
+/// for it, where it has one. An entry's directory is under `cwd` where
+/// `cordelia sync map` would sync its folder, and under `directory`
+/// where it would not.
+fn found_and_named(status: &serde_json::Value) -> Vec<(&str, &str, Option<&str>)> {
+    let found = status["report"]["unmapped"].as_array();
+    let named = status["notice"]["folders"].as_array();
+    found
+        .into_iter()
+        .chain(named)
+        .flatten()
+        .filter_map(|entry| {
+            let directory = entry["cwd"].as_str().or(entry["directory"].as_str())?;
+            Some((entry["folder"].as_str()?, directory, entry["says"].as_str()))
+        })
+        .collect()
+}
+
+/// Why `cordelia sync map` is not sent, where it would sync another
+/// folder than one that was found (decision 2026-10-04 §10.1). `map`
+/// checks whenever it is run, however the command was come by: it reads
+/// what the node lists as found and what its notice names, and where one
+/// of them has the directory that was given (`given`, or `root`, the
+/// directory whose folder holds its memory), and a Claude Code folder
+/// other than the one `map` would sync, it is refused with the reason.
+///
+/// A command copied from earlier output, or typed from memory, would
+/// otherwise map another folder: Claude Code's own folder for the
+/// directory of a tree laid out by hand, or the folder of a repository
+/// that has appeared above the directory since it was found.
+fn map_would_sync_another(
+    given: &std::path::Path,
+    root: &std::path::Path,
+    status: &serde_json::Value,
+) -> Option<String> {
+    use cordelia_api::found;
+    let claude_dir = std::path::Path::new(status["dir"].as_str()?);
+    let would_sync = found::claude_folder(claude_dir, root)?;
+    let listed = found_and_named(status);
+    let pairs = || {
+        listed
+            .iter()
+            .map(|(folder, directory, _)| (*folder, *directory))
+    };
+    let (asked, folder) = [given, root].into_iter().find_map(|asked| {
+        found::in_the_way(asked, &would_sync, pairs()).map(|folder| (asked, folder))
+    })?;
+    // The reason the node gave for the folder, or, where it found the
+    // folder before a repository appeared above its directory, that.
+    let said = listed
+        .iter()
+        .find(|(of, directory, _)| *of == folder && std::path::Path::new(directory) == asked)
+        .and_then(|(_, _, says)| *says)
+        .map(str::to_string);
+    let moved = || found::WhyNot::MemoryElsewhere(root.to_path_buf()).says();
+    let reason = said.or_else(|| (root != given).then(moved));
+    Some(found::map_refused(
+        asked,
+        &would_sync,
+        folder,
+        reason.as_deref(),
+    ))
+}
+
 /// Print what syncs on this device, what was found and is not syncing, and
 /// what this person's other devices sync. After a change (`since` is the
 /// settings generation it left), waits briefly for a report made under
@@ -3318,57 +3467,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         println!("Found on this machine, not syncing:");
         let rows: Vec<Vec<String>> = unmapped
             .iter()
-            .map(|u| {
-                let Some(cwd) = u["cwd"].as_str() else {
-                    return vec![
-                        short_path(&text(&u["folder"])),
-                        "its folder is not known".to_string(),
-                        "cordelia sync map <its folder> <name>".to_string(),
-                    ];
-                };
-                // `map` takes folders in the home directory only.
-                let mappable = std::path::Path::new(cwd).starts_with(real_home());
-                let (mut what, command) = match u["name"].as_str() {
-                    // Under the name it last had here, if it had another:
-                    // mapped as `~` it would go to another channel.
-                    Some(name) if name == cordelia_sync::claude::HOME_NAME => {
-                        match resp["home_name"].as_str() {
-                            Some(last) if last != name => (
-                                format!("{} (last synced as {last})", sync_label(name)),
-                                "cordelia sync home on".to_string(),
-                            ),
-                            _ => (sync_label(name), "cordelia sync map ~ --home".to_string()),
-                        }
-                    }
-                    Some(name) if !mappable => (
-                        name.to_string(),
-                        "outside your home directory: it cannot be mapped".to_string(),
-                    ),
-                    Some(name) => (
-                        name.to_string(),
-                        format!("cordelia sync map {}", shell_arg(cwd)),
-                    ),
-                    None if !mappable => (
-                        "not a git project".to_string(),
-                        "outside your home directory: it cannot be mapped".to_string(),
-                    ),
-                    None => (
-                        "needs a name (not a git project)".to_string(),
-                        format!("cordelia sync map {} <name>", shell_arg(cwd)),
-                    ),
-                };
-                // Not said of a home that last synced under another
-                // name: what the other devices sync is `~`, and turning
-                // home on here would not join that.
-                if u["name"]
-                    .as_str()
-                    .is_some_and(|n| available.iter().any(|a| a == n))
-                    && !command.ends_with("sync home on")
-                {
-                    what.push_str(" (your other devices sync it)");
-                }
-                vec![short_path(cwd), what, command]
-            })
+            .map(|found| found_row(found, resp["home_name"].as_str(), &available))
             .collect();
         print_columns(&rows);
     }
@@ -3855,6 +3954,269 @@ mod tests {
             assert_eq!(asked(sent), None, "{sent:?}");
         }
         assert!(ONLY_MAPPED_FOLDERS_SYNC.contains("the only scope there is"));
+    }
+
+    /// The list of what is found prints `cordelia sync map` only where it
+    /// maps what was found, and the reason in its place otherwise
+    /// (decision 2026-10-04 §10.1): from the entry as the node carries
+    /// it, for each kind of folder.
+    #[test]
+    fn test_a_map_command_is_printed_only_where_it_maps_what_was_found() {
+        let home = real_home().display().to_string();
+        let row = |found: serde_json::Value| found_row(&found, None, &[]);
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        let claude = format!("{home}/.claude/projects");
+
+        // What `map` would sync: the command, with its directory.
+        let project = serde_json::json!({
+            "folder": format!("{claude}/-x-Work-cn"), "cwd": format!("{home}/Work/cn"),
+            "name": "github.com/o/cn", "mappable": true,
+        });
+        assert_eq!(
+            row(project.clone()),
+            [
+                "~/Work/cn",
+                "github.com/o/cn",
+                "cordelia sync map ~/Work/cn"
+            ]
+        );
+        // One that needs a name: the command asks for one, and says why.
+        let needs = serde_json::json!({
+            "folder": format!("{claude}/-x-notes"), "cwd": format!("{home}/notes"), "name": null,
+            "mappable": true, "needs_name": true, "says": "needs a name (not a git project)",
+        });
+        assert_eq!(
+            row(needs),
+            [
+                "~/notes",
+                "needs a name (not a git project)",
+                "cordelia sync map ~/notes <name>"
+            ]
+        );
+        let taken = serde_json::json!({
+            "folder": format!("{claude}/-x-src-cn"), "cwd": format!("{home}/src/cn"),
+            "name": "github.com/o/cn", "mappable": true, "needs_name": true,
+            "says": "needs another name (its own is mapped from /x/Work/cn)",
+        });
+        assert_eq!(
+            row(taken)[1..],
+            [
+                "needs another name (its own is mapped from /x/Work/cn)",
+                "cordelia sync map ~/src/cn <name>"
+            ]
+        );
+        // The home directory's own entry, with what maps it: as `~`, or
+        // under the name it last had here.
+        let home_entry = serde_json::json!({
+            "folder": format!("{claude}/-x"), "cwd": home, "name": "~",
+            "mappable": true, "home": true,
+        });
+        assert_eq!(
+            row(home_entry.clone()),
+            ["~", "home memory", "cordelia sync map ~ --home"]
+        );
+        assert_eq!(
+            found_row(&home_entry, Some("team"), &[]),
+            [
+                "~",
+                "home memory (last synced as team)",
+                "cordelia sync home on"
+            ]
+        );
+        // What the other devices sync is marked.
+        let others = ["github.com/o/cn".to_string(), "~".to_string()];
+        assert_eq!(
+            found_row(&project, None, &others)[1],
+            "github.com/o/cn (your other devices sync it)"
+        );
+        assert_eq!(
+            found_row(&home_entry, Some("team"), &others)[1],
+            "home memory (last synced as team)"
+        );
+
+        // What `map` would not sync: no command, and the reason in its
+        // place, for each reason there is.
+        for (why, says) in [
+            (
+                "outside_home",
+                "outside your home directory: it cannot be mapped",
+            ),
+            ("directory_gone", "its directory is gone"),
+            (
+                "home_not_set",
+                "HOME is not set for the node: nothing can be mapped until it is",
+            ),
+            ("git_not_run", "the node cannot run git"),
+            (
+                "memory_elsewhere",
+                "Claude Code now keeps its memory with /x, a git repository",
+            ),
+            ("path_too_long", "its path is longer than 200 characters"),
+            (
+                "another_claude_dir",
+                "it is not under the Claude Code directory",
+            ),
+        ] {
+            let cannot = serde_json::json!({
+                "folder": format!("{claude}/-srv-app"), "cwd": null, "directory": "/srv/app",
+                "name": "github.com/o/app", "mappable": false, "why_not": why, "says": says,
+            });
+            let printed = row(cannot);
+            assert_eq!(printed, ["/srv/app", "github.com/o/app", says], "{why}");
+            assert!(!printed.join(" ").contains("cordelia sync map"), "{why}");
+        }
+        let no_name = json(
+            r#"{"folder":"/c/projects/-srv-n","cwd":null,"directory":"/srv/n","name":null,
+                "mappable":false,"why_not":"outside_home","says":"outside your home directory"}"#,
+        );
+        assert_eq!(
+            row(no_name),
+            ["/srv/n", "not a git project", "outside your home directory"]
+        );
+        // No directory known: the folder, and that.
+        let unknown = json(
+            r#"{"folder":"/c/projects/-gone","cwd":null,"name":null,"mappable":false,
+                "why_not":"no_directory","says":"its directory is not known"}"#,
+        );
+        assert_eq!(
+            row(unknown),
+            ["/c/projects/-gone", "its directory is not known"]
+        );
+        // A tree laid out by hand: no command at all, only that the
+        // layout cannot be mapped, and where the memory is. Not its
+        // directory, and not the home directory's command where that is
+        // what its transcripts record.
+        let by_hand = serde_json::json!({
+            "folder": "/c/projects/workspace", "cwd": null, "directory": home, "name": "~",
+            "mappable": false, "why_not": "laid_out_by_hand",
+            "says": "this layout cannot be mapped: Claude Code did not name the folder after \
+                     its directory",
+        });
+        assert_eq!(
+            row(by_hand),
+            [
+                "/c/projects/workspace/memory",
+                "this layout cannot be mapped"
+            ]
+        );
+        // An entry whose directory is under `cwd` and that is not said
+        // to be mappable gets no command: nothing is made up for it.
+        let unsaid = json(r#"{"folder":"/c/projects/-x-old","cwd":"/x/old","name":"old"}"#);
+        let printed = row(unsaid);
+        assert_eq!(printed[..2], ["/x/old", "old"]);
+        assert!(
+            printed[2].starts_with("the node does not say"),
+            "{printed:?}"
+        );
+        let not_mappable = json(
+            r#"{"folder":"/c/projects/-x-old","cwd":"/x/old","name":"old","mappable":false,
+                "says":"its directory is gone"}"#,
+        );
+        assert_eq!(
+            row(not_mappable),
+            ["/x/old", "old", "its directory is gone"]
+        );
+    }
+
+    /// `cordelia sync map` checks when it is run (decision 2026-10-04
+    /// §10.1): where the node lists a folder as found, or names one in
+    /// its notice, with the directory that was given and another Claude
+    /// Code folder than the one `map` would sync, nothing is sent, and
+    /// the reason is said. For a folder that it would sync, it goes on.
+    #[test]
+    fn test_map_is_not_sent_where_it_would_sync_another_folder_than_was_found() {
+        use std::path::Path;
+        let status = |found: serde_json::Value, named: serde_json::Value| {
+            serde_json::json!({
+                "enabled": true,
+                "dir": "/home/sam/.claude",
+                "report": { "unmapped": found },
+                "notice": { "folders": named },
+            })
+        };
+        let none = serde_json::json!([]);
+        let own = "/home/sam/.claude/projects/-home-sam-Work-cn";
+        let cn = Path::new("/home/sam/Work/cn");
+
+        // The folder that `map` would sync was found: it is sent.
+        let found = serde_json::json!([
+            { "folder": own, "cwd": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": true },
+        ]);
+        assert_eq!(
+            map_would_sync_another(cn, cn, &status(found, none.clone())),
+            None
+        );
+        // Nothing found, and sync off (the node then refuses): it is sent.
+        assert_eq!(
+            map_would_sync_another(cn, cn, &status(none.clone(), none.clone())),
+            None
+        );
+        assert_eq!(
+            map_would_sync_another(cn, cn, &serde_json::json!({ "enabled": false })),
+            None
+        );
+
+        // The directory of a tree laid out by hand.
+        let by_hand = serde_json::json!([
+            { "folder": "/home/sam/.claude/projects/workspace", "cwd": null,
+              "directory": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": false,
+              "why_not": "laid_out_by_hand", "says": "this layout cannot be mapped" },
+        ]);
+        for listed in [
+            status(by_hand.clone(), none.clone()),
+            status(none.clone(), by_hand.clone()),
+        ] {
+            let why = map_would_sync_another(cn, cn, &listed).expect("refused");
+            assert!(
+                why.contains("/home/sam/.claude/projects/workspace"),
+                "{why}"
+            );
+            assert!(why.contains("(this layout cannot be mapped)"), "{why}");
+            assert!(why.contains(own), "{why}");
+            assert!(why.contains("nothing was mapped"), "{why}");
+            // Given one of its subdirectories, whose memory is the
+            // repository's: refused as well.
+            let sub = Path::new("/home/sam/Work/cn/src");
+            assert!(map_would_sync_another(sub, cn, &listed).is_some());
+        }
+
+        // A directory that a repository has appeared above since it was
+        // found: `map` would sync the repository's folder.
+        let notes = Path::new("/home/sam/notes");
+        let above = Path::new("/home/sam");
+        let found = serde_json::json!([
+            { "folder": "/home/sam/.claude/projects/-home-sam-notes", "cwd": "/home/sam/notes",
+              "name": null, "mappable": true, "needs_name": true,
+              "says": "needs a name (not a git project)" },
+        ]);
+        let listed = status(found, none.clone());
+        assert_eq!(map_would_sync_another(notes, notes, &listed), None);
+        let why = map_would_sync_another(notes, above, &listed).expect("refused");
+        assert!(
+            why.contains("/home/sam/.claude/projects/-home-sam-notes"),
+            "{why}"
+        );
+        assert!(
+            why.contains("/home/sam/.claude/projects/-home-sam)"),
+            "{why}"
+        );
+        // An entry of another directory is not in the way.
+        let other = Path::new("/home/sam/other");
+        assert_eq!(map_would_sync_another(other, other, &listed), None);
+
+        // A folder that the notice names, which synced under another
+        // Claude Code directory.
+        let named = serde_json::json!([
+            { "folder": "/home/sam/.other/projects/-home-sam-Work-cn", "cwd": null,
+              "directory": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": false,
+              "why_not": "another_claude_dir",
+              "says": "it is not under the Claude Code directory that sync is set to" },
+        ]);
+        let why = map_would_sync_another(cn, cn, &status(none, named)).expect("refused");
+        assert!(
+            why.contains("it is not under the Claude Code directory"),
+            "{why}"
+        );
     }
 
     #[test]

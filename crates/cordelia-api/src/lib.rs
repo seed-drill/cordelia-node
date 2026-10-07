@@ -31,6 +31,7 @@ pub mod commands;
 pub mod entries;
 pub mod error;
 pub mod first_start;
+pub mod found;
 pub mod handlers;
 pub mod history;
 pub mod leaving;

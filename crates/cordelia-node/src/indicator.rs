@@ -49,8 +49,6 @@ pub struct Facts {
     pub stands: String,
     /// Folders the last cycle synced or is waiting to sync.
     pub folders: usize,
-    /// Everything found syncs (`--all`), not only mapped folders.
-    pub sync_all: bool,
     /// Whether this device took this version with what an earlier one
     /// held (decision 2026-10-04 §10.1): with no phrase it is then "not
     /// added yet", and otherwise it is a new install.
@@ -196,12 +194,7 @@ pub fn derive(f: &Facts) -> (State, String) {
         Some(_) => {}
     }
     if f.folders == 0 {
-        let summary = if f.sync_all {
-            "memory: nothing to sync"
-        } else {
-            "memory: nothing mapped"
-        };
-        return (Off, summary.into());
+        return (Off, "memory: nothing mapped".into());
     }
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
@@ -370,13 +363,6 @@ mod tests {
         assert_eq!(
             with(&|f| f.folders = 0),
             (State::Off, "memory: nothing mapped".into())
-        );
-        assert_eq!(
-            with(&|f| {
-                f.folders = 0;
-                f.sync_all = true;
-            }),
-            (State::Off, "memory: nothing to sync".into())
         );
         assert_eq!(
             with(&|f| f.conflicts = vec!["a".into(), "b".into()]),

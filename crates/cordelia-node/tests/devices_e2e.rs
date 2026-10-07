@@ -1832,7 +1832,14 @@ fn claude_memory_syncs_between_two_machines() {
     assert_eq!(s["state"], "off", "{s}");
     assert_eq!(s["summary"], "memory: nothing mapped", "{s}");
     assert_eq!(s["sync"]["all"], false, "{s}");
-    assert_eq!(s["sync"]["unmapped"].as_array().unwrap().len(), 3, "{s}");
+    // Each is carried with whether `cordelia sync map` would sync it:
+    // all three would, and so each has its directory under `cwd`.
+    let unmapped = s["sync"]["unmapped"].as_array().unwrap();
+    assert_eq!(unmapped.len(), 3, "{s}");
+    for found in unmapped {
+        assert_eq!(found["mappable"], true, "{found}");
+        assert!(found["cwd"].is_string(), "{found}");
+    }
 
     // What cannot be mapped by accident, or by a slip.
     let said = a.refused(&["sync", "map", &path(&a.home())]);

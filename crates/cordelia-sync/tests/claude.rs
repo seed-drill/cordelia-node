@@ -309,6 +309,16 @@ fn settle(a: &mut Device, b: &mut Device) {
     }
 }
 
+/// Store a cycle's report as the node's loop does after each cycle: what
+/// `cordelia sync status` shows, and what `map` reads of what was found.
+fn store_report(d: &Device, report: &cordelia_sync::claude::CycleReport) {
+    set_meta(
+        d,
+        meta::SYNC_CLAUDE_REPORT,
+        &serde_json::to_string(report).unwrap(),
+    );
+}
+
 /// Set a per-device sync setting in node metadata.
 fn set_meta(d: &Device, key: &str, value: &str) {
     let db = d.state.db.lock().unwrap();
@@ -1250,10 +1260,12 @@ fn memory_is_kept_per_repository_not_per_folder() {
     // One thing to map: the repository, not the subdirectory.
     assert_eq!(
         a.cycle().unmapped,
-        vec![cordelia_sync::claude::Found {
+        vec![cordelia_api::found::Entry {
             folder: a.folder_of(&a_repo).display().to_string(),
             cwd: Some(a_repo.display().to_string()),
             name: Some(PROJECT.to_string()),
+            mappable: true,
+            ..Default::default()
         }]
     );
     map(&a, &a_repo, PROJECT);
@@ -1321,6 +1333,12 @@ fn a_mapping_syncs_the_folder_named_after_it_and_no_other() {
 /// the repository that its transcript records, and not when that
 /// repository's directory is mapped, which syncs the folder that Claude
 /// Code names after the directory and no other.
+///
+/// It is listed as what it is: a layout that cannot be mapped, with its
+/// directory under another key than `cwd`, so that nothing offers a
+/// command or a switch for it. And `map` itself, given the directory that
+/// the tree records, is refused with that reason while the node lists the
+/// tree: it would sync another folder than the one that was found.
 #[test]
 fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
     let (mut a, mut b) = paired_explicit();
@@ -1351,13 +1369,59 @@ fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
     assert_eq!(read(&b_mem, "decision.md"), None);
     let report = a.cycle();
     assert!(report.folders.is_empty(), "{:?}", report.folders);
-    assert_eq!(report.unmapped.len(), 1, "{:?}", report.unmapped);
-    assert_eq!(report.unmapped[0].folder, entry.display().to_string());
+    assert_eq!(
+        report.unmapped,
+        vec![cordelia_api::found::Entry {
+            folder: entry.display().to_string(),
+            cwd: None,
+            directory: Some(a_repo.display().to_string()),
+            name: Some(PROJECT.to_string()),
+            why_not: Some("laid_out_by_hand"),
+            says: Some(
+                "this layout cannot be mapped: Claude Code did not name the folder after its \
+                 directory"
+                    .into()
+            ),
+            ..Default::default()
+        }]
+    );
     assert!(!holds(&a, &channel_of(&mut b, PROJECT)));
 
-    // The repository's directory is mapped: that syncs the folder Claude
-    // Code names after it under the directory that is set, which is
-    // another folder than the tree's. Nothing that the tree holds leaves.
+    // `map`, given the directory that the tree records, while the node
+    // lists the tree (its loop stores each cycle's report): refused with
+    // the reason, and no mapping is stored.
+    store_report(&a, &report);
+    let request = cordelia_api::types::SyncMapRequest {
+        folder: a_repo.display().to_string(),
+        name: PROJECT.into(),
+        home: false,
+    };
+    let generation = a.state.sync_control.generation();
+    let refused = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        refused.contains("this layout cannot be mapped"),
+        "{refused}"
+    );
+    assert!(refused.contains(&entry.display().to_string()), "{refused}");
+    assert!(refused.contains("nothing was mapped"), "{refused}");
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+    assert_eq!(a.state.sync_control.generation(), generation);
+    assert!(a.cycle().folders.is_empty());
+
+    // Where the node lists nothing (a setting was changed, and no cycle
+    // has run since), the repository's directory is mapped: that syncs
+    // the folder Claude Code names after it under the directory that is
+    // set, which is another folder than the tree's. Nothing that the tree
+    // holds leaves.
+    {
+        let db = a.state.db.lock().unwrap();
+        meta::remove(&db, meta::SYNC_CLAUDE_REPORT).unwrap();
+    }
     map(&a, &a_repo, PROJECT);
     std::fs::write(b_mem.join("reply.md"), "from b\n").unwrap();
     settle(&mut a, &mut b);
@@ -1370,6 +1434,128 @@ fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
     );
     let link = entry.join("memory").symlink_metadata().unwrap();
     assert!(link.file_type().is_symlink(), "the link is left as it is");
+}
+
+/// What is found is listed with whether `cordelia sync map` would sync
+/// that folder, and why not where it would not (decision 2026-10-04
+/// §10.1): each kind of folder, as the adapter finds it on disk. An entry
+/// carries its directory under `cwd` only where `map` would sync its
+/// folder.
+#[test]
+fn what_is_found_says_whether_map_would_sync_it() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let shown = |path: &Path| path.display().to_string();
+    // A git project, mapped: its folder syncs, and is not listed.
+    let repo = a.clone_at("Work/cordelia-node");
+    a.claude_folder(&repo);
+    map(&a, &repo, PROJECT);
+    // A second clone of it: found under the name that the first is
+    // mapped under, so it needs a name of its own.
+    let second = a.clone_at("src/cn");
+    a.session_in(&second);
+    // A project of its own, under its remote's name.
+    let other = a.clone_of("Work/other", "git@github.com:seed-drill/other.git");
+    a.session_in(&other);
+    // A folder that is no git project: under a name that is given.
+    let notes = a.plain_dir("notes");
+    a.claude_folder(&notes);
+    // The home directory's own folder.
+    a.home_memory();
+    // A directory outside the home directory.
+    let outside = a.home.parent().unwrap().join("elsewhere/app");
+    std::fs::create_dir_all(&outside).unwrap();
+    a.claude_folder(&outside);
+    // A directory that is gone.
+    let gone = a.home.join("was-here");
+    a.claude_folder(&gone);
+    // A folder with memory and no transcript: no directory is known.
+    let unknown = a.home.join(".claude/projects/-home-nobody-knows");
+    std::fs::create_dir_all(unknown.join("memory")).unwrap();
+    // Two folders laid out by hand: one whose transcript records the
+    // home directory, and one that records the mapped repository.
+    let by_hand = |name: &str, records: &Path| {
+        let folder = a.home.join(".claude/projects").join(name);
+        std::fs::create_dir_all(folder.join("memory")).unwrap();
+        let line = format!("{{\"cwd\":{:?}}}\n", shown(records));
+        std::fs::write(folder.join("scope.jsonl"), line).unwrap();
+        folder
+    };
+    let tree_of_home = by_hand("everything", &a.home);
+    let tree_of_repo = by_hand("workspace", &repo);
+
+    let report = a.cycle();
+    assert_eq!(report.folders.len(), 1, "{:?}", report.folders);
+    let entry = |folder: &Path| {
+        let of = shown(folder);
+        let found = report.unmapped.iter().find(|entry| entry.folder == of);
+        found.unwrap_or_else(|| panic!("{of} is not listed: {:?}", report.unmapped))
+    };
+    // What `map` would sync has its directory under `cwd`.
+    let own = entry(&a.folder_of(&other));
+    assert!(own.mappable && !own.needs_name && !own.home, "{own:?}");
+    assert_eq!(own.cwd, Some(shown(&other)));
+    assert_eq!(own.name.as_deref(), Some("github.com/seed-drill/other"));
+    assert_eq!((own.why_not, own.says.as_deref()), (None, None));
+
+    let named = entry(&a.folder_of(&notes));
+    assert!(named.mappable && named.needs_name, "{named:?}");
+    assert_eq!(named.cwd, Some(shown(&notes)));
+    assert_eq!(
+        named.says.as_deref(),
+        Some("needs a name (not a git project)")
+    );
+
+    let clone = entry(&a.folder_of(&second));
+    assert!(clone.mappable && clone.needs_name, "{clone:?}");
+    assert_eq!(clone.name.as_deref(), Some(PROJECT));
+    assert_eq!(
+        clone.says,
+        Some(format!(
+            "needs another name (its own is mapped from {})",
+            shown(&repo)
+        ))
+    );
+
+    let home = entry(&a.folder_of(&a.home));
+    assert!(home.mappable && home.home && !home.needs_name, "{home:?}");
+    assert_eq!(home.cwd, Some(shown(&a.home)));
+    assert_eq!(home.name.as_deref(), Some("~"));
+
+    // What it would not sync has no `cwd`, and says why.
+    for (folder, directory, why) in [
+        (a.folder_of(&outside), Some(&outside), "outside_home"),
+        (a.folder_of(&gone), Some(&gone), "directory_gone"),
+        (unknown.clone(), None, "no_directory"),
+        (tree_of_home.clone(), Some(&a.home), "laid_out_by_hand"),
+        (tree_of_repo.clone(), Some(&repo), "laid_out_by_hand"),
+    ] {
+        let listed = entry(&folder);
+        assert!(!listed.mappable && !listed.mapped, "{listed:?}");
+        assert_eq!(listed.cwd, None, "{listed:?}");
+        assert_eq!(listed.directory, directory.map(|dir| shown(dir)));
+        assert_eq!(listed.why_not, Some(why), "{listed:?}");
+        assert!(listed.says.is_some(), "{listed:?}");
+    }
+    // The tree that records the home directory is a tree, and not home.
+    assert!(!entry(&tree_of_home).home);
+    assert_eq!(report.unmapped.len(), 9, "{:?}", report.unmapped);
+
+    // A node whose `HOME` is not set maps nothing: no entry has a `cwd`.
+    a.adapter = ClaudeAdapter::new(a.home.join(".claude"), PathBuf::new(), &a.pk());
+    let report = a.cycle();
+    assert_eq!(report.folders.len(), 1, "what is mapped still syncs");
+    assert!(!report.unmapped.is_empty());
+    for listed in &report.unmapped {
+        assert_eq!(listed.cwd, None, "{listed:?}");
+        assert!(!listed.mappable, "{listed:?}");
+    }
+    let of = |folder: &Path| {
+        let of = shown(folder);
+        let found = report.unmapped.iter().find(|entry| entry.folder == of);
+        found.and_then(|entry| entry.why_not)
+    };
+    assert_eq!(of(&a.folder_of(&other)), Some("home_not_set"));
+    assert_eq!(of(&tree_of_repo), Some("laid_out_by_hand"));
 }
 
 #[test]
