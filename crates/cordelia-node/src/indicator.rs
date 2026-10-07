@@ -51,6 +51,10 @@ pub struct Facts {
     pub folders: usize,
     /// Everything found syncs (`--all`), not only mapped folders.
     pub sync_all: bool,
+    /// What the node is held up by, as it says it, where it is (decision
+    /// 2026-10-04 §10.1): `first_start` while its first start on this
+    /// version is not done. It runs no cycle and no pass until then.
+    pub held: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +111,19 @@ pub fn derive(f: &Facts) -> (State, String) {
             0 => (Offline, format!("{}: no peers", f.role)),
             n => (Synced, format!("{}: {n} {}", f.role, plural(n, "peer"))),
         };
+    }
+    // A node that is held up runs no cycle and no pass, with sync on or
+    // off, and refuses what would change anything (decision 2026-10-04
+    // §10.1): `cordelia status` says why.
+    match f.held.as_deref() {
+        Some("first_start") => {
+            return (
+                Attention,
+                "memory not syncing: the first start on this version is not done".into(),
+            );
+        }
+        Some(_) => return (Attention, "memory not syncing: the node is held up".into()),
+        None => {}
     }
     if !f.sync_enabled {
         return (Off, "memory sync off".into());
@@ -420,6 +437,48 @@ mod tests {
         f.stands = "no_phrase".into();
         f.sync_enabled = false;
         assert_eq!(state(&f), (State::Off, "memory sync off".into()));
+    }
+
+    /// A node that is held up is said to be so, ahead of everything that
+    /// a running personal node says of its memory: it runs no cycle and
+    /// no pass, with sync on or off (decision 2026-10-04 §10.1).
+    #[test]
+    fn a_node_that_is_held_up_needs_the_person_whatever_else_it_says() {
+        let held = |by: &str, edit: &dyn Fn(&mut Facts)| {
+            let mut f = synced();
+            f.held = Some(by.into());
+            edit(&mut f);
+            state(&f)
+        };
+        let first_start = (
+            State::Attention,
+            "memory not syncing: the first start on this version is not done".to_string(),
+        );
+        assert_eq!(held("first_start", &|_| {}), first_start);
+        assert_eq!(
+            held("first_start", &|f| f.sync_enabled = false),
+            first_start
+        );
+        assert_eq!(
+            held("first_start", &|f| f.stands = "no_phrase".into()),
+            first_start
+        );
+        assert_eq!(
+            held("first_start", &|f| f.errors = vec!["x".into()]),
+            first_start
+        );
+        assert_eq!(
+            held("something that a later node says", &|_| {}),
+            (
+                State::Attention,
+                "memory not syncing: the node is held up".into()
+            )
+        );
+        // A node that is not running, or was not asked, says that first.
+        assert_eq!(
+            held("first_start", &|f| f.running = false).0,
+            State::Stopped
+        );
     }
 
     #[test]

@@ -4159,3 +4159,30 @@ async fn a_personal_node_makes_its_passes_on_its_timers_and_none_without_a_phras
     // The change entry, the personal channel and the name.
     assert_eq!(channels_at(&relay), 3);
 }
+
+/// A node that is held up makes no pass (decision 2026-10-04 §10.1):
+/// nothing is shown, asked, sent or taken, by the whole pass or by the
+/// pass that sends, and no whole pass is counted. Held up no longer, it
+/// passes as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_is_held_up_makes_no_pass() {
+    use cordelia_api::state::Held;
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes("notes", "a.md", "a text");
+    device.connects_to("relay", relay.port, relay.key).await;
+
+    let held = Held::FirstStart("the first start on this version is not done".into());
+    device.state.held.hold(held);
+    device.passes().await;
+    device.sends().await;
+    assert!(relay.requests().is_empty(), "{:?}", relay.requests());
+    assert_eq!(device.state.own_channels.whole_passes(), (0, 0));
+
+    device.state.held.release();
+    device.passes().await;
+    assert!(!relay.requests().is_empty());
+    assert_eq!(device.state.own_channels.whole_passes(), (1, 1));
+}

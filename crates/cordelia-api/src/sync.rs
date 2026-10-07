@@ -89,6 +89,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         report,
         last_change_at,
         stands,
+        held: state.held.why().map(|held| held.says().to_string()),
     })
 }
 
@@ -412,13 +413,52 @@ pub fn names_follow(state: &AppState, db: &rusqlite::Connection, before: &[Strin
     state.own_channels.written();
 }
 
+/// Turn sync off on a node whose first start on this version is not done
+/// (decision 2026-10-04 §10.1): a request that turns sync off is never
+/// refused. The directory goes, and is kept as the last one.
+///
+/// Nothing else is touched, since the step is still to read it: the
+/// stored report, which a notice of what stopped is made from, and what
+/// folders had agreed, which the step forgets. A scope that was on by
+/// being absent with a directory set is written down as on first, so
+/// that the step still finds it so once the directory is gone.
+fn turn_off_while_held(control: &SyncControl, db: &rusqlite::Connection) -> Result<(), ApiError> {
+    control.changed(db);
+    if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
+        if meta::get(db, meta::SYNC_CLAUDE_ALL)?.is_none() {
+            meta::set(db, meta::SYNC_CLAUDE_ALL, "on")?;
+        }
+        meta::set(db, meta::SYNC_CLAUDE_LAST_DIR, &dir)?;
+    }
+    meta::remove(db, meta::SYNC_CLAUDE_DIR)?;
+    tracing::info!("sync: turned off, while the first start on this version is not done");
+    Ok(())
+}
+
 /// Turn the adapter on or off, and set what it syncs (see [`set_claude`]).
+///
+/// A node that is held up takes this only where it turns sync off
+/// ([`turn_off_while_held`]), and refuses the rest with why it is held
+/// up.
 pub async fn claude(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<SyncClaudeRequest>,
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
+    if let Some(held) = state.held.why() {
+        if body.enabled {
+            return Err(ApiError::Held(held.says().to_string()));
+        }
+        {
+            let db = state
+                .db
+                .lock()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            turn_off_while_held(&state.sync_control, &db)?;
+        }
+        return Ok(HttpResponse::Ok().json(status(&state)?));
+    }
     let home = home_dir().ok();
     {
         let db = state

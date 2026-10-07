@@ -1502,8 +1502,16 @@ pub(crate) async fn status_with(
         })
         .unwrap_or_default();
 
+    // Why the node is held up, where it is (decision 2026-10-04 §10.1):
+    // by what, and why in words for a person.
+    let held = state
+        .held
+        .why()
+        .map(|held| serde_json::json!({ "by": held.kind(), "why": held.says() }));
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
+        "held": held,
         // So that a command can tell when the node is not the version it is.
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime as u64,

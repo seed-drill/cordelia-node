@@ -473,4 +473,8 @@ pub struct SyncStatusResponse {
     /// (`fork`, `removed`, `not_listed`, `not_opened`). Only a device
     /// that has applied a statement publishes anything.
     pub stands: &'static str,
+    /// Why the node is held up, where it is (decision 2026-10-04 §10.1):
+    /// it runs no cycle and no pass until it is so no longer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
 }

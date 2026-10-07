@@ -308,3 +308,137 @@ fn a_relay_that_is_started_on_a_devices_database_removes_the_guard() {
         "{log}"
     );
 }
+
+/// What a node says of itself to `cordelia status --json`.
+fn status_of(node: &Node) -> serde_json::Value {
+    serde_json::from_str(&node.cli(&["status", "--json"])).unwrap()
+}
+
+/// Until its first start on this version has succeeded a node stays up,
+/// runs no cycle and no pass, refuses every request that changes
+/// anything except one that turns sync off, and says why in its status
+/// (decision 2026-10-04 §10.1). It tries again each time a cycle would
+/// have run: once the copy can be made, it is made and the step taken,
+/// with no restart.
+#[cfg(unix)]
+#[test]
+fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
+    use std::os::unix::fs::PermissionsExt;
+    let relay = relay_started();
+    let mut device = node("laptop", "personal", Some(relay.p2p));
+    let before = {
+        let conn = in_the_released_form(&device);
+        older_rows(&conn)
+    };
+    // What is left of a copy cannot be removed: a folder in it cannot be
+    // looked into.
+    let partial = format!("before-{VERSION}.partial");
+    let closed = device.data_dir().join(&partial).join("closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    std::fs::write(closed.join("a-file"), "x").unwrap();
+    let mode = |mode: u32| {
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(0o000);
+
+    device.start();
+    let all = [&relay, &device];
+    wait_for("device healthy", &all, 30, || healthy(&device));
+
+    // It stays up, and says why, with the room that the copy needs.
+    let status = status_of(&device);
+    assert_eq!(status["state"], "attention", "{status}");
+    assert_eq!(
+        status["summary"], "memory not syncing: the first start on this version is not done",
+        "{status}"
+    );
+    assert_eq!(status["held"]["by"], "first_start", "{status}");
+    let why = status["held"]["why"].as_str().unwrap().to_string();
+    assert!(
+        why.starts_with("the first start on this version is not done: the copy of the database"),
+        "{why}"
+    );
+    assert!(why.contains("bytes of room"), "{why}");
+    let said = device.cli(&["status"]);
+    assert!(said.contains(&format!("Held up:   {why}")), "{said}");
+    let line = device.cli(&["status", "--line"]);
+    assert!(
+        line.contains("the first start on this version is not done"),
+        "{line}"
+    );
+
+    // Nothing was changed: every older row and each key file is there,
+    // and there is no mark.
+    let unchanged = |device: &Node| {
+        let conn = database_of(device);
+        assert_eq!(older_rows(&conn), before);
+        assert_eq!(first_start::mark(&conn).unwrap(), None);
+        assert_eq!(
+            names_in(&device.data_dir().join("channel-keys")),
+            released::KEY_FILES
+        );
+        assert_eq!(copies_of(device), std::slice::from_ref(&partial));
+    };
+    unchanged(&device);
+
+    // A request that changes anything is refused, with why: a mapping,
+    // and sync turned on.
+    let other = device.home().join("work/other").display().to_string();
+    std::fs::create_dir_all(&other).unwrap();
+    let refused = device.refused(&["sync", "map", &other, "notes"]);
+    assert!(
+        refused.contains("the first start on this version is not done"),
+        "{refused}"
+    );
+    let dir = device.home().join(".claude").display().to_string();
+    let refused = device.refused(&["sync", "claude", "--dir", &dir]);
+    assert!(
+        refused.contains("the first start on this version is not done"),
+        "{refused}"
+    );
+    // No cycle has run: the stored report is the one the released
+    // version left, though a cycle would have run several times by now.
+    std::thread::sleep(std::time::Duration::from_secs(
+        2 * cordelia_sync::claude::CYCLE_SECS + 1,
+    ));
+    let sync = device.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(
+        sync["report"]["at"], "2026-10-05T09:12:44.512203817+00:00",
+        "{sync}"
+    );
+    assert_eq!(sync["enabled"], true, "{sync}");
+    unchanged(&device);
+    // And it has tried again, and said the reason once.
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(
+        log.matches("the first start on this version is not done")
+            .count(),
+        1,
+        "{log}"
+    );
+
+    // Turning sync off is taken.
+    let off = device.cli(&["sync", "off"]);
+    assert!(off.contains("Sync is off."), "{off}");
+    let sync = device.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(sync["enabled"], false, "{sync}");
+    assert_eq!(
+        sync["report"]["at"], "2026-10-05T09:12:44.512203817+00:00",
+        "{sync}"
+    );
+
+    // The copy can be made: the node makes its first start by itself.
+    mode(0o700);
+    wait_for("the node makes its first start", &all, 30, || {
+        status_of(&device)["held"].is_null().then_some(())
+    });
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+    let conn = database_of(&device);
+    let now = older_rows(&conn);
+    assert!(now.iter().all(|(_, rows)| *rows == 0), "{now:?}");
+    let mark = first_start::mark(&conn).unwrap().unwrap();
+    assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
+    assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
+    let status = status_of(&device);
+    assert_eq!(status["summary"], "memory sync off", "{status}");
+}

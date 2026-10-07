@@ -25,6 +25,11 @@ pub enum ApiError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// The node is held up, and takes no request that changes anything
+    /// (decision 2026-10-04 §10.1): it says why, in words for a person.
+    #[error("{0}")]
+    Held(String),
 }
 
 #[derive(Serialize)]
@@ -87,6 +92,12 @@ impl ResponseError for ApiError {
             Self::Internal(_) => (
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
+                None,
+                None,
+            ),
+            Self::Held(_) => (
+                actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                "held_up",
                 None,
                 None,
             ),

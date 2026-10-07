@@ -8,12 +8,61 @@
 //! before its sync loop and its first pass are started. A relay and a
 //! bootnode make none.
 //!
-//! Where it is not done the node is held up, with why
-//! ([`crate::state::HeldUp`]), and it is tried again.
+//! **Until it has succeeded the node is held up**
+//! ([`crate::state::HeldUp`]): it runs no cycle and no pass, and refuses
+//! every request that changes anything, except one that turns sync off
+//! ([`refuse_while_held`]). It answers status, which says why. It does
+//! not stop: under a service that restarts what stops, stopping would be
+//! a loop, and a stopped node can say nothing. It is tried again each
+//! time a cycle would have run.
+
+use actix_web::HttpRequest;
 
 use cordelia_storage::first_start::{self, Done};
 
+use crate::error::ApiError;
 use crate::state::{AppState, Held};
+
+/// The requests that a node whose first start is not done still answers,
+/// beside every `GET`: each reads, and writes nothing. They are what
+/// `cordelia status`, `cordelia sync status`, `cordelia devices` and
+/// `cordelia history` ask, and the local API's two that read.
+pub const ANSWERED_WHILE_HELD: [&str; 6] = [
+    "/api/v1/sync/status",
+    "/api/v1/devices/list",
+    "/api/v1/history/list",
+    "/api/v1/history/show",
+    "/api/v1/channels/entries",
+    "/api/v1/channels/identity",
+];
+
+/// The request that turns sync on or off. A node whose first start is
+/// not done takes it where it turns sync off, and its handler refuses
+/// the rest ([`crate::sync::claude`]).
+pub const SYNC_SETTING: &str = "/api/v1/sync/claude";
+
+/// Refuse a request that a node which is held up does not answer, with
+/// why it is held up (decision 2026-10-04 §10.1). Every handler that
+/// checks the node's token comes through here, so a route that is added
+/// is refused until it is listed.
+///
+/// Held up for its first start, a node answers every `GET`, the requests
+/// that only read ([`ANSWERED_WHILE_HELD`]), and the one that may turn
+/// sync off ([`SYNC_SETTING`]).
+pub fn refuse_while_held(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
+    let Some(held) = state.held.why() else {
+        return Ok(());
+    };
+    let path = req.path();
+    let answered = match &held {
+        _ if req.method() == actix_web::http::Method::GET => true,
+        Held::FirstStart(_) => ANSWERED_WHILE_HELD.contains(&path) || path == SYNC_SETTING,
+    };
+    match answered {
+        true => Ok(()),
+        false => Err(ApiError::Held(held.says().to_string())),
+    }
+}
 
 /// What is said of a first start that is not done: why, that nothing was
 /// changed, and that the node tries again by itself.

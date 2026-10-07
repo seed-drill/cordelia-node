@@ -408,3 +408,172 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
     let (status, seen) = asks!(app, "/api/v1/devices/list", json!({}));
     assert_eq!((status, &seen["state"]), (200, &json!("applied")), "{seen}");
 }
+
+/// Every request that a personal node's API takes with a body, each with
+/// one that it reads.
+fn requests_of_a_device() -> Vec<(&'static str, Value)> {
+    let mut all = routes();
+    all.extend([
+        ("/api/v1/devices/leave/back", json!({})),
+        (
+            "/api/v1/channels/publish",
+            json!({ "channel": "lab", "key": "notes.md", "content": "a text" }),
+        ),
+        ("/api/v1/channels/entries", json!({ "channel": "lab" })),
+        (
+            "/api/v1/channels/delete-key",
+            json!({ "channel": "lab", "key": "notes.md" }),
+        ),
+        ("/api/v1/channels/identity", json!({})),
+        ("/api/v1/sync/claude", json!({ "enabled": true })),
+        (
+            "/api/v1/sync/map",
+            json!({ "folder": "/home/sam/notes", "name": "lab" }),
+        ),
+        ("/api/v1/sync/unmap", json!({ "folder": "/home/sam/notes" })),
+        ("/api/v1/sync/status", json!({})),
+        ("/api/v1/history/list", json!({})),
+        ("/api/v1/history/show", json!({ "id": "00000000000abc" })),
+        (
+            "/api/v1/history/restore",
+            json!({ "ids": ["00000000000abc"] }),
+        ),
+        ("/api/v1/history/drop", json!({ "all": true })),
+    ]);
+    all
+}
+
+/// Until its first start on this version has succeeded, a node refuses
+/// every request that changes anything, with why it is held up, except
+/// one that turns sync off; it answers what only reads, and its status
+/// says why (decision 2026-10-04 §10.1). Held up no longer, it takes
+/// them again.
+#[actix_web::test]
+async fn test_a_node_that_is_held_up_refuses_what_changes_anything_but_turning_sync_off() {
+    use cordelia_api::first_start::{ANSWERED_WHILE_HELD, SYNC_SETTING};
+    use cordelia_api::state::Held;
+    use cordelia_storage::meta;
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let get = |path: &'static str| {
+        test::TestRequest::get()
+            .uri(path)
+            .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+            .to_request()
+    };
+    // Sync is on, with a stored report and a scope that is on by being
+    // absent, as an install from before mappings has it.
+    let stored = |key: &str| meta::get(&state.db.lock().unwrap(), key).unwrap();
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_REPORT, "{\"folders\":[]}").unwrap();
+    }
+    let everything = |state: &AppState| -> Vec<String> {
+        let db = state.db.lock().unwrap();
+        let mut held: Vec<String> = db
+            .prepare("SELECT key || '=' || value FROM node_meta ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for table in ["person", "person_typed_keys", "entries", "sync_files"] {
+            let rows: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            held.push(format!("{table}: {rows}"));
+        }
+        held
+    };
+
+    let why = "the first start on this version is not done: no room for the copy";
+    state.held.hold(Held::FirstStart(why.into()));
+    let before = everything(&state);
+    let generation = state.sync_control.generation();
+    let mut refused = Vec::new();
+    for (path, body) in requests_of_a_device() {
+        let (status, said) = asks!(app, path, body);
+        if ANSWERED_WHILE_HELD.contains(&path) {
+            assert_ne!(status, 503, "{path}: {said}");
+            continue;
+        }
+        assert_eq!(status, 503, "{path}: {said}");
+        assert_eq!(said["error"]["code"], "held_up", "{path}: {said}");
+        assert_eq!(said["error"]["message"], why, "{path}: {said}");
+        refused.push(path);
+    }
+    // Each request that changes anything is one of those refused: sync
+    // turned on among them, and nothing was written or woken by any.
+    assert_eq!(
+        refused.len(),
+        requests_of_a_device().len() - ANSWERED_WHILE_HELD.len()
+    );
+    assert!(refused.contains(&SYNC_SETTING));
+    assert_eq!(everything(&state), before);
+    assert_eq!(state.sync_control.generation(), generation);
+    assert_eq!(woken(&state).await, (false, false));
+
+    // What reads is answered, and the status says why.
+    for path in ["/api/v1/health", "/api/v1/peers", "/api/v1/metrics"] {
+        let answer = test::call_service(&app, get(path)).await;
+        assert_eq!(answer.status().as_u16(), 200, "{path}");
+    }
+    let answer = test::call_service(&app, get("/api/v1/status")).await;
+    assert_eq!(answer.status().as_u16(), 200);
+    let status: Value = test::read_body_json(answer).await;
+    assert_eq!(
+        status["held"],
+        json!({ "by": "first_start", "why": why }),
+        "{status}"
+    );
+    let (code, sync) = asks!(app, "/api/v1/sync/status", json!({}));
+    assert_eq!(
+        (code, &sync["held"], &sync["enabled"]),
+        (200, &json!(why), &json!(true))
+    );
+    let (code, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!((code, &seen["state"]), (200, &json!("no_phrase")), "{seen}");
+
+    // Turning sync off is taken: the directory goes, and is kept as the
+    // last one. The stored report stays, for the step to read, and the
+    // scope that was on by being absent is written down as on.
+    let (code, sync) = asks!(app, SYNC_SETTING, json!({ "enabled": false }));
+    assert_eq!((code, &sync["enabled"]), (200, &json!(false)), "{sync}");
+    assert_eq!(stored(meta::SYNC_CLAUDE_DIR), None);
+    assert_eq!(
+        stored(meta::SYNC_CLAUDE_LAST_DIR).as_deref(),
+        Some("/home/sam/.claude")
+    );
+    assert_eq!(stored(meta::SYNC_CLAUDE_ALL).as_deref(), Some("on"));
+    assert_eq!(
+        stored(meta::SYNC_CLAUDE_REPORT).as_deref(),
+        Some("{\"folders\":[]}")
+    );
+    assert!(state.sync_control.generation() > generation);
+    // Again, with sync off already: taken, and nothing more is written.
+    let off = everything(&state);
+    let (code, _) = asks!(app, SYNC_SETTING, json!({ "enabled": false }));
+    assert_eq!(code, 200);
+    assert_eq!(everything(&state), off);
+
+    // Held up no longer: a request that changes something is taken.
+    state.held.release();
+    let (code, sync) = asks!(
+        app,
+        SYNC_SETTING,
+        json!({ "enabled": true, "dir": "/home/sam/.claude" })
+    );
+    assert_eq!((code, &sync["enabled"]), (200, &json!(true)), "{sync}");
+    assert_eq!(sync["held"], Value::Null);
+    let answer = test::call_service(&app, get("/api/v1/status")).await;
+    let status: Value = test::read_body_json(answer).await;
+    assert_eq!(status["held"], Value::Null);
+}

@@ -327,7 +327,14 @@ impl DeviceEntries {
     /// whatever state the device is in ([`Self::asks_for_hand_overs`]).
     /// A whole pass is counted as it begins and as it ends, for a
     /// command that waits for one ([`cordelia_api::state::OwnChannels`]).
+    ///
+    /// **A node that is held up makes no pass** (decision 2026-10-04
+    /// §10.1): nothing is shown, asked, sent or taken, of either kind of
+    /// pass, until it is held up no longer.
     pub async fn pass(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
+        if self.state.held.why().is_some() {
+            return;
+        }
         let whole = kind == Pass::Whole;
         let number = whole.then(|| self.state.own_channels.whole_pass_begins());
         let links: Vec<&Link> = relays

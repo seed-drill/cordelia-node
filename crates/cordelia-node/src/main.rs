@@ -483,6 +483,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         if let Some(why) = &status.not_asked {
             details.push(format!("Not asked: {why}"));
         }
+        if let Some(why) = status.held() {
+            details.push(format!("Held up: {why}"));
+        }
         if status.facts.running {
             let relays = status.facts.peers_hot;
             details.push(match relays {
@@ -555,6 +558,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             out["not_asked"] = why.clone().into();
         }
         if let Some(live) = &status.live {
+            // Why the node is held up, where it is: by what, and why.
+            if !live["held"].is_null() {
+                out["held"] = live["held"].clone();
+            }
             // The node's own version: `version` above is this command's.
             out["node_version"] = live["version"].clone();
             out["uptime_secs"] = live["uptime_secs"].clone();
@@ -709,6 +716,11 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 n("peers_warm")
             );
             println!("  Sync errors: {}", n("sync_errors"));
+            // A node that is held up says why (decision 2026-10-04
+            // §10.1).
+            if let Some(why) = status.held() {
+                println!("  Held up:   {why}");
+            }
             if config.network.role == "personal" {
                 println!("  Memory:    {summary}");
                 for c in &status.facts.conflicts {
@@ -754,6 +766,14 @@ struct GatheredStatus {
     not_asked: Option<String>,
 }
 
+impl GatheredStatus {
+    /// Why the running node is held up, in its own words, where it is
+    /// (decision 2026-10-04 §10.1).
+    fn held(&self) -> Option<&str> {
+        self.live.as_ref()?["held"]["why"].as_str()
+    }
+}
+
 /// Collect the facts for [`indicator::derive`] without failing: a missing
 /// config, an uninitialised device or a stopped node are states to report,
 /// not errors. Status bars call this often, so the node gets a short
@@ -788,6 +808,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         return out;
     };
     out.facts.running = true;
+    out.facts.held = live["held"]["by"].as_str().map(str::to_string);
     out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
     out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
     out.facts.outbox_refused = live["outbox_refused"]
@@ -1402,10 +1423,26 @@ impl Every {
     }
 }
 
+/// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
+/// node whose first start on this version is not done runs none: it
+/// tries the first start again, each time a cycle would have run, and
+/// goes on only once that is done.
+fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
+    use cordelia_api::state::Held;
+    match state.held.why() {
+        None => true,
+        Some(Held::FirstStart(_)) => {
+            cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"))
+        }
+    }
+}
+
 /// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
 /// adapter cycle (if sync is on) off the async runtime, and store its
 /// report for `cordelia sync status`. Once in every
 /// `HISTORY_SWEEP_INTERVAL_SECS` it sweeps local history first.
+///
+/// A node that is held up runs no cycle ([`may_cycle`]).
 async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
     use cordelia_storage::meta;
     use cordelia_sync::claude::ClaudeAdapter;
@@ -1444,6 +1481,9 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             // either way.
             if sweep {
                 state.history.sweep(chrono::Utc::now());
+            }
+            if !may_cycle(&state) {
+                return false;
             }
             let (dir, generation) = match state.db.lock() {
                 Ok(db) => (
