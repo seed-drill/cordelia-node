@@ -15,6 +15,10 @@
 //! not stop: under a service that restarts what stops, stopping would be
 //! a loop, and a stopped node can say nothing. It is tried again each
 //! time a cycle would have run.
+//!
+//! **A node whose database is from a later version is held up too,** for
+//! as long as it runs: it changes nothing, so it takes no request but
+//! those of its status, and says so there.
 
 use actix_web::HttpRequest;
 
@@ -46,9 +50,13 @@ pub const SYNC_SETTING: &str = "/api/v1/sync/claude";
 /// checks the node's token comes through here, so a route that is added
 /// is refused until it is listed.
 ///
-/// Held up for its first start, a node answers every `GET`, the requests
-/// that only read ([`ANSWERED_WHILE_HELD`]), and the one that may turn
-/// sync off ([`SYNC_SETTING`]).
+/// - Held up for its first start, a node answers every `GET`, the
+///   requests that only read ([`ANSWERED_WHILE_HELD`]), and the one that
+///   may turn sync off ([`SYNC_SETTING`]).
+/// - Held up by a database from a later version, it answers every `GET`
+///   and nothing else. What it would read is not its database, and it
+///   writes nothing there: turning sync off is refused too, since the
+///   setting is in that database.
 pub fn refuse_while_held(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     let Some(held) = state.held.why() else {
         return Ok(());
@@ -57,6 +65,7 @@ pub fn refuse_while_held(req: &HttpRequest, state: &AppState) -> Result<(), ApiE
     let answered = match &held {
         _ if req.method() == actix_web::http::Method::GET => true,
         Held::FirstStart(_) => ANSWERED_WHILE_HELD.contains(&path) || path == SYNC_SETTING,
+        Held::LaterDatabase(_) => false,
     };
     match answered {
         true => Ok(()),
@@ -78,11 +87,15 @@ fn not_done(why: &first_start::NotDone) -> String {
 /// whether it is done.
 ///
 /// Where it is done the node is held up no longer. Where it is not, the
-/// node is held up, with why.
+/// node is held up, with why. A node that is held up by a database from
+/// a later version stays so: nothing is tried on that database.
 ///
 /// It is made under one hold of the database's lock, the copy included:
 /// nothing else of the node reads or writes meanwhile.
 pub fn take(state: &AppState, version: &str) -> bool {
+    if matches!(state.held.why(), Some(Held::LaterDatabase(_))) {
+        return false;
+    }
     let started = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         first_start::first_start(&db, &state.home_dir, version, chrono::Utc::now())

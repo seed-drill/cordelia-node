@@ -697,7 +697,22 @@ fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), Stor
 }
 
 /// Initialise the database: set pragmas and run pending migrations.
+///
+/// **A database from a later version is refused** (decision 2026-10-04
+/// §10.1): one whose version is above this schema's was written by a
+/// later version of the program, which may keep in it what this one
+/// would not know to keep. The version is read before anything else is
+/// done, and nothing is changed: no pragma is set, and no step is run.
+/// Whoever opens the database is told both versions
+/// ([`StorageError::LaterVersion`]).
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found > SCHEMA_VERSION {
+        return Err(StorageError::LaterVersion {
+            found,
+            own: SCHEMA_VERSION,
+        });
+    }
     run_steps(conn, SCHEMA_VERSION)
 }
 
@@ -940,6 +955,68 @@ mod tests {
         // A database that is further on is left where it is.
         init_db_as_released(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
+    }
+
+    /// A database from a later version is refused, by whoever opens it,
+    /// with both versions named, and nothing of it is changed (decision
+    /// 2026-10-04 §10.1): not its version, not a row, not the way it is
+    /// journalled, not a byte of its file. One at this schema's version,
+    /// or at an earlier one, is opened as before.
+    #[test]
+    fn test_a_database_from_a_later_version_is_refused_and_not_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let later = SCHEMA_VERSION + 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE of_a_later_version (what TEXT);
+                 INSERT INTO of_a_later_version VALUES ('kept');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", later).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let refused = match crate::db::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a database from a later version was opened"),
+        };
+        assert!(
+            matches!(refused, StorageError::LaterVersion { found, own }
+                if found == later && own == SCHEMA_VERSION),
+            "{refused:?}"
+        );
+        let says = refused.to_string();
+        assert!(
+            says.contains(&format!("schema version {later}"))
+                && says.contains(&format!("schema version {SCHEMA_VERSION} "))
+                && says.contains("nothing was changed"),
+            "{says}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        assert!(matches!(
+            init_db(&conn),
+            Err(StorageError::LaterVersion { .. })
+        ));
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let journal: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let tables: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version, journal.as_str(), tables), (later, "delete", 1));
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // At this schema's version: opened, and nothing refused.
+        let own = dir.path().join("own.db");
+        drop(crate::db::open(&own).unwrap());
+        assert!(crate::db::open(&own).is_ok());
     }
 
     #[test]

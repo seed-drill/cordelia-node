@@ -442,3 +442,158 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     let status = status_of(&device);
     assert_eq!(status["summary"], "memory sync off", "{status}");
 }
+
+/// Leave `node`'s database as a later version of the program would: with
+/// a table that this version does not know, at a schema version above
+/// this one's. Returns that version, and the bytes of the file.
+fn as_a_later_version_left_it(node: &Node) -> (u32, Vec<u8>) {
+    let later = cordelia_storage::schema::SCHEMA_VERSION + 3;
+    let path = node.data_dir().join("cordelia.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE of_a_later_version (what TEXT);
+             INSERT INTO of_a_later_version VALUES ('kept');",
+        )
+        .unwrap();
+        cordelia_storage::meta::set(&conn, cordelia_storage::meta::SYNC_CLAUDE_DIR, "/a/dir")
+            .unwrap();
+        conn.pragma_update(None, "user_version", later).unwrap();
+    }
+    (later, std::fs::read(&path).unwrap())
+}
+
+/// A database from a later version is refused by the node, which stays
+/// up and says so, and by each command that opens the database itself
+/// (decision 2026-10-04 §10.1): both versions are named, and nothing is
+/// changed. A node of a role that carries what others hand it does not
+/// start without its database: it says the same, and stops.
+#[test]
+fn a_database_from_a_later_version_is_refused_by_the_node_and_by_each_command() {
+    let mut device = node("laptop", "personal", None);
+    let (later, database) = as_a_later_version_left_it(&device);
+    let own = cordelia_storage::schema::SCHEMA_VERSION;
+    let named = |said: &str| {
+        for words in [
+            format!(
+                "is from a later version of Cordelia than this one: it is at schema version {later}"
+            ),
+            format!("this is Cordelia {VERSION}, which knows schema version {own} and none after"),
+            "Nothing was changed.".to_string(),
+        ] {
+            assert!(said.contains(&words), "{words:?} is not in:\n{said}");
+        }
+    };
+    let unchanged = |device: &Node| {
+        assert_eq!(
+            std::fs::read(device.data_dir().join("cordelia.db")).unwrap(),
+            database
+        );
+        assert!(copies_of(device).is_empty());
+    };
+    let token = device.token();
+
+    // Each command that opens the database itself.
+    named(&device.refused(&["channels"]));
+    named(&device.refused(&["stats"]));
+    named(&device.refused(&["init", "--force"]));
+    assert_eq!(device.token(), token);
+    // `cordelia status` says so where it would have read the database,
+    // and goes on.
+    let said = device.cli(&["status"]);
+    named(&said);
+    assert!(said.contains("Not read:"), "{said}");
+    assert!(said.contains("Running:   no"), "{said}");
+    unchanged(&device);
+
+    // The node stays up, and says so. It takes no request but those of
+    // its status: turning sync off is refused too.
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    let status = status_of(&device);
+    assert_eq!(status["state"], "attention", "{status}");
+    assert_eq!(
+        status["summary"], "memory not syncing: the database is from a later version",
+        "{status}"
+    );
+    assert_eq!(status["held"]["by"], "later_database", "{status}");
+    named(status["held"]["why"].as_str().unwrap());
+    let said = device.cli(&["status"]);
+    assert!(said.contains("Held up:   the database at"), "{said}");
+    for refused in [
+        &["sync", "off"][..],
+        &["sync", "claude"],
+        &["devices"],
+        &["sync", "status"],
+    ] {
+        named(&device.refused(refused));
+    }
+    // A cycle would have run by now: none has, and nothing was tried.
+    std::thread::sleep(std::time::Duration::from_secs(
+        cordelia_sync::claude::CYCLE_SECS + 1,
+    ));
+    assert_eq!(status_of(&device)["held"]["by"], "later_database");
+    device.stop();
+    unchanged(&device);
+
+    // A relay does not start on one: it says why, and stops.
+    let mut relay = node("relay", "relay", None);
+    let (_, database) = as_a_later_version_left_it(&relay);
+    relay.start();
+    let mut child = relay.child.take().unwrap();
+    let began = std::time::Instant::now();
+    let ended = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if began.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("the relay went on:\n{}", relay.log_tail());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(!ended.success());
+    named(&std::fs::read_to_string(relay.log()).unwrap());
+    assert_eq!(
+        std::fs::read(relay.data_dir().join("cordelia.db")).unwrap(),
+        database
+    );
+}
+
+/// `cordelia swarm-init` opens the database before it writes anything:
+/// one from a later version is refused, and no key and no token is
+/// written (decision 2026-10-04 §10.1).
+#[test]
+fn a_swarm_node_is_not_set_up_over_a_database_from_a_later_version() {
+    let lead = node("lead", "personal", None);
+    let child = node("child", "personal", None);
+    let (later, database) = as_a_later_version_left_it(&child);
+    // A folder that holds a database and no key yet.
+    for file in ["identity.key", "node-token"] {
+        std::fs::remove_file(child.data_dir().join(file)).unwrap();
+    }
+    let lead_key = lead.data_dir().join("identity.key").display().to_string();
+    let out = child.command(&[
+        "swarm-init",
+        "--index",
+        "1",
+        "--lead-identity",
+        &lead_key,
+        "--lead-entity-id",
+        "lead",
+    ]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!("it is at schema version {later}")),
+        "{said}"
+    );
+    assert!(said.contains("Nothing was changed."), "{said}");
+    for file in ["identity.key", "node-token"] {
+        assert!(!child.data_dir().join(file).exists(), "{file}");
+    }
+    assert_eq!(
+        std::fs::read(child.data_dir().join("cordelia.db")).unwrap(),
+        database
+    );
+}

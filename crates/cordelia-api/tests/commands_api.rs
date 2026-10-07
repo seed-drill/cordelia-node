@@ -577,3 +577,47 @@ async fn test_a_node_that_is_held_up_refuses_what_changes_anything_but_turning_s
     let status: Value = test::read_body_json(answer).await;
     assert_eq!(status["held"], Value::Null);
 }
+
+/// A node whose database is from a later version than its own changes
+/// nothing (decision 2026-10-04 §10.1): it refuses every request but
+/// those of its status, turning sync off among them, since the setting
+/// is in that database; and its status says so.
+#[actix_web::test]
+async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_its_status() {
+    use cordelia_api::state::Held;
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let why = "the database is from a later version of Cordelia than this one";
+    state.held.hold(Held::LaterDatabase(why.into()));
+    let generation = state.sync_control.generation();
+    let mut asked = requests_of_a_device();
+    asked.push(("/api/v1/sync/claude", json!({ "enabled": false })));
+    for (path, body) in asked {
+        let (status, said) = asks!(app, path, body);
+        assert_eq!(status, 503, "{path}: {said}");
+        assert_eq!(said["error"]["message"], why, "{path}: {said}");
+    }
+    assert_eq!(state.sync_control.generation(), generation);
+    assert_eq!(woken(&state).await, (false, false));
+    // The first start is not tried on it.
+    assert!(!cordelia_api::first_start::take(&state, "0.2.0-test"));
+    assert_eq!(state.held.why(), Some(Held::LaterDatabase(why.into())));
+
+    let get = test::TestRequest::get()
+        .uri("/api/v1/status")
+        .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+        .to_request();
+    let answer = test::call_service(&app, get).await;
+    assert_eq!(answer.status().as_u16(), 200);
+    let status: Value = test::read_body_json(answer).await;
+    assert_eq!(
+        status["held"],
+        json!({ "by": "later_database", "why": why }),
+        "{status}"
+    );
+}

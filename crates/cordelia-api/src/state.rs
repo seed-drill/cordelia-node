@@ -84,13 +84,18 @@ pub enum Held {
     /// not be made, or the step failed. It is tried again each time a
     /// cycle would have run. It says why, in words for a person.
     FirstStart(String),
+    /// Its database is from a later version than its own: the node runs
+    /// over a database of its own in memory, and nothing of the one on
+    /// disk is read or changed, for as long as the node runs. It says
+    /// so, with both versions.
+    LaterDatabase(String),
 }
 
 impl Held {
     /// Why the node is held up, in words for a person.
     pub fn says(&self) -> &str {
         match self {
-            Held::FirstStart(why) => why,
+            Held::FirstStart(why) | Held::LaterDatabase(why) => why,
         }
     }
 
@@ -98,6 +103,7 @@ impl Held {
     pub fn kind(&self) -> &'static str {
         match self {
             Held::FirstStart(_) => "first_start",
+            Held::LaterDatabase(_) => "later_database",
         }
     }
 }

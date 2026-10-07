@@ -53,7 +53,8 @@ pub struct Facts {
     pub sync_all: bool,
     /// What the node is held up by, as it says it, where it is (decision
     /// 2026-10-04 §10.1): `first_start` while its first start on this
-    /// version is not done. It runs no cycle and no pass until then.
+    /// version is not done, or `later_database` where its database is
+    /// from a later version. It runs no cycle and no pass meanwhile.
     pub held: Option<String>,
 }
 
@@ -120,6 +121,12 @@ pub fn derive(f: &Facts) -> (State, String) {
             return (
                 Attention,
                 "memory not syncing: the first start on this version is not done".into(),
+            );
+        }
+        Some("later_database") => {
+            return (
+                Attention,
+                "memory not syncing: the database is from a later version".into(),
             );
         }
         Some(_) => return (Attention, "memory not syncing: the node is held up".into()),
@@ -466,6 +473,13 @@ mod tests {
         assert_eq!(
             held("first_start", &|f| f.errors = vec!["x".into()]),
             first_start
+        );
+        assert_eq!(
+            held("later_database", &|f| f.sync_enabled = false),
+            (
+                State::Attention,
+                "memory not syncing: the database is from a later version".into()
+            )
         );
         assert_eq!(
             held("something that a later node says", &|_| {}),

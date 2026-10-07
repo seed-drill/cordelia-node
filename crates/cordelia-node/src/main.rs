@@ -338,6 +338,35 @@ fn main() -> anyhow::Result<()> {
 
 // ── cordelia init ──────────────────────────────────────────────────
 
+/// What is said of a database from a later version than this one
+/// (decision 2026-10-04 §10.1): where it is, both versions, that nothing
+/// was changed, and the way on.
+fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> String {
+    format!(
+        "the database at {} is from a later version of Cordelia than this one: it is at schema \
+         version {found}, and this is Cordelia {}, which knows schema version {own} and none \
+         after. Nothing was changed. Install the later version again; or, to go back to this \
+         one, put back the copy that the later version made, as its release notes say.",
+        db_path.display(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// Open the node's database, as a command that opens it itself does, with
+/// the schema's steps run. **A database from a later version is refused**
+/// (decision 2026-10-04 §10.1): the command names both versions, and
+/// changes nothing.
+fn open_database(db_path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+    use cordelia_storage::StorageError;
+    match cordelia_storage::db::open(db_path) {
+        Ok(conn) => Ok(conn),
+        Err(StorageError::LaterVersion { found, own }) => {
+            anyhow::bail!("{}", from_a_later_version(db_path, found, own))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn cmd_init(
     config_path: &str,
     name: Option<String>,
@@ -349,6 +378,14 @@ fn cmd_init(
     let mut config = Config::load(&config_file).unwrap_or_default();
     config.apply_env_overrides();
     let data_dir = config.data_dir();
+
+    // A database that this command would open is opened before anything
+    // is written: one from a later version is refused, and nothing is
+    // changed, not the node's token either (decision 2026-10-04 §10.1).
+    let db_path = data_dir.join("cordelia.db");
+    if db_path.exists() && force {
+        drop(open_database(&db_path)?);
+    }
 
     // 1. Generate or load Ed25519 identity
     let identity_path = data_dir.join("identity.key");
@@ -395,10 +432,9 @@ fn cmd_init(
     };
 
     // 4. Create database
-    let db_path = data_dir.join("cordelia.db");
     if !db_path.exists() || force {
         println!("Creating database...");
-        let _conn = cordelia_storage::db::open(&db_path)?;
+        let _conn = open_database(&db_path)?;
         println!("  done.");
         #[cfg(unix)]
         {
@@ -672,8 +708,19 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
 
     // DB stats
     let db_path = data_dir.join("cordelia.db");
-    if db_path.exists() {
-        let conn = cordelia_storage::db::open(&db_path)?;
+    // A database from a later version is not opened: the status says so,
+    // and goes on to what the node says of itself (decision 2026-10-04
+    // §10.1).
+    let opened = match db_path.exists() {
+        true => Some(open_database(&db_path)),
+        false => None,
+    };
+    if let Some(Err(why)) = &opened {
+        println!();
+        println!("Storage:");
+        println!("  Not read:  {why}");
+    }
+    if let Some(Ok(conn)) = opened {
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         println!();
@@ -911,9 +958,25 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let api_listener = std::net::TcpListener::bind(&listen_addr)
         .map_err(|e| anyhow::anyhow!("the node's API cannot listen at {listen_addr}: {e}"))?;
 
-    // Open database
+    // Open database. One from a later version is refused (decision
+    // 2026-10-04 §10.1). A personal node then stays up, over a database
+    // of its own in memory, and says so in its status: nothing of the
+    // one on disk is read or changed, and under a service that restarts
+    // what stops, stopping would be a loop. A node of any other role
+    // carries what other nodes hand it, and does not start without its
+    // database: it says why, and stops.
     let db_path = data_dir.join("cordelia.db");
-    let conn = cordelia_storage::db::open(&db_path)?;
+    let (conn, later) = match cordelia_storage::db::open(&db_path) {
+        Ok(conn) => (conn, None),
+        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
+            let why = from_a_later_version(&db_path, found, own);
+            if config.network.role != "personal" {
+                anyhow::bail!("{why}");
+            }
+            (cordelia_storage::db::open_in_memory()?, Some(why))
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Set up logging
     init_tracing(&config.logging.level);
@@ -1020,14 +1083,26 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // before anything else is written. A relay and a bootnode make no
     // copy and take no step: their databases are stepped as any version
     // steps them, at the opening.
-    if personal {
-        cordelia_api::first_start::take(&state, version);
+    //
+    // A node whose database is from a later version makes none: it is
+    // held up for as long as it runs, and touches nothing.
+    match &later {
+        Some(why) => {
+            tracing::error!("{why}");
+            state
+                .held
+                .hold(cordelia_api::state::Held::LaterDatabase(why.clone()));
+        }
+        None if personal => {
+            cordelia_api::first_start::take(&state, version);
+        }
+        None => {}
     }
 
     // A personal node keeps local history of what sync replaces. It holds
     // no channel of the older kind: no inbox is made for it, and nothing
     // of that kind is read (decision 2026-10-04 §10).
-    if personal {
+    if personal && later.is_none() {
         start_history(&state, &config.history);
     }
 
@@ -1426,7 +1501,8 @@ impl Every {
 /// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
 /// node whose first start on this version is not done runs none: it
 /// tries the first start again, each time a cycle would have run, and
-/// goes on only once that is done.
+/// goes on only once that is done. A node whose database is from a later
+/// version runs none for as long as it runs.
 fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
     use cordelia_api::state::Held;
     match state.held.why() {
@@ -1434,6 +1510,8 @@ fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
         Some(Held::FirstStart(_)) => {
             cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"))
         }
+        // Nothing is tried on a database from a later version.
+        Some(Held::LaterDatabase(_)) => false,
     }
 }
 
@@ -1664,7 +1742,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
-    let conn = cordelia_storage::db::open(&db_path)?;
+    let conn = open_database(&db_path)?;
 
     let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
 
@@ -1710,7 +1788,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
-    let conn = cordelia_storage::db::open(&db_path)?;
+    let conn = open_database(&db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?.len();
@@ -1809,6 +1887,11 @@ fn cmd_swarm_init(
             identity_path.display()
         );
     }
+    // The database is opened before anything is written: one from a
+    // later version is refused, and nothing is changed (decision
+    // 2026-10-04 §10.1).
+    let db_path = data_dir.join("cordelia.db");
+    let conn = open_database(&db_path)?;
     std::fs::write(&identity_path, child.seed())?;
     #[cfg(unix)]
     {
@@ -1826,10 +1909,6 @@ fn cmd_swarm_init(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
     }
-
-    // Create database
-    let db_path = data_dir.join("cordelia.db");
-    let conn = cordelia_storage::db::open(&db_path)?;
 
     // Create channel-keys directory
     std::fs::create_dir_all(data_dir.join("channel-keys"))?;
