@@ -1699,6 +1699,62 @@ mod tests {
         );
     }
 
+    /// The report that these tests store is in the bytes that the
+    /// released version writes ([`released::REPORT`]): what that version's
+    /// writer of JSON makes of a value, with each object's keys in order
+    /// and nothing between them, so that reading it and writing it again
+    /// gives the same bytes. It has the fields of that version's report
+    /// of a cycle and of a folder, and no other.
+    #[test]
+    fn the_stored_report_is_in_the_bytes_that_the_released_version_writes() {
+        let read: serde_json::Value = serde_json::from_str(released::REPORT).unwrap();
+        assert_eq!(read.to_string(), released::REPORT);
+        let keys = |of: &serde_json::Value| -> Vec<String> {
+            of.as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(
+            keys(&read),
+            [
+                "at",
+                "available",
+                "errors",
+                "excluded",
+                "folders",
+                "generation",
+                "unmapped",
+                "unsynced"
+            ]
+        );
+        let folders = read["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 3);
+        for folder in folders {
+            assert_eq!(
+                keys(folder),
+                [
+                    "channel_id",
+                    "conflict_files",
+                    "conflicts",
+                    "cwd",
+                    "error",
+                    "folder",
+                    "last_published_at",
+                    "last_pulled_at",
+                    "mapped",
+                    "project",
+                    "published",
+                    "pulled",
+                    "skipped",
+                    "too_large",
+                    "waiting"
+                ]
+            );
+        }
+        assert_eq!(keys(&read["unmapped"][0]), ["cwd", "folder", "name"]);
+        // The time is as that version writes one.
+        let at = read["at"].as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "{at}");
+    }
+
     /// A notice is one record for each time it was stored: a later one
     /// is added, and none is replaced. What is stored and cannot be read
     /// is as none.

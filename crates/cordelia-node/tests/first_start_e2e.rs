@@ -732,3 +732,208 @@ fn the_commands_of_the_older_kind_say_what_a_device_has_now_and_write_nothing() 
     }
     assert!(names_in(&fresh.data_dir().join("channel-keys")).is_empty());
 }
+
+/// What `node` holds under the name `lab`, by key: each key's revision,
+/// and its text.
+fn held_under_lab(node: &Node) -> Vec<(String, u64, Option<String>)> {
+    let answer = node.post(
+        "/api/v1/channels/entries",
+        serde_json::json!({ "channel": "lab" }),
+    );
+    let mut held: Vec<(String, u64, Option<String>)> = answer["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["key"].as_str().unwrap_or_default().to_string(),
+                entry["rev"].as_u64().unwrap_or(0),
+                entry["content"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+/// With real processes (decision 2026-10-04 §10, §10.1): a device in the
+/// released version's form is started on this version, a recovery phrase
+/// is made there, and its mapped folders are published as a first sync.
+/// What the folder holds is the first version of each file in the name's
+/// channel, at revision 1; the relay holds it; and nothing in the folder
+/// is changed.
+#[test]
+fn a_phrase_is_made_on_a_device_of_the_released_version_and_its_folders_are_published() {
+    let relay = relay_started();
+    let mut device = node("laptop", "personal", Some(relay.p2p));
+    drop(in_the_released_form(&device));
+    // The memory of the folder that is mapped, as the device has it.
+    let lab = lab_of(&device);
+    std::fs::create_dir_all(&lab).unwrap();
+    let memory = claude_folder(&device.home(), Path::new(&lab));
+    let files = [
+        ("MEMORY.md", "- [Notes](notes.md)\n"),
+        ("notes.md", "what the laptop knows\n"),
+    ];
+    for (name, text) in files {
+        std::fs::write(memory.join(name), text).unwrap();
+    }
+    let in_the_folder = |memory: &Path| -> Vec<(String, String)> {
+        let mut all: Vec<(String, String)> = names_in(memory)
+            .into_iter()
+            .filter(|name| !name.starts_with('.'))
+            .map(|name| {
+                let text = std::fs::read_to_string(memory.join(&name)).unwrap();
+                (name, text)
+            })
+            .collect();
+        all.sort();
+        all
+    };
+    let as_it_was = in_the_folder(&memory);
+    assert_eq!(as_it_was.len(), 2);
+
+    device.start();
+    let all = [&relay, &device];
+    wait_for("device healthy", &all, 30, || healthy(&device));
+    wait_for("device reaches its relay", &all, 60, || {
+        has_hot_peer(&device)
+    });
+    // Not added yet: sync is on and the folder is mapped, and nothing
+    // of it is published. The folder is as it was.
+    wait_for("a cycle has run", &all, 30, || {
+        let out = device.cli(&["sync", "status"]);
+        out.contains("Nothing is sent from this device")
+            .then_some(())
+    });
+    assert_eq!(rows(&database_of(&device), "entries"), 0);
+    assert_eq!(rows(&database_of(&relay), "entries"), 0);
+    assert_eq!(in_the_folder(&memory), as_it_was);
+
+    // The phrase is made on this device: its folders are published.
+    let words = makes_a_phrase(&device, "laptop");
+    assert_eq!(words.split_whitespace().count(), 12);
+    wait_for("the device has published its folder", &all, 90, || {
+        (held_under_lab(&device).len() == 2).then_some(())
+    });
+    let published = held_under_lab(&device);
+    let expected: Vec<(String, u64, Option<String>)> = files
+        .iter()
+        .map(|(name, text)| (name.to_string(), 1, Some(text.to_string())))
+        .collect();
+    assert_eq!(published, expected);
+    wait_for("the device has sent what it holds", &all, 90, || {
+        let seen = person_of(&device);
+        let relays = seen["relays"].as_array()?;
+        let sent = seen["names"]["to_go"].as_array()?.is_empty()
+            && seen["waiting"]
+                .as_array()?
+                .iter()
+                .all(|relay| relay["waits"] == 0);
+        (!relays.is_empty() && relays.iter().all(|relay| relay["holds_latest"] == true) && sent)
+            .then_some(())
+    });
+    // The relay holds the change, the device's words and the two files.
+    assert!(rows(&database_of(&relay), "entries") >= 4);
+    // Nothing in the folder was changed, and nothing was kept beside it.
+    assert_eq!(in_the_folder(&memory), as_it_was);
+    // The device says what it has now.
+    let status = wait_for("the device is synced", &all, 60, || {
+        let status = status_of(&device);
+        (status["state"] == "synced").then_some(status)
+    });
+    assert_eq!(status["sync"]["stands"], "applied", "{status}");
+    let channels = device.cli(&["channels"]);
+    assert!(
+        channels.lines().any(|line| line.starts_with("lab ")),
+        "{channels}"
+    );
+    // Nothing of the older kind came back, and the copy is as it was.
+    let conn = database_of(&device);
+    let older = older_rows(&conn);
+    assert!(
+        older
+            .iter()
+            .filter(|(table, _)| first_start::OLDER_TABLES.contains(table))
+            .all(|(_, rows)| *rows == 0),
+        "{older:?}"
+    );
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+}
+
+/// The same device with the scope stored on has the notice (decision
+/// 2026-10-04 §10.1): the date, the Claude Code directory, and each folder
+/// that the last stored report shows as syncing without a mapping. The
+/// scope is off afterwards, and the report is removed. (The notice is
+/// stored here; showing it is not this test's.)
+#[test]
+fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
+    use cordelia_storage::meta;
+    let relay = relay_started();
+    let mut device = node("laptop", "personal", Some(relay.p2p));
+    {
+        let conn = in_the_released_form(&device);
+        meta::set(&conn, meta::SYNC_CLAUDE_ALL, "on").unwrap();
+    }
+    let began = chrono::Utc::now();
+    device.start();
+    wait_for("device healthy", &[&relay, &device], 30, || {
+        healthy(&device)
+    });
+
+    let conn = database_of(&device);
+    let notices = first_start::notices(&conn).unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let notice = &notices[0];
+    let at = chrono::DateTime::parse_from_rfc3339(&notice.at).unwrap();
+    assert!(
+        at >= began - chrono::Duration::seconds(1) && at <= chrono::Utc::now(),
+        "{}",
+        notice.at
+    );
+    assert_eq!(
+        notice.dir.as_deref(),
+        Some(device.home().join(".claude").display().to_string().as_str())
+    );
+    let stopped: Vec<(&str, Option<&str>, Option<&str>)> = notice
+        .folders
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|folder| {
+            (
+                folder.folder.as_str(),
+                folder.cwd.as_deref(),
+                folder.name.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        stopped,
+        [
+            (
+                "/home/sam/.claude/projects/-home-sam-work-tools",
+                Some("/home/sam/work/tools"),
+                Some("github.com/sam/tools")
+            ),
+            (
+                "/home/sam/.claude/projects/-home-sam",
+                Some("/home/sam"),
+                Some("~")
+            ),
+        ]
+    );
+    assert_eq!(
+        meta::get(&conn, meta::SYNC_CLAUDE_ALL).unwrap().as_deref(),
+        Some("off")
+    );
+    let status = status_of(&device);
+    assert_eq!(status["sync"]["all"], false, "{status}");
+    // The report that the notice was made from is removed: a cycle of
+    // this version has stored its own since, or none has run yet.
+    let report = meta::get(&conn, meta::SYNC_CLAUDE_REPORT).unwrap();
+    assert!(
+        report.is_none_or(|report| !report.contains("2026-10-05T09:12:44")),
+        "the released version's report is still stored"
+    );
+}
