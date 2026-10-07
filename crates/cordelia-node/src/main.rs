@@ -1130,6 +1130,42 @@ fn format_uptime(secs: u64) -> String {
 /// lock on for as long as it runs.
 const NODE_LOCK: &str = "node.lock";
 
+/// What became of a try at the lock on a data directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lock {
+    /// This node holds it.
+    Held,
+    /// Another node holds it: this one does not start.
+    AnotherNode,
+    /// It could not be taken, for any other reason, as the system says
+    /// it: the node starts without it.
+    NotTaken(String),
+}
+
+/// What a node makes of the system's answer to its try at the lock
+/// (decision 2026-10-04 §10.1). **Only that another node holds the lock
+/// keeps this one from starting.** Any other failure, whatever it is,
+/// leaves the node with no lock, and it starts all the same: a volume
+/// that knows no locks is one where a node must still run.
+fn lock_tried(tried: Result<(), std::fs::TryLockError>) -> Lock {
+    match tried {
+        Ok(()) => Lock::Held,
+        Err(std::fs::TryLockError::WouldBlock) => Lock::AnotherNode,
+        Err(std::fs::TryLockError::Error(e)) => Lock::NotTaken(e.to_string()),
+    }
+}
+
+/// The node goes on with no lock on its data directory: it says so in
+/// its log, once, with why the lock could not be taken.
+fn goes_on_with_no_lock(data_dir: &std::path::Path, why: &str) -> Option<std::fs::File> {
+    tracing::warn!(
+        "the lock on the data directory {} could not be taken ({why}): the node goes on \
+         without it, and nothing stops a second node from being started on that directory",
+        data_dir.display()
+    );
+    None
+}
+
 /// Take the lock that says a node is running on the data directory
 /// `data_dir` (decision 2026-10-04 §10.1): an advisory lock on a file
 /// there, which the system lets go of when the process ends, however it
@@ -1138,9 +1174,13 @@ const NODE_LOCK: &str = "node.lock";
 ///
 /// Where another process holds it, a node is running on that directory:
 /// this one says so, and has changed nothing. The file holds nothing, and
-/// is left where it is when the node stops. On a volume that knows no
-/// such lock the node starts, and says that it could not take one.
-fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+/// is left where it is when the node stops.
+///
+/// **Nothing else keeps the node from starting** ([`lock_tried`]). Where
+/// the lock cannot be taken for any other reason (the volume knows no
+/// such lock, or the file cannot be opened), the node says so once and
+/// goes on without it: `None` is returned.
+fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<Option<std::fs::File>> {
     let path = data_dir.join(NODE_LOCK);
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -1149,26 +1189,18 @@ fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("the lock on {} cannot be taken: {e}", data_dir.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(e) => return Ok(goes_on_with_no_lock(data_dir, &e.to_string())),
+    };
+    match lock_tried(file.try_lock()) {
+        Lock::Held => Ok(Some(file)),
+        Lock::AnotherNode => anyhow::bail!(
             "another node is running on the data directory {}: a data directory is one node's. \
              Nothing was changed. Stop that node first, or give this one a directory of its own.",
             data_dir.display()
         ),
-        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-            tracing::warn!(
-                "the volume of the data directory knows no lock: nothing stops a second node \
-                 from being started on it"
-            );
-            Ok(file)
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            anyhow::bail!("the lock on {} cannot be taken: {e}", data_dir.display())
-        }
+        Lock::NotTaken(why) => Ok(goes_on_with_no_lock(data_dir, &why)),
     }
 }
 
@@ -6154,6 +6186,48 @@ mod tests {
         );
         let said = mapping_meant("x", None, None).unwrap_err().to_string();
         assert!(said.contains("not mapped on this device"), "{said}");
+    }
+
+    /// **Only that another node holds the lock on a data directory keeps
+    /// a node from starting** (decision 2026-10-04 §10.1). Whatever else
+    /// the system answers a try at the lock with, the node goes on
+    /// without it: a volume that knows no locks, and any other failure.
+    /// So does a node whose lock file cannot be opened at all.
+    #[test]
+    fn test_only_another_nodes_lock_keeps_a_node_from_starting() {
+        use std::fs::TryLockError;
+        use std::io::{Error, ErrorKind};
+        assert_eq!(lock_tried(Ok(())), Lock::Held);
+        assert_eq!(lock_tried(Err(TryLockError::WouldBlock)), Lock::AnotherNode);
+        for kind in [
+            ErrorKind::Unsupported,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let tried = lock_tried(Err(TryLockError::Error(Error::from(kind))));
+            assert!(matches!(tried, Lock::NotTaken(_)), "{kind:?}: {tried:?}");
+        }
+
+        // On a directory: the first node holds the lock, and a second is
+        // told that another node is running there.
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_data_dir(dir.path()).unwrap();
+        assert!(held.is_some());
+        let second = lock_data_dir(dir.path()).unwrap_err().to_string();
+        assert!(
+            second.starts_with("another node is running on the data directory"),
+            "{second}"
+        );
+        assert!(second.contains("Nothing was changed."), "{second}");
+        // Once the first lets go, the lock is taken again.
+        drop(held);
+        assert!(lock_data_dir(dir.path()).unwrap().is_some());
+
+        // The file of the lock cannot be opened: here a folder is in its
+        // place. The node goes on, with no lock.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(NODE_LOCK)).unwrap();
+        assert!(lock_data_dir(dir.path()).unwrap().is_none());
     }
 
     /// Where the node let go of a name that a carry held with no folder
