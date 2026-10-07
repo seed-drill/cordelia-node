@@ -162,7 +162,7 @@ This is the same idea as Nostr's addressable events (NIP-01, kinds 30000-39999).
 
 ### 4.4 Deletes that replicate
 
-> **This section stands.** Read "the channel's members" as the devices that count ([the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 4.4). A delete is a version, and is carried at a statement as a text is (7.3 there).
+> **This section stands.** Read "the channel's members" as the devices that count ([the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 4.4). A delete is a version, and is carried at a statement as a text is (7.3 there). What is swept once a delete has been held for 90 days, among the entries of a channel from its secret, at a relay and in a device's own store, is in section 2.3 there.
 
 A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`), so that a device that has been away for less than that learns that the file was deleted; after that, an hourly sweep drops the key's whole slot history. What counts as deleted depends on what the node can know:
 

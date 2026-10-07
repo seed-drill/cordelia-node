@@ -267,9 +267,10 @@ key they do not hold. Two roles matter in v1:
   longest: at its cap it takes no channel it does not already hold, a write
   that would take it past its cap is refused and drops nothing, and one
   address may add only so many channels an hour. A channel that nobody has
-  used for 90 days is dropped. Each device holds what it syncs and sends a
-  relay what the relay lacks, so nothing is lost for good when a relay is
-  rebuilt while a device still holds it.
+  used for 90 days is dropped, and so is a slot in which every entry is a
+  delete that the relay has held for 90 days. Each device holds what it
+  syncs and sends a relay what the relay lacks, so nothing is lost for good
+  when a relay is rebuilt while a device still holds it.
 
 Three things happen between a device and a relay:
 
@@ -372,7 +373,10 @@ removed key among the keys removed, and a commitment to a new person secret.
   applied the removal writes afterwards, and it writes nothing into the new
   channels: every entry there is signed by a device that the statement lists,
   or by one added since. What it wrote before is kept where a remaining
-  device had taken it.
+  device had taken it. What it had sent to a relay, and no remaining device
+  had taken, stays at the relay unless a person asks for it:
+  `cordelia sync carry <name> --from <device>`, at a terminal, says what it
+  found, asks a yes, and then asks for the phrase.
 - **A removal can always be made, sent and seen.** The change entry replaces
   the one before it, at the same size, in a channel a relay already holds: a
   relay at its cap still stores it. The command stays until every relay it
@@ -393,13 +397,21 @@ removed key among the keys removed, and a commitment to a new person secret.
 ### 3.7 Recovery
 
 `cordelia recover`, on a new machine, is for a person who has no device left
-that they trust. With the phrase the command can fetch the phrase's channel,
-which no device can. It takes the latest statement there; shows every device,
-and asks of each whether the person still has it, has lost it, or thinks it
-may be in someone else's hands; makes the next statement, with the new
-machine as the only device; and carries every name that the personal channel
-lists, from the relays' copies, in one look. Nothing is taken from a device
-that may be in someone else's hands.
+that they trust. It asks the relays that the machine is set up with. With
+the phrase the command can fetch the phrase's channel, which no device can.
+It takes the latest statement there; shows every device, and asks of each a
+typed answer: `have` (the person still has it), `lost` (it is lost or
+broken) or `hands` (it may be in someone else's hands). It shows the
+statement that the phrase will sign and asks a yes; makes the next statement,
+with the new machine as the only device; and carries every name that the
+personal channel lists, from the relays' copies, in one look. Nothing is
+taken from a device that may be in someone else's hands: what it wrote comes
+in only by `cordelia sync carry <name> --from <device>`, with the phrase.
+
+The command asks for the phrase first, since it reads at the relays with it,
+and forgets it once it has signed. The look is made by the node, and the
+command waits for it in a process that never held the phrase. A look that is
+interrupted is not taken up again by itself.
 
 Every other device stops when it hears, and each one that the person still
 has is added again by hand, with the two commands. A relay is a cache, not a
@@ -554,6 +566,7 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | A relay in total, for each kind of channel | 1 GiB unless its operator sets it | `max_storage_bytes` |
 | New channels from one address | 256 an hour | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` |
 | A relay keeps a channel that nobody uses | 90 days | `ENTRY_CHANNEL_UNUSED_DAYS` |
+| A relay, and a device, keep a delete | 90 days from when they stored it | `KEYED_TOMBSTONE_RETENTION_DAYS` |
 | A device keeps the secret of a generation it left | 90 days | `LEFT_SECRET_KEPT_DAYS` |
 | Devices a statement lists | 64 | `MAX_STATEMENT_DEVICES` |
 | Statements one phrase makes, and keys it removes | 256 each | `MAX_STATEMENT_NUMBER`, `MAX_STATEMENT_REMOVED` |

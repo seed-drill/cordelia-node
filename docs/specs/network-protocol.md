@@ -1120,6 +1120,16 @@ refused entry in a channel is still offered, since a delete, or a
 replacement that is no larger, makes room. The refused entry is kept apart
 and sent again after a wait that doubles.
 
+**A relay sweeps old deletes** (decision §2.3). An entry says in clear
+whether it is a delete, and a relay reads nothing else of it. Once an hour a
+relay drops each slot in which every entry that it holds, of every author,
+is a delete that it has held for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`).
+A slot in which one author's delete stands beside another author's text
+stays whole: no key's delete sweeps away what another key wrote. The
+channel's room follows, and a channel of which nothing is left is held no
+more: a pull of it is then answered as for a channel that is not held. A
+device sweeps its own store by a rule of its own (data-formats.md §10.1).
+
 #### 4.9.5 Between Relays That Work Together (0x14)
 
 Relays that their operator lists together pass entries between them without
@@ -1250,6 +1260,18 @@ Further, in a channel of its own it stores an entry only if its signer
 counts: a device of the statement it has applied, or one added since under
 that statement (decision §4.4). It takes nothing from a channel of a
 generation it has left.
+
+**A carry that a person asks for reads through one door** (decision §7.3,
+§9). `cordelia sync carry` and `cordelia recover` read, at each relay, a
+channel of a generation that the device has left, or never held: the device
+proves that channel's key and pulls it, page by page, within what it takes
+from a relay in a minute, and for two minutes at most (`CARRY_READ_MAX_SECS`).
+It stores nothing of what it pulls there, keeps no place, and pushes nothing.
+The proof is the node's own where it holds the channel's secret; where it
+does not, a command that was typed the recovery phrase makes the proof for
+each connection, over the session's value, and the node is handed no secret.
+What is read comes into the device's own channels only through the one
+function that judges a version for a carry.
 
 **One channel is read without leave:** the pair channel of a key typed at
 `cordelia accept`, for the hour that `accept` allows. A device that follows

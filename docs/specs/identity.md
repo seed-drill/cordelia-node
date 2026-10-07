@@ -145,12 +145,14 @@ The X25519 key is derived on demand and never persisted separately (ecies-envelo
 > | What | Where | Sensitivity |
 > |------|-------|-------------|
 > | The device's own key (the Ed25519 seed above) | `identity.key`, 0600 | CRITICAL to the device. It is not the person's identity: a lost device is removed, and a new one added, with no change to the others' keys |
-> | The person secret it has applied, and each one it left in the last 90 days | The database (`person_secrets`), 0600 | CRITICAL: whoever reads it reads every name of the person's until the next removal |
+> | The person secret it has applied, and each one it left in the last 90 days. A machine that recovered also keeps, as secrets it left then, the one of the generation it recovered from and those before it that the change entry gave the phrase: nine at most | The database (`person_secrets`), 0600 | CRITICAL: whoever reads it reads every name of the person's until the next removal |
 > | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the latest change entry | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
 > | The recovery phrase | Nowhere on any device. Written down by the person | CRITICAL: a copy reads everything, through every removal, with no sign; without it no device can be removed and nothing recovered |
 >
 > A personal node has no file under `channel-keys/` from its first start on
-> this version: no channel of its own has a key file. The move of the
+> this version: no channel of its own has a key file. (A key file of an older
+> channel that no copy beside the database holds is left where it is, and
+> `cordelia status` says how many: operations.md §10.5.) The move of the
 > device's key and the person secret to the operating system's keystore is
 > not in this version.
 
@@ -549,9 +551,12 @@ There is no "forgot password" flow in a decentralised system. The entity must re
 >   where the removed device can read, and `cordelia devices` shows which
 >   devices have not applied the change.
 > - **Where none remains that the person trusts:** `cordelia recover` on a
->   new machine, with the phrase. It brings back what the relays hold, for 90
->   days after the last device was on, and stops every other device until
->   each is added again by hand.
+>   new machine, with the phrase. It asks of each device a typed `have`,
+>   `lost` or `hands`, brings back what the relays hold, for 90 days after
+>   the last device was on, and stops every other device until each is added
+>   again by hand. It takes nothing that a device answered with `hands`
+>   wrote: that comes in only by `cordelia sync carry <name> --from <device>`,
+>   with the phrase.
 > - **A device removed by mistake** cannot come back under its key.
 >   `cordelia init --new-key` gives it a new one, keeps its memory folders,
 >   and it is then added as a new device.
