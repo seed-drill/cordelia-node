@@ -73,6 +73,63 @@ pub struct AppState {
     /// own, as the node last said it, and the word that something was
     /// written in one.
     pub own_channels: OwnChannels,
+    /// Whether the node is held up, and why.
+    pub held: HeldUp,
+}
+
+/// Why a node is held up (decision 2026-10-04 §10.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// Its first start on this version has not succeeded: the copy could
+    /// not be made, or the step failed. It is tried again each time a
+    /// cycle would have run. It says why, in words for a person.
+    FirstStart(String),
+}
+
+impl Held {
+    /// Why the node is held up, in words for a person.
+    pub fn says(&self) -> &str {
+        match self {
+            Held::FirstStart(why) => why,
+        }
+    }
+
+    /// What it is held up by, as a status names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Held::FirstStart(_) => "first_start",
+        }
+    }
+}
+
+/// Whether a node is held up, and why (decision 2026-10-04 §10.1).
+///
+/// A node that is held up does not stop: under a service that restarts
+/// what stops, stopping would be a loop, and a stopped node can say
+/// nothing. It stays up, and says why.
+///
+/// It is kept in memory: a step that fails because the database cannot
+/// be written has nowhere else to put it.
+#[derive(Default)]
+pub struct HeldUp {
+    why: Mutex<Option<Held>>,
+}
+
+impl HeldUp {
+    /// Why the node is held up, where it is.
+    pub fn why(&self) -> Option<Held> {
+        self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The node is held up, by `why`.
+    pub fn hold(&self, why: Held) {
+        *self.why.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    }
+
+    /// The node is held up no longer.
+    pub fn release(&self) {
+        *self.why.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// What a status will read of a device's side of its relays, for the
@@ -832,6 +889,7 @@ mod tests {
             relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
+            held: Default::default(),
             history: Default::default(),
         }
     }

@@ -532,6 +532,7 @@ impl World {
                     relist: Default::default(),
                     sync_control: Default::default(),
                     own_channels: Default::default(),
+                    held: Default::default(),
                     history: Default::default(),
                 };
                 // Set up with no relay: a folder's first cycle waits for

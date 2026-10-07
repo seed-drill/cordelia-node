@@ -48,6 +48,7 @@ fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
         relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
+        held: Default::default(),
         history: Default::default(),
     });
     (state, dir)

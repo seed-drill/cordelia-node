@@ -446,6 +446,7 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
         relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
+        held: Default::default(),
         history: Default::default(),
     }
 }

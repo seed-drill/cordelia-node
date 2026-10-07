@@ -812,6 +812,7 @@ mod tests {
             relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
+            held: Default::default(),
             history: Default::default(),
         };
         state.history.open(Store::new(&home, 30, 1 << 20));

@@ -2546,6 +2546,7 @@ mod tests {
             relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
+            held: Default::default(),
             history: Default::default(),
         };
         state.own_channels.set_up_with(0);

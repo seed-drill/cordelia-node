@@ -3125,15 +3125,59 @@ fn a_node_makes_no_swarm_channel_and_tells_its_relay_of_none() {
     assert_eq!(swarm_key_files(&a), Vec::<String>::new());
     let log = std::fs::read_to_string(a.log()).unwrap();
     assert!(!log.contains("removed swarm channels"), "{log}");
+    // Nor had it anything of the older kind to copy and move on at its
+    // first start (decision 2026-10-04 §10.1): it made no copy.
+    assert_eq!(copies_made(&a), Vec::<String>::new());
+    assert!(!log.contains("was copied and moved on"), "{log}");
+}
+
+/// The copies that a node made of its database, beside it, by their
+/// names.
+fn copies_made(n: &Node) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(n.data_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("before-"))
+        .collect()
 }
 
 /// A node that ran a version up to 0.2.0-alpha.7 holds the swarm channel
-/// that version made, with its key. When it starts it removes the channel
-/// and the key, and says once that it did, with how many and not which.
-/// Its relay is told nothing of the channel.
+/// that version made, with its key. When it starts, the channel and the
+/// key go, and the node says once that they did, with how many and not
+/// which. Its relay is told nothing of the channel.
+///
+/// On a personal node they go with everything of the older kind that it
+/// holds, at its first start on this version (decision 2026-10-04 §10.1):
+/// its database is copied and moved on, and the key files of the older
+/// channels are removed. A node of a role that carries the older kind
+/// removes a swarm channel by itself, and keeps the rest: a relay that
+/// holds one shows it.
 #[test]
 fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
+    // A relay that holds one removes it, and says so once, with how many
+    // and not which. It makes no copy.
+    let mut older = node("older-relay", "relay", None);
+    let of_the_relay = swarm_channel_as_an_earlier_version_made_it(&older);
+    older.start();
+    wait_for("relay healthy", &[&older], 30, || healthy(&older));
+    assert_eq!(swarm_key_files(&older), Vec::<String>::new());
+    let log = without_colour(&std::fs::read_to_string(older.log()).unwrap());
+    let said: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("removed swarm channels"))
+        .collect();
+    assert_eq!(said.len(), 1, "{log}");
+    for count in ["INFO", "channels=1", "items=0", "key_files=1"] {
+        assert!(said[0].contains(count), "{}", said[0]);
+    }
+    assert!(!log.contains(&of_the_relay), "{log}");
+    assert_eq!(copies_made(&older), Vec::<String>::new());
+    older.stop();
+
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -3158,17 +3202,32 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     let channels = b.cli(&["channels"]);
     assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
     assert_eq!(swarm_key_files(&b), Vec::<String>::new());
-    // The node said so once, and nowhere in its log is the channel's ID.
+    // The node said so once, and nowhere in its log is the channel's ID:
+    // its database was copied and moved on, and the key file removed.
     let log = without_colour(&std::fs::read_to_string(b.log()).unwrap());
-    let said: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("removed swarm channels"))
-        .collect();
-    assert_eq!(said.len(), 1, "{log}");
-    for count in ["INFO", "channels=1", "items=0", "key_files=1"] {
-        assert!(said[0].contains(count), "{}", said[0]);
+    let said = |what: &str| -> Vec<String> {
+        let lines = log.lines().filter(|line| line.contains(what));
+        lines.map(str::to_string).collect()
+    };
+    let moved_on = said("the database was copied and moved on");
+    assert_eq!(moved_on.len(), 1, "{log}");
+    assert!(moved_on[0].contains("INFO"), "{}", moved_on[0]);
+    let removed = said("removed the key files of the older channels");
+    assert_eq!(removed.len(), 1, "{log}");
+    for count in ["INFO", "key_files=1"] {
+        assert!(removed[0].contains(count), "{}", removed[0]);
     }
+    assert!(said("removed swarm channels").is_empty(), "{log}");
     assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{log}");
+    // The copy holds what the node held, the key file among it.
+    let copies = copies_made(&b);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copied_key = b
+        .data_dir()
+        .join(&copies[0])
+        .join("channel-keys")
+        .join(format!("{swarm}.key"));
+    assert!(copied_key.exists(), "{}", copied_key.display());
 }
 
 /// A channel ID that holds a name is never told to a peer, though the
@@ -3288,30 +3347,43 @@ async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
 /// as a file is. The node starts, removes the channel and the key it can
 /// remove, and warns once that one could not be removed: how many, and not
 /// which.
+///
+/// So does a personal node, which removes the key files of the older
+/// channels after its first start on this version (decision 2026-10-04
+/// §10.1), and a node of a role that carries the older kind, which
+/// removes those of a swarm channel.
 #[test]
 fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
-    let mut a = node("stuck-canary", "personal", None);
-    let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
-    let stuck = cordelia_storage::psk::slot_key_path(&a.data_dir(), &swarm);
-    std::fs::create_dir(&stuck).unwrap();
+    for (role, of_which) in [
+        ("personal", "of the older channels"),
+        ("relay", "of a swarm channel"),
+    ] {
+        let mut a = node("stuck-canary", role, None);
+        let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
+        let stuck = cordelia_storage::psk::slot_key_path(&a.data_dir(), &swarm);
+        std::fs::create_dir(&stuck).unwrap();
 
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
+        a.start();
+        wait_for("node healthy", &[&a], 30, || healthy(&a));
 
-    let channels = a.cli(&["channels"]);
-    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
-    assert_eq!(swarm_key_files(&a), vec![format!("{swarm}.slot")]);
-    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-    let warned: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("could not remove every key file"))
-        .collect();
-    assert_eq!(warned.len(), 1, "{log}");
-    for said in ["WARN", "key_files=1"] {
-        assert!(warned[0].contains(said), "{}", warned[0]);
+        let channels = a.cli(&["channels"]);
+        assert!(
+            !channels.contains(SWARM_CHANNEL_PREFIX),
+            "{role}: {channels}"
+        );
+        assert_eq!(swarm_key_files(&a), vec![format!("{swarm}.slot")], "{role}");
+        let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("could not remove every key file"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{role}: {log}");
+        for said in ["WARN", "key_files=1", of_which] {
+            assert!(warned[0].contains(said), "{role}: {}", warned[0]);
+        }
+        assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{role}: {log}");
     }
-    assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{log}");
 }
 
 /// An entry of `channel` with this ciphertext, signed by `author`, as it
@@ -3615,10 +3687,13 @@ async fn ask_as_its_relay(
 /// device of this version carries none (decision 2026-10-04 §10). The
 /// test is the relay. It asks the device which channels it holds, and for
 /// the swarm channel's entries by its ID; it pushes the device an entry
-/// of that channel; and it announces the channel to it. Each of the three
-/// streams is refused at once, and for that reason; nothing of what was
-/// pushed is stored. On the same connection the device does answer its
-/// relay on a stream that it serves.
+/// of that channel; and it announces the channel to it. What it asks is
+/// answered with nothing, as a device that holds no such channel would
+/// answer (decision 2026-10-04 §10.1): no channel, and nothing in the one
+/// asked for. The push and the announcement are refused at once, and for
+/// that reason; nothing of what was pushed is stored. On the same
+/// connection the device does answer its relay on a stream that it
+/// serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
     use cordelia_network::channel_announce::{announcement, send_channel_joined};
@@ -3661,13 +3736,17 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
     });
 
     // Asked which channels it holds, and for the swarm channel's entries
-    // by its ID: nothing comes back, and at once.
+    // by its ID: it answers at once that it holds none, and that the
+    // channel holds nothing, though its database holds both.
     let at_once = Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS / 2);
     let asked = tokio::time::timeout(at_once, ask_as_its_relay(&conn, &[swarm.as_str()])).await;
-    assert!(
-        matches!(asked, Ok(None)),
-        "the device answered its relay: {asked:?}"
-    );
+    let nothing = match &asked {
+        Ok(Some((listed, pages))) => {
+            listed.is_empty() && pages.len() == 1 && pages[0].items.is_empty() && !pages[0].has_more
+        }
+        _ => false,
+    };
+    assert!(nothing, "the device answered its relay: {asked:?}");
     // Pushed an entry of the channel: it is not taken.
     let stranger = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
     let pushed = entry_in(&stranger, &swarm, vec![7; 40]);
@@ -3690,16 +3769,21 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
         matches!(stopped, Ok(Ok(Some(_)))),
         "the device heard an announcement out: {stopped:?}"
     );
-    // Each was refused because a device carries no channel of that kind,
-    // and the device says so, for debugging.
+    // The two were refused because a device carries no channel of that
+    // kind, and the device says so, for debugging; and it says that it
+    // answered the sync with nothing.
     let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-    for stream in ["item_sync", "item_push", "channel_announce"] {
+    for stream in ["item_push", "channel_announce"] {
         let refused = log.lines().any(|line| {
-            line.contains("a personal node carries no channel of the older kind")
+            line.contains("refused: a personal node carries no channel of the older kind")
                 && line.contains(&format!("protocol=\"{stream}\""))
         });
         assert!(refused, "{stream}: {log}");
     }
+    assert!(
+        log.contains("answered a sync of the older kind with nothing"),
+        "{log}"
+    );
 
     // Nothing of what was pushed is stored, and the device holds the
     // channel and its own entry all the while.

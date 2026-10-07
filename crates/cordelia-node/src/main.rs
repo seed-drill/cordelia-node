@@ -873,10 +873,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         .trim()
         .to_string();
 
-    // Open database
-    let db_path = data_dir.join("cordelia.db");
-    let conn = cordelia_storage::db::open(&db_path)?;
-
     // The API listens only on this machine.
     let bind_addr = &config.api.bind_address;
     let Some(host) = api_host(bind_addr) else {
@@ -886,6 +882,17 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let http_port = config.node.http_port;
     let listen_addr = format!("{host}:{http_port}");
     let p2p_port = config.node.p2p_port;
+
+    // The port of the local API is bound before the database is opened,
+    // and so before anything is written (decision 2026-10-04 §10.1): a
+    // node that cannot bind, because another is running, changes
+    // nothing.
+    let api_listener = std::net::TcpListener::bind(&listen_addr)
+        .map_err(|e| anyhow::anyhow!("the node's API cannot listen at {listen_addr}: {e}"))?;
+
+    // Open database
+    let db_path = data_dir.join("cordelia.db");
+    let conn = cordelia_storage::db::open(&db_path)?;
 
     // Set up logging
     init_tracing(&config.logging.level);
@@ -921,27 +928,43 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         "node starting"
     );
 
-    // A node makes no channel that it does not use. Up to 0.2.0-alpha.7 a
-    // personal node made a swarm channel for itself each time it started,
-    // and v1 uses none. Any that this node holds is removed, with its key
-    // and whatever it holds. Its ID holds a name, so the log says how many
-    // went and does not say which.
-    let removed = cordelia_storage::channels::remove_swarm_channels(&conn, &data_dir)?;
-    if removed.any() {
-        tracing::info!(
-            channels = removed.channels,
-            items = removed.items,
-            key_files = removed.key_files,
-            "removed swarm channels, which this version does not use"
-        );
-    }
-    // A key file that could not be removed is no reason not to start. The
-    // node says how many, and tries again the next time it starts.
-    if removed.key_files_left > 0 {
-        tracing::warn!(
-            key_files = removed.key_files_left,
-            "could not remove every key file of a swarm channel; they are left, and the node starts"
-        );
+    // A personal node writes nothing of the older kind of channel: what
+    // it holds of that kind goes at its first start on this version,
+    // below. A node of any other role goes on carrying that kind.
+    let personal = config.network.role == "personal";
+    if !personal {
+        // A node makes no channel that it does not use. Up to
+        // 0.2.0-alpha.7 a node made a swarm channel for itself each time
+        // it started, and v1 uses none. Any that this node holds is
+        // removed, with its key and whatever it holds. Its ID holds a
+        // name, so the log says how many went and does not say which.
+        let removed = cordelia_storage::channels::remove_swarm_channels(&conn, &data_dir)?;
+        if removed.any() {
+            tracing::info!(
+                channels = removed.channels,
+                items = removed.items,
+                key_files = removed.key_files,
+                "removed swarm channels, which this version does not use"
+            );
+        }
+        // A key file that could not be removed is no reason not to start.
+        // The node says how many, and tries again the next time it starts.
+        if removed.key_files_left > 0 {
+            tracing::warn!(
+                key_files = removed.key_files_left,
+                "could not remove every key file of a swarm channel; they are left, and the node starts"
+            );
+        }
+        // The guard against a new channel of the older kind is a
+        // device's. A node of this role that is started on a database
+        // which a personal node moved on removes it (decision 2026-10-04
+        // §10.1).
+        if cordelia_storage::first_start::remove_guard(&conn)? {
+            tracing::info!(
+                "removed the guard that a personal node set on this database: a node of this \
+                 role takes channels of the older kind"
+            );
+        }
     }
 
     // Build app state
@@ -966,13 +989,24 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
+        held: Default::default(),
         history: Default::default(),
     });
+
+    // A personal node makes its first start on this version here
+    // (decision 2026-10-04 §10.1): after the port of its local API is
+    // bound, before its sync loop and its first pass are started, and
+    // before anything else is written. A relay and a bootnode make no
+    // copy and take no step: their databases are stepped as any version
+    // steps them, at the opening.
+    if personal {
+        cordelia_api::first_start::take(&state, version);
+    }
 
     // A personal node keeps local history of what sync replaces. It holds
     // no channel of the older kind: no inbox is made for it, and nothing
     // of that kind is read (decision 2026-10-04 §10).
-    if config.network.role == "personal" {
+    if personal {
         start_history(&state, &config.history);
     }
 
@@ -1063,7 +1097,11 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // setting takes effect at once: it wakes the loop, and a cycle
         // that was already running stops (see `SyncControl`).
         if config.network.role == "personal" {
-            if let Err(e) = cordelia_api::sync::keep_earlier_scope(&state) {
+            // Nothing is written of the settings while the first start is
+            // still to be made: the step reads the scope as it is stored.
+            if state.held.why().is_none()
+                && let Err(e) = cordelia_api::sync::keep_earlier_scope(&state)
+            {
                 tracing::warn!(error = %e, "sync: could not read the stored scope");
             }
             tokio::spawn(run_sync_loop(state.clone()));
@@ -1095,7 +1133,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
                     false => cordelia_api::configure_routes,
                 })
         })
-        .bind(&listen_addr)?
+        // On the port that was bound before anything was written.
+        .listen(api_listener)?
         // Only this node handles the signals that stop it, and it tells
         // the server to stop (below), so that one deadline covers both.
         .disable_signals()
