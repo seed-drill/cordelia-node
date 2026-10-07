@@ -872,7 +872,22 @@ pub fn wait_for<T>(
     }
 }
 
+/// Whether the node answers, and is not in the middle of the copy of its
+/// first start on this version. A node answers from the moment its port
+/// is bound, while that copy is still being made (decision 2026-10-04
+/// §10.1): a test that goes on from here finds the node as its start
+/// leaves it. ([`answers`] is the first half alone.)
 pub fn healthy(n: &Node) -> Option<()> {
+    answers(n)?;
+    let status = n.get("/api/v1/status")?;
+    let under_way = status["held"]["why"]
+        .as_str()
+        .is_some_and(|why| why.contains("is under way"));
+    (!under_way).then_some(())
+}
+
+/// Whether the node answers at all.
+pub fn answers(n: &Node) -> Option<()> {
     let url = format!("http://127.0.0.1:{}/api/v1/health", n.http);
     direct().get(&url).call().ok().map(|_| ())
 }

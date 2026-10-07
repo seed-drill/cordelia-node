@@ -1386,6 +1386,8 @@ mod tests {
             std::path::Path::new("/no/such/folder"),
             "0.2.0-test",
             chrono::Utc::now(),
+            &cordelia_storage::first_start::room_not_known,
+            &mut None,
         )
         .unwrap();
         assert!(!moved_on(&fresh[0].conn).unwrap());

@@ -137,7 +137,12 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     wait_for("device healthy", &[&relay, &device], 30, || {
         healthy(&device)
     });
-
+    // The node answers from the moment its port is bound: the copy and
+    // the step are made by then, or are being made, and its status says
+    // which.
+    wait_for("the first start is made", &[&relay, &device], 60, || {
+        status_of(&device)["held"].is_null().then_some(())
+    });
     // The copy, beside the database: at this schema's version, with every
     // older row and each key file.
     let name = format!("before-{VERSION}");
@@ -232,10 +237,14 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     // The guard is a device's, and a device's start leaves it.
     assert!(has_guard(&database_of(&device)));
     // A key file of an older channel that is found at a later start is
-    // removed then, whatever the mark says.
+    // removed then, whatever the mark says, where the copy holds it: one
+    // that the copy holds under that name with the same bytes goes, and
+    // one that no copy holds is left in place, and the status says so.
     device.stop();
-    let left = device.data_dir().join("channel-keys").join("grp_lab.key");
-    std::fs::write(&left, [1u8; 32]).unwrap();
+    let keys = device.data_dir().join("channel-keys");
+    let (held, not_held) = (keys.join("grp_lab.key"), keys.join("grp_since.key"));
+    std::fs::copy(copy.join("channel-keys").join("grp_lab.key"), &held).unwrap();
+    std::fs::write(&not_held, [1u8; 32]).unwrap();
     device.start();
     wait_for(
         "device healthy a third time",
@@ -243,7 +252,15 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
         30,
         || healthy(&device),
     );
-    assert!(!left.exists());
+    assert!(!held.exists());
+    assert_eq!(std::fs::read(&not_held).unwrap(), [1u8; 32]);
+    let status = status_of(&device);
+    assert_eq!(status["key_files_in_place"], 1, "{status}");
+    let said = device.cli(&["status"]);
+    assert!(
+        said.contains("Key files: 1 key file of an older version was left in place"),
+        "{said}"
+    );
 }
 
 /// A node that cannot bind the port of its local API, because another
@@ -296,6 +313,83 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
     assert_eq!(older_rows(&conn), before);
 }
 
+/// A node answers from the moment its port is bound, while the copy of
+/// its first start is still being made (decision 2026-10-04 §10.1): its
+/// status says that a copy is being made, a command that asks how it
+/// stands is told so, and a request that changes anything is refused, as
+/// by any node whose first start has not succeeded. Here the database is
+/// large enough for the copy to take a while.
+#[test]
+fn a_node_answers_while_the_copy_of_its_first_start_is_being_made() {
+    let mut device = node("laptop", "personal", None);
+    {
+        let conn = in_the_released_form(&device);
+        conn.execute_batch("CREATE TABLE ballast (held BLOB NOT NULL);")
+            .unwrap();
+        for _ in 0..96 {
+            conn.execute("INSERT INTO ballast VALUES (randomblob(1048576))", [])
+                .unwrap();
+        }
+    }
+    let other = device.home().join("work/other").display().to_string();
+    std::fs::create_dir_all(&other).unwrap();
+
+    device.start();
+    // Asked as often as it can be, from the first answer on.
+    let began = std::time::Instant::now();
+    let mut under_way = None;
+    loop {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(120),
+            "the node never made its first start:\n{}",
+            device.log_tail()
+        );
+        let Some(status) = device.get("/api/v1/status") else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        };
+        let Some(why) = status["held"]["why"].as_str() else {
+            break;
+        };
+        assert_eq!(status["held"]["by"], "first_start", "{status}");
+        assert!(why.contains("is under way"), "{why}");
+        if under_way.is_none() {
+            // A command is told how the node stands, and one that
+            // changes anything is refused with the same words.
+            let said = device.cli(&["status"]);
+            let refused = device.command(&["sync", "map", &other, "notes"]);
+            under_way = Some((why.to_string(), said, refused));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (why, said, refused) = under_way.expect("the node answered only once the copy was made");
+    assert!(
+        why.contains("a copy of the database from before this version is being made"),
+        "{why}"
+    );
+    // (A command that was asked as the copy ended may have found the
+    // node done: what it said then is not judged.)
+    if said.contains("Held up:") {
+        assert!(said.contains("is under way"), "{said}");
+    }
+    if !refused.status.success() {
+        let refused = String::from_utf8_lossy(&refused.stderr);
+        assert!(refused.contains("is under way"), "{refused}");
+    }
+    // The copy was made whole, and the step taken.
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+    let copy = device.data_dir().join(format!("before-{VERSION}"));
+    let copied = Connection::open_with_flags(
+        copy.join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(rows(&copied, "ballast"), 96);
+    let conn = database_of(&device);
+    let mark = first_start::mark(&conn).unwrap().unwrap();
+    assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
+}
+
 /// A relay's database is stepped as any version steps it: it keeps every
 /// older row and each key file, makes no copy, and has no mark (decision
 /// 2026-10-04 §10.1). A relay goes on carrying the older kind.
@@ -334,8 +428,14 @@ fn a_relay_that_is_started_on_a_devices_database_removes_the_guard() {
     drop(in_the_released_form(&relay));
     {
         let conn = cordelia_storage::db::open(&relay.data_dir().join("cordelia.db")).unwrap();
-        let moved_on =
-            first_start::first_start(&conn, &relay.data_dir(), VERSION, chrono::Utc::now());
+        let moved_on = first_start::first_start(
+            &conn,
+            &relay.data_dir(),
+            VERSION,
+            chrono::Utc::now(),
+            &first_start::room_not_known,
+            &mut None,
+        );
         assert!(moved_on.is_ok(), "{moved_on:?}");
         assert!(has_guard(&conn));
     }
@@ -368,9 +468,9 @@ fn status_of(node: &Node) -> serde_json::Value {
 /// Until its first start on this version has succeeded a node stays up,
 /// runs no cycle and no pass, refuses every request that changes
 /// anything except one that turns sync off, and says why in its status
-/// (decision 2026-10-04 §10.1). It tries again each time a cycle would
-/// have run: once the copy can be made, it is made and the step taken,
-/// with no restart.
+/// (decision 2026-10-04 §10.1). It tries again by itself, after a wait
+/// that doubles with each try that fails: once the copy can be made, it
+/// is made and the step taken, with no restart.
 #[cfg(unix)]
 #[test]
 fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
@@ -401,8 +501,16 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     let all = [&relay, &device];
     wait_for("device healthy", &all, 30, || healthy(&device));
 
-    // It stays up, and says why, with the room that the copy needs.
-    let status = status_of(&device);
+    // It stays up, and says why, with the room that the copy needs and
+    // the room there is. (Until its first try has failed it says that a
+    // copy is being made.)
+    let status = wait_for("the first try has failed", &all, 30, || {
+        let status = status_of(&device);
+        let not_done = status["held"]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("is not done"));
+        not_done.then_some(status)
+    });
     assert_eq!(status["state"], "attention", "{status}");
     assert_eq!(
         status["summary"], "memory not syncing: the first start on this version is not done",
@@ -414,7 +522,7 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
         why.starts_with("the first start on this version is not done: the copy of the database"),
         "{why}"
     );
-    assert!(why.contains("bytes of room"), "{why}");
+    assert!(why.contains("bytes of room, and the volume has "), "{why}");
     let said = device.cli(&["status"]);
     assert!(said.contains(&format!("Held up:   {why}")), "{said}");
     let line = device.cli(&["status", "--line"]);
@@ -489,9 +597,11 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     // that the step still finds it so with the directory gone.
     assert_eq!(scope(&device).as_deref(), Some("on"));
 
-    // The copy can be made: the node makes its first start by itself.
+    // The copy can be made: the node makes its first start by itself,
+    // at its next try. (The tries back off, and several have failed by
+    // now: the next is within a minute and a half of the last.)
     mode(0o700);
-    wait_for("the node makes its first start", &all, 30, || {
+    wait_for("the node makes its first start", &all, 120, || {
         status_of(&device)["held"].is_null().then_some(())
     });
     assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);

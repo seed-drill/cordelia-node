@@ -755,7 +755,11 @@ async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_i
     assert_eq!(state.sync_control.generation(), generation);
     assert_eq!(woken(&state).await, (false, false));
     // The first start is not tried on it.
-    assert!(!cordelia_api::first_start::take(&state, "0.2.0-test"));
+    assert!(!cordelia_api::first_start::take(
+        &state,
+        "0.2.0-test",
+        &cordelia_storage::first_start::room_not_known
+    ));
     assert_eq!(state.held.why(), Some(Held::LaterDatabase(why.into())));
 
     let get = test::TestRequest::get()

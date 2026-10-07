@@ -116,12 +116,35 @@ impl Held {
 ///
 /// It is kept in memory: a step that fails because the database cannot
 /// be written has nowhere else to put it.
+///
+/// With it is what one start of the node keeps of its first start on this
+/// version: what its tries keep between them, and how many key files of
+/// an older version were left in place.
 #[derive(Default)]
 pub struct HeldUp {
     why: Mutex<Option<Held>>,
+    tries: Mutex<crate::first_start::Tries>,
+    key_files_in_place: std::sync::atomic::AtomicUsize,
 }
 
 impl HeldUp {
+    /// What the tries at the first start keep between them. One try is
+    /// made at a time: the next waits here for it.
+    pub fn tries(&self) -> std::sync::MutexGuard<'_, crate::first_start::Tries> {
+        self.tries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many key files of an older version were left in place at this
+    /// start, since no copy holds them (decision 2026-10-04 §10.1).
+    pub fn key_files_in_place(&self) -> usize {
+        self.key_files_in_place.load(Ordering::Relaxed)
+    }
+
+    /// Note how many key files of an older version were left in place.
+    pub fn set_key_files_in_place(&self, files: usize) {
+        self.key_files_in_place.store(files, Ordering::Relaxed);
+    }
+
     /// Why the node is held up, where it is.
     pub fn why(&self) -> Option<Held> {
         self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()

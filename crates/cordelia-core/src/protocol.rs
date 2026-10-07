@@ -1562,6 +1562,27 @@ pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
 /// taken what it was offered, or was offered nothing more.
 pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
 
+/// How long a personal node waits before it tries its first start on
+/// this version again, after a try that failed (decision 2026-10-04
+/// §10.1): the sync cycle's five seconds after the first, and twice as
+/// long after each further one, up to FIRST_START_RETRY_MAX_SECS. A
+/// start that cannot succeed (no room for the copy, no leave to write)
+/// does not write its copy again every five seconds.
+pub const FIRST_START_RETRY_BASE_SECS: u64 = 5;
+
+/// The longest that a personal node waits between two tries at its first
+/// start on this version (decision 2026-10-04 §10.1): ten minutes, the
+/// longest wait before anything a relay refused is offered again
+/// (OUTBOX_REFUSED_RETRY_MAX_SECS). A person who has made room is not
+/// kept waiting for longer than that, and need not restart the node.
+pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// How much before its wait has passed a try at the first start is still
+/// made (decision 2026-10-04 §10.1): one second. A try is made when a
+/// sync cycle would have run, and the first wait is a cycle long: without
+/// this, the timer's own jitter would put every try off by a whole cycle.
+pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 23] = [
     LABEL_ENTRY_KEY,
@@ -2263,6 +2284,17 @@ mod tests {
         // A removal is shown for less long than the secret it left is
         // kept, so the time that it was applied is still known.
         const { assert!(REMOVAL_NOT_APPLIED_SHOWN_DAYS < LEFT_SECRET_KEPT_DAYS) };
+    }
+
+    /// The waits between the tries at a first start that keeps failing
+    /// (decision 2026-10-04 §10.1): from five seconds to ten minutes.
+    #[test]
+    fn test_the_tries_at_a_first_start_back_off_decision_2026_10_04_10_1() {
+        assert_eq!(FIRST_START_RETRY_BASE_SECS, 5);
+        assert_eq!(FIRST_START_RETRY_MAX_SECS, 600);
+        assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
+        assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
+        const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
     }
 
     /// The value that a proof is made over is exported from a TLS session

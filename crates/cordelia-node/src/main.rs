@@ -642,6 +642,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             if !live["held"].is_null() {
                 out["held"] = live["held"].clone();
             }
+            // Key files of an older version that were left in place.
+            if live["key_files_in_place"].as_u64() > Some(0) {
+                out["key_files_in_place"] = live["key_files_in_place"].clone();
+            }
             // The node's own version: `version` above is this command's.
             out["node_version"] = live["version"].clone();
             out["uptime_secs"] = live["uptime_secs"].clone();
@@ -820,6 +824,14 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             // §10.1).
             if let Some(why) = status.held() {
                 println!("  Held up:   {why}");
+            }
+            // Key files of an older version that no copy holds are left
+            // where they are, and said (decision 2026-10-04 §10.1).
+            if let Some(files) = live["key_files_in_place"].as_u64().filter(|n| *n > 0) {
+                println!(
+                    "  Key files: {}",
+                    cordelia_api::first_start::key_files_in_place_says(files as usize)
+                );
             }
             if config.network.role == "personal" {
                 println!("  Memory:    {summary}");
@@ -1048,6 +1060,23 @@ fn format_uptime(secs: u64) -> String {
 
 // ── cordelia start ─────────────────────────────────────────────────
 
+/// The free room on the volume that holds `folder`, in bytes, as far as
+/// whoever runs the node may use it: what the copy of the database at a
+/// first start is compared with before it is begun (decision 2026-10-04
+/// §10.1). None where it cannot be learned.
+fn room_on_volume(folder: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let volume = rustix::fs::statvfs(folder).ok()?;
+        Some(volume.f_bavail.saturating_mul(volume.f_frsize))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = folder;
+        None
+    }
+}
+
 fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
@@ -1209,9 +1238,13 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // A personal node makes its first start on this version here
     // (decision 2026-10-04 §10.1): after the port of its local API is
     // bound, before its sync loop and its first pass are started, and
-    // before anything else is written. A relay and a bootnode make no
-    // copy and take no step: their databases are stepped as any version
-    // steps them, at the opening.
+    // before anything else is written. Where a copy of the database is
+    // to be made, the node is held up here and the copy is made by the
+    // first turn of its sync loop, which runs no cycle before the step
+    // has succeeded: its server answers meanwhile, and its status says
+    // that a copy is being made. A relay and a bootnode make no copy and
+    // take no step: their databases are stepped as any version steps
+    // them, at the opening.
     //
     // A node whose database is from a later version makes none: it is
     // held up for as long as it runs, and touches nothing.
@@ -1223,7 +1256,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
                 .hold(cordelia_api::state::Held::LaterDatabase(why.clone()));
         }
         None if personal => {
-            cordelia_api::first_start::take(&state, version);
+            cordelia_api::first_start::take_at_start(&state, version, &room_on_volume);
         }
         None => {}
     }
@@ -1639,15 +1672,17 @@ fn scope_off(state: &cordelia_api::state::AppState) {
 
 /// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
 /// node whose first start on this version is not done runs none: it
-/// tries the first start again, each time a cycle would have run, and
-/// goes on only once that is done. A node whose database is from a later
-/// version runs none for as long as it runs.
+/// tries the first start again when a cycle would have run, after a wait
+/// that doubles with each try that fails, and goes on only once that is
+/// done. A node whose database is from a later version runs none for as
+/// long as it runs.
 fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
     use cordelia_api::state::Held;
     match state.held.why() {
         None => true,
         Some(Held::FirstStart(_)) => {
-            let done = cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"));
+            let done =
+                cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"), &room_on_volume);
             // The start that was held up is made now: the scope is
             // written off as at any start with sync on.
             if done {

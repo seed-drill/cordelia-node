@@ -1559,6 +1559,10 @@ pub(crate) async fn status_with(
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "running",
         "held": held,
+        // How many key files of an older version were left in place at
+        // this start, since no copy holds them (decision 2026-10-04
+        // §10.1).
+        "key_files_in_place": state.held.key_files_in_place(),
         // So that a command can tell when the node is not the version it is.
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime as u64,
