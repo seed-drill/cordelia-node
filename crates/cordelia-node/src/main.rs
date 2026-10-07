@@ -3464,7 +3464,27 @@ fn seen_is_not_known() -> String {
 /// under. A folder that is not under the Claude Code directory which
 /// sync is set to has none either, and says which directory it synced
 /// under.
+///
+/// What a row holds of the notice is printed as local history prints a
+/// name ([`printable_row`]).
 fn notice_row(named: &serde_json::Value) -> Option<Vec<String>> {
+    notice_row_as_stored(named).map(printable_row)
+}
+
+/// A row as it is safe to print (decision 2026-10-04 §16): each cell with
+/// its control characters, and the marks that change the direction text
+/// is laid out in, shown as escapes, as local history prints a name. A
+/// folder, a directory and a name are whatever is on the disk, in a
+/// transcript or in a notice that an earlier version stored: none of them
+/// moves the cursor or hides a line.
+fn printable_row(row: Vec<String>) -> Vec<String> {
+    row.iter()
+        .map(|cell| history_cmd::printable(cell))
+        .collect()
+}
+
+/// [`notice_row`], with every string as it is stored.
+fn notice_row_as_stored(named: &serde_json::Value) -> Option<Vec<String>> {
     use cordelia_sync::claude::HOME_NAME;
     let is = |key: &str| named[key].as_bool() == Some(true);
     if is("mapped") {
@@ -3664,10 +3684,13 @@ fn notice_details(notice: &serde_json::Value) -> Vec<String> {
                 .or(named["directory"].as_str())
                 .or(named["folder"].as_str())
                 .unwrap_or_default();
-            match named["name"].as_str() {
+            let said = match named["name"].as_str() {
                 Some(name) => format!("{} ({})", short_path(place), sync_label(name)),
                 None => short_path(place),
-            }
+            };
+            // As local history prints a name: nothing of it moves the
+            // cursor, or hides a line of a tooltip.
+            history_cmd::printable(&said)
         })
         .collect();
     if notice["not_known"].as_bool() == Some(true) {
@@ -3859,7 +3882,19 @@ fn print_columns(rows: &[Vec<String>]) {
 ///
 /// `home_name` is the name home memory last had on this device, and
 /// `available` the names that this person's other devices sync.
+///
+/// What a row holds of what was found is printed as local history prints
+/// a name ([`printable_row`]).
 fn found_row(
+    found: &serde_json::Value,
+    home_name: Option<&str>,
+    available: &[String],
+) -> Vec<String> {
+    printable_row(found_row_as_stored(found, home_name, available))
+}
+
+/// [`found_row`], with every string as it is stored.
+fn found_row_as_stored(
     found: &serde_json::Value,
     home_name: Option<&str>,
     available: &[String],
@@ -4004,7 +4039,9 @@ fn map_would_sync_another(
             shell_arg(&root.display().to_string())
         ));
     }
-    Some(why)
+    // It names a folder and a directory as they are on the disk: they
+    // are printed as local history prints a name.
+    Some(history_cmd::printable(&why))
 }
 
 /// Print what syncs on this device, what was found and is not syncing, and
@@ -4750,6 +4787,86 @@ mod tests {
             row(not_mappable),
             ["/x/old", "old", "its directory is gone"]
         );
+    }
+
+    /// What is printed of a folder that was found, or that a notice
+    /// names, is printed as local history prints a name (decision
+    /// 2026-10-04 §16): a folder, a directory and a name are whatever is
+    /// on the disk, in a transcript or in a stored notice, and none of
+    /// them moves the cursor, hides a line or turns the text around. So
+    /// it is in the list of what is found, in the notice, in a tooltip
+    /// and in the refusal of `map`.
+    #[test]
+    fn test_what_is_found_and_what_a_notice_names_is_printed_safely() {
+        let clears = "\u{1b}[2J";
+        let turns = "\u{202e}";
+        let safe = |printed: &str| {
+            assert!(
+                !printed.chars().any(|c| c.is_control() || c == '\u{202e}'),
+                "{printed:?}"
+            );
+            assert!(printed.contains("\\u{1b}[2J"), "{printed:?}");
+        };
+        let directory = format!("/home/sam/a{clears}{turns}b");
+        let folder = format!("/home/sam/.claude/projects/-home-sam-a{clears}b");
+        let name = format!("lab{clears}");
+        let says = format!("said{clears}");
+        // Each kind of row of what is found.
+        let found = [
+            serde_json::json!({ "folder": folder, "cwd": directory, "name": name,
+                                "mappable": true }),
+            serde_json::json!({ "folder": folder, "cwd": directory, "name": null,
+                                "mappable": true, "needs_name": true, "says": says }),
+            serde_json::json!({ "folder": folder, "cwd": null, "directory": directory,
+                                "name": name, "mappable": false, "why_not": "outside_home",
+                                "says": says }),
+            serde_json::json!({ "folder": folder, "cwd": null, "name": null,
+                                "mappable": false, "why_not": "no_directory", "says": says }),
+            serde_json::json!({ "folder": folder, "cwd": null, "directory": directory,
+                                "name": name, "mappable": false,
+                                "why_not": "laid_out_by_hand" }),
+        ];
+        for entry in &found {
+            let row = found_row(entry, None, &[]);
+            safe(&row.join(" | "));
+            // As it is stored, it is not safe: the test would pass
+            // without the escape otherwise.
+            let stored = found_row_as_stored(entry, None, &[]).join(" | ");
+            assert!(stored.contains(clears), "{stored:?}");
+            // And each row of the notice.
+            let row = notice_row(entry).unwrap();
+            safe(&row.join(" | "));
+        }
+        let under_another = serde_json::json!({
+            "folder": folder, "cwd": null, "directory": directory, "name": name,
+            "mappable": false, "why_not": "another_claude_dir",
+            "synced_under": format!("/home/sam/.other{clears}"),
+        });
+        safe(&notice_row(&under_another).unwrap().join(" | "));
+        // What a tooltip and the plain status list.
+        let notice = serde_json::json!({ "folders": found, "not_known": false });
+        let details = notice_details(&notice);
+        assert_eq!(details.len(), found.len());
+        for line in &details {
+            safe(line);
+        }
+        // The refusal of `map`.
+        let status = serde_json::json!({
+            "enabled": true,
+            "dir": "/home/sam/.claude",
+            "report": { "unmapped": [
+                { "folder": format!("/home/sam/.claude/projects/tree{clears}"), "cwd": null,
+                  "directory": "/home/sam/Work/cn", "name": null, "mappable": false,
+                  "why_not": "laid_out_by_hand", "says": says },
+            ] },
+        });
+        let cn = std::path::Path::new("/home/sam/Work/cn");
+        let own_gone = Said {
+            gone: vec!["/home/sam/.claude/projects/-home-sam-Work-cn"],
+            ..Default::default()
+        };
+        let why = map_would_sync_another(cn, cn, &status, &own_gone).expect("refused");
+        safe(&why);
     }
 
     /// A machine as a test says it is: every folder is there but those
