@@ -491,6 +491,7 @@ fn requests_of_a_device() -> Vec<(&'static str, Value)> {
         ),
         ("/api/v1/sync/unmap", json!({ "folder": "/home/sam/notes" })),
         ("/api/v1/sync/status", json!({})),
+        ("/api/v1/sync/seen", json!({})),
         ("/api/v1/history/list", json!({})),
         ("/api/v1/history/show", json!({ "id": "00000000000abc" })),
         (

@@ -139,7 +139,8 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/claude", web::post().to(sync::claude))
             .route("/map", web::post().to(sync::map))
             .route("/unmap", web::post().to(sync::unmap))
-            .route("/status", web::post().to(sync::sync_status)),
+            .route("/status", web::post().to(sync::sync_status))
+            .route("/seen", web::post().to(sync::seen)),
     );
     // Local history (decision 2026-09-30-agent-memory-sync §4.5b)
     cfg.service(

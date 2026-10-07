@@ -491,4 +491,12 @@ pub struct SyncStatusResponse {
     /// 2026-10-04 §10.1). With no phrase, such a device is "not added
     /// yet".
     pub moved_on: bool,
+    /// What a device whose stored scope was on is told, while it is
+    /// stored (decision 2026-10-04 §10.1): the folders that stopped
+    /// syncing when only mapped folders came to sync, each with whether
+    /// `cordelia sync map` would sync it now. It is there with sync on
+    /// and with it off, until a person says that it has been seen
+    /// (`POST /api/v1/sync/seen`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<crate::found::NoticeShown>,
 }

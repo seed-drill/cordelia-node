@@ -2987,8 +2987,9 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
 /// command but `status` and `off`, `restore`, `history drop`, `init
 /// --new-key`, and each command of a person's devices but `devices` with
 /// no act. Turning sync off is sent to any node. `cordelia status`,
-/// `cordelia sync status`, `cordelia devices` and `cordelia history`
-/// still answer beside such a node, with the note. And a look that says
+/// `cordelia sync status` (its `--seen` included), `cordelia devices`
+/// and `cordelia history` still answer beside such a node, with the
+/// note. And a look that says
 /// nothing of where the device stands is no look of this version: it is
 /// refused.
 ///
@@ -3085,10 +3086,12 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
         assert_eq!(another.asked().len(), before, "{args:?} asked the node");
     }
 
-    // What only shows is answered, with the note.
-    let shows: [&[&str]; 5] = [
+    // What only shows is answered, with the note: `cordelia sync
+    // status` with the act that puts its notice away among them.
+    let shows: [&[&str]; 6] = [
         &["status"],
         &["sync", "status"],
+        &["sync", "status", "--seen"],
         &["devices"],
         &["history"],
         &["history", "notes"],

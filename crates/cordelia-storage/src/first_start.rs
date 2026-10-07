@@ -556,6 +556,18 @@ fn store_notice(conn: &Connection, notice: &Notice) -> Result<(), CordeliaError>
     meta::set(conn, meta::SYNC_CLAUDE_NOTICE, &json)
 }
 
+/// Take the notices away: a person has seen them (decision 2026-10-04
+/// §10.1). Returns whether any was stored. Nothing else takes them away:
+/// they are still there after a restart, after sync is turned off, and
+/// after every other request.
+pub fn clear_notices(conn: &Connection) -> Result<bool, CordeliaError> {
+    let stored = meta::get(conn, meta::SYNC_CLAUDE_NOTICE)?.is_some();
+    if stored {
+        meta::remove(conn, meta::SYNC_CLAUDE_NOTICE)?;
+    }
+    Ok(stored)
+}
+
 // ── The guard ────────────────────────────────────────────────────────
 
 /// The name of the guard against a version that does not know of the
@@ -1811,6 +1823,30 @@ mod tests {
         store_notice(&conn, &notice("one")).unwrap();
         store_notice(&conn, &notice("two")).unwrap();
         assert_eq!(notices(&conn).unwrap(), [notice("one"), notice("two")]);
+    }
+
+    /// The notices are taken away by the one act that says a person has
+    /// seen them, which says whether there was any: every record goes,
+    /// and with none stored nothing is done. What was stored and could
+    /// not be read goes too.
+    #[test]
+    fn the_notices_are_taken_away_once_and_whole() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(!clear_notices(&conn).unwrap());
+        let notice = |at: &str| Notice {
+            at: at.into(),
+            dir: Some("/home/sam/.claude".into()),
+            folders: None,
+        };
+        store_notice(&conn, &notice("one")).unwrap();
+        store_notice(&conn, &notice("two")).unwrap();
+        assert!(clear_notices(&conn).unwrap());
+        assert!(notices(&conn).unwrap().is_empty());
+        assert_eq!(meta::get(&conn, meta::SYNC_CLAUDE_NOTICE).unwrap(), None);
+        assert!(!clear_notices(&conn).unwrap());
+        meta::set(&conn, meta::SYNC_CLAUDE_NOTICE, "not a list").unwrap();
+        assert!(clear_notices(&conn).unwrap());
+        assert_eq!(meta::get(&conn, meta::SYNC_CLAUDE_NOTICE).unwrap(), None);
     }
 
     /// A step that fails half way leaves nothing of it: every row and

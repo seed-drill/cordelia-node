@@ -199,6 +199,46 @@ impl Machine for ThisMachine {
     }
 }
 
+/// How long what git said of a directory is kept by [`Remembered`]. A
+/// status is asked every few seconds by a status line, and asks about
+/// each folder that a notice names.
+const ROOT_KEPT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The machine the node runs on, asked of git no more often than every
+/// [`ROOT_KEPT`] for one directory: what a status asks, while a notice is
+/// stored. Whether a directory is there is asked of the disk each time.
+/// (`cordelia sync map` does not ask through this: it asks git when it
+/// is run.)
+pub struct Remembered;
+
+/// What git last said of each directory, and when.
+type Roots = std::collections::HashMap<PathBuf, (std::time::Instant, Option<PathBuf>)>;
+
+static ROOTS: std::sync::LazyLock<std::sync::Mutex<Roots>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl Machine for Remembered {
+    fn is_dir(&self, dir: &Path) -> bool {
+        dir.is_dir()
+    }
+
+    fn memory_root(&self, dir: &Path) -> Option<PathBuf> {
+        let kept = |roots: &Roots| {
+            let fresh = roots.get(dir).filter(|(at, _)| at.elapsed() < ROOT_KEPT);
+            fresh.map(|(_, root)| root.clone())
+        };
+        if let Some(root) = kept(&ROOTS.lock().unwrap_or_else(|e| e.into_inner())) {
+            return root;
+        }
+        // Asked with the lock let go: git may take its time.
+        let root = memory_root_known(dir);
+        let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        roots.retain(|_, (at, _)| at.elapsed() < ROOT_KEPT);
+        roots.insert(dir.to_path_buf(), (std::time::Instant::now(), root.clone()));
+        root
+    }
+}
+
 /// What `cordelia sync map` would do with a folder that was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Maps {
@@ -535,6 +575,106 @@ pub fn named_in(notices: &[Notice]) -> Vec<Named> {
         }
     }
     out
+}
+
+/// One record of the notice, as a status carries it: one for each time a
+/// notice was stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoticeRecord {
+    /// When it was stored (RFC 3339).
+    pub at: String,
+    /// The Claude Code directory that sync was on for then, or last was.
+    pub dir: Option<String>,
+    /// How many folders it names. `None` where what stopped is not
+    /// known: the record has the date alone.
+    pub folders: Option<usize>,
+}
+
+/// A folder that the notice names, as a status carries it: what the one
+/// function says of it now ([`Entry`]), with the Claude Code directory
+/// that it synced under and the date of the record that names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoticeFolder {
+    #[serde(flatten)]
+    pub entry: Entry,
+    /// The Claude Code directory that it synced under.
+    pub synced_under: Option<String>,
+    /// When the record that names it was stored.
+    pub at: String,
+}
+
+/// What a device whose stored scope was on is told, and told what
+/// stopped (decision 2026-10-04 §10.1): the notice, as a status carries
+/// it while one is stored.
+///
+/// It is what was syncing in the last whole cycle before only mapped
+/// folders synced: a folder that had synced earlier, and not in that
+/// cycle, is not in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoticeShown {
+    /// One for each time a notice was stored, the oldest first.
+    pub records: Vec<NoticeRecord>,
+    /// Whether some record names no folder: what stopped then is not
+    /// known.
+    pub not_known: bool,
+    /// The Claude Code directory that its folders are asked against: the
+    /// one that is set, or, with sync off, the one that turning sync on
+    /// would use.
+    pub dir: String,
+    /// Each folder that the records name, once, with whether `cordelia
+    /// sync map` would sync it now.
+    pub folders: Vec<NoticeFolder>,
+    /// How many of them no mapping syncs now.
+    pub stopped: usize,
+}
+
+/// The notice as a status carries it, where one is stored: for each
+/// folder that it names, what the one function says now ([`would_map`]),
+/// asked against `against`.
+pub fn notice_shown(
+    notices: &[Notice],
+    against: &Against,
+    machine: &dyn Machine,
+) -> Option<NoticeShown> {
+    if notices.is_empty() {
+        return None;
+    }
+    let records = notices
+        .iter()
+        .map(|notice| NoticeRecord {
+            at: notice.at.clone(),
+            dir: notice.dir.clone(),
+            folders: notice.folders.as_ref().map(Vec::len),
+        })
+        .collect();
+    let names_none = |notice: &Notice| {
+        notice
+            .folders
+            .as_ref()
+            .is_none_or(|folders| folders.is_empty())
+    };
+    let folders: Vec<NoticeFolder> = named_in(notices)
+        .into_iter()
+        .map(|named| {
+            let asked = Asked {
+                folder: Path::new(&named.folder),
+                directory: named.cwd.as_deref().map(Path::new),
+                name: named.name.as_deref(),
+            };
+            NoticeFolder {
+                entry: Entry::of(&asked, against, machine),
+                synced_under: named.synced_under,
+                at: named.at,
+            }
+        })
+        .collect();
+    Some(NoticeShown {
+        records,
+        not_known: notices.iter().any(names_none),
+        dir: against.claude_dir.display().to_string(),
+        stopped: folders.iter().filter(|folder| !folder.entry.mapped).count(),
+        folders,
+    })
 }
 
 // ── `map` checks when it is run ──────────────────────────────────────
@@ -1137,6 +1277,196 @@ mod tests {
         codes.dedup();
         assert_eq!(codes.len(), reasons.len());
         assert!(reasons.iter().all(|why| !why.says().is_empty()));
+    }
+
+    /// What a status asks of git, it asks once for a directory while the
+    /// answer is kept: a status is asked every few seconds. Whether the
+    /// directory is there is asked each time. `map` asks git when it is
+    /// run.
+    #[test]
+    fn test_what_git_said_of_a_directory_is_kept_for_a_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let notes = base.join("above/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        assert_eq!(Remembered.memory_root(&notes), Some(notes.clone()));
+        assert_eq!(ThisMachine.memory_root(&notes), Some(notes.clone()));
+        // A repository appears above it.
+        let made = Command::new("git")
+            .arg("-C")
+            .arg(base.join("above"))
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        assert_eq!(ThisMachine.memory_root(&notes), Some(base.join("above")));
+        assert_eq!(Remembered.memory_root(&notes), Some(notes.clone()));
+        // The disk is asked each time.
+        assert!(Remembered.is_dir(&notes));
+        std::fs::remove_dir_all(&notes).unwrap();
+        assert!(!Remembered.is_dir(&notes));
+        assert!(!ThisMachine.is_dir(&notes));
+    }
+
+    /// The notice as a status carries it: one record for each time it
+    /// was stored, each folder once, and for each what the one function
+    /// says now. A folder that is named again has its later directory and
+    /// name. A record with the date alone says that what stopped is not
+    /// known. What is mapped since is counted as stopped no longer.
+    #[test]
+    fn test_the_notice_names_each_folder_once_with_what_map_would_do_now() {
+        use cordelia_storage::first_start::StoppedFolder;
+        let machine = Said::default();
+        let stopped = |directory: &str, name: Option<&str>| StoppedFolder {
+            folder: folder_of(directory),
+            cwd: Some(directory.into()),
+            name: name.map(str::to_string),
+        };
+        let notice = |at: &str, dir: &str, folders: Option<Vec<StoppedFolder>>| Notice {
+            at: at.into(),
+            dir: Some(dir.into()),
+            folders,
+        };
+        let against = |mappings: &'static [SyncMapping]| Against {
+            claude_dir: Path::new(CLAUDE),
+            home: Some(Path::new(HOME)),
+            mappings,
+        };
+        assert_eq!(notice_shown(&[], &against(&[]), &machine), None);
+
+        // The form of a report from before mappings: no directory.
+        let from_before = StoppedFolder {
+            folder: folder_of("/home/sam/old"),
+            cwd: None,
+            name: Some("github.com/o/old".into()),
+        };
+        // A tree laid out by hand, and a folder under another directory.
+        let by_hand = StoppedFolder {
+            folder: format!("{CLAUDE}/projects/workspace"),
+            cwd: Some("/home/sam/Work/cn".into()),
+            name: Some("github.com/o/cn".into()),
+        };
+        let elsewhere = StoppedFolder {
+            folder: "/home/sam/.other/projects/-home-sam-x".into(),
+            cwd: Some("/home/sam/x".into()),
+            name: None,
+        };
+        let first = notice(
+            "2026-10-05T10:00:00Z",
+            CLAUDE,
+            Some(vec![
+                stopped("/home/sam/Work/cn", Some("github.com/o/cn")),
+                stopped("/home/sam/notes", None),
+                from_before.clone(),
+                by_hand.clone(),
+            ]),
+        );
+        // Later: one of them again, with another directory's name, and
+        // one more; and a record with the date alone.
+        let again = StoppedFolder {
+            name: Some("github.com/o/renamed".into()),
+            ..stopped("/home/sam/Work/cn", None)
+        };
+        let second = notice(
+            "2026-10-06T10:00:00Z",
+            "/home/sam/.other",
+            Some(vec![again, elsewhere.clone()]),
+        );
+        let third = Notice {
+            at: "2026-10-07T10:00:00Z".into(),
+            dir: None,
+            folders: None,
+        };
+        let all = [first, second, third];
+        let shown = notice_shown(&all, &against(&[]), &machine).unwrap();
+        assert_eq!(
+            shown.records,
+            [
+                NoticeRecord {
+                    at: "2026-10-05T10:00:00Z".into(),
+                    dir: Some(CLAUDE.into()),
+                    folders: Some(4)
+                },
+                NoticeRecord {
+                    at: "2026-10-06T10:00:00Z".into(),
+                    dir: Some("/home/sam/.other".into()),
+                    folders: Some(2)
+                },
+                NoticeRecord {
+                    at: "2026-10-07T10:00:00Z".into(),
+                    dir: None,
+                    folders: None
+                },
+            ]
+        );
+        assert!(shown.not_known);
+        assert_eq!(shown.dir, CLAUDE);
+        assert_eq!(shown.stopped, 5);
+        let named: Vec<&str> = shown
+            .folders
+            .iter()
+            .map(|folder| folder.entry.folder.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                folder_of("/home/sam/Work/cn").as_str(),
+                folder_of("/home/sam/notes").as_str(),
+                folder_of("/home/sam/old").as_str(),
+                by_hand.folder.as_str(),
+                elsewhere.folder.as_str(),
+            ]
+        );
+        // Named twice: the later name, date and directory stand, and its
+        // command would carry that name.
+        let cn = &shown.folders[0];
+        assert_eq!(cn.entry.name.as_deref(), Some("github.com/o/renamed"));
+        assert_eq!(cn.entry.cwd.as_deref(), Some("/home/sam/Work/cn"));
+        assert!(cn.entry.mappable && !cn.entry.needs_name);
+        assert_eq!(cn.at, "2026-10-06T10:00:00Z");
+        assert_eq!(cn.synced_under.as_deref(), Some("/home/sam/.other"));
+        // The others, each as the one function says.
+        let why: Vec<Option<&str>> = shown.folders.iter().map(|f| f.entry.why_not).collect();
+        assert_eq!(
+            why,
+            [
+                None,
+                None,
+                Some("no_directory"),
+                Some("laid_out_by_hand"),
+                Some("another_claude_dir")
+            ]
+        );
+        assert!(shown.folders[1].entry.needs_name);
+        for cannot in &shown.folders[2..] {
+            assert_eq!(cannot.entry.cwd, None, "{cannot:?}");
+            assert!(!cannot.entry.mappable);
+        }
+        // As JSON: an entry's fields beside the two of the notice.
+        let as_json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(as_json["folders"][3]["why_not"], "laid_out_by_hand");
+        assert_eq!(as_json["folders"][3]["synced_under"], CLAUDE);
+        assert_eq!(as_json["folders"][3]["cwd"], serde_json::Value::Null);
+        assert_eq!(as_json["folders"][3]["directory"], "/home/sam/Work/cn");
+        assert_eq!(as_json["records"][2]["folders"], serde_json::Value::Null);
+
+        // Mapped since: by its folder, and it is stopped no longer.
+        let mapped: &'static [SyncMapping] = Box::leak(Box::new([
+            mapping("/home/sam/Work/cn", "github.com/o/renamed"),
+            mapping("/home/sam/notes", "lab"),
+        ]));
+        let shown = notice_shown(&all, &against(mapped), &machine).unwrap();
+        assert!(shown.folders[0].entry.mapped && shown.folders[1].entry.mapped);
+        assert_eq!(shown.stopped, 3);
+
+        // A notice whose records all name folders says nothing is
+        // unknown, and one that names none says that it is.
+        let known = notice_shown(&all[..2], &against(&[]), &machine).unwrap();
+        assert!(!known.not_known);
+        let empty = notice("2026-10-07T10:00:00Z", CLAUDE, Some(Vec::new()));
+        let unknown = notice_shown(&[empty], &against(&[]), &machine).unwrap();
+        assert!(unknown.not_known && unknown.folders.is_empty());
+        assert_eq!(unknown.stopped, 0);
     }
 
     /// `map` is refused for a directory that an entry has with another

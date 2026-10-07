@@ -58,6 +58,39 @@ pub struct Facts {
     /// version is not done, or `later_database` where its database is
     /// from a later version. It runs no cycle and no pass meanwhile.
     pub held: Option<String>,
+    /// The notice of what stopped syncing, while the node stores one
+    /// (decision 2026-10-04 §10.1).
+    pub notice: Option<Stopped>,
+}
+
+/// The notice that a device whose stored scope was on is given: the
+/// folders that stopped syncing when only mapped folders came to sync.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    /// How many folders it names that no mapping syncs now.
+    pub folders: usize,
+    /// Whether one of its records names no folder: what stopped then is
+    /// not known.
+    pub not_known: bool,
+}
+
+impl Stopped {
+    /// Whether it still asks for the person: while it names a folder
+    /// that is not mapped now, or a record of it names none. A notice
+    /// whose folders are all mapped does not.
+    pub fn counts(&self) -> bool {
+        self.folders > 0 || self.not_known
+    }
+
+    /// In a few words: how many folders stopped, counting those it names
+    /// that are not mapped now; or that folders did, where it names none
+    /// that is not.
+    pub fn says(&self) -> String {
+        match self.folders as u64 {
+            0 => "memory: folders stopped syncing".into(),
+            n => format!("memory: {n} {} stopped syncing", plural(n, "folder")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,15 +219,29 @@ pub fn derive(f: &Facts) -> (State, String) {
     if !f.errors.is_empty() {
         return (Attention, "memory sync error".into());
     }
+    // Folders that stopped syncing need the person (decision 2026-10-04
+    // §10.1): the notice is `attention`, so that a panel which draws from
+    // the state alone shows it. It is said in the place of "starting" and
+    // of "nothing mapped", and after a conflict and a file too large,
+    // which it never hides.
+    let stopped = f.notice.as_ref().filter(|notice| notice.counts());
     match f.report_age_secs {
-        None => return (Syncing, "memory sync starting".into()),
+        None => {
+            return match stopped {
+                Some(notice) => (Attention, notice.says()),
+                None => (Syncing, "memory sync starting".into()),
+            };
+        }
         Some(age) if age > STALE_REPORT_SECS => {
             return (Attention, "memory sync stalled".into());
         }
         Some(_) => {}
     }
     if f.folders == 0 {
-        return (Off, "memory: nothing mapped".into());
+        return match stopped {
+            Some(notice) => (Attention, notice.says()),
+            None => (Off, "memory: nothing mapped".into()),
+        };
     }
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
@@ -206,6 +253,9 @@ pub fn derive(f: &Facts) -> (State, String) {
             Attention,
             format!("memory: {n} {} too large", plural(n, "file")),
         );
+    }
+    if let Some(notice) = stopped {
+        return (Attention, notice.says());
     }
     if f.peers_hot == 0 {
         return match f.outbox_waiting {
@@ -510,6 +560,90 @@ mod tests {
         assert_eq!(
             held("first_start", &|f| f.running = false).0,
             State::Stopped
+        );
+    }
+
+    /// The notice of what stopped syncing is `attention` (decision
+    /// 2026-10-04 §10.1), so that a panel which draws from the state
+    /// alone shows it. It is said where "starting" and "nothing mapped"
+    /// would be, and never over an error, a stalled cycle, a conflict or
+    /// a file too large. With sync off the state is off. A notice whose
+    /// folders are all mapped does not count.
+    #[test]
+    fn the_notice_of_what_stopped_needs_the_person() {
+        let stopped = |folders: usize, not_known: bool| Stopped { folders, not_known };
+        let with = |notice: Stopped, edit: &dyn Fn(&mut Facts)| {
+            let mut f = synced();
+            f.notice = Some(notice);
+            edit(&mut f);
+            state(&f)
+        };
+        let three = (
+            State::Attention,
+            "memory: 3 folders stopped syncing".to_string(),
+        );
+        // With a mapping in step.
+        assert_eq!(with(stopped(3, false), &|_| {}), three);
+        assert_eq!(
+            with(stopped(1, false), &|_| {}),
+            (State::Attention, "memory: 1 folder stopped syncing".into())
+        );
+        // Where it names none, and where it names some and one record
+        // names none.
+        assert_eq!(
+            with(stopped(0, true), &|_| {}),
+            (State::Attention, "memory: folders stopped syncing".into())
+        );
+        assert_eq!(with(stopped(3, true), &|_| {}), three);
+        // With no mapping: not "nothing mapped". With no report yet: not
+        // "starting".
+        assert_eq!(with(stopped(3, false), &|f| f.folders = 0), three);
+        assert_eq!(
+            with(stopped(3, false), &|f| f.report_age_secs = None),
+            three
+        );
+        // Offline, sending, joining: the notice is said first.
+        assert_eq!(with(stopped(3, false), &|f| f.peers_hot = 0), three);
+        assert_eq!(with(stopped(3, false), &|f| f.outbox_waiting = 2), three);
+        assert_eq!(with(stopped(3, false), &|f| f.projects_waiting = 1), three);
+        // It hides no error, no stalled cycle, no conflict and no file
+        // too large.
+        for (edit, says) in [
+            (
+                (&|f: &mut Facts| f.errors = vec!["x".into()]) as &dyn Fn(&mut Facts),
+                "memory sync error",
+            ),
+            (
+                &|f: &mut Facts| f.report_age_secs = Some(STALE_REPORT_SECS + 1),
+                "memory sync stalled",
+            ),
+            (
+                &|f: &mut Facts| f.conflicts = vec!["a".into()],
+                "memory: 1 conflict",
+            ),
+            (
+                &|f: &mut Facts| f.too_large = vec!["a.md".into()],
+                "memory: 1 file too large",
+            ),
+        ] {
+            assert_eq!(
+                with(stopped(3, false), edit),
+                (State::Attention, says.to_string())
+            );
+        }
+        // With sync off, the state is off.
+        assert_eq!(
+            with(stopped(3, false), &|f| f.sync_enabled = false),
+            (State::Off, "memory sync off".into())
+        );
+        // A notice whose folders are all mapped does not count.
+        assert_eq!(
+            with(stopped(0, false), &|_| {}),
+            (State::Synced, "memory synced".into())
+        );
+        assert_eq!(
+            with(stopped(0, false), &|f| f.folders = 0),
+            (State::Off, "memory: nothing mapped".into())
         );
     }
 

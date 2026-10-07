@@ -57,41 +57,93 @@ fn store_exclusions(db: &rusqlite::Connection, list: &[String]) -> Result<(), Ap
 }
 
 fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
-    let report =
-        meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
-    let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
-    let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
     use cordelia_storage::person::State;
-    let stands = match crate::at_relays::stands(&db) {
-        Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
-        Ok(crate::at_relays::Stands::Applied) => "applied",
-        Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
-        Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
-        Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
-        Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
-        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    // What a stored notice names is asked of the disk and of git once
+    // the database's lock is let go.
+    let (mut status, notices, last_dir) = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
+        let report =
+            meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+        let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
+        let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
+        let stands = match crate::at_relays::stands(&db) {
+            Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
+            Ok(crate::at_relays::Stands::Applied) => "applied",
+            Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
+            Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
+            Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
+            Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
+            Err(e) => return Err(ApiError::Internal(e.to_string())),
+        };
+        let status = SyncStatusResponse {
+            enabled: dir.is_some(),
+            dir,
+            // Whatever is stored: only mapped folders sync.
+            all: false,
+            mappings: mappings(&db)?,
+            exclude: exclusions(&db)?,
+            home,
+            home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
+            generation: state.sync_control.generation(),
+            report,
+            last_change_at,
+            stands,
+            held: state.held.why().map(|held| held.says().to_string()),
+            moved_on: crate::look::moved_on(&db)?,
+            notice: None,
+        };
+        let notices = cordelia_storage::first_start::notices(&db)?;
+        let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
+        (status, notices, last_dir)
     };
-    Ok(SyncStatusResponse {
-        enabled: dir.is_some(),
-        dir,
-        // Whatever is stored: only mapped folders sync.
-        all: false,
-        mappings: mappings(&db)?,
-        exclude: exclusions(&db)?,
-        home,
-        home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
-        generation: state.sync_control.generation(),
-        report,
-        last_change_at,
-        stands,
-        held: state.held.why().map(|held| held.says().to_string()),
-        moved_on: crate::look::moved_on(&db)?,
-    })
+    if !notices.is_empty() {
+        // Asked against the Claude Code directory that is set, or, with
+        // sync off, the one that turning sync on would use: the last one
+        // kept, or the default (decision 2026-10-04 §10.1).
+        let default = || {
+            std::env::var("HOME")
+                .map(|home| format!("{home}/.claude"))
+                .ok()
+        };
+        let against_dir = status
+            .dir
+            .clone()
+            .or(last_dir)
+            .or_else(default)
+            .unwrap_or_default();
+        let home = home_dir().ok();
+        let against = crate::found::Against {
+            claude_dir: std::path::Path::new(&against_dir),
+            home: home.as_deref(),
+            mappings: &status.mappings,
+        };
+        status.notice = crate::found::notice_shown(&notices, &against, &crate::found::Remembered);
+    }
+    Ok(status)
+}
+
+/// A person has seen the notice of what stopped syncing (decision
+/// 2026-10-04 §10.1): it is taken away, every record of it. This is the
+/// one request that takes it away. It counts no change of settings: a
+/// cycle that is running goes on, and what a report was made under is
+/// still what stands. With no notice stored it does nothing, and answers
+/// as done.
+pub async fn seen(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
+    auth::check_bearer(&req, &state)?;
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if cordelia_storage::first_start::clear_notices(&db)? {
+            tracing::info!("sync: the notice of what stopped syncing was seen, and is put away");
+        }
+    }
+    Ok(HttpResponse::Ok().json(status(&state)?))
 }
 
 /// What is stored as the scope: that only mapped folders sync. There is

@@ -261,7 +261,12 @@ enum SyncCommand {
     /// Stop syncing (files already synced are left in place)
     Off,
     /// Show what syncs, what was found, and what your other devices sync
-    Status,
+    Status {
+        /// Put away the notice of the folders that stopped syncing: you
+        /// have seen it
+        #[arg(long)]
+        seen: bool,
+    },
     /// Sync home-folder memory on this device, or not: `on` maps the home
     /// directory, and `off` unmaps it
     Home {
@@ -564,6 +569,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         for e in &status.facts.errors {
             details.push(format!("Error: {e}"));
         }
+        // The folders that stopped syncing, with sync on or off.
+        if let Some(sync) = &status.sync {
+            for stopped in notice_details(&sync["notice"]) {
+                details.push(format!("Stopped syncing: {stopped}"));
+            }
+        }
         let text = indicator::bar(state, &summary, &details);
         if !text.is_empty() {
             println!("{text}");
@@ -665,6 +676,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 "unsynced": report["unsynced"],
                 "excluded": report["excluded"],
                 "errors": status.facts.errors,
+                // The notice of the folders that stopped syncing, while
+                // the node stores one: null where it stores none.
+                "notice": sync["notice"],
             });
         }
         // The connected peers and this person's devices, for panels.
@@ -782,6 +796,19 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 for e in &status.facts.errors {
                     println!("    error:    {e}");
                 }
+                // The folders that stopped syncing, with sync on or off
+                // (decision 2026-10-04 §10.1).
+                let stopped = status
+                    .sync
+                    .as_ref()
+                    .map(|sync| notice_details(&sync["notice"]))
+                    .unwrap_or_default();
+                for folder in &stopped {
+                    println!("    stopped:  {folder}");
+                }
+                if !stopped.is_empty() {
+                    println!("              (`cordelia sync status` says how to map each)");
+                }
                 // What this device says of itself and its person's
                 // devices (decision 2026-10-04 §5.1, §5.2, §8).
                 let timeout = std::time::Duration::from_secs(3);
@@ -877,6 +904,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
         out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
         out.facts.moved_on = sync["moved_on"].as_bool().unwrap_or(false);
+        // The notice of what stopped syncing, while the node stores one.
+        let notice = &sync["notice"];
+        out.facts.notice = notice.is_object().then(|| indicator::Stopped {
+            folders: notice["stopped"].as_u64().unwrap_or(0) as usize,
+            not_known: notice["not_known"].as_bool() == Some(true),
+        });
         out.facts.report_age_secs = report["at"]
             .as_str()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
@@ -2604,7 +2637,8 @@ const NOT_SENT_TO_ANOTHER_VERSION: &str = "This command changes something, and i
 /// to restart the node.
 ///
 /// The commands that change something are every `sync` command but
-/// `status` and `off`, `restore`, `history drop`, `init --new-key`, and
+/// `status` (its `--seen` included) and `off`, `restore`, `history
+/// drop`, `init --new-key`, and
 /// each command of a person's devices but `devices` with no act. Turning
 /// sync off is sent to any node, and what only shows is answered beside
 /// one, with the note ([`note_another_version`]).
@@ -2707,7 +2741,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     // off is sent to any node, and what only shows is answered beside
     // one: each with the note, said first.
     match &what {
-        SyncCommand::Off | SyncCommand::Status => note_another_version(config_path),
+        SyncCommand::Off | SyncCommand::Status { .. } => note_another_version(config_path),
         _ => refuse_another_version(config_path)?,
     }
     let set = |body: serde_json::Value| api_post(config_path, "/api/v1/sync/claude", body);
@@ -3002,7 +3036,25 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             println!("Sync is off. Files already synced stay where they are.");
             return Ok(());
         }
-        SyncCommand::Status => since = None,
+        SyncCommand::Status { seen } => {
+            // The one act that takes the notice away: a request of its
+            // own, which changes no setting (decision 2026-10-04 §10.1).
+            if seen {
+                match api_post_told(
+                    config_path,
+                    "/api/v1/sync/seen",
+                    serde_json::json!({}),
+                    None,
+                )? {
+                    Told::Yes(_) => println!("{NOTICE_SEEN}\n"),
+                    // A node that has no such request is another
+                    // version: it must be restarted first.
+                    Told::No { status: 404, .. } => anyhow::bail!("{}", seen_is_not_known()),
+                    Told::No { message, .. } => anyhow::bail!("{message}"),
+                }
+            }
+            since = None;
+        }
         SyncCommand::Home { state } => {
             let on = state == "on";
             // The home directory's mapping, whatever name it has.
@@ -3058,6 +3110,229 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
         SyncCommand::Exclude { .. } | SyncCommand::Include { .. } => return Ok(()),
     }
     print_sync_scope(config_path, since)
+}
+
+/// What `cordelia sync status --seen` says once the node has put the
+/// notice away, or had none.
+const NOTICE_SEEN: &str = "The notice of the folders that stopped syncing is put away.";
+
+/// What `cordelia sync status --seen` says of a node that has no such
+/// request: it runs another version, and must be restarted first.
+fn seen_is_not_known() -> String {
+    format!(
+        "the running node has no such request: it is another version than this command, and \
+         must be restarted first. Where it runs as the service that the install script set up, \
+         restart it with `{}`; otherwise stop it and start it again.",
+        restart_command(std::env::consts::OS)
+    )
+}
+
+/// One folder that the notice names, as `cordelia sync status` prints
+/// it: the command that maps it, or why no command does (decision
+/// 2026-10-04 §10.1). `None` for a folder that is mapped since: nothing
+/// is printed for it.
+///
+/// **A command is printed only where it maps the folder that stopped,**
+/// and it carries the folder's name, the one it synced under: `map` with
+/// no name takes the remote as it is now, which may be another. For a
+/// tree laid out by hand there is no command: the row says that the
+/// layout no longer syncs, where the memory is, and the name it synced
+/// under. A folder that is not under the Claude Code directory which
+/// sync is set to has none either, and says which directory it synced
+/// under.
+fn notice_row(named: &serde_json::Value) -> Option<Vec<String>> {
+    use cordelia_sync::claude::HOME_NAME;
+    let is = |key: &str| named[key].as_bool() == Some(true);
+    if is("mapped") {
+        return None;
+    }
+    let folder = named["folder"].as_str().unwrap_or_default();
+    let name = named["name"].as_str();
+    let says = named["says"].as_str();
+    let synced_as = match name {
+        Some(name) => format!("synced as {}", sync_label(name)),
+        None => "synced under no name that was kept".to_string(),
+    };
+    let Some(cwd) = named["cwd"].as_str().filter(|_| is("mappable")) else {
+        let directory = named["directory"].as_str().or(named["cwd"].as_str());
+        let place = directory.map_or_else(|| short_path(folder), short_path);
+        return Some(match named["why_not"].as_str() {
+            Some("laid_out_by_hand") => vec![
+                format!("{}/memory", short_path(folder)),
+                synced_as,
+                "this layout no longer syncs, and no command maps it".to_string(),
+            ],
+            Some("another_claude_dir") => vec![
+                place,
+                synced_as,
+                match named["synced_under"].as_str() {
+                    Some(under) => format!(
+                        "it synced under {}, which sync is not set to",
+                        short_path(under)
+                    ),
+                    None => "it synced under another Claude Code directory".to_string(),
+                },
+            ],
+            _ => vec![
+                place,
+                synced_as,
+                says.unwrap_or("the node does not say whether `cordelia sync map` would sync it")
+                    .to_string(),
+            ],
+        });
+    };
+    // In its one spelling, as `map` sends a name that is typed.
+    let tidied = name.map(cordelia_core::sync_name::tidy);
+    let (what, command) = if is("home") {
+        let command = match tidied.as_deref() {
+            None | Some(HOME_NAME) => "cordelia sync map ~ --home".to_string(),
+            Some(name) => format!("cordelia sync map ~ {} --home", shell_word(name)),
+        };
+        (synced_as, command)
+    } else if is("needs_name") {
+        (
+            says.unwrap_or("needs a name").to_string(),
+            format!("cordelia sync map {} <name>", shell_arg(cwd)),
+        )
+    } else {
+        let name = tidied.unwrap_or_default();
+        (
+            synced_as,
+            format!("cordelia sync map {} {}", shell_arg(cwd), shell_word(&name)),
+        )
+    };
+    Some(vec![short_path(cwd), what, command])
+}
+
+/// The day of a time written as RFC 3339, for a person to read.
+fn day_of(at: &str) -> &str {
+    at.get(..10).unwrap_or(at)
+}
+
+/// What `cordelia sync status` says of the notice, first, with sync on
+/// and with it off (decision 2026-10-04 §10.1): each folder it names
+/// that is not mapped now, in rows ([`notice_row`]), with what is said
+/// before them and after. Empty where the node carries none.
+fn notice_lines(
+    notice: &serde_json::Value,
+    sync_on: bool,
+) -> (Vec<String>, Vec<Vec<String>>, Vec<String>) {
+    let Some(named) = notice["folders"].as_array() else {
+        return Default::default();
+    };
+    let rows: Vec<Vec<String>> = named.iter().filter_map(notice_row).collect();
+    let not_known = notice["not_known"].as_bool() == Some(true);
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    if rows.is_empty() && !not_known {
+        before.push(
+            "Every folder that stopped syncing on this device is mapped again. To put this \
+             notice away: cordelia sync status --seen"
+                .to_string(),
+        );
+        return (before, rows, after);
+    }
+    let since = notice["records"][0]["at"]
+        .as_str()
+        .map(day_of)
+        .unwrap_or("an earlier day");
+    match rows.len() {
+        0 => before.push(format!(
+            "Folders stopped syncing on this device ({since}): only mapped folders sync, and \
+             they had synced because everything found did."
+        )),
+        1 => before.push(format!(
+            "1 folder stopped syncing on this device ({since}): only mapped folders sync, and \
+             it had synced because everything found did."
+        )),
+        n => before.push(format!(
+            "{n} folders stopped syncing on this device ({since}): only mapped folders sync, \
+             and they had synced because everything found did."
+        )),
+    }
+    if !rows.is_empty() {
+        before.push(
+            "These synced in the last whole cycle before that; a folder that had synced \
+             earlier, and not then, is not listed. To sync one again, map it:"
+                .to_string(),
+        );
+    }
+    if not_known {
+        let days: Vec<&str> = notice["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|record| record["folders"].as_u64().unwrap_or(0) == 0)
+            .filter_map(|record| record["at"].as_str().map(day_of))
+            .collect();
+        after.push(format!(
+            "What stopped on {} is not known: no report of the last cycle was kept. What is \
+             found on this machine is listed {}, with the command that maps each folder.",
+            match days.is_empty() {
+                true => "one day".to_string(),
+                false => days.join(" and on "),
+            },
+            match sync_on {
+                true => "below",
+                false => "by `cordelia sync status` once sync is on",
+            }
+        ));
+    }
+    if !sync_on {
+        after.push(
+            "Sync is off: turn it on first (`cordelia sync claude`). `cordelia sync map` is \
+             refused until then."
+                .to_string(),
+        );
+    }
+    after.push("Once you have seen this: cordelia sync status --seen".to_string());
+    (before, rows, after)
+}
+
+/// Print the notice of what stopped syncing, where the node carries one
+/// ([`notice_lines`]).
+fn print_notice(status: &serde_json::Value) {
+    let sync_on = status["enabled"].as_bool() == Some(true);
+    let (before, rows, after) = notice_lines(&status["notice"], sync_on);
+    if before.is_empty() && rows.is_empty() && after.is_empty() {
+        return;
+    }
+    for line in &before {
+        println!("{line}");
+    }
+    print_columns(&rows);
+    for line in &after {
+        println!("{line}");
+    }
+    println!();
+}
+
+/// What a status says of the notice in a list of what holds: each folder
+/// that stopped syncing and is not mapped now, and that some are not
+/// known, where a record names none. For plain `cordelia status` and for
+/// a bar's tooltip.
+fn notice_details(notice: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = notice["folders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|named| named["mapped"].as_bool() != Some(true))
+        .map(|named| {
+            let place = named["cwd"]
+                .as_str()
+                .or(named["directory"].as_str())
+                .or(named["folder"].as_str())
+                .unwrap_or_default();
+            match named["name"].as_str() {
+                Some(name) => format!("{} ({})", short_path(place), sync_label(name)),
+                None => short_path(place),
+            }
+        })
+        .collect();
+    if notice["not_known"].as_bool() == Some(true) {
+        out.push("folders that are not known (no report of the last cycle was kept)".to_string());
+    }
+    out
 }
 
 /// What `--mapped-only` says: it is taken, and changes nothing that syncs.
@@ -3382,6 +3657,8 @@ fn map_would_sync_another(
 fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()> {
     let status = || api_post(config_path, "/api/v1/sync/status", serde_json::json!({}));
     let mut resp = status()?;
+    // What stopped syncing is said first, with sync on or off.
+    print_notice(&resp);
     if resp["enabled"].as_bool() != Some(true) {
         println!("Sync is off. Turn it on with `cordelia sync claude`.");
         return Ok(());
@@ -4216,6 +4493,206 @@ mod tests {
         assert!(
             why.contains("it is not under the Claude Code directory"),
             "{why}"
+        );
+    }
+
+    /// What `cordelia sync status` prints for the notice (decision
+    /// 2026-10-04 §10.1): a `map` command for each folder that can be
+    /// mapped, with the name it synced under; none for one that cannot,
+    /// with why; nothing for a folder that is mapped since; and with sync
+    /// off, to turn sync on first.
+    #[test]
+    fn test_the_notice_offers_map_for_each_folder_that_can_be_mapped() {
+        let home = real_home().display().to_string();
+        let claude = format!("{home}/.claude");
+        let folder = |name: &str| format!("{claude}/projects/{name}");
+        let named = serde_json::json!([
+            // Can be mapped: its command carries its name, tidied as
+            // `map` would send it.
+            { "folder": folder("-x-Work-cn"), "cwd": format!("{home}/Work/cn"),
+              "name": "github.com/o/cn.git", "mappable": true, "synced_under": claude,
+              "at": "2026-10-05T10:00:00Z" },
+            // Mapped since: nothing is printed for it.
+            { "folder": folder("-x-notes"), "cwd": null, "directory": format!("{home}/notes"),
+              "name": "lab", "mappable": false, "mapped": true },
+            // Needs a name: another folder is mapped under its own.
+            { "folder": folder("-x-src-cn"), "cwd": format!("{home}/src/cn"),
+              "name": "github.com/o/two", "mappable": true, "needs_name": true,
+              "says": "needs another name (its own is mapped from /x/two)" },
+            // The home directory's own folder, as `~` and under a name.
+            { "folder": folder("-x"), "cwd": home, "name": "~", "mappable": true, "home": true },
+            // A tree laid out by hand.
+            { "folder": folder("workspace"), "cwd": null, "directory": format!("{home}/Work/app"),
+              "name": "github.com/o/app", "mappable": false, "why_not": "laid_out_by_hand",
+              "says": "this layout cannot be mapped" },
+            // Under another Claude Code directory.
+            { "folder": "/srv/other/projects/-x-old", "cwd": null,
+              "directory": format!("{home}/old"), "name": "old", "mappable": false,
+              "why_not": "another_claude_dir", "synced_under": "/srv/other",
+              "says": "it is not under the Claude Code directory that sync is set to" },
+            // From a report of before mappings: no directory.
+            { "folder": folder("-x-before"), "cwd": null, "name": "github.com/o/before",
+              "mappable": false, "why_not": "no_directory", "says": "its directory is not known" },
+            // Its directory is gone.
+            { "folder": folder("-x-gone"), "cwd": null, "directory": format!("{home}/gone"),
+              "name": null, "mappable": false, "why_not": "directory_gone",
+              "says": "its directory is gone" },
+        ]);
+        let rows: Vec<Vec<String>> = named
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(notice_row)
+            .collect();
+        let want: Vec<Vec<&str>> = vec![
+            vec![
+                "~/Work/cn",
+                "synced as github.com/o/cn.git",
+                "cordelia sync map ~/Work/cn github.com/o/cn",
+            ],
+            vec![
+                "~/src/cn",
+                "needs another name (its own is mapped from /x/two)",
+                "cordelia sync map ~/src/cn <name>",
+            ],
+            vec!["~", "synced as home memory", "cordelia sync map ~ --home"],
+            vec![
+                "~/.claude/projects/workspace/memory",
+                "synced as github.com/o/app",
+                "this layout no longer syncs, and no command maps it",
+            ],
+            vec![
+                "~/old",
+                "synced as old",
+                "it synced under /srv/other, which sync is not set to",
+            ],
+            vec![
+                "~/.claude/projects/-x-before",
+                "synced as github.com/o/before",
+                "its directory is not known",
+            ],
+            vec![
+                "~/gone",
+                "synced under no name that was kept",
+                "its directory is gone",
+            ],
+        ];
+        assert_eq!(rows, want);
+        // Home under a name of its own: the command carries it.
+        let home_as = serde_json::json!({
+            "folder": folder("-x"), "cwd": home, "name": "team", "mappable": true, "home": true,
+        });
+        assert_eq!(
+            notice_row(&home_as).unwrap()[2],
+            "cordelia sync map ~ team --home"
+        );
+        // A name that a shell would read is quoted.
+        let odd = serde_json::json!({
+            "folder": folder("-x-odd"), "cwd": format!("{home}/odd"), "name": "a%b",
+            "mappable": true,
+        });
+        assert_eq!(
+            notice_row(&odd).unwrap()[2],
+            "cordelia sync map ~/odd 'a%b'"
+        );
+
+        // The whole of what is printed, with sync on.
+        let notice = serde_json::json!({
+            "records": [
+                { "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 8 },
+            ],
+            "not_known": false,
+            "dir": claude,
+            "stopped": 7,
+            "folders": named,
+        });
+        let (before, printed, after) = notice_lines(&notice, true);
+        assert!(
+            before[0].starts_with("7 folders stopped syncing on this device (2026-10-05)"),
+            "{before:?}"
+        );
+        assert!(before[1].contains("in the last whole cycle"), "{before:?}");
+        assert_eq!(printed, rows);
+        assert_eq!(
+            after,
+            ["Once you have seen this: cordelia sync status --seen"]
+        );
+        // With sync off: to turn sync on first, since `map` is refused.
+        let (_, printed, after) = notice_lines(&notice, false);
+        assert_eq!(printed, rows);
+        assert!(
+            after[0].starts_with("Sync is off: turn it on first"),
+            "{after:?}"
+        );
+        assert!(after[1].ends_with("cordelia sync status --seen"));
+
+        // A record with the date alone: what stopped is not known, and
+        // what is found is listed for it.
+        let unknown = serde_json::json!({
+            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": null }],
+            "not_known": true, "dir": claude, "stopped": 0, "folders": [],
+        });
+        let (before, printed, after) = notice_lines(&unknown, true);
+        assert!(
+            before[0].starts_with("Folders stopped syncing on this device"),
+            "{before:?}"
+        );
+        assert_eq!(before.len(), 1);
+        assert!(printed.is_empty());
+        assert!(
+            after[0].starts_with("What stopped on 2026-10-05 is not known"),
+            "{after:?}"
+        );
+        assert!(after[0].contains("listed below"), "{after:?}");
+        let (_, _, after) = notice_lines(&unknown, false);
+        assert!(after[0].contains("once sync is on"), "{after:?}");
+
+        // Every folder mapped since: only how to put it away.
+        let all_mapped = serde_json::json!({
+            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 1 }],
+            "not_known": false, "dir": claude, "stopped": 0,
+            "folders": [{ "folder": folder("-x-notes"), "cwd": null, "name": "lab",
+                          "mappable": false, "mapped": true }],
+        });
+        let (before, printed, after) = notice_lines(&all_mapped, true);
+        assert!(printed.is_empty() && after.is_empty());
+        assert!(before[0].contains("is mapped again"), "{before:?}");
+        assert!(before[0].ends_with("cordelia sync status --seen"));
+        // One folder is said as one.
+        let one = serde_json::json!({
+            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 1 }],
+            "not_known": false, "dir": claude, "stopped": 1, "folders": [odd],
+        });
+        assert!(notice_lines(&one, true).0[0].starts_with("1 folder stopped syncing"));
+        // No notice: nothing.
+        let none = notice_lines(&serde_json::Value::Null, true);
+        assert!(none.0.is_empty() && none.1.is_empty() && none.2.is_empty());
+
+        // Plain `cordelia status` and a bar's tooltip name each folder
+        // that is not mapped now, and say where some are not known.
+        let details = notice_details(&notice);
+        assert_eq!(details.len(), 7, "{details:?}");
+        assert_eq!(details[0], "~/Work/cn (github.com/o/cn.git)");
+        assert_eq!(details[2], "~ (home memory)");
+        assert_eq!(details[6], "~/gone");
+        assert!(!details.iter().any(|line| line.contains("~/notes")));
+        let details = notice_details(&unknown);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].starts_with("folders that are not known"));
+        assert!(notice_details(&all_mapped).is_empty());
+        assert!(notice_details(&serde_json::Value::Null).is_empty());
+    }
+
+    /// `cordelia sync status --seen` beside a node that has no such
+    /// request says that the node must be restarted, and how.
+    #[test]
+    fn test_seen_says_to_restart_a_node_that_has_no_such_request() {
+        let said = seen_is_not_known();
+        assert!(said.contains("has no such request"), "{said}");
+        assert!(said.contains("must be restarted first"), "{said}");
+        assert!(
+            said.contains(restart_command(std::env::consts::OS)),
+            "{said}"
         );
     }
 

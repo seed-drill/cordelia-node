@@ -1754,6 +1754,138 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     assert_eq!(body["mappings"].as_array().unwrap().len(), 2);
 }
 
+/// A notice that is stored is carried by the status, with sync on and
+/// with it off, and with what `cordelia sync map` would do now for each
+/// folder it names (decision 2026-10-04 §10.1). It is taken away by the
+/// one request that says a person has seen it, and by nothing else: not
+/// by turning sync off or on, not by a mapping, and not by what a client
+/// that knows nothing of it sends. That request counts no change of
+/// settings, and with no notice stored it does nothing and answers as
+/// done.
+#[actix_web::test]
+async fn test_a_notice_is_carried_until_a_person_says_it_was_seen() {
+    use cordelia_storage::meta;
+    let home = real_home();
+    let claude = format!("{home}/.claude-of-a-test");
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let folder_of = |dir: &str| {
+        let claude = std::path::Path::new(&claude);
+        let folder = cordelia_api::found::claude_folder(claude, std::path::Path::new(dir));
+        folder.unwrap().display().to_string()
+    };
+    let lib = format!("{home}/code/lib-of-a-test");
+    let by_hand = format!("{claude}/projects/workspace");
+    let notice = json!([
+        { "at": "2026-10-05T00:00:00Z", "dir": claude, "folders": [
+            { "folder": folder_of(&lib), "cwd": lib, "name": "github.com/o/lib" },
+            { "folder": by_hand, "cwd": format!("{home}/code/app"), "name": "github.com/o/app" },
+        ] },
+        { "at": "2026-10-06T00:00:00Z", "dir": claude, "folders": null },
+    ]);
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_NOTICE, &notice.to_string()).unwrap();
+        // Sync is off, and was last on for this directory.
+        meta::set(&db, meta::SYNC_CLAUDE_LAST_DIR, &claude).unwrap();
+    }
+
+    // With sync off: carried, and asked against the directory that
+    // turning sync on would use.
+    let (code, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["enabled"], false);
+    let shown = &body["notice"];
+    assert_eq!(shown["dir"], claude, "{body}");
+    assert_eq!(shown["not_known"], true);
+    assert_eq!(shown["stopped"], 2);
+    assert_eq!(shown["records"].as_array().unwrap().len(), 2);
+    assert_eq!(shown["records"][0]["folders"], 2);
+    assert!(shown["records"][1]["folders"].is_null());
+    // The directory of the first is gone on this machine: no command.
+    assert_eq!(shown["folders"][0]["why_not"], "directory_gone", "{body}");
+    assert!(shown["folders"][0]["cwd"].is_null());
+    assert_eq!(shown["folders"][0]["name"], "github.com/o/lib");
+    assert_eq!(shown["folders"][0]["synced_under"], claude);
+    assert_eq!(shown["folders"][1]["why_not"], "laid_out_by_hand");
+
+    // Nothing but the one request takes it away: turning sync on, what
+    // an earlier client sends with it, a mapping, an unmapping, and
+    // turning sync off.
+    let stored = || {
+        let db = state.db.lock().unwrap();
+        meta::get(&db, meta::SYNC_CLAUDE_NOTICE).unwrap()
+    };
+    let before = stored();
+    assert!(before.is_some());
+    let other = format!("{home}/code/other-of-a-test");
+    for (path, sent) in [
+        ("/api/v1/sync/claude", json!({ "enabled": true })),
+        (
+            "/api/v1/sync/claude",
+            json!({ "enabled": true, "all": false }),
+        ),
+        (
+            "/api/v1/sync/claude",
+            json!({ "enabled": true, "home": true, "exclude": ["github.com/o/lib"] }),
+        ),
+        (
+            "/api/v1/sync/map",
+            json!({ "folder": other, "name": "other" }),
+        ),
+        ("/api/v1/sync/unmap", json!({ "folder": "other" })),
+        ("/api/v1/sync/status", json!({})),
+    ] {
+        let (code, body) = sync_post!(&app, path, sent);
+        assert_eq!(code, 200, "{path}: {body}");
+        assert_eq!(stored(), before, "{path}");
+        assert_eq!(body["notice"]["stopped"], 2, "{path}: {body}");
+        assert_eq!(body["notice"]["dir"], claude, "{path}: {body}");
+    }
+    // A folder that is mapped since is stopped no longer. (Its directory
+    // is gone here, so it is mapped as a person would map it once it is
+    // back: by its directory.)
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": lib, "name": "github.com/o/lib" })
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["notice"]["stopped"], 1, "{body}");
+    assert_eq!(body["notice"]["folders"][0]["mapped"], true, "{body}");
+    assert!(body["notice"]["folders"][0]["cwd"].is_null(), "{body}");
+    let (code, body) = sync_post!(&app, "/api/v1/sync/claude", json!({ "enabled": false }));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(stored(), before);
+    assert_eq!(body["notice"]["records"].as_array().unwrap().len(), 2);
+
+    // Seen: it is gone, and no change of settings is counted.
+    let generation = state.sync_control.generation();
+    let (code, body) = sync_post!(&app, "/api/v1/sync/seen", json!({}));
+    assert_eq!(code, 200, "{body}");
+    assert!(body.get("notice").is_none(), "{body}");
+    assert_eq!(stored(), None);
+    assert_eq!(state.sync_control.generation(), generation);
+    assert_eq!(body["generation"].as_u64(), Some(generation));
+    // With none stored it does nothing, and answers as done.
+    let (code, body) = sync_post!(&app, "/api/v1/sync/seen", json!({}));
+    assert_eq!(code, 200, "{body}");
+    assert!(body.get("notice").is_none(), "{body}");
+    assert_eq!(state.sync_control.generation(), generation);
+    // It needs the node's token, as every request does.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sync/seen")
+        .set_json(json!({}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
 /// The node's status says for how long no relay has been connected, by
 /// its own clock (decision 2026-10-04 §10.1): nothing before the node
 /// has looked, nothing while one is connected, and a number of seconds
