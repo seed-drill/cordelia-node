@@ -1028,6 +1028,88 @@ fn a_recovery_reads_more_names_than_one_connection_has_places_for() {
     );
 }
 
+/// **A proof goes with the session it was made over** (decision
+/// 2026-10-04 §16). The command is told the session of each relay's
+/// connection before it asks for the phrase. Here the relay is stopped
+/// and started while the command waits for the phrase, so the connection
+/// that the machine has when the words are typed is another one.
+///
+/// The node does not send a proof on a connection that it was not made
+/// for: it says that the connection changed. The command asks for the
+/// sessions again, makes its proofs again, and reads: the recovery goes
+/// on, and every file comes back. A relay is never said to hold nothing
+/// of the phrase for this.
+#[test]
+fn a_recovery_reads_at_a_connection_that_changed_after_its_session_was_said() {
+    let mut relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let memory = syncs_lab(&laptop);
+    std::fs::write(memory.join("a.md"), ON_THE_LAPTOP).unwrap();
+    wait_for(
+        "the relay was sent the file",
+        &[&relay, &laptop],
+        180,
+        || {
+            (text_of(&laptop, "a.md")? == ON_THE_LAPTOP)
+                .then_some(())
+                .and(has_sent_everything(&laptop))
+        },
+    );
+    laptop.stop();
+
+    let new = device_started("new", &relay);
+    let session_now = |n: &Node| -> Option<String> {
+        let said = n.post("/api/v1/carry/sessions", json!({}));
+        assert_eq!(said["sessions"].as_array().unwrap().len(), 1, "{said}");
+        said["sessions"][0]["session"].as_str().map(str::to_string)
+    };
+    let through = PassesOn::to(new.http);
+    let mut at = new.at_terminal_through(through.port, &["recover", "--name", "new"]);
+    at.says("The recovery phrase, twelve words");
+    // The command was told the session of the connection there is now.
+    let before = session_now(&new).expect("the relay is connected");
+
+    // The relay goes and comes back: the machine has another connection
+    // to it, with a session of its own.
+    relay.stop();
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    let after = wait_for("the connection is another", &[&new, &relay], 90, || {
+        session_now(&new).filter(|session| *session != before)
+    });
+
+    at.types(&words);
+    answers_and_yes(&mut at, &["lost"]);
+    at.says("The change is made (change 2)")
+        .says("The look is made: 1 name read, and 1 version carried, in 1 name.");
+    let said = at.done();
+    println!("{said}");
+    assert!(!said.contains("Could not read"), "{said}");
+    assert!(!said.contains("holds a change"), "{said}");
+    assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
+
+    // What crossed to the node: the first proof was made over the
+    // session from before, and said so; the sessions were asked for
+    // again; and the proofs after that were made over the new one.
+    let made_over: Vec<String> = through
+        .bodies("/api/v1/carry/read")
+        .iter()
+        .map(|body| {
+            let proofs = body["proofs"].as_array().unwrap();
+            assert_eq!(proofs.len(), 1, "{body}");
+            proofs[0]["session"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(made_over.len() >= 2, "{made_over:?}");
+    assert_eq!(made_over[0], before);
+    assert!(
+        made_over[1..].iter().all(|session| *session == after),
+        "{made_over:?} {after}"
+    );
+    assert_eq!(through.bodies("/api/v1/carry/sessions").len(), 1);
+}
+
 /// A recovery that is cut short, and the one after it (decision
 /// 2026-10-04 §9). The relay has no room for a new channel: it takes the
 /// first machine's change entry, which needs none, and nothing that the

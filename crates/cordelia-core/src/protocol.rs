@@ -1656,6 +1656,14 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
 
+/// How often a command that was typed the phrase makes its proofs again
+/// for one channel, at most (decision 2026-10-04 §16): a proof holds on
+/// the connection whose session it was made over, and where the node
+/// says that a connection has changed since, the command asks for the
+/// sessions again and makes the proofs anew. After the second time it
+/// says which relay it could not read.
+pub const CARRY_PROOFS_MADE_AGAIN: usize = 2;
+
 /// The label under which the key of one run of a command signs a batch
 /// of versions that it hands the node on the phrase's word (decision
 /// 2026-10-04 §16): the batch's number, and the hash of its versions as
@@ -2373,6 +2381,7 @@ mod tests {
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
         assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
+        assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
         assert!(LABELS.contains(&LABEL_CARRY_BATCH));
         assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
         // A part holds an entry of any size that a channel carries.

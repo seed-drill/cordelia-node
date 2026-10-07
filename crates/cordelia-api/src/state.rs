@@ -249,7 +249,20 @@ pub enum ProvedBy {
     /// for each relay by its name: the command that was typed the phrase,
     /// in its own process, over the value of each connection's session
     /// ([`DoorAsk::Sessions`]). The node is handed no secret.
-    Proofs(Vec<(String, [u8; 64])>),
+    Proofs(Vec<ProofMade>),
+}
+
+/// A proof of a channel's key that a command made for the connection to
+/// one relay (decision 2026-10-04 §16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofMade {
+    /// The relay, by its name.
+    pub relay: String,
+    /// The value of the session that the proof was made over. It holds
+    /// on the connection with that session, and on no other: where the
+    /// relay's connection has another by now, the proof is not sent.
+    pub session: [u8; 32],
+    pub proof: [u8; 64],
 }
 
 /// What one relay handed through the door for a carry.
@@ -263,9 +276,10 @@ pub enum LeftRead {
     /// Nothing was read, and why.
     NotRead(String),
     /// Nothing was read: the connection is another than the one that
-    /// the proofs were made for. Whoever made them makes them again, for
-    /// the connection there is now. It is never taken for a relay that
-    /// holds none.
+    /// the proof was made for, or there was none when the proofs were
+    /// made (decision 2026-10-04 §16). Whoever made them asks for the
+    /// sessions again and makes them again, for the connection there is
+    /// now. It is never taken for a relay that holds none.
     Changed,
     /// Nothing was read: the connection has no room left for a proof
     /// more. A relay remembers so many channels for one connection, and

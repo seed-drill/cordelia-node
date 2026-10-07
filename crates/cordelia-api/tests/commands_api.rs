@@ -408,6 +408,7 @@ fn routes() -> Vec<(&'static str, Value)> {
         ("/api/v1/carry/from/look", json!({ "name": "lab" })),
         ("/api/v1/carry/from", json!({ "word": no_word() })),
         ("/api/v1/carry/phrase/look", json!({ "name": "lab" })),
+        ("/api/v1/carry/sessions", json!({})),
         (
             "/api/v1/carry/read",
             json!({ "channel": "00", "proofs": [] }),
@@ -529,6 +530,29 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     // Asked again, the name is held already.
     let (_, said) = asks!(app, "/api/v1/carry", carry);
     assert_eq!(said["held_anew"], false);
+
+    // The sessions, at the route where a command asks for them again
+    // once a connection has changed (§16): with no network, none. And a
+    // proof is handed with the session that it was made over: one that
+    // says what is no session is refused.
+    let (status, said) = asks!(app, "/api/v1/carry/sessions", json!({}));
+    assert_eq!((status, &said["sessions"]), (200, &json!([])), "{said}");
+    let read = |session: String| {
+        let proof = json!({
+            "relay": "relay", "session": session, "proof": hex::encode([0u8; 64]),
+        });
+        json!({ "channel": hex::encode([7u8; 32]), "proofs": [proof] })
+    };
+    let (status, said) = asks!(app, "/api/v1/carry/read", read("0102".into()));
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string()
+            .contains("a session is not as many bytes in hex"),
+        "{said}"
+    );
+    let (status, said) = asks!(app, "/api/v1/carry/read", read(hex::encode([1u8; 32])));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!((&said["relays"], &said["entries"]), (&json!([]), &json!(0)));
 }
 
 /// A recovery, at the routes (decision 2026-10-04 §9, steps 4 and 5).

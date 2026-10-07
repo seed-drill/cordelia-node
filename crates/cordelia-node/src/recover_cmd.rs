@@ -62,9 +62,9 @@ use cordelia_core::protocol::{
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
-use cordelia_crypto::{derive, fingerprint, proof};
+use cordelia_crypto::{derive, fingerprint};
 
-use crate::carry_cmd::read_through_the_node;
+use crate::carry_cmd::{Sessions, read_with_secret};
 use crate::person_cmd::{
     NOT_A_YES, counted, default_label, file_shown, list, look, made_all_the_same, named,
     names_this_device, own_key, text, time_of, typed_phrase,
@@ -144,43 +144,69 @@ fn told(asked: anyhow::Result<Told>) -> anyhow::Result<Value> {
     }
 }
 
-/// A proof of the key of the channel whose secret is `secret`, for each
-/// connection that has a session, as the node is handed them.
-fn proofs_for(
-    secret: &[u8; 32],
-    sessions: &[(String, [u8; 32])],
-    own: &[u8; 32],
-) -> anyhow::Result<Vec<Value>> {
-    let mut proofs = Vec::new();
-    for (relay, session) in sessions {
-        let proof = proof::make(secret, session, own)?;
-        proofs.push(json!({ "relay": relay, "proof": hex::encode(proof) }));
-    }
-    Ok(proofs)
-}
-
 /// Read the channel whose secret is `secret` at every relay, through the
-/// node, and say of which relay it could not be read to its end.
+/// node, and say of which relay it could not be read to its end. The
+/// proofs are made over `sessions`: where a connection has changed since
+/// those were said, they are asked for again, and the proofs are made
+/// again ([`read_with_secret`], decision 2026-10-04 §16).
 fn read_channel(
     config_path: &str,
     secret: &[u8; 32],
-    sessions: &[(String, [u8; 32])],
+    sessions: &mut Sessions,
     own: &[u8; 32],
     what: &str,
 ) -> anyhow::Result<Vec<CheckedEntry>> {
-    let channel = derive::channel_id(secret)?;
-    let proofs = proofs_for(secret, sessions, own)?;
-    let (entries, relays) = read_through_the_node(config_path, &channel, proofs)?;
-    for relay in &relays {
-        let read = text(relay, "read");
-        if !matches!(read, "whole" | "not held") {
-            println!(
-                "  Could not read {what} at {} to its end ({read}).",
-                text(relay, "relay")
-            );
-        }
+    Ok(read_and_not_read(config_path, secret, sessions, own, what)?.0)
+}
+
+/// [`read_channel`], with the relays at which the channel could not be
+/// read to its end, each by its name.
+fn read_and_not_read(
+    config_path: &str,
+    secret: &[u8; 32],
+    sessions: &mut Sessions,
+    own: &[u8; 32],
+    what: &str,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>)> {
+    let (entries, relays) = read_with_secret(config_path, secret, sessions, own)?;
+    let not_read = not_read_to_its_end(&relays);
+    for (relay, read) in &not_read {
+        println!("  Could not read {what} at {relay} to its end ({read}).");
     }
-    Ok(entries)
+    let not_read = not_read.into_iter().map(|(relay, _)| relay).collect();
+    Ok((entries, not_read))
+}
+
+/// Of what the node says of each relay, those at which a channel could
+/// not be read to its end, with what is said of each: a relay that
+/// handed the channel whole, or holds none of it, is not among them.
+fn not_read_to_its_end(relays: &[Value]) -> Vec<(String, String)> {
+    relays
+        .iter()
+        .filter(|relay| !matches!(text(relay, "read"), "whole" | "not held"))
+        .map(|relay| (text(relay, "relay").into(), text(relay, "read").into()))
+        .collect()
+}
+
+/// What is said where no change of the phrase was found (decision
+/// 2026-10-04 §9, §16). Where every relay that was reached was read to
+/// its end, none of them holds one. **Where one could not be read, that
+/// is what is said, with the relay's name:** it is never said to hold
+/// none for that.
+fn none_found_says(not_read: &[String]) -> String {
+    if not_read.is_empty() {
+        return "no relay that was reached holds a change of this recovery phrase: there is \
+                nothing to recover from. Either these are not the words of your devices' phrase, \
+                or the relays have dropped what they held: a relay keeps what nobody has used \
+                for 90 days, and no longer. Nothing was done."
+            .to_string();
+    }
+    format!(
+        "the recovery phrase's own channel could not be read to its end at {}, and no change of \
+         this recovery phrase was found in what was read: whether a relay holds one is not \
+         known. Run `cordelia recover` again. Nothing was done.",
+        not_read.join(", ")
+    )
 }
 
 /// A statement's lists, a line each, read from the statement: each key
@@ -375,7 +401,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let maker = Device::new(own, &label)?;
 
     // The relays that the machine is set up with, and which is reached.
-    let mut sessions: Vec<(String, [u8; 32])> = Vec::new();
+    let mut sessions: Sessions = Vec::new();
     for relay in list(&asked, "sessions") {
         match relay["session"].as_str().and_then(carry::key_named) {
             Some(session) => sessions.push((text(relay, "relay").to_string(), session)),
@@ -395,9 +421,9 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let handed = {
+    let (handed, not_read) = {
         let secret = phrase.channel_secret()?;
-        read_channel(config_path, &secret, &sessions, &own, "it")?
+        read_and_not_read(config_path, &secret, &mut sessions, &own, "it")?
     };
 
     // 2. The change entry with the highest number, of those whose
@@ -410,12 +436,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         })
         .collect();
     let Some(found) = recover::found(candidates) else {
-        anyhow::bail!(
-            "no relay that was reached holds a change of this recovery phrase: there is nothing \
-             to recover from. Either these are not the words of your devices' phrase, or the \
-             relays have dropped what they held: a relay keeps what nobody has used for 90 days, \
-             and no longer. Nothing was done."
-        );
+        anyhow::bail!("{}", none_found_says(&not_read));
     };
     let (from, apart) = match found.apart.first() {
         None => (found.from, None),
@@ -473,7 +494,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         let handed = read_channel(
             config_path,
             &personal,
-            &sessions,
+            &mut sessions,
             &own,
             "the personal channel",
         )?;
@@ -543,7 +564,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     for earlier in &for_phrase.earlier {
         let personal = Zeroizing::new(derive::personal_secret(&earlier.secret)?);
         let what = format!("the personal channel of change {}", earlier.number);
-        let handed = read_channel(config_path, &personal, &sessions, &own, &what)?;
+        let handed = read_channel(config_path, &personal, &mut sessions, &own, &what)?;
         before.push(recover::names_before(
             &handed,
             &earlier.secret,
@@ -1014,6 +1035,48 @@ mod tests {
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
         let says = row_says(&odd, 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
+    }
+
+    /// Where no change of the phrase was found and a relay could not be
+    /// read to its end, the command says which relay, and that it is not
+    /// known whether one holds a change (decision 2026-10-04 §16): it
+    /// says that no relay holds one only where each was read to its end.
+    #[test]
+    fn test_a_relay_that_was_not_read_is_never_said_to_hold_no_change() {
+        let said = |relay: &str, read: &str| json!({ "relay": relay, "read": read });
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let relays = [
+            said("one", "whole"),
+            said("two", changed),
+            said("three", "not held"),
+            said("four", "part"),
+        ];
+        let not_read = not_read_to_its_end(&relays);
+        assert_eq!(
+            not_read,
+            [
+                ("two".to_string(), changed.to_string()),
+                ("four".to_string(), "part".to_string())
+            ]
+        );
+        let names: Vec<String> = not_read.into_iter().map(|(relay, _)| relay).collect();
+        let says = none_found_says(&names);
+        assert!(
+            says.starts_with(
+                "the recovery phrase's own channel could not be read to its end at two, four, \
+                 and no change of this recovery phrase was found in what was read"
+            ),
+            "{says}"
+        );
+        assert!(says.contains("whether a relay holds one is not known"));
+        assert!(!says.contains("no relay that was reached holds"), "{says}");
+        assert!(says.ends_with("Nothing was done."));
+        let none = none_found_says(&[]);
+        assert!(
+            none.starts_with("no relay that was reached holds a change of this recovery phrase"),
+            "{none}"
+        );
+        assert!(none.ends_with("Nothing was done."));
     }
 
     /// Where the answers could not all be kept, that is said before the

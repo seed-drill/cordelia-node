@@ -487,18 +487,28 @@ impl DeviceEntries {
                     }
                     // The proof for this connection: made here where the
                     // node holds the channel's secret, and otherwise the
-                    // one that was made for this relay.
-                    let proof = match &by {
-                        ProvedBy::Secret(secret) => link.session().and_then(|session| {
-                            cordelia_crypto::proof::make(secret, &session, &own).ok()
-                        }),
-                        ProvedBy::Proofs(proofs) => proofs
-                            .iter()
-                            .find(|(relay, _)| *relay == name)
-                            .map(|(_, proof)| *proof),
+                    // one that was made for this relay, over the value
+                    // of this very connection's session (§16). A proof
+                    // that was made over another session holds nowhere
+                    // now, and is not sent: the relay would answer it as
+                    // it answers for a channel that it does not hold.
+                    let session = link.session();
+                    let (proof, read_as) = match &by {
+                        ProvedBy::Secret(secret) => {
+                            let made = session.and_then(|session| {
+                                cordelia_crypto::proof::make(secret, &session, &own).ok()
+                            });
+                            let none = LeftRead::NotRead("no proof for this connection".into());
+                            (made, none)
+                        }
+                        ProvedBy::Proofs(proofs) => {
+                            let made = proofs
+                                .iter()
+                                .find(|made| made.relay == name && Some(made.session) == session);
+                            (made.map(|made| made.proof), LeftRead::Changed)
+                        }
                     };
                     let Some(proof) = proof else {
-                        let read_as = LeftRead::NotRead("no proof for this connection".into());
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,

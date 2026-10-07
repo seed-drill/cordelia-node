@@ -155,6 +155,7 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/from/look", web::post().to(carrying::from_look))
             .route("/from", web::post().to(carrying::from_take))
             .route("/phrase/look", web::post().to(carrying::phrase_look))
+            .route("/sessions", web::post().to(carrying::sessions_now))
             .route("/read", web::post().to(carrying::read_proved))
             .route("/read/part", web::post().to(carrying::read_part))
             .route("/handed", web::post().to(carrying::handed_take)),

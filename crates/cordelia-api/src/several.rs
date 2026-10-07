@@ -594,6 +594,24 @@ impl Node {
                             read: LeftRead::NoRoom,
                         }]);
                     }
+                    // Proofs that were made over another session than
+                    // the connection's hold nowhere: the connection
+                    // changed.
+                    DoorAsk::Read {
+                        by: ProvedBy::Proofs(made),
+                        answer,
+                        ..
+                    } if !made.iter().any(|made| {
+                        made.relay == "relay"
+                            && made.session == session_after(made_again.load(SeqCst))
+                    }) =>
+                    {
+                        order.lock().unwrap().push("changed");
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read: LeftRead::Changed,
+                        }]);
+                    }
                     DoorAsk::Read {
                         channel,
                         by,

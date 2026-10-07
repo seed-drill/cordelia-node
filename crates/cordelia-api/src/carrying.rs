@@ -64,7 +64,7 @@ use crate::commands::{self, Waited};
 use crate::error::ApiError;
 use crate::names;
 use crate::person::{self, Held, PersonError};
-use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProvedBy};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy};
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -210,6 +210,11 @@ pub async fn sessions(state: &AppState) -> Vec<(String, Option<[u8; 32]>)> {
     }
 }
 
+/// What is said of a relay whose connection is another than the one
+/// that a command made its proof for (decision 2026-10-04 §16): the
+/// command then asks for the sessions again, and makes its proofs again.
+pub const CONNECTION_CHANGED: &str = "not read: the connection changed";
+
 /// What is said where the new channel could not be fetched whole before
 /// a carry ([`fetched_whole`]).
 pub const NEW_CHANNEL_NOT_READ: &str = "the new channel could not be read at a relay (no relay \
@@ -266,7 +271,7 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
             LeftRead::NotReached => "not reached".to_string(),
             LeftRead::NotHeld => "not held".to_string(),
             LeftRead::NotRead(why) => format!("not read: {why}"),
-            LeftRead::Changed => "not read: the connection changed".to_string(),
+            LeftRead::Changed => CONNECTION_CHANGED.to_string(),
             LeftRead::NoRoom => "not read: the connection has no room left for a proof".to_string(),
             LeftRead::Read {
                 entries: wire,
@@ -979,6 +984,10 @@ pub(crate) fn sessions_say(sessions: &[(String, Option<[u8; 32]>)]) -> Vec<serde
 pub struct ProofFor {
     /// The relay, by its name.
     pub relay: String,
+    /// The value of the session that the proof was made over, in hex,
+    /// as the node said it ([`sessions`]): the proof is for the
+    /// connection with that session, and for no other.
+    pub session: String,
     /// The proof for the connection to it, in hex.
     pub proof: String,
 }
@@ -1000,6 +1009,13 @@ pub struct ReadRequest {
 /// none.** It proves and pulls, through the one door for a carry, and
 /// hands back what each relay handed, as it came.
 ///
+/// **Each proof goes with the value of the session that it was made
+/// over** (decision 2026-10-04 §16). Where the connection to a relay has
+/// another session by now, or there was none when the proofs were made,
+/// the relay is said to be one whose connection changed: the command
+/// asks for the sessions again ([`sessions_now`]) and makes its proofs
+/// again. It is never said to hold none for that.
+///
 /// Answers with what is said of each relay, how many entries were
 /// handed, and what the reading is named by: the entries themselves are
 /// handed a part at a time ([`read_part`]). A channel of this device's
@@ -1007,7 +1023,7 @@ pub struct ReadRequest {
 pub async fn read_with_proofs(
     state: &AppState,
     channel: [u8; 32],
-    proofs: Vec<(String, [u8; 64])>,
+    proofs: Vec<ProofMade>,
 ) -> serde_json::Value {
     let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     let at = read_at_relays(state, channel, ProvedBy::Proofs(proofs), until).await;
@@ -1037,15 +1053,35 @@ pub async fn read_proved(
     commands::asked(&req, &state)?;
     let bad = |what: &str| ApiError::BadRequest(format!("{what} is not as many bytes in hex"));
     let channel: [u8; 32] = carry::key_named(&body.channel).ok_or_else(|| bad("channel"))?;
-    let mut proofs: Vec<(String, [u8; 64])> = Vec::new();
-    for proof in &body.proofs {
-        let bytes: [u8; 64] = hex::decode(&proof.proof)
+    let mut proofs: Vec<ProofMade> = Vec::new();
+    for made in &body.proofs {
+        let proof: [u8; 64] = hex::decode(&made.proof)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| bad("a proof"))?;
-        proofs.push((proof.relay.clone(), bytes));
+        let session = carry::key_named(&made.session).ok_or_else(|| bad("a session"))?;
+        proofs.push(ProofMade {
+            relay: made.relay.clone(),
+            session,
+            proof,
+        });
     }
     Ok(HttpResponse::Ok().json(read_with_proofs(&state, channel, proofs).await))
+}
+
+/// `POST /api/v1/carry/sessions`: each relay that the device is set up
+/// with, with the value of the session of its connection now, where it
+/// has one ([`sessions`]). A command that was told that a connection
+/// changed asks here, and makes its proofs again over what it is told
+/// (decision 2026-10-04 §16). It is asked on a device that follows no
+/// phrase too: a recovery reads so.
+pub async fn sessions_now(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    commands::asked(&req, &state)?;
+    let sessions = sessions(&state).await;
+    Ok(HttpResponse::Ok().json(json!({ "sessions": sessions_say(&sessions) })))
 }
 
 #[derive(Deserialize)]
@@ -1621,18 +1657,41 @@ mod tests {
         node.did.lock().unwrap().clear();
         node.no_room.store(1, SeqCst);
         let channel = derive::channel_id(&old).unwrap();
-        let session = crate::several::session_after(2);
-        let proof = cordelia_crypto::proof::make(&old, &session, &own).unwrap();
-        let read = read_with_proofs(&node.state, channel, vec![("relay".into(), proof)]).await;
+        let made_over = |session: [u8; 32]| {
+            vec![ProofMade {
+                relay: "relay".into(),
+                session,
+                proof: cordelia_crypto::proof::make(&old, &session, &own).unwrap(),
+            }]
+        };
+        let before = crate::several::session_after(2);
+        let read = read_with_proofs(&node.state, channel, made_over(before)).await;
         assert_eq!(*node.did.lock().unwrap(), ["no room", "remake"]);
         assert_eq!(read["entries"], 0, "{read}");
-        assert_eq!(
-            read["relays"],
-            json!([{ "relay": "relay", "read": "not read: the connection changed" }])
-        );
+        let changed = json!([{ "relay": "relay", "read": CONNECTION_CHANGED }]);
+        assert_eq!(CONNECTION_CHANGED, "not read: the connection changed");
+        assert_eq!(read["relays"], changed);
+        let now = crate::several::session_after(3);
         assert_eq!(
             sessions(&node.state).await,
-            [("relay".to_string(), Some(crate::several::session_after(3)))]
+            [("relay".to_string(), Some(now))]
+        );
+
+        // **A proof goes with the session it was made over** (§16): one
+        // that was made for the connection from before is not sent on
+        // the one there is now, and the relay is said to be one whose
+        // connection changed. With proofs made again over the session
+        // that the node says now, the channel is read.
+        node.did.lock().unwrap().clear();
+        let read = read_with_proofs(&node.state, channel, made_over(before)).await;
+        assert_eq!(*node.did.lock().unwrap(), ["changed"]);
+        assert_eq!((&read["entries"], &read["relays"]), (&json!(0), &changed));
+        let read = read_with_proofs(&node.state, channel, made_over(now)).await;
+        assert_eq!(*node.did.lock().unwrap(), ["changed", "read"]);
+        assert_eq!(read["entries"], 1, "{read}");
+        assert_eq!(
+            read["relays"],
+            json!([{ "relay": "relay", "read": "whole" }])
         );
 
         // The read goes on only once the connection is another: while
@@ -1766,7 +1825,12 @@ mod tests {
         let proof = cordelia_crypto::proof::make(&first, &SESSION, &own).unwrap();
         let channel = derive::channel_id(&first).unwrap();
         node.asked.lock().unwrap().clear();
-        let read = read_with_proofs(&node.state, channel, vec![("relay".into(), proof)]).await;
+        let made = ProofMade {
+            relay: "relay".into(),
+            session: SESSION,
+            proof,
+        };
+        let read = read_with_proofs(&node.state, channel, vec![made]).await;
         assert_eq!(read["entries"], 3, "{read}");
         assert_eq!(
             read["relays"],

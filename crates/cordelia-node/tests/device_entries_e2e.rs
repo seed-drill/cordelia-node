@@ -24,7 +24,7 @@ use cordelia_api::change::make_change;
 use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProvedBy,
+    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy,
 };
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
@@ -4388,22 +4388,33 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
     let (name, session) = (&sessions[0].0, sessions[0].1.unwrap());
     assert_eq!(name, "relay");
     let proof = cordelia_crypto::proof::make(&old_secret, &session, &a.key()).unwrap();
-    let by_proof = ProvedBy::Proofs(vec![("relay".into(), proof)]);
-    let read = reads_left(&a, old, by_proof).await;
+    let made = |relay: &str, session: [u8; 32], proof: [u8; 64]| {
+        ProvedBy::Proofs(vec![ProofMade {
+            relay: relay.into(),
+            session,
+            proof,
+        }])
+    };
+    let read = reads_left(&a, old, made("relay", session, proof)).await;
     assert_eq!(
         handed_ids(&read[0].read),
         Some((at_the_relay.clone(), true))
     );
     let for_another = cordelia_crypto::proof::make(&old_secret, &session, &new.key()).unwrap();
-    let read = reads_left(
-        &a,
-        old,
-        ProvedBy::Proofs(vec![("relay".into(), for_another)]),
-    )
-    .await;
+    let read = reads_left(&a, old, made("relay", session, for_another)).await;
     assert_eq!(read[0].read, LeftRead::NotHeld);
-    let read = reads_left(&a, old, ProvedBy::Proofs(vec![("other".into(), proof)])).await;
-    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("no proof")));
+    // **A proof goes with the session that it was made over** (§16),
+    // and is sent on the connection with that session alone. One that
+    // is said to be made over another is not sent, though it would
+    // hold: the relay is answered for as one whose connection changed,
+    // and never as one that holds none. So is a relay that no proof
+    // was made for: it had no connection when the proofs were made.
+    let pulled = a.counts("relay").pulled;
+    let read = reads_left(&a, old, made("relay", [7; 32], proof)).await;
+    assert_eq!(read[0].read, LeftRead::Changed);
+    let read = reads_left(&a, old, made("other", session, proof)).await;
+    assert_eq!(read[0].read, LeftRead::Changed);
+    assert_eq!(a.counts("relay").pulled, pulled);
 
     // A channel that the relay does not hold, and a secret that is not
     // the channel's: no, with nothing handed.
