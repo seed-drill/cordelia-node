@@ -16,6 +16,7 @@ mod history_cmd;
 mod indicator;
 mod p2p;
 mod person_cmd;
+mod recover_cmd;
 mod relay_entries;
 mod terminal;
 
@@ -131,6 +132,28 @@ enum Commands {
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
     Settle,
+    /// Recover on this machine, with the recovery phrase, when you have
+    /// no device left that you trust: it stops every other device, and
+    /// brings back what the relays hold. If a device of yours remains,
+    /// remove the one that is gone from it instead. Asks at a terminal.
+    Recover {
+        /// What your devices call this machine, e.g. "laptop" (default:
+        /// the machine's name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// After a recovery is made: say what the look found, and what is
+    /// still to send. It is what `recover` goes on to, in a process that
+    /// never held the phrase.
+    #[command(hide = true)]
+    RecoverMade {
+        /// The change's number
+        number: u64,
+        /// The device that was recovered from, where it never wrote that
+        /// it had sent what it carried
+        #[arg(long)]
+        cut_short: Option<String>,
+    },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
     /// `settle` go on to, in a process that never held the phrase.
@@ -344,6 +367,10 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
+        Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
+        Some(Commands::RecoverMade { number, cut_short }) => {
+            recover_cmd::recover_made(&cli.config, number, cut_short)
+        }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::History {

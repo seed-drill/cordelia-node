@@ -124,7 +124,7 @@ pub(crate) fn text<'a>(value: &'a Value, field: &str) -> &'a str {
 /// `false` says that this could not be learned, and not that nothing was
 /// made: the node did not answer, or it keeps another entry so far, and
 /// may still be at work on what it was handed.
-fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
+pub(crate) fn made_all_the_same(config_path: &str, made: &[u8; 32]) -> bool {
     let made = hex::encode(made);
     for _ in 0..ASKS_AGAIN {
         std::thread::sleep(ASK_EVERY);

@@ -178,10 +178,13 @@ fn bytes_of(hex_bytes: &str, what: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 /// What is said of a removed device before anything of it is taken
-/// (decision 2026-10-04 §7.3).
+/// (decision 2026-10-04 §7.3), and of several.
 const MAY_HAVE_CHANGED: &str = "This is what that device wrote, as the relays hold it now. If it \
     was in someone else's hands, they may have changed it since: say no unless you know it was \
     not.";
+const MAY_HAVE_CHANGED_SEVERAL: &str = "This is what those devices wrote, as the relays hold it \
+    now. If one of them was in someone else's hands, they may have changed it since: say no \
+    unless you know that none was.";
 
 /// `cordelia sync carry <name> --from [<key>]...`: what the named removed
 /// devices signed in the name's channel, in the generations that this
@@ -243,7 +246,13 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
         println!("Nothing was taken.");
         return Ok(());
     }
-    println!("\n{MAY_HAVE_CHANGED}");
+    println!(
+        "\n{}",
+        match found.keys.len() {
+            1 => MAY_HAVE_CHANGED,
+            _ => MAY_HAVE_CHANGED_SEVERAL,
+        }
+    );
     if found.empty > 0
         && !at.yes(&format!(
             "\nBring in {} into {} where the new channel holds nothing?",
@@ -390,12 +399,13 @@ impl Found {
     /// them since.
     fn lines(&self, name: &str) -> Vec<String> {
         let name = file_shown(name);
-        let mut lines = vec![format!("\nWhat {} signed in {name}:", {
-            match self.keys.len() {
-                1 => "this removed key",
-                _ => "these removed keys, the newest version of each file among them",
-            }
-        })];
+        let mut lines = vec![match self.keys.len() {
+            1 => format!("\nWhat this removed key signed in {name}:"),
+            _ => format!(
+                "\nWhat these removed keys signed in {name} (of each file, the newest version \
+                 among them):"
+            ),
+        }];
         for (key, label) in self.keys.iter().zip(&self.labels) {
             lines.push(format!(
                 "  {}",
@@ -1036,7 +1046,10 @@ mod tests {
             .push(json!({ "key": hex::encode([8u8; 32]), "label": "" }));
         let all = Found::of(&two).unwrap().lines("lab").join("\n");
         assert!(
-            all.contains("these removed keys, the newest version of each file among them"),
+            all.contains(
+                "What these removed keys signed in lab (of each file, the newest version among \
+                 them):"
+            ),
             "{all}"
         );
         assert!(!all.contains("stand above"), "{all}");
