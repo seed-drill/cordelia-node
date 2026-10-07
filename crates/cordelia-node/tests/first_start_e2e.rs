@@ -143,6 +143,14 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     wait_for("the first start is made", &[&relay, &device], 60, || {
         status_of(&device)["held"].is_null().then_some(())
     });
+    // What the schema's steps said when the database was opened is in
+    // the log: logging is set up before that.
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert!(
+        log.contains("applying migration v11 (entries of a channel from its secret)"),
+        "{log}"
+    );
+
     // The copy, beside the database: at this schema's version, with every
     // older row and each key file.
     let name = format!("before-{VERSION}");

@@ -1129,6 +1129,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     config.apply_env_overrides();
     let data_dir = config.data_dir();
 
+    // Logging is set up before anything else is done, so that what the
+    // schema's steps say when the database is opened is in the log.
+    init_tracing(&config.logging.level);
+
     // Verify init has been run
     let identity_path = data_dir.join("identity.key");
     if !identity_path.exists() {
@@ -1187,9 +1191,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
         Err(e) => return Err(e.into()),
     };
-
-    // Set up logging
-    init_tracing(&config.logging.level);
 
     let version = env!("CARGO_PKG_VERSION");
     let role = &config.network.role;
