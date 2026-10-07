@@ -1680,6 +1680,23 @@ pub const LABEL_CARRY_BATCH: &[u8] = b"cordelia v2 carry batch";
 /// Derived: half of what one message of the wire holds, MAX_MESSAGE_BYTES.
 pub const CARRY_PART_MAX_BYTES: usize = MAX_MESSAGE_BYTES as usize / 2;
 
+/// The most bytes of one request's body that the local API of a device
+/// reads as JSON (decision 2026-10-04 §16): a body over it is refused,
+/// and is not read. What a command hands the node in one request is
+/// sized against this ([`CARRY_HANDED_MAX_BYTES`]).
+pub const LOCAL_API_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most bytes of versions that a command hands the node in one
+/// request (decision 2026-10-04 §7.3): each version counted as it is
+/// written in the request's body, with its chain, and with its name and
+/// its text as they are escaped there. A version over the bound is
+/// handed alone.
+/// Derived: a quarter of LOCAL_API_BODY_MAX_BYTES. A batch within the
+/// bound, and one version alone of the largest size that an entry holds,
+/// escaped as far as a text can be, each fit a request's body beside the
+/// word and the batch's signature.
+pub const CARRY_HANDED_MAX_BYTES: usize = LOCAL_API_BODY_MAX_BYTES / 4;
+
 /// The most names a recovery carries (decision 2026-10-04 §9): a device
 /// that is gone listed names too, and can have listed any number of its
 /// own. The names it leaves are named.
@@ -2384,6 +2401,21 @@ mod tests {
         assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
         assert!(LABELS.contains(&LABEL_CARRY_BATCH));
         assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
+        assert_eq!(LOCAL_API_BODY_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(CARRY_HANDED_MAX_BYTES, 512 * 1024);
+        // A batch at its bound fits a body. So does one version alone of
+        // the largest size, with every byte of its name and its text
+        // written as six, which is the most that JSON makes of one, and
+        // every byte of its chain as four: two of hex, and what goes
+        // between two links.
+        const {
+            assert!(
+                CARRY_HANDED_MAX_BYTES
+                    + 6 * MAX_ENTRY_NAME_AND_VALUE_BYTES
+                    + 4 * MAX_ENTRY_CHAIN_BYTES
+                    < LOCAL_API_BODY_MAX_BYTES
+            )
+        };
         // A part holds an entry of any size that a channel carries.
         const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };
         assert_eq!(RECOVERY_MAX_NAMES, 1_024);

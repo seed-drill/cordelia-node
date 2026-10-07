@@ -432,6 +432,60 @@ fn no_word() -> Value {
     json!({ "what": "", "until": 0, "signature": "" })
 }
 
+/// **A request's body is read up to its bound, and no further** (decision
+/// 2026-10-04 §16): what a command hands the node in one request is sized
+/// against it. A body over the bound is refused before it is read. One
+/// that holds a batch at its bound, and one version of the largest size
+/// beside it, is read: here it is answered as any request with no word
+/// that holds.
+#[actix_web::test]
+async fn test_a_request_body_is_read_up_to_its_bound_and_no_further() {
+    use cordelia_core::protocol::{
+        CARRY_HANDED_MAX_BYTES, LOCAL_API_BODY_MAX_BYTES, MAX_ENTRY_CHAIN_BYTES,
+        MAX_ENTRY_NAME_AND_VALUE_BYTES,
+    };
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    // A request that hands versions, with a body of so many bytes.
+    let body_of = |bytes: usize| -> Vec<u8> {
+        let mut body = json!({
+            "word": no_word(), "number": 0, "signature": "", "versions": [], "more": "",
+        });
+        let empty = serde_json::to_vec(&body).unwrap().len();
+        body["more"] = "x".repeat(bytes - empty).into();
+        let body = serde_json::to_vec(&body).unwrap();
+        assert_eq!(body.len(), bytes);
+        body
+    };
+    let mut answered = Vec::new();
+    let largest_batch = CARRY_HANDED_MAX_BYTES
+        + 6 * MAX_ENTRY_NAME_AND_VALUE_BYTES
+        + 4 * MAX_ENTRY_CHAIN_BYTES
+        + 4096;
+    for bytes in [
+        largest_batch,
+        LOCAL_API_BODY_MAX_BYTES,
+        LOCAL_API_BODY_MAX_BYTES + 1,
+    ] {
+        let request = test::TestRequest::post()
+            .uri("/api/v1/carry/handed")
+            .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body_of(bytes))
+            .to_request();
+        answered.push(test::call_service(&app, request).await.status().as_u16());
+    }
+    // Read, and refused for its word; read; and not read.
+    assert_eq!(answered, [400, 400, 413]);
+}
+
 /// A carry that a person asks for, at the route (decision 2026-10-04
 /// §7.3). It is refused on a device that follows no phrase, and for what
 /// is no name. A device that has left no generation has nothing to read,

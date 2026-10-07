@@ -105,6 +105,11 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 /// through the path that the sync adapter's goes through and says what
 /// it was published over.
 pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
+    // How much of a request's body is read as JSON, and no more: what a
+    // command hands the node is sized against it (§16).
+    cfg.app_data(
+        web::JsonConfig::default().limit(cordelia_core::protocol::LOCAL_API_BODY_MAX_BYTES),
+    );
     cfg.service(
         web::scope("/api/v1/channels")
             .route("/publish", web::post().to(local::publish))

@@ -68,7 +68,7 @@ use cordelia_api::carry::{self, Allows, Handed, Word};
 use cordelia_api::change::read_with;
 use cordelia_api::person::PersonError;
 use cordelia_core::protocol::{
-    CARRY_FIRST_MAX_SECS, CARRY_PART_MAX_BYTES, CARRY_PROOFS_MADE_AGAIN, CARRY_READ_MAX_SECS,
+    CARRY_FIRST_MAX_SECS, CARRY_HANDED_MAX_BYTES, CARRY_PROOFS_MADE_AGAIN, CARRY_READ_MAX_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::identity::NodeIdentity;
@@ -712,7 +712,7 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
         "name": name, "generations": [], "carried": 0, "held": 0, "higher": 0,
         "ties": [], "above": [], "deletes": 0, "by_other_keys": by_other_keys, "nothing": null,
     });
-    for (number, batch) in batches(&newest, CARRY_PART_MAX_BYTES).iter().enumerate() {
+    for (number, batch) in batches(&newest, CARRY_HANDED_MAX_BYTES).iter().enumerate() {
         let signature = run.sign(&carry::batch_signed(number as u64, batch)?);
         let done = told(api_post_told(
             config_path,
@@ -897,18 +897,27 @@ pub(crate) fn read_through_the_node(
     Ok((entries, relays))
 }
 
-/// `versions` in batches, each of which holds no more than `max_bytes`
-/// of text, and one version at least.
+/// How many bytes `version` takes in the body of the request that hands
+/// it (decision 2026-10-04 §7.3): as it is written there, with its
+/// chain, and with its name and its text as they are escaped; and what
+/// goes between two versions.
+fn handed_bytes(version: &Handed) -> usize {
+    serde_json::to_vec(version).map_or(usize::MAX, |written| written.len() + 1)
+}
+
+/// `versions` in batches, each of which takes no more than `max_bytes`
+/// in a request's body ([`handed_bytes`]), and holds one version at
+/// least.
 fn batches(versions: &[Handed], max_bytes: usize) -> Vec<&[Handed]> {
     let mut batches = Vec::new();
-    let (mut start, mut bytes) = (0, 0);
+    let (mut start, mut bytes) = (0usize, 0usize);
     for (at, version) in versions.iter().enumerate() {
-        let size = version.text.as_ref().map_or(0, String::len) + version.name.len();
-        if at > start && bytes + size > max_bytes {
+        let size = handed_bytes(version);
+        if at > start && bytes.saturating_add(size) > max_bytes {
             batches.push(&versions[start..at]);
             (start, bytes) = (at, 0);
         }
-        bytes += size;
+        bytes = bytes.saturating_add(size);
     }
     if start < versions.len() {
         batches.push(&versions[start..]);
@@ -1468,11 +1477,46 @@ mod tests {
         let sizes = |max: usize| -> Vec<usize> {
             batches(&all, max).iter().map(|batch| batch.len()).collect()
         };
-        assert_eq!(sizes(1_000), [4]);
-        assert_eq!(sizes(100), [2, 1, 1]);
+        // A version is counted as it is written in the body, and with
+        // what goes between two.
+        let written = |version: &Handed| serde_json::to_vec(version).unwrap().len() + 1;
+        let (a, c, d) = (written(&all[0]), written(&all[2]), written(&all[3]));
+        assert_eq!(handed_bytes(&all[0]), a);
+        assert!(a > 40 + 1 && c > a && a > d);
+        assert_eq!(sizes(usize::MAX), [4]);
+        assert_eq!(sizes(2 * a + c + d), [4]);
+        assert_eq!(sizes(2 * a + c + d - 1), [3, 1]);
+        assert_eq!(sizes(2 * a), [2, 1, 1]);
+        assert_eq!(sizes(2 * a - 1), [1, 1, 1, 1]);
         // A version over the bound goes alone.
         assert_eq!(sizes(10), [1, 1, 1, 1]);
         assert!(batches(&[], 100).is_empty());
+
+        // **The chain and the escaping count** (§7.3). A text of bytes
+        // that are written as six each, and a chain of a hundred links:
+        // a version takes many times its text and its name.
+        let long = Handed {
+            name: "n".into(),
+            rev: 1,
+            text: Some("\u{1}".repeat(100)),
+            signer: "ab".repeat(32),
+            chain: Some(vec!["cd".repeat(32); 100]),
+        };
+        assert!(handed_bytes(&long) > 6 * 100 + 100 * 66 + 64);
+        // Four hundred of them hold 40,400 bytes of text and names, and
+        // are far more than one request's body in all: they go in
+        // batches, each of which is within the bound as it is written.
+        let many = vec![long; 400];
+        let in_batches = batches(&many, CARRY_HANDED_MAX_BYTES);
+        assert!(in_batches.len() > 5, "{}", in_batches.len());
+        assert_eq!(
+            in_batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            400
+        );
+        for batch in in_batches {
+            let body = serde_json::to_vec(batch).unwrap().len();
+            assert!(body <= CARRY_HANDED_MAX_BYTES + 1, "{body}");
+        }
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],
