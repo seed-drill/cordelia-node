@@ -731,12 +731,19 @@ mod tests {
         s.write(2, LAB, FILE, "late");
         let at_the_relays = s[2].stored_in(&old);
         s.change(0, &[0, 1, 2], &[]);
-        // Device 0 has edited the file twice since, in the new channel.
-        s.write(0, LAB, FILE, "newer");
-        s.write(0, LAB, FILE, "newest");
-        assert_eq!(s[0].slot(LAB, FILE).current.unwrap().rev, 3);
+        // Device 1 has edited the file twice since, in the new channel,
+        // and device 0 has taken that: the entry at the higher revision
+        // is another device's, and device 0's own is the one it carried.
+        s.pass(0, 1);
+        s.write(1, LAB, FILE, "newer");
+        s.write(1, LAB, FILE, "newest");
+        s.pass(1, 0);
+        let slot = s[0].slot(LAB, FILE);
+        assert_eq!(slot.current.unwrap().rev, 3);
+        assert_eq!(slot.highest, Some(3));
 
         let was = read_on(&s, 0, &at_the_relays, &old, 1);
+        assert_eq!(was.versions[0].rev, 2);
         let before = s[0].stored();
         assert_eq!(
             bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
@@ -744,14 +751,23 @@ mod tests {
         );
         assert_eq!(s[0].stored(), before);
         assert_eq!(s[0].text(LAB, FILE).as_deref(), Some("newest"));
-        // It comes in at its own revision, or not at all: the entry that
-        // carries it is at the revision the version had.
-        let third = Version {
-            rev: 3,
+
+        // Where the entry at the higher revision is this device's own,
+        // the same: it comes in at its own revision, or not at all.
+        s.write(0, LAB, FILE, "the last");
+        assert_eq!(s[0].slot(LAB, FILE).current.unwrap().rev, 4);
+        let before = s[0].stored();
+        assert_eq!(
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            Brought::Higher
+        );
+        let fourth = Version {
+            rev: 4,
             ..was.versions[0].clone()
         };
-        assert_eq!(bring_on(&mut s, 0, &third, Rule::Counts), Brought::Tie);
+        assert_eq!(bring_on(&mut s, 0, &fourth, Rule::Counts), Brought::Tie);
         assert_eq!(s[0].stored(), before);
+        assert_eq!(s[0].text(LAB, FILE).as_deref(), Some("the last"));
     }
 
     /// A version that ties with an entry of this device's own cannot be
@@ -1054,6 +1070,12 @@ mod tests {
         let current = s[0].slot(LAB, "jumped.md").current.unwrap();
         assert_eq!(current.rev, at(2, 4));
         assert_eq!(current.rev, lifted(jumped));
+        // Brought again, the new channel holds it: it is the version at
+        // the revision that the renumbering gave it.
+        assert_eq!(
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            Brought::Held
+        );
     }
 
     /// A carry brings nothing in on a device that follows no phrase, on

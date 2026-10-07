@@ -244,13 +244,26 @@ fn recovers(new: &Node, port: Option<u16>, words: &str, answers: &[&str]) -> AtT
 }
 
 fn answers_and_yes(at: &mut AtTerminal, answers: &[&str]) {
-    for answer in answers {
-        at.says("Type `have`, `lost` or `hands`: ").types(answer);
+    answers_and(at, answers, "yes");
+}
+
+/// Answer of each device, in the order it is asked about, and then type
+/// `yes` at the command's yes. No answer is suggested: at the first
+/// device Enter is pressed first, which answers nothing.
+fn answers_and(at: &mut AtTerminal, answers: &[&str], yes: &str) {
+    for (n, answer) in answers.iter().enumerate() {
+        at.says("Type `have`, `lost` or `hands`: ");
+        if n == 0 {
+            at.types("")
+                .says("That is none of the answers. No answer is suggested: type one.")
+                .says("Type `have`, `lost` or `hands`: ");
+        }
+        at.types(answer);
     }
     at.says("The change that the recovery phrase will sign")
         .says("Recover on this machine?")
         .says("Type yes to go on")
-        .types("yes");
+        .types(yes);
 }
 
 /// A person with two devices loses both, and recovers on a third
@@ -467,6 +480,17 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
     });
     // The look is not taken up again by itself.
     assert!(new.post("/api/v1/recover/progress", json!({}))["look"].is_null());
+    // What the command had gone on to says so, and ends, where it finds
+    // that the node was started again before the look had ended.
+    let (ended, waited) = new
+        .at_terminal(&["recover-made", "2"])
+        .ends_within(Duration::from_secs(60));
+    assert!(ended, "{waited}");
+    assert!(
+        waited.contains("The look was interrupted")
+            && waited.contains("It is not taken up again by itself."),
+        "{waited}"
+    );
 
     // A device that was gone comes back: it is answered with the change,
     // and says that it was removed.
@@ -521,6 +545,18 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
     two.desktop.stop();
 
     let new = device_started("new", &relay);
+    // Anything but a yes makes nothing: the machine follows no phrase.
+    let mut at = new.at_terminal(&["recover", "--name", "new"]);
+    at.says("The recovery phrase, twelve words")
+        .types(&two.words);
+    answers_and(&mut at, &["lost", "hands"], "y");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert_eq!(person_of(&new)["state"], "no_phrase");
+
     let mut at = recovers(&new, None, &two.words, &["lost", "hands"]);
     at.says("The change is made (change 2)")
         .says("The look is made: 1 name read, and 1 version carried, in 1 name.");

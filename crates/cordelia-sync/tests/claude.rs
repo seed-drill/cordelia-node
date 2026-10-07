@@ -1685,6 +1685,25 @@ fn what_other_devices_sync_is_what_they_sync_now() {
     claude(&a, serde_json::json!({ "enabled": false }));
     relay(&a, &b);
     assert!(b.cycle().available.is_empty());
+
+    // A name that A holds by a carry that a person asked for has no
+    // folder on A, and is listed all the same (decision 2026-10-04
+    // §7.3): a cycle does not stop it for want of one, with sync on.
+    claude(&a, serde_json::json!({}));
+    {
+        let db = a.state.db.lock().unwrap();
+        names::hold_for_a_carry(&db, &a.state.identity, "brought", now()).unwrap();
+    }
+    settle(&mut a, &mut b);
+    assert_eq!(
+        b.cycle().available,
+        vec!["brought".to_string(), "lab-notes".to_string()]
+    );
+    let held = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_storage::person::channel_of_name(&db, "brought").unwrap()
+    };
+    assert!(held.is_some(), "the name is still held after its cycles");
 }
 
 #[test]

@@ -633,6 +633,9 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
         ),
         "{said}"
     );
+    // Only the generation that the desktop never held is read so: the
+    // ones whose secret the node holds are the plain command's.
+    assert!(!said.contains("Could not read"), "{said}");
     wait_for("the file is in the desktop's folder", &all, 120, || {
         (read(&d_mem.join("late.md"))?.as_str() == "the phone's last words\n").then_some(())
     });

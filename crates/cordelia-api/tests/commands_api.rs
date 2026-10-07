@@ -10,7 +10,8 @@ use std::time::Duration;
 use actix_web::{App, test, web};
 use serde_json::{Value, json};
 
-use cordelia_api::change::prepare_change;
+use cordelia_api::carry::{Allows, Word};
+use cordelia_api::change::{prepare_change, prepare_recovery, read_with};
 use cordelia_api::person::first_entry;
 use cordelia_api::state::AppState;
 use cordelia_crypto::addition::SignedAddition;
@@ -18,7 +19,7 @@ use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::entry::Entry;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::Phrase;
-use cordelia_crypto::statement::SignedStatement;
+use cordelia_crypto::statement::{Device, SignedStatement};
 use cordelia_storage::at_relays as kept_rows;
 
 const TOKEN: &str = "test-token-secret";
@@ -528,6 +529,125 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     // Asked again, the name is held already.
     let (_, said) = asks!(app, "/api/v1/carry", carry);
     assert_eq!(said["held_anew"], false);
+}
+
+/// A recovery, at the routes (decision 2026-10-04 §9, steps 4 and 5).
+/// The node is handed the change entry that the command made, the
+/// phrase's statement key, the secret of the generation recovered from,
+/// and the phrase's word for the look. It applies the statement, and is
+/// woken: to show the change entry to every relay at once, and to send
+/// the names. The look is begun, goes on after the route has answered,
+/// and what it found is read at the route for that. A word that does not
+/// hold makes nothing, and a recovery is made once.
+#[actix_web::test]
+async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, said) = asks!(app, "/api/v1/recover/look", json!({}));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["follows_a_phrase"], false);
+    assert_eq!(
+        said["this_device"],
+        encode_public_key(&state.identity.public_key()).unwrap()
+    );
+    assert_eq!(said["sessions"], json!([]));
+    let (_, said) = asks!(app, "/api/v1/recover/progress", json!({}));
+    assert!(said["look"].is_null(), "{said}");
+
+    // What the command makes with the phrase: the statement after the
+    // first one of a device that is gone, with this machine alone.
+    let phrase = Phrase::parse(WORDS).unwrap();
+    let gone = NodeIdentity::generate().unwrap().public_key();
+    let first = first_entry(&phrase, &gone, "laptop").unwrap();
+    let (statement, for_phrase) = read_with(&phrase, &first.entry).unwrap();
+    let own = state.identity.public_key();
+    let maker = Device::new(own, "new").unwrap();
+    let entry = prepare_recovery(&statement, None, maker, &[gone])
+        .unwrap()
+        .sign(&phrase, &first.entry, None)
+        .unwrap();
+    let allows = Allows::Look {
+        names: vec!["lab".into()],
+        takes: vec![hex::encode(gone)],
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let word = Word::give(&phrase, &own, &entry.id(), allows.says().unwrap(), now).unwrap();
+    let body = json!({
+        "entry": hex::encode(entry.to_wire()),
+        "statement_key": hex::encode(first.statement_key),
+        "left": [{ "number": 1, "secret": hex::encode(for_phrase.secret) }],
+        "gone": [{ "key": hex::encode(gone), "label": "laptop" }],
+        "still_have": [],
+        "word": word,
+    });
+
+    // A word whose text was changed after it was signed: nothing is made.
+    let mut changed = body.clone();
+    changed["word"]["what"] = Allows::Look {
+        names: vec!["lab".into(), "another".into()],
+        takes: vec![hex::encode(gone)],
+    }
+    .says()
+    .unwrap()
+    .into();
+    let (status, said) = asks!(app, "/api/v1/recover/make", changed);
+    assert_eq!(status, 400, "{said}");
+    assert!(said.to_string().contains("does not hold here"), "{said}");
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(seen["state"], "no_phrase");
+    assert_eq!(woken(&state).await, (false, false));
+
+    // The recovery.
+    let (status, made) = asks!(app, "/api/v1/recover/make", body.clone());
+    assert_eq!(status, 200, "{made}");
+    assert_eq!(made["change"], 2);
+    // The node is woken, to show the change entry to every relay at
+    // once, before anything is carried.
+    assert_eq!(woken(&state).await, (true, true));
+    // The look was begun, and ends: with no network it reaches no relay.
+    let mut found = Value::Null;
+    for _ in 0..100 {
+        let (_, said) = asks!(app, "/api/v1/recover/progress", json!({}));
+        found = said["look"].clone();
+        if found["finished"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(found["finished"], true, "{found}");
+    assert_eq!((&found["change"], &found["names"]), (&json!(2), &json!(1)));
+    assert_eq!(found["carried"], 0);
+    assert_eq!(found["not_read"][0]["read"], "no relay was reached");
+
+    // The machine follows the phrase, alone; the key that is gone is
+    // removed, and shown by its label; and the name is held and listed.
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(
+        (&seen["state"], &seen["change"]),
+        (&json!("applied"), &json!(2))
+    );
+    assert_eq!(seen["among"], "alone");
+    assert_eq!(seen["removed"][0]["label"], "laptop");
+    let names: Vec<&str> = seen["names"]["sent"]
+        .as_array()
+        .into_iter()
+        .chain(seen["names"]["to_go"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(names, ["lab"]);
+    // It is made once.
+    let (status, said) = asks!(app, "/api/v1/recover/make", body);
+    assert_eq!(status, 400, "{said}");
+    assert!(said.to_string().contains("already follows"), "{said}");
 }
 
 /// Once a device was given a new key, the node that still runs under the

@@ -1369,6 +1369,44 @@ mod tests {
         assert_eq!(waited, (true, false));
     }
 
+    /// A device that comes to sync a name carries it first (decision
+    /// 2026-10-04 §7.3): while a carry is being made into a channel, a
+    /// folder's first cycle there waits for it, though the channel was
+    /// fetched from every relay. It waits for that channel alone, until
+    /// the carry says that it has ended, and for no longer than a carry
+    /// may take: one that never says so holds nothing up for good.
+    #[test]
+    fn test_a_first_cycle_waits_for_a_carry_into_its_channel() {
+        let own = OwnChannels::default();
+        let (channel, other) = ([1u8; 32], [2u8; 32]);
+        let start = Instant::now();
+        let later = |secs: u64| start + std::time::Duration::from_secs(secs);
+        own.set_up_with(1);
+        own.fetched_from(&channel, "one", later(0));
+        own.fetched_from(&other, "one", later(0));
+        assert!(own.first_fetch_done(&channel, later(1)));
+
+        own.carrying(&channel, later(1));
+        assert!(!own.first_fetch_done(&channel, later(1)));
+        assert!(!own.first_fetch_done(&channel, later(100)));
+        assert!(own.first_fetch_done(&other, later(1)));
+        // The carry has ended.
+        own.carried(&channel);
+        assert!(own.first_fetch_done(&channel, later(2)));
+
+        // A carry that never says that it ended.
+        let wait = cordelia_core::protocol::CARRY_FIRST_MAX_SECS;
+        own.carrying(&channel, later(10));
+        assert!(!own.first_fetch_done(&channel, later(10 + wait - 1)));
+        assert!(own.first_fetch_done(&channel, later(10 + wait)));
+        // A node that is set up with no relay waits for a carry too.
+        let alone = OwnChannels::default();
+        alone.set_up_with(0);
+        assert!(alone.first_fetch_done(&channel, later(0)));
+        alone.carrying(&channel, later(0));
+        assert!(!alone.first_fetch_done(&channel, later(1)));
+    }
+
     /// A folder's first cycle in a channel waits for the channel to be
     /// fetched: from one relay at least, and from each other relay that
     /// the device is set up with, or until the wait for those has gone by

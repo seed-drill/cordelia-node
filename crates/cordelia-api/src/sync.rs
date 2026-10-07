@@ -2184,6 +2184,65 @@ mod tests {
         counted(&s, "sync off");
     }
 
+    /// A device that comes to sync a name carries it first (decision
+    /// 2026-10-04 §7.3): a mapping names, for that, each name that the
+    /// device holds anew by it, where the device has applied a statement
+    /// and still holds the secret of a generation that it left; and the
+    /// first cycle of a folder there is held back from then. A name that
+    /// was mapped before is not carried again, and nor is anything on a
+    /// device that has left no generation, or follows no phrase.
+    #[test]
+    fn test_a_mapping_carries_first_only_a_name_that_it_holds_anew() {
+        use crate::several::{Machine, Several, state_of};
+        use cordelia_storage::person as held_rows;
+        let home = std::path::Path::new("/home/sam");
+        let maps = |state: &AppState, folder: &str, name: &str| -> Vec<String> {
+            let db = state.db.lock().unwrap();
+            let on: SyncClaudeRequest =
+                serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+            set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+            let before = mapped_names(&db).unwrap();
+            let body = request(folder, name, false);
+            add_mapping(&state.sync_control, &db, &body, home).unwrap();
+            names_follow(state, &db, &before);
+            let anew = carries_first_for(state, &db, &before);
+            anew.into_iter().map(|(name, _)| name).collect()
+        };
+        let waits = |state: &AppState, name: &str| -> bool {
+            let channel = {
+                let db = state.db.lock().unwrap();
+                held_rows::channel_of_name(&db, name).unwrap().unwrap()
+            };
+            let now = std::time::Instant::now();
+            state.own_channels.fetched_from(&channel, "relay", now);
+            !state.own_channels.first_fetch_done(&channel, now)
+        };
+
+        // Under its first statement the device has left no generation.
+        let mut s = Several::of_one_person(1);
+        s.change(0, &[0], &[]);
+        let mut first = Several::of_one_person(1);
+        let no_left = state_of(first.machines.remove(0));
+        no_left.own_channels.set_up_with(1);
+        assert!(maps(&no_left, "/home/sam/notes", "lab").is_empty());
+        assert!(!waits(&no_left, "lab"));
+
+        // It has left one: the name that it comes to hold is carried
+        // first, and its folder's first cycle waits for that.
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        assert_eq!(maps(&state, "/home/sam/notes", "lab"), ["lab"]);
+        assert!(waits(&state, "lab"));
+        // A second mapping: only the name that is new by it.
+        assert_eq!(maps(&state, "/home/sam/work", "team"), ["team"]);
+        // The same mapping again holds nothing anew.
+        assert!(maps(&state, "/home/sam/work", "team").is_empty());
+
+        // A device that follows no phrase holds no name.
+        let alone = state_of(Machine::new(7));
+        assert!(maps(&alone, "/home/sam/notes", "lab").is_empty());
+    }
+
     /// What a device says of the names it syncs follows its settings
     /// (decision 2026-10-04 §2.2, §16): it holds a name and says that it
     /// syncs it when it maps the name, says so no longer and holds it no

@@ -486,6 +486,8 @@ pub(crate) struct Node {
     /// shows the change entry to every relay first, and `read` for a
     /// channel read through the door.
     pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
+    /// Whether the relay hands a channel in part, and not to its end.
+    pub(crate) in_part: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The session of the connection to the relay of a test.
@@ -514,6 +516,8 @@ impl Node {
         });
         let (node, holds, log) = (Arc::clone(&state), Arc::clone(&relay), Arc::clone(&asked));
         let order = Arc::clone(&did);
+        let in_part: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let part = Arc::clone(&in_part);
         tokio::spawn(async move {
             loop {
                 match node.own_channels.wait_door().await {
@@ -533,7 +537,7 @@ impl Node {
                             None => LeftRead::NotHeld,
                             Some(entries) => LeftRead::Read {
                                 entries: entries.clone(),
-                                whole: true,
+                                whole: !part.load(std::sync::atomic::Ordering::SeqCst),
                             },
                         };
                         let _ = answer.send(vec![LeftAt {
@@ -549,6 +553,7 @@ impl Node {
             relay,
             asked,
             did,
+            in_part,
         }
     }
 

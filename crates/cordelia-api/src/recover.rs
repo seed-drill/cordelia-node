@@ -965,6 +965,20 @@ mod tests {
         all
     }
 
+    /// Add to `handed` an entry that device 1 signed in the channel of a
+    /// name, which is no entry of the personal channel.
+    fn syncs_file(s: &Several, handed: &mut Vec<CheckedEntry>) {
+        let lab = s[1].own(LAB);
+        handed.push(entry_by(
+            &s[1].identity,
+            &lab,
+            1,
+            "notes.md",
+            text("a file"),
+            &[],
+        ));
+    }
+
     /// The change entry with the highest number is the one that a
     /// recovery is made from (decision 2026-10-04 §9, step 2). One that
     /// is on its chain is behind it, and is nothing; one that two relays
@@ -1119,6 +1133,11 @@ mod tests {
         turned.reverse();
         let again = read_generation(&from, &statement_key, &secret, &turned, s.now).unwrap();
         assert_eq!(again, read);
+        // What the relays handed of another channel is not read with it.
+        let mut with_another = handed.clone();
+        syncs_file(&s, &mut with_another);
+        let same = read_generation(&from, &statement_key, &secret, &with_another, s.now).unwrap();
+        assert_eq!(same, read);
         // A secret that the statement does not commit to reads nothing.
         let refused = read_generation(&from, &statement_key, &[9; 32], &handed, s.now);
         assert!(matches!(refused, Err(PersonError::SecretNotCommitted)));
@@ -1895,6 +1914,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(firsts["keys"][0]["key"], hex::encode(first_key));
+    }
+
+    /// The look says which names it could not read to their end, and
+    /// where (decision 2026-10-04 §9, step 5): a relay that handed a
+    /// channel in part, by its name and the generation; and a name for
+    /// which no relay was reached. What was handed is carried all the
+    /// same.
+    #[actix_web::test]
+    async fn test_the_look_says_which_names_it_could_not_read_to_their_end() {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let node = new_machine(9, &gone);
+        let answers = [Answer::Lost, Answer::Lost];
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        node.in_part
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["carried"], 4, "{found}");
+        // The relay holds `desk` in the generation recovered from, and
+        // `lab` in that one and in the one before.
+        let not_read = |name: &str, change: u64| json!({ "name": name, "change": change, "relay": "relay", "read": "part" });
+        assert_eq!(
+            found["not_read"],
+            json!([not_read("desk", 2), not_read(LAB, 2), not_read(LAB, 1)])
+        );
+
+        // A machine with no network reaches no relay.
+        let mut alone = crate::several::state_of(Machine::new(10));
+        alone.push_tx = None;
+        let alone = Node {
+            state: std::sync::Arc::new(alone),
+            relay: Default::default(),
+            asked: Default::default(),
+            did: Default::default(),
+            in_part: Default::default(),
+        };
+        let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&alone, &made).unwrap();
+        let found = the_look(&alone.state, number, &to_look).await;
+        assert_eq!(found["carried"], 0);
+        let missed = found["not_read"].as_array().unwrap();
+        assert_eq!(missed.len(), 4, "{found}");
+        assert!(
+            missed
+                .iter()
+                .all(|one| one["read"] == "no relay was reached")
+        );
     }
 
     /// A recovery whose look was interrupted was cut short (decision

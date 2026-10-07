@@ -998,6 +998,117 @@ mod tests {
         }
     }
 
+    /// A carry by command, on the node (decision 2026-10-04 §7.3): the
+    /// name is held, its new channel is fetched, and its channel in each
+    /// generation that the device left is read at the relay, with the
+    /// node's own proof. What keys that count signed there comes in, each
+    /// version as this device's own entry. What another key signed is
+    /// counted, and not taken. Run again, it takes what the new channel
+    /// still lacks: nothing.
+    #[actix_web::test]
+    async fn test_a_carry_by_command_takes_what_keys_that_count_signed_and_counts_the_rest() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1, 2], LAB);
+        let old = s[1].own(LAB);
+        // Device 1, which stays, and device 2, which is removed, each
+        // write a file that only the relay is sent.
+        s.write(1, LAB, "stays.md", "of device 1");
+        s.write(2, LAB, "gone.md", "of device 2");
+        let mut at_the_relay = s[1].stored_in(&old);
+        at_the_relay.extend(s[2].stored_in(&old));
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &at_the_relay);
+        let before = node.stored();
+
+        let done = carry_name(&node.state, LAB, false).await.unwrap();
+        assert!(done.held_anew);
+        assert!(done.read_all);
+        assert_eq!(done.tally.carried, 1);
+        assert_eq!(done.by_other_keys, 1);
+        assert_eq!(done.nothing, None);
+        assert_eq!(node.text(LAB, "stays.md").as_deref(), Some("of device 1"));
+        assert_eq!(node.text(LAB, "gone.md"), None);
+        // The name's word, and the version.
+        assert_eq!(node.stored(), before + 2);
+        // The new channel was fetched before anything was read, and the
+        // one generation that was left was read with the node's proof.
+        assert_eq!(*node.did.lock().unwrap(), ["pass", "read"]);
+        let channel = derive::channel_id(&old).unwrap();
+        assert_eq!(*node.asked.lock().unwrap(), [(channel, true)]);
+        let said = done.says(LAB);
+        assert_eq!(
+            said["generations"],
+            json!([{
+                "number": 1,
+                "relays": [{ "relay": "relay", "read": "whole" }],
+                "by_other_keys": 1,
+            }])
+        );
+
+        // Again: the new channel holds it.
+        let again = carry_name(&node.state, LAB, false).await.unwrap();
+        assert!(!again.held_anew);
+        assert_eq!((again.tally.carried, again.tally.held), (0, 1));
+        assert_eq!(node.stored(), before + 2);
+
+        // A relay that hands the channel in part: the carry says that it
+        // did not read to the end, and where.
+        node.in_part
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let part = carry_name(&node.state, LAB, false).await.unwrap();
+        assert!(!part.read_all);
+        assert_eq!(
+            part.says(LAB)["generations"][0]["relays"],
+            json!([{ "relay": "relay", "read": "part" }])
+        );
+    }
+
+    /// A device that comes to sync a name carries it first, where the
+    /// new channel holds nothing for it (decision 2026-10-04 §7.3). Where
+    /// the new channel holds anything for the name, the mapping carries
+    /// nothing, and says so: the command that is asked for by name does.
+    #[actix_web::test]
+    async fn test_a_mapping_carries_only_where_the_new_channel_holds_nothing() {
+        let fixture = |holds_something: bool| {
+            let mut s = Several::of_one_person(2);
+            s.hold(&[1], LAB);
+            let old = s[1].own(LAB);
+            s.write(1, LAB, "theirs.md", "of device 1");
+            let at_the_relay = s[1].stored_in(&old);
+            s.change(0, &[0, 1], &[]);
+            if holds_something {
+                s.hold(&[0], LAB);
+                s.write(0, LAB, "mine.md", "of device 0");
+            }
+            let node = Node::of(s.machines.remove(0));
+            node.relay_holds(&old, &at_the_relay);
+            node
+        };
+        // Nothing there: what the other device had sent is carried.
+        let empty = fixture(false);
+        let done = carry_name(&empty.state, LAB, true).await.unwrap();
+        assert_eq!((done.tally.carried, &done.nothing), (1, &None));
+        assert_eq!(empty.text(LAB, "theirs.md").as_deref(), Some("of device 1"));
+
+        // Something there: nothing is carried for the mapping.
+        let held = fixture(true);
+        let before = held.stored();
+        let done = carry_name(&held.state, LAB, true).await.unwrap();
+        assert_eq!(done.tally.carried, 0);
+        let nothing = done.nothing.unwrap();
+        assert!(
+            nothing.contains("holds something for this name already"),
+            "{nothing}"
+        );
+        assert_eq!(held.stored(), before);
+        assert_eq!(held.text(LAB, "theirs.md"), None);
+        // Asked for by name, it is carried.
+        let done = carry_name(&held.state, LAB, false).await.unwrap();
+        assert_eq!(done.tally.carried, 1);
+        assert_eq!(held.text(LAB, "theirs.md").as_deref(), Some("of device 1"));
+    }
+
     /// `--from` with no key lists each removed key that signed in the
     /// generations that the device can read, with how much, and takes
     /// nothing (decision 2026-10-04 §7.3). With a key named, by its
@@ -1025,6 +1136,12 @@ mod tests {
         // holds of the generation it left.
         assert_eq!(node.asked.lock().unwrap().len(), 1);
         assert!(node.asked.lock().unwrap()[0].1);
+        // With no key, a name that the device does not hold is not held
+        // for the look.
+        let other = look_from(&node.state, "another", &[]).await.unwrap();
+        assert_eq!(other["signed"], json!([]));
+        let held = held_rows::channel_of_name(&db(&node.state), "another");
+        assert_eq!(held.unwrap(), None);
 
         // Named by its label, and by its six words.
         for named in ["device 2".to_string(), carry::naming_words(&removed)] {
