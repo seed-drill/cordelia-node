@@ -123,13 +123,23 @@ The encryption binds the content to the channel, the slot and the revision. **Ro
 | A random slot key for each channel, never changed, which a removed device keeps | Derived from the channel's secret, so it changes with it |
 | One signature, the author's | Two: the author's and the channel's |
 | The type and the parent in clear | Gone from the wire. The kind of an entry is the first part of its name, inside the ciphertext |
-| Whether an entry is a delete, in clear and signed | Stays: a relay's sweep of old deletes needs it, and it says only that an entry is a delete |
+| Whether an entry is a delete, in clear and signed | Stays: the sweep of old deletes finds them by it, at a relay and in a device's own store (below), and it says only that an entry is a delete |
 | No expiry | None |
 | A tie at one revision goes to the higher hash of the ciphertext | To the higher hash of the text, and a text beats a delete. **Two entries with one text at one revision are the same version, whoever signed them.** A ciphertext's hash changes whenever an entry is sealed again, and a text's does not: so a tie is not drawn afresh when an entry is carried |
 | A revision may be any number up to the bound, and one at the top puts a name out of reach | A band and a count. A revision in the top half of a band is moved to the next band at each move, by a rule that every device applies alike, so a name comes back into reach at the next statement |
 | What an entry says can be left out for room, down to nothing | Room is kept for it in every entry, and a text may be 60 KB |
 
 The other limits of that record stand: the clear fields and the signatures are within the 1 KB that every entry is counted with (`ENTRY_OVERHEAD_BYTES`), a store keeps one entry for each author in each slot, and no rule at a relay compares one author's entries with another's.
+
+**Old deletes are swept.** A delete is held for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`, as in the record of 2026-09-30, 4.4), counted from when the node that holds it stored the entry. Each node looks once an hour.
+
+- **A slot goes whole, or not at all.** Were a delete to go alone, a lower revision by another author would be the slot's version again, and a file that was deleted would come back.
+- **A relay** drops a slot only where every entry that it holds there, of every author, is a delete that it has held for 90 days. It has no list of who counts, so no key's delete sweeps away what another key wrote: a slot in which one device's delete stands beside another device's text stays, with the delete. The channel's count of its room follows, and a channel of which nothing is left is held no more.
+- **A device,** in the channel of a name it holds, reads the slot as it reads it for a folder, with who counts. The slot goes where its current version is a delete, and the device has held every entry that is that delete for 90 days.
+  - It stays while a folder's record there names a text: that folder has not taken the delete yet, and with the slot gone its file would meet the channel as a new file does, and be published again. Once every folder has agreed that the file is deleted the slot goes, and those records go with it.
+  - In the personal channel, and in the pair channel of a hand-over it made, a slot goes only where every entry in it is a delete held for 90 days, as at a relay.
+  - A device that follows no phrase, that is in a fork, or that has stopped (4.3, 4.5) sweeps nothing, and nor does a node that is held up (10.1).
+- **Its limits.** A slot that has gone has no revision: the next entry written there starts again at the first. Each node counts from when it stored the delete, so two nodes drop it at two times: to a node that still holds it, a file that is made again under that name is below the delete until that node's own 90 days have passed. And a text that an older generation holds at a relay can come back by a carry that reaches that far, once the delete is gone (section 9).
 
 **The author is who signed.** A version that a device carries into a new channel is that device's entry there, and its chain says which key signed the entry it was carried from (7.3).
 
@@ -541,7 +551,7 @@ That is what git asks of a commit and its ancestors, with a window of 100 links,
 - Either command can be run again, and takes what the new channel still lacks: a relay that was down the first time is asked the second.
 - A name that nobody brings in within 90 days stays in the generation that was left. Status says how many names are not in the new generation, and for how long they still can be brought.
 
-**A delete is a version,** and is carried like a text: no file comes back by a move, with the one exception that the record of 2026-09-30 has too (4.4): a device that was off for longer than a delete is kept, 90 days, never saw it, and carries its text. A delete that is carried is a new entry, so the 90 days after which a relay sweeps it start again at each statement.
+**A delete is a version,** and is carried like a text: no file comes back by a move, with the one exception that the record of 2026-09-30 has too (4.4): a device that was off for longer than a delete is kept, 90 days, never saw it, and carries its text. A delete that is carried is a new entry, so the 90 days after which it is swept, at a relay and in a device's own store (2.3), start again at each statement.
 
 ### 7.4 What is carried that a person might not expect, and what is not
 
