@@ -1125,10 +1125,12 @@ pub const HAND_OVER_NAME: &str = "hand-over";
 /// was handed long ago is not taken for what a person means now.
 pub const PAIR_KEY_TYPED_SECS: i64 = 60 * 60;
 
-/// The most keys typed at `cordelia accept` that a device keeps: eight
-/// (decision 2026-10-04 §16). A ninth is refused. Each is a pair channel
-/// that the device asks its relays for, for its hour, and a key with
-/// which a hand-over could be taken.
+/// The most keys typed at `cordelia accept` that are within their hour
+/// on a device at one time: eight (decision 2026-10-04 §16). A ninth is
+/// refused. Each is a pair channel that the device asks its relays for,
+/// for its hour, and a key with which a hand-over could be taken. A key
+/// whose hour has gone holds no place: it is kept only to say what
+/// became of it (TYPED_KEY_KEPT_SECS).
 pub const MAX_TYPED_KEYS: usize = 8;
 
 /// How long a device keeps a key that was typed at `cordelia accept`, to
