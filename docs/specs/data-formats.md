@@ -923,6 +923,20 @@ CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_pla
   places say nothing of what the node stored for anyone else in between.
 - Only an entry that passed the check (§9.2) is stored, and what is read
   from a slot is checked again as it is read.
+- **Old deletes are swept by these two columns** (decision §2.3): `is_delete`
+  says in clear that an entry is a delete, and `stored_at` is when this node
+  stored it. Once an hour a node looks for each slot that holds a delete
+  which it stored 90 days ago or longer (`KEYED_TOMBSTONE_RETENTION_DAYS`).
+  A slot goes whole, or not at all.
+  - **A relay** drops a slot where every row in it is such a delete. The
+    channel's `bytes` in `relay_channels` (§10.2) follows, and a channel of
+    which nothing is left loses its row.
+  - **A device** drops a slot of a name it holds where the slot's current
+    version is a delete, and every row that is that delete is 90 days old.
+    The slot stays while a row of `sync_files` (§10.6) names a text for that
+    file. When it goes, the rows of `sync_files` that say the file is deleted
+    go with it. In its personal channel and in a pair channel it drops a slot
+    as a relay does.
 
 ### 10.2 relay_channels (v13; decision §2.4, §2.5): a relay's
 
@@ -1026,10 +1040,10 @@ CREATE TABLE person_names_before (                  -- v17
 | Table | What it holds | Decision |
 |---|---|---|
 | `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it has seen a statement made apart from the one applied); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
-| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork | §3 |
+| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
 | `person_change_entries` | The latest change entry it has seen (`latest`), whole, to show to a relay; and, in a fork, the one made apart (`apart`) | §4.5, §4.6 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
-| `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other | §2.2 |
+| `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |
 | `person_names_before` | Each name that a key had said it syncs, in the personal channel of a generation the device left, with when it left it. Written in the transaction that applies a statement. It is what a device shows of the names that no device lists yet in the new generation | §7.3, §8 |
 
@@ -1119,7 +1133,7 @@ CREATE TABLE person_left (                           -- v18
 
 | Table | What it holds | Decision |
 |---|---|---|
-| `person_typed_keys` | A key that a person typed at `cordelia accept`, with when. A pair channel is read only with such a key, and only for an hour after it was typed. `stood` is the row of the record's 5.1 that the device stood in when its yes was said: `no_phrase`, `alone`, `several` or `not_listed`. A hand-over is taken with the key only while the device stands there. `taken_at` is when a hand-over was taken with it: the key is then spent. `said` is what became of the last hand-over read with it, in words for a person. A device keeps at most 8, and each for a day | §2.2, §5.1, §16 |
+| `person_typed_keys` | A key that a person typed at `cordelia accept`, with when. A pair channel is read only with such a key, and only for an hour after it was typed. `stood` is the row of the record's 5.1 that the device stood in when its yes was said: `no_phrase`, `alone`, `several` or `not_listed`. A hand-over is taken with the key only while the device stands there. `taken_at` is when a hand-over was taken with it: the key is then spent. `said` is what became of the last hand-over read with it, in words for a person. At most 8 keys are within their hour at one time, and a ninth is refused. A row is kept for a day, to say what became of the key: one whose hour has gone holds no place | §2.2, §5.1, §16 |
 | `person_left_out` | A key that this device counted as a device before a statement it applied, and that is in neither of that statement's lists, with the label it was known by and the statement's number. It is shown until a person clears it (`cleared_at`) or a later statement lists it. Cleared, the row stays, so that adding that key still says what it is | §8 |
 | `person_cleared` | A notice that a person has cleared here, by the 32 bytes the notice is named by. It is shown no more on this device | §5.2, §6 |
 | `person_left` | A device's word that it left, kept when a statement is applied that still lists its key, where nobody had cleared it: the word itself is in a personal channel that the device reads no more. Shown until a person clears it here, or a statement lists the key no more | §5.2, §7.1 |
@@ -1178,11 +1192,20 @@ CREATE TABLE sync_files (
 | `sync.claude.notice` | JSON array of what a device whose stored scope was on has been told: for each time, the date, the Claude Code directory, and the folders that stopped syncing (`null` where that is not known: there was no stored report, it could not be read, or it was of a cycle that failed before it came to a folder) | Decision §10.1 |
 | `first_start.done` | The mark that the first start on this version is done: `stepped by <version>`, or `nothing to step, marked by <version>`. Any mark means done, in this version and in every later one | Decision §10.1 |
 | `person.not_carried` | JSON of the files whose record could not be carried when the device applied the statement it has applied: each as the name it syncs under and the file. Replaced at each statement applied | Decision §4.2 |
+| `person.removed_a_key` | Present where the statement that the device has applied removes a key that the statement it held before did not, as the device found it when it applied the statement. A renewal removes nobody, though its list of removed keys names every key removed so far. Written at each statement applied. A status shows a removal as not yet applied by every device only where it is present | Decision §10.1 |
+| `person.names_carried` | JSON array of the names that the device holds by a carry that a person asked for, or by a recovery, with no folder of its own mapped to them. It holds each, and lists it in the personal channel, whether or not sync is on. A name goes from the list when the device stops it | Decision §7.3, §9 |
+| `person.look_pending` | Present while the look of a recovery that was made on this machine has not ended: set where the recovery's statement is applied, and removed when the look has carried what it takes, or when a later statement is applied. While it is present the machine does not write that it has sent what it carried | Decision §8, §9 |
+| `person.removed_labels` | JSON object of what the device called each key that a statement it applied removed, by the key in hex. A statement lists removed keys bare, and a person names one by its label at `cordelia sync carry --from`. A key that the device never knew by a label is not in it | Decision §7.3 |
 | `usage.sighting_secret` | The secret a node hashes peer keys with for its usage counts. It never leaves the node | Kept |
 
 Four keys are of the older kind, and a personal node's first start removes
 them: `personal_channel_id`, `membership.accepted_personal_from`,
 `sync.claude.last_change` and `sync.claude.activity`.
+
+The four `person.*` keys that a device writes under a phrase, and
+`person.not_carried`, go when the device leaves its phrase. The notice
+(`sync.claude.notice`) goes only when a person says that it was seen
+(`cordelia sync status --seen`).
 
 ### 11.2 counters
 
@@ -1201,10 +1224,13 @@ as the items go.
 A personal node's first start sets a trigger, `moved_on_takes_no_channel`,
 on the older kind's table of channels: `BEFORE INSERT ON channels`, it aborts
 with words that say the database was moved on, by which version, and where
-the copy is. A version from before this one makes a channel at every start;
-started on this database by mistake, it stops there with those words. A relay
-that is started on a database which a personal node stepped removes the
-trigger: a relay goes on taking channels of the older kind.
+the copy is. It is set wherever the mark is written: on a database that had
+nothing to step, its words say which version marked it, and that no copy
+was made. A version from before this one makes a channel at every start;
+started on this database by mistake, it stops there with those words, and
+has changed nothing before it. A relay or a bootnode that is started on a
+database which a personal node stepped removes the trigger: a node of that
+role goes on taking channels of the older kind.
 
 ---
 
@@ -1213,25 +1239,55 @@ trigger: a relay goes on taking channels of the older kind.
 Decision 2026-10-04 §10.1, as `crates/cordelia-storage/src/first_start.rs`
 has it. A relay and a bootnode make no copy and take no step.
 
+**The lock.** A data directory is one node's. A node of any role takes an
+advisory lock on a file in it, `node.lock` (mode 0600, and empty), after the
+port of its local API is bound and before it opens the database, and holds
+it for as long as the process lives. A second node that is started on the
+same directory says that another is running there, and stops, with nothing
+changed. On a volume that knows no such lock the node starts, and says so in
+its log.
+
 **When.** A personal node whose database has no mark (§11.1) makes it at its
 start: after the port of its local API is bound, so that a node which cannot
-bind changes nothing; and before its sync loop and its first pass.
+bind changes nothing; after the lock is taken; and before its first cycle
+and its first pass. Where there is only a mark to write, it is written
+before anything else is started. Where a copy is to be made, the node is
+held up from its start, and the copy and the step are made by the first turn
+of its sync loop: its server answers meanwhile, and its status says that a
+copy is being made.
 
 **Who.** Where the device already follows a phrase, or the node holds no row
-of the older tables, none of the four older keys and no key file of an older
-channel, the mark is written and nothing else. Otherwise:
+of the older tables, none of the four older keys and nothing under the name
+of a key file of an older channel, the mark is written with the guard
+(§11.3), and nothing else. Otherwise:
 
 1. **The copy.** The database, as its opening left it, and the key files of
    the older channels, into a folder beside them named `before-<version>`
    (mode 0700, each file 0600). The database is copied with `VACUUM INTO`,
-   never by copying a file that is open. The copy is made under a name that
-   ends `.partial`, flushed, opened again read-only and checked (it opens,
+   never by copying a file that is open, on a connection of its own that is
+   opened for reading only. The copy is made under a name that ends
+   `.partial`, flushed, opened again read-only and checked (it opens,
    `PRAGMA integrity_check` says `ok`, and it is at this schema's version),
    and only then renamed. A `.partial` that a start finds is removed and made
    again. A whole folder that a start finds, with no mark in the database, is
-   kept as `before-<version>.earlier`, in the place of any before it: so
-   there are at most two. **Where the copy cannot be made, the step is not
-   taken,** and the node says why, with the bytes of room that a copy needs.
+   kept as `before-<version>.earlier`, in the place of any before it, once
+   the new copy is checked: so there are at most two.
+   - **Before anything is written the free room on the volume is compared
+     with what the copy needs:** the database's pages (`page_count` ×
+     `page_size`) and the key files. Where there is less, no copy is begun.
+     Where the room cannot be learned the copy is tried.
+   - **Where the copy cannot be made, the step is not taken,** and the node
+     says why, with the bytes of room that a copy needs and the bytes there
+     are. What was written of a copy that failed is removed at once.
+   - A copy that was made and checked is used again by a later try of the
+     same start where only the step failed, and only where the database
+     (what the node notes for itself in `node_meta`, and how many rows each
+     older table and each of `sync_files` and `index_lines` has) and the key
+     files still hold what the copy holds. One that no longer does is
+     removed, and made again.
+   - The tries back off: five seconds after the first that failed, and twice
+     as long after each further one, up to ten minutes (parameter-rationale.md
+     §12.11).
 2. **The step, in one transaction, all of it or none.** `sync_files` and
    `index_lines` are emptied. Every table of the older kind is emptied, in
    this order: `channel_members`, `channel_keys`, `dm_peers`, `items`,
@@ -1245,8 +1301,11 @@ channel, the mark is written and nothing else. Otherwise:
    They are found by their place and their names: whatever is in the folder
    `channel-keys` under a name that ends `.key`, `.ring.json` or `.slot`.
    They are looked for again at every start of a personal node, whatever the
-   mark says. One that cannot be removed is counted and said, and the node
-   goes on.
+   mark says. **At a start that makes no copy, one is removed only where a
+   whole `before-` folder beside the database holds a file of that name with
+   the same bytes:** any other is left where it is, and the status says how
+   many (`key_files_in_place`). One that cannot be removed is counted and
+   said, and the node goes on.
 
 **What stays:** the device's key, its token and its configuration, which are
 files and are not touched; its settings and its mappings; the counters;

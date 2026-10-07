@@ -160,8 +160,9 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 | `~/.cordelia/channel-keys/<personal_channel_id>.key` | 0600 | Personal channel PSK |
 
 > **v1 status.** In this version the data directory of a personal node
-> holds `config.toml`, `identity.key`, `node-token`, `cordelia.db`, and
-> `history/` (local history, mode 0700). It holds no `channel-keys/` file
+> holds `config.toml`, `identity.key`, `node-token`, `cordelia.db`,
+> `history/` (local history, mode 0700), and `node.lock` (mode 0600, empty:
+> the file that a running node holds its lock on, §10.5). It holds no `channel-keys/` file
 > once the first start on this version is done: the keys of a device's
 > channels are derived from the person secret, which is in the database.
 > After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
