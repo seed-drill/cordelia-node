@@ -537,11 +537,16 @@ pub async fn phrase_make(
     // It counts as a change of settings, and waits for a sync cycle that
     // is running to stop: the device's folders forget what they had
     // agreed where a phrase is replaced, and nothing of a cycle that
-    // began before is published or recorded after (§4.2, §5.2).
+    // began before is published or recorded after (§4.2, §5.2). Where a
+    // phrase was replaced the device has left one: the node keeps no
+    // note of which relays had handed its channels.
     let applied = state
-        .as_a_change(|conn| {
-            leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
-        })
+        .as_a_leaving(
+            |conn| {
+                leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
+            },
+            |applied| applied.is_ok(),
+        )
         .map_err(refused)?;
     state.own_channels.written();
     state.own_channels.ask_whole();
@@ -614,9 +619,13 @@ pub async fn forget(
 ) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
     // As a change of settings: its folders forget what they had agreed,
-    // and no cycle that began before records anything after.
+    // and no cycle that began before records anything after. The node
+    // keeps no note of which relays had handed the channels it held.
     let forgot = state
-        .as_a_change(|conn| leaving::forget(conn, &state.identity, false, now()))
+        .as_a_leaving(
+            |conn| leaving::forget(conn, &state.identity, false, now()),
+            |forgot| matches!(forgot, Ok(true)),
+        )
         .map_err(refused)?;
     Ok(HttpResponse::Ok().json(json!({ "forgot": forgot })))
 }

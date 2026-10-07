@@ -332,6 +332,18 @@ impl OwnChannels {
         let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
         fetched.remove(channel);
     }
+
+    /// Keep nothing of which relays have handed any channel: the device
+    /// has left the phrase it followed, its store holds nothing of the
+    /// channels it held, and its folders have forgotten what they had
+    /// agreed. Whatever channel it comes to hold is fetched again before
+    /// a folder's first cycle there, though it be one that it held
+    /// before: a device that comes back to the generation it left has the
+    /// same channel for each name.
+    pub fn forget_every_fetched(&self) {
+        let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        fetched.clear();
+    }
 }
 
 /// Where a device stands at the relays it is set up with, for the
@@ -847,11 +859,35 @@ impl AppState {
     /// It is counted whether or not the work then changes anything, as a
     /// settings command is.
     pub fn as_a_change<T>(&self, work: impl FnOnce(&Connection) -> T) -> T {
+        self.as_a_leaving(work, |_| false)
+    }
+
+    /// [`Self::as_a_change`], for work that may have the device leave the
+    /// phrase it follows: `left` says of what was done whether it did.
+    ///
+    /// A device that leaves a phrase drops what its store holds of every
+    /// channel of its own, and its folders forget what they had agreed.
+    /// Where it has, the node keeps nothing more of which relays had
+    /// handed each channel ([`OwnChannels::forget_every_fetched`]), under
+    /// the hold of the database's lock that the work was done under: a
+    /// device that comes back to the generation it left, in the same run
+    /// of the node, has the same channel for each name, and a folder's
+    /// first cycle there waits until that channel was fetched again
+    /// (decision 2026-10-04 §6). Otherwise the cycle would run on an
+    /// empty copy of the channel, and publish every file a second time.
+    pub fn as_a_leaving<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> T,
+        left: impl FnOnce(&T) -> bool,
+    ) -> T {
         let locked = || self.db.lock().unwrap_or_else(|e| e.into_inner());
         self.sync_control.changed(&locked());
         let _turn = self.history.turn();
         let db = locked();
         let done = work(&db);
+        if left(&done) {
+            self.own_channels.forget_every_fetched();
+        }
         self.sync_control.changed(&db);
         done
     }
@@ -1000,6 +1036,15 @@ mod tests {
         // Held no more, it is fetched again before a first cycle there.
         own.forget_fetched(&channel);
         assert!(!own.first_fetch_done(&channel, later(3600)));
+        // And so is every channel, once the device has left its phrase.
+        own.fetched_from(&channel, "one", later(10));
+        own.fetched_from(&channel, "two", later(10));
+        own.fetched_from(&other, "one", later(10));
+        own.fetched_from(&other, "two", later(10));
+        assert!(own.first_fetch_done(&channel, later(10)));
+        own.forget_every_fetched();
+        assert!(!own.first_fetch_done(&channel, later(3600)));
+        assert!(!own.first_fetch_done(&other, later(3600)));
 
         // A device set up with one relay waits for that one, and no longer.
         own.set_up_with(1);
@@ -1071,6 +1116,39 @@ mod tests {
                 .kept_beside("/m", "channel", "a.md")
                 .is_none()
         );
+    }
+
+    /// Work that has the device leave the phrase it follows is done as a
+    /// change of settings is, and the node then keeps nothing of which
+    /// relays had handed each channel: a folder's first cycle in a
+    /// channel that the device comes back to waits until it was fetched
+    /// again (decision 2026-10-04 §6). Work that leaves nothing keeps
+    /// what was noted.
+    #[test]
+    fn test_a_device_that_leaves_its_phrase_keeps_no_note_of_what_was_fetched() {
+        let state = test_state();
+        state.own_channels.set_up_with(1);
+        let channel = [1u8; 32];
+        let now = Instant::now();
+        state.own_channels.fetched_from(&channel, "one", now);
+        let before = state.sync_control.generation();
+
+        // It did not leave: what was noted stands, and the change counts.
+        let done = state.as_a_leaving(|_db| Ok::<bool, ()>(false), |done| *done == Ok(true));
+        assert_eq!(done, Ok(false));
+        assert!(state.own_channels.first_fetch_done(&channel, now));
+        assert_eq!(state.sync_control.generation(), before + 2);
+        // Nor where the work failed.
+        let failed = state.as_a_leaving(|_db| Err::<bool, ()>(()), |done| *done == Ok(true));
+        assert_eq!(failed, Err(()));
+        assert!(state.own_channels.first_fetch_done(&channel, now));
+
+        // It left: nothing is noted any more, by the time the work's hold
+        // of the database is given up.
+        let done = state.as_a_leaving(|_db| Ok::<bool, ()>(true), |done| *done == Ok(true));
+        assert_eq!(done, Ok(true));
+        assert!(!state.own_channels.first_fetch_done(&channel, now));
+        assert_eq!(state.sync_control.generation(), before + 6);
     }
 
     /// A cycle has a number, which is above the count of cycles begun at

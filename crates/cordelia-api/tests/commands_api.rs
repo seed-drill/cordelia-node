@@ -245,6 +245,65 @@ async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
     assert_eq!(woken(&state).await, (false, false));
 }
 
+/// A device that leaves the phrase it follows keeps no note of which
+/// relays had handed its channels (decision 2026-10-04 §6): its store
+/// holds nothing of them, and its folders have forgotten what they had
+/// agreed. Where it comes back to the generation it left, in the same run
+/// of the node, a folder's first cycle waits until its channel was
+/// fetched again, and does not publish every file a second time. So it is
+/// where a phrase is replaced, and where the device forgets its person.
+#[actix_web::test]
+async fn test_a_device_that_leaves_its_phrase_keeps_no_note_of_what_was_fetched() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    state.own_channels.set_up_with(1);
+    let channel = [8u8; 32];
+    let noted = std::time::Instant::now();
+    let fetched = |state: &AppState| state.own_channels.first_fetch_done(&channel, noted);
+    let note = |state: &AppState| state.own_channels.fetched_from(&channel, "relay", noted);
+
+    // A phrase is made on a device that follows none: it leaves nothing.
+    let (status, said) = makes_the_phrase!(app, state);
+    assert_eq!((status, &said["change"]), (200, &json!(1)), "{said}");
+    note(&state);
+    assert!(fetched(&state));
+    // A request that is refused leaves nothing either: the device is
+    // alone under a phrase, and the yes was for a device that follows
+    // none.
+    let (status, said) = makes_the_phrase!(app, state);
+    assert_eq!(status, 409, "{said}");
+    assert!(fetched(&state));
+
+    // The phrase is replaced: the device has left the one it followed.
+    let other = Phrase::generate().unwrap();
+    let made = first_entry(&other, &state.identity.public_key(), "laptop").unwrap();
+    let body = json!({
+        "entry": hex::encode(made.entry.to_wire()),
+        "statement_key": hex::encode(made.statement_key),
+        "from": "alone",
+    });
+    let (status, said) = asks!(app, "/api/v1/phrase/make", body);
+    assert_eq!((status, &said["change"]), (200, &json!(1)), "{said}");
+    assert!(!fetched(&state));
+
+    // The device forgets what it holds of its person, as one that is
+    // given a new key does. Asked again, it follows no phrase and has
+    // nothing to leave.
+    note(&state);
+    let (status, said) = asks!(app, "/api/v1/devices/forget", json!({}));
+    assert_eq!((status, &said["forgot"]), (200, &json!(true)), "{said}");
+    assert!(!fetched(&state));
+    note(&state);
+    let (status, said) = asks!(app, "/api/v1/devices/forget", json!({}));
+    assert_eq!((status, &said["forgot"]), (200, &json!(false)), "{said}");
+    assert!(fetched(&state));
+}
+
 /// Before a change is prepared the node is asked for a whole pass, and
 /// what it hands over is handed once a pass that began after that has
 /// ended: the device has shown its change entry to each relay, and
