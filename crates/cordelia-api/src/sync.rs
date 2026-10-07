@@ -90,6 +90,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         last_change_at,
         stands,
         held: state.held.why().map(|held| held.says().to_string()),
+        moved_on: crate::look::moved_on(&db)?,
     })
 }
 

@@ -308,9 +308,43 @@ impl Look {
 pub const NO_PHRASE: &str = "no recovery phrase yet: memory stays on this machine. Make one here \
                              (`cordelia phrase`), or add this machine from one that has one.";
 
-/// What is said in a few words of a device that follows no phrase
-/// (decision 2026-10-04 §5.1).
+/// What is said in a few words of a device that follows no phrase and
+/// took this version with what an earlier one held (decision 2026-10-04
+/// §10, §10.1): its database was moved on, and it is to be added again.
 pub const NOT_ADDED_YET: &str = "not added yet";
+
+/// What such a device says of itself: that it is not added yet, and the
+/// way on, which begins on the device whose memory is the most up to
+/// date (decision 2026-10-04 §10, steps 3 to 5).
+pub const NOT_ADDED: &str = "not added yet: this device has taken a version of Cordelia in \
+                             which every device is added again, and memory stays on this \
+                             machine until it is. Make the recovery phrase on one device, the \
+                             one whose memory is the most up to date (`cordelia phrase`), and \
+                             add each other device from it (`cordelia add-device` there, \
+                             `cordelia accept` here).";
+
+/// What is said in a few words of a device that follows no phrase and
+/// held nothing of an earlier version: a new install (decision
+/// 2026-10-04 §5.2).
+pub const NO_PHRASE_YET: &str = "no recovery phrase yet";
+
+/// Whether the step of the first start on this version was made on this
+/// database (decision 2026-10-04 §10.1): the device took this version
+/// with what an earlier one held, and everything of the older kind went.
+pub fn moved_on(conn: &Connection) -> Result<bool, cordelia_core::CordeliaError> {
+    Ok(cordelia_storage::first_start::mark(conn)?.is_some_and(|mark| mark.stepped))
+}
+
+/// What a device that follows no phrase says of itself, in a few words
+/// and in a sentence (decision 2026-10-04 §10.1): "not added yet" where
+/// the step of the first start was made (`moved_on`), and the words for
+/// a new install where it was not.
+pub fn no_phrase_says(moved_on: bool) -> (&'static str, &'static str) {
+    match moved_on {
+        true => (NOT_ADDED_YET, NOT_ADDED),
+        false => (NO_PHRASE_YET, NO_PHRASE),
+    }
+}
 
 /// Look at what this device holds of its person, at `now` (see the
 /// module's documentation). `at_relays` is where it stands at its relays,
@@ -350,8 +384,9 @@ pub fn look(
         };
         match held(conn)? {
             None => {
-                look.short = Some(NOT_ADDED_YET.into());
-                look.says.push(NO_PHRASE.into());
+                let (short, says) = no_phrase_says(moved_on(conn)?);
+                look.short = Some(short.into());
+                look.says.push(says.into());
             }
             Some(held) => {
                 of_its_person(conn, identity, &held, at_relays, &mut look)?;
@@ -1252,13 +1287,55 @@ mod tests {
         assert_eq!((&look.latest, &look.phrase_words), (&None, &None));
         assert_eq!(look.state, "no_phrase");
         assert_eq!(look.among, "no_phrase");
-        assert_eq!(look.short.as_deref(), Some("not added yet"));
+        assert_eq!(look.short.as_deref(), Some("no recovery phrase yet"));
         assert_eq!(
             look.says,
             [
                 "no recovery phrase yet: memory stays on this machine. Make one here \
               (`cordelia phrase`), or add this machine from one that has one."
             ]
+        );
+        // Where the device took this version with what an earlier one
+        // held, and the step of its first start was made: it is not
+        // added yet (decision 2026-10-04 §10.1).
+        assert!(!moved_on(&s[0].conn).unwrap());
+        cordelia_storage::first_start::step(&s[0].conn, "0.2.0-test", chrono::Utc::now()).unwrap();
+        assert!(moved_on(&s[0].conn).unwrap());
+        let look = seen(&s, 0);
+        assert_eq!(look.state, "no_phrase");
+        assert_eq!(look.short.as_deref(), Some("not added yet"));
+        assert_eq!(look.says.len(), 1);
+        assert!(
+            look.says[0].starts_with(
+                "not added yet: this device has taken a version of Cordelia in which every \
+                 device is added again, and memory stays on this machine until it is."
+            ),
+            "{:?}",
+            look.says
+        );
+        assert!(
+            look.says[0].contains("`cordelia phrase`"),
+            "{:?}",
+            look.says
+        );
+        assert!(
+            look.says[0].contains("`cordelia accept` here"),
+            "{:?}",
+            look.says
+        );
+        // A mark that says there was nothing to step is a new install's.
+        let fresh = Several::new(1);
+        cordelia_storage::first_start::first_start(
+            &fresh[0].conn,
+            std::path::Path::new("/no/such/folder"),
+            "0.2.0-test",
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert!(!moved_on(&fresh[0].conn).unwrap());
+        assert_eq!(
+            seen(&fresh, 0).short.as_deref(),
+            Some("no recovery phrase yet")
         );
         assert!(look.devices.is_empty() && look.notices.is_empty());
         assert_eq!(look.cannot_go_on, None);

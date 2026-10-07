@@ -51,6 +51,10 @@ pub struct Facts {
     pub folders: usize,
     /// Everything found syncs (`--all`), not only mapped folders.
     pub sync_all: bool,
+    /// Whether this device took this version with what an earlier one
+    /// held (decision 2026-10-04 §10.1): with no phrase it is then "not
+    /// added yet", and otherwise it is a new install.
+    pub moved_on: bool,
     /// What the node is held up by, as it says it, where it is (decision
     /// 2026-10-04 §10.1): `first_start` while its first start on this
     /// version is not done, or `later_database` where its database is
@@ -139,8 +143,22 @@ pub fn derive(f: &Facts) -> (State, String) {
     // (decision 2026-10-04 §5.2). One that follows no phrase yet syncs
     // nothing, and one that has stopped needs the person: neither is said
     // to be synced, whatever its last cycle listed.
+    //
+    // **With no phrase the state is `attention`** (decision 2026-10-04
+    // §10.1), so that a panel which draws from the state alone does not
+    // show the device as synced, or as resting: nothing it holds syncs
+    // until a person acts. A device that is not to be added turns sync
+    // off. It is "not added yet" where it took this version with what an
+    // earlier one held, and has "no recovery phrase yet" where it is a
+    // new install.
     match f.stands.as_str() {
-        "no_phrase" => return (Off, "memory stays here: no recovery phrase yet".into()),
+        "no_phrase" if f.moved_on => return (Attention, "memory: not added yet".into()),
+        "no_phrase" => {
+            return (
+                Attention,
+                "memory stays here: no recovery phrase yet".into(),
+            );
+        }
         "fork" => {
             return (
                 Attention,
@@ -421,13 +439,27 @@ mod tests {
         assert_eq!(stands("applied"), (State::Synced, "memory synced".into()));
         // A node that did not say where it stands is read as before.
         assert_eq!(stands(""), (State::Synced, "memory synced".into()));
+        // With no phrase the state is `attention`: a new install says
+        // that it has no recovery phrase yet, and a device that took
+        // this version with what an earlier one held, that it is not
+        // added yet (decision 2026-10-04 §10.1).
         assert_eq!(
             stands("no_phrase"),
             (
-                State::Off,
+                State::Attention,
                 "memory stays here: no recovery phrase yet".into()
             )
         );
+        let mut moved_on = synced();
+        moved_on.stands = "no_phrase".into();
+        moved_on.moved_on = true;
+        assert_eq!(
+            state(&moved_on),
+            (State::Attention, "memory: not added yet".into())
+        );
+        // Under a phrase, having moved on changes nothing.
+        moved_on.stands = "applied".into();
+        assert_eq!(state(&moved_on), (State::Synced, "memory synced".into()));
         for (stopped, says) in [
             ("fork", "two changes made apart"),
             ("removed", "this device was removed"),

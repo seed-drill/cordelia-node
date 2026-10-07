@@ -145,12 +145,15 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
     });
     assert!(said.contains("no recovery phrase yet"), "{said}");
     assert!(said.contains("stays on this machine"), "{said}");
+    // With no phrase the state asks for the person: nothing that the
+    // device holds syncs until one is made (decision 2026-10-04 §10.1).
     let s = state(&a);
-    assert_eq!(s["state"], "off", "{s}");
+    assert_eq!(s["state"], "attention", "{s}");
     assert_eq!(
         s["summary"], "memory stays here: no recovery phrase yet",
         "{s}"
     );
+    assert_eq!(s["sync"]["moved_on"], false, "{s}");
     // It holds no name, and its local API publishes nothing either.
     assert!(
         person_of(&a)["names"]["sent"]

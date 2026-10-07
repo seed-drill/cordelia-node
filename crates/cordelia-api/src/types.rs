@@ -477,4 +477,9 @@ pub struct SyncStatusResponse {
     /// it runs no cycle and no pass until it is so no longer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
+    /// Whether this device took this version with what an earlier one
+    /// held: the step of its first start was made here (decision
+    /// 2026-10-04 §10.1). With no phrase, such a device is "not added
+    /// yet".
+    pub moved_on: bool,
 }

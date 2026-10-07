@@ -579,7 +579,12 @@ impl ClaudeAdapter {
                 return report;
             }
         };
-        report.publishes_nothing = publishes_nothing(stands);
+        // A device that took this version with what an earlier one held
+        // is not added yet, and says so (decision 2026-10-04 §10.1).
+        let moved_on = lock(state)
+            .and_then(|db| cordelia_api::look::moved_on(&db))
+            .unwrap_or(false);
+        report.publishes_nothing = publishes_nothing(stands, moved_on);
 
         // What to sync: declared mappings first.
         let mut targets: Vec<Target> = Vec::new();
@@ -793,11 +798,13 @@ impl ClaudeAdapter {
 
 /// Why a device that stands so publishes nothing and takes nothing into
 /// its folders (decision 2026-10-04 §4.3, §4.5, §5.2), or `None` for one
-/// that has applied a statement and syncs.
-fn publishes_nothing(stands: Stands) -> Option<String> {
+/// that has applied a statement and syncs. `moved_on` is whether the
+/// device took this version with what an earlier one held: with no
+/// phrase it is then not added yet (§10.1).
+fn publishes_nothing(stands: Stands, moved_on: bool) -> Option<String> {
     let why = match stands {
         Stands::Applied => return None,
-        Stands::NoPhrase => cordelia_api::look::NO_PHRASE,
+        Stands::NoPhrase => cordelia_api::look::no_phrase_says(moved_on).1,
         Stands::Stopped(State::Fork) => {
             "two changes were made apart: memory stays on this machine until it is settled \
              with the phrase (`cordelia settle`)."

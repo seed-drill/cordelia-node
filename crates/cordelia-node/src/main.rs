@@ -656,6 +656,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 // nothing is, and where it stands under a phrase.
                 "publishes_nothing": report["publishes_nothing"],
                 "stands": sync["stands"],
+                // Whether the device took this version with what an
+                // earlier one held: with no phrase it is not added yet.
+                "moved_on": sync["moved_on"],
                 "unsynced": report["unsynced"],
                 "excluded": report["excluded"],
                 "errors": status.facts.errors,
@@ -871,6 +874,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
         out.facts.sync_all = sync["all"].as_bool().unwrap_or(false);
         out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
+        out.facts.moved_on = sync["moved_on"].as_bool().unwrap_or(false);
         out.facts.report_age_secs = report["at"]
             .as_str()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())

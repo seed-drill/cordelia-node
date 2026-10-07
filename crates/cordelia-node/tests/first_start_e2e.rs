@@ -170,6 +170,55 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
     assert_eq!(own(&device), own_before);
 
+    // The device follows no phrase: it is not added yet, and says so.
+    // Its state asks for the person, and nothing is published or
+    // fetched.
+    let status = wait_for(
+        "the device says where it stands",
+        &[&relay, &device],
+        30,
+        || {
+            let status = status_of(&device);
+            (status["sync"]["stands"] == "no_phrase").then_some(status)
+        },
+    );
+    assert_eq!(status["state"], "attention", "{status}");
+    assert_eq!(status["summary"], "memory: not added yet", "{status}");
+    assert_eq!(status["sync"]["moved_on"], true, "{status}");
+    assert_eq!(status["person"]["state"], "no_phrase", "{status}");
+    assert_eq!(status["person"]["short"], "not added yet", "{status}");
+    assert_eq!(status["outbox_waiting"], 0, "{status}");
+    let said = device.cli(&["status"]);
+    assert!(said.contains("Devices:   not added yet"), "{said}");
+    assert!(
+        said.contains(
+            "not added yet: this device has taken a version of Cordelia in which every device \
+             is added again, and memory stays on this machine until it is."
+        ),
+        "{said}"
+    );
+    let devices = device.cli(&["devices"]);
+    assert!(devices.contains("not added yet:"), "{devices}");
+    let sync = wait_for("a cycle has run", &[&relay, &device], 30, || {
+        let out = device.cli(&["sync", "status"]);
+        out.contains("Nothing is sent from this device")
+            .then_some(out)
+    });
+    assert!(sync.contains("not added yet"), "{sync}");
+    // The relay was shown nothing, and holds nothing of it.
+    let held: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(held["items_stored"], 0, "{held}");
+    {
+        let conn = database_of(&relay);
+        assert_eq!(rows(&conn, "entries"), 0);
+        assert_eq!(rows(&conn, "items"), 0);
+    }
+    {
+        let conn = database_of(&device);
+        assert_eq!(rows(&conn, "entries"), 0);
+        assert_eq!(rows(&conn, "person"), 0);
+    }
+
     // A second start changes nothing, and makes no second copy.
     let copied = std::fs::read(copy.join("cordelia.db")).unwrap();
     device.stop();

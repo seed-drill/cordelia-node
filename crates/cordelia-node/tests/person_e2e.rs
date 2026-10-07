@@ -110,7 +110,10 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
 
     // Before there is a phrase.
     let status = laptop.cli(&["status"]);
-    assert!(status.contains("Devices:   not added yet"), "{status}");
+    assert!(
+        status.contains("Devices:   no recovery phrase yet"),
+        "{status}"
+    );
     assert!(
         status.contains(
             "no recovery phrase yet: memory stays on this machine. Make one here (`cordelia \
@@ -120,7 +123,10 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     );
     let json: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["person"]["state"], "no_phrase");
-    assert_eq!(json["person"]["short"], "not added yet");
+    assert_eq!(json["person"]["short"], "no recovery phrase yet");
+    // It is a new install: it took this version with nothing that an
+    // earlier one held.
+    assert_eq!(json["sync"]["moved_on"], false, "{json}");
     let says = json["person"]["says"][0].as_str().unwrap();
     assert!(says.starts_with("no recovery phrase yet:"), "{json}");
     let devices = laptop.cli(&["devices"]);
