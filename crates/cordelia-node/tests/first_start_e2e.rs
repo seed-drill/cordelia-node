@@ -390,6 +390,72 @@ fn a_node_answers_while_the_copy_of_its_first_start_is_being_made() {
     assert_eq!((mark.stepped, mark.version.as_str()), (true, VERSION));
 }
 
+/// A data directory is one node's (decision 2026-10-04 §10.1): a second
+/// node that is started on the directory of one that runs, with ports of
+/// its own, says so and stops, and has changed nothing. Here the first
+/// is held up before its first start, so that anything the second did to
+/// the database would show: every older row and each key file is there,
+/// there is no mark, and no second copy was begun. Once the first has
+/// stopped, a node starts there as any does.
+#[cfg(unix)]
+#[test]
+fn a_second_node_on_the_same_data_directory_says_so_and_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut device = node("laptop", "personal", None);
+    let before = {
+        let conn = in_the_released_form(&device);
+        older_rows(&conn)
+    };
+    // The first cannot make its copy, and is held up: what is left of a
+    // copy cannot be removed.
+    let partial = format!("before-{VERSION}.partial");
+    let closed = device.data_dir().join(&partial).join("closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    std::fs::write(closed.join("a-file"), "x").unwrap();
+    let mode = |mode: u32| {
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(0o000);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("the first try has failed", &[&device], 30, || {
+        status_of(&device)["held"]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("is not done"))
+            .then_some(())
+    });
+    // The second could make the copy, were it to try.
+    mode(0o700);
+    std::fs::remove_dir_all(device.data_dir().join(&partial)).unwrap();
+
+    let (ended, said) = device.second_on_its_data_dir();
+    assert_eq!(ended, Some(false), "{said}");
+    assert!(
+        said.contains("another node is running on the data directory"),
+        "{said}"
+    );
+    assert!(said.contains("Nothing was changed."), "{said}");
+    {
+        let conn = database_of(&device);
+        assert_eq!(older_rows(&conn), before);
+        assert_eq!(first_start::mark(&conn).unwrap(), None);
+    }
+    assert_eq!(
+        names_in(&device.data_dir().join("channel-keys")),
+        released::KEY_FILES
+    );
+    // The first goes on, and makes its first start when it next tries.
+    wait_for("the first makes its first start", &[&device], 120, || {
+        status_of(&device)["held"].is_null().then_some(())
+    });
+    assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
+
+    // With the first stopped, the directory is free again.
+    device.stop();
+    device.start();
+    wait_for("device healthy again", &[&device], 30, || healthy(&device));
+}
+
 /// A relay's database is stepped as any version steps it: it keeps every
 /// older row and each key file, makes no copy, and has no mark (decision
 /// 2026-10-04 §10.1). A relay goes on carrying the older kind.

@@ -1060,6 +1060,52 @@ fn format_uptime(secs: u64) -> String {
 
 // ── cordelia start ─────────────────────────────────────────────────
 
+/// The name of the file in a node's data directory that the node holds a
+/// lock on for as long as it runs.
+const NODE_LOCK: &str = "node.lock";
+
+/// Take the lock that says a node is running on the data directory
+/// `data_dir` (decision 2026-10-04 §10.1): an advisory lock on a file
+/// there, which the system lets go of when the process ends, however it
+/// ends. The file that is returned holds it, and is kept for the life of
+/// the process.
+///
+/// Where another process holds it, a node is running on that directory:
+/// this one says so, and has changed nothing. The file holds nothing, and
+/// is left where it is when the node stops. On a volume that knows no
+/// such lock the node starts, and says that it could not take one.
+fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let path = data_dir.join(NODE_LOCK);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("the lock on {} cannot be taken: {e}", data_dir.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another node is running on the data directory {}: a data directory is one node's. \
+             Nothing was changed. Stop that node first, or give this one a directory of its own.",
+            data_dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::warn!(
+                "the volume of the data directory knows no lock: nothing stops a second node \
+                 from being started on it"
+            );
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!("the lock on {} cannot be taken: {e}", data_dir.display())
+        }
+    }
+}
+
 /// The free room on the volume that holds `folder`, in bytes, as far as
 /// whoever runs the node may use it: what the copy of the database at a
 /// first start is compared with before it is begun (decision 2026-10-04
@@ -1115,6 +1161,12 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // nothing.
     let api_listener = std::net::TcpListener::bind(&listen_addr)
         .map_err(|e| anyhow::anyhow!("the node's API cannot listen at {listen_addr}: {e}"))?;
+
+    // A data directory is one node's (decision 2026-10-04 §10.1): the
+    // lock on it is taken before the database is opened, and is held for
+    // as long as the process lives. A second node on the same directory,
+    // whatever port it was given, says so here and changes nothing.
+    let _one_node = lock_data_dir(&data_dir)?;
 
     // Open database. One from a later version is refused (decision
     // 2026-10-04 §10.1). A personal node then stays up, over a database

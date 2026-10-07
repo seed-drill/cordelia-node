@@ -240,6 +240,59 @@ impl Node {
         AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
     }
 
+    /// Start a second node on this node's data directory, with ports of
+    /// its own: it is given a copy of the node's configuration that
+    /// differs in its two ports, and in nothing else. It is given thirty
+    /// seconds to end by itself, and is stopped then: whether it ended
+    /// by itself and succeeded, and what it wrote. Its relays are this
+    /// node's, which are on this machine.
+    pub fn second_on_its_data_dir(&self) -> (Option<bool>, String) {
+        for host in self.will_dial() {
+            assert_on_this_machine(self.name, &host);
+        }
+        let (http, p2p) = (free_port(), free_port());
+        let own = std::fs::read_to_string(self.config()).unwrap();
+        let second = own
+            .replace(
+                &format!("http_port = {}", self.http),
+                &format!("http_port = {http}"),
+            )
+            .replace(
+                &format!("p2p_port = {}", self.p2p),
+                &format!("p2p_port = {p2p}"),
+            )
+            .replace(
+                &format!("listen_addr = \"0.0.0.0:{}\"", self.p2p),
+                &format!("listen_addr = \"0.0.0.0:{p2p}\""),
+            );
+        assert_ne!(own, second);
+        let config = self.dir.path().join("config-second.toml");
+        std::fs::write(&config, second).unwrap();
+        let log_path = self.dir.path().join("second.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        let mut child = self
+            .binary_at(&config, inherited)
+            .arg("start")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let ended = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status.success()),
+                None if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        (ended, std::fs::read_to_string(log_path).unwrap_or_default())
+    }
+
     /// This node's stand-in home directory (for the sync adapter): a real
     /// path, as Claude Code records them.
     pub fn home(&self) -> PathBuf {
