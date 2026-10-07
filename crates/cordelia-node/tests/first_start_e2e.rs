@@ -1010,3 +1010,399 @@ fn a_device_whose_scope_was_stored_on_has_the_notice_of_what_stopped() {
         "the released version's report is still stored"
     );
 }
+
+// ── Only what is mapped syncs ────────────────────────────────────────
+
+/// The name that a clone made by [`clone_at`] is found under: its remote.
+const TOOLS: &str = "github.com/seed-drill/cordelia-node";
+
+/// A git repository at `rel` under `home`, with a remote: what a version
+/// that synced everything found had found, under the remote's name.
+fn clone_at(home: &Path, rel: &str) -> std::path::PathBuf {
+    let repo = home.join(rel);
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/seed-drill/cordelia-node.git",
+        ],
+    ] {
+        // Without git's own variables: `GIT_DIR`, where the caller has
+        // it set, would make these act on the caller's repository.
+        let mut git = std::process::Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("GIT_")) {
+                git.env_remove(&name);
+            }
+        }
+        let made = git.arg("-C").arg(&repo).args(&args).output().unwrap();
+        assert!(made.status.success(), "git {args:?}: {made:?}");
+    }
+    repo
+}
+
+fn read(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// What holds on a node, each thing in a word, as `cordelia status
+/// --json` lists it.
+fn holds_of(status: &serde_json::Value) -> Vec<String> {
+    let all = status["holds"].as_array().into_iter().flatten();
+    all.filter_map(|holds| holds["what"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// With real processes (decision 2026-10-04 §10.1): only what is mapped
+/// syncs, and a device whose folders stopped is told which.
+///
+/// Two devices. The laptop's database says that the scope was on,
+/// written before its node starts, with a repository that was found, a
+/// stored report that shows it syncing without a mapping, and a control
+/// folder that is mapped. Its first start stores the notice. The desktop
+/// maps the same two names.
+///
+/// - An edit in the repository does not reach the desktop; the control
+///   folder's does.
+/// - The laptop's status carries the notice and names the repository,
+///   and its level is red: in `--json`, the line, the bar form and the
+///   plain status; `cordelia sync status` says it first. It is still
+///   there after a restart.
+/// - A file is deleted in the repository, and the repository is mapped:
+///   it merges. The file comes back, and is not deleted on the desktop;
+///   the laptop's edit reaches the desktop. The notice no longer names
+///   the repository, and `--seen` puts it away.
+///
+/// `scope` is what the laptop's database has stored as its scope. With
+/// `before_mappings` its stored report is in the form from before
+/// mappings, in which a folder has no directory: the notice then has no
+/// command for it, and the list of what is found has.
+fn folders_that_stopped_sync_again_once_they_are_mapped(
+    scope: Option<&str>,
+    before_mappings: bool,
+) {
+    use cordelia_storage::meta;
+    use serde_json::json;
+    let relay = relay_started();
+    let desktop = device_started("desktop", &relay);
+    let mut laptop = node("laptop", "personal", Some(relay.p2p));
+    let home = laptop.home();
+    let shown = |path: &Path| path.display().to_string();
+
+    // On the laptop: the control folder, which is mapped, and the
+    // repository, which was found. Each holds memory.
+    let lab = std::path::PathBuf::from(lab_of(&laptop));
+    std::fs::create_dir_all(&lab).unwrap();
+    let lab_mem = claude_folder(&home, &lab);
+    let repo = clone_at(&home, "work/tools");
+    let repo_mem = claude_folder(&home, &repo);
+    std::fs::write(repo_mem.join("shared.md"), "what both devices hold\n").unwrap();
+    let repo_folder = shown(&claude_project(&home, &repo));
+    {
+        let conn = in_the_released_form(&laptop);
+        match scope {
+            Some(scope) => meta::set(&conn, meta::SYNC_CLAUDE_ALL, scope).unwrap(),
+            None => {
+                meta::remove(&conn, meta::SYNC_CLAUDE_ALL).unwrap();
+            }
+        }
+        // The last cycle's report, as the version before stored it: the
+        // control folder, and the repository, which synced unmapped.
+        let folder = |dir: &Path, name: &str, mapped: bool| {
+            let mut folder = json!({
+                "channel_id": null, "conflict_files": [], "conflicts": 0, "error": null,
+                "folder": shown(&claude_project(&home, dir)),
+                "last_published_at": null, "last_pulled_at": null,
+                "project": name, "published": 0, "pulled": 0, "skipped": [], "too_large": [],
+                "waiting": false,
+            });
+            if !before_mappings {
+                folder["cwd"] = shown(dir).into();
+                folder["mapped"] = mapped.into();
+            }
+            folder
+        };
+        let report = json!({
+            "at": "2026-10-05T09:12:44.512203817+00:00",
+            "available": [], "errors": [], "excluded": [],
+            "folders": [folder(&lab, "lab", true), folder(&repo, TOOLS, false)],
+            "generation": 4, "unmapped": [], "unsynced": [],
+        });
+        meta::set(&conn, meta::SYNC_CLAUDE_REPORT, &report.to_string()).unwrap();
+    }
+    laptop.start();
+    let all = [&relay, &desktop, &laptop];
+    wait_for("laptop healthy", &all, 30, || healthy(&laptop));
+    wait_for("laptop reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
+    });
+
+    // Its first start stored the notice, and the scope is off. It is not
+    // added yet, and says that first: both are red.
+    let named = |status: &serde_json::Value| -> serde_json::Value {
+        let all = status["sync"]["notice"]["folders"].as_array().unwrap();
+        let found = all
+            .iter()
+            .find(|folder| folder["folder"] == repo_folder.as_str());
+        found
+            .unwrap_or_else(|| panic!("the notice does not name the repository: {status}"))
+            .clone()
+    };
+    let status = status_of(&laptop);
+    assert_eq!(status["sync"]["all"], false, "{status}");
+    assert_eq!(status["sync"]["notice"]["stopped"], 1, "{status}");
+    assert_eq!(status["sync"]["notice"]["not_known"], false, "{status}");
+    assert_eq!(named(&status)["name"], TOOLS);
+    assert_eq!(status["level"], "red", "{status}");
+    assert_eq!(status["summary"], "memory: not added yet", "{status}");
+    assert_eq!(holds_of(&status), ["no_phrase", "stopped_syncing"]);
+
+    // The two become one person's devices. The desktop maps its clone,
+    // under the remote's name, and its control folder.
+    pair(&desktop, &laptop, "laptop", &all);
+    let d_home = desktop.home();
+    let said = desktop.cli(&["sync", "claude", "--dir", &shown(&d_home.join(".claude"))]);
+    assert!(said.starts_with("Sync turned on.\n"), "{said}");
+    let d_repo = clone_at(&d_home, "code/tools");
+    let d_repo_mem = claude_folder(&d_home, &d_repo);
+    std::fs::write(d_repo_mem.join("shared.md"), "what both devices hold\n").unwrap();
+    std::fs::write(
+        d_repo_mem.join("from_desktop.md"),
+        "written on the desktop\n",
+    )
+    .unwrap();
+    let d_lab = d_home.join("lab");
+    std::fs::create_dir_all(&d_lab).unwrap();
+    let d_lab_mem = claude_folder(&d_home, &d_lab);
+    desktop.cli(&["sync", "map", &shown(&d_repo)]);
+    desktop.cli(&["sync", "map", &shown(&d_lab), "lab"]);
+    let mapped: Vec<String> = status_of(&desktop)["sync"]["mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|mapping| mapping["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(mapped, [TOOLS, "lab"]);
+
+    // An edit in each folder on the laptop. The control folder's reaches
+    // the desktop. The repository's does not: it is not mapped here.
+    std::fs::write(repo_mem.join("decision.md"), "decided on the laptop\n").unwrap();
+    std::fs::write(lab_mem.join("notes.md"), "noted on the laptop\n").unwrap();
+    wait_for(
+        "the control folder's edit reaches the desktop",
+        &all,
+        120,
+        || (read(&d_lab_mem.join("notes.md"))?.as_str() == "noted on the laptop\n").then_some(()),
+    );
+    // Some cycles later still not, and nothing of the desktop's came
+    // into the repository's folder here.
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    assert_eq!(read(&d_repo_mem.join("decision.md")), None);
+    assert_eq!(read(&repo_mem.join("from_desktop.md")), None);
+    let seen = person_of(&laptop);
+    let held: Vec<&str> = ["sent", "to_go"]
+        .iter()
+        .flat_map(|key| seen["names"][key].as_array().unwrap())
+        .filter_map(|name| name.as_str())
+        .collect();
+    assert_eq!(held, ["lab"], "the laptop holds no name for the repository");
+
+    // The laptop's status carries the notice, and is red: folders
+    // stopped syncing.
+    let status = wait_for("the laptop says what stopped", &all, 60, || {
+        let status = status_of(&laptop);
+        (status["summary"] == "memory: 1 folder stopped syncing").then_some(status)
+    });
+    assert_eq!(
+        (&status["level"], &status["state"]),
+        (&json!("red"), &json!("attention"))
+    );
+    assert!(holds_of(&status).contains(&"stopped_syncing".to_string()));
+    assert_eq!(status["sync"]["notice"]["stopped"], 1, "{status}");
+    let repository = named(&status);
+    assert_eq!(repository["name"], TOOLS);
+    let line = laptop.cli(&["status", "--line"]);
+    assert!(
+        line.contains("▲ memory: 1 folder stopped syncing"),
+        "{line}"
+    );
+    let bar: serde_json::Value =
+        serde_json::from_str(&laptop.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(bar["class"], json!(["attention", "red", "active"]), "{bar}");
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(tooltip.contains("Stopped syncing: "), "{tooltip}");
+    let plain = laptop.cli(&["status"]);
+    assert!(
+        plain.contains("Memory:    memory: 1 folder stopped syncing"),
+        "{plain}"
+    );
+    assert!(plain.contains("    stopped:  "), "{plain}");
+    // `cordelia sync status` says it first, with the command that maps
+    // the repository under the name it synced under; or, from a report
+    // of before mappings, that its directory is not known, with the
+    // command in the list of what is found.
+    let said = laptop.cli(&["sync", "status"]);
+    assert!(
+        said.starts_with("1 folder stopped syncing on this device"),
+        "{said}"
+    );
+    let by_the_notice = format!("cordelia sync map ~/work/tools {TOOLS}");
+    match before_mappings {
+        false => {
+            assert_eq!(repository["mappable"], true, "{repository}");
+            assert_eq!(repository["cwd"], shown(&repo).as_str());
+            assert!(
+                tooltip.contains(&format!("~/work/tools ({TOOLS})")),
+                "{tooltip}"
+            );
+            assert!(said.contains(&by_the_notice), "{said}");
+        }
+        true => {
+            assert_eq!(repository["why_not"], "no_directory", "{repository}");
+            assert!(repository["cwd"].is_null(), "{repository}");
+            assert!(said.contains("its directory is not known"), "{said}");
+            assert!(!said.contains(&by_the_notice), "{said}");
+            let found = said.split("Found on this machine, not syncing:").nth(1);
+            let found = found.unwrap_or_else(|| panic!("{said}"));
+            assert!(found.contains("cordelia sync map ~/work/tools\n"), "{said}");
+        }
+    }
+    assert!(said.contains("cordelia sync status --seen"), "{said}");
+
+    if !before_mappings {
+        // The notice is still there after a restart.
+        laptop.stop();
+        laptop.start();
+        let all = [&relay, &desktop, &laptop];
+        wait_for("laptop healthy again", &all, 30, || healthy(&laptop));
+        wait_for("the laptop is red again", &all, 60, || {
+            let status = status_of(&laptop);
+            (status["summary"] == "memory: 1 folder stopped syncing").then_some(())
+        });
+
+        // `map` checks when it is run. A memory tree laid out by hand
+        // records a directory: `map` of that directory would sync
+        // another folder, and is refused with the reason.
+        let other = home.join("work/other");
+        std::fs::create_dir_all(&other).unwrap();
+        let tree = home.join(".claude/projects/workspace");
+        std::fs::create_dir_all(tree.join("memory")).unwrap();
+        std::fs::write(tree.join("memory/kept.md"), "kept by hand\n").unwrap();
+        let line = format!("{{\"cwd\":{:?}}}\n", shown(&other));
+        std::fs::write(tree.join("scope.jsonl"), line).unwrap();
+        // And a folder that is no repository, which is found; a
+        // repository then appears above it.
+        let notes = home.join("deep/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        claude_folder(&home, &notes);
+        let said = wait_for("the laptop lists both", &all, 60, || {
+            let said = laptop.cli(&["sync", "status"]);
+            let both = said.contains("this layout cannot be mapped")
+                && said.contains("cordelia sync map ~/deep/notes <name>");
+            both.then_some(said)
+        });
+        assert!(
+            said.contains("~/.claude/projects/workspace/memory"),
+            "{said}"
+        );
+        assert!(!said.contains("cordelia sync map ~/work/other"), "{said}");
+        let refused = laptop.refused(&["sync", "map", &shown(&other), "other"]);
+        assert!(
+            refused.contains("this layout cannot be mapped"),
+            "{refused}"
+        );
+        assert!(refused.contains("nothing was mapped"), "{refused}");
+        let above = home.join("deep");
+        let made = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&above)
+            .args(["init", "-q"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let refused = laptop.refused(&["sync", "map", &shown(&notes), "notes"]);
+        assert!(refused.contains("would sync another folder"), "{refused}");
+        assert!(
+            refused.contains("a git repository that contains it"),
+            "{refused}"
+        );
+        let mappings = status_of(&laptop)["sync"]["mappings"].clone();
+        assert_eq!(mappings.as_array().unwrap().len(), 1, "{mappings}");
+    }
+    let all = [&relay, &desktop, &laptop];
+
+    // A file is deleted in the repository, and then the repository is
+    // mapped: by the notice's command, or by the list's.
+    std::fs::remove_file(repo_mem.join("shared.md")).unwrap();
+    let said = match before_mappings {
+        false => laptop.cli(&["sync", "map", &shown(&repo), TOOLS]),
+        true => laptop.cli(&["sync", "map", &shown(&repo)]),
+    };
+    assert!(
+        said.contains(&format!("Mapped ~/work/tools to {TOOLS}.")),
+        "{said}"
+    );
+    // It merges: what each side wrote reaches the other, and the file
+    // that was deleted here comes back, and is not deleted there.
+    wait_for("the laptop's edit reaches the desktop", &all, 120, || {
+        (read(&d_repo_mem.join("decision.md"))?.as_str() == "decided on the laptop\n").then_some(())
+    });
+    wait_for("the desktop's file reaches the laptop", &all, 120, || {
+        (read(&repo_mem.join("from_desktop.md"))?.as_str() == "written on the desktop\n")
+            .then_some(())
+    });
+    wait_for("the deleted file comes back", &all, 120, || {
+        (read(&repo_mem.join("shared.md"))?.as_str() == "what both devices hold\n").then_some(())
+    });
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    assert_eq!(
+        read(&d_repo_mem.join("shared.md")).as_deref(),
+        Some("what both devices hold\n"),
+        "it is not deleted on the desktop"
+    );
+    assert_eq!(
+        read(&repo_mem.join("shared.md")).as_deref(),
+        Some("what both devices hold\n")
+    );
+
+    // The notice no longer names the repository: nothing of it is red.
+    let status = wait_for("the notice names nothing that stopped", &all, 60, || {
+        let status = status_of(&laptop);
+        (status["sync"]["notice"]["stopped"] == 0 && status["level"] != "red").then_some(status)
+    });
+    assert_eq!(named(&status)["mapped"], true, "{status}");
+    assert!(!holds_of(&status).contains(&"stopped_syncing".to_string()));
+    let said = laptop.cli(&["sync", "status"]);
+    assert!(
+        said.starts_with("Every folder that stopped syncing on this device is mapped again."),
+        "{said}"
+    );
+    // Seen: it is put away, and the status carries none.
+    let said = laptop.cli(&["sync", "status", "--seen"]);
+    assert!(
+        said.starts_with("The notice of the folders that stopped syncing is put away."),
+        "{said}"
+    );
+    let status = status_of(&laptop);
+    assert!(status["sync"]["notice"].is_null(), "{status}");
+    assert!(!laptop.cli(&["sync", "status"]).contains("stopped syncing"));
+    let conn = database_of(&laptop);
+    assert!(first_start::notices(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn folders_that_synced_unmapped_stop_and_sync_again_once_they_are_mapped() {
+    folders_that_stopped_sync_again_once_they_are_mapped(Some("on"), false);
+}
+
+/// The same from data where no scope is stored, with a directory set,
+/// and a stored report in the form from before mappings.
+#[test]
+fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() {
+    folders_that_stopped_sync_again_once_they_are_mapped(None, true);
+}

@@ -3720,15 +3720,18 @@ fn map_would_sync_another(
     let (asked, folder) = [given, root].into_iter().find_map(|asked| {
         found::in_the_way(asked, &would_sync, pairs()).map(|folder| (asked, folder))
     })?;
-    // The reason the node gave for the folder, or, where it found the
-    // folder before a repository appeared above its directory, that.
-    let said = listed
-        .iter()
-        .find(|(of, directory, _)| *of == folder && std::path::Path::new(directory) == asked)
-        .and_then(|(_, _, says)| *says)
-        .map(str::to_string);
-    let moved = || found::WhyNot::MemoryElsewhere(root.to_path_buf()).says();
-    let reason = said.or_else(|| (root != given).then(moved));
+    // Where the folder was found for the directory that was given, and
+    // Claude Code now keeps that directory's memory with a repository
+    // that contains it, that is the reason: what the node said of the
+    // folder was said before. Otherwise, the reason the node gave.
+    let reason = match asked == given && root != given {
+        true => Some(found::WhyNot::MemoryElsewhere(root.to_path_buf()).says()),
+        false => listed
+            .iter()
+            .find(|(of, directory, _)| *of == folder && std::path::Path::new(directory) == asked)
+            .and_then(|(_, _, says)| *says)
+            .map(str::to_string),
+    };
     Some(found::map_refused(
         asked,
         &would_sync,
@@ -4564,6 +4567,13 @@ mod tests {
             why.contains("/home/sam/.claude/projects/-home-sam)"),
             "{why}"
         );
+        // The reason is the repository, and not what was said of the
+        // folder when it was found.
+        assert!(
+            why.contains("(Claude Code now keeps its memory with /home/sam, a git repository"),
+            "{why}"
+        );
+        assert!(!why.contains("needs a name"), "{why}");
         // An entry of another directory is not in the way.
         let other = Path::new("/home/sam/other");
         assert_eq!(map_would_sync_another(other, other, &listed), None);
