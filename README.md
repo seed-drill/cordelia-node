@@ -85,9 +85,9 @@ read what your devices write from now on. `accept` joins the machine, and the
 folders it maps, to the devices of the key you typed. The phrase is not typed
 to add a device.
 
-- Every device of yours shows a new device until you clear it there
-  (`cordelia devices --clear`). A device that you did not add is one to
-  remove.
+- Every device of yours shows a new device, and its status line is amber,
+  until you clear it there (`cordelia devices --clear`) or a renewal lists
+  it (`cordelia renew`). A device that you did not add is one to remove.
 - Add a machine soon after you install it. For as long as it follows no
   phrase, one yes at a terminal joins it, and its folders, to whichever
   device's key is typed. A machine that is already one of several stays where
@@ -106,6 +106,7 @@ cordelia sync map ~/Work/my-project   # a git project, named by its remote
 cordelia sync map ~/notes lab-notes   # any other folder in your home directory, under a name you choose
 cordelia sync map ~ --home            # home memory
 cordelia sync status                  # what syncs, what was found, what your other devices sync
+cordelia sync status --seen           # put away the notice of folders that stopped syncing
 ```
 
 **Only folders that you map sync.** A folder syncs because `cordelia sync map`
@@ -164,14 +165,16 @@ cordelia remove-device <key>     # remove a device (asks for the phrase)
 cordelia renew                   # a new secret for the devices that stay (asks for the phrase)
 cordelia settle                  # settle two changes that were made apart (asks for the phrase)
 cordelia recover                 # on a new machine, with no device left (asks for the phrase)
+cordelia sync carry [<name>]     # bring in what a device that never returned had sent to the relays
 ```
 
 `cordelia devices` is the one place to look. It lists every device of the
 last change, with whether it has applied that change and sent what it held;
-every device added since, and who added it; every removed key; and, for each
-relay, whether it holds the latest change. Beside each device's label are
-the first four words of its key's fingerprint: two devices can have one
-label, and the words tell them apart.
+every device added since, and who added it; every removed key; the names
+that no device lists yet since the last change, and what this device has
+still to send; and, for each relay, whether it holds the latest change.
+Beside each device's label are the first four words of its key's
+fingerprint: two devices can have one label, and the words tell them apart.
 
 **To remove a device** that is lost, stolen or retired, run
 `cordelia remove-device <key>` on a device that remains. It shows the device
@@ -196,26 +199,69 @@ the device being removed syncs. Then it asks a yes, and then the phrase.
 - A device that was removed by mistake cannot come back under its key.
   `cordelia init --new-key` gives it a new one and keeps its memory folders;
   it is then added as a new device.
+- Given a key that this device knows nothing of (it is in no list of the
+  last change, and was not added since), `cordelia remove-device <key>` says
+  so, and that removing it refuses that key for good. It asks a typed
+  answer, `refuse`, before it goes on as any removal. That is for a key that
+  was one of your devices before an upgrade, and is not to be added again.
 
 `cordelia renew` removes nobody. It gives the devices that stay a new secret,
 and asks of each device added since the last change whether it stays: run it
 once your devices are added, so that they are in a list you have looked at.
 
 **To recover**, when you have no device left that you trust, install
-Cordelia on a new machine and run `cordelia recover`. It asks for the phrase,
-shows every device and asks of each whether you still have it, have lost it,
-or think it may be in someone else's hands, and brings back what the relays
-hold. Keep the machine on until it says that everything is sent.
+Cordelia on a new machine and run `cordelia recover`. It asks the relays
+that the machine is set up with. It asks for the phrase, shows every device
+with the first words of its key's fingerprint, and asks of each one of three
+things, each typed: `have` (you still have it), `lost` (it is lost or
+broken) or `hands` (it may be in someone else's hands). It shows the change
+that the phrase will sign, asks a yes, and then looks once at what the
+relays hold and brings it back. When the look has ended it says what it
+found, and how many names this machine has still to send: keep the machine
+on until `cordelia devices` shows nothing left to send.
 
 - Every other device stops when it hears, and each one that you still have
   is added again from the new machine, with the two commands.
+- Nothing that a device answered with `hands` wrote is brought back by the
+  recovery, nor what a device that it added wrote: the command says how much
+  that is, and `cordelia sync carry <name> --from <device>` brings it in.
 - A relay is a cache, not a backup: recovery brings back what the relays
   hold, for 90 days after the last of your devices was on.
 - Where a device remains that you trust, remove the lost one from it
   instead: that stops nobody else.
-- `cordelia sync carry <name>` brings in what a device that never returned
-  had sent to the relays. With `--from <label>`, and the phrase, it also
-  takes what a removed device wrote there.
+
+**`cordelia sync carry`** brings in what the relays still hold from before a
+change and no device carried: the last edits of a device that never
+returned, or a name that no device syncs any more.
+
+```bash
+cordelia sync carry                       # every name this device holds
+cordelia sync carry lab-notes             # one name
+cordelia sync carry lab-notes --from      # list the removed keys that signed there; takes nothing
+cordelia sync carry lab-notes --from "desktop"   # what that removed device wrote there (asks for the phrase)
+cordelia sync carry lab-notes --phrase    # read what this device never held the secret of (asks for the phrase)
+```
+
+- Without a flag it takes what your devices that still count wrote, from
+  the channels of each secret that this device left in the last 90 days.
+  `cordelia sync map` does the same for a folder that comes to sync a name.
+- `--from` names a removed device by its label, or by the first six words of
+  its key's fingerprint, in quotes; give it once for each device. It says
+  what it found before it asks anything: what would go where the channel
+  holds nothing, and which files stand above a version that the channel
+  holds. The first comes in on a yes. The second comes in only on a second
+  yes, for a name that has a folder on this device, and the text it replaces
+  is kept beside the file. Then it asks for the phrase. A device in someone
+  else's hands may have changed what the relays hold of it: say no unless
+  you know it was not.
+- `--phrase` is for a device that never held one of the secrets that were
+  in use: it was off through two changes or more, or was added after a
+  change. The command asks a yes and then the phrase, reads what the relays
+  hold under those secrets, and takes what your devices that count wrote.
+- `--from` and `--phrase` are two carries: the two together are refused,
+  and each is for one name.
+- Each can be run again, and takes what is still missing: a relay that was
+  down the first time is asked the second.
 
 **If the phrase is lost, or someone else has seen it,** it cannot be
 replaced. Start again on every device: `cordelia phrase` on one, which makes
@@ -231,19 +277,36 @@ memory folders, and is added again.
    and synced, so that every memory folder holds what the others hold. A
    file that was deleted on one machine and is still on another comes back.
 2. **Upgrade each machine.** A relay is upgraded before the devices that use
-   it: if you run your own, see [deploy/relay/README.md](deploy/relay/README.md). It keeps its key, its memory folders and its
-   mappings. It publishes nothing, and its status says "not added yet".
+   it: if you run your own, see [deploy/relay/README.md](deploy/relay/README.md).
+   Each machine keeps its key, its memory folders and its mappings. It
+   publishes nothing, and its status says "not added yet".
 3. **Run `cordelia phrase` on one machine,** the one whose memory is the most
    up to date.
 4. **Add each other machine** with `cordelia add-device` and `cordelia
    accept`, as above.
 
 A machine whose sync was set to everything it found is told which folders
-stopped: `cordelia sync map` each one that is to go on. At its first start on
-this version a machine copies its database into a folder named
-`before-<version>` beside it, before it empties anything of the version
-before. The copy holds what the machine held, some of it in the clear, and
-can be deleted once you are content. Going back to the version before is in
+stopped: `cordelia sync status` lists them, each with the command that maps
+it. `cordelia sync map` each one that is to go on, and
+`cordelia sync status --seen` puts the notice away.
+
+At its first start on this version a machine copies its database into a
+folder named `before-<version>` beside it, before it empties anything of the
+version before. The copy holds what the machine held, some of it in the
+clear, and can be deleted once you are content.
+
+- Where the copy cannot be made (the volume has too little room, say),
+  nothing is changed and nothing syncs: `cordelia status` says why, with the
+  room that the copy needs and the room there is. The node stays up and
+  tries again by itself, after waits that grow from five seconds to ten
+  minutes, and needs no restart.
+- A data directory is one node's. A second node that is started on a
+  directory where one runs says so, changes nothing, and stops.
+- A device that was removed before the upgrade is no device after it, and
+  its key is not refused either. To have the key refused, remove it once
+  more by key: `cordelia remove-device <key>`.
+
+Going back to the version before is in
 [docs/specs/operations.md](docs/specs/operations.md), section 10.5.
 
 ### Status
@@ -253,36 +316,52 @@ memory sync. For status bars:
 
 - `cordelia status --line` prints one short line: `● memory synced`,
   `◐ memory sending 3`, `○ memory offline`, `▲ memory: 1 conflict`,
-  `▲ memory: 1 file too large`, `▲ memory: not added yet`, and so on. It
-  prints nothing on a machine where Cordelia is not set up. The line shows
-  the first thing of the gravest level, and its tooltip shows everything.
-  - **Red** is for what stops this device syncing until you act: it was
-    removed; it is in no list of the last change, and is to be added again;
-    two changes were made apart, and are to be settled with the phrase; a
-    change could not be opened or applied here; its first start on this
-    version has not succeeded; or it has a folder mapped and no recovery
-    phrase yet ("not added yet" after an upgrade, "no recovery phrase yet"
-    on a new install). A machine that is not to be added turns sync off.
-  - **Amber** is for what goes on, and waits on you or on a relay: a removal
-    that some device has not applied, for its first seven days; a device
-    added since the last change that nobody has cleared; a device that has
-    said it left; a relay that has been connected for more than five minutes
-    and does not hold the latest change; a relay that refuses a new channel,
-    for room or because its address has added too many; names that are not
-    yet in the channels of the last change, or not yet sent, for more than
-    five minutes.
+  `▲ memory: 1 file too large`, `▲ memory: not added yet`,
+  `◆ memory: 1 device added, not yet cleared`, and so on. It prints nothing
+  on a machine where Cordelia is not set up. The status has one level, red
+  (`▲`) or amber (`◆`) or none: the line shows the first thing of the
+  gravest level, and its tooltip shows everything that holds.
+  - **Red** is for what you should act on now. Whatever sync is set to: this
+    device was removed; it is in no list of the last change, and is to be
+    added again; two changes were made apart, and are to be settled with the
+    phrase; a change could not be opened or applied here; its first start on
+    this version has not succeeded, or its database is from a later version.
+    With sync on: it has a folder mapped and no recovery phrase yet ("not
+    added yet" after an upgrade, "no recovery phrase yet" on a new install);
+    a sync error; a cycle that has stalled; conflict files to merge; files
+    too large to sync; and folders that stopped syncing at the upgrade. A
+    machine that is not to be added turns sync off.
+  - **Amber** is for what you should know of. Of your devices, with sync on
+    or off: a removal that some device has not applied, for its first seven
+    days; a device added since the last change, on every device until it is
+    cleared there (`cordelia devices --clear`) or a renewal lists it
+    (`cordelia renew`); a device that has said it left. Of folders, with
+    sync on and a folder mapped: no relay connected for more than five
+    minutes; entries that relays keep refusing; a running node that is not
+    the version of the command (restart it); a relay that has been connected
+    for more than five minutes and does not hold the latest change; a relay
+    that has refused something in the last twenty minutes, for room or
+    because its address has added too many channels; names that are not yet
+    in the channels of the last change (for its first seven days), or not
+    yet sent, for more than five minutes.
 - `cordelia status --json` gives the same `state` (`synced`, `syncing`,
   `offline`, `attention`, `off`, `stopped`, `uninitialised`) and `summary`,
-  with everything a panel or an agent needs: whether the node is `running`
-  (`null` where the command did not ask it, with why in `not_asked`: the
-  API's address is set to something other than `127.0.0.1` or `::1`), the
-  connected relays, your devices, each folder that syncs and its name, what
-  was found and is not syncing, what your other devices sync, what waits to
-  reach a relay and what a relay refused, last change, the conflict files
-  waiting to be merged, the files that are too large to sync, and the files
-  that could not be synced in the last cycle, each with why (the first
-  hundred, and how many more). With sync on and no recovery phrase the
-  `state` is `attention`.
+  the `level` (`red`, `amber`, or `null` where none holds) and, under
+  `holds`, everything that holds, red first, each with its level, a word for
+  what it is, and what the line says of it. A panel draws the level and
+  works nothing out itself. With them is everything a panel or an agent
+  needs: whether the node is `running` (`null` where the command did not ask
+  it, with why in `not_asked`: the API's address is set to something other
+  than `127.0.0.1` or `::1`), why the node is held up where it is (`held`),
+  the connected relays and for how long none has been connected
+  (`no_relay_secs`), your devices, each folder that syncs and its name, what
+  was found and is not syncing, the notice of the folders that stopped
+  syncing (`sync.notice`), what your other devices sync, what waits to reach
+  a relay and what a relay refused, last change, the conflict files waiting
+  to be merged, the files that are too large to sync, and the files that
+  could not be synced in the last cycle, each with why (the first hundred,
+  and how many more). With sync on, a folder mapped and no recovery phrase
+  the `state` is `attention`.
 
 To show it in Claude Code, add this to `~/.claude/settings.json` (use the full
 path, e.g. `~/.cordelia/bin/cordelia`, if `cordelia` is not on the `PATH`
@@ -306,8 +385,9 @@ omarchy plugin add https://github.com/seed-drill/omarchy-cordelia.git --enable
 ```
 
 For any other bar, `cordelia status --waybar` prints an icon, a tooltip and
-the state as a class, in the JSON that Waybar's custom modules take. The
-icons are Nerd Font glyphs.
+the state as a class, in the JSON that Waybar's custom modules take. With a
+level the class is the state and then the level (`red` or `amber`), and with
+red also `active`. The icons are Nerd Font glyphs.
 
 - **Omarchy, without the panel:** add this to `bar.layout.right` in
   `~/.config/omarchy/shell.json`. The bar highlights the icon when a conflict
@@ -322,7 +402,8 @@ icons are Nerd Font glyphs.
   }
   ```
 - **Waybar:** a custom module, styled by class (`synced`, `syncing`,
-  `offline`, `attention`, `off`, `stopped`).
+  `offline`, `attention`, `off`, `stopped`, and `red` or `amber` where a
+  level holds).
   ```json
   "custom/cordelia": {
     "exec": "~/.cordelia/bin/cordelia status --waybar",
@@ -358,9 +439,10 @@ cargo test --all               # unit, protocol, and end-to-end tests
 The local API (`127.0.0.1:9473`, bearer token in `~/.cordelia/node-token`)
 covers the names a device holds (`/api/v1/channels/publish`, `entries` and
 `delete-key`), a person's devices (`/api/v1/devices/*`, `/api/v1/phrase/make`,
-`/api/v1/change/*`), sync (`/api/v1/sync/*`) and local history
-(`/api/v1/history/*`). No route takes the recovery phrase: a command reads it
-at a terminal and signs in its own process.
+`/api/v1/change/*`), a carry that a person asks for and recovery
+(`/api/v1/carry/*`, `/api/v1/recover/*`), sync (`/api/v1/sync/*`) and local
+history (`/api/v1/history/*`). No route takes the recovery phrase: a command
+reads it at a terminal and signs in its own process.
 
 ## Security
 

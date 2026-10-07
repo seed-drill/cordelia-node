@@ -311,21 +311,25 @@ Phase 4: device management UI, selective revocation via key rotation.
 > |---------|--------------|--------------------|
 > | `cordelia init` | Create this device's key and database. `--new-key` gives the device a new key | `--new-key` does |
 > | `cordelia start` | Run the node. (`cordelia stop` is not built: a node is stopped by its service, or by a signal) | |
-> | `cordelia status` | This device, its peers and memory sync. `--line` for a status bar, `--json` for tools, `--waybar` for a bar module | |
+> | `cordelia status [--line \| --json \| --waybar]` | This device, its peers and memory sync. `--line` for a status bar, `--json` for tools, `--waybar` for a bar module (§4.3) | |
 > | `cordelia id` | Print this device's public key | |
 > | `cordelia phrase [--name <label>]` | Make the recovery phrase of your devices on this one: twelve words, shown once and typed back | Yes |
 > | `cordelia add-device <key> [--name <label>]` | Add another of your devices; then `cordelia accept` on it, within the hour | Yes |
 > | `cordelia accept <key>` | Take what the device that added this one hands over | Yes |
 > | `cordelia devices [--clear]` | Your devices, what each has applied, and what each relay holds. `--clear` goes through what this device has to tell you | `--clear` does |
-> | `cordelia remove-device <key>` | Remove one of your devices | Yes, and the phrase |
+> | `cordelia remove-device <key>` | Remove one of your devices. Given a key that this device knows nothing of (it is in no list of the last change, and was not added since), it says so, and that removing it refuses that key for good, and asks a typed answer, `refuse`, before it goes on as any removal | Yes, and the phrase |
 > | `cordelia renew` | Give the devices that stay a new secret: of each device added since the last change, you say whether it stays | Yes, and the phrase |
 > | `cordelia settle` | Settle two changes that were made apart, on a device that has seen both | Yes, and the phrase |
-> | `cordelia recover` | On a new machine, with no device left that you trust: bring back what the relays hold. `--relay` names a relay beside those it is set up with | Yes, and the phrase |
-> | `cordelia sync claude` | Turn on Claude Code memory sync. Nothing syncs until a folder is mapped. `--all` is refused | |
-> | `cordelia sync map <folder> [name]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop | |
-> | `cordelia sync off`, `cordelia sync status` | Stop syncing; show what syncs and what was found | |
-> | `cordelia sync carry [name]` | Bring into the channels of the last change what a generation that was left still holds at the relays. `--from <label>` and `--phrase` take what a removed device signed, or read a generation this device never held | `--from` and `--phrase` do, and the phrase |
-> | `cordelia history`, `cordelia restore <id>` | Local history: the versions that sync replaced here, and putting one back | |
+> | `cordelia recover [--name <label>]` | On a machine that follows no phrase, with no device left that you trust: bring back what the relays hold. It asks the relays that the machine is set up with, and takes no other. Of each device it asks a typed `have`, `lost` or `hands` (§9) | Yes, and the phrase, which it asks for first |
+> | `cordelia sync claude [--dir <path>] [--mapped-only] [--no-home] [--reset]` | Turn on Claude Code memory sync. Nothing syncs until a folder is mapped. `--dir` sets the Claude Code directory, and `--reset` goes back to `~/.claude`; `--no-home` unmaps the home directory; `--mapped-only` is taken, and is the only scope there is. `--all` and `--exclude` are refused | |
+> | `cordelia sync map <folder> [name] [--home]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop. `--home` maps the home directory itself | |
+> | `cordelia sync home on\|off` | Map the home directory, or unmap it | |
+> | `cordelia sync off` | Stop syncing | |
+> | `cordelia sync status [--seen]` | Show what syncs, what was found and what your other devices sync. `--seen` shows the notice of the folders that stopped syncing once more, and puts it away | |
+> | `cordelia sync carry [name]` | Bring into the channels of the last change what your devices that count had sent to the relays before it, in each generation that this device left in the last 90 days; with no name, for every name this device holds | |
+> | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing | With a device named: twice a yes at most, and then the phrase |
+> | `cordelia sync carry <name> --phrase` | Read the generations whose secret this device never held, and take what your devices that count signed there. `--from` and `--phrase` together are refused | Yes, and the phrase |
+> | `cordelia history [<name or folder>] [--removed] [--since <time>]`, `cordelia history show <id>`, `cordelia history drop`, `cordelia restore <id>...` | Local history: the versions that sync replaced or removed here, printing one, removing kept versions, and putting versions back | |
 > | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
 >
 > - **A command that asks at a terminal refuses when its input is not one,**
@@ -333,13 +337,22 @@ Phase 4: device management UI, selective revocation via key rotation.
 > - **The recovery phrase is typed at the command's own prompt, with echo
 >   off:** never as an argument, never over the local API. The command signs
 >   in its own process and forgets the words before it waits for anything.
+>   `remove-device`, `renew`, `settle` and `sync carry --from` ask for it
+>   last, after what they show and their yes. `recover` asks for it first and
+>   holds it through its prompts, since it reads at the relays with it. What
+>   a command waits for afterwards (the sending after a change, the look of a
+>   recovery) it waits for in a new process, which never held the phrase.
+> - **A command that makes or asks for a phrase asks how the node stands
+>   first,** and shows no word where the node is held up (§10.5).
 > - **A command that changes anything refuses a node of another version than
 >   its own,** with the note that says how to restart it. Turning sync off is
 >   the exception. `cordelia status`, `cordelia sync status`, `cordelia
 >   devices` and `cordelia history` still answer beside such a node, with the
 >   note (decision 2026-10-04 §10.1, rule 6).
-> - `cordelia sync exclude` and `cordelia sync include` are refused: only
->   what is mapped syncs, so there is nothing to exclude.
+> - `cordelia sync exclude`, `cordelia sync include`, `cordelia sync claude
+>   --exclude` and `cordelia sync claude --all` are refused, before anything
+>   is sent to the node, with what to do instead: only what is mapped syncs,
+>   so there is nothing to exclude.
 > - `cordelia pair`, `join`, `export` and `version` below are not commands.
 >   `cordelia --version` prints the version.
 
@@ -395,35 +408,69 @@ JSON output (`--json`):
 > **v1 status.** `cordelia status` shows this device and, while the node
 > runs, its peers and memory sync; `cordelia status --json` gives the same as
 > data, with a `state` of `synced`, `syncing`, `offline`, `attention`, `off`,
-> `stopped` or `uninitialised`. **The status line has one level** (decision
-> 2026-10-04 §8, §10.1), for a personal node that runs with sync on. It
-> shows the first thing of the gravest level, and the tooltip everything.
+> `stopped` or `uninitialised`. **The status has one level** beside its state
+> (decision 2026-10-04 §8, §10.1): red, amber or none. The command works it
+> out (`crates/cordelia-node/src/indicator.rs`), and a panel draws it. Red
+> is what a person should act on now, and amber what a person should know
+> of. The line shows the first thing of the gravest level (`▲` for red, `◆`
+> for amber), and the tooltip everything that holds. `--json` carries
+> `level` (`red`, `amber` or `null`) and `holds`: everything that holds, red
+> first, each with its `level`, a word for what it is (`what`) and what the
+> line says of it (`says`).
 >
-> - **Red,** ahead of everything else: this device has stopped (it was
->   removed, or is in no list of the last change, or is in a fork, or was
->   answered with a change that it could not open or apply); the first start
->   on this version has not succeeded (§10.5); and then, where something is
->   mapped, that it follows no phrase ("not added yet" after the upgrade, "no
->   recovery phrase yet" on a new install). That is red on every device after
->   this upgrade, and on every new install with a folder mapped, until a
->   person acts: nothing it holds syncs until then. A device that is not to
->   be added turns sync off. With nothing mapped, the notice of what stopped
->   at the first start, errors and a stalled cycle are red.
-> - **Amber,** after what else is amber: a removal that some device has not
->   applied, for its first seven days (after that it is in `cordelia devices`
->   only); a device added since the last change that nobody has cleared;
->   a device that has said it left; a relay that has been connected for more
->   than five minutes and does not hold the latest change; a relay that
->   refuses a new channel for room or for the address's allowance; names that
->   are not yet in the channels of the last change, or not yet sent, for more
->   than five minutes.
+> - **Before any level:** a device that is not set up, a node that is
+>   stopped or was not asked, and a relay or a bootnode have states of their
+>   own and no level.
+> - **Red,** in this order. Whatever sync is set to: this device has stopped
+>   (it was removed, or is in no list of the last change, or is in a fork,
+>   or was answered with a change that it could not open or apply); the node
+>   is held up (its first start on this version has not succeeded, or its
+>   database is from a later version: §10.5). With sync on: it follows no
+>   phrase, where something is mapped ("not added yet" after the upgrade,
+>   "no recovery phrase yet" on a new install); sync errors; a cycle that
+>   has stalled; conflict files; files too large; and folders that stopped
+>   syncing (the notice of the first start, while it names a folder that no
+>   mapping syncs, and until `cordelia sync status --seen`). No phrase is red on every device after this upgrade that has
+>   sync on and a folder mapped, and on every new install with a folder
+>   mapped, until a person acts: nothing it holds syncs until then. A device
+>   that is not to be added turns sync off. With nothing mapped, the notice,
+>   errors and a stalled cycle are red all the same.
+> - **Amber, of a person's devices,** wherever this device follows a phrase,
+>   with sync on or off and with or without a folder mapped: a removal that
+>   some device has not applied, for seven days from when this device
+>   applied it (after that it is in `cordelia devices` only); a device added
+>   since the last change, on every device until a person clears it there
+>   (`cordelia devices --clear`) or a statement lists it, as a renewal does
+>   (`cordelia renew`); a device that has said it left.
+> - **Amber, of folders,** with sync on, something mapped and a report of a
+>   cycle: no relay connected for more than five minutes; entries that relays
+>   keep refusing; a running node that is not the version the command is; a
+>   relay that has been connected for more than five minutes and does not
+>   hold the latest change; a relay that has refused something for room, or
+>   for the address's allowance, in the last twenty minutes; names that a
+>   device which still counts had listed and that no device lists in the
+>   channels of the last change, once that has lasted for more than five
+>   minutes and for seven days from when this device applied the change; or
+>   names not yet sent, for more than five minutes.
+> - **The state is as it was, whatever the level,** for a panel that draws
+>   from it alone. With sync on, something mapped and no phrase it is
+>   `attention`, and so it is on a device that has stopped, on a node that
+>   is held up, and with the notice. The line and the level never disagree:
+>   where a state is `attention` and there is no level, the line and the bar
+>   draw as the state alone has them.
+> - `--waybar` gives an icon, a tooltip and a class: the state, then the
+>   level (`red` or `amber`) where one holds, and `active` with red, or with
+>   `attention` where there is no level.
 >
 > `cordelia devices` is the one place to look: every device of the last
 > change with whether it has applied it and sent what it held, every device
-> added since and who added it, every removed key, every key that is in
-> neither list, every device that has said it left, the names that no device
-> lists yet, what this device has still to send, and for each relay whether
-> it holds the latest change.
+> added since and who added it, every removed key with the label that this
+> device knew it by, every key that is in neither list, every device that
+> has said it left, the names that no device lists yet and for how many
+> more days each can be brought in, what this device has still to send, and
+> for each relay whether it holds the latest change. Beside a device that
+> has not applied the change, or is still sending, it names `cordelia sync
+> carry`.
 
 ### 4.4 `cordelia peers`
 
@@ -461,10 +508,22 @@ System channels (prefixed `__`) are hidden by default. Use `--all` to include th
 > what is stored and its encrypted size (entries of its own channels on a
 > personal node, items of the older kind on a relay); the names held, or the
 > channels subscribed; the distinct peers seen in the last day and week; and
-> the channels active in the last day and week. On a relay it also prints
-> `Storage: <in use> of <allowed>`: what the items of the older kind are
-> counted at (each its content and 1 KB) against `max_storage_bytes`.
-> `--json` gives the same for tools.
+> the channels active in the last day and week. **On a relay it also prints
+> the room of each kind of channel, each against its cap,** which is
+> `max_storage_bytes` for both (decision 2026-10-04 §2.5):
+>
+> ```
+> Storage:          <in use> in use of <allowed> allowed, by channels of the older kind
+>                   <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
+> ```
+>
+> The first line is what the items of the older kind are counted at (each
+> its content and 1 KB); the second is what the entries of the channels from
+> their secrets are counted at, with how many such channels the relay holds
+> and how many entries. Neither kind is counted against the other's cap.
+> `--json` gives the same for tools: `storage_used_bytes` and
+> `storage_max_bytes` for the older kind, and under `entries` the same two
+> with `channels_held`, `entries_stored` and `content_bytes_stored`.
 
 ```
 $ cordelia stats
@@ -788,10 +847,19 @@ SPOs running Cardano nodes already have Prometheus + Grafana. The Cordelia dashb
 >   <key>` on one that remains, with the phrase. A new machine is then
 >   added with the two commands.
 > - **No device remains that you trust:** `cordelia recover` on a new
->   machine, with the phrase. It asks which devices are gone, brings back
->   what the relays hold, and stops every other device until each is added
->   again by hand. It reaches back 90 days from when the last device was on:
->   a relay is a cache, not a backup.
+>   machine, with the phrase. It asks the relays that the machine is set up
+>   with; asks of each device a typed `have` (you still have it), `lost` (it
+>   is lost or broken) or `hands` (it may be in someone else's hands); looks
+>   once at what the relays hold, and brings it back; and stops every other
+>   device until each is added again by hand. It takes nothing that a device
+>   answered with `hands` wrote: that comes in by `cordelia sync carry <name>
+>   --from <device>`, with the phrase. It reaches back 90 days from when the
+>   last device was on: a relay is a cache, not a backup.
+> - **A device never returned, and had sent edits that no other device
+>   took:** `cordelia sync carry <name>` on a device that remains brings in
+>   what the relays hold of them, from each generation that the device left
+>   in the last 90 days. `--phrase` reads the generations that the device
+>   never held the secret of.
 > - **The phrase is lost:** devices can still be added, and none can ever be
 >   removed or recovered. The way on is to start again on every device:
 >   `cordelia phrase` on one, and `cordelia init --new-key` and the two
@@ -953,7 +1021,10 @@ folder (the last writes of a device that is gone, and what had been handed
 through the local API and not yet sent); removals made before the upgrade,
 which are forgotten (the first change removes nobody: a device that was
 removed before the upgrade is no device after it, since nothing lists it,
-and its key is not refused either, so it is not to be added again); a file
+and its key is not refused either, so it is not to be added again: to have
+the key refused, remove it once by key after the upgrade, with `cordelia
+remove-device <key>`, which asks a typed `refuse` for a key that the device
+knows nothing of); a file
 of more than 60 KB, where the limit was 64 KB; and the named and direct
 channels that the local API of the version before could make. A device left on the
 version before goes on in the older channels alone, for as long as the
@@ -962,27 +1033,46 @@ relays carry them, which is one version.
 **The first start.** A personal node that holds anything of the version
 before makes a copy and then one step, when it starts (data-formats.md §12):
 
+- **A data directory is one node's.** A node takes a lock on the directory
+  (a file in it, `node.lock`) before it opens the database. A second node
+  that is started on the same directory, whatever ports it was given, says
+  that another is running there, changes nothing, and stops.
 - **The copy** is a folder beside the database, `before-<version>`: the
   database as its opening left it (the schema's steps have added tables, and
   have changed no row that was there), and the key files of the older
-  channels. It is made and checked before anything is emptied. Where it
-  cannot be made (no room,
-  no leave to write), the step is not taken: the node stays up, runs no
-  cycle and no pass, refuses every request that changes anything but one
-  that turns sync off, and its status says why, with the room that is
-  needed. It tries again by itself and needs no restart.
+  channels. It is made and checked before anything is emptied. The node
+  answers while it is made: its status says that a copy is being made.
+- **Where the copy cannot be made** (no room, no leave to write), the step
+  is not taken. The room on the volume is compared with what the copy needs
+  before anything is written, and what was written of a copy that failed is
+  removed at once. The node stays up, runs no cycle and no pass, refuses
+  every request that changes anything but one that turns sync off, and its
+  status says why, with the room that is needed and the room there is. It
+  tries again by itself and needs no restart: five seconds after the first
+  try that failed, and twice as long after each further one, up to ten
+  minutes. A copy that was made is used again where only the step failed.
 - **The step** empties what the device held of the older kind, and every
   folder forgets what it had agreed. The device's key, its settings, its
   mappings and local history stay.
+- **The key files of the older channels are removed after the step.** At a
+  later start one is removed only where a `before-` folder holds a file of
+  that name with the same bytes: any other is left where it is, and
+  `cordelia status` says how many (`Key files:`).
 - **A device whose scope was "everything found" is told what stopped:** the
-  folders that synced without a mapping sync no longer, and status names
-  them. Only what is mapped syncs: `cordelia sync map` each folder that is
-  to go on.
+  folders that synced without a mapping sync no longer, and `cordelia sync
+  status` names them, each with the command that maps it. Only what is
+  mapped syncs: `cordelia sync map` each folder that is to go on, and
+  `cordelia sync status --seen` puts the notice away.
 - **The copy holds what the device held:** sealed entries, the keys of
   channels that relays keep for up to 90 days more, and also text in the
   clear (removed lines of the index, the names and paths of memory files).
   It is beside memory folders that hold the same memory in the clear. It can
   be deleted once you are content.
+- **A database from a later version is refused.** A personal node stays up,
+  held up, and its status names both versions: it answers every `GET`, its
+  status among them, and no other request, and changes nothing. A relay or a bootnode says
+  the same, and stops. A command that opens the database itself is refused
+  likewise.
 
 **Going back:**
 
@@ -1020,6 +1110,14 @@ on and where the copy is.
 | `Error: the node's API address is set to '...'` | `api.bind_address`, or `CORDELIA_BIND_ADDRESS`, is neither `127.0.0.1` nor `::1` | Set it to one of the two. This is a security constraint, not a bug |
 | `Error: database locked` | Stale lock from crashed process | Remove `~/.cordelia/cordelia.db-wal` and `cordelia.db-shm`, restart |
 | `Error: config parse error` | Invalid TOML | Check `config.toml` syntax. Run `cordelia init` to regenerate |
+
+> **v1 status.** Three more, of this version:
+>
+> | What is said | Why | What to do |
+> |--------------|-----|------------|
+> | `another node is running on the data directory ...` | A data directory is one node's: the node that runs holds the lock on it | Stop that node first, or give this one a directory of its own. Nothing was changed |
+> | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back the copy that it made, as §10.5 says |
+> | `cordelia status` says `Held up:` | The first start on this version is not done (the copy could not be made), or the database is from a later version | For the first: make the room that the status names. The node tries again by itself |
 
 ### 11.2 No Peers Connecting
 
