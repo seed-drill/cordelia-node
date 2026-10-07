@@ -669,6 +669,15 @@ pub fn used_bytes(conn: &Connection) -> Result<u64, CordeliaError> {
     .map_err(storage)
 }
 
+/// How many channels from their secrets the relay holds.
+pub fn count_held(conn: &Connection) -> Result<u64, CordeliaError> {
+    conn.query_row("SELECT COUNT(*) FROM relay_channels", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|channels| channels.max(0) as u64)
+    .map_err(storage)
+}
+
 /// While the relay holds more than `max_bytes`, drop the channel it has
 /// held for the shortest time: of two held since one time, the one it
 /// took later. Returns the channels dropped, in the order they went.
@@ -1648,6 +1657,7 @@ mod tests {
             sum += cost;
         }
         assert_eq!(used_bytes(conn).unwrap(), sum);
+        assert_eq!(count_held(conn).unwrap(), rows.len() as u64);
         let with_entries: i64 = conn
             .query_row(
                 "SELECT COUNT(DISTINCT channel_id) FROM entries",

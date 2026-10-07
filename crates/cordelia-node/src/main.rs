@@ -2080,9 +2080,25 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     // falls when a channel is dropped (the file does not shrink).
     let used = cordelia_storage::items::stored_cost(&conn)?;
     let cap = config.node.max_storage_bytes;
+    // What a node that carries both kinds holds of the channels from
+    // their secrets: they are counted apart, by what their entries are
+    // counted at, against a cap of their own of the same size (decision
+    // 2026-10-04 §2.5). An operator sees the room of each kind.
+    let of_entries = match personal {
+        true => None,
+        false => {
+            let (entries, content_bytes) = cordelia_storage::usage::stored_of_own(&conn)?;
+            Some(EntriesHeld {
+                used: cordelia_storage::relay::used_bytes(&conn)?,
+                channels: cordelia_storage::relay::count_held(&conn)?,
+                entries,
+                content_bytes,
+            })
+        }
+    };
 
     if json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "database_bytes": db_size,
             "storage_used_bytes": used,
             "storage_max_bytes": cap,
@@ -2098,17 +2114,24 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
                 "7d": usage.channels_active_7d,
             },
         });
+        if let Some(held) = &of_entries {
+            out["entries"] = serde_json::json!({
+                "storage_used_bytes": held.used,
+                "storage_max_bytes": cap,
+                "channels_held": held.channels,
+                "entries_stored": held.entries,
+                "content_bytes_stored": held.content_bytes,
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
     println!("Database:         {}", format_bytes(db_size));
     if config.network.role == "relay" {
-        println!(
-            "Storage:          {} in use of {} allowed",
-            format_bytes(used),
-            format_bytes(cap)
-        );
+        for line in storage_lines(used, cap, of_entries.as_ref()) {
+            println!("{line}");
+        }
     }
     println!(
         "Stored:           {} {}, {} of encrypted content",
@@ -2130,6 +2153,46 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// What a node that carries both kinds of channel holds of the channels
+/// from their secrets (decision 2026-10-04 §2.5).
+struct EntriesHeld {
+    /// What its entries are counted at: what this kind's cap is set
+    /// against.
+    used: u64,
+    /// How many channels it holds.
+    channels: u64,
+    /// How many entries, and the bytes of their content.
+    entries: u64,
+    content_bytes: u64,
+}
+
+/// What `cordelia stats` says of a relay's room: each kind of channel
+/// against its cap, which is of one size for both (decision 2026-10-04
+/// §2.5). `used` is what the older kind holds.
+fn storage_lines(used: u64, cap: u64, of_entries: Option<&EntriesHeld>) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Storage:          {} in use of {} allowed, by channels of the older kind",
+        format_bytes(used),
+        format_bytes(cap)
+    )];
+    if let Some(held) = of_entries {
+        lines.push(format!(
+            "                  {} in use of {} allowed, by channels from their secrets ({} held, \
+             {} {})",
+            format_bytes(held.used),
+            format_bytes(cap),
+            held.channels,
+            held.entries,
+            if held.entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+        ));
+    }
+    lines
 }
 
 /// `1.5 MB`, `12.0 KB`.
@@ -5196,6 +5259,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("could not be learned"), "{refused}");
+    }
+
+    /// `cordelia stats` on a relay says the room of each kind of channel
+    /// against its cap, which is of one size for both (decision
+    /// 2026-10-04 §2.5): the older kind first, and then the channels from
+    /// their secrets, with how many it holds.
+    #[test]
+    fn test_stats_says_the_room_of_each_kind_of_channel() {
+        let held = EntriesHeld {
+            used: 3 * 1_048_576,
+            channels: 2,
+            entries: 1,
+            content_bytes: 7,
+        };
+        assert_eq!(
+            storage_lines(2048, 16 * 1_048_576, Some(&held)),
+            [
+                "Storage:          2.0 KB in use of 16.0 MB allowed, by channels of the older kind",
+                "                  3.0 MB in use of 16.0 MB allowed, by channels from their \
+                 secrets (2 held, 1 entry)",
+            ]
+        );
+        let more = EntriesHeld { entries: 5, ..held };
+        assert!(storage_lines(0, 1024, Some(&more))[1].ends_with("(2 held, 5 entries)"));
+        // A node that holds none of the new kind's tables says the one.
+        assert_eq!(storage_lines(2048, 4096, None).len(), 1);
     }
 
     /// Each system's service is restarted by its own command, as the
