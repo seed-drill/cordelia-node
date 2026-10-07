@@ -13,6 +13,12 @@
 //! a relay for the channels of its own ([`at_relays`]), which the node
 //! asks when it has leave to use a connection.
 //!
+//! What a relay holds of a generation that was left comes in only where
+//! a person asks: the one function that judges a version for such a
+//! carry, and a person's word for it, given with the phrase ([`carry`]);
+//! the node's half of `cordelia sync carry` ([`carrying`]); and recovery,
+//! on a machine that follows no phrase ([`recover`]).
+//!
 //! The commands a person types reach those through the routes of
 //! [`commands`]. The sync adapter reads and publishes through [`publish`],
 //! says which names a device syncs through [`names`], and a device's
