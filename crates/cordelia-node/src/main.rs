@@ -2822,6 +2822,12 @@ const VERSION_NOT_LEARNED: &str = "The running node's version could not be learn
                                    changes something, and is sent only to a node of its own \
                                    version: nothing was done.";
 
+/// What a command that makes or asks for a recovery phrase says of a
+/// node that is held up, after why the node is.
+const NOT_WHILE_HELD_UP: &str = "The node is held up, and would refuse what this command hands \
+                                 it in the end: no recovery phrase was shown or asked for, and \
+                                 nothing was done.";
+
 /// How long a command that changes something waits for the node to say
 /// which version it is: as long as it waits for the node to do what it
 /// asks. A node that is busy answers late, and is not taken for one that
@@ -2861,6 +2867,30 @@ fn refuse_by_version(status: &anyhow::Result<serde_json::Value>) -> anyhow::Resu
         Some(note) => {
             VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
             anyhow::bail!("{note}\n{NOT_SENT_TO_ANOTHER_VERSION}")
+        }
+    }
+}
+
+/// [`refuse_another_version`], and then refuse a node that is held up:
+/// for a command that makes, shows or asks for a recovery phrase
+/// (decision 2026-10-04 §10.1). A node that is held up refuses what such
+/// a command hands it in the end, so the command asks how the node stands
+/// first: no word of a phrase is shown, and none is asked for, where the
+/// node would then refuse.
+pub(crate) fn refuse_before_a_phrase(config_path: &str) -> anyhow::Result<()> {
+    refuse_by_how_it_stands(&node_status(config_path, VERSION_ASKED_FOR))
+}
+
+/// [`refuse_before_a_phrase`], given what the node answered when it was
+/// asked its status.
+fn refuse_by_how_it_stands(status: &anyhow::Result<serde_json::Value>) -> anyhow::Result<()> {
+    refuse_by_version(status)?;
+    let held = status.as_ref().ok().and_then(|node| node.get("held"));
+    match held {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(held) => {
+            let why = held["why"].as_str().unwrap_or("it does not say why");
+            anyhow::bail!("{why}\n{NOT_WHILE_HELD_UP}")
         }
     }
 }
@@ -5121,6 +5151,51 @@ mod tests {
             refused.contains("from before nodes said their version"),
             "{refused}"
         );
+    }
+
+    /// A command that makes or asks for a recovery phrase asks how the
+    /// node stands first, and is refused where the node is held up, with
+    /// why the node is (decision 2026-10-04 §10.1): before any word is
+    /// shown. It is refused for the node's version as any command that
+    /// changes something is, and that is said first.
+    #[test]
+    fn test_a_command_of_a_phrase_is_refused_by_a_node_that_is_held_up() {
+        let own = env!("CARGO_PKG_VERSION");
+        let stands = |held: serde_json::Value| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({ "version": own, "held": held }))
+        };
+        assert!(refuse_by_how_it_stands(&stands(serde_json::Value::Null)).is_ok());
+        assert!(refuse_by_how_it_stands(&Ok(serde_json::json!({ "version": own }))).is_ok());
+
+        let why = "the first start on this version is not done: no room";
+        let held = stands(serde_json::json!({ "by": "first_start", "why": why }));
+        let refused = refuse_by_how_it_stands(&held).unwrap_err().to_string();
+        assert!(refused.starts_with(&format!("{why}\n")), "{refused}");
+        assert!(
+            refused.contains("no recovery phrase was shown or asked for"),
+            "{refused}"
+        );
+        // Held up, and saying nothing of why.
+        let held = stands(serde_json::json!({ "by": "something" }));
+        let refused = refuse_by_how_it_stands(&held).unwrap_err().to_string();
+        assert!(refused.contains("The node is held up"), "{refused}");
+
+        // The version comes first.
+        let another = Ok(serde_json::json!({
+            "version": "0.0.0-another",
+            "held": { "by": "first_start", "why": why },
+        }));
+        let refused = refuse_by_how_it_stands(&another).unwrap_err().to_string();
+        assert!(
+            refused.contains("is not sent to a node of another version"),
+            "{refused}"
+        );
+        assert!(!refused.contains("The node is held up"), "{refused}");
+        let not_reached: anyhow::Result<serde_json::Value> = Err(anyhow::anyhow!("not reached"));
+        let refused = refuse_by_how_it_stands(&not_reached)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("could not be learned"), "{refused}");
     }
 
     /// Each system's service is restarted by its own command, as the

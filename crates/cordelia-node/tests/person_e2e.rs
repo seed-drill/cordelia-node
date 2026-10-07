@@ -3054,6 +3054,62 @@ fn a_command_that_changes_anything_refuses_a_node_whose_version_it_cannot_learn(
     assert_eq!(settings["enabled"], false, "{settings}");
 }
 
+/// A command that makes or asks for a recovery phrase asks how the node
+/// stands first, and shows no word and asks for none where the node is
+/// held up (decision 2026-10-04 §10.1): it says why the node is, and has
+/// asked the node for nothing but how it stands. Here the node is behind
+/// a stand-in that says it is held up for its first start.
+#[test]
+fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let why = "the first start on this version is not done: no room for the copy";
+    let held = Answers::in_the_place_of(&laptop, move |path, answer| {
+        if path == "/api/v1/status" {
+            answer["held"] = json!({ "by": "first_start", "why": why });
+        }
+    });
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+    let soon = std::time::Duration::from_secs(60);
+    let of_a_phrase: [&[&str]; 4] = [
+        &["phrase", "--name", "laptop"],
+        &["remove-device", &other],
+        &["renew"],
+        &["settle"],
+    ];
+    for args in of_a_phrase {
+        let before = held.asked().len();
+        let said = laptop
+            .at_terminal_through(held.port, args)
+            .refused_within(soon);
+        assert!(said.contains(why), "{args:?}: {said}");
+        assert!(
+            said.contains("no recovery phrase was shown or asked for, and nothing was done."),
+            "{args:?}: {said}"
+        );
+        for shown in [
+            "A recovery phrase is twelve words",
+            "The recovery phrase, shown once",
+            "Type the twelve words back",
+            "The recovery phrase, twelve words",
+        ] {
+            assert!(!said.contains(shown), "{args:?}: {said}");
+        }
+        let asked = held.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // The control: the node itself is not held up, and a phrase is made.
+    makes_a_phrase(&laptop, "laptop");
+    assert_eq!(look(&laptop)["change"], 1);
+}
+
 /// A command that changes anything refuses a node of another version
 /// than its own, with the note that says how to restart it, and sends it
 /// nothing (decision 2026-10-04 §10.1, rule 6; §16): every `sync`

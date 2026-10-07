@@ -7,7 +7,9 @@
 //! own** (§16; §10.1, rule 6), with the note that says how to restart
 //! it: a route of the same name may mean another thing there. `cordelia
 //! devices`, which only shows, is answered beside such a node, with the
-//! note.
+//! note. **A command that makes or asks for a recovery phrase also asks
+//! how the node stands first,** and shows no word where the node is held
+//! up (§10.1).
 //!
 //! **Every yes is asked here, at a terminal** ([`crate::terminal`]), and
 //! each command that asks refuses, before anything else, where its input
@@ -55,7 +57,10 @@ use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
 use crate::terminal::Terminal;
-use crate::{Told, api_post, api_post_told, note_another_version, refuse_another_version};
+use crate::{
+    Told, api_post, api_post_told, note_another_version, refuse_another_version,
+    refuse_before_a_phrase,
+};
 
 /// Whose words a recovery phrase is, and what it is for: said wherever
 /// one is made (decision 2026-10-04 §5).
@@ -271,7 +276,7 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
 /// change entry and the statement key, and never the words.
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
-    refuse_another_version(config_path)?;
+    refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
     let seen = look(config_path)?;
@@ -928,7 +933,7 @@ fn made_at_a_terminal(
     which: impl FnOnce() -> anyhow::Result<Which>,
 ) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
-    refuse_another_version(config_path)?;
+    refuse_before_a_phrase(config_path)?;
     change(config_path, &at, &which()?)
 }
 
