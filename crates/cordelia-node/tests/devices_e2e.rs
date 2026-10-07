@@ -385,12 +385,28 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
         (relays.len() == 1 && relays[0]["state"] == "unreachable").then_some(())
     });
     assert!(has_hot_peer(&a).is_none(), "no relay yet, so no peer");
+    // The node says for how long no relay has been connected, by its
+    // own clock (decision 2026-10-04 §10.1): the status line goes by it.
+    let no_relay_secs = |n: &Node| n.get("/api/v1/status").unwrap()["no_relay_secs"].clone();
+    let first = wait_for("a says since when it has no relay", &[&a], 30, || {
+        no_relay_secs(&a).as_u64()
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let later = no_relay_secs(&a).as_u64().unwrap();
+    assert!(later > first && later < 120, "{first} then {later}");
 
     relay.start();
     wait_for("relay healthy", &[&relay, &a], 30, || healthy(&relay));
     wait_for("a reaches the relay by name", &[&relay, &a], 60, || {
         has_hot_peer(&a)
     });
+    // With a relay connected, it says none.
+    wait_for(
+        "a says that a relay is connected",
+        &[&relay, &a],
+        30,
+        || no_relay_secs(&a).is_null().then_some(()),
+    );
 }
 
 /// The peers `n` is connected to, by key.

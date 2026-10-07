@@ -3142,6 +3142,57 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     assert!(!said.contains("The running node is version"), "{said}");
     let settings = laptop.post("/api/v1/sync/status", json!({}));
     assert_eq!(settings["enabled"], true, "{settings}");
+    // `--mapped-only` is sent, as the only scope there is: `all: false`
+    // (decision 2026-10-04 §10.1). Seen at a stand-in that changes
+    // nothing of what the node answers.
+    let same = Answers::in_the_place_of(&laptop, |_, _| {});
+    let said = laptop
+        .at_terminal_through(same.port, &["sync", "claude", "--mapped-only"])
+        .done();
+    assert!(
+        said.contains("Only mapped folders sync: that is the only scope there is."),
+        "{said}"
+    );
+    let sent: Vec<Value> = same
+        .asked()
+        .iter()
+        .filter(|(path, _)| path == "/api/v1/sync/claude")
+        .filter_map(|(_, body)| serde_json::from_slice(body).ok())
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        (&sent[0]["enabled"], &sent[0]["all"]),
+        (&json!(true), &json!(false))
+    );
+
+    // A node of another version is one of the things that a status
+    // holds, where something is mapped and a cycle has reported: only
+    // the command knows of it, and so the level is the command's
+    // (decision 2026-10-04 §10.1). Beside the node as it is, it is not.
+    let notes = home.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    laptop.cli(&["sync", "map", notes.to_str().unwrap(), "notes"]);
+    let status_through = |port: u16| -> Value {
+        let said = laptop
+            .at_terminal_through(port, &["status", "--json"])
+            .done();
+        let from = said.find('{').unwrap_or_else(|| panic!("{said}"));
+        serde_json::from_str(&said[from..]).unwrap_or_else(|e| panic!("{e}: {said}"))
+    };
+    let whats = |status: &Value| -> Vec<String> {
+        let all = status["holds"].as_array().into_iter().flatten();
+        all.filter_map(|holds| holds["what"].as_str().map(str::to_string))
+            .collect()
+    };
+    wait_for("a cycle has reported the folder", &[&laptop], 60, || {
+        (status_through(same.port)["sync"]["folders"] == 1).then_some(())
+    });
+    assert_eq!(whats(&status_through(same.port)), ["no_phrase"]);
+    let beside_another = status_through(another.port);
+    assert_eq!(whats(&beside_another), ["no_phrase", "other_version"]);
+    assert_eq!(beside_another["level"], "red", "{beside_another}");
+    assert_eq!(beside_another["node_version"], "0.0.0-another");
+    laptop.cli(&["sync", "unmap", "notes"]);
 
     // A look that says nothing of where the device stands: refused, by
     // a command that only shows as by one that acts.

@@ -1234,11 +1234,18 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
     assert_eq!(bar["class"], json!(["attention", "red", "active"]), "{bar}");
     let tooltip = bar["tooltip"].as_str().unwrap();
     assert!(tooltip.contains("Stopped syncing: "), "{tooltip}");
+    // The tooltip and the plain status list everything that holds, and
+    // not only what the line says: a device was added, and is not
+    // cleared.
+    assert_eq!(holds_of(&status), ["stopped_syncing", "added"]);
+    let also = "To know: 1 device added, not yet cleared";
+    assert!(tooltip.contains(also), "{tooltip}");
     let plain = laptop.cli(&["status"]);
     assert!(
         plain.contains("Memory:    memory: 1 folder stopped syncing"),
         "{plain}"
     );
+    assert!(plain.contains(&format!("    also:     {also}")), "{plain}");
     assert!(plain.contains("    stopped:  "), "{plain}");
     // `cordelia sync status` says it first, with the command that maps
     // the repository under the name it synced under; or, from a report
