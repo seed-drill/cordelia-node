@@ -488,7 +488,9 @@ enum Say {
 
 /// What a test has a stand-in do as each request arrives, before it is
 /// answered: for a show, `Some` is what this one is answered with, in the
-/// place of what the script says.
+/// place of what the script says. For a push, `Some` that is no answer
+/// has the stand-in take the push and answer nothing: it resets the
+/// stream, or keeps it open.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -625,6 +627,8 @@ impl StandIn {
                     };
                     Ok(Some(WireMessage::EntryPulled(page)))
                 }
+                WireMessage::EntryPush(_) if matches!(hooked, Some(Say::Reset)) => Ok(None),
+                WireMessage::EntryPush(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
                 WireMessage::EntryPush(push) => {
                     let answers = match script.pushed.as_mut() {
                         Some(pushed) => push
@@ -2382,6 +2386,84 @@ async fn a_relay_that_was_never_sent_a_hand_over_is_not_sent_a_delete_over_it() 
     assert!(!named.contains(&pair));
     assert!(adder.holds_of(&pair).is_empty());
     assert!(!sent_anywhere(&adder));
+}
+
+/// A hand-over that was sent to a relay whose answer was lost is still
+/// written over there (decision 2026-10-04 §6): that a relay is sent
+/// something of a pair channel is kept from before it is sent, whatever
+/// comes back. Here the relay takes each push of the pair channel and
+/// answers none. Two hours on, when the hand-over goes from the store,
+/// the delete over it is pushed to that relay all the same: no relay
+/// goes on holding that generation's secret sealed to a key because an
+/// answer was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_over_whose_push_was_not_answered_is_still_written_over_at_that_relay() {
+    let relay = StandIn::started().await;
+    let (mut adder, new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    adder.connects_to("relay", relay.port, relay.key).await;
+    let now = adder.now();
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        now,
+    );
+    let hand_over = added.unwrap().hand_over;
+    let pair = hand_over.channel;
+    let of_the_pair = move |request: &WireMessage| {
+        matches!(request, WireMessage::EntryPush(_)) && channels_named(request).contains(&pair)
+    };
+    // What the relay was pushed of the pair channel, since it was last
+    // asked: each entry by what it is named by, and whether it is a
+    // delete.
+    let pushed = |relay: &StandIn| -> Vec<([u8; 32], bool)> {
+        relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|entry| Entry::from_wire(&entry).unwrap())
+            .filter(|entry| entry.channel == pair)
+            .map(|entry| (entry.id(), entry.delete))
+            .collect()
+    };
+    let sent_anywhere = |device: &Device| {
+        cordelia_storage::at_relays::keeps_any_anywhere(&device.db(), &pair).unwrap()
+    };
+
+    // The relay is sent the hand-over, and its answer is lost: the
+    // stream is reset.
+    relay.hook(move |request| of_the_pair(request).then_some(Say::Reset));
+    adder.passes().await;
+    adder.sends().await;
+    let sent = pushed(&relay);
+    assert!(sent.contains(&(hand_over.id(), false)), "{sent:?}");
+    assert!(
+        sent_anywhere(&adder),
+        "nothing is kept of a push that was sent and not answered"
+    );
+
+    // Two hours on, the hand-over goes from the store. The relay answers
+    // again, and is sent the delete over it.
+    relay.hook(|_| None);
+    adder
+        .clock
+        .run_ahead(Duration::from_secs(HAND_OVER_KEPT_SECS as u64));
+    for _ in 0..3 {
+        adder.passes().await;
+        adder.sends().await;
+    }
+    assert!(!adder.holds_of(&pair).contains(&hand_over.id()));
+    let sent = pushed(&relay);
+    assert!(
+        sent.iter().any(|(_, delete)| *delete),
+        "the relay was sent no delete over the hand-over: {sent:?}"
+    );
 }
 
 /// What came back on a stream is not taken where the device applied a
