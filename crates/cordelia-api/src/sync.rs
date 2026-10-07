@@ -777,11 +777,16 @@ fn maps_another_folder(
     let Some(would_sync) = found::claude_folder(claude_dir, given) else {
         return Ok(None);
     };
+    let to_map = found::ToMap {
+        given,
+        would_sync: &would_sync,
+        claude_dir,
+    };
     let entries = found_and_named(db)?;
     let pairs = entries
         .iter()
         .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
-    let Some(folder) = found::in_the_way(given, &would_sync, pairs) else {
+    let Some(folder) = found::in_the_way(&to_map, pairs, &found::ThisMachine) else {
         return Ok(None);
     };
     let name = entries
@@ -803,10 +808,10 @@ fn maps_another_folder(
         _ => None,
     };
     Ok(Some(found::map_refused(
-        given,
-        &would_sync,
+        &to_map,
         folder,
         reason.as_deref(),
+        &found::ThisMachine,
     )))
 }
 

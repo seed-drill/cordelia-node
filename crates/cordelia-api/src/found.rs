@@ -679,46 +679,105 @@ pub fn notice_shown(
 
 // ── `map` checks when it is run ──────────────────────────────────────
 
-/// The folder that stands in the way of `cordelia sync map` for the
-/// directory `given`, where one does (decision 2026-10-04 §10.1): an
-/// entry that was found, or that a notice names, has that directory, and
-/// a Claude Code folder other than `would_sync`, which is the folder that
-/// `map` would sync. `entries` are those entries, each as its folder and
-/// its directory.
+/// What `cordelia sync map` is about to do: what its check is asked of.
+#[derive(Debug, Clone, Copy)]
+pub struct ToMap<'a> {
+    /// The directory that was given.
+    pub given: &'a Path,
+    /// The folder that `map` would sync: Claude Code's own folder for
+    /// the directory, or for the repository the directory is in.
+    pub would_sync: &'a Path,
+    /// The Claude Code directory that is set.
+    pub claude_dir: &'a Path,
+}
+
+impl ToMap<'_> {
+    /// Whether the folder at `folder` is a tree laid out by hand for the
+    /// directory that was given: Claude Code did not name it after that
+    /// directory.
+    pub fn is_by_hand(&self, folder: &str) -> bool {
+        !is_claude_folder_for(Path::new(folder), self.given)
+    }
+}
+
+/// The folder that stands in the way of `cordelia sync map`, where one
+/// does (decision 2026-10-04 §10.1). `entries` are the folders that were
+/// found, and those that a notice names, each as its folder and its
+/// directory. One of them stands in the way where all of this holds:
+///
+/// - it has the directory that was given, and is another folder than the
+///   one that `map` would sync;
+/// - it is directly under the `projects` of the Claude Code directory
+///   that is set: **a folder that a notice names under another Claude
+///   Code directory stands in nobody's way,** for nothing under this
+///   directory was listed for it;
+/// - it holds memory now: where its memory was moved away, nothing sits
+///   there that the mapping would leave behind;
+/// - and, **where it is a tree laid out by hand, Claude Code's own folder
+///   for the directory is not there.** Where that folder is there, `map`
+///   syncs it, which is what was asked: the tree records the directory,
+///   and is not its memory. Where it is not there, `map` would sync an
+///   empty folder while the memory sits in the tree.
 ///
 /// `map` asks this whenever it is run, however the command was come by:
 /// copied from earlier output, sent by a panel whose status is seconds
 /// old, or typed from memory. Without it, `map` would sync another folder
-/// than the one that was listed: for a tree laid out by hand, Claude
-/// Code's own folder for the directory, which may hold memory that the
-/// tree had kept out.
+/// than the one that was listed.
 pub fn in_the_way<'a>(
-    given: &Path,
-    would_sync: &Path,
+    to_map: &ToMap,
     entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    machine: &dyn Machine,
 ) -> Option<&'a str> {
+    let projects = to_map.claude_dir.join("projects");
+    let own_is_there = machine.is_dir(to_map.would_sync);
     entries
         .into_iter()
         .find(|(folder, directory)| {
-            Path::new(directory) == given && Path::new(folder) != would_sync
+            let another =
+                Path::new(directory) == to_map.given && Path::new(folder) != to_map.would_sync;
+            let under_this = Path::new(folder).parent() == Some(projects.as_path());
+            if !another || !under_this || !machine.is_dir(&Path::new(folder).join("memory")) {
+                return false;
+            }
+            !(to_map.is_by_hand(folder) && own_is_there)
         })
         .map(|(folder, _)| folder)
 }
 
-/// What `cordelia sync map` is refused with, for the directory `given`
-/// and the folder that stands in its way ([`in_the_way`]): with the
-/// reason that stands in the place of a command for that folder, where
-/// there is one.
-pub fn map_refused(given: &Path, would_sync: &Path, folder: &str, reason: Option<&str>) -> String {
+/// What `cordelia sync map` is refused with, for the folder that stands
+/// in its way ([`in_the_way`]). **Every refusal says which folder is in
+/// the way, why, and what clears it** (decision 2026-10-04 §10.1).
+///
+/// `reason` is what stands in the place of a command for that folder,
+/// where there is one. What always clears it is to move the folder's
+/// memory to where `map` syncs it. `or_else` is another way out, where
+/// there is one: for a tree laid out by hand, a session of Claude Code in
+/// the directory makes its own folder, which `map` then syncs.
+pub fn map_refused(
+    to_map: &ToMap,
+    folder: &str,
+    reason: Option<&str>,
+    machine: &dyn Machine,
+) -> String {
+    let (given, would_sync) = (to_map.given.display(), to_map.would_sync.display());
     let reason = reason.map(|why| format!(" ({why})")).unwrap_or_default();
-    format!(
-        "{} was found as the directory of the memory in {folder}{reason}, and `cordelia sync \
-         map` would sync another folder for it ({}): nothing was mapped. No command maps the \
-         memory in {folder} as it stands: it has to be where Claude Code keeps the memory of a \
-         folder that can be mapped.",
-        given.display(),
-        would_sync.display(),
-    )
+    let there = match machine.is_dir(to_map.would_sync) {
+        true => "",
+        false => ", which is not there",
+    };
+    let mut says = format!(
+        "{given} was found as the directory of the memory in {folder}{reason}, and `cordelia \
+         sync map` would sync another folder for it ({would_sync}{there}): nothing was mapped. \
+         To sync the memory in {folder}, move it into {would_sync}/memory, where Claude Code \
+         keeps the memory of {given}, and map again."
+    );
+    if to_map.is_by_hand(folder) {
+        says.push_str(&format!(
+            " To map {given} and leave that memory where it is, start a Claude Code session in \
+             {given} first: it makes the folder that `cordelia sync map` then syncs."
+        ));
+    }
+    says
 }
 
 #[cfg(test)]
@@ -1473,36 +1532,124 @@ mod tests {
     /// folder than the one `map` would sync, and for no other: not for an
     /// entry of another directory, and not where the folder that was
     /// found is the one that would be synced.
+    ///
+    /// A tree laid out by hand that records the directory stands in the
+    /// way only where Claude Code's own folder for the directory is not
+    /// there (decision 2026-10-04 §10.1): where it is, `map` syncs it,
+    /// which is what was asked. An entry whose folder is under another
+    /// Claude Code directory stands in nobody's way, and nor does a
+    /// folder that holds no memory now.
     #[test]
     fn test_map_is_refused_for_a_directory_whose_found_folder_is_another() {
         let would_sync = PathBuf::from(folder_of("/home/sam/Work/cn"));
         let by_hand = format!("{CLAUDE}/projects/workspace");
         let given = Path::new("/home/sam/Work/cn");
-        let stands = |entries: &[(&'static str, &'static str)]| {
-            in_the_way(given, &would_sync, entries.iter().copied())
+        let to_map = ToMap {
+            given,
+            would_sync: &would_sync,
+            claude_dir: Path::new(CLAUDE),
         };
         let own: &'static str = folder_of("/home/sam/Work/cn").leak();
         let by_hand: &'static str = by_hand.leak();
-        assert_eq!(stands(&[]), None);
-        assert_eq!(stands(&[(own, "/home/sam/Work/cn")]), None);
-        assert_eq!(stands(&[(by_hand, "/home/sam/other")]), None);
-        let folder = stands(&[(own, "/home/sam/Work/cn"), (by_hand, "/home/sam/Work/cn")]);
-        assert_eq!(folder, Some(by_hand));
+        // Claude Code's own folder for the directory is not there.
+        let own_gone = Said {
+            gone: vec![own],
+            ..Default::default()
+        };
+        let stands = |entries: &[(&'static str, &'static str)], machine: &Said| {
+            in_the_way(&to_map, entries.iter().copied(), machine)
+        };
+        assert_eq!(stands(&[], &own_gone), None);
+        assert_eq!(stands(&[(own, "/home/sam/Work/cn")], &own_gone), None);
+        assert_eq!(stands(&[(by_hand, "/home/sam/other")], &own_gone), None);
+        let both = [(own, "/home/sam/Work/cn"), (by_hand, "/home/sam/Work/cn")];
+        assert_eq!(stands(&both, &own_gone), Some(by_hand));
 
-        let why = map_refused(
+        // The own folder is there: the tree stands in nobody's way, with
+        // the own folder listed or not.
+        let there = Said::default();
+        assert_eq!(stands(&both, &there), None);
+        assert_eq!(stands(&both[1..], &there), None);
+
+        // A folder under another Claude Code directory: in nobody's way,
+        // though it is another folder for the directory, laid out by
+        // hand or named by Claude Code.
+        let elsewhere: &'static str = "/home/sam/.claude-before/projects/workspace";
+        let named_elsewhere: &'static str = "/home/sam/.claude-before/projects/-home-sam-Work-cn";
+        let deeper: &'static str = "/home/sam/.claude/projects/a/workspace";
+        for folder in [elsewhere, named_elsewhere, deeper] {
+            assert_eq!(stands(&[(folder, "/home/sam/Work/cn")], &own_gone), None);
+        }
+        // A tree whose memory was moved away holds none: it is in
+        // nobody's way.
+        let moved: &'static str = format!("{by_hand}/memory").leak();
+        let emptied = Said {
+            gone: vec![own, moved],
+            ..Default::default()
+        };
+        assert_eq!(stands(&both, &emptied), None);
+
+        // A folder that Claude Code named after the directory, and that
+        // is another than the one `map` would sync (the directory's
+        // memory is now a repository's): in the way, with the folder
+        // that would be synced there or not.
+        let of_the_repository = PathBuf::from(folder_of("/home/sam/Work"));
+        let above = ToMap {
             given,
-            &would_sync,
+            would_sync: &of_the_repository,
+            claude_dir: Path::new(CLAUDE),
+        };
+        let found = [(own, "/home/sam/Work/cn")];
+        assert_eq!(in_the_way(&above, found.iter().copied(), &there), Some(own));
+        assert!(!above.is_by_hand(own));
+        assert!(to_map.is_by_hand(by_hand));
+
+        // A folder that Claude Code named after another directory, and
+        // that records this one, is laid out by hand for this one.
+        let after_another: &'static str = folder_of("/home/sam/Work/old").leak();
+        assert!(to_map.is_by_hand(after_another));
+        let recorded = [(after_another, "/home/sam/Work/cn")];
+        assert_eq!(stands(&recorded, &there), None);
+        assert_eq!(stands(&recorded, &own_gone), Some(after_another));
+
+        // Every refusal says which folder is in the way, why, and what
+        // clears it.
+        let why = map_refused(
+            &to_map,
             by_hand,
             Some(&WhyNot::LaidOutByHand.says()),
+            &own_gone,
         );
         assert!(why.contains(by_hand), "{why}");
         assert!(why.contains("this layout cannot be mapped"), "{why}");
         assert!(why.contains("would sync another folder"), "{why}");
-        assert!(why.contains("nothing was mapped"), "{why}");
-        let bare = map_refused(given, &would_sync, by_hand, None);
         assert!(
-            bare.contains(&format!("{by_hand}, and `cordelia sync map`")),
+            why.contains(&format!("({own}, which is not there)")),
+            "{why}"
+        );
+        assert!(why.contains("nothing was mapped"), "{why}");
+        assert!(
+            why.contains(&format!(
+                "To sync the memory in {by_hand}, move it into {own}/memory"
+            )),
+            "{why}"
+        );
+        assert!(
+            why.contains("start a Claude Code session in /home/sam/Work/cn first"),
+            "{why}"
+        );
+        // A folder that Claude Code named: the one way out.
+        let bare = map_refused(&above, own, None, &there);
+        assert!(
+            bare.contains(&format!("{own}, and `cordelia sync map`")),
             "{bare}"
         );
+        let repository = of_the_repository.display();
+        assert!(bare.contains(&format!("({repository})")), "{bare}");
+        assert!(
+            bare.contains(&format!("move it into {repository}/memory")),
+            "{bare}"
+        );
+        assert!(!bare.contains("start a Claude Code session"), "{bare}");
     }
 }

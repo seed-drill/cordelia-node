@@ -1641,14 +1641,23 @@ async fn test_a_status_says_that_the_scope_is_off_whatever_is_stored() {
 /// `map` checks when it is run (decision 2026-10-04 §10.1). Where a
 /// folder that the node lists as found, or that a notice names, has the
 /// directory that is given, and is another folder than the one `map`
-/// would sync, the request is refused with the reason: it stores no
-/// mapping and counts no change. For a folder that it would sync, it
-/// maps.
+/// would sync, the request is refused with the reason and with what
+/// clears it: it stores no mapping and counts no change. For a folder
+/// that it would sync, it maps.
+///
+/// A tree laid out by hand stands in the way only where Claude Code's
+/// own folder for the directory is not there: once it is, the same
+/// request maps that folder. And a folder that a notice names under
+/// another Claude Code directory stands in nobody's way.
 #[actix_web::test]
 async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found() {
     use cordelia_storage::meta;
     let home = real_home();
-    let claude = format!("{home}/.claude-of-a-test");
+    // The Claude Code directory is the test's own: what the check asks
+    // of the disk is there.
+    let dir = tempfile::tempdir().unwrap();
+    let claude = dir.path().canonicalize().unwrap().join(".claude");
+    let claude = claude.display().to_string();
     let state = test_state();
     let app = test::init_service(
         App::new()
@@ -1666,13 +1675,17 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     // What a cycle stored of what it found: a tree laid out by hand that
     // records one directory, and Claude Code's own folder for another.
     let by_hand = format!("{claude}/projects/workspace");
+    std::fs::create_dir_all(format!("{by_hand}/memory")).unwrap();
     let tree_dir = format!("{home}/code/app");
     let own_dir = format!("{home}/code/lib");
-    let own = cordelia_api::found::claude_folder(
-        std::path::Path::new(&claude),
-        std::path::Path::new(&own_dir),
-    )
-    .unwrap();
+    let folder_of = |dir: &str| {
+        let folder = cordelia_api::found::claude_folder(
+            std::path::Path::new(&claude),
+            std::path::Path::new(dir),
+        );
+        folder.unwrap().display().to_string()
+    };
+    let own = folder_of(&own_dir);
     let report = json!({
         "folders": [],
         "unmapped": [
@@ -1689,17 +1702,31 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     let generation = state.sync_control.generation();
 
     // The directory that the tree records: `map` would sync Claude
-    // Code's own folder for it, which is not the folder that was found.
-    let (code, body) = sync_post!(
-        &app,
-        "/api/v1/sync/map",
-        json!({ "folder": tree_dir, "name": "github.com/o/app" })
-    );
+    // Code's own folder for it, which is not there. The memory sits in
+    // the tree.
+    let own_of_the_tree = folder_of(&tree_dir);
+    let map_the_tree = json!({ "folder": tree_dir, "name": "github.com/o/app" });
+    let (code, body) = sync_post!(&app, "/api/v1/sync/map", map_the_tree.clone());
     assert_eq!(code, 400, "{body}");
-    let said = body.to_string();
+    let said = body["error"]["message"].as_str().unwrap().to_string();
     assert!(said.contains("this layout cannot be mapped"), "{said}");
     assert!(said.contains(&by_hand), "{said}");
+    assert!(
+        said.contains(&format!("({own_of_the_tree}, which is not there)")),
+        "{said}"
+    );
     assert!(said.contains("nothing was mapped"), "{said}");
+    // What clears it.
+    assert!(
+        said.contains(&format!(
+            "To sync the memory in {by_hand}, move it into {own_of_the_tree}/memory"
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("start a Claude Code session in {tree_dir} first")),
+        "{said}"
+    );
     assert_eq!(state.sync_control.generation(), generation);
     let (_, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
     assert_eq!(body["mappings"], json!([]));
@@ -1717,17 +1744,59 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
         json!([{ "folder": own_dir, "name": "lib" }])
     );
 
+    // Claude Code's own folder for the tree's directory is there now: the
+    // same request maps that folder, which is what was asked, and the
+    // tree stays as it is.
+    store_report();
+    std::fs::create_dir_all(&own_of_the_tree).unwrap();
+    let (code, body) = sync_post!(&app, "/api/v1/sync/map", map_the_tree);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 2);
+    assert!(std::path::Path::new(&format!("{by_hand}/memory")).is_dir());
+
     // A folder that a notice names, which synced under another Claude
-    // Code directory: its directory is refused too, while the notice is
-    // stored. A later record of the notice stands for a folder that is
-    // named again.
-    let elsewhere = format!("{home}/.claude-of-another-test/projects/-somewhere-notes");
+    // Code directory, stands in nobody's way: its directory is mapped,
+    // and so is the directory that an earlier record had for it.
+    let before = dir.path().canonicalize().unwrap().join(".claude-before");
+    let elsewhere = before.join("projects/-somewhere-notes");
+    std::fs::create_dir_all(elsewhere.join("memory")).unwrap();
+    let (before, elsewhere) = (
+        before.display().to_string(),
+        elsewhere.display().to_string(),
+    );
     let notes = format!("{home}/notes");
     let notice = json!([
-        { "at": "2026-10-05T00:00:00Z", "dir": format!("{home}/.claude-of-another-test"),
+        { "at": "2026-10-05T00:00:00Z", "dir": before,
           "folders": [{ "folder": elsewhere, "cwd": format!("{home}/old-notes"), "name": null }] },
-        { "at": "2026-10-06T00:00:00Z", "dir": format!("{home}/.claude-of-another-test"),
+        { "at": "2026-10-06T00:00:00Z", "dir": before,
           "folders": [{ "folder": elsewhere, "cwd": notes, "name": null }] },
+    ]);
+    {
+        let db = state.db.lock().unwrap();
+        meta::set(&db, meta::SYNC_CLAUDE_NOTICE, &notice.to_string()).unwrap();
+    }
+    for (folder, name) in [(notes, "notes"), (format!("{home}/old-notes"), "old-notes")] {
+        let (code, body) = sync_post!(
+            &app,
+            "/api/v1/sync/map",
+            json!({ "folder": folder, "name": name })
+        );
+        assert_eq!(code, 200, "{body}");
+    }
+    let (_, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+    assert_eq!(body["mappings"].as_array().unwrap().len(), 4);
+
+    // A tree laid out by hand that a notice names, under the directory
+    // that is set, with a later record's directory: in the way of that
+    // directory, and not of the one its earlier record had.
+    let named_tree = format!("{claude}/projects/kept-by-hand");
+    std::fs::create_dir_all(format!("{named_tree}/memory")).unwrap();
+    let (was, now) = (format!("{home}/was-here"), format!("{home}/is-here"));
+    let notice = json!([
+        { "at": "2026-10-05T00:00:00Z", "dir": claude,
+          "folders": [{ "folder": named_tree, "cwd": was, "name": null }] },
+        { "at": "2026-10-06T00:00:00Z", "dir": claude,
+          "folders": [{ "folder": named_tree, "cwd": now, "name": null }] },
     ]);
     {
         let db = state.db.lock().unwrap();
@@ -1736,22 +1805,16 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     let (code, body) = sync_post!(
         &app,
         "/api/v1/sync/map",
-        json!({ "folder": notes, "name": "notes" })
+        json!({ "folder": now, "name": "is-here" })
     );
     assert_eq!(code, 400, "{body}");
-    assert!(
-        body.to_string()
-            .contains("it is not under the Claude Code directory that sync is set to"),
-        "{body}"
-    );
-    // The directory that its earlier record had is not its directory now.
+    assert!(body.to_string().contains(&named_tree), "{body}");
     let (code, body) = sync_post!(
         &app,
         "/api/v1/sync/map",
-        json!({ "folder": format!("{home}/old-notes"), "name": "old-notes" })
+        json!({ "folder": was, "name": "was-here" })
     );
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["mappings"].as_array().unwrap().len(), 2);
 }
 
 /// A notice that is stored is carried by the status, with sync on and

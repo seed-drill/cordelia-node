@@ -1545,6 +1545,17 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
             "{refused}"
         );
         assert!(refused.contains("nothing was mapped"), "{refused}");
+        // It says which folder is in the way, and what clears it.
+        assert!(refused.contains("/.claude/projects/workspace"), "{refused}");
+        assert!(refused.contains("which is not there"), "{refused}");
+        assert!(
+            refused.contains("To sync the memory in") && refused.contains("move it into"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("start a Claude Code session in"),
+            "{refused}"
+        );
         let above = home.join("deep");
         let made = std::process::Command::new("git")
             .arg("-C")
@@ -1623,6 +1634,41 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
     assert!(!laptop.cli(&["sync", "status"]).contains("stopped syncing"));
     let conn = database_of(&laptop);
     assert!(first_start::notices(&conn).unwrap().is_empty());
+
+    if !before_mappings {
+        // The tree laid out by hand stands in the way of its directory
+        // only while Claude Code's own folder for that directory is not
+        // there. A session is started in the directory: the same command
+        // now maps that folder, which is what was asked, and nothing
+        // that the tree holds leaves the machine.
+        let other = home.join("work/other");
+        let own_mem = claude_folder(&home, &other);
+        std::fs::write(own_mem.join("own.md"), "of the directory itself\n").unwrap();
+        let said = wait_for("the laptop lists the own folder", &all, 60, || {
+            let said = laptop.cli(&["sync", "status"]);
+            said.contains("cordelia sync map ~/work/other <name>")
+                .then_some(said)
+        });
+        assert!(said.contains("this layout cannot be mapped"), "{said}");
+        let said = laptop.cli(&["sync", "map", &shown(&other), "other"]);
+        assert!(said.contains("Mapped ~/work/other to other."), "{said}");
+        let d_other = d_home.join("work/other");
+        std::fs::create_dir_all(&d_other).unwrap();
+        let d_other_mem = claude_folder(&d_home, &d_other);
+        desktop.cli(&["sync", "map", &shown(&d_other), "other"]);
+        wait_for(
+            "the own folder's file reaches the desktop",
+            &all,
+            120,
+            || {
+                (read(&d_other_mem.join("own.md"))?.as_str() == "of the directory itself\n")
+                    .then_some(())
+            },
+        );
+        assert_eq!(read(&d_other_mem.join("kept.md")), None);
+        let tree = home.join(".claude/projects/workspace/memory/kept.md");
+        assert_eq!(read(&tree).as_deref(), Some("kept by hand\n"));
+    }
 }
 
 #[test]

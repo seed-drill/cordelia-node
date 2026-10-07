@@ -3154,7 +3154,8 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 // `map` checks when it is run: it is not sent where it
                 // would sync another folder than one that was found
                 // (decision 2026-10-04 §10.1).
-                if let Some(why) = map_would_sync_another(&given, &root, &settings) {
+                let machine = cordelia_api::found::ThisMachine;
+                if let Some(why) = map_would_sync_another(&given, &root, &settings, &machine) {
                     anyhow::bail!("{why}");
                 }
                 // Home memory syncs only when it is asked for, and by
@@ -3927,16 +3928,19 @@ fn found_and_named(status: &serde_json::Value) -> Vec<(&str, &str, Option<&str>)
 /// what the node lists as found and what its notice names, and where one
 /// of them has the directory that was given (`given`, or `root`, the
 /// directory whose folder holds its memory), and a Claude Code folder
-/// other than the one `map` would sync, it is refused with the reason.
+/// other than the one `map` would sync, it is refused with the reason,
+/// and with what clears it ([`cordelia_api::found::in_the_way`]).
 ///
 /// A command copied from earlier output, or typed from memory, would
 /// otherwise map another folder: Claude Code's own folder for the
-/// directory of a tree laid out by hand, or the folder of a repository
-/// that has appeared above the directory since it was found.
+/// directory of a tree laid out by hand, where that folder is not there,
+/// or the folder of a repository that has appeared above the directory
+/// since it was found.
 fn map_would_sync_another(
     given: &std::path::Path,
     root: &std::path::Path,
     status: &serde_json::Value,
+    machine: &dyn cordelia_api::found::Machine,
 ) -> Option<String> {
     use cordelia_api::found;
     let claude_dir = std::path::Path::new(status["dir"].as_str()?);
@@ -3947,8 +3951,13 @@ fn map_would_sync_another(
             .iter()
             .map(|(folder, directory, _)| (*folder, *directory))
     };
+    let to_map = |asked| found::ToMap {
+        given: asked,
+        would_sync: &would_sync,
+        claude_dir,
+    };
     let (asked, folder) = [given, root].into_iter().find_map(|asked| {
-        found::in_the_way(asked, &would_sync, pairs()).map(|folder| (asked, folder))
+        found::in_the_way(&to_map(asked), pairs(), machine).map(|folder| (asked, folder))
     })?;
     // Where the folder was found for the directory that was given, and
     // Claude Code now keeps that directory's memory with a repository
@@ -3962,12 +3971,17 @@ fn map_would_sync_another(
             .and_then(|(_, _, says)| *says)
             .map(str::to_string),
     };
-    Some(found::map_refused(
-        asked,
-        &would_sync,
-        folder,
-        reason.as_deref(),
-    ))
+    let mut why = found::map_refused(&to_map(asked), folder, reason.as_deref(), machine);
+    // The memory that Claude Code keeps with the repository is mapped by
+    // the repository's own directory.
+    if asked != root {
+        why.push_str(&format!(
+            " To sync the memory that Claude Code keeps with {} as it is: cordelia sync map {}",
+            root.display(),
+            shell_arg(&root.display().to_string())
+        ));
+    }
+    Some(why)
 }
 
 /// Print what syncs on this device, what was found and is not syncing, and
@@ -4715,11 +4729,38 @@ mod tests {
         );
     }
 
+    /// A machine as a test says it is: every folder is there but those
+    /// it names as gone, and no directory is in a repository.
+    #[derive(Default)]
+    struct Said {
+        gone: Vec<&'static str>,
+    }
+
+    impl cordelia_api::found::Machine for Said {
+        fn is_dir(&self, dir: &std::path::Path) -> bool {
+            !self
+                .gone
+                .iter()
+                .any(|gone| std::path::Path::new(gone) == dir)
+        }
+
+        fn memory_root(&self, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+            Some(dir.to_path_buf())
+        }
+    }
+
     /// `cordelia sync map` checks when it is run (decision 2026-10-04
     /// §10.1): where the node lists a folder as found, or names one in
     /// its notice, with the directory that was given and another Claude
     /// Code folder than the one `map` would sync, nothing is sent, and
-    /// the reason is said. For a folder that it would sync, it goes on.
+    /// the reason is said, with what clears it. For a folder that it
+    /// would sync, it goes on.
+    ///
+    /// A tree laid out by hand is in the way only where Claude Code's
+    /// own folder for the directory is not there: where it is, that is
+    /// the folder the command maps, which is what was asked. And a
+    /// folder that the notice names under another Claude Code directory
+    /// is in nobody's way.
     #[test]
     fn test_map_is_not_sent_where_it_would_sync_another_folder_than_was_found() {
         use std::path::Path;
@@ -4734,28 +4775,31 @@ mod tests {
         let none = serde_json::json!([]);
         let own = "/home/sam/.claude/projects/-home-sam-Work-cn";
         let cn = Path::new("/home/sam/Work/cn");
+        let there = Said::default();
+        let own_gone = Said { gone: vec![own] };
 
         // The folder that `map` would sync was found: it is sent.
         let found = serde_json::json!([
             { "folder": own, "cwd": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": true },
         ]);
         assert_eq!(
-            map_would_sync_another(cn, cn, &status(found, none.clone())),
+            map_would_sync_another(cn, cn, &status(found.clone(), none.clone()), &there),
             None
         );
         // Nothing found, and sync off (the node then refuses): it is sent.
         assert_eq!(
-            map_would_sync_another(cn, cn, &status(none.clone(), none.clone())),
+            map_would_sync_another(cn, cn, &status(none.clone(), none.clone()), &there),
             None
         );
         assert_eq!(
-            map_would_sync_another(cn, cn, &serde_json::json!({ "enabled": false })),
+            map_would_sync_another(cn, cn, &serde_json::json!({ "enabled": false }), &there),
             None
         );
 
         // The directory of a tree laid out by hand.
+        let tree = "/home/sam/.claude/projects/workspace";
         let by_hand = serde_json::json!([
-            { "folder": "/home/sam/.claude/projects/workspace", "cwd": null,
+            { "folder": tree, "cwd": null,
               "directory": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": false,
               "why_not": "laid_out_by_hand", "says": "this layout cannot be mapped" },
         ]);
@@ -4763,19 +4807,42 @@ mod tests {
             status(by_hand.clone(), none.clone()),
             status(none.clone(), by_hand.clone()),
         ] {
-            let why = map_would_sync_another(cn, cn, &listed).expect("refused");
+            // Claude Code's own folder for the directory is not there:
+            // the command would map an empty folder.
+            let why = map_would_sync_another(cn, cn, &listed, &own_gone).expect("refused");
+            assert!(why.contains(tree), "{why}");
+            assert!(why.contains("(this layout cannot be mapped)"), "{why}");
             assert!(
-                why.contains("/home/sam/.claude/projects/workspace"),
+                why.contains(&format!("({own}, which is not there)")),
                 "{why}"
             );
-            assert!(why.contains("(this layout cannot be mapped)"), "{why}");
-            assert!(why.contains(own), "{why}");
             assert!(why.contains("nothing was mapped"), "{why}");
+            // What clears it, both ways.
+            assert!(
+                why.contains(&format!(
+                    "To sync the memory in {tree}, move it into {own}/memory"
+                )),
+                "{why}"
+            );
+            assert!(
+                why.contains("start a Claude Code session in /home/sam/Work/cn first"),
+                "{why}"
+            );
             // Given one of its subdirectories, whose memory is the
             // repository's: refused as well.
             let sub = Path::new("/home/sam/Work/cn/src");
-            assert!(map_would_sync_another(sub, cn, &listed).is_some());
+            assert!(map_would_sync_another(sub, cn, &listed, &own_gone).is_some());
+            // The own folder is there: the command maps it, which is
+            // what was asked, and the tree is in nobody's way.
+            assert_eq!(map_would_sync_another(cn, cn, &listed, &there), None);
+            assert_eq!(map_would_sync_another(sub, cn, &listed, &there), None);
         }
+        // So too where the own folder was found beside the tree.
+        let both = serde_json::json!([found[0].clone(), by_hand[0].clone()]);
+        assert_eq!(
+            map_would_sync_another(cn, cn, &status(both, none.clone()), &there),
+            None
+        );
 
         // A directory that a repository has appeared above since it was
         // found: `map` would sync the repository's folder.
@@ -4787,8 +4854,8 @@ mod tests {
               "says": "needs a name (not a git project)" },
         ]);
         let listed = status(found, none.clone());
-        assert_eq!(map_would_sync_another(notes, notes, &listed), None);
-        let why = map_would_sync_another(notes, above, &listed).expect("refused");
+        assert_eq!(map_would_sync_another(notes, notes, &listed, &there), None);
+        let why = map_would_sync_another(notes, above, &listed, &there).expect("refused");
         assert!(
             why.contains("/home/sam/.claude/projects/-home-sam-notes"),
             "{why}"
@@ -4804,23 +4871,49 @@ mod tests {
             "{why}"
         );
         assert!(!why.contains("needs a name"), "{why}");
+        // What clears it: the memory moved to the repository's, or the
+        // repository mapped by its own directory. No session helps: the
+        // folder is Claude Code's own.
+        assert!(
+            why.contains(
+                "move it into /home/sam/.claude/projects/-home-sam/memory, where Claude Code \
+                 keeps the memory of /home/sam/notes"
+            ),
+            "{why}"
+        );
+        assert!(
+            why.contains(
+                "To sync the memory that Claude Code keeps with /home/sam as it is: cordelia \
+                 sync map "
+            ),
+            "{why}"
+        );
+        assert!(!why.contains("start a Claude Code session"), "{why}");
+        // A folder whose memory was moved away is in nobody's way.
+        let moved = Said {
+            gone: vec!["/home/sam/.claude/projects/-home-sam-notes/memory"],
+        };
+        assert_eq!(map_would_sync_another(notes, above, &listed, &moved), None);
         // An entry of another directory is not in the way.
         let other = Path::new("/home/sam/other");
-        assert_eq!(map_would_sync_another(other, other, &listed), None);
+        assert_eq!(map_would_sync_another(other, other, &listed, &there), None);
 
         // A folder that the notice names, which synced under another
-        // Claude Code directory.
+        // Claude Code directory: it is in nobody's way, whether or not
+        // Claude Code's own folder for the directory is there.
         let named = serde_json::json!([
             { "folder": "/home/sam/.other/projects/-home-sam-Work-cn", "cwd": null,
               "directory": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": false,
               "why_not": "another_claude_dir",
               "says": "it is not under the Claude Code directory that sync is set to" },
+            { "folder": "/home/sam/.other/projects/workspace", "cwd": null,
+              "directory": "/home/sam/Work/cn", "name": "github.com/o/cn", "mappable": false,
+              "why_not": "another_claude_dir",
+              "says": "it is not under the Claude Code directory that sync is set to" },
         ]);
-        let why = map_would_sync_another(cn, cn, &status(none, named)).expect("refused");
-        assert!(
-            why.contains("it is not under the Claude Code directory"),
-            "{why}"
-        );
+        let listed = status(none, named);
+        assert_eq!(map_would_sync_another(cn, cn, &listed, &there), None);
+        assert_eq!(map_would_sync_another(cn, cn, &listed, &own_gone), None);
     }
 
     /// What `cordelia sync status` prints for the notice (decision
