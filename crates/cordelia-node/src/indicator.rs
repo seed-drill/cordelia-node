@@ -144,6 +144,12 @@ pub struct Devices {
     pub names_to_go: usize,
     /// For how long the first of them has waited, in seconds.
     pub to_go_secs: Option<u64>,
+    /// How many of those names the device holds by a carry that a person
+    /// asked for, or by a recovery, with no folder mapped to them: what
+    /// was brought in there waits whatever sync says.
+    pub carried_to_go: usize,
+    /// For how long the first of those has waited, in seconds.
+    pub carried_to_go_secs: Option<u64>,
 }
 
 /// How grave what holds is.
@@ -307,10 +313,10 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 8. files too large;
 /// 9. folders that stopped syncing.
 ///
-/// **Amber,** in this order. What is about folders (1 to 3, and 7 to 9)
+/// **Amber,** in this order. What is about folders (1 to 3, and 8 to 10)
 /// holds only with sync on, something mapped and a report: with none of
 /// them, nothing would move anyway. What is about a person's devices (4
-/// to 6) holds wherever this device follows a phrase, with sync on or
+/// to 7) holds wherever this device follows a phrase, with sync on or
 /// off, and with or without a folder mapped.
 /// 1. no relay connected for more than five minutes, by the node's own
 ///    clock;
@@ -320,16 +326,21 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 ///    when this device applied it;
 /// 5. a device added since the last change that nobody has cleared;
 /// 6. a device that has said it left;
-/// 7. a relay that has been connected for more than five minutes and
+/// 7. names that a recovery, or a carry by command, holds with no folder
+///    mapped to them, and of which what was brought in is not yet sent,
+///    for more than five minutes: a machine that has just recovered maps
+///    nothing, and may have sync off;
+/// 8. a relay that has been connected for more than five minutes and
 ///    does not hold the latest change;
-/// 8. a relay that refuses a new channel for room, or for the address's
+/// 9. a relay that refuses a new channel for room, or for the address's
 ///    allowance;
-/// 9. names that a device which still counts had listed and that no
-///    device lists in the new generation, once that has lasted for more
-///    than five minutes, and for seven days from when this device applied
-///    the change: after that they are in `cordelia devices` only, as a
-///    removal is, so that a device in a drawer does not keep every line
-///    amber for good; or names not yet sent, for more than five minutes.
+/// 10. names that a device which still counts had listed and that no
+///     device lists in the new generation, once that has lasted for more
+///     than five minutes, and for seven days from when this device
+///     applied the change: after that they are in `cordelia devices`
+///     only, as a removal is, so that a device in a drawer does not keep
+///     every line amber for good; or names not yet sent, for more than
+///     five minutes: those of them that the seventh does not say.
 pub fn holds(f: &Facts) -> Vec<Holds> {
     let mut out: Vec<Holds> = Vec::new();
     let personal_and_running = f.initialised && !f.not_asked && f.running && f.role == "personal";
@@ -438,6 +449,13 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             1 => amber("left", "memory: a device has left".into()),
             n => amber("left", format!("memory: {n} devices have left")),
         }
+        // What a recovery, or a carry by command, brought in and has
+        // not yet sent: no folder is mapped to those names, so nothing
+        // of them turns on what sync says.
+        if d.carried_to_go > 0 && d.carried_to_go_secs.as_ref().is_some_and(long) {
+            let names = count(d.carried_to_go, "name");
+            amber("carried", format!("memory: {names} carried, not yet sent"));
+        }
     }
     if !of_folders {
         return out;
@@ -463,7 +481,10 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     }
     let shown_still = |secs: &u64| long(secs) && *secs <= NOT_LISTED_SHOWN_SECS;
     let not_listed = d.names_not_listed > 0 && d.applied_secs.as_ref().is_some_and(shown_still);
-    let not_sent = d.names_to_go > 0 && d.to_go_secs.as_ref().is_some_and(long);
+    // The names that a carry holds with no folder are said above, and
+    // not a second time here.
+    let of_folders_to_go = d.names_to_go.saturating_sub(d.carried_to_go);
+    let not_sent = of_folders_to_go > 0 && d.to_go_secs.as_ref().is_some_and(long);
     if not_listed {
         let names = count(d.names_not_listed, "name");
         amber(
@@ -471,7 +492,7 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             format!("memory: {names} not yet listed by a device"),
         );
     } else if not_sent {
-        let names = count(d.names_to_go, "name");
+        let names = count(of_folders_to_go, "name");
         amber("names", format!("memory: {names} not yet sent"));
     }
     out
@@ -875,7 +896,7 @@ mod tests {
     ];
 
     /// Each thing of the amber list, alone, in the list's order.
-    const AMBER: [(Edit, &str, &str); 10] = [
+    const AMBER: [(Edit, &str, &str); 11] = [
         (
             &|f| {
                 f.peers_hot = 0;
@@ -910,6 +931,15 @@ mod tests {
             "memory: a device has left",
         ),
         (
+            &|f| {
+                f.devices.names_to_go = 1;
+                f.devices.carried_to_go = 1;
+                f.devices.carried_to_go_secs = Some(400);
+            },
+            "carried",
+            "memory: 1 name carried, not yet sent",
+        ),
+        (
             &|f| f.devices.without_latest_secs = vec![10, 400],
             "relay_without_latest",
             "memory: a relay does not hold the latest change",
@@ -939,7 +969,7 @@ mod tests {
 
     /// The things of the amber list that are about a person's devices:
     /// the rest of it is about folders.
-    const OF_DEVICES: [&str; 3] = ["removal_not_applied", "added", "left"];
+    const OF_DEVICES: [&str; 4] = ["removal_not_applied", "added", "left", "carried"];
 
     /// What has no level, as it always was: each says its own.
     const NO_LEVEL: [(Edit, State, &str); 6] = [
@@ -1048,6 +1078,7 @@ mod tests {
             "removal_not_applied",
             "added",
             "left",
+            "carried",
             "relay_without_latest",
             "relay_no_room",
             "names",
@@ -1324,9 +1355,9 @@ mod tests {
                 assert_eq!(shown.summary, *says, "{where_}");
                 assert_eq!(whats(&shown), [*what], "{where_}");
             }
-            // Amber: each of the three, alone, with the state as it is
+            // Amber: each of the four, alone, with the state as it is
             // without it.
-            for (amber, what, says) in &AMBER[3..6] {
+            for (amber, what, says) in &AMBER[3..7] {
                 let without = with(place);
                 let shown = with(&|f| {
                     amber(f);
@@ -1337,7 +1368,7 @@ mod tests {
                 assert_eq!(whats(&shown), [*what], "{where_}");
                 assert_eq!(shown.state, without.state, "{where_}");
             }
-            // Everything amber at once: the three, in their order, and
+            // Everything amber at once: the four, in their order, and
             // nothing that is about folders.
             let all = with(&|f| {
                 for (edit, _, _) in AMBER {
@@ -1378,7 +1409,7 @@ mod tests {
         // Sync off with a notice stored, errors, conflicts and no relay:
         // nothing of folders holds, and the line says off.
         let off = with(&|f| {
-            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[6..]) {
+            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[7..]) {
                 edit(f);
             }
             f.sync_enabled = false;
@@ -1520,7 +1551,7 @@ mod tests {
     #[test]
     fn with_nothing_mapped_or_no_report_yet_there_is_no_amber_of_folders() {
         let of_folders = |f: &mut Facts| {
-            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[6..]) {
+            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[7..]) {
                 edit(f);
             }
         };
@@ -1550,7 +1581,7 @@ mod tests {
         assert_eq!(no_report.summary, "memory sync starting");
         // Each thing of folders needs all three: with one of them
         // missing, none holds.
-        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[6..]) {
+        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[7..]) {
             for missing in [
                 (&|f: &mut Facts| f.mapped = 0) as &dyn Fn(&mut Facts),
                 &|f: &mut Facts| f.report_age_secs = None,
@@ -1854,6 +1885,45 @@ mod tests {
         assert_eq!(to_go(Some(300)), None);
         assert_eq!(to_go(Some(301)), amber);
         assert_eq!(to_go(None), None);
+        // What a carry holds with no folder, and has not yet sent: so
+        // too, and on a machine that maps nothing, with sync off.
+        let carried = |secs: Option<u64>| {
+            level(&|f| {
+                f.sync_enabled = false;
+                f.mapped = 0;
+                f.folders = 0;
+                f.devices.names_to_go = 2;
+                f.devices.carried_to_go = 2;
+                f.devices.carried_to_go_secs = secs;
+            })
+        };
+        assert_eq!(carried(Some(300)), None);
+        assert_eq!(carried(Some(301)), amber);
+        assert_eq!(carried(None), None);
+        assert_eq!(level(&|f| f.devices.carried_to_go_secs = Some(900)), None);
+        // Those names are said once: what is said of names still to send
+        // is of the others.
+        let both = with(&|f| {
+            f.devices.names_to_go = 3;
+            f.devices.to_go_secs = Some(400);
+            f.devices.carried_to_go = 2;
+            f.devices.carried_to_go_secs = Some(400);
+        });
+        let says: Vec<&str> = both.holds.iter().map(|h| h.says.as_str()).collect();
+        assert_eq!(
+            says,
+            [
+                "memory: 2 names carried, not yet sent",
+                "memory: 1 name not yet sent"
+            ]
+        );
+        let only_carried = with(&|f| {
+            f.devices.names_to_go = 2;
+            f.devices.to_go_secs = Some(400);
+            f.devices.carried_to_go = 2;
+            f.devices.carried_to_go_secs = Some(400);
+        });
+        assert_eq!(whats(&only_carried), ["carried"]);
         // A time with nothing that waits is nothing.
         assert_eq!(level(&|f| f.devices.to_go_secs = Some(900)), None);
         assert_eq!(level(&|f| f.devices.applied_secs = Some(900)), None);

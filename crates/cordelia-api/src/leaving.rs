@@ -444,15 +444,22 @@ pub fn names_to_go(
 /// A status says that names are not yet sent only once they have waited
 /// for some minutes: what was written a moment ago, and what a relay
 /// that has just connected is being sent, is on its way.
+///
+/// `of` says which names are asked about: every name, or those that the
+/// device holds by a carry ([`crate::names::carried`]).
 pub fn names_waiting_since(
     conn: &Connection,
     identity: &NodeIdentity,
     relays: &[([u8; 32], i64)],
+    of: &dyn Fn(&str) -> bool,
 ) -> Result<Option<i64>, PersonError> {
     let carried_up_to = kept_rows::carried_up_to(conn)?;
     let mut since: Option<i64> = None;
     for channel in crate::at_relays::channels(conn, identity)? {
-        if !matches!(channel.kind, Kind::Name(_)) {
+        let Kind::Name(name) = &channel.kind else {
+            continue;
+        };
+        if !of(name) {
             continue;
         }
         let first_after = |place: i64| -> Result<Option<(i64, i64)>, PersonError> {

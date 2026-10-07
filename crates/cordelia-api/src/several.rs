@@ -2123,8 +2123,9 @@ mod tests {
         let (conn, identity) = (&s[0].conn, &s[0].identity);
         let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
         // Each relay with when it was last connected.
-        let since =
-            |relays: &[([u8; 32], i64)]| names_waiting_since(conn, identity, relays).unwrap();
+        let since = |relays: &[([u8; 32], i64)]| {
+            names_waiting_since(conn, identity, relays, &|_| true).unwrap()
+        };
         // Both connected before anything was stored.
         let long = |relays: &[[u8; 32]]| {
             let relays: Vec<([u8; 32], i64)> = relays.iter().map(|relay| (*relay, 0)).collect();
@@ -2184,7 +2185,7 @@ mod tests {
         // The personal channel is no name: what waits of it is not said.
         let alone = Machine::new(7);
         assert_eq!(
-            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)]).unwrap(),
+            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)], &|_| true).unwrap(),
             None
         );
     }

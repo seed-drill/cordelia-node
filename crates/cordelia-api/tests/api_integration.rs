@@ -2006,6 +2006,11 @@ async fn test_the_status_says_for_how_long_no_relay_has_been_connected() {
     state.own_channels.relays_connected(&[], earlier);
     let secs = status().await["no_relay_secs"].as_u64().unwrap();
     assert!((400..460).contains(&secs), "{secs}");
+    // The node looks again, and finds none still: the time is counted
+    // from when it first found none, and not from its last look.
+    state.own_channels.relays_connected(&[], now);
+    let secs = status().await["no_relay_secs"].as_u64().unwrap();
+    assert!((400..460).contains(&secs), "{secs}");
 
     state
         .own_channels

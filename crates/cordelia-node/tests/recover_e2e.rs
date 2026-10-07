@@ -1177,6 +1177,13 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
         || holds_the_change(&relay, &first, 2).then_some(()),
     );
     assert_eq!(held(&first).len(), 2);
+    // What a status goes by for that: the name is held by the recovery,
+    // with no folder mapped to it, and waits whatever sync says. The
+    // machine maps nothing, and sync is off on it.
+    let names = person_of(&first)["names"].clone();
+    assert_eq!(names["to_go"], json!(["lab"]), "{names}");
+    assert_eq!(names["carried_to_go"], json!(["lab"]), "{names}");
+    assert!(names["carried_to_go_since"].is_i64(), "{names}");
     first.stop();
 
     // The second machine.

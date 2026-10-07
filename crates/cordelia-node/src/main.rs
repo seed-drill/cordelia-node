@@ -1109,6 +1109,10 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         applied_secs,
         names_to_go: person["names"]["to_go"].as_array().map_or(0, Vec::len),
         to_go_secs: ago(&person["names"]["to_go_since"]),
+        carried_to_go: person["names"]["carried_to_go"]
+            .as_array()
+            .map_or(0, Vec::len),
+        carried_to_go_secs: ago(&person["names"]["carried_to_go_since"]),
     }
 }
 
@@ -5558,7 +5562,10 @@ mod tests {
                 { "name": "old", "by": [], "by_gone": [{ "key": "g" }] },
                 { "name": "team", "by": [{ "key": "a" }], "by_gone": [{ "key": "g" }] },
             ],
-            "names": { "sent": ["x"], "to_go": ["lab"], "to_go_since": now - 30 },
+            "names": {
+                "sent": ["x"], "to_go": ["lab", "old", "team"], "to_go_since": now - 30,
+                "carried_to_go": ["old", "team"], "carried_to_go_since": now - 20,
+            },
         });
         assert_eq!(
             devices_facts(&look, now),
@@ -5574,8 +5581,11 @@ mod tests {
                 no_room_secs: vec![60, 0],
                 names_not_listed: 2,
                 applied_secs: Some(3_600),
-                names_to_go: 1,
+                names_to_go: 3,
                 to_go_secs: Some(30),
+                // Of those, the names that a carry holds with no folder.
+                carried_to_go: 2,
+                carried_to_go_secs: Some(20),
             }
         );
 
