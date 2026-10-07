@@ -7,12 +7,17 @@
 **Implements**: WP5 (Local Enrollment CLI), WP7 (Install Script + Packaging), WP13 (CLI Stats + Metrics)
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/network-protocol.md
 
-> **v1 status (2026-09-30).** Device pairing (§3) is replaced by
-> `cordelia add-device` and `cordelia accept` (see the README). The CLI (§4)
-> adds `id`, `add-device`, `accept`, `remove-device`, `devices`, `invites` and
-> `sync claude | map | unmap | off | status`. The install script pins a release with
-> `CORDELIA_VERSION`. Relays are run from [`deploy/relay/`](../../deploy/relay/)
-> ([decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.6).
+> **v1 status.** Device pairing (§3) is replaced by a recovery phrase and two
+> commands: `cordelia phrase` on one device, then `cordelia add-device` there
+> and `cordelia accept` on each other (see the README, and the
+> [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)).
+> The commands of this version are in §4.1. The install script pins a release
+> with `CORDELIA_VERSION`, and run again with a later one it upgrades and
+> restarts the node (`CORDELIA_NO_RESTART=1` leaves the node as it is). Relays
+> are run from [`deploy/relay/`](../../deploy/relay/)
+> ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md) §4.6).
+> The upgrade to this version, the copy that a device makes at its first
+> start on it, and how to go back, are in §10.
 
 ---
 
@@ -121,6 +126,16 @@ Your identity:
 Node is running. Install SDK: npm install @seeddrill/cordelia
 ```
 
+> **v1 status.** `cordelia init` creates this device's key, its token, its
+> configuration and its database, and no channel: there is no personal
+> channel until there is a recovery phrase. `cordelia start` runs the node.
+> A device that follows no phrase publishes nothing, and its status says "no
+> recovery phrase yet: memory stays on this machine. Make one here
+> (`cordelia phrase`), or add this machine from one that has one."
+> `cordelia init --new-key` gives a device a new key: it leaves the devices
+> it is with, keeps its memory folders and their mappings, and then follows
+> no phrase. It asks at a terminal.
+
 ### 2.2 Steps
 
 1. **Generate Ed25519 keypair** (CSPRNG, 32-byte seed)
@@ -143,6 +158,14 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 | `~/.cordelia/cordelia.db` | 0600 | SQLite database (items, groups, FTS5) |
 | `~/.cordelia/channel-keys/` | 0700 | Directory for channel PSK files |
 | `~/.cordelia/channel-keys/<personal_channel_id>.key` | 0600 | Personal channel PSK |
+
+> **v1 status.** In this version the data directory of a personal node
+> holds `config.toml`, `identity.key`, `node-token`, `cordelia.db`, and
+> `history/` (local history, mode 0700). It holds no `channel-keys/` file
+> once the first start on this version is done: the keys of a device's
+> channels are derived from the person secret, which is in the database.
+> After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
+> §10.5. A relay keeps `channel-keys/` for the older kind.
 
 ### 2.4 Idempotency
 
@@ -196,6 +219,15 @@ The `node_token` is redacted by default (secrets should not appear in CI logs or
 ---
 
 ## 3. Device Pairing: `cordelia pair` / `cordelia join`
+
+> **v1 status.** Not built, and replaced. No key is shared between devices.
+> A second device is added with `cordelia add-device <its key>` on a device
+> that is in, and `cordelia accept <that device's key>` on the new one,
+> within an hour, each at a terminal with its yes. What is handed over is
+> the person secret, sealed in an entry of a channel that only those two
+> devices can derive (decision 2026-10-04 §6). The phrase is not typed to
+> add. Every device shows the addition until a person clears it there
+> (`cordelia devices --clear`).
 
 ### 3.1 First Device (Initiator)
 
@@ -273,6 +305,44 @@ Phase 4: device management UI, selective revocation via key rotation.
 | `cordelia version` | Print version and build info | No |
 | `cordelia help` | Print help | No |
 
+> **v1 status.** The commands of this version (`cordelia --help`):
+>
+> | Command | What it does | Asks at a terminal |
+> |---------|--------------|--------------------|
+> | `cordelia init` | Create this device's key and database. `--new-key` gives the device a new key | `--new-key` does |
+> | `cordelia start` | Run the node. (`cordelia stop` is not built: a node is stopped by its service, or by a signal) | |
+> | `cordelia status` | This device, its peers and memory sync. `--line` for a status bar, `--json` for tools, `--waybar` for a bar module | |
+> | `cordelia id` | Print this device's public key | |
+> | `cordelia phrase [--name <label>]` | Make the recovery phrase of your devices on this one: twelve words, shown once and typed back | Yes |
+> | `cordelia add-device <key> [--name <label>]` | Add another of your devices; then `cordelia accept` on it, within the hour | Yes |
+> | `cordelia accept <key>` | Take what the device that added this one hands over | Yes |
+> | `cordelia devices [--clear]` | Your devices, what each has applied, and what each relay holds. `--clear` goes through what this device has to tell you | `--clear` does |
+> | `cordelia remove-device <key>` | Remove one of your devices | Yes, and the phrase |
+> | `cordelia renew` | Give the devices that stay a new secret: of each device added since the last change, you say whether it stays | Yes, and the phrase |
+> | `cordelia settle` | Settle two changes that were made apart, on a device that has seen both | Yes, and the phrase |
+> | `cordelia recover` | On a new machine, with no device left that you trust: bring back what the relays hold. `--relay` names a relay beside those it is set up with | Yes, and the phrase |
+> | `cordelia sync claude` | Turn on Claude Code memory sync. Nothing syncs until a folder is mapped. `--all` is refused | |
+> | `cordelia sync map <folder> [name]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop | |
+> | `cordelia sync off`, `cordelia sync status` | Stop syncing; show what syncs and what was found | |
+> | `cordelia sync carry [name]` | Bring into the channels of the last change what a generation that was left still holds at the relays. `--from <label>` and `--phrase` take what a removed device signed, or read a generation this device never held | `--from` and `--phrase` do, and the phrase |
+> | `cordelia history`, `cordelia restore <id>` | Local history: the versions that sync replaced here, and putting one back | |
+> | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
+>
+> - **A command that asks at a terminal refuses when its input is not one,**
+>   before it asks or does anything. A yes is the word `yes`.
+> - **The recovery phrase is typed at the command's own prompt, with echo
+>   off:** never as an argument, never over the local API. The command signs
+>   in its own process and forgets the words before it waits for anything.
+> - **A command that changes anything refuses a node of another version than
+>   its own,** with the note that says how to restart it. Turning sync off is
+>   the exception. `cordelia status`, `cordelia sync status`, `cordelia
+>   devices` and `cordelia history` still answer beside such a node, with the
+>   note (decision 2026-10-04 §10.1, rule 6).
+> - `cordelia sync exclude` and `cordelia sync include` are refused: only
+>   what is mapped syncs, so there is nothing to exclude.
+> - `cordelia pair`, `join`, `export` and `version` below are not commands.
+>   `cordelia --version` prints the version.
+
 `cordelia start` flags:
 
 | Flag | Description |
@@ -322,6 +392,39 @@ JSON output (`--json`):
 }
 ```
 
+> **v1 status.** `cordelia status` shows this device and, while the node
+> runs, its peers and memory sync; `cordelia status --json` gives the same as
+> data, with a `state` of `synced`, `syncing`, `offline`, `attention`, `off`,
+> `stopped` or `uninitialised`. **The status line has one level** (decision
+> 2026-10-04 §8, §10.1), for a personal node that runs with sync on. It
+> shows the first thing of the gravest level, and the tooltip everything.
+>
+> - **Red,** ahead of everything else: this device has stopped (it was
+>   removed, or is in no list of the last change, or is in a fork, or was
+>   answered with a change that it could not open or apply); the first start
+>   on this version has not succeeded (§10.5); and then, where something is
+>   mapped, that it follows no phrase ("not added yet" after the upgrade, "no
+>   recovery phrase yet" on a new install). That is red on every device after
+>   this upgrade, and on every new install with a folder mapped, until a
+>   person acts: nothing it holds syncs until then. A device that is not to
+>   be added turns sync off. With nothing mapped, the notice of what stopped
+>   at the first start, errors and a stalled cycle are red.
+> - **Amber,** after what else is amber: a removal that some device has not
+>   applied, for its first seven days (after that it is in `cordelia devices`
+>   only); a device added since the last change that nobody has cleared;
+>   a device that has said it left; a relay that has been connected for more
+>   than five minutes and does not hold the latest change; a relay that
+>   refuses a new channel for room or for the address's allowance; names that
+>   are not yet in the channels of the last change, or not yet sent, for more
+>   than five minutes.
+>
+> `cordelia devices` is the one place to look: every device of the last
+> change with whether it has applied it and sent what it held, every device
+> added since and who added it, every removed key, every key that is in
+> neither list, every device that has said it left, the names that no device
+> lists yet, what this device has still to send, and for each relay whether
+> it holds the latest change.
+
 ### 4.4 `cordelia peers`
 
 ```
@@ -347,7 +450,21 @@ __personal           realtime   156     1m ago          [system]
 System channels (prefixed `__`) are hidden by default. Use `--all` to include them.
 ```
 
+> **v1 status.** On a personal node `cordelia channels` lists the names that
+> the device holds, each with how many entries it stores of the name's
+> channel and when it stored the last. A device holds a name once it follows
+> a recovery phrase and a folder is mapped to it.
+
 ### 4.6 `cordelia stats`
+
+> **v1 status.** `cordelia stats` prints counts only: the database's size;
+> what is stored and its encrypted size (entries of its own channels on a
+> personal node, items of the older kind on a relay); the names held, or the
+> channels subscribed; the distinct peers seen in the last day and week; and
+> the channels active in the last day and week. On a relay it also prints
+> `Storage: <in use> of <allowed>`: what the items of the older kind are
+> counted at (each its content and 1 KB) against `max_storage_bytes`.
+> `--json` gives the same for tools.
 
 ```
 $ cordelia stats
@@ -660,6 +777,34 @@ SPOs running Cardano nodes already have Prometheus + Grafana. The Cordelia dashb
 
 ## 9. Backup and Recovery
 
+> **v1 status.** What a person keeps is the **recovery phrase**: twelve
+> words, written down when `cordelia phrase` shows them. A device's key file
+> is that device's alone and is not copied to another: a machine that is
+> lost is replaced, and its key removed. The files under `channel-keys/` are
+> of the older kind, and a personal node has none. §9.2 to §9.4 below are of
+> the design before; what stands in their place:
+>
+> - **A device is lost, and another remains:** `cordelia remove-device
+>   <key>` on one that remains, with the phrase. A new machine is then
+>   added with the two commands.
+> - **No device remains that you trust:** `cordelia recover` on a new
+>   machine, with the phrase. It asks which devices are gone, brings back
+>   what the relays hold, and stops every other device until each is added
+>   again by hand. It reaches back 90 days from when the last device was on:
+>   a relay is a cache, not a backup.
+> - **The phrase is lost:** devices can still be added, and none can ever be
+>   removed or recovered. The way on is to start again on every device:
+>   `cordelia phrase` on one, and `cordelia init --new-key` and the two
+>   commands on each other.
+> - **The database is lost, the key file is not:** the device follows no
+>   phrase when it starts. It is handed the last change again by the two
+>   commands, from a device that has it, and its folders meet the channels as
+>   on a first sync: a copy is kept beside each file that differs.
+> - **One machine's mistake** (an edit or a delete that every device took):
+>   `cordelia history` and `cordelia restore`, on any device, for 30 days.
+>
+> Keep your own backup of anything you cannot afford to lose.
+
 ### 9.1 What to Back Up
 
 | Data | Location | Priority | Recovery Impact |
@@ -745,6 +890,14 @@ The install script detects an existing installation and performs an in-place bin
 - Config: New fields added with defaults. Existing fields never removed without deprecation cycle (warn for one minor version, remove in next major).
 - Wire protocol: CBOR forward-compatibility (unknown fields ignored, logged at DEBUG). New capabilities via new mini-protocol IDs.
 
+> **v1 status.** `cordelia --version` prints the version. The install
+> script, run again with a later `CORDELIA_VERSION`, replaces the binary,
+> restarts a node that is running as the service it set up, and waits until
+> the node says that it is the new version. A node and a command that find
+> the database at a later schema version than their own name both versions
+> and change nothing. §10.5 is the upgrade to this version, which is a new
+> start, and how to go back from it.
+
 ### 10.4 Rollback
 
 If an upgrade causes issues:
@@ -757,6 +910,102 @@ cordelia start
 ```
 
 **Database rollback caveat:** If the new version applied a schema migration, rolling back the binary may fail if the old version doesn't understand the new schema. Schema migrations are designed to be forward-compatible where possible (additive columns, not destructive). If a migration is not forward-compatible, the release notes will state this explicitly.
+
+### 10.5 The Upgrade to This Version, the Copy, and Going Back
+
+> **v1 status.** Decision 2026-10-04 §10 and §10.1.
+
+**Nobody is carried over.** Each device takes this version, starts alone
+from its memory folders, and is added again with the two commands. No
+device is handed a secret on the strength of what it held before, and there
+is one phrase, made once.
+
+**The order:**
+
+1. **Bring every device into step first, on the version it has.** Each is
+   on, and has synced, so that every memory folder holds what the others
+   hold. This is the one thing the person has to see to: a file that was
+   deleted on one device and is still on another comes back, and a device
+   that was behind brings its old files as its own.
+2. **The relays take this version.** A relay carries the new channels and,
+   for one version, the older ones as they are, each kind within a cap of
+   its own (`deploy/relay/README.md`).
+3. **Each device takes this version.** It keeps its key, its memory folders
+   and its mappings. Its folders forget what they had agreed. It follows no
+   phrase and publishes nothing, and its status says "not added yet".
+4. **On one device, at a terminal, run `cordelia phrase`:** the device whose
+   memory is the most up to date, since what it holds is then the channels'
+   earliest version of each file.
+5. **Add each other device:** `cordelia add-device` on the first, `cordelia
+   accept` on the other. Its folders meet the channels as on any first sync:
+   a file with the same text on both is agreed; where a file differs, this
+   device's text is kept beside the file as a copy and the file takes the
+   channel's; a file only here is published; `MEMORY.md` is merged.
+
+Between taking this version and being added, a device can be joined to any
+set of devices by `accept` and one yes: add the devices soon after they are
+upgraded. `cordelia renew`, run once they are added, puts them in a list that
+the person has looked at; without it, the first removal asks about every
+device but the first.
+
+**What the upgrade does not carry:** what is in the older channels and in no
+folder (the last writes of a device that is gone, and what had been handed
+through the local API and not yet sent); removals made before the upgrade,
+which are forgotten (the first change removes nobody: a device that was
+removed before the upgrade is no device after it, since nothing lists it,
+and its key is not refused either, so it is not to be added again); a file
+of more than 60 KB, where the limit was 64 KB; and the named and direct
+channels that the local API of the version before could make. A device left on the
+version before goes on in the older channels alone, for as long as the
+relays carry them, which is one version.
+
+**The first start.** A personal node that holds anything of the version
+before makes a copy and then one step, when it starts (data-formats.md §12):
+
+- **The copy** is a folder beside the database, `before-<version>`: the
+  database as its opening left it (the schema's steps have added tables, and
+  have changed no row that was there), and the key files of the older
+  channels. It is made and checked before anything is emptied. Where it
+  cannot be made (no room,
+  no leave to write), the step is not taken: the node stays up, runs no
+  cycle and no pass, refuses every request that changes anything but one
+  that turns sync off, and its status says why, with the room that is
+  needed. It tries again by itself and needs no restart.
+- **The step** empties what the device held of the older kind, and every
+  folder forgets what it had agreed. The device's key, its settings, its
+  mappings and local history stay.
+- **A device whose scope was "everything found" is told what stopped:** the
+  folders that synced without a mapping sync no longer, and status names
+  them. Only what is mapped syncs: `cordelia sync map` each folder that is
+  to go on.
+- **The copy holds what the device held:** sealed entries, the keys of
+  channels that relays keep for up to 90 days more, and also text in the
+  clear (removed lines of the index, the names and paths of memory files).
+  It is beside memory folders that hold the same memory in the clear. It can
+  be deleted once you are content.
+
+**Going back:**
+
+1. Stop the node.
+2. Install the version before, with the installer told to leave the node as
+   it is (`CORDELIA_NO_RESTART=1`).
+3. Remove the database, `cordelia.db`, and the two files that the store
+   keeps beside it, whose names end `-wal` and `-shm`. Left there, they
+   would be replayed over what is put back.
+4. Put the copy's database and key files where they were.
+5. Move the `before-<version>` folder away.
+6. Start the node.
+
+What that does not give back: the device's key and its configuration file
+were never in the copy, so a device that was given a new key since cannot go
+back. The mappings and the sync settings are rows of the database, so they
+are as the copy has them, and those made since go with the database that is
+removed. And the memory folders are as they are now, so what changed in
+them since is published into the older channels as edits.
+
+A version from before this one that is started by mistake on a database
+which this version stepped stops with words that say the database was moved
+on and where the copy is.
 
 ---
 

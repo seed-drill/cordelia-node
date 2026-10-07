@@ -7,20 +7,33 @@
 **Depends on**: specs/ecies-envelope-encryption.md, specs/network-protocol.md
 **Informs**: All specs that reference entity identity, key management, or authentication
 
-> **v1 status (2026-09-30).** v1 implements Layer 0 only: key generation and
+> **v1 status.** v1 implements Layer 0 only: key generation and
 > storage (§3), entity, node and author IDs (§4), authentication (§5) and Bech32
-> (§11) stand. Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.1:
+> (§11) stand. A person's devices are as the
+> [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)
+> has them, which replaces the device and membership model of the
+> [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md) §4.1:
 >
-> - **Pairing (§6) is dropped.** Each device keeps its own key and joins its
->   person's channels as a member: `cordelia add-device <key>` on one device,
->   `cordelia accept <key>` on the other. There is no shared seed.
-> - **The personal channel (§7.4)** is an ordinary `grp_` channel, not an ID
->   derived from the public key. It holds the device roster (its member list)
->   and the map from name to channel. Until 0.2.0-alpha.3 it also held home
->   memory, which now has a channel of its own.
+> - **Pairing (§6) is dropped.** Each device has its own key, and there is no
+>   shared seed. A device is one of a person's because it holds the **person
+>   secret**: 32 random bytes from which every channel of the person's own is
+>   derived. It is handed that secret when it is added: `cordelia add-device
+>   <key>` on a device that is in, and `cordelia accept <key>` on the new one,
+>   within an hour, each at a terminal with its yes.
+> - **A person also has a recovery phrase:** twelve words, made on one device
+>   by `cordelia phrase` and shown once. It signs the statement of which
+>   devices are the person's, and recovers to a new machine. No device stores
+>   the words. Without them a device can be added, and none can ever be
+>   removed or recovered.
+> - **The personal channel (§7.4)** is derived from the person secret, not
+>   from a public key, and has no member list. It holds what the person's
+>   devices tell each other: which names each syncs, the devices added since
+>   the last statement, and which statement each device has applied.
 > - **Compromise response (§10.1)** is `cordelia remove-device <key>` from
->   another device, which removes it from every channel and rotates their
->   keys.
+>   another device, with the recovery phrase: one signed statement that names
+>   the devices that remain and commits to a new person secret. Where no
+>   device is left that the person trusts, it is `cordelia recover` on a new
+>   machine, with the phrase.
 > - Layers 1-3 (§2.2-§2.4), DM channels (§7.3) and proof of agency (§9) are
 >   not in v1. The identity ADR this spec cites is archived
 >   ([`docs/archive/`](../archive/README.md)).
@@ -125,6 +138,21 @@ All three derivations are deterministic from the 32-byte seed. The seed is the s
 | `~/.cordelia/channel-keys/<channel_id>.key` | 0600 | Channel PSK (32 bytes, raw binary) | HIGH -- channel content unreadable without it |
 
 The X25519 key is derived on demand and never persisted separately (ecies-envelope-encryption.md SS2.2).
+
+> **v1 status.** What a device of a person's holds, and where (decision
+> 2026-10-04 §3, §5):
+>
+> | What | Where | Sensitivity |
+> |------|-------|-------------|
+> | The device's own key (the Ed25519 seed above) | `identity.key`, 0600 | CRITICAL to the device. It is not the person's identity: a lost device is removed, and a new one added, with no change to the others' keys |
+> | The person secret it has applied, and each one it left in the last 90 days | The database (`person_secrets`), 0600 | CRITICAL: whoever reads it reads every name of the person's until the next removal |
+> | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the latest change entry | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
+> | The recovery phrase | Nowhere on any device. Written down by the person | CRITICAL: a copy reads everything, through every removal, with no sign; without it no device can be removed and nothing recovered |
+>
+> A personal node has no file under `channel-keys/` from its first start on
+> this version: no channel of its own has a key file. The move of the
+> device's key and the person secret to the operating system's keystore is
+> not in this version.
 
 The data directory `~/.cordelia/` has mode 0700. The node MUST warn on startup if key file permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0) (operations.md SS5.4).
 
@@ -362,6 +390,18 @@ Domain-separated, entity-specific: each entity's personal channel has a unique I
 
 Access: `invite_only`, mode: `realtime`, always the first channel created.
 
+> **v1 status.** The personal channel is a channel from its secret (decision
+> 2026-10-04 §2.2): its secret is `HKDF(person secret, "cordelia v2
+> personal")`, its ID is the public half of a signing key derived from that
+> secret, and every device of the person can derive it. It is made when the
+> phrase is, and not at `cordelia init`: a device that follows no phrase has
+> no secret and publishes nothing. It holds no memory, no key envelopes and
+> no attestations. Its entries are `name/<the name>` (a device's word that it
+> syncs a name), `added/<key>` (a record of an addition), `applied/<key>`
+> (which statement a device has applied) and `left/<key>` (a device's word
+> that it has left): data-formats.md §9.7. Each name's memory has a channel
+> of its own, derived from the person secret and the name.
+
 ---
 
 ## 8. Privacy Properties
@@ -497,6 +537,29 @@ If an identity key is compromised:
 
 There is no "forgot password" flow in a decentralised system. The entity must re-establish its presence under the new key.
 
+> **v1 status.** A device's key is not shared, so a device that is lost or
+> taken over is removed and the others keep their keys (decision 2026-10-04
+> §7, §9):
+>
+> - **Where a device of the person's remains:** `cordelia remove-device
+>   <key>` on it, with the recovery phrase. One signed statement names the
+>   devices that remain and commits to a new person secret, sealed to each of
+>   them. From the moment a device applies it, the removed device reads
+>   nothing that device writes. A device that has not heard still writes
+>   where the removed device can read, and `cordelia devices` shows which
+>   devices have not applied the change.
+> - **Where none remains that the person trusts:** `cordelia recover` on a
+>   new machine, with the phrase. It brings back what the relays hold, for 90
+>   days after the last device was on, and stops every other device until
+>   each is added again by hand.
+> - **A device removed by mistake** cannot come back under its key.
+>   `cordelia init --new-key` gives it a new one, keeps its memory folders,
+>   and it is then added as a new device.
+> - **A recovery phrase that has leaked, or is lost,** cannot be replaced in
+>   this version. The remedy for either is to start again on every device:
+>   `cordelia phrase` on one, and on each other `cordelia init --new-key` and
+>   the two commands that add it.
+
 ### 10.2 Key Backup
 
 Per operations.md SS9.1-9.2:
@@ -507,6 +570,14 @@ Per operations.md SS9.1-9.2:
 | HIGH | Channel PSKs | `~/.cordelia/channel-keys/*.key` | Without these, channel content is unreadable. Open channel PSKs can be re-obtained; invite-only require re-invitation |
 | LOW | Node token | `~/.cordelia/node-token` | Regeneratable |
 | MEDIUM | Database | `~/.cordelia/cordelia.db` | Rebuildable via replication |
+
+> **v1 status.** What a person keeps safe is the recovery phrase, and not a
+> device's key file: a device's key is that device's alone, and a machine
+> that is lost is replaced by recovering, or by adding a new one from a
+> device that remains. A relay is a cache, not a backup: the phrase brings
+> back what the relays hold, for 90 days after the last device of the
+> person's was on. `--show-backup-key` and `--import-key` below are not in
+> the command line.
 
 **Backup methods (Phase 1):**
 
@@ -531,6 +602,7 @@ All key types use Bech32 encoding (BIP-173) for human-readable representation (e
 | `cordelia_xpk` | X25519 public key | 32 bytes | ECIES envelope recipient, key agreement |
 | `cordelia_sig` | Ed25519 signature | 64 bytes | Signed attestations, item signatures |
 | `cordelia_psk` | Channel PSK | 32 bytes | Manual PSK import/export (secret material) |
+| `cordelia_ch` | The ID of a channel from its secret: the public half of the channel's signing key | 32 bytes | A channel's ID as text (decision 2026-10-04 §2.1). A device's key is no channel's ID, and the other way round |
 
 Bech32 variant (not Bech32m): aligned with Cardano CIP-19 convention. SPOs and Cardano tooling use Bech32 throughout. Same variant avoids mixed-encoding friction in Phase 3 (ecies-envelope-encryption.md SS3.1).
 

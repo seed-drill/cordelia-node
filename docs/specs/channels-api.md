@@ -8,20 +8,38 @@
 **Depends on**: specs/ecies-envelope-encryption.md, decisions/2026-03-09-mvp-implementation-plan.md
 **Reference**: cordelia-core/docs/reference/api.md (existing node API, pre-pivot)
 
-> **v1 status (2026-09-30).** Changes and additions, per the
-> [decision record](../decisions/2026-09-30-agent-memory-sync.md); request and response types are in
-> `crates/cordelia-api/src/types.rs`.
+> **v1 status.** A node serves one of two sets of routes, by its role
+> (`crates/cordelia-api/src/lib.rs`).
+>
+> - **A personal node** carries no channel of the older kind
+>   ([decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)
+>   §10). Under `/api/v1/channels/` it serves four routes, for the names the
+>   device holds: `publish`, `entries`, `delete-key` and `identity` (§3.16).
+>   It does not serve `subscribe`, `listen`, `list`, `info`, `unsubscribe`,
+>   `dm`, `list-dms`, `group`, `group/invite`, `group/remove`, `list-groups`,
+>   `rotate-psk`, `delete-item` or `search`: there is nothing to subscribe
+>   to, create, join or rotate.
+> - **A relay or a bootnode** serves the Channels API of the older kind, as
+>   §3.1 to §3.15 have it, with the changes below.
+> - **Every node** serves the routes of a person's devices (§3.17), sync and
+>   local history (§3.18; `/api/v1/history/{list,show,restore,drop}`,
+>   decision 2026-09-30 §4.5b), `GET /api/v1/health` and `GET /api/v1/peers`.
+> - **Gone from every node:** `/api/v1/devices/remove` and
+>   `/api/v1/invites/{list,process}`. A device is removed by a statement that
+>   the command signs with the recovery phrase (`/api/v1/change/*`), and
+>   nothing arrives in an inbox.
+>
+> For the older kind, per the
+> [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md);
+> request and response types are in `crates/cordelia-api/src/types.rs`:
 >
 > - **`publish`** takes an optional `key`: it publishes a new revision of that
 >   key instead of appending an item (group channels only).
-> - **New:** `POST /api/v1/channels/entries` returns the current value of every
+> - `POST /api/v1/channels/entries` returns the current value of every
 >   key in a channel, with any conflicts, and `POST /api/v1/channels/delete-key`
 >   deletes a key.
 > - **`delete-item` (§3.12)** deletes only the caller's own items, in the
 >   channel named.
-> - **New, used by the CLI:** `/api/v1/devices/{add,accept,remove,list}`,
->   `/api/v1/invites/{list,process}`, `/api/v1/sync/{claude,status}` and
->   `/api/v1/history/{list,show,restore,drop}` (local history, decision §4.5b).
 > - **Not used by v1:** `dm` (§3.7), `group/invite` (§3.9), `group/remove`
 >   (§3.10) and `rotate-psk` (§3.11) still write key envelopes into the
 >   channel itself, which never reach other nodes. Open channels and PSK
@@ -965,7 +983,189 @@ cordelia_items_synced_total 45
 
 ---
 
+### 3.16 The Local API of a Device, for the Names It Holds
+
+> **v1 status.** What a personal node serves under `/api/v1/channels/`
+> (decision 2026-10-04 §2.3, §16; `crates/cordelia-api/src/local.rs`). There
+> are four routes. Nothing is created, joined or subscribed to: a request
+> names a name that this device holds, and the channel is the name's, derived
+> from the person's secret.
+
+A device holds a name once it follows a recovery phrase and a folder of its
+own is mapped to the name (`cordelia sync map`). A request for a name that it
+does not hold is `404`, and says how to hold one. On a device that follows no
+recovery phrase each route below but `identity` is `400`, with the way on in
+its message: such a device has no secret, and publishes nothing. A device
+that has stopped (it was removed, is in no list, is in a fork, or could not
+open a change) publishes nothing either: `publish`, and a `delete-key` of a
+key that holds a version, are `400`. `entries` still answers there, with
+what the device holds.
+
+**A publish here goes through the path that the sync adapter's goes through,**
+and so does a delete: one path for every entry that a node writes in a name.
+So an entry written through the local API says what it was written after, as
+the adapter's does.
+
+#### POST /api/v1/channels/publish
+
+**Request:**
+```json
+{ "channel": "github.com/owner/repo", "key": "notes.md", "content": "..." }
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `channel` | string | yes | The name, which this device holds |
+| `key` | string | yes | What the value is published under: for a memory file, the file's name. There is no publishing without one |
+| `content` | any | yes | A string is published as a text, which is what a memory file holds. Any other JSON is published as bytes that are no text: the sync adapter takes it for no version of a file |
+
+**Response (200):**
+```json
+{
+  "channel": "github.com/owner/repo",
+  "key": "notes.md",
+  "rev": 7,
+  "entry": "<hex: the entry's ID>",
+  "author": "cordelia_pk1...",
+  "over": { "rev": 6, "kind": "text", "entries": ["<hex>"] }
+}
+```
+
+`over` is what the entry was published over: the version that the slot held
+when the request was read (its revision, which of `text`, `delete` and
+`other` its value was, and the entries that the device held of it), or `null`
+where the slot held no version. The read and the publish are made under one
+hold of the database's lock.
+
+**Errors:**
+- `400` if `key` is missing, or the key and what is published under it are
+  more than 60 KB together.
+- `404` if this device does not hold the name.
+- `409` if no revision is left under that key until the next change of
+  devices (decision 2026-10-04 §2.3): nothing was written.
+
+#### POST /api/v1/channels/entries
+
+**Request:** `{ "channel": "github.com/owner/repo" }`
+
+**Response (200):** the current version under each key, in order of key, as
+the device's own store has it under the statement it has applied.
+
+```json
+{
+  "channel": "github.com/owner/repo",
+  "entries": [
+    { "key": "notes.md", "rev": 7, "kind": "text", "deleted": false,
+      "content": "...", "authors": ["cordelia_pk1..."], "conflicts": 0 }
+  ]
+}
+```
+
+A deleted key is listed, with `deleted: true` and `content: null`. `authors`
+is every key that signed an entry which is that version. `conflicts` is how
+many other versions stand at that revision: they lost the tie.
+
+#### POST /api/v1/channels/delete-key
+
+**Request:** `{ "channel": "github.com/owner/repo", "key": "notes.md" }`
+
+A delete is published over the version that the slot holds, as any value is,
+and the answer is the answer of a publish. `404` where the key holds no
+version, or a delete already.
+
+#### POST /api/v1/channels/identity, GET /api/v1/status, GET /api/v1/metrics
+
+As §3.14 and §3.15, of the device's own channels: the channels counted are
+the names that it holds, and what waits to be sent is what waits in a channel
+of the device's own. Nothing of the older kind is read.
+
+---
+
+### 3.17 A Person's Devices
+
+> **v1 status.** The routes behind `cordelia phrase`, `add-device`, `accept`,
+> `devices`, `remove-device`, `renew`, `settle` and `init --new-key` (decision
+> 2026-10-04 §5 to §8; `crates/cordelia-api/src/commands.rs`). Every node
+> serves them.
+
+- **No route takes a recovery phrase, and none is given one.** A command
+  that needs the phrase reads it at its own terminal, signs and seals in its
+  own process, and hands the node what it made: a change entry, and for a new
+  phrase the statement key. An entry and a statement travel as hex of their
+  bytes.
+- **No route asks a yes.** Every yes is asked by the command, at a terminal.
+  A program that holds the node's token can make these calls itself. What it
+  cannot do is have a phrase sign what a person was not shown (decision §5,
+  and the threat model's T17).
+- **Every route here is `409` once the device was given a new key** and the
+  node has not been started again.
+- **A node whose first start on this version is not done** (§3.18) answers
+  `devices/list` and refuses the rest.
+
+| Route | What it does |
+|-------|--------------|
+| `POST /api/v1/devices/list` | Everything `cordelia devices` and `cordelia status` say of this device and its person: where it stands (`state`: `no_phrase`, `applied`, `fork`, `removed`, `not_listed`, `not_opened`); the devices of the statement it has applied, each with whether it has applied the statement and sent what it carried; the devices added since, with who added each; the removed keys; the keys that are in neither list of the last change; the devices that have said they left; for each relay, whether it holds the latest change entry; the keys typed at `accept`; the notices that a person has not cleared; the names that no device lists yet; and what this device has still to send. Each device is shown with its label and the first four words of its key's fingerprint |
+| `POST /api/v1/devices/clear` | `{ "notice": "<hex>" }`: a person clears a notice on this device. `404` where it shows no such notice |
+| `POST /api/v1/devices/add/look` | `{ "device": "cordelia_pk1...", "label": "desktop" }`: what adding that key would do, with nothing written: `would` is `add`, or `hand_again` for a key that the statement already lists |
+| `POST /api/v1/devices/add` | The same body with `would`, which says what the yes was for. The device writes the hand-over in the pair channel and, where a record is made, the record in the personal channel. `409` where adding the key would by then do the other |
+| `POST /api/v1/devices/accept` | `{ "key": "cordelia_pk1...", "row": "no_phrase" }`: a person typed a key. It is kept with its time and the row of the record's 5.1 that the yes named (`no_phrase`, `alone`, `several`, `not_listed`), and the node asks its relays for what that device hands over until it is taken or the hour is gone. Answers `typed_at` and `until`. Refused where no hand-over could be taken as the device stands, and a ninth key |
+| `POST /api/v1/phrase/make` | `{ "entry": "<hex>", "statement_key": "<hex>", "from": "no_phrase" }`: the device starts alone under a new phrase. It is handed the first statement's change entry and the statement key, and never the words. `from` is where the device stood when the command asked its yes (`no_phrase`, `alone`, `several`) |
+| `POST /api/v1/change/prepare` | `{ "settle": false }`: the device shows its change entry to each relay and fetches, for two minutes at most, runs a sync cycle, and hands the command what it signs over and shows: the statement applied and the change entry kept, as their signed bytes; the record of each device added since; in a fork, the statement made apart and its entry; the names that the personal channel lists, each with the keys that list it; how much each device wrote that this one received in the last day and week; and what it could not fetch |
+| `POST /api/v1/change/make` | `{ "entry": "<hex>", "over": "<hex>", "apart": null }`: the node's half of a change that a command made with the phrase. One transaction, in which what the prompt showed is checked again: `409` where a statement arrived meanwhile, and nothing is made. Answers the change's number, how much was carried, and the files whose record could not be carried |
+| `POST /api/v1/devices/leave` | What a device owes the devices it leaves, before it is given a new key: its word that it has left, and a delete over each hand-over that a relay was sent |
+| `POST /api/v1/devices/leave/sent` | For each relay the node is connected to, how many of the device's channels still have something waiting to be sent there |
+| `POST /api/v1/devices/leave/back` | The device takes back its word that it has left: for `cordelia init --new-key` that a person stops at its second yes |
+| `POST /api/v1/devices/forget` | The device forgets what it holds of its person, and then follows no phrase: for a device that is given a new key |
+
+A refusal says the way on in its message: "this device follows no recovery
+phrase yet. Make one here (`cordelia phrase`), or add this device from one
+that has one", and so on. What a person did that is refused is `400`, and what
+changed under a prompt is `409`.
+
+`cordelia recover` and `cordelia sync carry` (decision 2026-10-04 §9, §7.3)
+read the recovery phrase in the command, as the commands above do.
+
+---
+
+### 3.18 Sync, and a Node That Is Held Up
+
+> **v1 status.** `/api/v1/sync/{claude,map,unmap,status}`, per the decision
+> record of 2026-09-30 §4.5, with what the decision record of 2026-10-04
+> §10.1 changes.
+
+- **Only what is mapped syncs.** A folder syncs because `map` declared it,
+  and for no other reason. A request to `sync/claude` that turns on a scope
+  of everything found (`all`) is refused. `exclude` and `home`, which a panel
+  of the version before may still send, are accepted and stored as before:
+  there is nothing left to exclude. A request that turns sync off is never
+  refused.
+- **`map`** forgets what the folder it adds had agreed, and its first cycle
+  in the name's channel waits until a relay has handed that channel.
+- **`cordelia status --json`,** which a panel reads, is worked out by the
+  command from `GET /api/v1/status` and `sync/status`, and carries what
+  `devices/list` answers under `person`. Its `state` is one of seven names
+  (`synced`, `syncing`, `offline`, `attention`, `off`, `stopped`,
+  `uninitialised`). Where the node runs and sync is on, a device with no
+  recovery phrase, and one with a notice of what stopped at the first start,
+  has the state `attention`, so that a panel which draws from the state
+  alone does not show it as synced.
+- **A node whose first start on this version is not done** (decision
+  2026-10-04 §10.1) runs no cycle and no pass. It answers every `GET`,
+  `sync/status`, `devices/list`, `history/list`, `history/show`,
+  `channels/entries` and `channels/identity`, and a request to `sync/claude`
+  that turns sync off. It refuses every other request with `503`, the code
+  `held_up`, and why it is held up. A node whose database is from a later
+  version answers every `GET` and nothing else: it writes nothing, so there
+  even turning sync off is refused.
+
+---
+
 ## 4. Channel ID Formats
+
+> **v1 status.** These are the IDs of the older kind. The ID of a channel
+> from its secret is the public half of a signing key derived from that
+> secret, written `cordelia_ch1...` (data-formats.md §9.1). The local API of
+> a device takes a name and never an ID.
 
 Three channel types, three ID formats:
 
@@ -1012,6 +1212,11 @@ These use a well-known PSK (technically encrypted, practically public). See arch
 ---
 
 ## 6. PSK Distribution
+
+> **v1 status.** Of the older kind of channel. A channel from its secret has
+> no key to distribute for each channel: every device of a person derives
+> every channel of that person's own from the one person secret, and a device
+> is handed that secret once, when it is added (decision 2026-10-04 §2.2, §6).
 
 ### 6.1 Open Channels
 
@@ -1062,6 +1267,17 @@ Phase 1 is a greenfield build. The existing node API (L1/L2/groups) is reference
 - `devices/*` endpoints -- portal enrollment deprecated, replaced by local `cordelia init`
 
 This is a clean break. Zero backward compatibility with the pre-pivot API. No migration path needed (no external adoption to protect).
+
+> **v1 status.** The namespaces a node serves in this version, by role:
+>
+> | Namespace | Personal node | Relay, bootnode |
+> |-----------|---------------|-----------------|
+> | `/api/v1/channels/*` | `publish`, `entries`, `delete-key`, `identity` for the names it holds (§3.16) | The Channels API of the older kind (§3.1 to §3.14) |
+> | `/api/v1/devices/*`, `/api/v1/phrase/make`, `/api/v1/change/*` | A person's devices (§3.17) | Served |
+> | `/api/v1/sync/*`, `/api/v1/history/*` | Sync and local history (§3.18) | Served |
+> | `/api/v1/status`, `/api/v1/metrics`, `/api/v1/health`, `/api/v1/peers` | Yes | Yes |
+>
+> `/api/v1/diagnostics` is not served.
 
 ---
 
