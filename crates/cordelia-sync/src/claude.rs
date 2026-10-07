@@ -358,6 +358,10 @@ impl found::Machine for Looked {
     fn memory_root(&self, dir: &Path) -> Option<PathBuf> {
         self.git.then(|| dir.to_path_buf())
     }
+
+    fn real_path(&self, dir: &Path) -> Option<PathBuf> {
+        dir.canonicalize().ok()
+    }
 }
 
 /// The adapter for one Claude Code directory (`~/.claude`).

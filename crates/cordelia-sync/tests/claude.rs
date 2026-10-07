@@ -1436,6 +1436,52 @@ fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
     assert!(link.file_type().is_symlink(), "the link is left as it is");
 }
 
+/// `map` compares directories by their real paths, as it takes the one
+/// it is given (decision 2026-10-04 §10.1). A folder that was found for a
+/// link to a directory has that directory: `map`, given the real
+/// directory, is refused while the folder that it would sync is not
+/// there, with the reason that the folder is listed with. Once Claude
+/// Code's own folder for the real directory is there, the same request
+/// maps it.
+#[test]
+fn map_is_refused_for_the_real_directory_of_a_folder_found_through_a_link() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let real = a.plain_dir("kept/real");
+    let link = a.home.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let of_the_link = a.claude_folder(&link);
+    std::fs::write(of_the_link.join("kept.md"), "written through the link\n").unwrap();
+    let report = a.cycle();
+    store_report(&a, &report);
+
+    let request = cordelia_api::types::SyncMapRequest {
+        folder: real.display().to_string(),
+        name: "real".into(),
+        home: false,
+    };
+    let map = |a: &Device| {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+    };
+    let refused = map(&a).unwrap_err().to_string();
+    assert!(
+        refused.contains("its directory is reached through a link"),
+        "{refused}"
+    );
+    let folder = a.folder_of(&link).display().to_string();
+    assert!(refused.contains(&folder), "{refused}");
+    assert!(refused.contains("which is not there"), "{refused}");
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+
+    // A session in the real directory makes its own folder: the same
+    // request maps that folder.
+    a.session_in(&real);
+    let report = a.cycle();
+    store_report(&a, &report);
+    map(&a).unwrap();
+    assert_eq!(mapped(&a.state.db.lock().unwrap()).len(), 1);
+}
+
 /// What is found is listed with whether `cordelia sync map` would sync
 /// that folder, and why not where it would not (decision 2026-10-04
 /// §10.1): each kind of folder, as the adapter finds it on disk. An entry
@@ -1471,6 +1517,12 @@ fn what_is_found_says_whether_map_would_sync_it() {
     // A folder with memory and no transcript: no directory is known.
     let unknown = a.home.join(".claude/projects/-home-nobody-knows");
     std::fs::create_dir_all(unknown.join("memory")).unwrap();
+    // A directory that a session recorded through a link: `map` takes a
+    // directory by its real path, and would sync the folder of that.
+    let real = a.plain_dir("kept/real");
+    let link = a.home.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    a.claude_folder(&link);
     // Two folders laid out by hand: one whose transcript records the
     // home directory, and one that records the mapped repository.
     let by_hand = |name: &str, records: &Path| {
@@ -1526,6 +1578,7 @@ fn what_is_found_says_whether_map_would_sync_it() {
         (a.folder_of(&outside), Some(&outside), "outside_home"),
         (a.folder_of(&gone), Some(&gone), "directory_gone"),
         (unknown.clone(), None, "no_directory"),
+        (a.folder_of(&link), Some(&link), "through_a_link"),
         (tree_of_home.clone(), Some(&a.home), "laid_out_by_hand"),
         (tree_of_repo.clone(), Some(&repo), "laid_out_by_hand"),
     ] {
@@ -1538,7 +1591,12 @@ fn what_is_found_says_whether_map_would_sync_it() {
     }
     // The tree that records the home directory is a tree, and not home.
     assert!(!entry(&tree_of_home).home);
-    assert_eq!(report.unmapped.len(), 9, "{:?}", report.unmapped);
+    assert_eq!(report.unmapped.len(), 10, "{:?}", report.unmapped);
+    let through = entry(&a.folder_of(&link)).says.clone().unwrap();
+    assert!(
+        through.contains(&format!("syncs the folder of {}", shown(&real))),
+        "{through}"
+    );
 
     // A node whose `HOME` is not set maps nothing: no entry has a `cwd`.
     a.adapter = ClaudeAdapter::new(a.home.join(".claude"), PathBuf::new(), &a.pk());

@@ -184,6 +184,9 @@ pub trait Machine {
     /// The directory whose folder holds the memory of sessions started
     /// in `dir` ([`memory_root_known`]). `None` where git cannot be run.
     fn memory_root(&self, dir: &Path) -> Option<PathBuf>;
+    /// The real path of `dir`, with every link on the way followed.
+    /// `None` where it cannot be told: the directory is gone.
+    fn real_path(&self, dir: &Path) -> Option<PathBuf>;
 }
 
 /// The machine the node runs on, asked each time.
@@ -196,6 +199,10 @@ impl Machine for ThisMachine {
 
     fn memory_root(&self, dir: &Path) -> Option<PathBuf> {
         memory_root_known(dir)
+    }
+
+    fn real_path(&self, dir: &Path) -> Option<PathBuf> {
+        dir.canonicalize().ok()
     }
 }
 
@@ -236,6 +243,10 @@ impl Machine for Remembered {
         roots.retain(|_, (at, _)| at.elapsed() < ROOT_KEPT);
         roots.insert(dir.to_path_buf(), (std::time::Instant::now(), root.clone()));
         root
+    }
+
+    fn real_path(&self, dir: &Path) -> Option<PathBuf> {
+        dir.canonicalize().ok()
     }
 }
 
@@ -293,6 +304,10 @@ pub enum WhyNot {
     PathTooLong,
     /// Its directory is gone.
     DirectoryGone,
+    /// Its directory is reached through a link, and this is its real
+    /// path: `map` syncs the folder that Claude Code names after the real
+    /// path, which is another folder.
+    ThroughALink(PathBuf),
     /// Git cannot be run, so the repository that its directory may be in
     /// is not known.
     GitNotRun,
@@ -312,6 +327,7 @@ impl WhyNot {
             WhyNot::OutsideHome => "outside_home",
             WhyNot::PathTooLong => "path_too_long",
             WhyNot::DirectoryGone => "directory_gone",
+            WhyNot::ThroughALink(_) => "through_a_link",
             WhyNot::GitNotRun => "git_not_run",
             WhyNot::MemoryElsewhere(_) => "memory_elsewhere",
         }
@@ -336,6 +352,11 @@ impl WhyNot {
                 "its path is longer than {FOLDER_NAME_MAX} characters: it cannot be mapped yet"
             ),
             WhyNot::DirectoryGone => "its directory is gone".into(),
+            WhyNot::ThroughALink(real) => format!(
+                "its directory is reached through a link: `cordelia sync map` syncs the folder \
+                 of {}, which is another",
+                real.display()
+            ),
             WhyNot::GitNotRun => "the node cannot run git, and cannot tell which repository \
                                   its directory is in"
                 .into(),
@@ -374,9 +395,16 @@ impl WhyAName {
 ///    after its directory is a tree laid out by hand, whatever its
 ///    transcripts record as its directory, the home directory included.
 /// 2. **The directory:** none is known; `HOME` is not set; it is outside
-///    the home directory; its path is too long; it is gone; git cannot be
-///    run; or Claude Code keeps its memory with a repository that
-///    contains it. The home directory itself is mapped by its own command.
+///    the home directory; its path is too long; it is gone; it is not its
+///    own real path; git cannot be run; or Claude Code keeps its memory
+///    with a repository that contains it. The home directory itself is
+///    mapped by its own command.
+///
+///    `cordelia sync map` takes a directory by its real path, and syncs
+///    the folder that Claude Code names after that. So a directory that
+///    was recorded through a link is asked by its real path here too: a
+///    command printed for it would map the folder of the real path, which
+///    is another folder than the one that was found.
 /// 3. **The name:** it has none, or one that cannot be mapped, or one
 ///    that another folder is mapped under. It can then be mapped under a
 ///    name that a person gives it.
@@ -421,6 +449,11 @@ pub fn would_map(asked: &Asked, against: &Against, machine: &dyn Machine) -> Map
     }
     if !machine.is_dir(directory) {
         return Maps::No(WhyNot::DirectoryGone);
+    }
+    match machine.real_path(directory) {
+        Some(real) if real != directory => return Maps::No(WhyNot::ThroughALink(real)),
+        Some(_) => {}
+        None => return Maps::No(WhyNot::DirectoryGone),
     }
     match machine.memory_root(directory) {
         None => return Maps::No(WhyNot::GitNotRun),
@@ -706,7 +739,10 @@ impl ToMap<'_> {
 /// directory. One of them stands in the way where all of this holds:
 ///
 /// - it has the directory that was given, and is another folder than the
-///   one that `map` would sync;
+///   one that `map` would sync. **Directories are compared by their real
+///   paths,** as `map` takes the one it is given: a folder whose directory
+///   was recorded through a link has the directory that the link leads
+///   to;
 /// - it is directly under the `projects` of the Claude Code directory
 ///   that is set: **a folder that a notice names under another Claude
 ///   Code directory stands in nobody's way,** for nothing under this
@@ -722,26 +758,27 @@ impl ToMap<'_> {
 /// `map` asks this whenever it is run, however the command was come by:
 /// copied from earlier output, sent by a panel whose status is seconds
 /// old, or typed from memory. Without it, `map` would sync another folder
-/// than the one that was listed.
+/// than the one that was listed. Returns the entry that stands in the
+/// way: its folder, and its directory as it was recorded.
 pub fn in_the_way<'a>(
     to_map: &ToMap,
     entries: impl IntoIterator<Item = (&'a str, &'a str)>,
     machine: &dyn Machine,
-) -> Option<&'a str> {
+) -> Option<(&'a str, &'a str)> {
     let projects = to_map.claude_dir.join("projects");
     let own_is_there = machine.is_dir(to_map.would_sync);
-    entries
-        .into_iter()
-        .find(|(folder, directory)| {
-            let another =
-                Path::new(directory) == to_map.given && Path::new(folder) != to_map.would_sync;
-            let under_this = Path::new(folder).parent() == Some(projects.as_path());
-            if !another || !under_this || !machine.is_dir(&Path::new(folder).join("memory")) {
-                return false;
-            }
-            !(to_map.is_by_hand(folder) && own_is_there)
-        })
-        .map(|(folder, _)| folder)
+    // A directory that is gone has no real path: it is compared as it is
+    // written.
+    let real = |dir: &Path| machine.real_path(dir).unwrap_or_else(|| dir.to_path_buf());
+    let given = real(to_map.given);
+    entries.into_iter().find(|(folder, directory)| {
+        let another = real(Path::new(directory)) == given && Path::new(folder) != to_map.would_sync;
+        let under_this = Path::new(folder).parent() == Some(projects.as_path());
+        if !another || !under_this || !machine.is_dir(&Path::new(folder).join("memory")) {
+            return false;
+        }
+        !(to_map.is_by_hand(folder) && own_is_there)
+    })
 }
 
 /// What `cordelia sync map` is refused with, for the folder that stands
@@ -750,9 +787,9 @@ pub fn in_the_way<'a>(
 ///
 /// `reason` is what stands in the place of a command for that folder,
 /// where there is one. What always clears it is to move the folder's
-/// memory to where `map` syncs it. `or_else` is another way out, where
-/// there is one: for a tree laid out by hand, a session of Claude Code in
-/// the directory makes its own folder, which `map` then syncs.
+/// memory to where `map` syncs it. For a tree laid out by hand there is
+/// another way: a session of Claude Code in the directory makes its own
+/// folder, which `map` then syncs.
 pub fn map_refused(
     to_map: &ToMap,
     folder: &str,
@@ -791,6 +828,8 @@ mod tests {
         gone: Vec<&'static str>,
         inside: Vec<(&'static str, &'static str)>,
         no_git: bool,
+        /// Each directory that is a link, with where it leads.
+        links: Vec<(&'static str, &'static str)>,
     }
 
     impl Machine for Said {
@@ -807,6 +846,14 @@ mod tests {
                 .iter()
                 .find(|(inside, _)| Path::new(inside) == dir);
             Some(root.map_or_else(|| dir.to_path_buf(), |(_, root)| PathBuf::from(root)))
+        }
+
+        fn real_path(&self, dir: &Path) -> Option<PathBuf> {
+            if !self.is_dir(dir) {
+                return None;
+            }
+            let link = self.links.iter().find(|(link, _)| Path::new(link) == dir);
+            Some(link.map_or_else(|| dir.to_path_buf(), |(_, real)| PathBuf::from(real)))
         }
     }
 
@@ -921,6 +968,69 @@ mod tests {
                 Some("was"),
                 &none,
                 &gone,
+                Some(HOME)
+            ),
+            Maps::No(WhyNot::DirectoryGone)
+        );
+        // A directory that was recorded through a link: `map` takes a
+        // directory by its real path, and would sync the folder of that,
+        // which is another. It is said before git is asked, and after a
+        // directory that is gone.
+        let linked = Said {
+            links: vec![("/home/sam/link", "/home/sam/Work/real")],
+            no_git: true,
+            ..Default::default()
+        };
+        let folder = folder_of("/home/sam/link");
+        let through = WhyNot::ThroughALink(PathBuf::from("/home/sam/Work/real"));
+        assert_eq!(
+            asks(
+                &folder,
+                Some("/home/sam/link"),
+                Some("lab"),
+                &none,
+                &linked,
+                Some(HOME)
+            ),
+            Maps::No(through.clone())
+        );
+        assert_eq!(through.code(), "through_a_link");
+        assert!(
+            through
+                .says()
+                .contains("syncs the folder of /home/sam/Work/real, which is another"),
+            "{}",
+            through.says()
+        );
+        // The real directory itself is mapped as any other.
+        let real_folder = folder_of("/home/sam/Work/real");
+        let with_git = Said {
+            links: vec![("/home/sam/link", "/home/sam/Work/real")],
+            ..Default::default()
+        };
+        assert_eq!(
+            asks(
+                &real_folder,
+                Some("/home/sam/Work/real"),
+                Some("lab"),
+                &none,
+                &with_git,
+                Some(HOME)
+            ),
+            Maps::Yes(How::UnderItsName)
+        );
+        let link_gone = Said {
+            links: vec![("/home/sam/link", "/home/sam/Work/real")],
+            gone: vec!["/home/sam/link"],
+            ..Default::default()
+        };
+        assert_eq!(
+            asks(
+                &folder,
+                Some("/home/sam/link"),
+                Some("lab"),
+                &none,
+                &link_gone,
                 Some(HOME)
             ),
             Maps::No(WhyNot::DirectoryGone)
@@ -1557,7 +1667,7 @@ mod tests {
             ..Default::default()
         };
         let stands = |entries: &[(&'static str, &'static str)], machine: &Said| {
-            in_the_way(&to_map, entries.iter().copied(), machine)
+            in_the_way(&to_map, entries.iter().copied(), machine).map(|(folder, _)| folder)
         };
         assert_eq!(stands(&[], &own_gone), None);
         assert_eq!(stands(&[(own, "/home/sam/Work/cn")], &own_gone), None);
@@ -1600,7 +1710,10 @@ mod tests {
             claude_dir: Path::new(CLAUDE),
         };
         let found = [(own, "/home/sam/Work/cn")];
-        assert_eq!(in_the_way(&above, found.iter().copied(), &there), Some(own));
+        assert_eq!(
+            in_the_way(&above, found.iter().copied(), &there),
+            Some((own, "/home/sam/Work/cn"))
+        );
         assert!(!above.is_by_hand(own));
         assert!(to_map.is_by_hand(by_hand));
 
@@ -1611,6 +1724,45 @@ mod tests {
         let recorded = [(after_another, "/home/sam/Work/cn")];
         assert_eq!(stands(&recorded, &there), None);
         assert_eq!(stands(&recorded, &own_gone), Some(after_another));
+
+        // Directories are compared by their real paths, as `map` takes
+        // the one it is given. A folder that was found for a link to the
+        // directory has the directory: it is in the way while the folder
+        // that `map` would sync is not there, and is told by its
+        // directory as it was recorded.
+        let of_the_link: &'static str = folder_of("/home/sam/link").leak();
+        let through = [(of_the_link, "/home/sam/link")];
+        let link = |gone: Vec<&'static str>| Said {
+            links: vec![("/home/sam/link", "/home/sam/Work/cn")],
+            gone,
+            ..Default::default()
+        };
+        assert_eq!(
+            in_the_way(&to_map, through.iter().copied(), &link(vec![own])),
+            Some((of_the_link, "/home/sam/link"))
+        );
+        assert_eq!(
+            in_the_way(&to_map, through.iter().copied(), &link(vec![])),
+            None
+        );
+        // With no link between them they are two directories.
+        assert_eq!(stands(&through, &own_gone), None);
+        // And a mapping that is given through the link is checked
+        // against what was found for the real directory.
+        let given_link = ToMap {
+            given: Path::new("/home/sam/link"),
+            would_sync: Path::new(of_the_link),
+            claude_dir: Path::new(CLAUDE),
+        };
+        let found_real = [(own, "/home/sam/Work/cn")];
+        assert_eq!(
+            in_the_way(
+                &given_link,
+                found_real.iter().copied(),
+                &link(vec![of_the_link])
+            ),
+            Some((own, "/home/sam/Work/cn"))
+        );
 
         // Every refusal says which folder is in the way, why, and what
         // clears it.

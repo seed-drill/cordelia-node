@@ -786,16 +786,18 @@ fn maps_another_folder(
     let pairs = entries
         .iter()
         .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
-    let Some(folder) = found::in_the_way(&to_map, pairs, &found::ThisMachine) else {
+    let Some((folder, recorded)) = found::in_the_way(&to_map, pairs, &found::ThisMachine) else {
         return Ok(None);
     };
     let name = entries
         .iter()
-        .find(|(of, directory, _)| of == folder && Path::new(directory) == given)
+        .find(|(of, directory, _)| of == folder && directory == recorded)
         .and_then(|(_, _, name)| name.as_deref());
+    // The folder is asked with its directory as it was recorded: where
+    // that is a link, the reason says so.
     let asked = found::Asked {
         folder: Path::new(folder),
-        directory: Some(given),
+        directory: Some(Path::new(recorded)),
         name,
     };
     let against = found::Against {

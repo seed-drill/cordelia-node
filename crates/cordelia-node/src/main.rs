@@ -3956,8 +3956,8 @@ fn map_would_sync_another(
         would_sync: &would_sync,
         claude_dir,
     };
-    let (asked, folder) = [given, root].into_iter().find_map(|asked| {
-        found::in_the_way(&to_map(asked), pairs(), machine).map(|folder| (asked, folder))
+    let (asked, (folder, recorded)) = [given, root].into_iter().find_map(|asked| {
+        found::in_the_way(&to_map(asked), pairs(), machine).map(|entry| (asked, entry))
     })?;
     // Where the folder was found for the directory that was given, and
     // Claude Code now keeps that directory's memory with a repository
@@ -3967,7 +3967,7 @@ fn map_would_sync_another(
         true => Some(found::WhyNot::MemoryElsewhere(root.to_path_buf()).says()),
         false => listed
             .iter()
-            .find(|(of, directory, _)| *of == folder && std::path::Path::new(directory) == asked)
+            .find(|(of, directory, _)| *of == folder && *directory == recorded)
             .and_then(|(_, _, says)| *says)
             .map(str::to_string),
     };
@@ -4734,6 +4734,8 @@ mod tests {
     #[derive(Default)]
     struct Said {
         gone: Vec<&'static str>,
+        /// Each directory that is a link, with where it leads.
+        links: Vec<(&'static str, &'static str)>,
     }
 
     impl cordelia_api::found::Machine for Said {
@@ -4746,6 +4748,14 @@ mod tests {
 
         fn memory_root(&self, dir: &std::path::Path) -> Option<std::path::PathBuf> {
             Some(dir.to_path_buf())
+        }
+
+        fn real_path(&self, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+            let link = self
+                .links
+                .iter()
+                .find(|(link, _)| std::path::Path::new(link) == dir);
+            Some(link.map_or_else(|| dir.to_path_buf(), |(_, real)| real.into()))
         }
     }
 
@@ -4776,7 +4786,10 @@ mod tests {
         let own = "/home/sam/.claude/projects/-home-sam-Work-cn";
         let cn = Path::new("/home/sam/Work/cn");
         let there = Said::default();
-        let own_gone = Said { gone: vec![own] };
+        let own_gone = Said {
+            gone: vec![own],
+            ..Default::default()
+        };
 
         // The folder that `map` would sync was found: it is sent.
         let found = serde_json::json!([
@@ -4892,11 +4905,44 @@ mod tests {
         // A folder whose memory was moved away is in nobody's way.
         let moved = Said {
             gone: vec!["/home/sam/.claude/projects/-home-sam-notes/memory"],
+            ..Default::default()
         };
         assert_eq!(map_would_sync_another(notes, above, &listed, &moved), None);
         // An entry of another directory is not in the way.
         let other = Path::new("/home/sam/other");
         assert_eq!(map_would_sync_another(other, other, &listed, &there), None);
+
+        // Directories are compared by their real paths: the command
+        // takes the one it is given by its real path. A folder that was
+        // found for a link to the directory is in the way while the
+        // folder that the command would sync is not there, with the
+        // reason that the node gave for it.
+        let through = serde_json::json!([
+            { "folder": "/home/sam/.claude/projects/-home-sam-link", "cwd": null,
+              "directory": "/home/sam/link", "name": null, "mappable": false,
+              "why_not": "through_a_link",
+              "says": "its directory is reached through a link" },
+        ]);
+        let listed = status(through, none.clone());
+        let linked = |gone: Vec<&'static str>| Said {
+            gone,
+            links: vec![("/home/sam/link", "/home/sam/Work/cn")],
+        };
+        let why = map_would_sync_another(cn, cn, &listed, &linked(vec![own])).expect("refused");
+        assert!(
+            why.contains("/home/sam/.claude/projects/-home-sam-link"),
+            "{why}"
+        );
+        assert!(
+            why.contains("(its directory is reached through a link)"),
+            "{why}"
+        );
+        assert_eq!(
+            map_would_sync_another(cn, cn, &listed, &linked(vec![])),
+            None
+        );
+        // With no link between them they are two directories.
+        assert_eq!(map_would_sync_another(cn, cn, &listed, &own_gone), None);
 
         // A folder that the notice names, which synced under another
         // Claude Code directory: it is in nobody's way, whether or not
