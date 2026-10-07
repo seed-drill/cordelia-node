@@ -6,6 +6,8 @@
 //! folders, its settings and its mappings; its folders forget what they
 //! had agreed, and it reads none of the older channels, keys or rows
 //! again.
+//! So a personal node that has no mark of the step makes it when it
+//! starts ([`first_start`]):
 //!
 //! 1. **A copy first** ([`copy`]): the database, as its opening left it,
 //!    and the key files of the older channels, into a folder beside them
@@ -18,6 +20,15 @@
 //!    ([`Notice`]); the stored report is removed and the scope is written
 //!    off; a guard is set against a version that does not know of the
 //!    step ([`GUARD`]); and the mark is written ([`Mark`]).
+//! 3. **After the commit the key files of the older channels are
+//!    removed** ([`remove_older_key_files`]): found by their place and
+//!    their names, and looked for again at every start, whatever the mark
+//!    says.
+//!
+//! A database that holds nothing of the older kind (a first install), or
+//! in which the device already follows a recovery phrase, gets the mark
+//! and nothing else. Any mark means done, in this version and in every
+//! later one.
 //!
 //! What stays: the counters, the device's settings and mappings, what the
 //! node keeps for its usage counts, and everything that a later step of
@@ -122,6 +133,31 @@ pub fn older_key_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     found.sort();
     Ok(found)
+}
+
+/// Whether the node holds anything of the older kind: a row in one of
+/// its tables, one of its keys, or a key file of an older channel.
+pub fn holds_older(conn: &Connection, data_dir: &Path) -> Result<bool, CordeliaError> {
+    for table in OLDER_TABLES {
+        let any: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if any {
+            return Ok(true);
+        }
+    }
+    for key in OLDER_KEYS {
+        if meta::get(conn, key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    let files = older_key_files(data_dir)
+        .map_err(|e| CordeliaError::Storage(format!("the folder of channel keys: {e}")))?;
+    Ok(!files.is_empty())
 }
 
 // ── The mark ─────────────────────────────────────────────────────────
@@ -638,6 +674,117 @@ pub fn remove_older_key_files(data_dir: &Path) -> (usize, usize) {
         }
     }
     (removed, left)
+}
+
+// ── The whole of it ──────────────────────────────────────────────────
+
+/// What a first start came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Done {
+    /// The database had the mark: there was nothing to do.
+    Already(Mark),
+    /// The node held nothing of the older kind, or the device follows a
+    /// recovery phrase: the mark was written, and nothing else.
+    Marked,
+    /// The copy was made, in this folder, and the step was taken.
+    Stepped {
+        copy: PathBuf,
+        /// The notice that was stored, where one was.
+        notice: Option<Notice>,
+    },
+}
+
+/// A first start that is done, and what became of the key files of the
+/// older channels after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstStart {
+    pub done: Done,
+    /// How many key files of the older channels were removed.
+    pub key_files_removed: usize,
+    /// How many could not be removed, and are still there.
+    pub key_files_left: usize,
+}
+
+/// Why a first start is not done. Nothing of the node's own was changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotDone {
+    /// The copy could not be made, so the step was not taken.
+    NotCopied(NotCopied),
+    /// The database could not be read, or the step failed and left
+    /// nothing of itself.
+    Failed(String),
+}
+
+impl From<CordeliaError> for NotDone {
+    fn from(e: CordeliaError) -> Self {
+        NotDone::Failed(e.to_string())
+    }
+}
+
+impl std::fmt::Display for NotDone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotDone::NotCopied(not) => write!(
+                f,
+                "the copy of the database from before this version could not be made ({}). It \
+                 needs {} bytes of room",
+                not.why, not.room_needed
+            ),
+            NotDone::Failed(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+/// What a personal node does when it starts, to a database that its
+/// opening has stepped as any version steps it (decision 2026-10-04
+/// §10.1). `data_dir` is the folder of the database and of the key files,
+/// `version` the node's own, and `now` the date of a notice.
+///
+/// - **With a mark** nothing is stepped.
+/// - **With no mark,** where the device already follows a recovery
+///   phrase, or the node holds no row and no key file of the older kind,
+///   the mark is written and nothing else.
+/// - **Otherwise** the copy is made and then the step is taken
+///   ([`copy`], [`step`]). Where the copy cannot be made the step is not
+///   taken, and where the step fails nothing of it is left: either way
+///   there is no mark, and a later call tries again.
+///
+/// Then, whichever of these it was, the key files of the older channels
+/// are removed ([`remove_older_key_files`]): a start that was cut short
+/// after the step's commit must not leave them for good.
+pub fn first_start(
+    conn: &Connection,
+    data_dir: &Path,
+    version: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<FirstStart, NotDone> {
+    let done = match mark(conn)? {
+        Some(mark) => Done::Already(mark),
+        None => {
+            let follows_a_phrase = crate::person::person(conn)?.is_some();
+            if follows_a_phrase || !holds_older(conn, data_dir)? {
+                meta::set(
+                    conn,
+                    meta::FIRST_START,
+                    &format!("{NOTHING_TO_STEP}{version}"),
+                )?;
+                Done::Marked
+            } else {
+                let copy = copy(conn, data_dir, version).map_err(NotDone::NotCopied)?;
+                let stepped = step(conn, version, now)?;
+                Done::Stepped {
+                    copy,
+                    notice: stepped.notice,
+                }
+            }
+        }
+    };
+    let (key_files_removed, key_files_left) = remove_older_key_files(data_dir);
+    Ok(FirstStart {
+        done,
+        key_files_removed,
+        key_files_left,
+    })
 }
 
 // ── A node of the released version, for tests ────────────────────────
@@ -1420,10 +1567,14 @@ mod tests {
             }
         });
         let notice = step(&conn, VERSION, now()).unwrap().notice;
-        // Whatever was stored, the scope is off afterwards, and the
-        // report is removed.
+        // Whatever the scope was, it is off afterwards, and the stored
+        // report and the times that each name last synced are removed:
+        // nothing says that a folder syncs on a device that follows no
+        // phrase.
         assert_eq!(key(&conn, meta::SYNC_CLAUDE_ALL).as_deref(), Some("off"));
         assert_eq!(key(&conn, meta::SYNC_CLAUDE_REPORT), None);
+        assert_eq!(key(&conn, meta::SYNC_CLAUDE_ACTIVITY), None);
+        assert_eq!(key(&conn, meta::SYNC_CLAUDE_LAST_CHANGE), None);
         // What is stored is what the step says it stored.
         let stored: Vec<Notice> = notice.clone().into_iter().collect();
         assert_eq!(notices(&conn).unwrap(), stored);
@@ -1651,5 +1802,347 @@ mod tests {
         assert!(names_in(&data.join("channel-keys")).is_empty());
         assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), [9u8; 32]);
         assert_eq!(remove_older_key_files(data), (0, 0));
+    }
+
+    // ── The whole of a first start ───────────────────────────────────
+
+    fn stepped_by_this_version() -> Mark {
+        Mark {
+            stepped: true,
+            version: VERSION.into(),
+        }
+    }
+
+    /// A database in the released version's form is started on this
+    /// version (decision 2026-10-04 §10.1). The copy is there, with every
+    /// older row and each key file. The records, every older row and the
+    /// older key files are gone from the node's own. The key, the
+    /// settings, the mappings, the counters and local history are as
+    /// they were.
+    #[test]
+    fn a_database_of_the_released_version_is_copied_and_then_stepped() {
+        let (dir, conn) = released_node(|_| {});
+        let data = dir.path();
+        let (before, own_files) = (everything(&conn), its_own_files(data));
+        assert!(holds_older(&conn, data).unwrap());
+        let settings = |conn: &Connection| -> Vec<Option<String>> {
+            [
+                meta::SYNC_CLAUDE_DIR,
+                meta::SYNC_CLAUDE_MAPPINGS,
+                meta::SYNC_CLAUDE_EXCLUDE,
+                meta::SYNC_CLAUDE_HOME,
+                meta::SYNC_CLAUDE_HOME_NAME,
+            ]
+            .iter()
+            .map(|name| key(conn, name))
+            .collect()
+        };
+        let settings_before = settings(&conn);
+        assert!(settings_before.iter().all(Option::is_some));
+
+        let started = first_start(&conn, data, VERSION, now()).unwrap();
+        let copy = data.join("before-0.2.0-test");
+        assert_eq!(
+            started,
+            FirstStart {
+                done: Done::Stepped {
+                    copy: copy.clone(),
+                    notice: None
+                },
+                key_files_removed: released::KEY_FILES.len(),
+                key_files_left: 0,
+            }
+        );
+        // The copy holds what the node held: it has no mark, and no
+        // guard.
+        assert_eq!(copies_in(data), ["before-0.2.0-test"]);
+        assert_eq!(names_in(&copy.join("channel-keys")), released::KEY_FILES);
+        let copied =
+            Connection::open_with_flags(copy.join("cordelia.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        assert_eq!(everything(&copied), before);
+        assert_eq!(mark(&copied).unwrap(), None);
+        drop(copied);
+
+        // The node's own: nothing of the older kind, and no key file.
+        for table in AGREED_TABLES.iter().chain(&OLDER_TABLES) {
+            assert_eq!(rows(&conn, table), 0, "{table}");
+        }
+        for name in OLDER_KEYS {
+            assert_eq!(key(&conn, name), None, "{name}");
+        }
+        assert!(!holds_older(&conn, data).unwrap());
+        assert!(older_key_files(data).unwrap().is_empty());
+        assert!(names_in(&data.join("channel-keys")).is_empty());
+        // What stays is as it was.
+        assert_eq!(settings(&conn), settings_before);
+        assert_eq!(rows(&conn, "peer_sightings"), 1);
+        assert_eq!(its_own_files(data), own_files);
+        assert_eq!(mark(&conn).unwrap(), Some(stepped_by_this_version()));
+        assert!(has_guard(&conn));
+    }
+
+    /// A second start changes nothing and makes no second copy, and nor
+    /// does a start in a later version: any mark means done (decision
+    /// 2026-10-04 §10.1).
+    #[test]
+    fn a_second_start_changes_nothing_and_makes_no_second_copy() {
+        let (dir, conn) = released_node(|conn| {
+            meta::set(conn, meta::SYNC_CLAUDE_ALL, "on").unwrap();
+        });
+        let data = dir.path();
+        first_start(&conn, data, VERSION, now()).unwrap();
+        assert_eq!(notices(&conn).unwrap().len(), 1);
+        // A setting made since is not the step's to change.
+        meta::set(&conn, meta::SYNC_CLAUDE_ALL, "on").unwrap();
+        let before = everything(&conn);
+        let copy = data.join("before-0.2.0-test");
+        let copied = std::fs::read(copy.join("cordelia.db")).unwrap();
+
+        for version in [VERSION, "9.9.9"] {
+            let again = first_start(&conn, data, version, now()).unwrap();
+            assert_eq!(
+                again,
+                FirstStart {
+                    done: Done::Already(stepped_by_this_version()),
+                    key_files_removed: 0,
+                    key_files_left: 0,
+                }
+            );
+            assert_eq!(everything(&conn), before, "{version}");
+            assert_eq!(copies_in(data), ["before-0.2.0-test"], "{version}");
+            assert_eq!(std::fs::read(copy.join("cordelia.db")).unwrap(), copied);
+        }
+        // A mark in another form is still a mark.
+        meta::set(&conn, meta::FIRST_START, "done").unwrap();
+        let again = first_start(&conn, data, VERSION, now()).unwrap();
+        assert!(matches!(again.done, Done::Already(_)), "{again:?}");
+        assert_eq!(copies_in(data), ["before-0.2.0-test"]);
+    }
+
+    /// A first install writes the mark and makes no copy: it holds
+    /// nothing of the older kind (decision 2026-10-04 §10.1). No guard is
+    /// set, and nothing else is written.
+    #[test]
+    fn a_first_install_gets_the_mark_and_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join(DATABASE)).unwrap();
+        std::fs::create_dir(dir.path().join("channel-keys")).unwrap();
+        assert!(!holds_older(&conn, dir.path()).unwrap());
+        assert_eq!(mark(&conn).unwrap(), None);
+        let before = everything(&conn);
+
+        let started = first_start(&conn, dir.path(), VERSION, now()).unwrap();
+        assert_eq!(started.done, Done::Marked);
+        assert!(copies_in(dir.path()).is_empty());
+        let marked = Mark {
+            stepped: false,
+            version: VERSION.into(),
+        };
+        assert_eq!(mark(&conn).unwrap(), Some(marked));
+        // The mark, and nothing else.
+        let mut with_the_mark = before;
+        with_the_mark.retain(|line| line != "node_meta: 0");
+        with_the_mark.push("node_meta: 1".into());
+        with_the_mark.push(format!(
+            "noted {}=nothing to step, marked by {VERSION}",
+            meta::FIRST_START
+        ));
+        with_the_mark.sort();
+        let mut after = everything(&conn);
+        after.sort();
+        assert_eq!(after, with_the_mark);
+        let again = first_start(&conn, dir.path(), VERSION, now()).unwrap();
+        assert!(matches!(again.done, Done::Already(_)), "{again:?}");
+    }
+
+    /// Each thing of the older kind, alone, is something to step: a row
+    /// in one of its tables, one of its keys, or a key file.
+    #[test]
+    fn a_node_holds_something_of_the_older_kind_by_any_one_of_them() {
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = db::open(&dir.path().join(DATABASE)).unwrap();
+            (dir, conn)
+        };
+        let (dir, conn) = fresh();
+        assert!(!holds_older(&conn, dir.path()).unwrap());
+        // What a folder agreed, a setting and the counters are not of it.
+        meta::set(&conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        meta::set(&conn, meta::SYNC_CLAUDE_ALL, "on").unwrap();
+        assert!(!holds_older(&conn, dir.path()).unwrap());
+
+        for name in OLDER_KEYS {
+            let (dir, conn) = fresh();
+            meta::set(&conn, name, "x").unwrap();
+            assert!(holds_older(&conn, dir.path()).unwrap(), "{name}");
+        }
+        let (dir, conn) = fresh();
+        new_channel(&conn, "grp_one").unwrap();
+        assert!(holds_older(&conn, dir.path()).unwrap());
+        let (dir, conn) = fresh();
+        conn.execute(
+            "INSERT INTO trusted_keys (entity_key, kind, added_at)
+             VALUES (X'BB', 'device', '2026-10-07')",
+            [],
+        )
+        .unwrap();
+        assert!(holds_older(&conn, dir.path()).unwrap());
+        let (dir, conn) = fresh();
+        std::fs::create_dir(dir.path().join("channel-keys")).unwrap();
+        assert!(!holds_older(&conn, dir.path()).unwrap());
+        std::fs::write(
+            dir.path().join("channel-keys").join("grp_one.slot"),
+            [1u8; 32],
+        )
+        .unwrap();
+        assert!(holds_older(&conn, dir.path()).unwrap());
+        // And it is stepped, with its copy.
+        let started = first_start(&conn, dir.path(), VERSION, now()).unwrap();
+        assert!(matches!(started.done, Done::Stepped { .. }), "{started:?}");
+        assert_eq!(started.key_files_removed, 1);
+    }
+
+    /// A database in which the device follows a recovery phrase, and that
+    /// has no mark, is not stepped (decision 2026-10-04 §10.1): it is
+    /// from a build that already left the older channels. The mark is
+    /// written, no copy is made, and every row stays.
+    #[test]
+    fn a_database_that_follows_a_phrase_is_marked_and_not_stepped() {
+        use crate::person::{Following, Person, State, put_person};
+        let (dir, conn) = released_node(|_| {});
+        let follows = Person {
+            state: State::Applied,
+            following: Following {
+                phrase_key: [1; 32],
+                statement_key: [2; 32],
+                phrase_channel: [3; 32],
+            },
+            statement: vec![4, 5, 6],
+        };
+        put_person(&conn, &follows).unwrap();
+        let before: Vec<i64> = OLDER_TABLES
+            .iter()
+            .map(|table| rows(&conn, table))
+            .collect();
+        assert!(before.iter().all(|rows| *rows > 0));
+
+        let started = first_start(&conn, dir.path(), VERSION, now()).unwrap();
+        assert_eq!(started.done, Done::Marked);
+        let after: Vec<i64> = OLDER_TABLES
+            .iter()
+            .map(|table| rows(&conn, table))
+            .collect();
+        assert_eq!(after, before);
+        assert!(key(&conn, meta::SYNC_CLAUDE_REPORT).is_some());
+        assert!(copies_in(dir.path()).is_empty());
+        assert!(!has_guard(&conn));
+        assert_eq!(mark(&conn).unwrap().map(|mark| mark.stepped), Some(false));
+        // The key files of the older channels are looked for at every
+        // start, whatever the mark says.
+        assert_eq!(started.key_files_removed, released::KEY_FILES.len());
+    }
+
+    /// Where the copy cannot be made, the step is not taken: no older
+    /// row or key file is changed, and there is no mark (decision
+    /// 2026-10-04 §10.1). The answer says why, with the room a copy
+    /// needs. Once it can be made, the next call makes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_cannot_be_made_takes_no_step() {
+        let (dir, conn) = released_node(|_| {});
+        let data = dir.path();
+        let (before, key_files) = (everything(&conn), key_files_held(data));
+        let closed = a_partial_copy_that_cannot_be_removed(data);
+
+        let not_done = first_start(&conn, data, VERSION, now()).unwrap_err();
+        let NotDone::NotCopied(not_copied) = &not_done else {
+            panic!("{not_done:?}");
+        };
+        let says = not_done.to_string();
+        assert!(says.contains("could not be made"), "{says}");
+        assert!(
+            says.contains(&format!("needs {} bytes of room", not_copied.room_needed)),
+            "{says}"
+        );
+        assert_eq!(everything(&conn), before);
+        assert_eq!(mark(&conn).unwrap(), None);
+        assert_eq!(key_files_held(data), key_files);
+        assert_eq!(copies_in(data), ["before-0.2.0-test.partial"]);
+
+        set_mode(&closed, 0o700);
+        let started = first_start(&conn, data, VERSION, now()).unwrap();
+        assert!(matches!(started.done, Done::Stepped { .. }), "{started:?}");
+        assert_eq!(copies_in(data), ["before-0.2.0-test"]);
+        assert_eq!(mark(&conn).unwrap(), Some(stepped_by_this_version()));
+    }
+
+    /// Where the step fails, nothing of it is left, and the key files are
+    /// where they were: the next start makes the copy again, keeping the
+    /// one from before as the earlier one, and takes the step (decision
+    /// 2026-10-04 §10.1).
+    #[test]
+    fn a_first_start_whose_step_fails_is_made_whole_by_the_next() {
+        let (dir, conn) = released_node(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER no_row BEFORE DELETE ON trusted_keys BEGIN
+                     SELECT RAISE(ABORT, 'this row stays');
+                 END;",
+            )
+            .unwrap();
+        });
+        let data = dir.path();
+        let (before, key_files) = (everything(&conn), key_files_held(data));
+
+        let not_done = first_start(&conn, data, VERSION, now()).unwrap_err();
+        assert!(
+            matches!(&not_done, NotDone::Failed(why) if why.contains("this row stays")),
+            "{not_done:?}"
+        );
+        assert_eq!(everything(&conn), before);
+        assert_eq!(key_files_held(data), key_files);
+        assert_eq!(copies_in(data), ["before-0.2.0-test"]);
+
+        conn.execute_batch("DROP TRIGGER no_row").unwrap();
+        let started = first_start(&conn, data, VERSION, now()).unwrap();
+        assert!(matches!(started.done, Done::Stepped { .. }), "{started:?}");
+        assert_eq!(
+            copies_in(data),
+            ["before-0.2.0-test", "before-0.2.0-test.earlier"]
+        );
+        assert!(older_key_files(data).unwrap().is_empty());
+    }
+
+    /// A start that is cut short after the step's commit, before the key
+    /// files are removed: the next start removes them (decision
+    /// 2026-10-04 §10.1). One that cannot be removed is counted, and the
+    /// start is done all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_start_cut_short_after_the_commit_still_removes_the_key_files() {
+        let (dir, conn) = released_node(|_| {});
+        let data = dir.path();
+        copy(&conn, data, VERSION).unwrap();
+        step(&conn, VERSION, now()).unwrap();
+        let files = released::KEY_FILES.len();
+        assert_eq!(older_key_files(data).unwrap().len(), files);
+
+        // The folder of channel keys cannot be written: none can go.
+        set_mode(&data.join("channel-keys"), 0o500);
+        let started = first_start(&conn, data, VERSION, now()).unwrap();
+        assert_eq!(started.done, Done::Already(stepped_by_this_version()));
+        assert_eq!(
+            (started.key_files_removed, started.key_files_left),
+            (0, files)
+        );
+        set_mode(&data.join("channel-keys"), 0o700);
+
+        let started = first_start(&conn, data, VERSION, now()).unwrap();
+        assert_eq!(
+            (started.key_files_removed, started.key_files_left),
+            (files, 0)
+        );
+        assert!(older_key_files(data).unwrap().is_empty());
+        assert_eq!(copies_in(data), ["before-0.2.0-test"]);
     }
 }
