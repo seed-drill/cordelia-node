@@ -1562,6 +1562,12 @@ pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
 /// taken what it was offered, or was offered nothing more.
 pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
 
+/// The most characters of a file's name that a command prints, and that
+/// the node puts in a line of its status (decision 2026-10-04 §16):
+/// another device may have written the name, and a name may be as long
+/// as an entry's text. What is cut is marked as cut.
+pub const FILE_NAME_SHOWN_CHARS: usize = 120;
+
 /// How long a personal node waits before it tries its first start on
 /// this version again, after a try that failed (decision 2026-10-04
 /// §10.1): the sync cycle's five seconds after the first, and twice as

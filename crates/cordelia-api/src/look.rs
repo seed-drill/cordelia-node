@@ -665,7 +665,7 @@ fn of_its_names(
         let each: Vec<String> = look
             .not_carried
             .iter()
-            .map(|file| format!("{} in {}", file.file, file.name))
+            .map(|file| format!("{} in {}", name_shown(&file.file), file.name))
             .collect();
         look.says.push(format!(
             "what this device held of {} could not be read at the last change, and was not \
@@ -675,6 +675,20 @@ fn of_its_names(
         ));
     }
     Ok(())
+}
+
+/// A file's name as far as it is put in a line that is shown (decision
+/// 2026-10-04 §16): its first characters, and a mark where it was cut.
+/// Another device may have written the name, at any length. (What a
+/// command prints of it, it prints with control characters shown as
+/// escapes.)
+pub fn name_shown(name: &str) -> String {
+    use cordelia_core::protocol::FILE_NAME_SHOWN_CHARS;
+    let mut shown: String = name.chars().take(FILE_NAME_SHOWN_CHARS).collect();
+    if shown.len() < name.len() {
+        shown.push_str("...");
+    }
+    shown
 }
 
 /// A count with its noun: `1 name`, `3 names`.
@@ -2076,5 +2090,34 @@ mod tests {
         s.change(0, &[0], &[]);
         let look = seen(&s, 0);
         assert_eq!((look.change, look.statements_left), (Some(2), None));
+    }
+
+    /// A file's name is put in a line of the status only as far as its
+    /// first characters, with a mark where it was cut (decision
+    /// 2026-10-04 §16): another device may have written it, at any
+    /// length.
+    #[test]
+    fn test_a_files_name_is_cut_where_it_is_put_in_a_line() {
+        use cordelia_core::protocol::FILE_NAME_SHOWN_CHARS;
+        assert_eq!(FILE_NAME_SHOWN_CHARS, 120);
+        assert_eq!(name_shown("notes.md"), "notes.md");
+        // Characters are counted, and not bytes.
+        let just = "\u{e9}".repeat(FILE_NAME_SHOWN_CHARS);
+        assert_eq!(name_shown(&just), just);
+        let long = format!("{just}x.md");
+        assert_eq!(name_shown(&long), format!("{just}..."));
+
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        note_not_carried(&s[0].conn, &[("lab".into(), long.clone())]).unwrap();
+        let look = seen(&s, 0);
+        assert_eq!(look.not_carried[0].file, long);
+        let line = look
+            .says
+            .iter()
+            .find(|line| line.contains("was not carried"))
+            .expect("the look says what was not carried");
+        assert!(line.contains(&format!("{just}... in lab")), "{line}");
+        assert!(!line.contains("x.md"), "{line}");
     }
 }

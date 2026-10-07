@@ -147,6 +147,22 @@ fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
     value[field].as_array().into_iter().flatten()
 }
 
+/// A file's name, or a line that may hold one, as it is printed
+/// (decision 2026-10-04 §16): another device may have written the name.
+/// It is cut where a name is cut, and its control characters and the
+/// marks that change the direction of text are shown as escapes, as
+/// local history prints names.
+fn file_shown(name: &str) -> String {
+    crate::history_cmd::printable(&cordelia_api::look::name_shown(name))
+}
+
+/// Whether a row that the node shows is this device's: its key is `own`,
+/// the one in this device's key file (decision 2026-10-04 §16). Which
+/// row is this device's is never the node's word.
+fn is_own(device: &Value, own: &[u8; 32]) -> bool {
+    decode_public_key(text(device, "key")).ok() == Some(*own)
+}
+
 /// This device's key, read from its key file as `cordelia id` reads it
 /// (decision 2026-10-04 §16). What a command shows as this device, signs
 /// for and prints is this, and never the node's word of it: whatever
@@ -259,9 +275,11 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
             }
         }
     };
+    // A line may name a file, as another device wrote its name: it is
+    // printed as local history prints names.
     let says = list(seen, "says")
         .filter_map(|line| line.as_str())
-        .map(str::to_string)
+        .map(crate::history_cmd::printable)
         .collect();
     (short, says)
 }
@@ -587,17 +605,21 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
     note_another_version(config_path);
     let seen = look(config_path)?;
     names_this_device(&seen, &own)?;
-    for line in devices_lines(&seen) {
+    for line in devices_lines(&seen, &own) {
         println!("{line}");
     }
     Ok(())
 }
 
-/// What `cordelia devices` prints, a line each.
-fn devices_lines(seen: &Value) -> Vec<String> {
+/// What `cordelia devices` prints, a line each. `own` is this device's
+/// key, from its key file: which row is this device's goes by it.
+fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
-    out.push(format!("This device: {}", text(seen, "this_device")));
+    out.push(format!(
+        "This device: {}",
+        encode_public_key(own).unwrap_or_default()
+    ));
     let Some(change) = change else {
         out.extend(list(seen, "says").filter_map(|line| Some(line.as_str()?.to_string())));
         return out;
@@ -616,7 +638,7 @@ fn devices_lines(seen: &Value) -> Vec<String> {
         ));
     }
     let applied = |device: &Value| match device["applied"].as_u64() {
-        _ if device["this_device"] == true => "this device".to_string(),
+        _ if is_own(device, own) => "this device".to_string(),
         // Whether it has sent what it held when it applied the change
         // (§8): it says so itself, once it has.
         Some(number) if number == change => match device["sent"] == true {
@@ -860,8 +882,8 @@ fn names_lines(seen: &Value) -> Vec<String> {
     for file in not_carried {
         out.push(format!(
             "  {} in {}",
-            text(file, "file"),
-            text(file, "name")
+            file_shown(text(file, "file")),
+            file_shown(text(file, "name"))
         ));
     }
     out
@@ -1397,8 +1419,8 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                     println!(
                         "  What this device held of {} in {} could not be read, and was not \
                          carried: it meets its channel as a new file does.",
-                        text(file, "file"),
-                        text(file, "name")
+                        file_shown(text(file, "file")),
+                        file_shown(text(file, "name"))
                     );
                 }
                 println!(
@@ -1740,7 +1762,7 @@ pub fn change_made(config_path: &str, number: u64) -> anyhow::Result<()> {
 ///   is set up with, with every one of them connected: so a relay that
 ///   took the change and was lost before the names went does not let
 ///   the wait end.
-fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
+fn after_a_change(seen: &Value, number: u64, own: &[u8; 32]) -> (Vec<String>, usize) {
     let mut now: Vec<String> = Vec::new();
     let mut missing = 0;
     let relays: Vec<&Value> = list(seen, "relays").collect();
@@ -1810,7 +1832,7 @@ fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
     }
     // Its own word that it has sent what it carried, under this change.
     let said_sent = list(seen, "devices")
-        .filter(|device| device["this_device"] == true)
+        .filter(|device| is_own(device, own))
         .any(|device| device["applied"].as_u64() == Some(number) && device["sent"] == true);
     if !said_sent {
         missing += 1;
@@ -1818,7 +1840,7 @@ fn after_a_change(seen: &Value, number: u64) -> (Vec<String>, usize) {
             "keep this machine on: this device has not yet sent every relay what it carried".into(),
         );
     }
-    for device in list(seen, "devices").filter(|device| device["this_device"] != true) {
+    for device in list(seen, "devices").filter(|device| !is_own(device, own)) {
         let applied = device["applied"].as_u64() == Some(number);
         now.push(match (applied, device["sent"] == true) {
             (true, true) => format!(
@@ -1845,6 +1867,9 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
          has sent what it holds. This command stays until then, and says what is missing. \
          Stopping it stops nothing: the node goes on."
     );
+    // Which row is this device's goes by its key file, as the prompts
+    // go, and not by the node's word (decision 2026-10-04 §16).
+    let own = own_key(config_path)?;
     let mut said: Vec<String> = Vec::new();
     loop {
         std::thread::sleep(ASK_EVERY);
@@ -1853,7 +1878,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<()> {
             println!("This device has since applied another change: `cordelia devices` says.");
             return Ok(());
         }
-        let (now, missing) = after_a_change(&seen, number);
+        let (now, missing) = after_a_change(&seen, number, &own);
         for line in &now {
             if !said.contains(line) {
                 println!("  {line}");
@@ -2693,9 +2718,12 @@ mod tests {
     /// own word says that it has sent what it carried (decision
     /// 2026-10-04 §7.1, step 4; §8). A relay that took the change and was
     /// lost before the names went leaves three things missing, and each
-    /// alone is one.
+    /// alone is one. Which row is this device's goes by its key, from its
+    /// key file, and not by the node's word of it (§16).
     #[test]
     fn the_wait_after_a_change_ends_only_once_the_devices_own_word_says_all_is_sent() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
         let look = |not_reached: Value, waiting: Value, to_go: Value, own: Value| {
             json!({
                 "change": 3,
@@ -2705,16 +2733,18 @@ mod tests {
                 "waiting": waiting,
                 "names": { "sent": ["lab"], "to_go": to_go },
                 "devices": [
-                    { "key": "a", "label": "desktop", "words": "w", "this_device": true,
+                    { "key": written(1), "label": "desktop", "words": "w",
                       "applied": own["applied"], "sent": own["sent"] },
-                    // Another device's word is not this device's.
-                    { "key": "b", "label": "laptop", "words": "w", "applied": 3, "sent": true },
+                    // Another device's word is not this device's, though
+                    // the node should say that the row is this device's.
+                    { "key": written(2), "label": "laptop", "words": "w", "this_device": true,
+                      "applied": 3, "sent": true },
                 ],
             })
         };
         let reached = json!([{ "relay": "127.0.0.1:9474", "waits": 0 }]);
         let sent = json!({ "applied": 3, "sent": true });
-        let missing = |seen: &Value| after_a_change(seen, 3);
+        let missing = |seen: &Value| after_a_change(seen, 3, &key(1));
 
         let (lines, none) = missing(&look(json!([]), reached.clone(), json!([]), sent.clone()));
         assert_eq!(none, 0, "{lines:?}");
@@ -2808,25 +2838,36 @@ mod tests {
     #[test]
     fn devices_says_what_was_sent_and_which_names_are_not_yet_listed() {
         let shown = |label: &str| json!({ "key": "k", "label": label, "words": "w w w w" });
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        // A file's name as another device may have written it: with what
+        // would move the cursor and repaint a line, and far too long.
+        let hostile = format!("ghost\u{1b}[2K\r\u{202e}.md{}", "x".repeat(400));
         let seen = json!({
-            "this_device": "cordelia_pk1this",
+            "this_device": "cordelia_pk1another",
             "change": 2,
             "devices": [
-                { "key": "a", "label": "desktop", "words": "w", "this_device": true,
+                { "key": written(1), "label": "desktop", "words": "w",
                   "applied": 2, "sent": false },
-                { "key": "b", "label": "laptop", "words": "w", "applied": 2, "sent": true },
-                { "key": "c", "label": "tablet", "words": "w", "applied": 2, "sent": false },
-                { "key": "d", "label": "phone", "words": "w", "applied": 1, "sent": true },
+                { "key": written(2), "label": "laptop", "words": "w", "this_device": true,
+                  "applied": 2, "sent": true },
+                { "key": written(3), "label": "tablet", "words": "w", "applied": 2,
+                  "sent": false },
+                { "key": written(4), "label": "phone", "words": "w", "applied": 1,
+                  "sent": true },
             ],
             "names": { "sent": ["lab"], "to_go": ["team", "~"] },
             "names_not_listed": [
                 { "name": "old-notes", "by": [shown("laptop")], "by_gone": [], "days_left": 89 },
                 { "name": "its-own", "by": [], "by_gone": [shown("")], "days_left": 1 },
             ],
-            "not_carried": [{ "name": "lab", "file": "ghost.md" }],
+            "not_carried": [
+                { "name": "lab", "file": "ghost.md" },
+                { "name": "lab", "file": hostile },
+            ],
             "names_not_shown": 3,
         });
-        let lines = devices_lines(&seen).join("\n");
+        let lines = devices_lines(&seen, &key(1)).join("\n");
         assert!(
             lines.contains(
                 "\n3 names that cannot be shown are listed by a device: what they are called \
@@ -2834,7 +2875,15 @@ mod tests {
             ),
             "{lines}"
         );
+        // This device is the row of the key in its key file, whatever
+        // row the node says is this device's, and whatever key the node
+        // names as its own (§16).
+        assert!(
+            lines.starts_with(&format!("This device: {}\n", written(1))),
+            "{lines}"
+        );
         assert!(lines.contains("(w) \"desktop\": this device"), "{lines}");
+        assert!(!lines.contains("\"laptop\": this device"), "{lines}");
         assert!(
             lines.contains("(w) \"laptop\": has applied change 2, and has sent what it held"),
             "{lines}"
@@ -2873,6 +2922,25 @@ mod tests {
         );
         assert!(lines.contains("Not carried at the last change"), "{lines}");
         assert!(lines.contains("  ghost.md in lab"), "{lines}");
+        // A file's name is printed as local history prints names, and no
+        // more than its first characters (§16).
+        let cut = format!(
+            "  ghost\\u{{1b}}[2K\\r\\u{{202e}}.md{}... in lab",
+            "x".repeat(cordelia_core::protocol::FILE_NAME_SHOWN_CHARS - 14)
+        );
+        assert!(lines.contains(&cut), "{lines}");
+        assert!(!lines.contains('\u{1b}'), "{lines}");
+        assert!(!lines.contains('\u{202e}'), "{lines}");
+        assert_eq!(file_shown("plain.md"), "plain.md");
+        // So is a line of the status that names one.
+        let (_, says) = status_lines(&json!({
+            "short": "x",
+            "says": [format!("what this device held of 1 file: gh\u{1b}[2Kost.md in lab")],
+        }));
+        assert_eq!(
+            says,
+            ["what this device held of 1 file: gh\\u{1b}[2Kost.md in lab"]
+        );
 
         // With nothing to say of names, nothing is said of them.
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
