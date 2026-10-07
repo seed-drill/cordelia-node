@@ -991,6 +991,14 @@ pub fn passed_over(
 /// And for room, where the batch is of what was carried: what makes
 /// room is something new, which is sent before it at every pass.
 ///
+/// **So too for room, where the entry is one that the device carried
+/// into the personal channel** (decision 2026-10-04 §7.3, §8): its own
+/// words there, which are sent with what came since. How far a relay
+/// was sent that channel is what says whether the words that were
+/// carried have been sent ([`carried_waits_at`]). Moved on past a word
+/// that waits, it would have the device say that it has sent what it
+/// carried ([`say_sent`]) while that word waits.
+///
 /// An answer that does not say one thing for each entry says nothing of
 /// any: nothing moves, and all of it is sent again. All of it is written
 /// as one.
@@ -1006,6 +1014,12 @@ pub fn sent(
         return Ok(done);
     }
     in_one(conn, || {
+        // In the personal channel, what the device carried is sent with
+        // what came since: up to here in the store's order.
+        let carried_words_to = match (batch.which, &channel.kind) {
+            (Which::Since, Kind::Personal) => kept_rows::carried_up_to(conn)?,
+            _ => 0,
+        };
         let mut answers = answers.iter();
         let mut up_to = None;
         for item in &batch.items {
@@ -1024,7 +1038,7 @@ pub fn sent(
                     done.another_at.push(seq);
                 }
                 Some(Pushed::DoesNotCheck) => done.do_not_check += 1,
-                Some(Pushed::NoRoom) if batch.which == Which::Since => {
+                Some(Pushed::NoRoom) if batch.which == Which::Since && seq > carried_words_to => {
                     done.no_room += 1;
                     kept_rows::refused(conn, relay, &channel.id, seq)?;
                     if !again {
@@ -2365,6 +2379,73 @@ mod tests {
         let again = sends(on, &RELAY, &notes, Which::Carried);
         assert_eq!(ids(&again.entries), ids(&carried.entries[1..]));
         assert!(!again.waits);
+    }
+
+    /// A word that the device carried into the personal channel, and that
+    /// a relay has no room for, stops the batch where it is (decision
+    /// 2026-10-04 §7.3, §8): how far the relay was sent the channel does
+    /// not move past it, nothing is kept apart, and the word and what
+    /// follows it are sent again from there. So the device does not say
+    /// that it has sent what it carried while a word that it carried
+    /// waits. What it wrote there since the change is kept apart as in
+    /// any channel, and what follows that is still offered.
+    #[test]
+    fn test_a_carried_word_that_a_relay_has_no_room_for_is_not_passed() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let now = s.tick();
+        crate::names::say(&s[0].conn, &s[0].identity, "notes", now).unwrap();
+        s.write(0, "notes", "a.md", "a text");
+        s.meet(&[0, 1]);
+        s.change(0, &[0, 1], &[]);
+        // What it carried into the name's channel has been sent.
+        let notes = notes_of(&s[0]);
+        let far = i64::MAX / 2;
+        kept_rows::sent(&s[0].conn, &RELAY, &notes.id, far).unwrap();
+        kept_rows::carried(&s[0].conn, &RELAY, &notes.id, far).unwrap();
+
+        // In the new personal channel: its word that it syncs the name,
+        // which it carried, and then its word that it has applied the
+        // statement, which it wrote once it had carried.
+        let personal = channel_of(&s[0], Kind::Personal);
+        let both = sends(&s[0], &RELAY, &personal, Which::Since);
+        assert_eq!(both.entries.len(), 2, "{both:?}");
+        let waiting = |s: &Several| {
+            kept_rows::waiting_refused(&s[0].conn, &RELAY, &personal.id)
+                .unwrap()
+                .len()
+        };
+        let waits = |s: &Several| carried_waits_at(&s[0].conn, &s[0].identity, &RELAY).unwrap();
+        let says = |s: &mut Several| {
+            let now = s.tick();
+            say_sent(&s[0].conn, &s[0].identity, &[RELAY], now).unwrap()
+        };
+        let answered = |s: &Several, batch: &Batch, answers: &[Pushed]| {
+            sent(&s[0].conn, &RELAY, &personal, batch, answers).unwrap()
+        };
+        let done = answered(&s, &both, &[Pushed::NoRoom, Pushed::Holds]);
+        assert_eq!(
+            done,
+            Sent {
+                refused: Some(Pushed::NoRoom),
+                ..Sent::default()
+            }
+        );
+        assert_eq!(waiting(&s), 0);
+        assert!(waits(&s));
+        assert!(!says(&mut s));
+        // The word is sent again from where it is, with what follows it.
+        let again = sends(&s[0], &RELAY, &personal, Which::Since);
+        assert_eq!(ids(&again.entries), ids(&both.entries));
+        // The relay holds it now, and has no room for the other, which
+        // came since the device carried: that one is kept apart, as in
+        // any channel, and passed. Nothing that was carried waits.
+        let done = answered(&s, &again, &[Pushed::Holds, Pushed::NoRoom]);
+        assert_eq!((done.held, done.no_room, done.refused), (1, 1, None));
+        assert_eq!(waiting(&s), 1);
+        assert!(sends_new(&s[0], &RELAY, &personal).is_empty());
+        assert!(!waits(&s));
+        assert!(says(&mut s));
     }
 
     /// What a relay handed a device is sent to another relay, which is
