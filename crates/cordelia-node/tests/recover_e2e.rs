@@ -1331,6 +1331,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
         .says("1. Change 3:")
         .says("2. Change 3:")
         .says("the change it makes settles the two")
+        .says("comes back only by adding them again.")
         .says("Type `1` or `2`, the one to recover from: ")
         .types("3");
     at.says("That is neither.")

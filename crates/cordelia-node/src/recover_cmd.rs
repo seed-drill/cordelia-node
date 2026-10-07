@@ -209,6 +209,33 @@ fn none_found_says(not_read: &[String]) -> String {
     )
 }
 
+/// What is said of two changes that were made apart, before the person
+/// says which to recover from (decision 2026-10-04 §9, step 2):
+/// `on_neither` is how many more changes the relays hold that are on the
+/// chain of neither of the two. And what the recovery does with the two:
+/// **what the devices of the other had not sent comes back only by
+/// adding them again.**
+fn apart_lines(on_neither: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if on_neither > 0 {
+        lines.push(format!(
+            "{} besides those is on neither's chain, and is not settled by this recovery.",
+            match on_neither {
+                1 => "1 more change".to_string(),
+                n => format!("{n} more changes"),
+            }
+        ));
+    }
+    lines.push(
+        "The recovery is made from one of them, and the change it makes settles the two: every \
+         key that either removed stays removed. The devices of the other that are not asked \
+         about here are in no list after it, and what they had written and not sent to a relay \
+         comes back only by adding them again."
+            .to_string(),
+    );
+    lines
+}
+
 /// A statement's lists, a line each, read from the statement: each key
 /// with the first four words of its fingerprint.
 fn lists_lines(statement: &Statement, own: &[u8; 32]) -> anyhow::Result<Vec<String>> {
@@ -438,9 +465,9 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let Some(found) = recover::found(candidates) else {
         anyhow::bail!("{}", none_found_says(&not_read));
     };
-    let (from, apart) = match found.apart.first() {
-        None => (found.from, None),
-        Some(other) => {
+    let (from, apart) = match found.second() {
+        None => (found.from.clone(), None),
+        Some((other, on_neither)) => {
             println!(
                 "\nTwo changes were made apart: the relays hold one that is not on the other's \
                  chain. Each is shown from its signed bytes."
@@ -452,26 +479,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
                     println!("{line}");
                 }
             }
-            if found.apart.len() > 1 {
-                println!(
-                    "\n{} besides those is on neither's chain, and is not settled by this \
-                     recovery.",
-                    match found.apart.len() - 1 {
-                        1 => "1 more change".to_string(),
-                        n => format!("{n} more changes"),
-                    }
-                );
+            for line in apart_lines(on_neither) {
+                println!("\n{line}");
             }
-            println!(
-                "\nThe recovery is made from one of them, and the change it makes settles the \
-                 two: every key that either removed stays removed. The devices of the other \
-                 that are not asked about here are in no list after it."
-            );
             loop {
                 let typed = at.answer("  Type `1` or `2`, the one to recover from: ")?;
                 match typed.as_deref() {
-                    Some("1") => break (found.from, Some(other.clone())),
-                    Some("2") => break (other.clone(), Some(found.from)),
+                    Some("1") => break (found.from.clone(), Some(other.clone())),
+                    Some("2") => break (other.clone(), Some(found.from.clone())),
                     Some(_) => println!("  That is neither. No answer is suggested: type one."),
                     None => anyhow::bail!(
                         "the input ended before an answer was typed. Nothing was made."
@@ -1042,6 +1057,35 @@ mod tests {
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
         let says = row_says(&odd, 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
+    }
+
+    /// Of two changes made apart, the command says how many more are on
+    /// neither's chain, where any is, and what settling the two means
+    /// (decision 2026-10-04 §9, step 2): what the devices of the other
+    /// branch had not sent comes back only by adding them again.
+    #[test]
+    fn test_what_is_said_of_two_changes_made_apart() {
+        let settles = apart_lines(0);
+        assert_eq!(settles.len(), 1, "{settles:?}");
+        assert!(
+            settles[0].starts_with("The recovery is made from one of them"),
+            "{settles:?}"
+        );
+        assert!(
+            settles[0].ends_with(
+                "are in no list after it, and what they had written and not sent to a relay \
+                 comes back only by adding them again."
+            ),
+            "{settles:?}"
+        );
+        let one = apart_lines(1);
+        assert_eq!(
+            one[0],
+            "1 more change besides those is on neither's chain, and is not settled by this \
+             recovery."
+        );
+        assert_eq!(one[1], settles[0]);
+        assert!(apart_lines(3)[0].starts_with("3 more changes besides those"));
     }
 
     /// Where no change of the phrase was found and a relay could not be

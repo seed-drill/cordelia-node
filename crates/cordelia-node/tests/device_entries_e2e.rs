@@ -4572,6 +4572,29 @@ async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
     assert!(handed_ids(&read[0].read).unwrap().1);
     assert_eq!(relay.requests().len(), 2);
 
+    // **A page of which nothing is an entry of the channel is not the
+    // channel's end.** The relay hands a page of the channel, and then
+    // one that holds an entry of another channel and bytes that are no
+    // entry: the reading stops there, with what it had, and the channel
+    // is said to be read in part.
+    let (first, junk) = (pages[0].clone(), pages[1][1..].to_vec());
+    relay.pulls(move |pull| {
+        let page = match pull.after {
+            0 => first.clone(),
+            _ => junk.clone(),
+        };
+        EntryPulled {
+            next: pull.after + 1,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let read = reads_left(&a, old, by_secret()).await;
+    let (ids, whole) = handed_ids(&read[0].read).unwrap();
+    assert!(!whole, "{read:?}");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(relay.requests().len(), 3);
+
     // A channel of the device's own is refused, and the relay is asked
     // nothing: the name's channel in the generation applied, and the
     // personal channel.

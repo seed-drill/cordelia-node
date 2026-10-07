@@ -541,6 +541,11 @@ impl DeviceEntries {
     /// a page holds nothing, until a page does not move the place, or
     /// until `until`.
     ///
+    /// **A page of which nothing is an entry of the channel, though the
+    /// relay handed something, is not the channel's end:** what the
+    /// relay holds beyond it is not known. The reading stops there, and
+    /// the channel is said to be read in part, not whole.
+    ///
     /// **What the device takes from one relay in a minute is bounded
     /// here as in a pass** ([`Self::room_to_take`]): where the minute is
     /// used up it waits for room, and a relay is never asked for more
@@ -612,6 +617,14 @@ impl DeviceEntries {
                     let moved = (mark, next) != place;
                     let nothing = entries.is_empty();
                     read.extend(entries.iter().map(|entry| entry.to_wire()));
+                    // The relay handed something, and nothing of it is an
+                    // entry of the channel: that is no end of a channel.
+                    if nothing && !handed.is_empty() {
+                        return LeftRead::Read {
+                            entries: read,
+                            whole: false,
+                        };
+                    }
                     // A page that holds nothing, or that leaves the place
                     // where it was, is the channel's end.
                     if nothing || !moved {

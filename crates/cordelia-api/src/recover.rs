@@ -125,6 +125,25 @@ pub struct Found {
     pub apart: Vec<Candidate>,
 }
 
+impl Found {
+    /// The change that was made apart from [`Self::from`] and that a
+    /// recovery settles with it, where there is one: the first of those
+    /// that are apart. With how many of the others are **on the chain of
+    /// neither of the two** (decision 2026-10-04 §9, step 2): one that
+    /// is on the second's chain is behind that one, and is nothing, as
+    /// one on the first's chain is. Those on neither's chain are not
+    /// settled by the recovery.
+    pub fn second(&self) -> Option<(&Candidate, usize)> {
+        let (second, others) = self.apart.split_first()?;
+        let behind = |other: &&Candidate| {
+            let link = other.statement.statement.link();
+            link.is_ok_and(|link| second.statement.statement.has_on_chain(&link))
+        };
+        let on_neither = others.len() - others.iter().filter(behind).count();
+        Some((second, on_neither))
+    }
+}
+
 /// Of the change entries that the relays handed, the one to recover from
 /// (decision 2026-10-04 §9, step 2): the one with the highest number.
 /// **Any other that is not on that one's chain is a fork, whatever its
@@ -1202,6 +1221,29 @@ mod tests {
 
         assert_eq!(of(&[&first]).unwrap().from.entry.id(), first.id());
         assert_eq!(of(&[]), None);
+
+        // **What is on neither's chain is counted against both.** A
+        // change is made after the other, at number 4, as the fourth is:
+        // whichever of the two is first, the other is the second, and
+        // the change that it was made after is behind it, on its chain,
+        // and is nothing. A change made apart from the second, which is
+        // on the chain of neither, is counted.
+        assert_eq!(one_chain.second(), None);
+        let (second_of, none) = forked.second().unwrap();
+        assert_eq!((second_of.entry.id(), none), (other.id(), 0));
+        let made_after = |entry: &CheckedEntry| {
+            let after = candidate(entry).statement;
+            make_change(&s.phrase, &after, entry, &s.key(0), s.listed(&[0, 1]), &[]).unwrap()
+        };
+        let after_other = made_after(&other);
+        let apart_from_second = made_after(&first);
+        let both = of(&[&fourth, &after_other, &other]).unwrap();
+        let (second_of, on_neither) = both.second().unwrap();
+        let two = [both.from.entry.id(), second_of.entry.id()];
+        assert!(two.contains(&fourth.id()) && two.contains(&after_other.id()));
+        assert_eq!(on_neither, 0);
+        let three = of(&[&fourth, &after_other, &other, &apart_from_second]).unwrap();
+        assert_eq!(three.second().unwrap().1, 1);
     }
 
     /// Six devices: 0, 1 and 2 are the statement's; device 1 added 3,
