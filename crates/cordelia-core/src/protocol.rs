@@ -1598,8 +1598,53 @@ pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
 /// this, the timer's own jitter would put every try off by a whole cycle.
 pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
 
+// ── A carry that a person asks for, and a recovery ──────────────────
+
+/// How long a carry by command reads one name at the relays, at most
+/// (decision 2026-10-04 §7.3): the fetch of the new channel, and then the
+/// name's channel in each generation that the device left. What was not
+/// read to its end by then is said, and the command can be run again.
+/// Derived: as long as the fetch before a change, CHANGE_FETCH_MAX_SECS.
+pub const CARRY_READ_MAX_SECS: u64 = CHANGE_FETCH_MAX_SECS;
+
+/// How long a channel that a carry is being made into holds back the
+/// first cycle of a folder that has just been mapped to its name, at
+/// most (decision 2026-10-04 §7.3): a device that comes to sync a name
+/// carries it first. A carry that never says it has ended holds nothing
+/// up for longer than this.
+/// Derived: a little longer than the carry may read, CARRY_READ_MAX_SECS.
+pub const CARRY_FIRST_MAX_SECS: u64 = CARRY_READ_MAX_SECS + 60;
+
+/// How many words of a key's fingerprint name a removed key at `cordelia
+/// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
+/// 66 bits. A statement lists removed keys bare, so a machine that never
+/// knew a device has no label for it.
+pub const CARRY_FROM_WORDS: usize = 6;
+
+/// The label under which the phrase's signing key signs a person's word
+/// for a carry (decision 2026-10-04 §7.3, §9): which name, which keys
+/// that do not count, and which files above a version that is held. A
+/// signature under it is no statement and no entry.
+pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
+
+/// How long a person's word for a carry stands (decision 2026-10-04
+/// §7.3): ten minutes from when the phrase signed it. The command hands
+/// it to the node at once; a word that is found later is no word.
+pub const CARRY_WORD_SECS: i64 = 10 * 60;
+
+/// The most names a recovery carries (decision 2026-10-04 §9): a device
+/// that is gone listed names too, and can have listed any number of its
+/// own. The names it leaves are named.
+pub const RECOVERY_MAX_NAMES: usize = 1_024;
+
+/// The most devices a recovery shows at its prompt, of the statement's
+/// and of those added since (decision 2026-10-04 §9). Beyond it the
+/// command says how many it could not show, and the look takes nothing
+/// from those.
+pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 23] = [
+pub const LABELS: [&[u8]; 24] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1623,6 +1668,7 @@ pub const LABELS: [&[u8]; 23] = [
     LABEL_CHANNEL_PROOF,
     LABEL_SESSION_VALUE,
     LABEL_FINGERPRINT,
+    LABEL_CARRY_WORD,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2228,7 +2274,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 23);
+        assert_eq!(LABELS.len(), 24);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2261,6 +2307,28 @@ mod tests {
         assert_eq!(TYPED_KEY_KEPT_SECS, 86_400);
         // A key is kept for longer than it reads, to say what became of it.
         const { assert!(TYPED_KEY_KEPT_SECS > PAIR_KEY_TYPED_SECS) };
+    }
+
+    /// What a carry that a person asks for, and a recovery, go by
+    /// (decision 2026-10-04 §7.3, §9).
+    #[test]
+    fn test_a_carry_by_command_and_a_recovery_decision_2026_10_04_7_3_and_9() {
+        assert_eq!(CARRY_READ_MAX_SECS, 120);
+        assert_eq!(CARRY_FIRST_MAX_SECS, 180);
+        // The first cycle waits for longer than the carry may read.
+        const { assert!(CARRY_FIRST_MAX_SECS > CARRY_READ_MAX_SECS) };
+        assert_eq!(CARRY_FROM_WORDS, 6);
+        // More words than a device is shown by, and within the hash.
+        const { assert!(CARRY_FROM_WORDS > FINGERPRINT_WORDS_SHOWN) };
+        const { assert!(CARRY_FROM_WORDS * 11 <= 256) };
+        assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
+        assert!(LABELS.contains(&LABEL_CARRY_WORD));
+        assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(RECOVERY_MAX_NAMES, 1_024);
+        assert_eq!(RECOVERY_MAX_DEVICES_SHOWN, 256);
+        // A recovery shows every device that a reader may count, and
+        // every record that it may keep as not counted beside them.
+        const { assert!(RECOVERY_MAX_DEVICES_SHOWN >= MAX_COUNTED_DEVICES) };
     }
 
     /// What the sync adapter goes by in a channel from its secret: how

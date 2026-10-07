@@ -2813,6 +2813,17 @@ pub async fn p2p_loop(
                 device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
             }
 
+            // A command's work asked something through the door for a
+            // carry: a channel of a generation that the device has left
+            // or never followed, read at each relay (decision 2026-10-04
+            // §7.3, §9). Off the select loop: it waits on the relays.
+            ask = state.own_channels.wait_door(), if device_entries.is_some() => {
+                if let Some(device) = device_entries.clone() {
+                    let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr);
+                    tokio::spawn(async move { device.door(&relays, ask).await });
+                }
+            }
+
             // ── Entries of channels from their secrets, on a relay ────
             // What nobody uses goes after 90 days (decision 2026-10-04
             // §2.5). Off the select loop: it writes under the db lock.

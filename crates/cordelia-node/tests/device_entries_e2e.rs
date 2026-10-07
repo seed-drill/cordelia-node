@@ -23,7 +23,9 @@ use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::change::make_change;
 use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
-use cordelia_api::state::{AppState, AtRelay, AtRelays, CannotGoOn};
+use cordelia_api::state::{
+    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProvedBy,
+};
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
@@ -42,7 +44,7 @@ use cordelia_network::messages::{
 };
 use cordelia_network::{codec, connection, transport};
 use cordelia_node::device_entries::{
-    Asked, Clock, Counts, DeviceEntries, Link, NoLeave, PairRead, Pass, Refused, Relay,
+    Asked, Clock, Counts, DeviceEntries, LeftRefused, Link, NoLeave, PairRead, Pass, Refused, Relay,
 };
 use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::person::State;
@@ -4250,6 +4252,341 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
         }
     }
     assert_eq!(refused, Some(Refused::AskedEnough));
+    assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
+}
+
+// ── The door for a carry that a person asked for ─────────────────────
+
+/// Ask the device's engine to read `channel` at each relay through the
+/// door for a carry, as the node does where a command's work asked.
+async fn reads_left(device: &Device, channel: [u8; 32], by: ProvedBy) -> Vec<LeftAt> {
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let ask = DoorAsk::Read {
+        channel,
+        by,
+        until,
+        answer,
+    };
+    device.engine.door(&device.relays, ask).await;
+    answered.await.unwrap()
+}
+
+/// The entries that one relay handed through the door, each by what it
+/// is named by; `None` where it handed none of the channel.
+fn handed_ids(read: &LeftRead) -> Option<(BTreeSet<[u8; 32]>, bool)> {
+    match read {
+        LeftRead::Read { entries, whole } => {
+            let ids = entries
+                .iter()
+                .map(|bytes| Entry::from_wire(bytes).unwrap().id())
+                .collect();
+            Some((ids, *whole))
+        }
+        _ => None,
+    }
+}
+
+/// The door for a carry that a person asked for (decision 2026-10-04
+/// §7.3, §7.5, §9), against a relay: a device that has applied a change
+/// reads, at its relay, the channel of a name in the generation that it
+/// left. It is handed everything that the relay holds of it, to its end.
+/// It stores none of it, keeps no place, and the relay holds what it
+/// held. A device that follows no phrase reads the same way, with the
+/// channel's secret, as a recovery does: no leave is asked. A relay that
+/// is not connected is said to be that, and a relay that does not hold
+/// the channel, or is given a proof that does not hold, says no.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing() {
+    let relay = relay_started("relay", None);
+    let (mut a, mut b) = (Device::new("laptop"), Device::new("desktop"));
+    a.makes_the_phrase(&phrase());
+    a.adds(&b);
+    for device in [&mut a, &mut b] {
+        device.connects("relay", &relay).await;
+        device.holds("lab");
+    }
+    a.writes("lab", "first.md", "what both hold");
+    all_pass(&[&a, &b], 3).await;
+    // The desktop writes, the relay is sent it, and the laptop does not
+    // take it before it makes a change.
+    b.writes("lab", "late.md", "the desktop's last words");
+    b.passes().await;
+    let (old_secret, old) = (b.name_secret("lab"), b.channel("lab"));
+    let at_the_relay: BTreeSet<[u8; 32]> = held_at(&relay, &old).iter().map(Entry::id).collect();
+    assert_eq!(at_the_relay.len(), 2);
+    a.changes(&phrase(), &[&a, &b], &[]);
+    a.passes().await;
+    assert_ne!(a.channel("lab"), old);
+    assert_eq!(a.text("lab", "late.md"), None);
+    let stored = |device: &Device| -> i64 {
+        let db = device.db();
+        db.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap()
+    };
+    let (stored_before, pulled_before) = (stored(&a), a.counts("relay").pulled);
+
+    // With the secret of the generation that it left: everything that
+    // the relay holds of the channel, to its end.
+    let by_secret = || ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let read = reads_left(&a, old, by_secret()).await;
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].relay, "relay");
+    assert_eq!(
+        handed_ids(&read[0].read),
+        Some((at_the_relay.clone(), true))
+    );
+    // Nothing of it is stored, and no place is kept there.
+    assert_eq!(stored(&a), stored_before);
+    assert!(a.holds_of(&old).is_empty());
+    assert!(!kept_rows::keeps_any_anywhere(&a.db(), &old).unwrap());
+    assert_eq!(a.place("relay", &old), ([0u8; 8], 0));
+    // What it was handed is counted with what it takes of the relay.
+    assert_eq!(a.counts("relay").pulled, pulled_before + 2);
+    // And the relay holds what it held: nothing was pushed there.
+    let after: BTreeSet<[u8; 32]> = held_at(&relay, &old).iter().map(Entry::id).collect();
+    assert_eq!(after, at_the_relay);
+
+    // A device that follows no phrase reads the same way: no leave is
+    // asked, and it has none to give.
+    let mut new = Device::new("tablet");
+    new.connects("relay", &relay).await;
+    assert_eq!(new.stands(), Stands::NoPhrase);
+    let read = reads_left(&new, old, by_secret()).await;
+    assert_eq!(
+        handed_ids(&read[0].read),
+        Some((at_the_relay.clone(), true))
+    );
+    assert_eq!(stored(&new), 0);
+    assert_eq!(new.stands(), Stands::NoPhrase);
+
+    // With proofs that were made elsewhere, over the value of each
+    // connection's session: the same. A proof that was made for another
+    // connection does not hold, and a relay with no proof is not asked.
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    a.engine.door(&a.relays, DoorAsk::Sessions { answer }).await;
+    let sessions = answered.await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    let (name, session) = (&sessions[0].0, sessions[0].1.unwrap());
+    assert_eq!(name, "relay");
+    let proof = cordelia_crypto::proof::make(&old_secret, &session, &a.key()).unwrap();
+    let by_proof = ProvedBy::Proofs(vec![("relay".into(), proof)]);
+    let read = reads_left(&a, old, by_proof).await;
+    assert_eq!(
+        handed_ids(&read[0].read),
+        Some((at_the_relay.clone(), true))
+    );
+    let for_another = cordelia_crypto::proof::make(&old_secret, &session, &new.key()).unwrap();
+    let read = reads_left(
+        &a,
+        old,
+        ProvedBy::Proofs(vec![("relay".into(), for_another)]),
+    )
+    .await;
+    assert_eq!(read[0].read, LeftRead::NotHeld);
+    let read = reads_left(&a, old, ProvedBy::Proofs(vec![("other".into(), proof)])).await;
+    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("no proof")));
+
+    // A channel that the relay does not hold, and a secret that is not
+    // the channel's: no, with nothing handed.
+    let never = derive::own_secret(&old_secret, "never-held").unwrap();
+    let not_held = derive::channel_id(&never).unwrap();
+    let read = reads_left(
+        &a,
+        not_held,
+        ProvedBy::Secret(zeroize::Zeroizing::new(never)),
+    )
+    .await;
+    assert_eq!(read[0].read, LeftRead::NotHeld);
+    let read = reads_left(&a, old, ProvedBy::Secret(zeroize::Zeroizing::new(never))).await;
+    assert_eq!(read[0].read, LeftRead::NotHeld);
+
+    // A relay that the device is set up with and does not reach is
+    // answered for as that, in the order of the relays.
+    a.set_up_with("far");
+    let read = reads_left(&a, old, by_secret()).await;
+    let said: Vec<(&str, bool)> = read
+        .iter()
+        .map(|at| (at.relay.as_str(), at.read == LeftRead::NotReached))
+        .collect();
+    assert_eq!(said, [("relay", false), ("far", true)]);
+
+    // A node that is held up reads nothing.
+    a.state
+        .held
+        .hold(cordelia_api::state::Held::FirstStart("not done".into()));
+    let read = reads_left(&a, old, by_secret()).await;
+    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("held up")));
+    a.state.held.release();
+}
+
+/// The door for a carry proves and pulls, and does nothing else
+/// (decision 2026-10-04 §7.3, §7.5), against a stand-in that records
+/// every request. It makes one proof, of that channel, and then pulls of
+/// that channel alone: from the start under no mark, and then from each
+/// place that it was handed, until a page holds nothing. It shows
+/// nothing, and pushes nothing. An entry of another channel, and bytes
+/// that are no entry, are dropped. **A channel of the device's own is
+/// refused, with nothing asked of the relay:** there is one way in to
+/// those. And what it asks is counted with what a device asks of a relay
+/// in a minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
+    let relay = StandIn::started().await;
+    let mut a = Device::new("laptop");
+    a.makes_the_phrase(&phrase());
+    a.holds("lab");
+    let (old_secret, old) = (a.name_secret("lab"), a.channel("lab"));
+    let personal_before = a.personal_secret();
+    let of_the_old = |rev: u64, file: &str| {
+        sealed(
+            &a.state.identity,
+            &old_secret,
+            rev,
+            file,
+            Value::Text(format!("{file} {rev}")),
+        )
+    };
+    let pages = vec![
+        vec![
+            of_the_old(1, "a.md").to_wire(),
+            of_the_old(1, "b.md").to_wire(),
+        ],
+        vec![
+            of_the_old(1, "c.md").to_wire(),
+            // An entry of another channel, and bytes that are no entry.
+            sealed(
+                &a.state.identity,
+                &personal_before,
+                3,
+                "elsewhere",
+                Value::Delete,
+            )
+            .to_wire(),
+            vec![1, 2, 3],
+        ],
+        vec![],
+    ];
+    // What of those pages is an entry of the channel: three.
+    let of_the_channel: BTreeSet<[u8; 32]> = pages
+        .iter()
+        .flatten()
+        .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+        .filter(|entry| entry.channel == old)
+        .map(|entry| entry.id())
+        .collect();
+    assert_eq!(of_the_channel.len(), 3);
+    a.changes(&phrase(), &[&a], &[]);
+    a.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    // The relay answers the proof with no: it is asked no more.
+    let by_secret = || ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let read = reads_left(&a, old, by_secret()).await;
+    assert_eq!(read[0].read, LeftRead::NotHeld);
+    let asked = relay.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(matches!(&asked[0], WireMessage::ChannelProve(prove) if prove.channel == old));
+
+    // It holds the channel, and hands it in three pages.
+    relay.holds_what_is_proved(true);
+    let mark = [7u8; 8];
+    let hands = pages.clone();
+    relay.pulls(move |pull| {
+        let page = hands.get(pull.after as usize).cloned().unwrap_or_default();
+        EntryPulled {
+            next: pull.after + u64::from(!page.is_empty()),
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let read = reads_left(&a, old, by_secret()).await;
+    let (ids, whole) = handed_ids(&read[0].read).unwrap();
+    assert!(whole);
+    assert_eq!(ids, of_the_channel);
+    // One proof, and then pulls of that channel alone: from the start
+    // under no mark, and then from each place that it was handed.
+    let asked = relay.requests();
+    assert!(matches!(&asked[0], WireMessage::ChannelProve(prove) if prove.channel == old));
+    let pulls: Vec<([u8; 8], u64)> = asked[1..]
+        .iter()
+        .map(|request| match request {
+            WireMessage::EntryPull(pull) => {
+                assert_eq!(pull.channel, old);
+                (pull.mark, pull.after)
+            }
+            other => panic!("neither a proof nor a pull: {other:?}"),
+        })
+        .collect();
+    assert_eq!(pulls, [([0u8; 8], 0), (mark, 1), (mark, 2)]);
+    assert!(a.holds_of(&old).is_empty());
+
+    // A page that does not move the place ends the reading: a relay
+    // that hands the same page again and again is not asked for ever.
+    let again = pages[0].clone();
+    relay.pulls(move |pull| EntryPulled {
+        entries: again.iter().cloned().map(Into::into).collect(),
+        next: pull.after,
+        mark: pull.mark,
+    });
+    let read = reads_left(&a, old, by_secret()).await;
+    assert!(handed_ids(&read[0].read).unwrap().1);
+    assert_eq!(relay.requests().len(), 2);
+
+    // A channel of the device's own is refused, and the relay is asked
+    // nothing: the name's channel in the generation applied, and the
+    // personal channel.
+    for (channel, secret) in [
+        (a.channel("lab"), a.name_secret("lab")),
+        (a.personal(), a.personal_secret()),
+    ] {
+        let read = reads_left(
+            &a,
+            channel,
+            ProvedBy::Secret(zeroize::Zeroizing::new(secret)),
+        )
+        .await;
+        assert!(
+            matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("this device's own")),
+            "{read:?}"
+        );
+    }
+    assert!(relay.requests().is_empty());
+
+    // What the door asks is counted with what a device asks of a relay
+    // in a minute: a channel read again and again is refused before the
+    // relay would count a breach.
+    relay.holds_what_is_proved(false);
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    let mut asked_enough = false;
+    for _ in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+        let proof = a
+            .link("relay")
+            .session()
+            .and_then(|session| cordelia_crypto::proof::make(&old_secret, &session, &a.key()).ok())
+            .unwrap();
+        let page = a
+            .engine
+            .leave()
+            .left(
+                &a.state,
+                &a.link("relay"),
+                &old,
+                &proof,
+                ([0u8; 8], 0),
+                true,
+            )
+            .await;
+        if page == Err(LeftRefused::AskedEnough) {
+            asked_enough = true;
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until || page.is_ok(),
+            "{page:?}"
+        );
+    }
+    assert!(asked_enough);
     assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
 }
 

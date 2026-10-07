@@ -196,6 +196,13 @@ impl HeldUp {
 /// relays_connected`]): what a status says of a device that is offline,
 /// and of a relay that does not hold the latest change (decision
 /// 2026-10-04 §10.1).
+///
+/// And it carries what a command's work asks through the door for a
+/// carry ([`OwnChannels::ask_door`], decision 2026-10-04 §7.3, §9): a
+/// channel of a generation that the device has left, or never followed,
+/// read at each relay. The node takes each asking up and answers it.
+/// And which channels a carry is being made into, before a folder's
+/// first cycle there ([`OwnChannels::carrying`]).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -216,7 +223,76 @@ pub struct OwnChannels {
     fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
     /// Since when each relay has been connected, and since when none has.
     connected: Mutex<Connected>,
+    /// What was asked through the door for a carry, and is not taken up
+    /// yet.
+    door: Mutex<std::collections::VecDeque<DoorAsk>>,
+    door_asked: tokio::sync::Notify,
+    /// The channels that a carry is being made into, each with when that
+    /// began.
+    carrying: Mutex<std::collections::HashMap<[u8; 32], Instant>>,
 }
+
+/// How a channel's key is proved to a relay, through the door for a carry.
+pub enum ProvedBy {
+    /// The node holds the channel's secret: it makes the proof for each
+    /// connection itself. The secret is of a generation that the device
+    /// left, or was handed at a recovery (decision 2026-10-04 §3, §9).
+    Secret(zeroize::Zeroizing<[u8; 32]>),
+    /// The proofs were made by whoever holds the channel's secret, one
+    /// for each relay by its name: the command that was typed the phrase,
+    /// in its own process, over the value of each connection's session
+    /// ([`DoorAsk::Sessions`]). The node is handed no secret.
+    Proofs(Vec<(String, [u8; 64])>),
+}
+
+/// What one relay handed through the door for a carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftRead {
+    /// The node is not connected to the relay.
+    NotReached,
+    /// The relay does not hold the channel, or the proof did not hold
+    /// there: a relay says neither which.
+    NotHeld,
+    /// Nothing was read, and why.
+    NotRead(String),
+    /// What it handed of the channel, each entry as its bytes on the
+    /// wire, and whether the channel was read to its end.
+    Read { entries: Vec<Vec<u8>>, whole: bool },
+}
+
+/// A relay that the device is set up with, by its name, with what it
+/// handed through the door for a carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftAt {
+    pub relay: String,
+    pub read: LeftRead,
+}
+
+/// What a command's work asks of the node through the door for a carry
+/// (decision 2026-10-04 §7.3, §9).
+pub enum DoorAsk {
+    /// Each relay that the device is set up with, by its name, with the
+    /// value of the session of the connection to it, where there is one:
+    /// what a proof for that connection is made over.
+    Sessions {
+        answer: tokio::sync::oneshot::Sender<Vec<(String, Option<[u8; 32]>)>>,
+    },
+    /// Read the channel whose ID is `channel` at each relay, until
+    /// `until`: it is of a generation that the device has left, or never
+    /// followed.
+    Read {
+        channel: [u8; 32],
+        by: ProvedBy,
+        until: Instant,
+        answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
+    },
+}
+
+/// How long a channel that a carry is being made into holds back a
+/// folder's first cycle there, at most: a carry that never says it has
+/// ended holds nothing up for longer.
+const CARRYING_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(cordelia_core::protocol::CARRY_FIRST_MAX_SECS);
 
 /// Since when the node's relays have been connected, by the node's own
 /// clock.
@@ -292,6 +368,55 @@ impl OwnChannels {
         self.asked.notified().await;
     }
 
+    /// A command's work asks something through the door for a carry: the
+    /// node takes it up, and answers on the asking's own channel.
+    pub fn ask_door(&self, ask: DoorAsk) {
+        self.door
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ask);
+        self.door_asked.notify_one();
+    }
+
+    /// Wait for something to be asked through the door for a carry, and
+    /// take it up: each asking is taken up once.
+    pub async fn wait_door(&self) -> DoorAsk {
+        loop {
+            let asked = self
+                .door
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            if let Some(asked) = asked {
+                return asked;
+            }
+            self.door_asked.notified().await;
+        }
+    }
+
+    /// A carry is being made into the channel whose ID is `channel`, from
+    /// `now`: a folder with no record in it yet waits for the carry
+    /// before its first cycle there ([`Self::first_fetch_done`]).
+    pub fn carrying(&self, channel: &[u8; 32], now: Instant) {
+        let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying.insert(*channel, now);
+    }
+
+    /// The carry into the channel whose ID is `channel` has ended.
+    pub fn carried(&self, channel: &[u8; 32]) {
+        let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying.remove(channel);
+    }
+
+    /// Whether a carry is being made into the channel at `now`: one
+    /// began, has not said that it ended, and its wait has not gone by.
+    fn is_carrying(&self, channel: &[u8; 32], now: Instant) -> bool {
+        let carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        carrying
+            .get(channel)
+            .is_some_and(|began| now.saturating_duration_since(*began) < CARRYING_WAIT)
+    }
+
     /// The node begins a whole pass. Returns the pass's number, which it
     /// gives back when the pass ends.
     pub fn whole_pass_begins(&self) -> u64 {
@@ -353,7 +478,15 @@ impl OwnChannels {
     /// only the wait says that the others had their time. A node that is
     /// set up with no relay has none to wait for, and nobody to publish
     /// to: its folders do not wait.
+    ///
+    /// **A device that comes to sync a name carries it first** (decision
+    /// 2026-10-04 §7.3): while a carry is being made into the channel,
+    /// the folder waits for that too, so that what it publishes is
+    /// written over what was carried, and not beside it.
     pub fn first_fetch_done(&self, channel: &[u8; 32], now: Instant) -> bool {
+        if self.is_carrying(channel, now) {
+            return false;
+        }
         if self.relays_set_up() == Some(0) {
             return true;
         }
