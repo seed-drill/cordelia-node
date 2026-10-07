@@ -1,8 +1,8 @@
 # Testing Guide
 
-> **v1 status (2026-09-30).** `cargo test --all` runs everything v1 needs,
-> including real-process tests over QUIC through a relay
-> (`crates/cordelia-node/tests/devices_e2e.rs`; set `CORDELIA_E2E_KEEP=1` to
+> **v1 status.** `cargo test --all` runs everything v1 needs,
+> including the tests with real processes over QUIC through a relay
+> (`crates/cordelia-node/tests/`, below; set `CORDELIA_E2E_KEEP=1` to
 > keep the node directories). The toolchain is pinned in `rust-toolchain.toml`,
 > so `rustup update stable` is not needed. The Docker topology and scale suites
 > below predate v1 and are stale.
@@ -40,6 +40,75 @@ cargo test -p cordelia-network -- --nocapture
 
 **Baseline:** every test of `cargo test --all` passes. (The count changes with
 almost every change: the pull request that changed it last says what it is.)
+
+## Tests with real processes
+
+They are in `crates/cordelia-node/tests/`, and `cargo test --all` runs them.
+Each test starts the nodes it needs as processes of their own, on this
+machine, with a relay of the test's own: nothing is dialled but localhost,
+and each node has a directory of its own, which is removed afterwards.
+`CORDELIA_E2E_KEEP=1` keeps each node's directory (its configuration, data
+and log), and prints where.
+
+```bash
+cargo test -p cordelia-node --test person_e2e
+cargo test -p cordelia-node --test memory_e2e
+cargo test -p cordelia-node --test devices_e2e
+cargo test -p cordelia-node --test relay_entries_e2e
+cargo test -p cordelia-node --test device_entries_e2e
+cargo test -p cordelia-node --test first_start_e2e
+cargo test -p cordelia-node --test threat_model
+```
+
+| File | What it covers |
+|------|----------------|
+| `person_e2e.rs` | The commands a person types for their devices (decision 2026-10-04 §5 to §8), each run as a person runs it: `cordelia phrase`, `add-device`, `accept`, `devices`, `remove-device`, `renew`, `settle` and `init --new-key`. A phrase is made and the relay holds its first change; a device is added by the two commands and every device shows it until it is cleared; a device is removed and the others apply; two changes made apart are settled; a command with no terminal refuses; no word of a phrase reaches the node, its log or its files; a command refuses a node of another version |
+| `memory_e2e.rs` | Memory syncing between a person's devices, in channels from the person's secret, set up with the commands a person types: a phrase is made and the folders are published, and a second device's folders meet them; a removed device's later edit reaches nobody and the others go on syncing; an edit made before a device heard of a change arrives as an edit of the carried version |
+| `devices_e2e.rs` | Two devices of one person, driven through the command line and the local API: a phrase, `add-device` and `accept`, and what one publishes under a name that both hold reaches the other through the relay. Claude memory between two machines; home memory under any name; an edit overtaken while apart; the line of a memory that comes back; local history and its restore. Relays that are down, that lose their database and are filled again; a node's stopping on each signal; a personal node that listens on nothing. The older kind of channel as a relay carries it, shown with a stand-in that speaks its streams. And the harness itself: it starts no node that would dial another machine |
+| `relay_entries_e2e.rs` | A relay that carries channels from their secrets, beside the older kind (decision 2026-10-04 §2.4, §2.5). The test is the client: it opens the streams itself. A client with a channel's secret pushes, proves and pulls; one with only the channel's ID gets nothing; a show, whole and short; a relay near its cap; the allowance of new channels; the limits by address, counted for both kinds together; two relays that work together; a channel unused for 90 days; a personal node that answers none of these streams |
+| `device_entries_e2e.rs` | A device's side of its relays (decision 2026-10-04 §4.6, §7.3). The device is in the test's process: the node's own engine over real connections, with a clock of its own that a test runs ahead where a wait is tested. The relays are processes. The show, whole once and short after; leave, when it is given and when it ends; a device that wakes; a device that applies the change its relay holds before it sends anything; what a relay refuses for room; a hand-over that is dropped after two hours; the pair channel of a typed key |
+| `first_start_e2e.rs` | A node's first start on this version (decision 2026-10-04 §10.1): a personal node whose database is in the released version's form copies it and moves it on, once, after its port is bound; a relay makes no copy and keeps every older row; a node that cannot bind changes nothing; a first start that cannot be made holds the node up until it can; a database from a later version is refused |
+| `threat_model.rs` | That `docs/security/threat-model.md` names, for every claim it marks as tested, tests that exist and run; and the claims that need real processes |
+
+`crates/cordelia-node/tests/common/mod.rs` is the harness they share: it
+starts a node, runs a command against it, and asks its local API.
+
+**Commands are run at a pseudo-terminal.** A command that asks a yes, or the
+recovery phrase, asks at a terminal, and refuses where its input is not one.
+So a test runs the built `cordelia` binary with a pseudo-terminal for its
+input and its output, holds the other end, reads what the command says and
+types what a person would (`Node::at_terminal`, `AtTerminal`). That a program
+with a shell can give a command a terminal is the limit that the decision
+record states (§5), and these tests show it. They need a Unix: the tests of
+a process that cannot be dumped or traced run on Linux only.
+
+**`CORDELIA_SEQUENCES`.** `crates/cordelia-sync/src/claude/sequences.rs` runs
+sequences of edits, deletes, syncs and changes of a person's devices over
+several devices, written and generated, and asks where each text ends. A
+device checks both signatures of every entry each time it reads a slot, and
+in a test build that is most of what a cycle takes. `CORDELIA_SEQUENCES` is
+how many generated sequences a test runs for each number of devices: 1 by
+default (a test that runs more runs a small multiple of it), with the
+written sequences at one seed each. From `CORDELIA_SEQUENCES=12` everything
+is run: every written sequence with every seed and every mix of kinds, and
+the generated ones for two, three and four devices.
+
+```bash
+CORDELIA_SEQUENCES=12 cargo test -p cordelia-sync sequences
+```
+
+**Test vectors.** `docs/reference/step4-test-vectors.json` holds the
+derivations of a channel from its secret, the recovery phrase and two
+statements. A test in `crates/cordelia-crypto/src/vectors.rs` checks the code
+against the file, and fails on any change of a value until the file is
+written again, on purpose:
+
+```bash
+CORDELIA_WRITE_VECTORS=1 cargo test -p cordelia-crypto vectors
+```
+
+**The install script** has tests of its own, which download nothing and
+touch no service: `sh scripts/test-install.sh`. CI runs them.
 
 ## E2E topology and scale suites (stale)
 
@@ -104,6 +173,10 @@ bash tests/e2e/run-e2e.sh                # Runs all T1-T7
 |-------|----------|---------------|-------------|
 | Unit | `crates/*/src/**` | Per-module logic | `cargo test --all` |
 | Integration | `crates/cordelia-network/tests/` | Two-node QUIC | `cargo test -p cordelia-network` |
+| API | `crates/cordelia-api/tests/` | The local API over HTTP: the routes of a person's devices (`commands_api.rs`), and the Channels API of the older kind | `cargo test -p cordelia-api` |
+| Adapter | `crates/cordelia-sync/tests/`, `crates/cordelia-sync/src/claude/sequences.rs` | The Claude Code adapter over memory folders; sequences over several devices | `cargo test -p cordelia-sync` |
+| Real processes | `crates/cordelia-node/tests/` | A person's devices, memory sync, a relay, a device's passes, the first start, the threat model (above) | `cargo test -p cordelia-node` |
+| Install script | `scripts/test-install.sh` | What `install.sh` does about a node that is running | `sh scripts/test-install.sh` |
 | E2E Smoke (stale) | `tests/e2e/smoke-test.sh` | Single node API as it was before v1: four of its checks no longer match. Its node is given a relay on this machine where nothing listens, so it dials nothing else | `bash tests/e2e/smoke-test.sh` |
 | S2 Scale | `tests/e2e/scale/run-s2.sh` | Relay mesh + delivery | `bash tests/e2e/scale/run-s2.sh R` |
 | S3 Scale | `tests/e2e/scale/run-s3.sh` | PAN swarm | `bash tests/e2e/scale/run-s3.sh N` |
