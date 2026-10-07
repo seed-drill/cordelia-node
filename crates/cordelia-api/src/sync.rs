@@ -668,8 +668,28 @@ fn home_dir() -> Result<std::path::PathBuf, ApiError> {
     Ok(home.canonicalize().unwrap_or(home))
 }
 
-/// What `POST /api/v1/sync/map` does, with the database lock held: declare
-/// that Claude's memory for a folder syncs under a name.
+/// What `POST /api/v1/sync/map` does, for a caller that holds the
+/// database's lock throughout: declare that Claude's memory for a folder
+/// syncs under a name ([`add_mapping_looked`]), after the check of what
+/// was found for the folder's directory ([`map_asked`], [`map_looked`]).
+///
+/// The node's own route asks the disk and git with the lock let go
+/// ([`map`]). This is for a caller that has no other holder to keep
+/// waiting.
+pub fn add_mapping(
+    control: &SyncControl,
+    db: &rusqlite::Connection,
+    body: &SyncMapRequest,
+    home_dir: &std::path::Path,
+) -> Result<(), ApiError> {
+    let asked = map_asked(control, db, body, home_dir)?;
+    let looked = asked.as_ref().map(|asked| map_looked(asked, home_dir));
+    add_mapping_looked(control, db, body, home_dir, looked.as_ref())
+}
+
+/// Declare that Claude's memory for a folder syncs under a name, with the
+/// database lock held. `looked` is what the check of what was found said
+/// for this mapping ([`map_looked`]), where one was made.
 ///
 /// The folder is taken as given: the adapter syncs the Claude Code folder
 /// named after it and no other. (Claude Code keeps one memory per git
@@ -684,11 +704,18 @@ fn home_dir() -> Result<std::path::PathBuf, ApiError> {
 /// meets its channel as on any first sync, and nothing that it lost while
 /// it did not sync is sent as a delete. Mapping what is already mapped
 /// adds nothing, and forgets nothing.
-pub fn add_mapping(
+///
+/// **A mapping is added only with its check, made under the settings as
+/// they stand.** The check is of this folder, under this Claude Code
+/// directory, at this count of settings commands: where a setting has
+/// changed since it was made, or none was made, nothing is mapped, and
+/// the request says to run it again.
+pub fn add_mapping_looked(
     control: &SyncControl,
     db: &rusqlite::Connection,
     body: &SyncMapRequest,
     home_dir: &std::path::Path,
+    looked: Option<&MapLooked>,
 ) -> Result<(), ApiError> {
     let Some(claude_dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? else {
         return Err(ApiError::BadRequest(
@@ -697,10 +724,20 @@ pub fn add_mapping(
     };
     let mut list = mappings(db)?;
     let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
-    if let Some(mapping) = &checked
-        && let Some(why) = maps_another_folder(db, &claude_dir, mapping, home_dir, &list)?
-    {
-        return Err(ApiError::BadRequest(why));
+    if let Some(mapping) = &checked {
+        let of_this = |looked: &&MapLooked| {
+            looked.generation == control.generation_under(db)
+                && looked.claude_dir == claude_dir
+                && looked.folder == mapping.folder
+        };
+        match looked.filter(of_this) {
+            Some(looked) => {
+                if let Some(why) = &looked.refused {
+                    return Err(ApiError::BadRequest(why.clone()));
+                }
+            }
+            None => return Err(ApiError::BadRequest(SETTINGS_CHANGED_UNDER_MAP.into())),
+        }
     }
     control.changed(db);
     if let Some(mapping) = checked {
@@ -723,6 +760,11 @@ pub fn add_mapping(
     }
     Ok(())
 }
+
+/// What a mapping is refused with where a setting changed between its
+/// check and the moment it would be stored.
+pub const SETTINGS_CHANGED_UNDER_MAP: &str = "the sync settings changed while this mapping was \
+    being checked: nothing was mapped. Run it again.";
 
 /// The folders that were found and are not mapped, as the last stored
 /// report lists them, and the folders that a stored notice names: each as
@@ -756,69 +798,139 @@ fn found_and_named(
     Ok(out)
 }
 
-/// Why `mapping` is refused, where it would sync another folder than one
-/// that was found, or that a notice names, with the directory it gives
-/// (decision 2026-10-04 §10.1): `map` checks whenever it is run, however
-/// the request was come by ([`crate::found::in_the_way`]). The reason is
-/// the one that stands in the place of a command for that folder, as the
-/// one function gives it.
-fn maps_another_folder(
+/// What the check of a mapping goes by, as it is read with the database's
+/// lock held ([`map_asked`]): everything that is then asked of the disk
+/// and of git with the lock let go ([`map_looked`]).
+#[derive(Debug, Clone)]
+pub struct MapAsked {
+    /// The count of settings commands that it was read under.
+    generation: u64,
+    /// The Claude Code directory that is set.
+    claude_dir: String,
+    /// The mapping that would be stored.
+    mapping: SyncMapping,
+    /// The mappings that are declared.
+    mappings: Vec<SyncMapping>,
+    /// What was found, and what a notice names ([`found_and_named`]).
+    entries: Vec<(String, String, Option<String>)>,
+}
+
+/// What the check of a mapping said ([`map_looked`]): why it is refused,
+/// where it is, for one folder under one Claude Code directory, at one
+/// count of settings commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapLooked {
+    generation: u64,
+    claude_dir: String,
+    folder: String,
+    /// Why the mapping is refused, where it would sync another folder
+    /// than one that was found for its directory.
+    pub refused: Option<String>,
+}
+
+/// Read what the check of the mapping that `body` asks for goes by, with
+/// the database's lock held (decision 2026-10-04 §10.1). `None` where
+/// there is nothing to check: sync is off, the request is refused for a
+/// reason of its own, or it declares what is declared already. Whoever
+/// stores the mapping says which ([`add_mapping_looked`]).
+pub fn map_asked(
+    control: &SyncControl,
     db: &rusqlite::Connection,
-    claude_dir: &str,
-    mapping: &SyncMapping,
+    body: &SyncMapRequest,
     home_dir: &std::path::Path,
-    mappings: &[SyncMapping],
-) -> Result<Option<String>, ApiError> {
+) -> Result<Option<MapAsked>, ApiError> {
+    let Some(claude_dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? else {
+        return Ok(None);
+    };
+    let mappings = mappings(db)?;
+    let Ok(Some(mapping)) = check_mapping(body, home_dir, &mappings) else {
+        return Ok(None);
+    };
+    Ok(Some(MapAsked {
+        generation: control.generation_under(db),
+        claude_dir,
+        mapping,
+        mappings,
+        entries: found_and_named(db)?,
+    }))
+}
+
+/// Why the mapping that was asked for is refused, where it would sync
+/// another folder than one that was found, or that a notice names, with
+/// the directory it gives (decision 2026-10-04 §10.1): `map` checks
+/// whenever it is run, however the request was come by
+/// ([`crate::found::in_the_way`]). The reason is the one that stands in
+/// the place of a command for that folder, as the one function gives it.
+///
+/// **It asks the disk and git, and is called with the database's lock let
+/// go:** git may take its time, and nothing else waits on it then.
+pub fn map_looked(asked: &MapAsked, home_dir: &std::path::Path) -> MapLooked {
     use crate::found;
     use std::path::Path;
 
-    let claude_dir = Path::new(claude_dir);
-    let given = Path::new(&mapping.folder);
-    let Some(would_sync) = found::claude_folder(claude_dir, given) else {
-        return Ok(None);
+    let claude_dir = Path::new(&asked.claude_dir);
+    let given = Path::new(&asked.mapping.folder);
+    let refused = || -> Option<String> {
+        let would_sync = found::claude_folder(claude_dir, given)?;
+        let to_map = found::ToMap {
+            given,
+            would_sync: &would_sync,
+            claude_dir,
+        };
+        let entries = &asked.entries;
+        let pairs = entries
+            .iter()
+            .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
+        let (folder, recorded) = found::in_the_way(&to_map, pairs, &found::ThisMachine)?;
+        let name = entries
+            .iter()
+            .find(|(of, directory, _)| of == folder && directory == recorded)
+            .and_then(|(_, _, name)| name.as_deref());
+        // The folder is asked with its directory as it was recorded:
+        // where that is a link, the reason says so.
+        let folder_asked = found::Asked {
+            folder: Path::new(folder),
+            directory: Some(Path::new(recorded)),
+            name,
+        };
+        let against = found::Against {
+            claude_dir,
+            home: Some(home_dir),
+            mappings: &asked.mappings,
+        };
+        let reason = match found::would_map(&folder_asked, &against, &found::ThisMachine) {
+            found::Maps::No(why) => Some(why.says()),
+            _ => None,
+        };
+        Some(found::map_refused(
+            &to_map,
+            folder,
+            reason.as_deref(),
+            &found::ThisMachine,
+        ))
     };
-    let to_map = found::ToMap {
-        given,
-        would_sync: &would_sync,
-        claude_dir,
-    };
-    let entries = found_and_named(db)?;
-    let pairs = entries
-        .iter()
-        .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));
-    let Some((folder, recorded)) = found::in_the_way(&to_map, pairs, &found::ThisMachine) else {
-        return Ok(None);
-    };
-    let name = entries
-        .iter()
-        .find(|(of, directory, _)| of == folder && directory == recorded)
-        .and_then(|(_, _, name)| name.as_deref());
-    // The folder is asked with its directory as it was recorded: where
-    // that is a link, the reason says so.
-    let asked = found::Asked {
-        folder: Path::new(folder),
-        directory: Some(Path::new(recorded)),
-        name,
-    };
-    let against = found::Against {
-        claude_dir,
-        home: Some(home_dir),
-        mappings,
-    };
-    let reason = match found::would_map(&asked, &against, &found::ThisMachine) {
-        found::Maps::No(why) => Some(why.says()),
-        _ => None,
-    };
-    Ok(Some(found::map_refused(
-        &to_map,
-        folder,
-        reason.as_deref(),
-        &found::ThisMachine,
-    )))
+    MapLooked {
+        generation: asked.generation,
+        claude_dir: asked.claude_dir.clone(),
+        folder: asked.mapping.folder.clone(),
+        refused: refused(),
+    }
 }
 
+/// How many times `map` reads, looks and comes back to store a mapping
+/// before it gives up: each time a setting changed while it looked.
+const MAP_TRIES: usize = 3;
+
 /// Declare that Claude's memory for a folder syncs under a name (see
-/// [`add_mapping`]).
+/// [`add_mapping_looked`]).
+///
+/// **The disk and git are asked first, and then the database's lock is
+/// taken** (decision 2026-10-04 §10.1): what the check goes by is read
+/// under a short hold of the lock ([`map_asked`]), the check is made with
+/// the lock let go ([`map_looked`]), and the mapping is stored under a
+/// second hold, where no setting has changed in between. Where one has,
+/// the check is made again, a few times; and then the request is refused,
+/// with nothing mapped.
 pub async fn map(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -826,14 +938,25 @@ pub async fn map(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
     let home_dir = home_dir()?;
-    {
-        let db = state
+    let lock = || {
+        state
             .db
             .lock()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    };
+    for tried in 1..=MAP_TRIES {
+        let asked = map_asked(&state.sync_control, &*lock()?, &body, &home_dir)?;
+        let looked = asked.as_ref().map(|asked| map_looked(asked, &home_dir));
+        let db = lock()?;
+        let moved =
+            |looked: &MapLooked| looked.generation != state.sync_control.generation_under(&db);
+        if looked.as_ref().is_some_and(moved) && tried < MAP_TRIES {
+            continue;
+        }
         let before = mapped_names(&db)?;
-        add_mapping(&state.sync_control, &db, &body, &home_dir)?;
+        add_mapping_looked(&state.sync_control, &db, &body, &home_dir, looked.as_ref())?;
         names_follow(&state, &db, &before);
+        break;
     }
     Ok(HttpResponse::Ok().json(status(&state)?))
 }
@@ -1342,6 +1465,78 @@ mod tests {
         agree(&s);
         s.claude(serde_json::json!({}));
         assert_eq!(remembered(&s).len(), 3);
+    }
+
+    /// A mapping is stored only with its check, made under the settings
+    /// as they stand (decision 2026-10-04 §10.1). The check asks the disk
+    /// and git, and is made with the database's lock let go: it is of
+    /// one folder, under one Claude Code directory, at one count of
+    /// settings commands. Where a setting has changed since, or the
+    /// check is of another folder, or there is none, nothing is mapped
+    /// and nothing is counted; and what the check refused is refused.
+    #[test]
+    fn test_a_mapping_is_stored_only_with_its_check_under_the_settings_as_they_stand() {
+        let s = Settings::on();
+        let home = std::path::Path::new(HOME);
+        let body = request("/home/sam/code/app", "app", false);
+        let asked =
+            |s: &Settings, body: &SyncMapRequest| map_asked(&s.control, &s.db, body, home).unwrap();
+        let store = |s: &Settings, body: &SyncMapRequest, looked: Option<&MapLooked>| {
+            add_mapping_looked(&s.control, &s.db, body, home, looked)
+        };
+        let refused = |s: &Settings, body: &SyncMapRequest, looked: Option<&MapLooked>| {
+            let before = s.control.generation();
+            let why = store(s, body, looked).unwrap_err().to_string();
+            assert!(mappings(&s.db).unwrap().is_empty(), "{why}");
+            assert_eq!(s.control.generation(), before, "{why}");
+            why
+        };
+
+        // The check is read under the lock, and made without the
+        // database: it is handed nothing of it.
+        let read = asked(&s, &body).expect("something to check");
+        let looked = map_looked(&read, home);
+        assert_eq!(looked.refused, None);
+        // With no check: nothing is mapped.
+        assert!(refused(&s, &body, None).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // A check of another folder is no check of this one.
+        let other = request("/home/sam/code/lib", "lib", false);
+        let of_another = map_looked(&asked(&s, &other).unwrap(), home);
+        assert!(refused(&s, &body, Some(&of_another)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // A setting changes between the check and the store: the check
+        // is of settings that stand no longer.
+        s.control.changed(&s.db);
+        assert!(refused(&s, &body, Some(&looked)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // So too where the Claude Code directory is another now.
+        let read = asked(&s, &body).unwrap();
+        let looked = map_looked(&read, home);
+        s.claude(serde_json::json!({ "dir": "/home/sam/.claude-two" }));
+        let mut of_this_count = looked.clone();
+        of_this_count.generation = s.control.generation();
+        assert!(refused(&s, &body, Some(&of_this_count)).contains(SETTINGS_CHANGED_UNDER_MAP));
+        // What the check refused is refused, in its words.
+        let read = asked(&s, &body).unwrap();
+        let mut said_no = map_looked(&read, home);
+        said_no.refused = Some("another folder was found for it".into());
+        assert!(refused(&s, &body, Some(&said_no)).contains("another folder was found for it"));
+        // And a check made under the settings as they stand is stored.
+        let looked = map_looked(&asked(&s, &body).unwrap(), home);
+        store(&s, &body, Some(&looked)).unwrap();
+        assert_eq!(mappings(&s.db).unwrap().len(), 1);
+
+        // Nothing to check: sync off, a request that is refused for a
+        // reason of its own, and a mapping that is declared already. The
+        // store says which, with or without a check.
+        assert!(asked(&s, &body).is_none());
+        store(&s, &body, None).unwrap();
+        let outside = request("/srv/app", "app", false);
+        assert!(asked(&s, &outside).is_none());
+        let why = store(&s, &outside, None).unwrap_err().to_string();
+        assert!(why.contains("outside the home directory"), "{why}");
+        s.claude(serde_json::json!({ "enabled": false }));
+        assert!(asked(&s, &other).is_none());
+        let why = store(&s, &other, None).unwrap_err().to_string();
+        assert!(why.contains("sync is off"), "{why}");
     }
 
     /// A folder that a mapping adds forgets what it had agreed, whatever
