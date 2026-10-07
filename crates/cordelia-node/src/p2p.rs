@@ -3978,12 +3978,21 @@ pub async fn handle_peer_streams(
         };
 
         match protocol {
-            // A personal node carries no channel of the older kind: it
-            // takes no push of one, serves no sync of one, and hears no
-            // announcement of one. Each is refused at once, so that the
-            // peer does not wait for an answer that is not coming.
+            // A personal node carries no channel of the older kind. What
+            // a peer asks it of that kind it answers with nothing, as a
+            // device that holds no such channel would (decision
+            // 2026-10-04 §10.1): a relay asks each of its devices which
+            // channels it holds, and one that is answered asks again at
+            // its usual pace, where one that is refused takes that for a
+            // failure and asks again within the minute.
+            cordelia_network::messages::Protocol::ItemSync if !carries_older_kind(&node_role) => {
+                answer_sync_with_nothing(&mut send, &mut recv, &peer_id).await;
+                continue;
+            }
+            // It takes no push of that kind, and hears no announcement of
+            // one. Each is refused at once, so that the peer does not
+            // wait for an answer that is not coming.
             cordelia_network::messages::Protocol::ItemPush
-            | cordelia_network::messages::Protocol::ItemSync
             | cordelia_network::messages::Protocol::ChannelAnnounce
                 if !carries_older_kind(&node_role) =>
             {
@@ -4259,6 +4268,62 @@ async fn handle_inbound_push(
         });
     let _ = cordelia_network::codec::write_frame(send, &ack).await;
     None
+}
+
+/// The most requests of one stream that [`answer_sync_with_nothing`]
+/// answers: a peer that goes on asking on one stream is left there.
+const NOTHING_ANSWERED_AT_MOST: usize = 64;
+
+/// What a node that holds no channel of the older kind answers to one
+/// message of a sync of that kind (decision 2026-10-04 §10.1): to the
+/// question which channels it holds, that it holds none; to a request for
+/// a channel's items, that the channel holds nothing. `None` for a
+/// message that asks neither: nothing is answered, and the stream ends.
+fn nothing_for(
+    asked: &cordelia_network::messages::WireMessage,
+) -> Option<cordelia_network::messages::WireMessage> {
+    use cordelia_network::messages::{SyncChannelListResponse, SyncResponse, WireMessage};
+    match asked {
+        WireMessage::SyncChannelListRequest(_) => Some(WireMessage::SyncChannelListResponse(
+            SyncChannelListResponse {
+                channel_ids: Vec::new(),
+            },
+        )),
+        WireMessage::SyncRequest(_) => Some(WireMessage::SyncResponse(SyncResponse {
+            items: Vec::new(),
+            has_more: false,
+            last_seq: None,
+        })),
+        _ => None,
+    }
+}
+
+/// Answer a sync of the older kind as a node that holds no channel of
+/// that kind does ([`nothing_for`]): each request on the stream, until
+/// the peer has no more. The node's database is not read: a personal
+/// node carries no channel of that kind, whatever its database once
+/// held.
+async fn answer_sync_with_nothing(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    peer_id: &NodeId,
+) {
+    for _ in 0..NOTHING_ANSWERED_AT_MOST {
+        let Ok(asked) = cordelia_network::codec::read_frame(recv).await else {
+            break;
+        };
+        let Some(nothing) = nothing_for(&asked) else {
+            break;
+        };
+        if cordelia_network::codec::write_frame(send, &nothing)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    tracing::debug!(peer = %peer_id, "answered a sync of the older kind with nothing: a personal node carries no channel of that kind");
+    let _ = send.finish();
 }
 
 async fn handle_inbound_sync(
@@ -4713,6 +4778,36 @@ mod tests {
         let none = relay_snapshots(&set_up, &[], &tries, &|_| true);
         assert_eq!(none.len(), 3);
         assert!(none.iter().all(|relay| relay.state == "unreachable"));
+    }
+
+    /// A device answers a request of the older kind with nothing, as a
+    /// device that holds no such channel would (decision 2026-10-04
+    /// §10.1): it holds no channel, and a channel that it is asked for
+    /// holds nothing. Anything else on such a stream is not answered.
+    #[test]
+    fn a_request_of_the_older_kind_is_answered_with_nothing() {
+        use cordelia_network::messages::{SyncChannelListRequest, SyncRequest, WireMessage};
+        let which = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
+        match nothing_for(&which) {
+            Some(WireMessage::SyncChannelListResponse(held)) => {
+                assert!(held.channel_ids.is_empty())
+            }
+            other => panic!("{other:?}"),
+        }
+        let items = WireMessage::SyncRequest(SyncRequest {
+            channel_id: "grp_lab".into(),
+            since: None,
+            limit: 100,
+            after_seq: None,
+        });
+        match nothing_for(&items) {
+            Some(WireMessage::SyncResponse(held)) => {
+                assert!(held.items.is_empty() && !held.has_more && held.last_seq.is_none())
+            }
+            other => panic!("{other:?}"),
+        }
+        let answer = nothing_for(&which).unwrap();
+        assert!(nothing_for(&answer).is_none());
     }
 
     /// A personal node carries no channel of the older kind (decision

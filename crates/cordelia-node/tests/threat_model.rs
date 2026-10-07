@@ -3086,3 +3086,38 @@ async fn t03_a_page_longer_than_the_one_asked_for_is_not_taken() {
     );
     assert_eq!(relay_holds(&relay), (0, 0));
 }
+
+/// A device answers its relay's request of the older kind with nothing,
+/// as a device that holds no channel of that kind would (decision
+/// 2026-10-04 §10.1). A relay asks each of its devices which channels it
+/// holds: answered, it asks again at its usual pace, which this relay is
+/// set up to make short. A device that refused the request would be asked
+/// again only a minute later, as a peer that failed to answer is.
+#[test]
+fn a_device_answers_its_relays_request_of_the_older_kind_with_nothing() {
+    let mut relay = node("relay", "relay", None);
+    relay.relay_ask_again_secs(1);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let a = device_started("a", &relay);
+
+    let answered = || {
+        let log = std::fs::read_to_string(a.log()).unwrap_or_default();
+        log.matches("answered a sync of the older kind with nothing")
+            .count()
+    };
+    // Asked, answered, and asked again within the relay's own pace: three
+    // times in well under the minute that a failure would cost.
+    let began = std::time::Instant::now();
+    wait_for(
+        "the relay asks its device again and again",
+        &[&relay, &a],
+        50,
+        || (answered() >= 3).then_some(()),
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(55),
+        "{:?}",
+        began.elapsed()
+    );
+}
