@@ -1413,21 +1413,37 @@ fn a_tree_laid_out_by_hand_is_listed_and_never_synced() {
     assert_eq!(a.state.sync_control.generation(), generation);
     assert!(a.cycle().folders.is_empty());
 
-    // Where the node lists nothing (a setting was changed, and no cycle
-    // has run since), the repository's directory is mapped: that syncs
-    // the folder Claude Code names after it under the directory that is
-    // set, which is another folder than the tree's. Nothing that the tree
-    // holds leaves.
+    // Where the node has no report to read (a setting was changed, and
+    // no cycle has run since), it looks at what is found for the
+    // directory itself: the request is refused all the same.
     {
         let db = a.state.db.lock().unwrap();
         meta::remove(&db, meta::SYNC_CLAUDE_REPORT).unwrap();
     }
+    let refused = {
+        let db = a.state.db.lock().unwrap();
+        cordelia_api::sync::add_mapping(&a.state.sync_control, &db, &request, &a.home)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        refused.contains("this layout cannot be mapped"),
+        "{refused}"
+    );
+    assert!(mapped(&a.state.db.lock().unwrap()).is_empty());
+
+    // The folder that Claude Code names after the repository's
+    // directory, under the directory that is set, is made: the
+    // repository's directory is then mapped. That syncs that folder,
+    // which is another than the tree's. Nothing that the tree holds
+    // leaves.
+    let named_after_it = cordelia_sync::discover::claude_folder(&tree, &a_repo).unwrap();
+    std::fs::create_dir_all(&named_after_it).unwrap();
     map(&a, &a_repo, PROJECT);
     std::fs::write(b_mem.join("reply.md"), "from b\n").unwrap();
     settle(&mut a, &mut b);
     assert_eq!(read(&b_mem, "decision.md"), None);
     assert_eq!(read(&real, "reply.md"), None);
-    let named_after_it = cordelia_sync::discover::claude_folder(&tree, &a_repo).unwrap();
     assert_eq!(
         read(&named_after_it.join("memory"), "reply.md").as_deref(),
         Some("from b\n")

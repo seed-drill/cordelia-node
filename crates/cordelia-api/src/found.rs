@@ -26,6 +26,7 @@
 //! gives a switch to every found entry that has a `cwd`, and that switch
 //! would map another folder.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -144,6 +145,111 @@ pub fn is_claude_folder_for(folder: &Path, dir: &Path) -> bool {
     }
     have.strip_prefix(&want[..FOLDER_NAME_MAX])
         .is_some_and(|hash| hash.starts_with('-'))
+}
+
+// ── The directory that a folder's transcripts record ─────────────────
+
+/// Lines read from each transcript while looking for the working directory.
+const TRANSCRIPT_SCAN_LINES: usize = 200;
+
+/// Transcripts read per folder while looking for its working directory.
+const TRANSCRIPTS_SCANNED: usize = 20;
+
+/// The working directories recorded in the folder's transcripts, without
+/// repeats: the newest transcript's first. A session can move to another
+/// directory, so a folder's transcripts may name more than one.
+pub fn recorded_cwds(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut transcripts: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    transcripts.sort_by_key(|t| std::cmp::Reverse(t.0));
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    for (_, path) in transcripts.into_iter().take(TRANSCRIPTS_SCANNED) {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file)
+            .lines()
+            .take(TRANSCRIPT_SCAN_LINES)
+            .map_while(Result::ok)
+        {
+            if !line.contains("\"cwd\"") {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                && let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
+                && !found.iter().any(|f| f == Path::new(cwd))
+            {
+                found.push(PathBuf::from(cwd));
+            }
+        }
+    }
+    found
+}
+
+/// The directory that the folder `folder` under `projects` belongs to,
+/// as its transcripts record it, told as the sync adapter tells it:
+///
+/// - the directory that Claude Code named the folder after, where a
+///   transcript of it records that directory: a session can move
+///   elsewhere, and a folder is believed only about the directory it is
+///   named after;
+/// - for a folder that Claude Code did not name (its names start with a
+///   dash), which is a tree laid out by hand, the directory that its
+///   newest transcript records first;
+/// - none for a folder that Claude Code named and whose transcripts
+///   record another directory, or none.
+pub fn recorded_directory(folder: &Path) -> Option<PathBuf> {
+    let cwds = recorded_cwds(folder);
+    if let Some(own) = cwds.iter().find(|cwd| is_claude_folder_for(folder, cwd)) {
+        return Some(own.clone());
+    }
+    let named_by_claude = folder
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('-'));
+    match named_by_claude {
+        true => None,
+        false => cwds.into_iter().next(),
+    }
+}
+
+/// What is found on disk for the directory `given`, under the Claude Code
+/// directory `claude_dir`, as the node looks itself (decision 2026-10-04
+/// §10.1): each folder directly under `projects` that holds memory and
+/// belongs to that directory ([`recorded_directory`]), as its folder and
+/// its directory as recorded, in order of folder. Directories are
+/// compared by their real paths.
+///
+/// `map` checks against what the last cycle's report lists as found, and
+/// every request that changes a setting removes that report. Until the
+/// next cycle stores one, the node looks here, at the one directory that
+/// is being mapped: a mapping that comes just after another is checked
+/// as any is. It reads the transcripts of each folder that holds memory,
+/// which is what a cycle does, and is called with the database's lock
+/// let go.
+pub fn found_for(claude_dir: &Path, given: &Path, machine: &dyn Machine) -> Vec<(String, String)> {
+    let Ok(listed) = std::fs::read_dir(claude_dir.join("projects")) else {
+        return Vec::new();
+    };
+    let real = |dir: &Path| machine.real_path(dir).unwrap_or_else(|| dir.to_path_buf());
+    let given = real(given);
+    let shown = |path: &Path| path.display().to_string();
+    let mut found: Vec<(String, String)> = listed
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|folder| folder.join("memory").is_dir())
+        .filter_map(|folder| Some((shown(&folder), recorded_directory(&folder)?)))
+        .filter(|(_, directory)| real(directory) == given)
+        .map(|(folder, directory)| (folder, shown(&directory)))
+        .collect();
+    found.sort();
+    found
 }
 
 // ── Whether `map` would sync a folder ────────────────────────────────
@@ -1636,6 +1742,101 @@ mod tests {
         let unknown = notice_shown(&[empty], &against(&[]), &machine).unwrap();
         assert!(unknown.not_known && unknown.folders.is_empty());
         assert_eq!(unknown.stopped, 0);
+    }
+
+    /// The node looks at what is found for a directory itself (decision
+    /// 2026-10-04 §10.1): each folder under `projects` that holds memory
+    /// and belongs to the directory, as the sync adapter tells which
+    /// directory a folder belongs to. A tree laid out by hand belongs to
+    /// the directory that its newest transcript records first; a folder
+    /// that Claude Code named, to the directory it is named after, where
+    /// a transcript records that, and to none otherwise. Directories are
+    /// compared by their real paths.
+    #[test]
+    fn test_the_node_looks_at_what_is_found_for_a_directory_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let claude = root.join(".claude");
+        let shown = |path: &Path| path.display().to_string();
+        let work = root.join("work/app");
+        let other = root.join("work/other");
+        for made in [&work, &other] {
+            std::fs::create_dir_all(made).unwrap();
+        }
+        // A folder under `projects`, with a transcript for each
+        // directory it records, and with memory or without.
+        let folder = |name: &str, records: &[&Path], memory: bool| {
+            let folder = claude.join("projects").join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            if memory {
+                std::fs::create_dir_all(folder.join("memory")).unwrap();
+            }
+            let lines: Vec<String> = records
+                .iter()
+                .map(|cwd| format!("{{\"type\":\"user\",\"cwd\":{:?}}}\n", shown(cwd)))
+                .collect();
+            if !lines.is_empty() {
+                std::fs::write(folder.join("session.jsonl"), lines.concat()).unwrap();
+            }
+            folder
+        };
+        let own_name = claude_folder_name(&work);
+        let own = folder(&own_name, &[&other, &work], true);
+        let tree = folder("workspace", &[&work, &other], true);
+        // In no list: a tree that records another directory first, one
+        // that holds no memory, one with no transcript, and a folder
+        // that Claude Code named after another directory.
+        folder("second", &[&other, &work], true);
+        folder("emptied", &[&work], false);
+        folder("bare", &[], true);
+        folder(&claude_folder_name(&root.join("gone")), &[&work], true);
+
+        assert_eq!(recorded_directory(&own), Some(work.clone()));
+        assert_eq!(recorded_directory(&tree), Some(work.clone()));
+        assert_eq!(
+            recorded_directory(&claude.join("projects/second")),
+            Some(other.clone())
+        );
+        assert_eq!(recorded_directory(&claude.join("projects/bare")), None);
+        let named_after_another = claude
+            .join("projects")
+            .join(claude_folder_name(&root.join("gone")));
+        assert_eq!(recorded_directory(&named_after_another), None);
+
+        let found = found_for(&claude, &work, &ThisMachine);
+        let mut want = vec![(shown(&own), shown(&work)), (shown(&tree), shown(&work))];
+        want.sort();
+        assert_eq!(found, want);
+        // For the other directory: the tree that records it first.
+        assert_eq!(
+            found_for(&claude, &other, &ThisMachine),
+            [(shown(&claude.join("projects/second")), shown(&other))]
+        );
+        // By real path: a link to the directory is the directory.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        assert_eq!(found_for(&claude, &link, &ThisMachine), want);
+        // Nothing where there is no such directory of projects.
+        assert!(found_for(&root.join("nowhere"), &work, &ThisMachine).is_empty());
+
+        // And the check finds the tree in the way with it, while Claude
+        // Code's own folder for the directory is not there.
+        std::fs::remove_dir_all(&own).unwrap();
+        let would_sync = claude_folder(&claude, &work).unwrap();
+        let to_map = ToMap {
+            given: &work,
+            would_sync: &would_sync,
+            claude_dir: &claude,
+        };
+        let found = found_for(&claude, &work, &ThisMachine);
+        let pairs = found
+            .iter()
+            .map(|(folder, directory)| (folder.as_str(), directory.as_str()));
+        let in_the_way = in_the_way(&to_map, pairs, &ThisMachine);
+        assert_eq!(
+            in_the_way.map(|(folder, _)| folder.to_string()),
+            Some(shown(&tree))
+        );
     }
 
     /// `map` is refused for a directory that an entry has with another

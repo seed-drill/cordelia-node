@@ -813,6 +813,9 @@ pub struct MapAsked {
     mappings: Vec<SyncMapping>,
     /// What was found, and what a notice names ([`found_and_named`]).
     entries: Vec<(String, String, Option<String>)>,
+    /// Whether a report of a cycle is stored: what was found is read
+    /// from it. Where none is, the node looks itself.
+    report_stored: bool,
 }
 
 /// What the check of a mapping said ([`map_looked`]): why it is refused,
@@ -852,6 +855,7 @@ pub fn map_asked(
         mapping,
         mappings,
         entries: found_and_named(db)?,
+        report_stored: meta::get(db, meta::SYNC_CLAUDE_REPORT)?.is_some(),
     }))
 }
 
@@ -864,6 +868,12 @@ pub fn map_asked(
 ///
 /// **It asks the disk and git, and is called with the database's lock let
 /// go:** git may take its time, and nothing else waits on it then.
+///
+/// **Where no report of a cycle is stored, it looks at what is found for
+/// the directory itself** ([`crate::found::found_for`]): a request that
+/// changes a setting removes the report, and until the next cycle stores
+/// one there would be nothing to check against. A command waits for a
+/// report; a panel does not.
 pub fn map_looked(asked: &MapAsked, home_dir: &std::path::Path) -> MapLooked {
     use crate::found;
     use std::path::Path;
@@ -877,7 +887,20 @@ pub fn map_looked(asked: &MapAsked, home_dir: &std::path::Path) -> MapLooked {
             would_sync: &would_sync,
             claude_dir,
         };
-        let entries = &asked.entries;
+        // What was found is read from the last cycle's report, which
+        // every request that changes a setting removes. Where none is
+        // stored, the node looks at what is found for this directory
+        // itself, before it answers.
+        let mut entries = asked.entries.clone();
+        if !asked.report_stored {
+            let looked = found::found_for(claude_dir, given, &found::ThisMachine);
+            entries.extend(
+                looked
+                    .into_iter()
+                    .map(|(folder, directory)| (folder, directory, None)),
+            );
+        }
+        let entries = &entries;
         let pairs = entries
             .iter()
             .map(|(folder, directory, _)| (folder.as_str(), directory.as_str()));

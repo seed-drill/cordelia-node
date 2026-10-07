@@ -1698,6 +1698,29 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
         let db = state.db.lock().unwrap();
         meta::set(&db, meta::SYNC_CLAUDE_REPORT, &report.to_string()).unwrap();
     };
+    // No report is stored yet: sync was just turned on, and no cycle has
+    // run. The node looks at what is found for the directory itself
+    // before it answers: the tree's transcript records the directory.
+    std::fs::write(
+        format!("{by_hand}/scope.jsonl"),
+        format!("{{\"cwd\":{tree_dir:?}}}\n"),
+    )
+    .unwrap();
+    let (_, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+    assert!(body["report"].is_null(), "{body}");
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/map",
+        json!({ "folder": tree_dir, "name": "github.com/o/app" })
+    );
+    assert_eq!(code, 400, "{body}");
+    let said = body["error"]["message"].as_str().unwrap().to_string();
+    assert!(said.contains(&by_hand), "{said}");
+    assert!(said.contains("this layout cannot be mapped"), "{said}");
+    let (_, body) = sync_post!(&app, "/api/v1/sync/status", json!({}));
+    assert_eq!(body["mappings"], json!([]));
+    std::fs::remove_file(format!("{by_hand}/scope.jsonl")).unwrap();
+
     store_report();
     let generation = state.sync_control.generation();
 

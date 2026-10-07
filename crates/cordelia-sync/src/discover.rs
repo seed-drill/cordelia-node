@@ -13,12 +13,8 @@
 //! A folder found on disk is matched to its project by the working
 //! directory recorded in its transcripts, and that directory's git remote.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Lines read from each transcript while looking for the working directory.
-const TRANSCRIPT_SCAN_LINES: usize = 200;
 
 /// A Claude Code project folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,55 +51,15 @@ pub fn folders(claude_dir: &Path) -> Vec<Folder> {
     out
 }
 
-// Where Claude Code keeps the memory of a directory, and what it names
-// the folder: asked by the node's status as well, of the folders that a
-// notice names, and so kept beside the one function that says whether
-// `cordelia sync map` would sync a folder.
+// Where Claude Code keeps the memory of a directory, what it names the
+// folder, and which directories a folder's transcripts record: asked by
+// the node as well, of the folders that a notice names and of what is
+// found for a directory that is being mapped, and so kept beside the one
+// function that says whether `cordelia sync map` would sync a folder.
 pub use cordelia_api::found::{
     claude_folder, claude_folder_name, is_claude_folder_for, memory_root, memory_root_is_assumed,
-    memory_root_known,
+    memory_root_known, recorded_cwds,
 };
-
-/// Transcripts read per folder while looking for its working directory.
-const TRANSCRIPTS_SCANNED: usize = 20;
-
-/// The working directories recorded in the folder's transcripts, without
-/// repeats: the newest transcript's first. A session can move to another
-/// directory, so a folder's transcripts may name more than one.
-pub fn recorded_cwds(folder: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut transcripts: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    transcripts.sort_by_key(|t| std::cmp::Reverse(t.0));
-
-    let mut found: Vec<PathBuf> = Vec::new();
-    for (_, path) in transcripts.into_iter().take(TRANSCRIPTS_SCANNED) {
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file)
-            .lines()
-            .take(TRANSCRIPT_SCAN_LINES)
-            .map_while(Result::ok)
-        {
-            if !line.contains("\"cwd\"") {
-                continue;
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-                && let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
-                && !found.iter().any(|f| f == Path::new(cwd))
-            {
-                found.push(PathBuf::from(cwd));
-            }
-        }
-    }
-    found
-}
 
 /// The working directory recorded first in the folder's newest transcript.
 pub fn recorded_cwd(folder: &Path) -> Option<PathBuf> {
