@@ -119,7 +119,10 @@ pub struct Devices {
     /// For each relay that has refused something for room, or for the
     /// address's allowance: how long ago it last did, in seconds.
     pub no_room_secs: Vec<u64>,
-    /// How many names no device lists yet in the generation applied.
+    /// How many names that a device which still counts had listed are
+    /// listed by no device yet in the generation applied. A name that
+    /// only a device which counts no longer had listed is not among them:
+    /// it is in `cordelia devices`, and in no level.
     pub names_not_listed: usize,
     /// For how long this device has applied the change, in seconds,
     /// where it knows.
@@ -197,6 +200,11 @@ const AMBER_WAIT_SECS: u64 = cordelia_core::protocol::STATUS_AMBER_WAIT_SECS;
 /// after this device applied it.
 const REMOVAL_SHOWN_SECS: u64 =
     cordelia_core::protocol::REMOVAL_NOT_APPLIED_SHOWN_DAYS as u64 * 24 * 60 * 60;
+
+/// Names that no device lists yet in the new generation are amber for
+/// this long after this device applied the change: as long as a removal
+/// that some device has not applied.
+const NOT_LISTED_SHOWN_SECS: u64 = REMOVAL_SHOWN_SECS;
 
 /// A relay's refusal for room is taken to stand for this long.
 const NO_ROOM_STANDS_SECS: u64 = cordelia_core::protocol::NO_ROOM_STANDS_SECS;
@@ -279,8 +287,12 @@ fn no_phrase_says(moved_on: bool) -> &'static str {
 ///    does not hold the latest change;
 /// 8. a relay that refuses a new channel for room, or for the address's
 ///    allowance;
-/// 9. names that are not yet in the new generation, or not yet sent,
-///    for more than five minutes.
+/// 9. names that a device which still counts had listed and that no
+///    device lists in the new generation, once that has lasted for more
+///    than five minutes, and for seven days from when this device applied
+///    the change: after that they are in `cordelia devices` only, as a
+///    removal is, so that a device in a drawer does not keep every line
+///    amber for good; or names not yet sent, for more than five minutes.
 pub fn holds(f: &Facts) -> Vec<Holds> {
     let mut out: Vec<Holds> = Vec::new();
     let personal_and_running = f.initialised && !f.not_asked && f.running && f.role == "personal";
@@ -400,7 +412,8 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     if d.no_room_secs.iter().any(|ago| *ago <= NO_ROOM_STANDS_SECS) {
         amber("relay_no_room", "memory: a relay has no room".into());
     }
-    let not_listed = d.names_not_listed > 0 && d.applied_secs.as_ref().is_some_and(long);
+    let shown_still = |secs: &u64| long(secs) && *secs <= NOT_LISTED_SHOWN_SECS;
+    let not_listed = d.names_not_listed > 0 && d.applied_secs.as_ref().is_some_and(shown_still);
     let not_sent = d.names_to_go > 0 && d.to_go_secs.as_ref().is_some_and(long);
     if not_listed {
         let names = count(d.names_not_listed, "name");
@@ -1354,7 +1367,8 @@ mod tests {
     /// that does not say since when. A relay that does not hold the
     /// latest change: amber once it has been connected for more than
     /// five minutes. Names not yet in the new generation, or not yet
-    /// sent: amber after more than five minutes. A removal that some
+    /// sent: amber after more than five minutes, and the first of them
+    /// for seven days from when the change was applied. A removal that some
     /// device has not applied: amber for its first seven days. A relay's
     /// refusal for room: while it is recent.
     #[test]
@@ -1397,6 +1411,20 @@ mod tests {
         assert_eq!(not_listed(Some(300)), None);
         assert_eq!(not_listed(Some(301)), amber);
         assert_eq!(not_listed(None), None);
+        // For seven days from when this device applied the change, and
+        // no longer: a device in a drawer does not keep the line amber.
+        let week = 7 * 24 * 60 * 60;
+        assert_eq!(not_listed(Some(week)), amber);
+        assert_eq!(not_listed(Some(week + 1)), None);
+        assert_eq!(not_listed(Some(90 * 24 * 60 * 60)), None);
+        // Names still to send are said then, where some wait.
+        let both = with(&|f| {
+            f.devices.names_not_listed = 1;
+            f.devices.applied_secs = Some(week + 1);
+            f.devices.names_to_go = 2;
+            f.devices.to_go_secs = Some(400);
+        });
+        assert_eq!(both.summary, "memory: 2 names not yet sent");
         let to_go = |secs: Option<u64>| {
             level(&|f| {
                 f.devices.names_to_go = 1;

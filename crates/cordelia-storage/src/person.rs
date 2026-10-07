@@ -660,6 +660,24 @@ pub fn forget_name_before(conn: &Connection, name: &str) -> Result<usize, Cordel
     .map_err(storage)
 }
 
+/// Note no longer that the key `key` had listed `name`: that key has said
+/// since, in a generation that the device came to, whether it syncs the
+/// name there. What other keys had listed stays noted. Returns whether a
+/// row went.
+pub fn forget_name_said_by(
+    conn: &Connection,
+    name: &str,
+    key: &[u8; 32],
+) -> Result<bool, CordeliaError> {
+    let rows = conn
+        .execute(
+            "DELETE FROM person_names_before WHERE name = ?1 AND said_by = ?2",
+            params![name, key.as_slice()],
+        )
+        .map_err(storage)?;
+    Ok(rows > 0)
+}
+
 /// Forget each name that was listed in a generation which the device left
 /// 90 days ago or longer, by its own clock: that generation's secret is
 /// forgotten then ([`forget_left_secrets`]), and the name can be brought
@@ -1574,6 +1592,17 @@ mod tests {
         assert_eq!(forget_name_before(&conn, "notes").unwrap(), 2);
         assert_eq!(forget_name_before(&conn, "notes").unwrap(), 0);
         assert_eq!(names_before(&conn).unwrap(), [before("app", b, NOW)]);
+        // One key's note of a name goes, and no other key's, and no other
+        // name's.
+        note_name_before(&conn, "app", &a, NOW).unwrap();
+        note_name_before(&conn, "notes", &a, NOW).unwrap();
+        assert!(forget_name_said_by(&conn, "app", &a).unwrap());
+        assert!(!forget_name_said_by(&conn, "app", &a).unwrap());
+        assert_eq!(
+            names_before(&conn).unwrap(),
+            [before("app", b, NOW), before("notes", a, NOW)]
+        );
+        assert!(forget_name_said_by(&conn, "notes", &a).unwrap());
 
         // All of them, where the device leaves its phrase.
         assert_eq!(forget_names_before(&conn, None).unwrap(), 1);

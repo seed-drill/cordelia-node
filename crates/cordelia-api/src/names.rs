@@ -444,12 +444,39 @@ pub fn stop(
     })
 }
 
+/// Whether the key `key` has said, in the personal channel whose secret is
+/// `personal`, whether it syncs `name`, as this device's store holds it:
+/// an entry of its own under the name's word, in a band of the statement
+/// numbered `number`, that passes the check. A text says that it syncs
+/// the name there, and a delete that it syncs it no longer.
+fn has_said(
+    conn: &Connection,
+    personal: &[u8; 32],
+    number: u64,
+    name: &str,
+    key: &[u8; 32],
+) -> Result<bool, PersonError> {
+    let channel = derive::channel_id(personal)?;
+    let slot = slot_id(&derive::slot_key(personal)?, &word_name(name));
+    let Some(held) = entries::author_entry(conn, &channel, &slot, key)? else {
+        return Ok(false);
+    };
+    Ok(in_a_band_of(held.entry.rev, number) && held.entry.check().is_ok())
+}
+
 /// Note what the personal channel of the generation that this device is
 /// leaving lists, as its store holds it at `now`: each name, with each
 /// key that counts under the statement it leaves and whose word lists the
 /// name. It is called in the transaction that applies a statement, before
 /// what the store holds of that generation is dropped (decision
 /// 2026-10-04 §7.3).
+///
+/// **A note of an earlier generation goes first where the key that had
+/// listed the name has said, in the generation that is left, whether it
+/// syncs the name** ([`has_said`]): a word that lists it is noted again
+/// here, as of now, and a delete says that the device syncs it no longer,
+/// on purpose. So a name that a device has unmapped is not shown again,
+/// at the next statement, as one that no device lists yet.
 ///
 /// `secret` is the person secret of the generation that is left, and
 /// `counting` who counted under its statement.
@@ -462,6 +489,13 @@ pub(crate) fn note_listed_before(
 ) -> Result<(), PersonError> {
     let personal = derive::personal_secret(secret)?;
     let channel = derive::channel_id(&personal)?;
+    for before in held_rows::names_before(conn)? {
+        let said = counting.counts(&before.key)
+            && has_said(conn, &personal, number, &before.name, &before.key)?;
+        if said {
+            held_rows::forget_name_said_by(conn, &before.name, &before.key)?;
+        }
+    }
     for slot in entries::channel_slots(conn, &channel)? {
         for entry in entries::slot_entries(conn, &channel, &slot)? {
             // An entry in a band above the statement's counts for
@@ -507,17 +541,37 @@ pub struct NotListedYet {
 /// (decision 2026-10-04 §7.3, §8), in order of name. A name that only
 /// keys which count no longer had listed has none in [`NotListedYet::by`]:
 /// it is shown apart, as that.
+///
+/// **A key's note of a name is passed over where that key has said, in
+/// the generation applied, that it syncs the name no longer** (decision
+/// 2026-10-04 §10.1): the device that listed the name has unmapped it, or
+/// turned sync off, on purpose, and every device that reads its word
+/// shows the name no more for it. The note itself goes when the
+/// generation is left ([`note_listed_before`]).
 pub fn not_listed_yet(conn: &Connection) -> Result<Vec<NotListedYet>, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
         return Ok(Vec::new());
     };
     let now_listed: BTreeSet<String> = listed(conn)?.into_iter().map(|one| one.name).collect();
     let kept_for = i64::from(LEFT_SECRET_KEPT_DAYS) * 24 * 60 * 60;
+    let personal = derive::personal_secret(&standing.secret)?;
     let mut not_yet: Vec<NotListedYet> = Vec::new();
     for before in held_rows::names_before(conn)? {
         // What was noted and is no name is counted apart, and not shown
         // ([`not_names_before`]).
         if now_listed.contains(&before.name) || !is_a_name(&before.name) {
+            continue;
+        }
+        let counts = standing.counting.counts(&before.key);
+        let said_since = counts
+            && has_said(
+                conn,
+                &personal,
+                standing.number(),
+                &before.name,
+                &before.key,
+            )?;
+        if said_since {
             continue;
         }
         if not_yet.last().is_none_or(|last| last.name != before.name) {
@@ -532,7 +586,7 @@ pub fn not_listed_yet(conn: &Connection) -> Result<Vec<NotListedYet>, PersonErro
             continue;
         };
         of.until = of.until.max(before.left_at.saturating_add(kept_for));
-        match standing.counting.counts(&before.key) {
+        match counts {
             true => of.by.push(before.key),
             false => of.by_gone.push(before.key),
         }
@@ -1120,14 +1174,129 @@ mod tests {
         assert_eq!(noted(&s), ["team"]);
         assert!(not_yet(&s).is_empty());
         // The other it says no longer, and holds still: no device lists
-        // it now, and it is shown.
+        // it now, and the one that had listed it has said so on purpose.
+        // It is shown no more, and stays noted until the generation is
+        // left.
         assert!(unsay(&s[0].conn, &s[0].identity, "team", now).unwrap());
-        assert_eq!(not_yet(&s), ["team"]);
+        assert!(not_yet(&s).is_empty());
+        assert_eq!(noted(&s), ["team"]);
         // Stopped on a device that holds it no more: the note goes all
         // the same.
         assert!(held_rows::drop_name(&s[0].conn, "team").unwrap());
         assert_eq!(stop(&s[0].conn, &s[0].identity, "team", now).unwrap(), None);
         assert!(noted(&s).is_empty());
+    }
+
+    /// Where the device that had listed a name says, in the new
+    /// generation, that it syncs it no longer, the note of it goes on
+    /// every device that reads that (decision 2026-10-04 §10.1): the name
+    /// is not shown as one that no device lists yet, for 90 days, on
+    /// devices where nobody can do anything about it. The note of another
+    /// key that had listed the name stays, and a word in a band above the
+    /// statement's, or of a key that counts no longer, takes no note
+    /// away. When the generation is left the note is gone for good.
+    #[test]
+    fn test_a_note_goes_where_the_device_that_listed_the_name_says_it_syncs_it_no_longer() {
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        for (n, name) in [(1, "team"), (1, "lab"), (2, "lab"), (2, "tablets")] {
+            s.hold(&[n], name);
+            say(&s[n].conn, &s[n].identity, name, now).unwrap();
+        }
+        s.meet(&[0, 1, 2]);
+        let change = s.change(0, &[0, 1, 2], &[]);
+        let not_yet = |s: &Several, n: usize| -> Vec<(String, usize)> {
+            let not_yet = not_listed_yet(&s[n].conn).unwrap();
+            not_yet
+                .into_iter()
+                .map(|name| (name.name, name.by.len()))
+                .collect()
+        };
+        let all = [("lab".into(), 2), ("tablets".into(), 1), ("team".into(), 1)];
+        assert_eq!(not_yet(&s, 0), all);
+
+        // Device 1 applies the change and carries its words. It then
+        // unmaps one name: a delete over its word, in the new generation.
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        assert!(
+            stop(&s[1].conn, &s[1].identity, "team", now)
+                .unwrap()
+                .is_some()
+        );
+        // Until device 0 reads that, it shows the name.
+        assert_eq!(not_yet(&s, 0), all);
+        s.pass(1, 0);
+        // Device 1 lists `lab` there, so that name is listed; and it has
+        // said that it syncs `team` no longer, so that note is passed
+        // over. What device 2 had listed is still not listed by it.
+        assert_eq!(not_yet(&s, 0), [("tablets".into(), 1)]);
+        assert_eq!(listed_on(&s, 0), [("lab".to_string(), vec![1])]);
+        // It unmaps the other too: the name is listed by no device, and
+        // is shown for device 2, which had listed it and has not said.
+        let now = s.tick();
+        stop(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(not_yet(&s, 0), [("lab".into(), 1), ("tablets".into(), 1)]);
+
+        // A word in a band above the statement's says nothing: the note
+        // stays. So does it for the word of a key that does not count.
+        let above = entry_by(
+            &s[2].identity,
+            &s[0].personal(),
+            (3 << cordelia_core::protocol::REV_COUNT_BITS) + 1,
+            "name/tablets",
+            Value::Delete,
+            &[],
+        );
+        entries::store(&s[0].conn, &above, now).unwrap();
+        assert_eq!(not_yet(&s, 0), [("lab".into(), 1), ("tablets".into(), 1)]);
+        let stranger = Machine::new(9);
+        held_rows::note_name_before(&s[0].conn, "theirs", &stranger.identity.public_key(), now)
+            .unwrap();
+        let theirs = entry_by(
+            &stranger.identity,
+            &s[0].personal(),
+            (2 << cordelia_core::protocol::REV_COUNT_BITS) + 1,
+            "name/theirs",
+            Value::Delete,
+            &[],
+        );
+        entries::store(&s[0].conn, &theirs, now).unwrap();
+        let shown = not_listed_yet(&s[0].conn).unwrap();
+        assert_eq!(shown.len(), 3);
+        assert_eq!(shown[2].name, "theirs");
+        assert_eq!(shown[2].by_gone.len(), 1);
+        held_rows::forget_name_before(&s[0].conn, "theirs").unwrap();
+
+        // The next statement: the notes that a device has answered since
+        // go for good, before the store drops the generation, and what it
+        // had listed and still lists is noted as of now.
+        let noted = |s: &Several| -> Vec<(String, usize)> {
+            let before = held_rows::names_before(&s[0].conn).unwrap();
+            let key_of = |key: &[u8; 32]| (0..3).find(|n| s.key(*n) == *key).unwrap();
+            before
+                .into_iter()
+                .map(|before| (before.name, key_of(&before.key)))
+                .collect()
+        };
+        let both = |a: usize, b: usize| (a.min(b), a.max(b));
+        let mut before = noted(&s);
+        before.sort_by_key(|(name, key)| (name.clone(), *key));
+        let lab = both(1, 2);
+        assert_eq!(
+            before,
+            [
+                ("lab".into(), lab.0),
+                ("lab".into(), lab.1),
+                ("tablets".into(), 2),
+                ("team".into(), 1)
+            ]
+        );
+        s.change(0, &[0, 1, 2], &[]);
+        let mut after = noted(&s);
+        after.sort_by_key(|(name, key)| (name.clone(), *key));
+        assert_eq!(after, [("lab".into(), 2), ("tablets".into(), 2)]);
     }
 
     /// Where a device comes to sync a name it holds it, so that its

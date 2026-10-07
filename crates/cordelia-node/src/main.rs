@@ -1039,7 +1039,12 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         no_room_secs: list("relays")
             .filter_map(|relay| ago(&relay["no_room_at"]))
             .collect(),
-        names_not_listed: list("names_not_listed").count(),
+        // Only a name that a device which still counts had listed: one
+        // that only a device which counts no longer had listed is in
+        // `cordelia devices`, and in no level.
+        names_not_listed: list("names_not_listed")
+            .filter(|name| name["by"].as_array().is_some_and(|by| !by.is_empty()))
+            .count(),
         applied_secs,
         names_to_go: person["names"]["to_go"].as_array().map_or(0, Vec::len),
         to_go_secs: ago(&person["names"]["to_go_since"]),
@@ -5052,7 +5057,13 @@ mod tests {
                 { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null },
                 { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5 },
             ],
-            "names_not_listed": [{ "name": "lab" }, { "name": "team" }],
+            // Two that a device which still counts had listed, and one
+            // that only a device which counts no longer had.
+            "names_not_listed": [
+                { "name": "lab", "by": [{ "key": "a" }], "by_gone": [] },
+                { "name": "old", "by": [], "by_gone": [{ "key": "g" }] },
+                { "name": "team", "by": [{ "key": "a" }], "by_gone": [{ "key": "g" }] },
+            ],
             "names": { "sent": ["x"], "to_go": ["lab"], "to_go_since": now - 30 },
         });
         assert_eq!(
@@ -5105,6 +5116,15 @@ mod tests {
             look["cannot_go_on"] = "this device was removed".into();
         });
         assert!(!removed.not_applied);
+        // A name that only a device which counts no longer had listed is
+        // in no level; nor is one of which the node does not say who had.
+        let gone = edit(&|look| {
+            look["names_not_listed"] = serde_json::json!([
+                { "name": "old", "by": [], "by_gone": [{ "key": "g" }] },
+                { "name": "bare" },
+            ]);
+        });
+        assert_eq!(gone.names_not_listed, 0);
     }
 
     #[test]
