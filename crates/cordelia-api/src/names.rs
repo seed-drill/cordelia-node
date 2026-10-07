@@ -181,6 +181,16 @@ pub fn unsay(
     })
 }
 
+/// Whether an entry at the revision `rev` is read under the statement
+/// numbered `number` (decision 2026-10-04 §2.3): one in a band above the
+/// statement's counts for nothing, whoever signed it. It is the one rule
+/// for every word of the personal channel that is read as a name: those
+/// of the generation applied ([`words`]), and those that are noted when a
+/// generation is left ([`note_listed_before`]).
+fn in_a_band_of(rev: u64, number: u64) -> bool {
+    cordelia_core::revision::band(rev) <= number
+}
+
 /// The words of the personal channel that list something, as this
 /// device's store holds it.
 struct Words {
@@ -195,7 +205,8 @@ struct Words {
 /// Each word of the personal channel that lists something, as this
 /// device's store holds it. A word is an entry under `name/` that is no
 /// delete, read from its own signer and no other. `of` says whose words
-/// are read.
+/// are read. An entry in a band above the statement's is no word
+/// ([`in_a_band_of`]).
 ///
 /// What comes after `name/` is read as a name only where it is one
 /// ([`is_a_name`]): a word that is not is counted for its key, and what
@@ -210,7 +221,8 @@ fn words(
     let (mut names, mut not_names) = (Vec::new(), Vec::new());
     for slot in entries::channel_slots(conn, &channel)? {
         for entry in entries::slot_entries(conn, &channel, &slot)? {
-            if entry.delete || !of(&entry.author) {
+            let read = of(&entry.author) && in_a_band_of(entry.rev, standing.number());
+            if entry.delete || !read {
                 continue;
             }
             let Ok(inside) = entry.open(&personal) else {
@@ -454,8 +466,7 @@ pub(crate) fn note_listed_before(
         for entry in entries::slot_entries(conn, &channel, &slot)? {
             // An entry in a band above the statement's counts for
             // nothing, and its word is not read.
-            let counts = counting.counts(&entry.author)
-                && cordelia_core::revision::band(entry.rev) <= number;
+            let counts = counting.counts(&entry.author) && in_a_band_of(entry.rev, number);
             if entry.delete || !counts {
                 continue;
             }
@@ -685,6 +696,67 @@ mod tests {
         );
         entries::store(&s[0].conn, &word, now).unwrap();
         assert_eq!(listed_on(&s, 0), [("lab".to_string(), vec![0])]);
+    }
+
+    /// A word in a band above the statement's counts for nothing
+    /// (decision 2026-10-04 §2.3), by the one rule for every word that
+    /// is read as a name: it lists no name in the generation applied,
+    /// for its own device or for any other, is counted as no word that
+    /// is no name, and is not noted as listed before when the generation
+    /// is left. A word in the statement's own band, and one in a band
+    /// below it, are read.
+    #[test]
+    fn test_a_word_in_a_band_above_the_statements_is_read_nowhere() {
+        use cordelia_core::protocol::REV_COUNT_BITS;
+        let mut s = Several::of_one_person(2);
+        // A second statement, so that there is a band below the applied
+        // one's as well as one above it.
+        s.change(0, &[0, 1], &[]);
+        let change = s[0].latest();
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        assert_eq!((s[0].number(), s[1].number()), (2, 2));
+        let personal = s[0].personal();
+        let word = |by: usize, band: u64, name: &str| {
+            entry_by(
+                &s[by].identity,
+                &personal,
+                (band << REV_COUNT_BITS) + 1,
+                &word_name(name),
+                Value::Text(String::new()),
+                &[],
+            )
+        };
+        // As a store would hold them had it taken them: the door for an
+        // entry from outside takes none in a band above.
+        for entry in [
+            word(1, 1, "below"),
+            word(1, 2, "in-its-band"),
+            word(1, 3, "above"),
+            word(0, 3, "its-own-above"),
+            word(1, 3, "Above And No Name"),
+        ] {
+            entries::store(&s[0].conn, &entry, now).unwrap();
+        }
+        assert_eq!(
+            listed_on(&s, 0),
+            [
+                ("below".to_string(), vec![1]),
+                ("in-its-band".to_string(), vec![1])
+            ]
+        );
+        assert!(said_here(&s[0].conn, &s[0].identity).unwrap().is_empty());
+        assert!(not_names(&s[0].conn).unwrap().is_empty());
+
+        // The generation is left: what was listed is noted by the same
+        // rule.
+        s.change(0, &[0, 1], &[]);
+        let noted: Vec<String> = held_rows::names_before(&s[0].conn)
+            .unwrap()
+            .into_iter()
+            .map(|before| before.name)
+            .collect();
+        assert_eq!(noted, ["below", "in-its-band"]);
     }
 
     /// A device that follows no phrase has no secret: it holds no name,
