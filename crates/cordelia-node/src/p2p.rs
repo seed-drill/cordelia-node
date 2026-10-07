@@ -2675,7 +2675,7 @@ pub async fn p2p_loop(
                         }
                     });
                 }
-                publish_relays(&state, &relays, &relay_tries, &conn_mgr);
+                publish_relays(&state, &relays_set_up, &relays, &relay_tries, &conn_mgr);
             }
 
             // ── Peer-sharing (spawn discovery + connects) ─────────────
@@ -3694,19 +3694,43 @@ fn is_configured_relay(
     })
 }
 
-/// Publish where each configured relay stands, for `cordelia peers` and
-/// `cordelia status`.
-fn publish_relays(
-    state: &cordelia_api::state::AppState,
-    relays: &[cordelia_network::bootstrap::RelayAddr],
+/// What is said of a relay whose name does not resolve, where its
+/// standing is listed.
+const NAME_DOES_NOT_RESOLVE: &str = "its name does not resolve";
+
+/// Where each relay that the node is set up with stands, for `cordelia
+/// peers` and `cordelia status`.
+///
+/// **Every relay of the configuration is here, by its name, whether or
+/// not the name resolves** (decision 2026-10-04 §16): `set_up` is what
+/// the node was configured with, `resolved` the addresses that those
+/// names resolve to now, and `connected` whether a relay at one of those
+/// is connected. A relay whose name has not resolved cannot be dialled:
+/// it is unreachable, and its line says why.
+fn relay_snapshots(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
     tries: &std::collections::HashMap<String, RelayTry>,
-    conn_mgr: &cordelia_network::connection::ConnectionManager,
-) {
-    let list: Vec<cordelia_api::state::RelaySnapshot> = relays
+    connected: &dyn Fn(&cordelia_network::bootstrap::RelayAddr) -> bool,
+) -> Vec<cordelia_api::state::RelaySnapshot> {
+    let key_of = |key: Option<[u8; 32]>| {
+        key.and_then(|k| cordelia_crypto::bech32::encode_public_key(&k).ok())
+    };
+    set_up
         .iter()
-        .map(|relay| {
+        .map(|named| {
+            let Some(relay) = resolved.iter().find(|relay| relay.host == named.host) else {
+                return cordelia_api::state::RelaySnapshot {
+                    host: named.host.clone(),
+                    key: key_of(named.key),
+                    state: "unreachable".into(),
+                    unreachable_secs: None,
+                    last_tried_secs: None,
+                    error: Some(NAME_DOES_NOT_RESOLVE.into()),
+                };
+            };
             let tried = tries.get(&relay.host);
-            let connected = relay_connected(conn_mgr, relay);
+            let connected = connected(relay);
             let failing = tried.filter(|t| t.failures > 0 && !connected);
             let state = if connected {
                 "connected"
@@ -3719,9 +3743,7 @@ fn publish_relays(
             };
             cordelia_api::state::RelaySnapshot {
                 host: relay.host.clone(),
-                key: relay
-                    .key
-                    .and_then(|k| cordelia_crypto::bech32::encode_public_key(&k).ok()),
+                key: key_of(relay.key),
                 state: state.into(),
                 unreachable_secs: failing.and_then(|t| t.since).map(|t| t.elapsed().as_secs()),
                 last_tried_secs: tried
@@ -3731,7 +3753,21 @@ fn publish_relays(
                 error: failing.and_then(|t| t.error.clone()),
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Publish where each relay that the node is set up with stands
+/// ([`relay_snapshots`]).
+fn publish_relays(
+    state: &cordelia_api::state::AppState,
+    set_up: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    tries: &std::collections::HashMap<String, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) {
+    let list = relay_snapshots(set_up, resolved, tries, &|relay| {
+        relay_connected(conn_mgr, relay)
+    });
     if let Ok(mut current) = state.relays.write()
         && *current != list
     {
@@ -4618,6 +4654,66 @@ async fn send_channel_announcements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every relay that a node is set up with is listed for `cordelia
+    /// peers` and `cordelia status`, by its name, whether or not the name
+    /// resolves (decision 2026-10-04 §16): one that does not is
+    /// unreachable, and its line says why.
+    #[test]
+    fn a_relay_whose_name_does_not_resolve_is_listed_with_the_others() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let named = |host: &str, key: Option<[u8; 32]>| Relay {
+            host: host.into(),
+            key,
+        };
+        let set_up = [
+            named("relay1.example:9474", Some([7; 32])),
+            named("no-such-name.example:9474", Some([8; 32])),
+            named("relay3.example:9474", None),
+        ];
+        let at = |host: &str, last: u8, key: Option<[u8; 32]>| RelayAddr {
+            host: host.into(),
+            addr: std::net::SocketAddr::from(([127, 0, 0, last], 9474)),
+            key,
+        };
+        let resolved = [
+            at("relay1.example:9474", 1, Some([7; 32])),
+            at("relay3.example:9474", 3, None),
+        ];
+        let tries = std::collections::HashMap::new();
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &|relay| {
+            relay.host == "relay1.example:9474"
+        });
+        let stands: Vec<(&str, &str, Option<&str>)> = listed
+            .iter()
+            .map(|relay| {
+                (
+                    relay.host.as_str(),
+                    relay.state.as_str(),
+                    relay.error.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            stands,
+            [
+                ("relay1.example:9474", "connected", None),
+                (
+                    "no-such-name.example:9474",
+                    "unreachable",
+                    Some("its name does not resolve")
+                ),
+                ("relay3.example:9474", "connecting", None),
+            ]
+        );
+        // Its key is said as any relay's is.
+        let key = cordelia_crypto::bech32::encode_public_key(&[8; 32]).unwrap();
+        assert_eq!(listed[1].key.as_deref(), Some(key.as_str()));
+        // With no name resolved, every relay is still listed.
+        let none = relay_snapshots(&set_up, &[], &tries, &|_| true);
+        assert_eq!(none.len(), 3);
+        assert!(none.iter().all(|relay| relay.state == "unreachable"));
+    }
 
     /// A personal node carries no channel of the older kind (decision
     /// 2026-10-04 §10): it pushes none, fetches none, announces none and

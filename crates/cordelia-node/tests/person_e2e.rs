@@ -244,6 +244,30 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
     let named = of(NO_SUCH_NAME).expect("the relay whose name does not resolve is listed");
     assert_eq!(named["heard_since_woke"], false, "{named}");
     assert_eq!(named["holds_latest"], Value::Null, "{named}");
+    // `cordelia peers`, and the status that a panel reads, list it too,
+    // with why it is not reached.
+    let unresolved = |relays: &[Value]| -> Option<()> {
+        let named = relays.iter().find(|relay| relay["host"] == NO_SUCH_NAME)?;
+        (named["state"] == "unreachable" && named["error"] == "its name does not resolve")
+            .then_some(())
+    };
+    wait_for("the relay that cannot be found is listed", &all, 20, || {
+        unresolved(&relays_of(&laptop))
+    });
+    let status: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    let listed = status["peers"]["relays"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(listed.len(), 2, "{status}");
+    assert!(unresolved(&listed).is_some(), "{status}");
+    let peers = laptop.cli(&["peers"]);
+    assert!(
+        peers.contains(&format!(
+            "{NO_SUCH_NAME}  unreachable (its name does not resolve)"
+        )),
+        "{peers}"
+    );
 
     // While it wakes it sends nothing in a channel of its own: half of
     // the wait on, what it wrote in its personal channel still waits.
