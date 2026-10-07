@@ -468,6 +468,81 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
     assert_eq!((status, &seen["state"]), (200, &json!("applied")), "{seen}");
 }
 
+/// What a look says for the level that a status shows (decision
+/// 2026-10-04 §10.1): for each relay, for how long the node has been
+/// connected to it, by the node's own clock, and when it last refused
+/// something for room; when this device applied the change; and since
+/// when the first of what it has still to send has waited.
+#[actix_web::test]
+async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
+    use cordelia_api::state::{AtRelay, AtRelays, NoRoom};
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    let at = |relay: &str, no_room: Option<NoRoom>| AtRelay {
+        relay: relay.into(),
+        holds_latest: Some(false),
+        heard_since_woke: true,
+        no_room,
+        another_form: 0,
+        refuses: None,
+    };
+    let refused = NoRoom {
+        at: 1_790_000_000,
+        over_allowance: true,
+        of_the_change: false,
+    };
+    state.own_channels.say(AtRelays {
+        relays: vec![
+            at("relay.example:9474", Some(refused)),
+            at("other.example:9474", None),
+        ],
+        cannot_go_on: None,
+    });
+    let now = std::time::Instant::now();
+    let earlier = now.checked_sub(Duration::from_secs(400)).unwrap();
+    state
+        .own_channels
+        .relays_connected(&["relay.example:9474"], earlier);
+    state
+        .own_channels
+        .relays_connected(&["relay.example:9474"], now);
+
+    let (status, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(status, 200, "{seen}");
+    let relays = seen["relays"].as_array().unwrap();
+    assert_eq!(relays.len(), 2, "{seen}");
+    // Connected for some minutes, and refused for room at a time.
+    assert_eq!(relays[0]["relay"], "relay.example:9474");
+    let connected = relays[0]["connected_secs"].as_u64().unwrap();
+    assert!((400..460).contains(&connected), "{connected}");
+    assert_eq!(relays[0]["no_room_at"], 1_790_000_000);
+    assert!(relays[0]["no_room"].is_string(), "{seen}");
+    assert_eq!(relays[0]["holds_latest"], false);
+    // Not connected, and never refused.
+    assert!(relays[1]["connected_secs"].is_null(), "{seen}");
+    assert!(relays[1]["no_room_at"].is_null(), "{seen}");
+    // Under its first statement the device has left no generation.
+    assert_eq!(seen["change"], 1);
+    assert!(seen["applied_at"].is_null(), "{seen}");
+    assert!(seen.as_object().unwrap().contains_key("applied_at"));
+    // Nothing waits to be sent: no time since when.
+    assert_eq!(seen["names"]["to_go"], json!([]));
+    assert!(seen["names"]["to_go_since"].is_null(), "{seen}");
+    assert!(
+        seen["names"]
+            .as_object()
+            .unwrap()
+            .contains_key("to_go_since")
+    );
+}
+
 /// Every request that a personal node's API takes with a body, each with
 /// one that it reads.
 fn requests_of_a_device() -> Vec<(&'static str, Value)> {

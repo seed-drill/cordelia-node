@@ -1535,6 +1535,33 @@ pub const RECEIVED_LAST_WEEK_SECS: i64 = 7 * RECEIVED_LAST_DAY_SECS;
 // local history keeps by default.
 const _: () = assert!(RECEIVED_LAST_WEEK_SECS <= HISTORY_DAYS as i64 * 24 * 60 * 60);
 
+/// How long a thing that will pass by itself has lasted before the status
+/// line shows it as amber (decision 2026-10-04 §10.1): no relay
+/// connected; a relay that is connected and does not hold the latest
+/// change; and, after a change, names that are not yet in the new
+/// generation or not yet sent. Five minutes: a machine that wakes, a
+/// relay that restarts and a device that has just applied a change are
+/// each through it in less, and what lasts longer is worth a person's
+/// knowing. The first two are counted by the node's own clock, which
+/// does not run while the machine sleeps.
+pub const STATUS_AMBER_WAIT_SECS: u64 = 300;
+
+/// For how many days after a device applied a removal the status line
+/// shows as amber that some device has not applied it (decision
+/// 2026-10-04 §8, §10.1). After that it is said in `cordelia devices`
+/// only: a device that lies in a drawer does not keep every status line
+/// amber for good.
+pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
+
+/// For how long after a relay refused something for room, or for the
+/// address's allowance, the status line takes it that the relay still
+/// refuses (decision 2026-10-04 §10.1). A device keeps the time of a
+/// relay's last refusal, and offers again what was refused after a wait
+/// that doubles up to OUTBOX_REFUSED_RETRY_MAX_SECS: a relay that still
+/// refuses has refused again within twice that, and one that has not has
+/// taken what it was offered, or was offered nothing more.
+pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 23] = [
     LABEL_ENTRY_KEY,
@@ -2217,6 +2244,25 @@ mod tests {
         assert_eq!(RECEIVED_LAST_WEEK_SECS, 604_800);
         // A file's text and its name are bounded by the one constant.
         assert_eq!(MAX_ENTRY_NAME_AND_VALUE_BYTES, 61_440);
+    }
+
+    /// What the status line goes by for its level (decision 2026-10-04
+    /// §8, §10.1): the five minutes that a passing thing has lasted
+    /// before it is amber, the seven days for which a removal that some
+    /// device has not applied is, and for how long a relay's refusal for
+    /// room is taken to stand.
+    #[test]
+    fn test_the_level_of_the_status_line_decision_2026_10_04_10_1() {
+        assert_eq!(STATUS_AMBER_WAIT_SECS, 300);
+        assert_eq!(REMOVAL_NOT_APPLIED_SHOWN_DAYS, 7);
+        assert_eq!(NO_ROOM_STANDS_SECS, 1_200);
+        assert_eq!(NO_ROOM_STANDS_SECS, 2 * OUTBOX_REFUSED_RETRY_MAX_SECS);
+        // A device that wakes has heard from its relays, or given them
+        // up, well within the wait.
+        const { assert!(WAKE_WAIT_SECS * 2 < STATUS_AMBER_WAIT_SECS) };
+        // A removal is shown for less long than the secret it left is
+        // kept, so the time that it was applied is still known.
+        const { assert!(REMOVAL_NOT_APPLIED_SHOWN_DAYS < LEFT_SECRET_KEPT_DAYS) };
     }
 
     /// The value that a proof is made over is exported from a TLS session

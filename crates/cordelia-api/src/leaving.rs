@@ -428,6 +428,56 @@ pub fn names_to_go(
     Ok(names)
 }
 
+/// Since when something of a name's channel has waited to be sent to one
+/// of `relays`, by their node keys: when this device stored the earliest
+/// entry that is the first to wait at one of them, in seconds. `None`
+/// where nothing of a name waits. What a relay had no room for waits
+/// from when it was stored.
+///
+/// A status says that names are not yet sent only once they have waited
+/// for some minutes (decision 2026-10-04 §10.1): what was written a
+/// moment ago is being sent.
+pub fn names_waiting_since(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[[u8; 32]],
+) -> Result<Option<i64>, PersonError> {
+    let carried_up_to = kept_rows::carried_up_to(conn)?;
+    let mut since: Option<i64> = None;
+    for channel in crate::at_relays::channels(conn, identity)? {
+        if !matches!(channel.kind, Kind::Name(_)) {
+            continue;
+        }
+        let first_after = |place: i64| -> Result<Option<(i64, i64)>, PersonError> {
+            let next = entries::channel_entries_after(conn, &channel.id, place, 1)?;
+            Ok(next.first().map(|held| (held.seq, held.stored_at)))
+        };
+        for relay in relays {
+            let kept = kept_rows::kept(conn, relay, &channel.id)?;
+            // As [`waits_in`] finds what waits: what came since the
+            // statement was applied, and what was carried then.
+            let mut waits: Vec<i64> = Vec::new();
+            if let Some((_, at)) = first_after(kept.sent_to.max(carried_up_to))? {
+                waits.push(at);
+            }
+            if let Some((seq, at)) = first_after(kept.carried_to)?
+                && seq <= carried_up_to
+            {
+                waits.push(at);
+            }
+            for refused in kept_rows::waiting_refused(conn, relay, &channel.id)? {
+                if let Some((seq, at)) = first_after(refused - 1)?
+                    && seq == refused
+                {
+                    waits.push(at);
+                }
+            }
+            since = waits.into_iter().chain(since).min();
+        }
+    }
+    Ok(since)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

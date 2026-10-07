@@ -254,12 +254,15 @@ fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
         .into_iter()
         .map(|(_, key)| key)
         .collect();
-    let names = leaving::names_to_go(&db(state), &state.identity, &relays).map_err(refused)?;
+    let conn = db(state);
+    let names = leaving::names_to_go(&conn, &state.identity, &relays).map_err(refused)?;
+    // Since when the first of what is still to go has waited.
+    let since = leaving::names_waiting_since(&conn, &state.identity, &relays).map_err(refused)?;
     let (to_go, sent): (Vec<_>, Vec<_>) = names.into_iter().partition(|(_, to_go)| *to_go);
     let named = |names: Vec<(String, bool)>| -> Vec<String> {
         names.into_iter().map(|(name, _)| name).collect()
     };
-    Ok(json!({ "sent": named(sent), "to_go": named(to_go) }))
+    Ok(json!({ "sent": named(sent), "to_go": named(to_go), "to_go_since": since }))
 }
 
 /// The files whose record a change could not carry, as an answer lists
@@ -286,6 +289,17 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
         (seen, sync_is_on(&conn)?, folders_mapped(&conn)?)
     };
     let mut answer = serde_json::to_value(&seen).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // For how long each relay has been connected, by the node's own
+    // clock: a status counts a relay that does not hold the latest
+    // change only once it has been connected for some minutes (decision
+    // 2026-10-04 §10.1).
+    let at_now = std::time::Instant::now();
+    for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+        let connected = relay["relay"]
+            .as_str()
+            .and_then(|name| state.own_channels.connected_for(name, at_now));
+        relay["connected_secs"] = connected.map(|connected| connected.as_secs()).into();
+    }
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
     answer["waiting"] = waiting(&state)?.into();
@@ -1181,6 +1195,20 @@ mod tests {
         s.write(0, "lab", "notes.md", "one");
         s.write(0, "team", "notes.md", "one");
         let state = state_of(s.machines.remove(0));
+        // The names, and since when the first of what is still to go has
+        // waited: a time where something waits, and none where nothing
+        // does.
+        let names_sent = |state: &AppState| -> Result<serde_json::Value, ApiError> {
+            let mut names = super::names_sent(state)?;
+            let since = names
+                .as_object_mut()
+                .unwrap()
+                .remove("to_go_since")
+                .unwrap();
+            let waits = !names["to_go"].as_array().unwrap().is_empty();
+            assert_eq!(since.as_i64().is_some(), waits, "{names}: {since}");
+            Ok(names)
+        };
         // No relay is connected: nothing is known to wait anywhere.
         assert_eq!(channels_waiting(&state), 0);
         assert_eq!(

@@ -1840,6 +1840,92 @@ mod tests {
         );
     }
 
+    /// Since when names have waited to be sent (decision 2026-10-04
+    /// §10.1): when the device stored the earliest entry that is the
+    /// first to wait at one of the relays asked about. Nothing where
+    /// nothing waits, and nothing where no relay is asked about.
+    #[test]
+    fn test_since_when_names_have_waited_to_be_sent() {
+        use crate::leaving::names_waiting_since;
+        let mut s = Several::of_one_person(1);
+        s.hold(&[0], "lab");
+        s.hold(&[0], "team");
+        s.write(0, "lab", "notes.md", "one");
+        s.write(0, "team", "notes.md", "one");
+        s.write(0, "team", "more.md", "two");
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
+        let since = |relays: &[[u8; 32]]| names_waiting_since(conn, identity, relays).unwrap();
+        let channel = |name: &str| held_rows::channel_of_name(conn, name).unwrap().unwrap();
+        let (lab, team) = (channel("lab"), channel("team"));
+        // Each entry was stored at a time of its own.
+        let held =
+            |channel: &[u8; 32]| entries::channel_entries_after(conn, channel, 0, 8).unwrap();
+        let stored = |channel: &[u8; 32], at: &[i64]| {
+            for (held, at) in held(channel).iter().zip(at) {
+                conn.execute(
+                    "UPDATE entries SET stored_at = ?1 WHERE seq = ?2",
+                    rusqlite::params![at, held.seq],
+                )
+                .unwrap();
+            }
+        };
+        stored(&lab, &[500]);
+        stored(&team, &[300, 400]);
+
+        // The first that waits, of the earliest name.
+        assert_eq!(since(&[relay]), Some(300));
+        assert_eq!(since(&[]), None);
+        // The first of `team` is sent: its second waits, from when it
+        // was stored.
+        kept_rows::sent(conn, &relay, &team, held(&team)[0].seq).unwrap();
+        assert_eq!(since(&[relay]), Some(400));
+        // At another relay everything waits still.
+        assert_eq!(since(&[relay, other_relay]), Some(300));
+        assert_eq!(since(&[other_relay, relay]), Some(300));
+        // Everything is sent to the one: nothing waits there.
+        kept_rows::sent(conn, &relay, &team, i64::MAX / 2).unwrap();
+        assert_eq!(since(&[relay]), Some(500));
+        kept_rows::sent(conn, &relay, &lab, i64::MAX / 2).unwrap();
+        assert_eq!(since(&[relay]), None);
+        // What a relay had no room for waits from when it was stored.
+        kept_rows::refused(conn, &relay, &team, held(&team)[1].seq).unwrap();
+        assert_eq!(since(&[relay]), Some(400));
+        // The personal channel is no name: what waits of it is not said.
+        let alone = Machine::new(7);
+        assert_eq!(
+            names_waiting_since(&alone.conn, &alone.identity, &[relay]).unwrap(),
+            None
+        );
+    }
+
+    /// A look says when the device applied the change that stands: when
+    /// it left the generation before, where it left one (decision
+    /// 2026-10-04 §10.1). A status counts some things only for a time
+    /// from then.
+    #[test]
+    fn test_a_look_says_when_the_device_applied_the_change() {
+        let mut s = Several::of_one_person(2);
+        let seen = |s: &Several, n: usize| {
+            look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
+        };
+        // Under the first statement, no generation was left.
+        assert_eq!(seen(&s, 0).applied_at, None);
+        assert_eq!(seen(&s, 1).applied_at, None);
+        let change = s.change(0, &[0, 1], &[]);
+        let made = s.now;
+        assert_eq!(seen(&s, 0).applied_at, Some(made));
+        assert_eq!(seen(&s, 1).applied_at, None, "it has not applied it");
+        let later = s.tick() + 600;
+        take(&s[1].conn, &s[1].identity, &change, later).unwrap();
+        assert_eq!(seen(&s, 1).change, Some(2));
+        assert_eq!(seen(&s, 1).applied_at, Some(later));
+        // The later of two.
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(seen(&s, 0).applied_at, Some(s.now));
+        assert_eq!(seen(&s, 0).change, Some(3));
+    }
+
     /// What another device wrote as a name and is none is not shown by a
     /// look, in anything it says or lists: it is counted, and said as a
     /// number (decision 2026-10-04 §16). So neither `cordelia devices` nor

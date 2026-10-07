@@ -224,6 +224,12 @@ pub struct AtRelayLook {
     pub heard_since_woke: bool,
     /// The relay's last refusal for room, in words.
     pub no_room: Option<String>,
+    /// When that refusal was, in seconds, in UTC: a status counts it
+    /// only while it is recent.
+    pub no_room_at: Option<i64>,
+    /// For how long the node has been connected to the relay, by its own
+    /// clock, where it is: the node's route fills it in.
+    pub connected_secs: Option<u64>,
     /// How many entries of this device's own the relay holds in another
     /// form.
     pub another_form: usize,
@@ -249,6 +255,10 @@ pub struct Look {
     pub may_add: bool,
     /// The number of the statement applied.
     pub change: Option<u64>,
+    /// When this device applied it, in seconds, by its own clock, where
+    /// it left a generation for it and still keeps that generation's
+    /// secret: when it left. `None` on a device that has left none.
+    pub applied_at: Option<i64>,
     /// What the change entry of that statement is named by, in hex: the
     /// latest that the device keeps. A command that made a change, and
     /// lost the node's answer, learns by it whether the node made it
@@ -365,6 +375,7 @@ pub fn look(
             others: 0,
             may_add: false,
             change: None,
+            applied_at: None,
             latest: None,
             phrase_words: None,
             statements_left: None,
@@ -440,6 +451,9 @@ fn of_its_person(
     };
     look.may_add = held.state == State::Applied && counting.may_add(&own);
     look.change = Some(statement.number);
+    // It left the generation before when it applied this one.
+    let left = held_rows::secrets(conn)?;
+    look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
     look.latest = Some(hex::encode(latest_entry(conn)?.id()));
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
@@ -1172,6 +1186,8 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                     }
                 )
             }),
+            no_room_at: relay.no_room.map(|refused| refused.at),
+            connected_secs: None,
             another_form: relay.another_form,
             refuses: relay.refuses.clone(),
         })
