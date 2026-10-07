@@ -57,7 +57,7 @@ use zeroize::{Zeroize, Zeroizing};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
-    PERSONAL_APPLIED_SENT,
+    PERSONAL_APPLIED_SENT, RECOVERY_MAX_LEFT_SECRETS,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
@@ -92,6 +92,12 @@ pub enum PersonError {
 
     #[error("the statement is not the first of a phrase, made on this device and listing it alone")]
     NotAFirstStatement,
+
+    #[error(
+        "the statement is not a recovery's: made on this device and listing it alone, after \
+         another statement"
+    )]
+    NotARecovery,
 
     #[error("this device has stopped ({0:?}): the way on is a person's")]
     Stopped(State),
@@ -1148,6 +1154,87 @@ pub fn follow_first(
         };
         its_own_entry(&change)?;
         apply_judged(conn, identity, None, &change, now)
+    })
+}
+
+/// Follow the phrase whose statement `entry` carries, on a device that
+/// follows none, where a recovery made that statement on this device
+/// (decision 2026-10-04 §5.1, §9, step 4): the node's half of `cordelia
+/// recover`. `entry` is the change entry that the command made with the
+/// phrase, and `statement_key` the phrase's statement key. The node opens
+/// the secret that the entry seals to this device's key, and applies the
+/// statement: it has nothing to carry.
+///
+/// `left` are the secrets of the generation that was recovered from, and
+/// of those before it that its change entry gave the phrase, each with
+/// its statement's number. **The machine keeps them as a device keeps a
+/// secret it left, for 90 days** (§3, §9): they are for the look that
+/// follows, and for a carry by command after it. They are the one thing
+/// that the phrase opens which the node is handed.
+///
+/// Refused, with nothing changed: on a device that already follows a
+/// phrase; an entry that is no change entry, or that the statement key
+/// does not open; a statement that is not a recovery's (made on this
+/// device, listing it alone, after another statement); a secret that is
+/// not sealed to this device, or is not the one that the statement
+/// commits to; more secrets than an entry gives; and one that is said to
+/// be of this statement or a later one.
+pub fn follow_recovered(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    statement_key: &[u8; 32],
+    left: &[(u64, [u8; 32])],
+    now: i64,
+) -> Result<Applied, PersonError> {
+    in_one(conn, || {
+        if held_rows::person(conn)?.is_some() {
+            return Err(PersonError::FollowsAPhrase);
+        }
+        let following = Following {
+            phrase_key: entry.author,
+            statement_key: *statement_key,
+            phrase_channel: entry.channel,
+        };
+        let opened = change_entry::open_for_device(
+            entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        )?;
+        opened.statement.verify()?;
+        let own = identity.public_key();
+        let made = &opened.statement.statement;
+        let is_a_recoverys = made.number > 1
+            && !made.chain.is_empty()
+            && made.maker == own
+            && made.devices.len() == 1
+            && made.devices[0].key == own;
+        if !is_a_recoverys {
+            return Err(PersonError::NotARecovery);
+        }
+        let DeviceSecret::Opened(secret) = opened.secret else {
+            return Err(PersonError::SecretNotCommitted);
+        };
+        let before_it = left
+            .iter()
+            .all(|(number, _)| *number >= 1 && *number < made.number);
+        if left.len() > RECOVERY_MAX_LEFT_SECRETS || !before_it {
+            return Err(PersonError::NotARecovery);
+        }
+        let change = Change {
+            following: &following,
+            statement: &opened.statement,
+            secret: &secret,
+            entry,
+        };
+        its_own_entry(&change)?;
+        let applied = apply_judged(conn, identity, None, &change, now)?;
+        for (number, left_secret) in left {
+            held_rows::keep_left_secret(conn, *number, left_secret, now)?;
+        }
+        Ok(applied)
     })
 }
 

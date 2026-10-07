@@ -16,7 +16,8 @@ pub fn open(path: &Path) -> Result<Connection, StorageError> {
     Ok(conn)
 }
 
-/// Open an in-memory database with schema initialised. For testing.
+/// Open an in-memory database with schema initialised: for testing, and
+/// for what a command reads in its own process and keeps in no file.
 pub fn open_in_memory() -> Result<Connection, StorageError> {
     let conn = Connection::open_in_memory()?;
     schema::init_db(&conn)?;

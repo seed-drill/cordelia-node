@@ -233,6 +233,9 @@ pub struct OwnChannels {
     /// What was last read at the relays for a command, with what that
     /// reading is named by: kept until the command has been handed it.
     shelf: Mutex<(u64, Vec<Vec<u8>>)>,
+    /// How far the look of a recovery is, and what it found, where this
+    /// node has made one since it started (decision 2026-10-04 §9).
+    look: Mutex<Option<serde_json::Value>>,
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -418,6 +421,19 @@ impl OwnChannels {
         carrying
             .get(channel)
             .is_some_and(|began| now.saturating_duration_since(*began) < CARRYING_WAIT)
+    }
+
+    /// Keep how far the look of a recovery is, or what it found (decision
+    /// 2026-10-04 §9, step 5), for the command that waits for it. It is
+    /// kept in memory alone: a look that is interrupted is not taken up
+    /// again by itself, and a node that starts again says nothing of one.
+    pub fn set_look(&self, said: serde_json::Value) {
+        *self.look.lock().unwrap_or_else(|e| e.into_inner()) = Some(said);
+    }
+
+    /// What was last kept of the look of a recovery ([`Self::set_look`]).
+    pub fn look(&self) -> Option<serde_json::Value> {
+        self.look.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Keep `entries`, which were read at the relays for a command that

@@ -42,6 +42,7 @@ pub mod look;
 pub mod names;
 pub mod person;
 pub mod publish;
+pub mod recover;
 #[cfg(test)]
 mod several;
 pub mod state;
@@ -151,6 +152,17 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/read", web::post().to(carrying::read_proved))
             .route("/read/part", web::post().to(carrying::read_part))
             .route("/handed", web::post().to(carrying::handed_take)),
+    );
+
+    // Recovery (decision 2026-10-04 §9): the phrase is typed at the
+    // command, which hands the node the change entry that it made, the
+    // secrets of the generations before, which the machine keeps, and a
+    // word for the look.
+    cfg.service(
+        web::scope("/api/v1/recover")
+            .route("/look", web::post().to(recover::look))
+            .route("/make", web::post().to(recover::make))
+            .route("/progress", web::post().to(recover::progress)),
     );
 
     // Sync adapters (decision 2026-09-30-agent-memory-sync §4.5)

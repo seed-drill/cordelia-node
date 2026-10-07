@@ -1651,6 +1651,13 @@ pub const RECOVERY_MAX_NAMES: usize = 1_024;
 /// from those.
 pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
 
+/// The most secrets of generations before its own that a machine which
+/// recovers is handed, and keeps as a device keeps a secret it left
+/// (decision 2026-10-04 §3, §9): the one of the generation it recovered
+/// from, and as many before it as a change entry gives the phrase.
+/// Derived: MAX_EARLIER_SECRETS and one.
+pub const RECOVERY_MAX_LEFT_SECRETS: usize = MAX_EARLIER_SECRETS + 1;
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 24] = [
     LABEL_ENTRY_KEY,
@@ -2337,6 +2344,7 @@ mod tests {
         const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };
         assert_eq!(RECOVERY_MAX_NAMES, 1_024);
         assert_eq!(RECOVERY_MAX_DEVICES_SHOWN, 256);
+        assert_eq!(RECOVERY_MAX_LEFT_SECRETS, 9);
         // A recovery shows every device that a reader may count, and
         // every record that it may keep as not counted beside them.
         const { assert!(RECOVERY_MAX_DEVICES_SHOWN >= MAX_COUNTED_DEVICES) };

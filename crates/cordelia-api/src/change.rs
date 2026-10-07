@@ -174,6 +174,48 @@ pub fn prepare_settlement(
     })
 }
 
+/// Prepare the statement that a recovery makes (decision 2026-10-04 §9,
+/// step 4), with no phrase: a new secret, and the statement after `from`,
+/// the one that is recovered from, in the bytes that will be signed. It
+/// lists `maker`, the machine that recovers, as its only device, and as
+/// removed every key in `removed`: each device that the person said is
+/// gone. **A device of `from` that is in neither is one the person still
+/// has:** it is in no list, and is added again by hand, with its key
+/// read from the device itself (§9, step 6).
+///
+/// Where `apart` is given, a statement that is not on the chain of
+/// `from` was found beside it: the statement that is made settles the
+/// two (§4.5), and lists as removed every key that either removed.
+///
+/// Refused: whatever a statement refuses, a maker that `from` or `apart`
+/// lists as removed among it.
+pub fn prepare_recovery(
+    from: &SignedStatement,
+    apart: Option<&SignedStatement>,
+    maker: Device,
+    removed: &[[u8; 32]],
+) -> Result<Prepared, PersonError> {
+    let secret = Zeroizing::new(statement::new_secret()?);
+    let key = maker.key;
+    let made = match apart {
+        None => from.statement.next(key, &secret, vec![maker], removed)?,
+        Some(apart) => Statement::settle(
+            &from.statement,
+            &apart.statement,
+            key,
+            &secret,
+            vec![maker],
+            removed,
+        )?,
+    };
+    Ok(Prepared {
+        applied: from.clone(),
+        apart: apart.cloned(),
+        bytes: made.to_bytes()?,
+        secret,
+    })
+}
+
 /// Make the change that follows the statement `applied` (decision
 /// 2026-10-04 §4.5, §7.1): a removal, or a renewal where `removed` is
 /// empty.

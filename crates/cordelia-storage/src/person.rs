@@ -325,6 +325,32 @@ pub fn apply_secret(
     applied
 }
 
+/// Keep `secret`, of statement `number`, as a secret that the device left
+/// at `now` (decision 2026-10-04 §3, §9). A machine that recovers is
+/// handed the secret of the generation it recovered from, and those
+/// before it that the change entry gave the phrase: it keeps each as a
+/// device keeps a secret it left, for 90 days from then. One that the
+/// device holds already, applied or left, stays as it is. Says whether it
+/// was kept anew.
+pub fn keep_left_secret(
+    conn: &Connection,
+    number: u64,
+    secret: &[u8; 32],
+    now: i64,
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_secrets (number, secret, left_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(number, secret) DO NOTHING",
+        params![
+            i64::try_from(number).unwrap_or(i64::MAX),
+            secret.as_slice(),
+            now
+        ],
+    )
+    .map(|rows| rows > 0)
+    .map_err(storage)
+}
+
 /// Forget each secret that the device left 90 days ago or longer, by its
 /// own clock: `now` is that clock, in seconds. The secret it has applied
 /// is never forgotten here. Returns how many were forgotten.
@@ -1172,6 +1198,48 @@ mod tests {
         let applied = applied_secret(&conn).unwrap().unwrap();
         assert_eq!((applied.number, applied.secret), (3, [0xa3; 32]));
         assert_eq!(KEPT_SECS, 7_776_000);
+    }
+
+    /// A machine that recovers keeps the secret of the generation it
+    /// recovered from, and those before it, as secrets it left then
+    /// (decision 2026-10-04 §3, §9): each is listed with the left ones,
+    /// and forgotten 90 days after. One that the device holds already
+    /// stays as it is, and the applied one stays the applied one.
+    #[test]
+    fn test_a_secret_that_a_recovery_hands_over_is_kept_as_one_that_was_left() {
+        let conn = db::open_in_memory().unwrap();
+        apply_secret(&conn, 4, &[0xa4; 32], NOW).unwrap();
+        assert!(keep_left_secret(&conn, 3, &[0xa3; 32], NOW).unwrap());
+        assert!(keep_left_secret(&conn, 2, &[0xa2; 32], NOW).unwrap());
+        // Two generations can have one number, after two changes made
+        // apart: each is kept.
+        assert!(keep_left_secret(&conn, 2, &[0xb2; 32], NOW).unwrap());
+        // Kept twice, it is kept once, and as it was first kept.
+        assert!(!keep_left_secret(&conn, 3, &[0xa3; 32], NOW + 50 * DAY).unwrap());
+        // The applied one is not made a left one by it.
+        assert!(!keep_left_secret(&conn, 4, &[0xa4; 32], NOW).unwrap());
+        let held: Vec<(u64, [u8; 32], Option<i64>)> = secrets(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|secret| (secret.number, secret.secret, secret.left_at))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (4, [0xa4; 32], None),
+                (3, [0xa3; 32], Some(NOW)),
+                (2, [0xb2; 32], Some(NOW)),
+                (2, [0xa2; 32], Some(NOW)),
+            ]
+        );
+        // For 90 days from when the recovery was made, and no longer.
+        assert_eq!(forget_left_secrets(&conn, NOW + 90 * DAY - 1).unwrap(), 0);
+        assert_eq!(forget_left_secrets(&conn, NOW + 90 * DAY).unwrap(), 3);
+        let applied = applied_secret(&conn).unwrap().unwrap();
+        assert_eq!((applied.number, applied.secret), (4, [0xa4; 32]));
+        // A number that no statement has is refused by the table.
+        assert!(keep_left_secret(&conn, 0, &[1; 32], NOW).is_err());
+        assert!(keep_left_secret(&conn, 257, &[1; 32], NOW).is_err());
     }
 
     /// A device that leaves its phrase forgets every secret it holds, the

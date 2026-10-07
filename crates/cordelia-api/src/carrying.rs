@@ -959,136 +959,12 @@ pub async fn handed_take(
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
     use cordelia_crypto::entry::Value;
     use cordelia_crypto::phrase::Phrase;
-    use cordelia_storage::meta;
 
-    use crate::several::{Machine, OTHER_WORDS, Several, entry_by, state_of};
+    use crate::several::{Machine, Node, OTHER_WORDS, SESSION, Several, entry_by};
 
     const LAB: &str = "lab";
-
-    /// What the relay of a test holds: for each channel, its entries, as
-    /// their bytes on the wire.
-    type AtTheRelay = Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>;
-
-    /// What was asked through the door: each channel, with whether the
-    /// node proved its key itself.
-    type Asked = Arc<Mutex<Vec<([u8; 32], bool)>>>;
-
-    /// A node of a test: its state, with a network; what its one relay
-    /// holds; and what was asked through the door, each channel with
-    /// whether the node proved its key itself.
-    struct Node {
-        state: Arc<AppState>,
-        relay: AtTheRelay,
-        asked: Asked,
-    }
-
-    /// The session of the connection to the relay of a test.
-    const SESSION: [u8; 32] = [5; 32];
-
-    impl Node {
-        /// The node of `machine`, with a stand-in for its loop: asked for
-        /// a whole pass it makes one; asked through the door it answers
-        /// for its one relay, `relay`, with what that holds of the
-        /// channel.
-        fn of(machine: Machine) -> Self {
-            let mut state = state_of(machine);
-            state.push_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
-            let state = Arc::new(state);
-            let relay: AtTheRelay = Default::default();
-            let asked: Asked = Default::default();
-            let passes = Arc::clone(&state);
-            tokio::spawn(async move {
-                loop {
-                    passes.own_channels.wait_asked().await;
-                    let pass = passes.own_channels.whole_pass_begins();
-                    passes.own_channels.whole_pass_ended(pass);
-                }
-            });
-            let (node, holds, log) = (Arc::clone(&state), Arc::clone(&relay), Arc::clone(&asked));
-            tokio::spawn(async move {
-                loop {
-                    match node.own_channels.wait_door().await {
-                        DoorAsk::Sessions { answer } => {
-                            let _ = answer.send(vec![("relay".to_string(), Some(SESSION))]);
-                        }
-                        DoorAsk::Read {
-                            channel,
-                            by,
-                            answer,
-                            ..
-                        } => {
-                            let by_secret = matches!(by, ProvedBy::Secret(_));
-                            log.lock().unwrap().push((channel, by_secret));
-                            let read = match holds.lock().unwrap().get(&channel) {
-                                None => LeftRead::NotHeld,
-                                Some(entries) => LeftRead::Read {
-                                    entries: entries.clone(),
-                                    whole: true,
-                                },
-                            };
-                            let _ = answer.send(vec![LeftAt {
-                                relay: "relay".into(),
-                                read,
-                            }]);
-                        }
-                    }
-                }
-            });
-            Self {
-                state,
-                relay,
-                asked,
-            }
-        }
-
-        /// The relay holds `entries` of the channel whose secret is
-        /// `secret`.
-        fn relay_holds(&self, secret: &[u8; 32], entries: &[CheckedEntry]) {
-            let channel = derive::channel_id(secret).unwrap();
-            let wire = entries.iter().map(|entry| entry.to_wire()).collect();
-            self.relay.lock().unwrap().insert(channel, wire);
-        }
-
-        /// The text of `file` in the name, as the node reads it.
-        fn text(&self, file: &str) -> Option<String> {
-            let conn = db(&self.state);
-            match crate::publish::read(&conn, LAB, file)
-                .ok()?
-                .slot
-                .current?
-                .value
-            {
-                Value::Text(text) => Some(text),
-                other => Some(format!("{other:?}")),
-            }
-        }
-
-        /// How many entries the node's store holds.
-        fn stored(&self) -> i64 {
-            let conn = db(&self.state);
-            conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
-                .unwrap()
-        }
-
-        /// A word of `phrase` for `allows`, given now on this node's
-        /// device, under the change entry that it keeps.
-        fn word(&self, phrase: &Phrase, allows: &Allows) -> Word {
-            let under = person::latest_entry(&db(&self.state)).unwrap().id();
-            let own = self.state.identity.public_key();
-            Word::give(phrase, &own, &under, allows.says().unwrap(), now()).unwrap()
-        }
-
-        /// A folder of this device's is mapped to the name.
-        fn maps_a_folder(&self) {
-            let mapped = json!([{ "folder": "/home/sam/notes", "name": LAB }]).to_string();
-            meta::set(&db(&self.state), meta::SYNC_CLAUDE_MAPPINGS, &mapped).unwrap();
-        }
-    }
 
     /// Devices 0 and 2 sync a name, and device 2 writes there what only
     /// the relay is sent: over a file that device 0 holds, a file of its
@@ -1163,8 +1039,8 @@ mod tests {
             assert_eq!(found["under"], hex::encode(under));
         }
         assert_eq!(node.stored(), before);
-        assert_eq!(node.text("only.md"), None);
-        assert_eq!(node.text("kept.md").as_deref(), Some("of device 0"));
+        assert_eq!(node.text(LAB, "only.md"), None);
+        assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("of device 0"));
 
         // What names no removed key is refused: a label that none goes
         // by, and a key that counts.
@@ -1243,9 +1119,9 @@ mod tests {
         assert_eq!(done["carried"], 1, "{done}");
         assert_eq!(done["above"], json!(["kept.md"]));
         assert_eq!(done["deletes"], 1);
-        assert_eq!(node.text("only.md").as_deref(), Some("of device 2"));
-        assert_eq!(node.text("kept.md").as_deref(), Some("of device 0"));
-        assert_eq!(node.text("deleted.md"), None);
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("of device 2"));
+        assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("of device 0"));
+        assert_eq!(node.text(LAB, "deleted.md"), None);
         assert_eq!(node.stored(), before + 1);
         // Run again, it takes what the new channel still lacks: nothing.
         let again = take_from(&node.state, &word).await.unwrap();
@@ -1253,14 +1129,14 @@ mod tests {
 
         // With a folder mapped, the second yes named the file: it comes
         // in above the version that the new channel holds.
-        node.maps_a_folder();
+        node.maps_a_folder(LAB);
         let word = node.word(&phrase, &from(&[removed], &["kept.md"]));
         let done = take_from(&node.state, &word).await.unwrap();
         assert_eq!(done["carried"], 1, "{done}");
         assert_eq!(done["above"], json!([]));
-        assert_eq!(node.text("kept.md").as_deref(), Some("over it"));
+        assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("over it"));
         // A file that the word does not name stays where it is.
-        assert_eq!(node.text("deleted.md"), None);
+        assert_eq!(node.text(LAB, "deleted.md"), None);
     }
 
     /// A generation whose secret this device never held is read by the
@@ -1365,9 +1241,12 @@ mod tests {
         let word = node.word(&phrase, &Allows::Handed { name: LAB.into() });
         let done = take_handed(&node.state, &word, &versions).unwrap();
         assert_eq!(done["carried"], 2, "{done}");
-        assert_eq!(node.text("kept.md").as_deref(), Some("edited on device 2"));
         assert_eq!(
-            node.text("late.md").as_deref(),
+            node.text(LAB, "kept.md").as_deref(),
+            Some("edited on device 2")
+        );
+        assert_eq!(
+            node.text(LAB, "late.md").as_deref(),
             Some("sent before the change")
         );
         // A version that says a key signed it which does not count is
@@ -1382,6 +1261,6 @@ mod tests {
             (&done["carried"], &done["by_other_keys"]),
             (&json!(0), &json!(1))
         );
-        assert_eq!(node.text("theirs.md"), None);
+        assert_eq!(node.text(LAB, "theirs.md"), None);
     }
 }

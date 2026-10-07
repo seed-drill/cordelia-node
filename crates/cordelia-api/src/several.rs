@@ -7,7 +7,9 @@
 //! channel goes through [`take`], and the entry of a pair channel is
 //! given to [`accept`] with the key that a person typed.
 
+use std::collections::HashMap;
 use std::ops::Index;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
@@ -28,15 +30,18 @@ use cordelia_crypto::version::{self, Slot};
 use cordelia_crypto::{item_decrypt, item_encrypt};
 use cordelia_storage::db;
 use cordelia_storage::entries;
+use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Kept, State};
 
 use crate::adding::{Accepted, Added, accept, add_device};
+use crate::carry::{Allows, Word};
 use crate::change::make_change;
 use crate::person::{
     Applied, Held, Shown, applied_name, applied_secret, first_statement, held, hold_name,
     kept_entry, latest_entry, shown, who_counts,
 };
 use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProvedBy};
 use crate::take::{Taken, take};
 
 pub(crate) const WORDS: &str =
@@ -448,6 +453,141 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
         own_channels: Default::default(),
         held: Default::default(),
         history: Default::default(),
+    }
+}
+
+// ── A node with a network, and a stand-in for its loop ───────────────
+
+fn db(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
+    state.db.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The clock that a route goes by, in seconds.
+fn wall_clock() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// What the relay of a test holds: for each channel, its entries, as
+/// their bytes on the wire.
+pub(crate) type AtTheRelay = Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>;
+
+/// What was asked through the door: each channel, with whether the
+/// node proved its key itself.
+pub(crate) type Asked = Arc<Mutex<Vec<([u8; 32], bool)>>>;
+
+/// A node of a test: its state, with a network; what its one relay
+/// holds; and what was asked through the door, each channel with
+/// whether the node proved its key itself.
+pub(crate) struct Node {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) relay: AtTheRelay,
+    pub(crate) asked: Asked,
+    /// What the stand-in did, in order: `pass` for a whole pass, which
+    /// shows the change entry to every relay first, and `read` for a
+    /// channel read through the door.
+    pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
+}
+
+/// The session of the connection to the relay of a test.
+pub(crate) const SESSION: [u8; 32] = [5; 32];
+
+impl Node {
+    /// The node of `machine`, with a stand-in for its loop: asked for
+    /// a whole pass it makes one; asked through the door it answers
+    /// for its one relay, `relay`, with what that holds of the
+    /// channel.
+    pub(crate) fn of(machine: Machine) -> Self {
+        let mut state = state_of(machine);
+        state.push_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        let state = Arc::new(state);
+        let relay: AtTheRelay = Default::default();
+        let asked: Asked = Default::default();
+        let did: Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let (passes, order) = (Arc::clone(&state), Arc::clone(&did));
+        tokio::spawn(async move {
+            loop {
+                passes.own_channels.wait_asked().await;
+                let pass = passes.own_channels.whole_pass_begins();
+                order.lock().unwrap().push("pass");
+                passes.own_channels.whole_pass_ended(pass);
+            }
+        });
+        let (node, holds, log) = (Arc::clone(&state), Arc::clone(&relay), Arc::clone(&asked));
+        let order = Arc::clone(&did);
+        tokio::spawn(async move {
+            loop {
+                match node.own_channels.wait_door().await {
+                    DoorAsk::Sessions { answer } => {
+                        let _ = answer.send(vec![("relay".to_string(), Some(SESSION))]);
+                    }
+                    DoorAsk::Read {
+                        channel,
+                        by,
+                        answer,
+                        ..
+                    } => {
+                        let by_secret = matches!(by, ProvedBy::Secret(_));
+                        log.lock().unwrap().push((channel, by_secret));
+                        order.lock().unwrap().push("read");
+                        let read = match holds.lock().unwrap().get(&channel) {
+                            None => LeftRead::NotHeld,
+                            Some(entries) => LeftRead::Read {
+                                entries: entries.clone(),
+                                whole: true,
+                            },
+                        };
+                        let _ = answer.send(vec![LeftAt {
+                            relay: "relay".into(),
+                            read,
+                        }]);
+                    }
+                }
+            }
+        });
+        Self {
+            state,
+            relay,
+            asked,
+            did,
+        }
+    }
+
+    /// The relay holds `entries` of the channel whose secret is
+    /// `secret`.
+    pub(crate) fn relay_holds(&self, secret: &[u8; 32], entries: &[CheckedEntry]) {
+        let channel = derive::channel_id(secret).unwrap();
+        let wire = entries.iter().map(|entry| entry.to_wire()).collect();
+        self.relay.lock().unwrap().insert(channel, wire);
+    }
+
+    /// The text of `file` in `name`, as the node reads it.
+    pub(crate) fn text(&self, name: &str, file: &str) -> Option<String> {
+        let conn = db(&self.state);
+        match read(&conn, name, file).ok()?.slot.current?.value {
+            Value::Text(text) => Some(text),
+            other => Some(format!("{other:?}")),
+        }
+    }
+
+    /// How many entries the node's store holds.
+    pub(crate) fn stored(&self) -> i64 {
+        let conn = db(&self.state);
+        conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A word of `phrase` for `allows`, given now on this node's
+    /// device, under the change entry that it keeps.
+    pub(crate) fn word(&self, phrase: &Phrase, allows: &Allows) -> Word {
+        let under = latest_entry(&db(&self.state)).unwrap().id();
+        let own = self.state.identity.public_key();
+        Word::give(phrase, &own, &under, allows.says().unwrap(), wall_clock()).unwrap()
+    }
+
+    /// A folder of this device's is mapped to `name`.
+    pub(crate) fn maps_a_folder(&self, name: &str) {
+        let mapped = serde_json::json!([{ "folder": "/home/sam/notes", "name": name }]).to_string();
+        meta::set(&db(&self.state), meta::SYNC_CLAUDE_MAPPINGS, &mapped).unwrap();
     }
 }
 
