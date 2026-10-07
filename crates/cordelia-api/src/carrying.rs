@@ -64,7 +64,9 @@ use crate::commands::{self, Waited};
 use crate::error::ApiError;
 use crate::names;
 use crate::person::{self, Held, PersonError};
+use crate::publish::Standing;
 use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy};
+use crate::take::take;
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -604,6 +606,111 @@ pub(crate) fn newest_of(
     Ok(carry::newest(all))
 }
 
+/// What the relays hold of the channel of `name` in the generation
+/// applied, for a name that this device does not hold (decision
+/// 2026-10-04 §7.3): read through the door, as a channel that was left
+/// is read, and stored nowhere. Says too whether it was read whole: one
+/// relay at least handed it to its end or holds none of it, and every
+/// relay that was reached did.
+///
+/// **What `--from` takes is judged against this, with the name not
+/// held:** the device comes to hold a name, and to list it, only once
+/// something is taken.
+///
+/// A node with no network has no relay to read: nothing is all there is.
+async fn new_channel_read(
+    state: &AppState,
+    name: &str,
+    until: Instant,
+) -> Result<(Vec<CheckedEntry>, bool), PersonError> {
+    let secret = {
+        let conn = db(state);
+        let standing = Standing::to_write(&conn)?;
+        Zeroizing::new(derive::own_secret(&standing.secret, name)?)
+    };
+    if state.push_tx.is_none() {
+        return Ok((Vec::new(), true));
+    }
+    let channel = derive::channel_id(&secret)?;
+    let at = read_at_relays(state, channel, ProvedBy::Secret(secret), until).await;
+    let (entries, said) = handed(&at);
+    Ok((entries, read_whole(&said)))
+}
+
+/// Whether a channel was read whole, from what is said of each relay:
+/// one relay at least handed it to its end or holds none of it, and
+/// every relay that was reached did. A relay that was not reached says
+/// nothing of it, as it says nothing to a pass.
+fn read_whole(said: &[serde_json::Value]) -> bool {
+    let reached = || said.iter().filter(|said| said["read"] != "not reached");
+    reached().next().is_some() && reached().all(read_to_its_end)
+}
+
+/// What is said to undo what was written for a judgement.
+const UNDONE: &str = "undone";
+
+/// What `judge` finds in the store as it would be with `name` held and
+/// `new` taken, which is what the relays hold of the name's new channel:
+/// **all of it in a transaction that is undone.** Nothing is held, listed
+/// or stored by it.
+fn judged_as_if_held<T>(
+    state: &AppState,
+    conn: &rusqlite::Connection,
+    name: &str,
+    new: &[CheckedEntry],
+    judge: impl FnOnce() -> Result<T, PersonError>,
+) -> Result<T, PersonError> {
+    let mut judged = None;
+    let undone = person::in_one(conn, || {
+        person::hold_name(conn, name, now())?;
+        for entry in new {
+            take(conn, &state.identity, entry, now())?;
+        }
+        judged = Some(judge()?);
+        Err::<(), _>(PersonError::NotCarried(UNDONE.into()))
+    });
+    match (judged, undone) {
+        (Some(judged), _) => Ok(judged),
+        (None, Err(e)) => Err(e),
+        (None, Ok(())) => Err(PersonError::NotCarried(UNDONE.into())),
+    }
+}
+
+/// Bring versions into the channel of a name that this device does not
+/// hold (decision 2026-10-04 §7.3): the device holds the name and lists
+/// it ([`names::hold_for_a_carry`]), `new` is taken, which is what the
+/// relays hold of the name's new channel, and `brings` brings in what it
+/// may. **All of it stands where something was carried, and all of it is
+/// undone where nothing was:** the device then holds the name no more
+/// than it did. Returns what `brings` counted, and whether the device
+/// came to hold the name.
+fn brought_holding(
+    state: &AppState,
+    conn: &rusqlite::Connection,
+    name: &str,
+    new: &[CheckedEntry],
+    brings: impl FnOnce() -> Result<Tally, PersonError>,
+) -> Result<(Tally, bool), PersonError> {
+    let mut nothing = None;
+    let kept = person::in_one(conn, || {
+        let anew = held_rows::channel_of_name(conn, name)?.is_none();
+        names::hold_for_a_carry(conn, &state.identity, name, now())?;
+        for entry in new {
+            take(conn, &state.identity, entry, now())?;
+        }
+        let tally = brings()?;
+        if anew && tally.carried == 0 {
+            nothing = Some(tally);
+            return Err(PersonError::NotCarried(UNDONE.into()));
+        }
+        Ok((tally, anew))
+    });
+    match nothing {
+        Some(tally) => Ok((tally, false)),
+        None => kept,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct FromLookRequest {
     /// The name.
@@ -630,9 +737,15 @@ pub struct FromLookRequest {
 ///
 /// A key is named by the label that this device knew it by, or by the
 /// first six words of its key's fingerprint: refused where either
-/// matches two removed keys, or none ([`carry::named_key`]). With keys
-/// named, the device comes to hold the name, so that what is judged
-/// against is what the relays hold of its new channel.
+/// matches two removed keys, or none ([`carry::named_key`]).
+///
+/// What is judged against is what the relays hold of the name's new
+/// channel. Where the device holds the name, its store is brought up to
+/// that first ([`fetched_whole`]). **Where it does not, it is not made to
+/// hold it:** the new channel is read through the door
+/// ([`new_channel_read`]), and judged against in a transaction that is
+/// undone ([`judged_as_if_held`]). After a no, nothing is held, and
+/// nothing was done.
 pub async fn look_from(
     state: &AppState,
     name: &str,
@@ -664,13 +777,20 @@ pub async fn look_from(
         }));
     }
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    let mut held_anew = false;
     // Whether the new channel was fetched whole just before: only then
-    // is it judged which of its slots hold nothing (§7.3).
+    // is it judged which of its slots hold nothing (§7.3). And what the
+    // relays hold of it, where the device does not hold the name.
     let mut new_read = true;
+    let mut new: Option<Vec<CheckedEntry>> = None;
     if !keys.is_empty() {
-        held_anew = holds(state, name)?;
-        new_read = fetched_whole(state, deadline).await;
+        let holds_it = held_rows::channel_of_name(&db(state), name)?.is_some();
+        match holds_it {
+            true => new_read = fetched_whole(state, deadline).await,
+            false => {
+                let (entries, whole) = new_channel_read(state, name, deadline).await?;
+                (new_read, new) = (whole, Some(entries));
+            }
+        }
     }
     let read = read_generations(state, name, &left, deadline).await?;
 
@@ -700,15 +820,27 @@ pub async fn look_from(
     // What the named keys signed, judged against the new channel, with
     // nothing written: and not judged at all where the new channel could
     // not be read.
-    let mut tally = Tally::default();
-    let has_folder = {
+    let (tally, has_folder) = {
         let conn = db(state);
-        for version in newest_of(&read, &keys)?.iter().filter(|_| new_read) {
-            let would =
-                carry::would_bring(&conn, &state.identity, name, version, Rule::EmptySlots)?;
-            tally.count(&version.name, would);
-        }
-        names::has_folder(&conn, name)?
+        let versions = newest_of(&read, &keys)?;
+        let judge = || -> Result<Tally, PersonError> {
+            let mut tally = Tally::default();
+            for version in versions.iter().filter(|_| new_read) {
+                let would =
+                    carry::would_bring(&conn, &state.identity, name, version, Rule::EmptySlots)?;
+                tally.count(&version.name, would);
+            }
+            Ok(tally)
+        };
+        // A name that the device has come to hold since is judged in
+        // its store, as any name that it holds.
+        let tally = match &new {
+            Some(new) if held_rows::channel_of_name(&conn, name)?.is_none() => {
+                judged_as_if_held(state, &conn, name, new, judge)?
+            }
+            _ => judge()?,
+        };
+        (tally, names::has_folder(&conn, name)?)
     };
     let named: Vec<serde_json::Value> = removed
         .iter()
@@ -721,7 +853,6 @@ pub async fn look_from(
         // What the word is given under: the change entry that the device
         // keeps now.
         "under": hex::encode(under),
-        "held_anew": held_anew,
         "signed": signed_there,
         "keys": named,
         // Would go into slots where the new channel holds nothing.
@@ -805,6 +936,11 @@ pub const NO_FOLDER_FOR_ABOVE: &str = "no folder of this device's is mapped to t
 /// transaction that brings the versions in: posted again, it is refused,
 /// and nothing is read for it.
 ///
+/// **A name that the device does not hold is held only once something
+/// is taken** ([`brought_holding`]): what the relays hold of its new
+/// channel is read through the door, and where nothing comes in the
+/// device holds and lists the name no more than it did.
+///
 /// Refused, with nothing taken: a word that does not hold, or that was
 /// taken before; a key that the statement applied does not list as
 /// removed; and a file named to come in above a version, for a name that
@@ -852,12 +988,20 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
         });
         return Ok(done.says(name));
     }
-    done.held_anew = holds(state, name)?;
     // Which slots are empty is judged only where the new channel was
     // fetched whole just before (§7.3): where it could not be, nothing
-    // is taken.
+    // is taken. A name that the device holds is fetched into its store;
+    // one that it does not hold is read through the door.
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    if !fetched_whole(state, deadline).await {
+    let holds_it = held_rows::channel_of_name(&db(state), name)?.is_some();
+    let (new_read, new) = match holds_it {
+        true => (fetched_whole(state, deadline).await, None),
+        false => {
+            let (entries, whole) = new_channel_read(state, name, deadline).await?;
+            (whole, Some(entries))
+        }
+    };
+    if !new_read {
         done.read_all = false;
         done.nothing = Some(NEW_CHANNEL_NOT_READ.into());
         return Ok(done.says(name));
@@ -874,8 +1018,7 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
         // is taken once, as one with what it brings in.
         allowed_still(&conn, state, word)?;
         let versions = newest_of(&read, &keys)?;
-        done.tally = person::in_one(&conn, || {
-            carry::take_once(&conn, word, now())?;
+        let brings = || -> Result<Tally, PersonError> {
             let mut tally = Tally::default();
             for version in &versions {
                 let rule = match above.contains(&version.name) {
@@ -886,6 +1029,13 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
                 tally.count(&version.name, brought);
             }
             Ok(tally)
+        };
+        (done.tally, done.held_anew) = person::in_one(&conn, || {
+            carry::take_once(&conn, word, now())?;
+            match &new {
+                Some(new) => brought_holding(state, &conn, name, new, brings),
+                None => Ok((brings()?, false)),
+            }
         })?;
     }
     if done.tally.carried > 0 {
@@ -1397,13 +1547,14 @@ mod tests {
         assert_eq!(signed["entries"], 3);
         assert_eq!(listed["keys"], json!([]));
         assert_eq!(listed["empty"], 0);
-        // Nothing was written, and the name is not held anew for it.
-        assert_eq!(listed["held_anew"], false);
+        // Nothing was written.
         assert_eq!(node.stored(), before);
         // It was read through the door, with the secret that the node
-        // holds of the generation it left.
+        // holds of the generation it left. With no key named, nothing is
+        // judged, and the new channel is not fetched first.
         assert_eq!(node.asked.lock().unwrap().len(), 1);
         assert!(node.asked.lock().unwrap()[0].1);
+        assert_eq!(*node.did.lock().unwrap(), ["read"]);
         // With no key, a name that the device does not hold is not held
         // for the look.
         let other = look_from(&node.state, "another", &[]).await.unwrap();
@@ -1442,6 +1593,215 @@ mod tests {
         let alone = Node::of(Machine::new(9));
         let none = look_from(&alone.state, LAB, &[]).await;
         assert!(matches!(none, Err(PersonError::FollowsNoPhrase)));
+    }
+
+    /// Devices 1 and 2 sync a name that device 0 does not hold. Device 2
+    /// writes over a file of device 1's, and a file of its own, and only
+    /// the relay is sent them. It is then removed, on device 1, which
+    /// carries what it holds into the new channel: the relay holds that.
+    struct NotHeld {
+        /// The node of device 0, with its stand-in for a relay.
+        node: Option<Node>,
+        /// The key of device 2.
+        removed: [u8; 32],
+        /// The secret of the name's channel in the generation that was
+        /// left, and in the one applied, with what device 1 carried
+        /// into that.
+        old: [u8; 32],
+        new: [u8; 32],
+        in_the_new: Vec<CheckedEntry>,
+        /// What device 2 wrote over device 1's file, and its own file.
+        over: CheckedEntry,
+        only: CheckedEntry,
+    }
+
+    fn a_name_not_held() -> NotHeld {
+        let (machine, mut not_held) = a_machine_that_does_not_hold_the_name();
+        let node = Node::of(machine);
+        node.relay_holds(&not_held.new, &not_held.in_the_new);
+        not_held.node = Some(node);
+        not_held
+    }
+
+    /// [`a_name_not_held`], with the machine of device 0 and no node.
+    fn a_machine_that_does_not_hold_the_name() -> (Machine, NotHeld) {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1, 2], LAB);
+        s.write(1, LAB, "kept.md", "of device 1");
+        s.meet(&[1, 2]);
+        let old = s[2].own(LAB);
+        let over = s.write(2, LAB, "kept.md", "over it");
+        let only = s.write(2, LAB, "only.md", "of device 2");
+        s.change(1, &[0, 1], &[2]);
+        s.pass(1, 0);
+        let new = s[1].own(LAB);
+        assert_ne!(new, old);
+        let in_the_new = s[1].stored_in(&new);
+        assert_eq!(in_the_new.len(), 1);
+        let removed = s.key(2);
+        let not_held = NotHeld {
+            node: None,
+            removed,
+            old,
+            new,
+            in_the_new,
+            over,
+            only,
+        };
+        (s.machines.remove(0), not_held)
+    }
+
+    /// **`--from` holds a name only once something is taken** (decision
+    /// 2026-10-04 §7.3). On a device that does not hold the name, the
+    /// look reads the name's new channel through the door and judges
+    /// against it: the device holds nothing, lists nothing and stores
+    /// nothing, and no pass is asked for. After a no, nothing was done.
+    ///
+    /// With the phrase's word: where nothing comes in, the device holds
+    /// the name no more than it did. Where something does, it holds the
+    /// name and lists it, as one held by a carry, and its store holds
+    /// what the relays hold of the new channel.
+    #[actix_web::test]
+    async fn test_from_holds_a_name_only_once_something_is_taken() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let phrase = Phrase::parse(crate::several::WORDS).unwrap();
+        let held = |node: &Node| held_rows::channel_of_name(&db(&node.state), LAB).unwrap();
+        let listed = |node: &Node| {
+            let conn = db(&node.state);
+            let said = names::said_here(&conn, &node.state.identity).unwrap();
+            (
+                said.contains(LAB),
+                names::carried(&conn).unwrap().contains(LAB),
+            )
+        };
+        let id = |secret: &[u8; 32]| derive::channel_id(secret).unwrap();
+
+        let NotHeld {
+            node,
+            removed,
+            old,
+            new,
+            over,
+            only,
+            ..
+        } = a_name_not_held();
+        let node = node.unwrap();
+        node.relay_holds(&old, &[over, only]);
+        let before = node.stored();
+        let named = [carry::naming_words(&removed)];
+
+        // The look: what would go into an empty slot, and what stands
+        // above a version that the new channel holds at the relay.
+        let found = look_from(&node.state, LAB, &named).await.unwrap();
+        assert_eq!(found["new_read"], true, "{found}");
+        assert_eq!(
+            (&found["empty"], &found["above"]),
+            (&json!(1), &json!(["kept.md"]))
+        );
+        assert_eq!(found["has_folder"], false);
+        assert!(found.get("held_anew").is_none(), "{found}");
+        // Nothing is held, listed or stored. No pass was asked for: the
+        // new channel and the one that was left were read through the
+        // door.
+        assert_eq!(held(&node), None);
+        assert_eq!(listed(&node), (false, false));
+        assert_eq!(node.stored(), before);
+        assert_eq!(*node.did.lock().unwrap(), ["read", "read"]);
+        assert_eq!(
+            *node.asked.lock().unwrap(),
+            [(id(&new), true), (id(&old), true)]
+        );
+        // Where the new channel was not handed whole, nothing is judged.
+        node.in_part.store(true, SeqCst);
+        let found = look_from(&node.state, LAB, &named).await.unwrap();
+        assert_eq!(found["new_read"], false, "{found}");
+        assert_eq!((&found["empty"], &found["above"]), (&json!(0), &json!([])));
+        // And nothing is taken, nor held.
+        let word = node.word(&phrase, &from(&[removed], &["never.md"]));
+        let refused = take_from(&node.state, &word).await;
+        assert!(refused.is_err(), "{refused:?}");
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert!(
+            done["nothing"]
+                .as_str()
+                .unwrap()
+                .contains("could not be read"),
+            "{done}"
+        );
+        assert_eq!(held(&node), None);
+        node.in_part.store(false, SeqCst);
+
+        // A node with no network has no relay to read: nothing is all
+        // that the new channel holds, and it is judged so.
+        let (machine, _) = a_machine_that_does_not_hold_the_name();
+        let mut state = crate::several::state_of(machine);
+        state.push_tx = None;
+        let found = look_from(&state, LAB, &named).await.unwrap();
+        assert_eq!(found["new_read"], true, "{found}");
+        assert_eq!(
+            (&found["empty"], &found["read_all"]),
+            (&json!(0), &json!(false))
+        );
+
+        // Whether a channel was read whole, from what each relay said.
+        let said = |how: &[&str]| -> Vec<serde_json::Value> {
+            how.iter()
+                .map(|how| json!({ "relay": "r", "read": how }))
+                .collect()
+        };
+        assert!(read_whole(&said(&["whole"])));
+        assert!(read_whole(&said(&["not held", "not reached"])));
+        assert!(!read_whole(&said(&[])));
+        assert!(!read_whole(&said(&["not reached"])));
+        assert!(!read_whole(&said(&["whole", "part"])));
+        assert!(!read_whole(&said(&["whole", CONNECTION_CHANGED])));
+
+        // A yes that brings nothing in: the relay holds of the removed
+        // key only what stands above a version of the new channel, which
+        // comes in on no first yes. The device holds the name no more
+        // than it did, and its word is taken all the same.
+        let nothing = a_name_not_held();
+        let node = nothing.node.unwrap();
+        node.relay_holds(&nothing.old, &[nothing.over]);
+        let before = node.stored();
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(
+            (&done["carried"], &done["held_anew"]),
+            (&json!(0), &json!(false))
+        );
+        assert_eq!(done["above"], json!(["kept.md"]), "{done}");
+        assert_eq!(held(&node), None);
+        assert_eq!(listed(&node), (false, false));
+        assert_eq!(node.stored(), before);
+        let again = take_from(&node.state, &word).await;
+        assert!(
+            matches!(&again, Err(PersonError::NotCarried(why)) if why.contains(carry::WORD_TAKEN)),
+            "{again:?}"
+        );
+
+        // A yes that brings something in: the device holds the name and
+        // lists it, as one that it holds by a carry. Its store holds
+        // what the relay holds of the new channel, and what was taken.
+        let taken = a_name_not_held();
+        let node = taken.node.unwrap();
+        node.relay_holds(&taken.old, &[taken.over, taken.only]);
+        let before = node.stored();
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(
+            (&done["carried"], &done["held_anew"]),
+            (&json!(1), &json!(true))
+        );
+        assert_eq!(done["above"], json!(["kept.md"]));
+        assert_eq!(held(&node), Some(id(&taken.new)));
+        assert_eq!(listed(&node), (true, true));
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("of device 2"));
+        assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("of device 1"));
+        // The new channel's entry, the one carried, and the device's
+        // word that it syncs the name.
+        assert_eq!(node.stored(), before + 3);
     }
 
     /// What a removed key signed comes in only under a word that the

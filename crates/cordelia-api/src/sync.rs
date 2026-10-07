@@ -100,6 +100,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             moved_on: crate::look::moved_on(&db)?,
             notice: None,
             carried: None,
+            let_go: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
         let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
@@ -1091,23 +1092,61 @@ pub fn remove_mapping(
     Ok(())
 }
 
-/// Stop syncing a mapped folder (see [`remove_mapping`]).
+/// Let go of the name `name`, where this device holds it by a carry that
+/// a person asked for, or by a recovery, with no folder mapped to it
+/// ([`crate::names::carried`], decision 2026-10-04 §7.3): the device says
+/// no longer that it syncs the name, and holds it no more, as for a name
+/// whose folder is unmapped ([`crate::names::stop`]). What its store held
+/// of the name's channel goes with it: what it had brought in there and
+/// had not yet sent is not sent. Says whether the name was let go: not
+/// where the device does not hold it so, and nothing is done then.
+pub fn let_go_of_a_carried_name(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    name: &str,
+) -> Result<bool, ApiError> {
+    use crate::commands::refused;
+    if !crate::names::carried(db).map_err(refused)?.contains(name) {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now().timestamp();
+    let held = crate::names::stop(db, &state.identity, name, now).map_err(refused)?;
+    if let Some(channel) = held {
+        state.own_channels.forget_fetched(&channel);
+    }
+    tracing::info!(%name, "sync: a name that was held by a carry, with no folder, is let go");
+    state.own_channels.written();
+    Ok(true)
+}
+
+/// Stop syncing a mapped folder (see [`remove_mapping`]). **Where no
+/// folder is mapped so, a name that the device holds by a carry is let
+/// go** ([`let_go_of_a_carried_name`]), and the answer says so: such a
+/// name has no folder to unmap, and is held until a person says this.
 pub async fn unmap(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<SyncUnmapRequest>,
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
+    let mut let_go = None;
     {
         let db = state
             .db
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         let before = mapped_names(&db)?;
-        remove_mapping(&state.sync_control, &db, &body)?;
-        names_follow(&state, &db, &before);
+        match remove_mapping(&state.sync_control, &db, &body) {
+            Ok(()) => names_follow(&state, &db, &before),
+            Err(not_mapped) => match let_go_of_a_carried_name(&state, &db, &body.folder)? {
+                true => let_go = Some(body.folder.clone()),
+                false => return Err(not_mapped),
+            },
+        }
     }
-    Ok(HttpResponse::Ok().json(status(&state)?))
+    let mut status = status(&state)?;
+    status.let_go = let_go;
+    Ok(HttpResponse::Ok().json(status))
 }
 
 // ── POST /api/v1/sync/status ───────────────────────────────────────
@@ -2356,5 +2395,76 @@ mod tests {
         assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
         assert!(held(&db).is_empty());
         assert!(said(&alone, &db).is_empty());
+    }
+
+    /// A name that the device holds by a carry, with no folder mapped to
+    /// it, has no folder to unmap (decision 2026-10-04 §7.3): unmapping
+    /// its name lets go of it. The device says no longer that it syncs
+    /// it, and holds it no more; what its store held of the name's
+    /// channel goes, and the channel is fetched again before a folder's
+    /// first cycle there. Nothing is let go of that it does not hold so:
+    /// a name that a folder is mapped to, and one that it does not hold.
+    #[test]
+    fn test_a_name_that_a_carry_holds_with_no_folder_is_let_go() {
+        use crate::several::{Several, state_of};
+        use cordelia_storage::person as held_rows;
+        let home = std::path::Path::new("/home/sam");
+        let mut s = Several::of_one_person(1);
+        let now = s.tick();
+        crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "lab", now).unwrap();
+        s.write(0, "lab", "a.md", "brought in by a carry");
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        let db = state.db.lock().unwrap();
+        let on: SyncClaudeRequest =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+        set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+        let before = mapped_names(&db).unwrap();
+        let body = request("/home/sam/work", "team", false);
+        add_mapping(&state.sync_control, &db, &body, home).unwrap();
+        names_follow(&state, &db, &before);
+
+        let held = |db: &rusqlite::Connection| -> Vec<String> {
+            let names = held_rows::names(db).unwrap();
+            names.into_iter().map(|name| name.name).collect()
+        };
+        let said = |db: &rusqlite::Connection| -> Vec<String> {
+            let said = crate::names::said_here(db, &state.identity).unwrap();
+            said.into_iter().collect()
+        };
+        let by_a_carry = |db: &rusqlite::Connection| -> Vec<String> {
+            crate::names::carried(db).unwrap().into_iter().collect()
+        };
+        let lab = held_rows::channel_of_name(&db, "lab").unwrap().unwrap();
+        let of_lab = |db: &rusqlite::Connection| {
+            cordelia_storage::entries::channel_entries_after(db, &lab, 0, 10)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(held(&db), ["lab", "team"]);
+        assert_eq!(said(&db), ["lab", "team"]);
+        assert_eq!(by_a_carry(&db), ["lab"]);
+        assert_eq!(of_lab(&db), 1);
+        let at = std::time::Instant::now();
+        state.own_channels.fetched_from(&lab, "relay", at);
+        assert!(state.own_channels.first_fetch_done(&lab, at));
+
+        // A name that a folder is mapped to, and one that is not held:
+        // neither is let go of, and nothing changes.
+        for not_so in ["team", "never"] {
+            assert!(!let_go_of_a_carried_name(&state, &db, not_so).unwrap());
+        }
+        assert_eq!(held(&db), ["lab", "team"]);
+        assert_eq!(of_lab(&db), 1);
+
+        // The name that the carry holds: let go.
+        assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+        assert_eq!(held(&db), ["team"]);
+        assert_eq!(said(&db), ["team"]);
+        assert!(by_a_carry(&db).is_empty());
+        assert_eq!(of_lab(&db), 0);
+        assert!(!state.own_channels.first_fetch_done(&lab, at));
+        // Once.
+        assert!(!let_go_of_a_carried_name(&state, &db, "lab").unwrap());
     }
 }

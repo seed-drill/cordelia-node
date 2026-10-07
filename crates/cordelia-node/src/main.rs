@@ -3099,6 +3099,19 @@ fn version_note(node: Option<&str>, own: &str) -> Option<String> {
     }
 }
 
+/// What `cordelia sync unmap <name>` says where the node let go of a
+/// name that this device held by a carry, with no folder mapped to it
+/// (decision 2026-10-04 §7.3).
+fn let_go_says(name: &str) -> String {
+    let name = sync_label(name);
+    format!(
+        "This device holds {name} no longer. It held it by a carry, with no folder mapped to \
+         it: nothing more of {name} is sent from here or fetched, and what it had brought in \
+         and had not yet sent to a relay is not sent. Your other devices keep what they hold \
+         of it."
+    )
+}
+
 /// The mapping `cordelia sync unmap <word>` means, given the mapping whose
 /// name the word is and the mapping whose folder it is. One word that
 /// means two mappings is refused: it is not for the command to pick.
@@ -3407,7 +3420,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             }
         }
         SyncCommand::Unmap { folder } => {
-            let settings = sync_settings(config_path)?;
+            let settings = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
             let mappings = declared_mappings(&settings);
             // A name; or a folder, which may be any folder of a mapped
             // repository, or one that is no longer on disk.
@@ -3427,6 +3440,30 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 }
                 mapping_at(&mappings, &spellings)
             };
+            // A word that names no mapping may be a name that this
+            // device holds by a carry, with no folder mapped to it: the
+            // node lets go of such a name, and says that it did
+            // (decision 2026-10-04 §7.3), with sync on or off. Where it
+            // does not, the word names nothing here, as before.
+            if by_name.is_none() && by_folder.is_none() {
+                let name = cordelia_core::sync_name::tidy(&folder);
+                let asked = api_post_told(
+                    config_path,
+                    "/api/v1/sync/unmap",
+                    serde_json::json!({ "folder": name }),
+                    None,
+                )?;
+                if let Told::Yes(after) = asked
+                    && let Some(name) = after["let_go"].as_str()
+                {
+                    println!("{}", let_go_says(name));
+                    return Ok(());
+                }
+            }
+            // A folder is unmapped with sync on.
+            if settings["enabled"].as_bool() != Some(true) {
+                anyhow::bail!("Sync is off. Turn it on with `cordelia sync claude`.");
+            }
             // A word that ends in `/` is a folder. If it is not a mapped
             // one, and is a mapping's name without the `/`, say so.
             if by_folder.is_none()
@@ -6117,6 +6154,27 @@ mod tests {
         );
         let said = mapping_meant("x", None, None).unwrap_err().to_string();
         assert!(said.contains("not mapped on this device"), "{said}");
+    }
+
+    /// Where the node let go of a name that a carry held with no folder
+    /// (decision 2026-10-04 §7.3), `cordelia sync unmap <name>` says so:
+    /// that the device holds the name no longer, and that what it had
+    /// brought in and not yet sent is not sent.
+    #[test]
+    fn test_what_unmap_says_of_a_name_that_a_carry_held() {
+        let said = let_go_says("lab");
+        assert!(
+            said.starts_with(
+                "This device holds lab no longer. It held it by a carry, with no folder mapped \
+                 to it: nothing more of lab is sent from here or fetched"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("what it had brought in and had not yet sent to a relay is not sent"),
+            "{said}"
+        );
+        assert!(said.ends_with("Your other devices keep what they hold of it."));
     }
 
     /// A command asks the node only at one of the two addresses that the

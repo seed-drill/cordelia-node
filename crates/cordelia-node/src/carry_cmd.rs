@@ -953,7 +953,8 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
     if done["held_anew"] == true {
         lines.push(format!(
             "  This device now holds {name} and lists it, with no folder mapped to it: it \
-             sends what it carried, and carries the name at each later change."
+             sends what it carried, and carries the name at each later change. To let go of \
+             it: cordelia sync unmap {name}"
         ));
     }
     if number("higher") > 0 {
@@ -1082,6 +1083,10 @@ mod tests {
         );
         assert!(
             all.contains("This device now holds lab and lists it"),
+            "{all}"
+        );
+        assert!(
+            all.contains("To let go of it: cordelia sync unmap lab"),
             "{all}"
         );
         assert!(

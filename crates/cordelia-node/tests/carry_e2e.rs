@@ -294,6 +294,129 @@ fn six_words_of(n: &Node) -> String {
     cordelia_api::carry::naming_words(&key)
 }
 
+/// The names that `n` holds, as `cordelia devices` is told them: those
+/// it has sent, and those still to go.
+fn names_held(n: &Node) -> Vec<String> {
+    let seen = person_of(n);
+    let of = |field: &str| seen["names"][field].as_array().cloned().unwrap_or_default();
+    let mut names: Vec<String> = of("sent")
+        .iter()
+        .chain(&of("to_go"))
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// **`--from` holds a name only once something is taken** (decision
+/// 2026-10-04 §7.3). The desktop alone syncs `lab`, and is removed. The
+/// laptop, which never held the name, looks at what the removed key
+/// signed there: the command says what it found, and after a no the
+/// laptop holds no name, and nothing was done. With a yes and the phrase
+/// the files come in, and the laptop holds the name and lists it, with no
+/// folder mapped to it.
+///
+/// **Such a name can be let go:** `cordelia sync unmap lab` lets go of
+/// it, and says so. Asked again, the word names nothing here.
+#[test]
+fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(
+        d_mem.join("one.md"),
+        "written on the desktop
+",
+    )
+    .unwrap();
+    std::fs::write(
+        d_mem.join("two.md"),
+        "and this
+",
+    )
+    .unwrap();
+    sync_is_turned_on(&desktop);
+    let out = desktop.cli(&["sync", "map", &path(&d_notes), "lab"]);
+    assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    wait_for(
+        "the desktop has sent its files",
+        &[&relay, &desktop],
+        120,
+        || (held(&desktop).len() == 2 && has_sent_everything(&desktop).is_some()).then_some(()),
+    );
+    let desktop_key = key_of(&desktop);
+    desktop.stop();
+
+    // The desktop is removed, on the laptop, which holds no name.
+    let all = [&relay, &laptop];
+    let mut at = removes(&laptop, &desktop_key, &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for("the relay holds the change", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+    assert!(names_held(&laptop).is_empty());
+
+    // What the removed key signed is said, and a no takes nothing: the
+    // laptop holds no name for having looked.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("What this removed key signed in lab:")
+        .says("2 versions would go into slots where the new channel holds nothing.")
+        .says("Bring in 2 versions into slots where the new channel holds nothing?")
+        .types("no");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+    // Nor is there anything to let go of: the laptop syncs nothing.
+    let unmapped = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(unmapped.contains("Sync is off."), "{unmapped}");
+
+    // With a yes and the phrase the files come in, and the laptop holds
+    // the name and lists it.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("Bring in 2 versions into slots").types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    println!("{said}");
+    assert!(said.contains("lab: 2 versions brought in"), "{said}");
+    assert!(
+        said.contains("This device now holds lab and lists it, with no folder mapped to it"),
+        "{said}"
+    );
+    assert!(
+        said.contains("To let go of it: cordelia sync unmap lab"),
+        "{said}"
+    );
+    assert_eq!(names_held(&laptop), ["lab"]);
+    let texts: Vec<Option<String>> = held(&laptop).into_iter().map(|(_, _, text)| text).collect();
+    assert_eq!(
+        texts,
+        [
+            Some("written on the desktop\n".to_string()),
+            Some("and this\n".to_string())
+        ]
+    );
+    wait_for("the laptop has sent what it carried", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+
+    // The name has no folder to unmap: unmapping its name lets go of it.
+    let said = laptop.cli(&["sync", "unmap", "lab"]);
+    assert!(
+        said.starts_with("This device holds lab no longer. It held it by a carry"),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+    let again = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(again.contains("Sync is off."), "{again}");
+}
+
 /// The copies that a folder keeps beside its files.
 fn kept_beside(memory: &Path) -> Vec<String> {
     let mut beside: Vec<String> = std::fs::read_dir(memory)

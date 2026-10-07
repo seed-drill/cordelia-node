@@ -510,4 +510,9 @@ pub struct SyncStatusResponse {
     /// request that mapped the folder, and only where a carry was made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carried: Option<serde_json::Value>,
+    /// The name that this device let go of (decision 2026-10-04 §7.3):
+    /// one that it held by a carry or a recovery, with no folder mapped
+    /// to it. Only in the answer to the request that unmapped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go: Option<String>,
 }

@@ -553,6 +553,21 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     let (status, said) = asks!(app, "/api/v1/carry/read", read(hex::encode([1u8; 32])));
     assert_eq!(status, 200, "{said}");
     assert_eq!((&said["relays"], &said["entries"]), (&json!([]), &json!(0)));
+
+    // The name is held by the carry, with no folder mapped to it:
+    // unmapping it lets go of it, and the answer says so. Asked again,
+    // nothing is mapped so, as for any word that names no mapping.
+    let unmap = json!({ "folder": "lab" });
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["let_go"], "lab");
+    assert_eq!(held(&state), None);
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap);
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string().contains("is not mapped on this device"),
+        "{said}"
+    );
 }
 
 /// A recovery, at the routes (decision 2026-10-04 §9, steps 4 and 5).
