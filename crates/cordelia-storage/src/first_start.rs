@@ -1250,12 +1250,49 @@ mod tests {
         let _ = std::fs::remove_file(at("cut.db-wal"));
         let _ = std::fs::remove_file(at("cut.db-shm"));
         assert!(checked(&at("cut.db")).is_err());
+        // One whose pages are all there, and which the store's own check
+        // finds not whole: a row holds what its table says it cannot.
+        {
+            let conn = db::open(&at("unsound.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE of_a_test (x);
+                 INSERT INTO of_a_test VALUES (NULL);
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master SET sql = 'CREATE TABLE of_a_test (x NOT NULL)'
+                  WHERE name = 'of_a_test';
+                 PRAGMA writable_schema = OFF;",
+            )
+            .unwrap();
+        }
+        let refused = checked(&at("unsound.db")).unwrap_err();
+        assert!(refused.contains("the copy is not whole"), "{refused}");
         // And one that is all three.
         drop(db::open(&at("whole.db")).unwrap());
         let conn = db::open(&at("whole.db")).unwrap();
         conn.execute("VACUUM INTO ?1", params![at("copy.db").to_str().unwrap()])
             .unwrap();
         assert_eq!(checked(&at("copy.db")), Ok(()));
+
+        // A copy that fails the check is not given its name: it stays
+        // under the name it was made under, a whole copy from before
+        // stays where it is, and the answer says why. Here the database
+        // is at the released version's schema, which no opening by this
+        // version leaves it at.
+        let node = tempfile::tempdir().unwrap();
+        let conn = released::database(&node.path().join(DATABASE)).unwrap();
+        let whole = node.path().join("before-0.2.0-test");
+        std::fs::create_dir(&whole).unwrap();
+        std::fs::write(whole.join("from-the-start-before"), "x").unwrap();
+        let not_copied = copy(&conn, node.path(), VERSION).unwrap_err();
+        assert!(
+            not_copied.why.contains("is at schema version 10"),
+            "{not_copied:?}"
+        );
+        assert_eq!(
+            copies_in(node.path()),
+            ["before-0.2.0-test", "before-0.2.0-test.partial"]
+        );
+        assert_eq!(names_in(&whole), ["from-the-start-before"]);
     }
 
     /// A `.partial` that a start finds is removed and made again: what
@@ -1760,6 +1797,8 @@ mod tests {
     /// is as none.
     #[test]
     fn a_later_notice_is_added_and_none_is_replaced() {
+        // Under one key, in this version and in every later one.
+        assert_eq!(meta::SYNC_CLAUDE_NOTICE, "sync.claude.notice");
         let conn = db::open_in_memory().unwrap();
         assert!(notices(&conn).unwrap().is_empty());
         meta::set(&conn, meta::SYNC_CLAUDE_NOTICE, "not a list").unwrap();
@@ -1812,6 +1851,8 @@ mod tests {
     /// (decision 2026-10-04 §10.1).
     #[test]
     fn the_guard_refuses_a_new_channel_with_its_words_until_a_relay_removes_it() {
+        // Under one name, by which a relay of any version finds it.
+        assert_eq!(GUARD, "moved_on_takes_no_channel");
         let (dir, conn) = released_node(|_| {});
         assert!(new_channel(&conn, "grp_before").is_ok());
         assert!(!has_guard(&conn));
@@ -1847,6 +1888,8 @@ mod tests {
     /// it. A mark in another form is still a mark.
     #[test]
     fn a_mark_in_any_form_is_a_mark() {
+        // Under one key, in this version and in every later one.
+        assert_eq!(meta::FIRST_START, "first_start.done");
         let conn = db::open_in_memory().unwrap();
         assert_eq!(mark(&conn).unwrap(), None);
         let read = |value: &str| {

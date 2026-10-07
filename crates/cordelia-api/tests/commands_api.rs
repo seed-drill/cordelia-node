@@ -494,6 +494,21 @@ async fn test_a_node_that_is_held_up_refuses_what_changes_anything_but_turning_s
         held
     };
 
+    // What only reads is answered, each by its name: the requests of
+    // `cordelia sync status`, `cordelia devices` and `cordelia history`,
+    // and the local API's two that read.
+    assert_eq!(
+        ANSWERED_WHILE_HELD,
+        [
+            "/api/v1/sync/status",
+            "/api/v1/devices/list",
+            "/api/v1/history/list",
+            "/api/v1/history/show",
+            "/api/v1/channels/entries",
+            "/api/v1/channels/identity",
+        ]
+    );
+
     let why = "the first start on this version is not done: no room for the copy";
     state.held.hold(Held::FirstStart(why.into()));
     let before = everything(&state);

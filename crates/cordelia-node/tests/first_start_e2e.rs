@@ -229,6 +229,8 @@ fn a_device_of_the_released_version_is_copied_and_moved_on_when_it_starts() {
     assert_eq!(copies_of(&device), [name]);
     assert_eq!(std::fs::read(copy.join("cordelia.db")).unwrap(), copied);
     assert_eq!(own(&device), own_before);
+    // The guard is a device's, and a device's start leaves it.
+    assert!(has_guard(&database_of(&device)));
     // A key file of an older channel that is found at a later start is
     // removed then, whatever the mark says.
     device.stop();
@@ -372,13 +374,18 @@ fn status_of(node: &Node) -> serde_json::Value {
 #[cfg(unix)]
 #[test]
 fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
+    use cordelia_storage::meta;
     use std::os::unix::fs::PermissionsExt;
     let relay = relay_started();
     let mut device = node("laptop", "personal", Some(relay.p2p));
     let before = {
         let conn = in_the_released_form(&device);
+        // The scope is on by being absent with a directory set, as an
+        // install from before mappings has it.
+        meta::remove(&conn, meta::SYNC_CLAUDE_ALL).unwrap();
         older_rows(&conn)
     };
+    let scope = |device: &Node| meta::get(&database_of(device), meta::SYNC_CLAUDE_ALL).unwrap();
     // What is left of a copy cannot be removed: a folder in it cannot be
     // looked into.
     let partial = format!("before-{VERSION}.partial");
@@ -427,6 +434,9 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
             released::KEY_FILES
         );
         assert_eq!(copies_of(device), std::slice::from_ref(&partial));
+        // Nor is anything written of the settings: the step reads the
+        // scope as it is stored.
+        assert_eq!(scope(device), None);
     };
     unchanged(&device);
 
@@ -475,6 +485,9 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
         sync["report"]["at"], "2026-10-05T09:12:44.512203817+00:00",
         "{sync}"
     );
+    // The scope that was on by being absent is written down as on, so
+    // that the step still finds it so with the directory gone.
+    assert_eq!(scope(&device).as_deref(), Some("on"));
 
     // The copy can be made: the node makes its first start by itself.
     mode(0o700);
@@ -490,6 +503,16 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
     let status = status_of(&device);
     assert_eq!(status["summary"], "memory sync off", "{status}");
+    // The device is left the notice of what stopped, though sync was
+    // turned off before the step could be taken; and the scope is off.
+    let notices = first_start::notices(&conn).unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        notices[0].dir.as_deref(),
+        Some(device.home().join(".claude").display().to_string().as_str())
+    );
+    assert_eq!(notices[0].folders.as_ref().map(Vec::len), Some(2));
+    assert_eq!(scope(&device).as_deref(), Some("off"));
 }
 
 /// Leave `node`'s database as a later version of the program would: with
