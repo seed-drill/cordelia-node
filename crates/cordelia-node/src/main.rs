@@ -1197,6 +1197,14 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // setting takes effect at once: it wakes the loop, and a cycle
         // that was already running stops (see `SyncControl`).
         if config.network.role == "personal" {
+            // The stored scope is off whenever sync is on (decision
+            // 2026-10-04 §10.1): it is written so at every start with
+            // sync on. Nothing is written of the settings while the
+            // first start is still to be made: the step reads the scope
+            // as it is stored, and writes it off itself.
+            if state.held.why().is_none() {
+                scope_off(&state);
+            }
             tokio::spawn(run_sync_loop(state.clone()));
         }
 
@@ -1495,6 +1503,15 @@ impl Every {
     }
 }
 
+/// Write the stored scope off, where sync is on and it is not stored so
+/// ([`cordelia_api::sync::scope_off_at_start`]): what a personal node
+/// does when it starts, once its first start on this version is done.
+fn scope_off(state: &cordelia_api::state::AppState) {
+    if let Err(e) = cordelia_api::sync::scope_off_at_start(state) {
+        tracing::warn!(error = %e, "sync: could not write the stored scope off");
+    }
+}
+
 /// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
 /// node whose first start on this version is not done runs none: it
 /// tries the first start again, each time a cycle would have run, and
@@ -1505,7 +1522,13 @@ fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
     match state.held.why() {
         None => true,
         Some(Held::FirstStart(_)) => {
-            cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"))
+            let done = cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"));
+            // The start that was held up is made now: the scope is
+            // written off as at any start with sync on.
+            if done {
+                scope_off(state);
+            }
+            done
         }
         // Nothing is tried on a database from a later version.
         Some(Held::LaterDatabase(_)) => false,

@@ -884,6 +884,56 @@ fn a_phrase_is_made_on_a_device_of_the_released_version_and_its_folders_are_publ
     assert_eq!(copies_of(&device), [format!("before-{VERSION}")]);
 }
 
+/// The stored scope is off whenever sync is on (decision 2026-10-04
+/// §10.1): a node that starts with sync on writes it off, from a scope
+/// that is stored on and from none stored with a directory set, as a
+/// database that an earlier build left has it. With sync off it writes
+/// nothing, and the command that turns sync on then does. Its first
+/// start on this version is done here, and takes no part.
+#[test]
+fn a_node_that_starts_with_sync_on_writes_the_stored_scope_off() {
+    use cordelia_storage::meta;
+    let relay = relay_started();
+    let mut device = device_started("laptop", &relay);
+    let all = [&relay];
+    let dir = device.home().join(".claude").display().to_string();
+    let said = device.cli(&["sync", "claude", "--dir", &dir]);
+    assert!(said.starts_with("Sync turned on.\n"), "{said}");
+    let scope = |device: &Node| meta::get(&database_of(device), meta::SYNC_CLAUDE_ALL).unwrap();
+    assert_eq!(scope(&device).as_deref(), Some("off"));
+    // The node is stopped, and its database is left as `stored` has the
+    // scope; then it is started.
+    let mut started_from = |device: &mut Node, stored: Option<&str>| {
+        device.stop();
+        {
+            let conn = Connection::open(device.data_dir().join("cordelia.db")).unwrap();
+            match stored {
+                Some(stored) => meta::set(&conn, meta::SYNC_CLAUDE_ALL, stored).unwrap(),
+                None => meta::remove(&conn, meta::SYNC_CLAUDE_ALL).unwrap(),
+            }
+        }
+        device.start();
+        wait_for("device healthy", &all, 30, || healthy(device));
+    };
+    for stored in [Some("on"), None] {
+        started_from(&mut device, stored);
+        wait_for("the scope is written off", &all, 30, || {
+            (scope(&device).as_deref() == Some("off")).then_some(())
+        });
+    }
+
+    // With sync off nothing is written at a start: the scope is as it
+    // was left. Turning sync on writes it off.
+    device.cli(&["sync", "off"]);
+    started_from(&mut device, Some("on"));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(scope(&device).as_deref(), Some("on"));
+    device.cli(&["sync", "claude"]);
+    assert_eq!(scope(&device).as_deref(), Some("off"));
+    let status = status_of(&device);
+    assert_eq!(status["sync"]["all"], false, "{status}");
+}
+
 /// The same device with the scope stored on has the notice (decision
 /// 2026-10-04 §10.1): the date, the Claude Code directory, and each folder
 /// that the last stored report shows as syncing without a mapping. The

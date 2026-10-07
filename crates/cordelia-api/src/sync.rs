@@ -94,6 +94,44 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
     })
 }
 
+/// What is stored as the scope: that only mapped folders sync. There is
+/// no other scope (decision 2026-10-04 §10.1).
+const SCOPE_OFF: &str = "off";
+
+/// The stored scope is off whenever sync is on (decision 2026-10-04
+/// §10.1): a node writes it so when it starts with sync on, whatever was
+/// stored, and where nothing was. Returns whether it wrote. With sync off
+/// nothing is written: the request that turns sync on writes it
+/// ([`set_claude`]).
+///
+/// Nothing reads the scope to say what syncs. It is written for what
+/// reads the settings as an earlier version did: there, a directory that
+/// is set with no scope stored is a scope that is on.
+///
+/// A node whose first start on this version is still to be made does not
+/// ask this: the step of the first start reads the scope as it is
+/// stored, and writes it off itself.
+pub fn scope_off_at_start(state: &AppState) -> Result<bool, ApiError> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if meta::get(&db, meta::SYNC_CLAUDE_DIR)?.is_none() {
+        return Ok(false);
+    }
+    let stored = meta::get(&db, meta::SYNC_CLAUDE_ALL)?;
+    if stored.as_deref() == Some(SCOPE_OFF) {
+        return Ok(false);
+    }
+    meta::set(&db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
+    tracing::warn!(
+        "sync: what was stored said that everything found on this machine syncs. Only mapped \
+         folders sync: `cordelia sync status` lists what is found, with the command that maps \
+         each"
+    );
+    Ok(true)
+}
+
 /// A name a folder can sync under: `~` for home memory, or 1 to 200
 /// characters of lower-case letters, digits and `. _ - / ~ + % @`. That
 /// covers a normalised git remote (`github.com/owner/repo`,
@@ -240,14 +278,13 @@ pub fn set_claude(
         // Counted before anything is written (see `SyncControl::changed`).
         control.changed(db);
 
-        // The scope is stored before the directory that turns sync on, so
-        // that sync is never on with its scope left to be implied.
-        let was_all = meta::get(db, meta::SYNC_CLAUDE_ALL)?.is_some_and(|v| v == "on");
-        let all = body.all.unwrap_or(was_all && !body.reset);
-        if all != was_all {
-            tracing::info!(all, "sync: scope changed");
-        }
-        meta::set(db, meta::SYNC_CLAUDE_ALL, if all { "on" } else { "off" })?;
+        // The stored scope is off whenever sync is on (decision
+        // 2026-10-04 §10.1): it is written so at every request that
+        // turns sync on or leaves it on, whatever was stored. It is
+        // written before the directory that turns sync on, and the key
+        // is never removed: an earlier version reads a directory that is
+        // set, with no scope stored, as a scope that is on.
+        meta::set(db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
         // Whether a folder stopped syncing by this request: the home
         // directory's, where home memory is turned off and it was mapped.
         // Nothing else that a request can set says what syncs.
@@ -1218,21 +1255,21 @@ mod tests {
         let s = Settings::on();
         s.map(HOME, "team");
         let count = s.control.generation();
-        let body = serde_json::json!({ "enabled": true, "all": true, "home": false });
+        let other = "/home/sam/.claude-other";
+        let body = serde_json::json!({ "enabled": true, "dir": other, "home": false });
         let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
         assert!(set_claude(&s.control, &s.db, &body, None).is_err());
         assert_eq!(s.names(), ["team"]);
-        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
-        assert_ne!(all.as_deref(), Some("on"));
+        let dir = || meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(dir().as_deref(), Some(DIR));
         assert_eq!(s.control.generation(), count);
 
         // Everything else is carried out without it.
-        let body = serde_json::json!({ "enabled": true, "all": true });
+        let body = serde_json::json!({ "enabled": true, "dir": other });
         let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
         set_claude(&s.control, &s.db, &body, None).unwrap();
         assert_eq!(s.names(), ["team"]);
-        let all = meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap();
-        assert_eq!(all.as_deref(), Some("on"));
+        assert_eq!(dir().as_deref(), Some(other));
         assert!(s.control.generation() > count);
     }
 
@@ -1266,6 +1303,97 @@ mod tests {
         assert_eq!(s.home_name().as_deref(), Some("crew"));
         s.map(HOME, "~");
         assert_eq!(s.home_name().as_deref(), Some("~"));
+    }
+
+    /// The stored scope is off whenever sync is on (decision 2026-10-04
+    /// §10.1). A start with sync on writes it off, from a stored `on` and
+    /// from no scope stored with a directory set; a start with sync off
+    /// writes nothing. A request that turns sync on, or leaves it on,
+    /// writes it off over whatever is stored. And the key is never
+    /// removed: read as an earlier version reads the settings, the scope
+    /// is off from the first time sync is turned on.
+    #[test]
+    fn test_the_stored_scope_is_off_whenever_sync_is_on() {
+        use crate::several::{Machine, state_of};
+        let stored = |db: &rusqlite::Connection| meta::get(db, meta::SYNC_CLAUDE_ALL).unwrap();
+        // As an earlier version reads the settings: on where the key says
+        // so, and where a directory is set and there is no key.
+        let on_as_it_was_read = |db: &rusqlite::Connection| {
+            let dir = meta::get(db, meta::SYNC_CLAUDE_DIR).unwrap();
+            stored(db).map_or(dir.is_some(), |scope| scope == "on")
+        };
+        let set = |db: &rusqlite::Connection, dir: Option<&str>, scope: Option<&str>| {
+            for (key, value) in [(meta::SYNC_CLAUDE_DIR, dir), (meta::SYNC_CLAUDE_ALL, scope)] {
+                match value {
+                    Some(value) => meta::set(db, key, value).unwrap(),
+                    None => meta::remove(db, key).unwrap(),
+                }
+            }
+        };
+
+        // At a start.
+        let state = state_of(Machine::new(1));
+        for (dir, scope, wrote, then) in [
+            (Some(DIR), Some("on"), true, Some("off")),
+            (Some(DIR), None, true, Some("off")),
+            (Some(DIR), Some("off"), false, Some("off")),
+            (Some(DIR), Some("something else"), true, Some("off")),
+            // Sync is off: nothing is written, whatever is stored.
+            (None, Some("on"), false, Some("on")),
+            (None, None, false, None),
+        ] {
+            set(&state.db.lock().unwrap(), dir, scope);
+            assert_eq!(
+                scope_off_at_start(&state).unwrap(),
+                wrote,
+                "{dir:?} {scope:?}"
+            );
+            let db = state.db.lock().unwrap();
+            assert_eq!(stored(&db).as_deref(), then, "{dir:?} {scope:?}");
+            assert_eq!(
+                on_as_it_was_read(&db),
+                then == Some("on"),
+                "{dir:?} {scope:?}"
+            );
+        }
+
+        // At a request that turns sync on, or leaves it on.
+        for (dir, scope) in [
+            (Some(DIR), Some("on")),
+            (Some(DIR), None),
+            (None, Some("on")),
+            (None, None),
+        ] {
+            let s = Settings {
+                db: cordelia_storage::db::open_in_memory().unwrap(),
+                control: SyncControl::default(),
+            };
+            set(&s.db, dir, scope);
+            s.claude(serde_json::json!({ "dir": DIR }));
+            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{dir:?} {scope:?}");
+            assert!(!on_as_it_was_read(&s.db));
+        }
+
+        // Turned on for the first time on this version, the scope is
+        // stored, and off. Whatever is asked after, the key is there.
+        let s = Settings::on();
+        assert_eq!(stored(&s.db).as_deref(), Some("off"));
+        s.map(HOME, "team");
+        s.map("/home/sam/notes", "lab");
+        for request in [
+            serde_json::json!({ "reset": true }),
+            serde_json::json!({ "reset": true, "dir": DIR }),
+            serde_json::json!({ "home": false }),
+            serde_json::json!({ "all": false }),
+            serde_json::json!({ "exclude": ["x"] }),
+            serde_json::json!({ "enabled": false }),
+            serde_json::json!({ "enabled": true }),
+        ] {
+            s.claude(request.clone());
+            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{request}");
+        }
+        s.unmap("lab");
+        assert_eq!(stored(&s.db).as_deref(), Some("off"));
     }
 
     /// A handler counts its change before the first thing it writes. One

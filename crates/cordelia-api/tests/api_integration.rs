@@ -1489,7 +1489,6 @@ async fn test_sync_settings_survive_being_turned_on_again() {
         json!({
             "enabled": true,
             "dir": "/srv/claude",
-            "all": true,
             "home": false,
             "exclude": ["github.com/Client-Co/*", "github.com/o/secret.git"],
         })
@@ -1505,7 +1504,7 @@ async fn test_sync_settings_survive_being_turned_on_again() {
     let (code, body) = sync_post!(&app, "/api/v1/sync/claude", json!({ "enabled": true }));
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["dir"], "/srv/claude");
-    assert_eq!(body["all"], true);
+    assert_eq!(body["all"], false);
     assert_eq!(body["home"], false);
     assert_eq!(
         body["exclude"],
@@ -1566,12 +1565,6 @@ async fn test_sync_settings_survive_being_turned_on_again() {
 
     // Reset puts the scope, home and exclude settings back to the
     // defaults. Mappings stay: they are removed one at a time.
-    let (_, body) = sync_post!(
-        &app,
-        "/api/v1/sync/claude",
-        json!({ "enabled": true, "all": true })
-    );
-    assert_eq!(body["all"], true);
     let (_, body) = sync_post!(
         &app,
         "/api/v1/sync/claude",
