@@ -110,11 +110,11 @@ const KEYS_FOLDER: &str = "channel-keys";
 /// of its earlier keys, and its slot key (see [`crate::psk`]).
 const KEY_FILE_ENDINGS: [&str; 3] = [".key", ".ring.json", ".slot"];
 
-/// The key files of the older channels, found by their place and their
-/// names: each file in the folder of channel keys whose name ends as a
-/// key file's does, in order. A link is not one, and nothing is followed.
-/// None where there is no such folder.
-pub fn older_key_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// Whatever is in the folder of channel keys under a name that ends as a
+/// key file's does, in order, each with whether it is a file: what is
+/// found by its place and its name. Nothing is followed. None where there
+/// is no such folder.
+fn named_as_key_files(data_dir: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
     let entries = match std::fs::read_dir(data_dir.join(KEYS_FOLDER)) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -127,16 +127,30 @@ pub fn older_key_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             .file_name()
             .to_str()
             .is_some_and(|name| KEY_FILE_ENDINGS.iter().any(|ending| name.ends_with(ending)));
-        if named_as_one && entry.file_type()?.is_file() {
-            found.push(entry.path());
+        if named_as_one {
+            found.push((entry.path(), entry.file_type()?.is_file()));
         }
     }
     found.sort();
     Ok(found)
 }
 
+/// The key files of the older channels, found by their place and their
+/// names: each file in the folder of channel keys whose name ends as a
+/// key file's does, in order. They are what a copy holds. A link under
+/// such a name is not one, nor a folder: neither is read.
+pub fn older_key_files(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let named = named_as_key_files(data_dir)?;
+    Ok(named
+        .into_iter()
+        .filter(|(_, is_a_file)| *is_a_file)
+        .map(|(path, _)| path)
+        .collect())
+}
+
 /// Whether the node holds anything of the older kind: a row in one of
-/// its tables, one of its keys, or a key file of an older channel.
+/// its tables, one of its keys, or anything under the name of a key file
+/// of an older channel.
 pub fn holds_older(conn: &Connection, data_dir: &Path) -> Result<bool, CordeliaError> {
     for table in OLDER_TABLES {
         let any: bool = conn
@@ -155,9 +169,9 @@ pub fn holds_older(conn: &Connection, data_dir: &Path) -> Result<bool, CordeliaE
             return Ok(true);
         }
     }
-    let files = older_key_files(data_dir)
+    let named = named_as_key_files(data_dir)
         .map_err(|e| CordeliaError::Storage(format!("the folder of channel keys: {e}")))?;
-    Ok(!files.is_empty())
+    Ok(!named.is_empty())
 }
 
 // ── The mark ─────────────────────────────────────────────────────────
@@ -658,16 +672,22 @@ pub fn step(
 }
 
 /// Remove the key files of the older channels (decision 2026-10-04
-/// §10.1). Returns how many went, and how many are left: those that could
-/// not be removed. Nothing here fails: one that cannot be removed is
-/// counted, for the node to say, and looked for again at the next start.
-/// (Where the folder itself cannot be read, that counts as one left.)
+/// §10.1): whatever is in the folder of channel keys under a name that
+/// ends as a key file's does, as a file is removed. So a link goes, and
+/// not what it points to; and a folder under such a name cannot be
+/// removed so, and is left.
+///
+/// Returns how many went, and how many are left: those that could not be
+/// removed. Nothing here fails: one that cannot be removed is counted,
+/// for the node to say, and looked for again at the next start. (Where
+/// the folder of channel keys itself cannot be read, that counts as one
+/// left.)
 pub fn remove_older_key_files(data_dir: &Path) -> (usize, usize) {
-    let Ok(files) = older_key_files(data_dir) else {
+    let Ok(named) = named_as_key_files(data_dir) else {
         return (0, 1);
     };
     let (mut removed, mut left) = (0, 0);
-    for file in files {
+    for (file, _) in named {
         match std::fs::remove_file(&file) {
             Ok(()) => removed += 1,
             Err(_) => left += 1,
@@ -1359,8 +1379,10 @@ mod tests {
 
     /// The key files of the older channels are found by their place and
     /// their names, and nothing else is: not the device's key, which is
-    /// beside the folder; not a file of another name in it; not a folder;
-    /// not a link.
+    /// beside the folder; not a file of another name in it. A copy holds
+    /// those that are files. What is removed is whatever has such a name,
+    /// as a file is removed: a link goes, and not what it points to; a
+    /// folder cannot go so, and is counted as left.
     #[test]
     fn only_the_key_files_of_the_older_channels_are_found() {
         let (dir, _conn) = released_node(|_| {});
@@ -1380,12 +1402,21 @@ mod tests {
         let none = tempfile::tempdir().unwrap();
         assert!(older_key_files(none.path()).unwrap().is_empty());
 
-        // Removing them removes those, and nothing else.
-        assert_eq!(remove_older_key_files(data), (released::KEY_FILES.len(), 0));
-        let mut left = names_in(&keys);
-        left.retain(|name| name != "linked.key");
-        assert_eq!(left, ["a-folder.key", "key", "notes.txt"]);
+        // A copy holds the files, and neither the link nor the folder.
+        let conn = db::open(&data.join(DATABASE)).unwrap();
+        let copy = copy(&conn, data, VERSION).unwrap();
+        assert_eq!(names_in(&copy.join("channel-keys")), released::KEY_FILES);
+
+        // Removing them removes whatever has such a name, as a file is
+        // removed, and nothing else.
+        let links = usize::from(cfg!(unix));
+        assert_eq!(
+            remove_older_key_files(data),
+            (released::KEY_FILES.len() + links, 1)
+        );
+        assert_eq!(names_in(&keys), ["a-folder.key", "key", "notes.txt"]);
         assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), [9u8; 32]);
+        assert_eq!(remove_older_key_files(data), (0, 1));
         assert_eq!(remove_older_key_files(none.path()), (0, 0));
     }
 
@@ -2001,6 +2032,14 @@ mod tests {
         let started = first_start(&conn, dir.path(), VERSION, now()).unwrap();
         assert!(matches!(started.done, Done::Stepped { .. }), "{started:?}");
         assert_eq!(started.key_files_removed, 1);
+        // So is a folder under the name of a key file: it is found by
+        // its place and its name, whatever it is, and is left, and said.
+        let (dir, conn) = fresh();
+        std::fs::create_dir_all(dir.path().join("channel-keys").join("grp_one.key")).unwrap();
+        assert!(holds_older(&conn, dir.path()).unwrap());
+        let started = first_start(&conn, dir.path(), VERSION, now()).unwrap();
+        assert!(matches!(started.done, Done::Stepped { .. }), "{started:?}");
+        assert_eq!((started.key_files_removed, started.key_files_left), (0, 1));
     }
 
     /// A database in which the device follows a recovery phrase, and that
