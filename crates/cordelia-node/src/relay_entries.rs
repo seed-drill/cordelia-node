@@ -562,6 +562,31 @@ impl RelayEntries {
         }
     }
 
+    /// Drop each slot in which every entry is a delete that the relay has
+    /// held for 90 days (decision 2026-10-04 §2.3, §7.3): the channel's
+    /// count of its room follows, and a channel of which nothing is left
+    /// is held no more.
+    pub fn sweep_deletes(&self, db: &Mutex<Connection>) {
+        self.sweep_deletes_at(db, unix_now());
+    }
+
+    /// [`Self::sweep_deletes`], at `now`, this relay's time in seconds.
+    fn sweep_deletes_at(&self, db: &Mutex<Connection>, now: i64) {
+        let Ok(db) = db.lock() else { return };
+        match relay::sweep_deletes(&db, now) {
+            Ok(swept) => {
+                if swept.entries > 0 {
+                    tracing::info!(
+                        entries = swept.entries,
+                        "swept the deletes that this relay has held for 90 days"
+                    );
+                }
+                self.dropped(&swept.channels, "nothing left once its old deletes went");
+            }
+            Err(e) => tracing::warn!(error = %e, "could not sweep old deletes"),
+        }
+    }
+
     /// The relay dropped `channels`. Its places in them, at the relays it
     /// pulls from, mean nothing for a channel that it takes again: they
     /// are forgotten, and such a channel is pulled from the start.
@@ -4640,6 +4665,59 @@ mod tests {
                 .get(&peer(8), &channel(2))
                 .is_some()
         );
+    }
+
+    /// Each hour a relay drops the deletes that it has held for 90 days
+    /// (decision 2026-10-04 §2.3, §7.3): what it holds of the channel is
+    /// counted less by what went, and a channel of which nothing is left
+    /// is held no more, with the relay's place in it at a relay it works
+    /// with. A text is never swept.
+    #[test]
+    fn a_relay_sweeps_the_deletes_it_has_held_for_90_days_and_its_room_follows() {
+        let at = relay_of(u64::MAX, &[8]);
+        let delete = |c: u16, name: &str| {
+            let inside = Inside {
+                name: name.to_string(),
+                value: Value::Delete,
+                chain: Some(Vec::new()),
+            };
+            Entry::seal(&secret(c), &device(1), 7, &inside)
+                .unwrap()
+                .check()
+                .unwrap()
+        };
+        // Channel 1: a text, and a delete. Channel 2: a delete alone.
+        let (gone, alone) = (delete(1, "gone.md"), delete(2, "hand-over"));
+        at.hold(&small(1, 1, 5), NOW);
+        at.hold(&gone, NOW);
+        at.hold(&alone, NOW);
+        for c in [1, 2] {
+            lock(&at.entries.places).keep(
+                &peer(8),
+                channel(c),
+                Place {
+                    mark: [7; 8],
+                    after: 1,
+                    not_before: None,
+                },
+            );
+        }
+        let cost = |entry: &CheckedEntry| entry_cost(entry.content.len());
+        assert_eq!(at.used(), SMALL + cost(&gone) + cost(&alone));
+
+        // A second short of 90 days nothing goes.
+        at.entries.sweep_deletes_at(&at.db, NOW + 90 * DAY - 1);
+        assert_eq!(at.used(), SMALL + cost(&gone) + cost(&alone));
+        // At 90 days both deletes go. The first channel is counted at its
+        // text alone. The second is held no more, and the place in it is
+        // forgotten: taken again, it is pulled from the start.
+        at.entries.sweep_deletes_at(&at.db, NOW + 90 * DAY);
+        assert_eq!(at.used(), SMALL);
+        assert_eq!(at.held(1).unwrap().bytes, SMALL);
+        assert_eq!(at.held(2), None);
+        let places = lock(&at.entries.places);
+        assert_eq!(places.total(), 1);
+        assert!(places.get(&peer(8), &channel(1)).is_some());
     }
 
     /// The room for this kind of channel is its own: what the relay holds

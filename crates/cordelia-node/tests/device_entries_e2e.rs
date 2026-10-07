@@ -4322,6 +4322,39 @@ async fn a_personal_node_makes_its_passes_on_its_timers_and_none_without_a_phras
     assert_eq!(channels_at(&relay), 3);
 }
 
+/// On the node's hourly timer a device drops from its own store each
+/// slot whose delete it has held for 90 days (decision 2026-10-04 §2.3,
+/// §7.3), by its own clock. A node that is held up sweeps nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
+    use cordelia_api::state::Held;
+    use cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS;
+    let device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes("notes", "stays.md", "a text");
+    device.writes("notes", "gone.md", "a text that is deleted");
+    device.deletes("notes", "gone.md");
+    let channel = device.channel("notes");
+    assert_eq!(device.holds_of(&channel).len(), 2);
+
+    let held_for = Duration::from_secs(u64::from(KEYED_TOMBSTONE_RETENTION_DAYS) * 24 * 60 * 60);
+    device.clock.run_ahead(held_for - Duration::from_secs(60));
+    device.engine.sweep_deletes();
+    assert_eq!(device.holds_of(&channel).len(), 2);
+
+    device.clock.run_ahead(Duration::from_secs(120));
+    let held = Held::FirstStart("the first start on this version is not done".into());
+    device.state.held.hold(held);
+    device.engine.sweep_deletes();
+    assert_eq!(device.holds_of(&channel).len(), 2, "swept while held up");
+    device.state.held.release();
+    device.engine.sweep_deletes();
+    assert_eq!(device.holds_of(&channel).len(), 1);
+    assert_eq!(device.text("notes", "stays.md").as_deref(), Some("a text"));
+    assert_eq!(device.text("notes", "gone.md"), None);
+}
+
 /// A node that is held up makes no pass (decision 2026-10-04 §10.1):
 /// nothing is shown, asked, sent or taken, by the whole pass or by the
 /// pass that sends, and no whole pass is counted. Held up no longer, it

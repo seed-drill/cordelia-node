@@ -43,6 +43,7 @@ pub mod publish;
 #[cfg(test)]
 mod several;
 pub mod state;
+pub mod swept;
 pub mod sync;
 pub mod take;
 pub mod types;

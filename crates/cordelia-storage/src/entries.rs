@@ -171,22 +171,8 @@ pub fn slot_entries(
     channel: &[u8; 32],
     slot: &[u8; 32],
 ) -> Result<Vec<CheckedEntry>, CordeliaError> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {ENTRY_COLUMNS} FROM entries
-             WHERE channel_id = ?1 AND slot = ?2
-             ORDER BY seq ASC"
-        ))
-        .map_err(storage)?;
-    let rows = stmt
-        .query_map(
-            params![channel.as_slice(), slot.as_slice()],
-            stored_entry_from_row,
-        )
-        .map_err(storage)?;
     let mut entries = Vec::new();
-    for row in rows {
-        let held = row.map_err(storage)?;
+    for held in slot_stored(conn, channel, slot)? {
         match held.entry.check() {
             Ok(entry) => entries.push(entry),
             Err(e) => tracing::warn!(
@@ -303,6 +289,93 @@ pub fn remove_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, Co
     conn.execute(
         "DELETE FROM entries WHERE channel_id = ?1",
         params![channel.as_slice()],
+    )
+    .map_err(storage)
+}
+
+/// Every entry that the store holds in one slot of a channel, as it is
+/// stored, in the order they were stored: each with when the store took
+/// it. Whoever reads one checks it.
+pub fn slot_stored(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<Vec<StoredEntry>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM entries
+             WHERE channel_id = ?1 AND slot = ?2
+             ORDER BY seq ASC"
+        ))
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![channel.as_slice(), slot.as_slice()],
+            stored_entry_from_row,
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// A slot of a channel: the channel's ID, and the slot.
+pub type SlotOf = ([u8; 32], [u8; 32]);
+
+/// The slots, of every channel, in which the store holds a delete that it
+/// stored at `by` or before, in seconds: where a sweep of old deletes
+/// looks (decision 2026-10-04 §2.3). Each as its channel and its slot, in
+/// order. An entry says in clear whether it is a delete, so nothing is
+/// opened to find them.
+pub fn slots_with_a_delete_stored(
+    conn: &Connection,
+    by: i64,
+) -> Result<Vec<SlotOf>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT channel_id, slot FROM entries
+             WHERE is_delete = 1 AND stored_at <= ?1
+             ORDER BY channel_id, slot",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![by], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Whether every entry that the store holds in one slot of a channel is a
+/// delete that it stored at `by` or before. A slot that holds nothing is
+/// none.
+///
+/// It is what a node that reads no entry goes by (decision 2026-09-30
+/// §4.4): a slot is deleted for it only where every author's entry there
+/// is a delete. One author's delete never takes another author's text
+/// with it.
+pub fn holds_only_deletes_stored(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    by: i64,
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 AND COALESCE(MIN(is_delete = 1 AND stored_at <= ?3), 0)
+         FROM entries WHERE channel_id = ?1 AND slot = ?2",
+        params![channel.as_slice(), slot.as_slice(), by],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// Remove every entry of one slot of a channel. Returns how many there
+/// were. A slot goes whole or not at all: were a delete to go alone, a
+/// lower revision by another author would be the slot's version again.
+pub fn remove_slot(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM entries WHERE channel_id = ?1 AND slot = ?2",
+        params![channel.as_slice(), slot.as_slice()],
     )
     .map_err(storage)
 }
@@ -989,6 +1062,97 @@ mod tests {
         remove_channel(&conn, &channel()).unwrap();
         assert!(channel_slots(&conn, &channel()).unwrap().is_empty());
         assert_eq!(channel_slots(&conn, &other_channel()).unwrap().len(), 1);
+    }
+
+    /// The slots in which the store holds an old delete are found with
+    /// nothing opened, by the mark that an entry carries in clear and by
+    /// when the store took it (decision 2026-10-04 §2.3): each slot once,
+    /// whatever else it holds. Whether a slot holds old deletes alone is
+    /// asked of that slot. A slot is removed whole, and no other with it.
+    #[test]
+    fn test_old_deletes_are_found_by_slot_and_a_slot_is_removed_whole() {
+        let conn = db::open_in_memory().unwrap();
+        let delete = |n: u8, rev: u64, name: &str| made(&SECRET, n, rev, name, Value::Delete);
+        // One slot with a text and a delete, one with two deletes of
+        // which one is stored later, one with a text alone, and a delete
+        // in another channel.
+        for (entry, at) in [
+            (text(1, 3, "mixed.md", "a text"), NOW),
+            (delete(2, 4, "mixed.md"), NOW),
+            (delete(1, 2, "gone.md"), NOW),
+            (delete(2, 2, "gone.md"), NOW + 100),
+            (text(1, 1, "kept.md", "a text"), NOW),
+            (
+                made(&OTHER_SECRET, 1, 1, "gone.md", Value::Delete),
+                NOW + 50,
+            ),
+        ] {
+            assert_eq!(store(&conn, &entry, at).unwrap(), Outcome::Stored);
+        }
+        let other_slot = slot_id(&derive::slot_key(&OTHER_SECRET).unwrap(), "gone.md");
+        let mut ours = vec![(channel(), slot("mixed.md")), (channel(), slot("gone.md"))];
+        ours.sort();
+
+        // Before any delete was stored there is none; then those stored
+        // by then, each slot once, in order.
+        assert!(
+            slots_with_a_delete_stored(&conn, NOW - 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(slots_with_a_delete_stored(&conn, NOW).unwrap(), ours);
+        let mut all = ours.clone();
+        all.push((other_channel(), other_slot));
+        all.sort();
+        assert_eq!(slots_with_a_delete_stored(&conn, NOW + 50).unwrap(), all);
+        // A slot with two old deletes is given once.
+        assert_eq!(slots_with_a_delete_stored(&conn, NOW + 100).unwrap(), all);
+
+        // A slot with a text holds no deletes alone, however old. One
+        // with two deletes does once both are old, and not while one is
+        // younger. A slot that holds nothing does not.
+        let only = |name: &str, by: i64| {
+            holds_only_deletes_stored(&conn, &channel(), &slot(name), by).unwrap()
+        };
+        assert!(!only("mixed.md", NOW + 1000));
+        assert!(!only("kept.md", NOW + 1000));
+        assert!(!only("gone.md", NOW + 99));
+        assert!(only("gone.md", NOW + 100));
+        assert!(!only("no-such.md", NOW + 1000));
+        assert!(holds_only_deletes_stored(&conn, &other_channel(), &other_slot, NOW + 50).unwrap());
+        assert!(
+            !holds_only_deletes_stored(&conn, &other_channel(), &other_slot, NOW + 49).unwrap()
+        );
+
+        // Each entry of a slot is given with when the store took it.
+        let stored: Vec<(u64, i64)> = slot_stored(&conn, &channel(), &slot("gone.md"))
+            .unwrap()
+            .iter()
+            .map(|held| (held.entry.rev, held.stored_at))
+            .collect();
+        assert_eq!(stored, [(2, NOW), (2, NOW + 100)]);
+
+        // A slot goes whole, and no other slot or channel with it.
+        assert_eq!(remove_slot(&conn, &channel(), &slot("gone.md")).unwrap(), 2);
+        assert_eq!(remove_slot(&conn, &channel(), &slot("gone.md")).unwrap(), 0);
+        assert_eq!(held(&conn).len(), 3);
+        assert!(
+            slot_entries(&conn, &channel(), &slot("gone.md"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            slot_entries(&conn, &channel(), &slot("mixed.md"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            channel_entries_after(&conn, &other_channel(), 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

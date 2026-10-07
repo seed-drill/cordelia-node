@@ -658,6 +658,12 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 /// than this, every node drops the key's whole slot history. A device
 /// offline for longer than this can bring a deleted file back with a stale
 /// edit; 90 days covers a laptop left in a drawer for a season.
+///
+/// It is also how long a delete is held among the entries of a channel
+/// from its secret, at a relay and in a device's own store (decision
+/// 2026-10-04 §2.3, §7.3), counted from when the node stored the entry:
+/// a delete that is carried at a statement is a new entry, and starts
+/// again.
 pub const KEYED_TOMBSTONE_RETENTION_DAYS: u32 = 90;
 
 /// The index line of a memory that a device deleted (decision 2026-09-30
@@ -1255,9 +1261,10 @@ pub const MAX_CHANNELS_PROVED_ON_A_CONNECTION: usize = MAX_CHANNELS_ASKED_OF_A_P
 
 /// The protocol byte of a stream on which a connection shows an entry, and
 /// is answered with what the receiver holds (decision 2026-10-04 §2.4,
-/// item 5). The four streams of entries begin at 0x10, apart from the
-/// eight of the older kind: a peer that does not know them refuses the
-/// stream, and reads none of them as one of its own.
+/// item 5). The five streams of entries are 0x10 to 0x14, apart from the
+/// eight of the older kind: show, prove, pull and push, and the one
+/// between relays that work together. A peer that does not know them
+/// refuses the stream, and reads none of them as one of its own.
 pub const PROTOCOL_ENTRY_SHOW: u8 = 0x10;
 
 /// The protocol byte of a stream on which a connection proves that it
@@ -2412,8 +2419,9 @@ mod tests {
         }
     }
 
-    /// The four streams of entries have bytes of their own, each another,
-    /// and none of them one of the eight that the older kind has.
+    /// Four of the five streams of entries (the fifth, between relays
+    /// that work together, has a test of its own): each has a byte of its
+    /// own, and none of them is one of the eight that the older kind has.
     #[test]
     fn test_the_streams_of_entries_decision_2026_10_04_2_4() {
         assert_eq!(PROTOCOL_ENTRY_SHOW, 0x10);

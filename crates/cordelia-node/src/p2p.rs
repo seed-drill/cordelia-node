@@ -2841,25 +2841,38 @@ pub async fn p2p_loop(
                 }
             }
 
-            // ── Keyed tombstone GC (§4.4) ─────────────────────────────
-            // Of the older kind's items, on the nodes that carry them. No
-            // such node holds a channel's member list, so it sweeps a key
-            // only when every author has deleted it.
-            _ = gc_interval.tick(), if carries_older_kind(&node_role) => {
-                let gc_state = state.clone();
-                let members_known = false;
-                tokio::task::spawn_blocking(move || {
-                    let Ok(db) = gc_state.db.lock() else { return };
-                    match cordelia_storage::items::gc_keyed_tombstones(
-                        &db,
-                        cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
-                        members_known,
-                    ) {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
-                        Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
-                    }
-                });
+            // ── Old deletes (§4.4; decision 2026-10-04 §2.3, §7.3) ────
+            // One timer, and one length of time, for both kinds. Off the
+            // select loop: each writes under the db lock.
+            _ = gc_interval.tick() => {
+                // Of the older kind's items, on the nodes that carry
+                // them. No such node holds a channel's member list, so it
+                // sweeps a key only when every author has deleted it.
+                if carries_older_kind(&node_role) {
+                    let gc_state = state.clone();
+                    let members_known = false;
+                    tokio::task::spawn_blocking(move || {
+                        let Ok(db) = gc_state.db.lock() else { return };
+                        match cordelia_storage::items::gc_keyed_tombstones(
+                            &db,
+                            cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+                            members_known,
+                        ) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
+                            Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
+                        }
+                    });
+                }
+                // Of the entries of channels from their secrets: a relay
+                // sweeps what it holds, and a device its own store.
+                if let Some(entries) = relay_entries.clone() {
+                    let sweep_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.sweep_deletes(&sweep_state.db));
+                }
+                if let Some(device) = device_entries.clone() {
+                    tokio::task::spawn_blocking(move || device.sweep_deletes());
+                }
             }
 
             // ── Push retry processing ─────────────────────────────────
