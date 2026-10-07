@@ -1592,8 +1592,10 @@ mod tests {
         // has a record of it in the channel of its name. Until then it
         // stays, whatever else the folder has a record of there, and
         // whatever a folder has a record of under that file's name in
-        // another channel. A file under a name that the device holds no
-        // more has no channel to meet, and goes.
+        // another channel. A file under a name that the device does not
+        // hold stays too: the name may be one that could not be held in
+        // this cycle, for an error. It goes where the device stops the
+        // name, on purpose.
         let conn = &s[0].conn;
         let noted = |conn: &rusqlite::Connection| -> Vec<NotCarried> {
             let now = crate::several::START;
@@ -1617,10 +1619,20 @@ mod tests {
         let record = agreed(&s[0], 1, "met");
         sync_state::save(conn, folder, &channel, "other.md", &record).unwrap();
         sync_state::save(conn, folder, "another-channel", "ghost.md", &record).unwrap();
-        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 1);
-        assert_eq!(noted(conn), std::slice::from_ref(&ghost));
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        assert_eq!(noted(conn), [ghost.clone(), gone.clone()]);
         sync_state::save(conn, folder, &channel, "ghost.md", &record).unwrap();
         assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 1);
+        assert_eq!(noted(conn), std::slice::from_ref(&gone));
+        assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);
+        assert_eq!(noted(conn), std::slice::from_ref(&gone));
+        // The name is stopped: its files are noted no longer, and those
+        // of another name are.
+        note(&[&ghost, &gone]);
+        let now = crate::several::START;
+        names::stop(conn, &s[0].identity, "held-no-more", now).unwrap();
+        assert_eq!(noted(conn), std::slice::from_ref(&ghost));
+        names::stop(conn, &s[0].identity, "lab", now).unwrap();
         assert!(noted(conn).is_empty());
         assert_eq!(meta::get(conn, meta::PERSON_NOT_CARRIED).unwrap(), None);
         assert_eq!(crate::look::clear_not_carried_that_met(conn).unwrap(), 0);

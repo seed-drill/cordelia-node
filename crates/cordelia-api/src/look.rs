@@ -756,9 +756,14 @@ pub(crate) fn note_removed_a_key(conn: &Connection, removes: bool) -> Result<(),
 /// ([`note_not_carried`]) each file that has met its channel since
 /// (decision 2026-10-04 §4.2): a folder has a record of it in the channel
 /// of the name it syncs under, so the file was published there as this
-/// device's own, or took the version that the channel had. A file under
-/// a name that the device holds no more is dropped too: it syncs here no
-/// longer, and has no channel to meet. Returns how many went.
+/// device's own, or took the version that the channel had. Returns how
+/// many went.
+///
+/// **A file goes only where its name is held and the file has met its
+/// channel.** A name that is not held at the end of a cycle may be one
+/// that could not be held in that cycle, for an error: its files have
+/// met nothing, and stay noted. A name that the device stops on purpose
+/// takes its files out of the note there ([`forget_not_carried_of`]).
 ///
 /// The sync adapter does so at the end of a cycle. Until then the file is
 /// said in `cordelia devices` and in a status, and no longer than that:
@@ -777,7 +782,7 @@ pub fn clear_not_carried_that_met(conn: &Connection) -> Result<usize, PersonErro
                     let recorded = sync_state::files(conn, &written)?;
                     recorded.iter().any(|(_, key)| *key == file.file)
                 }
-                None => true,
+                None => false,
             };
             if !met {
                 still.push((file.name.clone(), file.file.clone()));
@@ -788,6 +793,22 @@ pub fn clear_not_carried_that_met(conn: &Connection) -> Result<usize, PersonErro
         }
         Ok(noted.len() - still.len())
     })
+}
+
+/// Note no longer the files under `name` whose record could not be
+/// carried ([`note_not_carried`]): the device has stopped the name, and
+/// none of them has a channel to meet here. Returns how many went.
+pub(crate) fn forget_not_carried_of(conn: &Connection, name: &str) -> Result<usize, PersonError> {
+    let noted = not_carried(conn)?;
+    let still: Vec<(String, String)> = noted
+        .iter()
+        .filter(|file| file.name != name)
+        .map(|file| (file.name.clone(), file.file.clone()))
+        .collect();
+    if still.len() != noted.len() {
+        note_not_carried(conn, &still)?;
+    }
+    Ok(noted.len() - still.len())
 }
 
 /// What the personal channel of the generation applied says of each

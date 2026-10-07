@@ -419,6 +419,10 @@ pub fn unsay_all(
 /// file was agreed which the folder has lost since, and a delete would be
 /// published for it.
 ///
+/// **The files under it whose record could not be carried are noted no
+/// longer** ([`crate::look::forget_not_carried_of`]): the name syncs here
+/// no more, on purpose, and they have no channel to meet.
+///
 /// **A name that this device stops is noted no longer as listed before**
 /// ([`note_listed_before`]): it was mapped here in the generation
 /// applied, and a person has it synced here no more. Otherwise it would
@@ -433,6 +437,9 @@ pub fn stop(
     in_one(conn, || {
         unsay(conn, identity, name, now)?;
         held_rows::forget_name_before(conn, name)?;
+        // A file under it whose record could not be carried has no
+        // channel to meet here now: it is noted no longer.
+        crate::look::forget_not_carried_of(conn, name)?;
         let Some(channel) = held_rows::channel_of_name(conn, name)? else {
             return Ok(None);
         };
