@@ -160,21 +160,22 @@ fn read_channel(
 }
 
 /// [`read_channel`], with the relays at which the channel could not be
-/// read to its end, each by its name.
+/// read to its end, each by its name, and of how many relays the node
+/// said anything.
 fn read_and_not_read(
     config_path: &str,
     secret: &[u8; 32],
     sessions: &mut Sessions,
     own: &[u8; 32],
     what: &str,
-) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>)> {
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>, usize)> {
     let (entries, relays) = read_with_secret(config_path, secret, sessions, own)?;
     let not_read = not_read_to_its_end(&relays);
     for (relay, read) in &not_read {
         println!("  Could not read {what} at {relay} to its end ({read}).");
     }
     let not_read = not_read.into_iter().map(|(relay, _)| relay).collect();
-    Ok((entries, not_read))
+    Ok((entries, not_read, relays.len()))
 }
 
 /// Of what the node says of each relay, those at which a channel could
@@ -207,6 +208,32 @@ fn none_found_says(not_read: &[String]) -> String {
          known. Run `cordelia recover` again. Nothing was done.",
         not_read.join(", ")
     )
+}
+
+/// What a recovery is refused with where the personal channel of the
+/// change it recovers from, numbered `number`, was read to its end at
+/// none of the `relays` that the node said anything of (decision
+/// 2026-10-04 §9, step 3): `not_read` names each at which it was not.
+/// Which devices were added since that change, and which names are
+/// listed, is then not known, and nothing is asked. `None` where it was
+/// read to its end at one relay at least: the command goes on, and says
+/// before its yes at which it was not ([`will_do_lines`]).
+fn personal_not_read_says(number: u64, relays: usize, not_read: &[String]) -> Option<String> {
+    if not_read.len() < relays {
+        return None;
+    }
+    let at = match not_read.is_empty() {
+        true => "was read at no relay".to_string(),
+        false => format!(
+            "could not be read to its end at {}, and so at no relay",
+            not_read.join(", ")
+        ),
+    };
+    Some(format!(
+        "the personal channel of change {number} {at}: which devices were added since that \
+         change, and which names they sync, is not known. Run `cordelia recover` again. Nothing \
+         was done."
+    ))
 }
 
 /// What is said of two changes that were made apart, before the person
@@ -306,11 +333,18 @@ fn asks_of(at: &Terminal, says: &str) -> anyhow::Result<Answer> {
 /// What a recovery will do, said before its yes (decision 2026-10-04
 /// §9): from whom the look takes and from whom it takes nothing; the
 /// names that are carried, and those that are left; and what stops.
+///
+/// `not_read` names each relay at which the personal channel of the
+/// change recovered from could not be read to its end. Where there is
+/// one, no name is said to be listed nowhere: devices added since the
+/// change, and names, may be missing from what was read, and that is
+/// said, with the relay.
 fn will_do_lines(
     generation: &Generation,
     answers: &[Answer],
     names: &recover::Names,
     own: &[u8; 32],
+    not_read: &[String],
 ) -> Vec<String> {
     let rows = &generation.rows;
     let taken = recover::takes(rows, answers);
@@ -364,7 +398,10 @@ fn will_do_lines(
         all.join(", ")
     };
     match names.carried.is_empty() {
-        true => lines.push("No name is carried: none is listed.".to_string()),
+        true => lines.push(match not_read.is_empty() {
+            true => "No name is carried: none is listed.".to_string(),
+            false => "No name is carried: none is listed in what was read.".to_string(),
+        }),
         false => lines.push(format!(
             "{} carried: {}.",
             match names.carried.len() {
@@ -373,6 +410,13 @@ fn will_do_lines(
             },
             said(&names.carried)
         )),
+    }
+    if !not_read.is_empty() {
+        lines.push(format!(
+            "The personal channel of the change recovered from could not be read to its end at \
+             {}: devices added since that change, and names, may be missing here.",
+            not_read.join(", ")
+        ));
     }
     if !names.over_the_bound.is_empty() {
         lines.push(format!(
@@ -449,7 +493,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let (handed, not_read) = {
+    let (handed, not_read, _) = {
         let secret = phrase.channel_secret()?;
         read_and_not_read(config_path, &secret, &mut sessions, &own, "it")?
     };
@@ -505,17 +549,19 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "\nRecovering from change {}. Reading its personal channel at each relay...",
         statement.number
     );
-    let generation = {
+    let (generation, personal_not_read) = {
         let personal = Zeroizing::new(derive::personal_secret(&for_phrase.secret)?);
-        let handed = read_channel(
-            config_path,
-            &personal,
-            &mut sessions,
-            &own,
-            "the personal channel",
-        )?;
+        let what = "the personal channel";
+        let (handed, not_read, relays) =
+            read_and_not_read(config_path, &personal, &mut sessions, &own, what)?;
+        // Read to its end at no relay: nothing is asked.
+        if let Some(refusal) = personal_not_read_says(statement.number, relays, &not_read) {
+            anyhow::bail!("{refusal}");
+        }
         let now = chrono::Utc::now().timestamp();
-        recover::read_generation(&from, &statement_key, &for_phrase.secret, &handed, now)?
+        let read =
+            recover::read_generation(&from, &statement_key, &for_phrase.secret, &handed, now)?;
+        (read, not_read)
     };
     let rows = &generation.rows;
     println!(
@@ -607,7 +653,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     for line in lists_lines(&signs, &own)? {
         println!("{line}");
     }
-    for line in will_do_lines(&generation, &answers, &names, &own) {
+    for line in will_do_lines(&generation, &answers, &names, &own, &personal_not_read) {
         println!("{line}");
     }
     if !at.yes("\nRecover on this machine?")? {
@@ -1131,6 +1177,82 @@ mod tests {
         assert!(none.ends_with("Nothing was done."));
     }
 
+    /// Where the personal channel of the change recovered from was read
+    /// to its end at no relay, the recovery is refused before anything
+    /// is asked, and says at which relays it could not be read (decision
+    /// 2026-10-04 §9, step 3). Where it was read to its end at one relay
+    /// at least, the command goes on, and says before its yes that
+    /// devices added since and names may be missing, and at which relay:
+    /// no name is then said to be listed nowhere.
+    #[test]
+    fn test_a_personal_channel_that_was_not_read_is_never_said_to_list_nothing() {
+        let at = |relays: &[&str]| -> Vec<String> {
+            relays.iter().map(|relay| relay.to_string()).collect()
+        };
+        // Read to its end at each relay, or at one of two: it goes on.
+        assert_eq!(personal_not_read_says(3, 2, &[]), None);
+        assert_eq!(personal_not_read_says(3, 2, &at(&["two"])), None);
+        assert_eq!(personal_not_read_says(3, 1, &[]), None);
+        // At neither of two, and not at the only one: refused.
+        let refused = personal_not_read_says(3, 2, &at(&["one", "two"])).unwrap();
+        assert_eq!(
+            refused,
+            "the personal channel of change 3 could not be read to its end at one, two, and so \
+             at no relay: which devices were added since that change, and which names they \
+             sync, is not known. Run `cordelia recover` again. Nothing was done."
+        );
+        assert!(personal_not_read_says(3, 1, &at(&["one"])).is_some());
+        // The node said nothing of any relay: it was read nowhere.
+        let nowhere = personal_not_read_says(4, 0, &[]).unwrap();
+        assert!(
+            nowhere.starts_with("the personal channel of change 4 was read at no relay: which"),
+            "{nowhere}"
+        );
+        assert!(nowhere.ends_with("Nothing was done."));
+
+        // Before the yes. Read to its end at every relay: as before.
+        let generation = Generation {
+            rows: rows(),
+            ..Default::default()
+        };
+        let answers = [Answer::Lost, Answer::Lost, Answer::Lost, Answer::NotAsked];
+        let none = recover::Names::default();
+        let own = [9; 32];
+        let whole = will_do_lines(&generation, &answers, &none, &own, &[]).join("\n");
+        assert!(
+            whole.contains("No name is carried: none is listed.\n"),
+            "{whole}"
+        );
+        assert!(!whole.contains("could not be read"), "{whole}");
+        // Not at one relay: no name is said to be listed nowhere.
+        let part = will_do_lines(&generation, &answers, &none, &own, &at(&["two"])).join("\n");
+        assert!(
+            part.contains(
+                "No name is carried: none is listed in what was read.\nThe personal channel of \
+                 the change recovered from could not be read to its end at two: devices added \
+                 since that change, and names, may be missing here.\n"
+            ),
+            "{part}"
+        );
+        assert!(!part.contains("none is listed.\n"), "{part}");
+        // And where names are carried, that more may be missing is said
+        // all the same.
+        let lab = recover::Names {
+            carried: vec!["lab".into()],
+            ..Default::default()
+        };
+        let not_read = at(&["two", "three"]);
+        let part = will_do_lines(&generation, &answers, &lab, &own, &not_read).join("\n");
+        assert!(
+            part.contains(
+                "1 name is carried: lab.\nThe personal channel of the change recovered from \
+                 could not be read to its end at two, three: devices added since that change, \
+                 and names, may be missing here.\n"
+            ),
+            "{part}"
+        );
+    }
+
     /// Where the answers could not all be kept, that is said before the
     /// first question (decision 2026-10-04 §9, step 3): a statement has
     /// room for 256 removed keys. Nothing is said where they could.
@@ -1203,7 +1325,7 @@ mod tests {
         // The laptop is lost; the desktop may be in someone else's
         // hands, and with it the phone it added.
         let answers = [Answer::Lost, Answer::OtherHands, Answer::Have, Answer::Have];
-        let all = will_do_lines(&generation, &answers, &names, &[9; 32]).join("\n");
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &[]).join("\n");
         assert!(
             all.contains(&format!(
                 "The look takes what these wrote, as the relays hold it now: ({}) \"laptop\".",
@@ -1254,7 +1376,7 @@ mod tests {
             Answer::Have,
         ];
         let empty = recover::Names::default();
-        let all = will_do_lines(&generation, &none, &empty, &[9; 32]).join("\n");
+        let all = will_do_lines(&generation, &none, &empty, &[9; 32], &[]).join("\n");
         assert!(
             all.contains("Nothing that those devices wrote is brought back by this recovery."),
             "{all}"
