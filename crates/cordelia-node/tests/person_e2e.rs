@@ -3235,3 +3235,100 @@ fn changes_made_while_passes_are_in_flight_leave_nothing_of_a_channel_left() {
     let log = std::fs::read_to_string(relay.log()).unwrap();
     assert!(!log.contains("breach"), "the relay counted a breach");
 }
+
+/// What another device wrote as a name and is none is never printed
+/// (decision 2026-10-04 §16): not at the prompt of a removal, just before
+/// the yes and the phrase, and not by `cordelia devices` or `cordelia
+/// status`, with `--json` or without. It is counted, and said as a number.
+///
+/// The laptop's words are written here as only a device that does not run
+/// this code would write them: under its own key, in the personal channel,
+/// with an escape sequence, a new line, a great length, and another
+/// spelling.
+#[test]
+fn a_word_that_is_no_name_is_printed_by_no_command() {
+    use cordelia_crypto::entry::{Entry, Inside, Value as Held};
+    let relay = relay_started();
+    let desktop = device_started("desktop", &relay);
+    let laptop = device_started("laptop", &relay);
+    let all = [&relay, &desktop, &laptop];
+    let words = pair(&desktop, &laptop, "laptop", &all).unwrap();
+
+    // The laptop's words, in the desktop's own store, as if the desktop
+    // had been given them.
+    let no_names = [
+        "\x1b[2J\x1b[31mNOT-A-NAME-escape".to_string(),
+        "NOT-A-NAME-two\nlines".to_string(),
+        format!("NOT-A-NAME-long-{}", "x".repeat(50_000)),
+        "NOT-A-NAME-In-Capitals".to_string(),
+        "not-a-name-NOT-A-NAME.git".to_string(),
+    ];
+    {
+        let store = rusqlite::Connection::open(desktop.data_dir().join("cordelia.db")).unwrap();
+        store
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let secret: [u8; 32] = store
+            .query_row(
+                "SELECT secret FROM person_secrets WHERE left_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let personal = cordelia_crypto::derive::personal_secret(&secret).unwrap();
+        let by = cordelia_crypto::identity::NodeIdentity::from_file(
+            &laptop.data_dir().join("identity.key"),
+        )
+        .unwrap();
+        for no_name in &no_names {
+            let inside = Inside {
+                name: format!("{}{no_name}", cordelia_core::protocol::PERSONAL_NAME_PREFIX),
+                value: Held::Text(String::new()),
+                chain: Some(Vec::new()),
+            };
+            let word = Entry::seal(&personal, &by, 1, &inside)
+                .unwrap()
+                .check()
+                .unwrap();
+            cordelia_storage::entries::store(&store, &word, 1_790_000_000).unwrap();
+        }
+    }
+    let counted = format!(
+        "{} names that cannot be shown are listed by a device",
+        no_names.len()
+    );
+    let shows_none = |said: &str| {
+        assert!(!said.to_uppercase().contains("NOT-A-NAME"), "{said}");
+        assert!(!said.contains('\x1b'), "{said:?}");
+        assert!(said.len() < 20_000, "{}", said.len());
+    };
+
+    let devices = desktop.cli(&["devices"]);
+    assert!(devices.contains(&counted), "{devices}");
+    shows_none(&devices);
+    let status = desktop.cli(&["status"]);
+    assert!(status.contains(&counted), "{status}");
+    shows_none(&status);
+    let as_json = desktop.cli(&["status", "--json"]);
+    shows_none(&as_json);
+    let seen: Value = serde_json::from_str(&as_json).unwrap();
+    assert_eq!(seen["person"]["names_not_shown"], no_names.len(), "{seen}");
+
+    // The prompt of a removal: the number, and nothing of what they hold.
+    let mut at = desktop.at_terminal(&["remove-device", &key_of(&laptop)]);
+    at.says("Make this change?").says("Type yes to go on");
+    let said = at.said.clone();
+    assert!(
+        said.contains(&format!(
+            "{} names that cannot be shown stay behind too",
+            no_names.len()
+        )),
+        "{said}"
+    );
+    assert!(!said.to_uppercase().contains("NOT-A-NAME"), "{said}");
+    assert!(said.len() < 20_000, "{}", said.len());
+    at.types("no");
+    let said = at.done();
+    assert!(!said.to_uppercase().contains("NOT-A-NAME"), "{said}");
+    let _ = words;
+}

@@ -17,6 +17,11 @@
 //!   channel of each, whether or not it syncs the name itself, and a
 //!   command that removes a device shows the names that only that device
 //!   lists.
+//! - **A word is read as a name only where it is one that this version
+//!   would itself map, in its one spelling** ([`is_a_name`], decision
+//!   2026-10-04 §16). What a device wrote under `name/` is whatever it
+//!   chose to write, and a status and the prompt of a removal show names:
+//!   a word that is no name is counted ([`not_names`]), and never shown.
 //! - **When a device applies a statement** it carries its own words with
 //!   the rest of what it wrote in the personal channel
 //!   ([`crate::person`]): the list of names in a new personal channel is
@@ -46,6 +51,17 @@ use cordelia_storage::person::{self as held_rows, State};
 
 use crate::person::{Counting, PersonError, hold_name, in_one};
 use crate::publish::Standing;
+
+/// Whether `name` is a name as this version would itself map one: of the
+/// characters that a name may have, no longer than a name may be, and in
+/// its one spelling (decision 2026-10-04 §16). A word of the personal
+/// channel is read as a name only where it is. So what another device
+/// wrote there is never shown where it holds a control character, an
+/// escape sequence or a new line, is longer than a name, or is spelled
+/// another way.
+pub fn is_a_name(name: &str) -> bool {
+    crate::sync::valid_sync_name(name) && cordelia_core::sync_name::tidy(name) == name
+}
 
 /// The name, in the personal channel, of a device's word that it syncs
 /// `name`: `name/` and the name.
@@ -163,18 +179,33 @@ pub fn unsay(
     })
 }
 
-/// Each word of the personal channel that lists a name, as this device's
-/// store holds it: the name, and the key whose word it is. A word is an
-/// entry under `name/` and a name that is no delete, read from its own
-/// signer and no other. `of` says whose words are read.
+/// The words of the personal channel that list something, as this
+/// device's store holds it.
+struct Words {
+    /// Each word that lists a name ([`is_a_name`]): the name, and the key
+    /// whose word it is, in order.
+    names: Vec<(String, [u8; 32])>,
+    /// The key of each word that is under `name/` and lists no name, once
+    /// for each such word, in order of key.
+    not_names: Vec<[u8; 32]>,
+}
+
+/// Each word of the personal channel that lists something, as this
+/// device's store holds it. A word is an entry under `name/` that is no
+/// delete, read from its own signer and no other. `of` says whose words
+/// are read.
+///
+/// What comes after `name/` is read as a name only where it is one
+/// ([`is_a_name`]): a word that is not is counted for its key, and what
+/// it holds goes no further.
 fn words(
     conn: &Connection,
     standing: &Standing,
     of: impl Fn(&[u8; 32]) -> bool,
-) -> Result<Vec<(String, [u8; 32])>, PersonError> {
+) -> Result<Words, PersonError> {
     let personal = derive::personal_secret(&standing.secret)?;
     let channel = derive::channel_id(&personal)?;
-    let mut said = Vec::new();
+    let (mut names, mut not_names) = (Vec::new(), Vec::new());
     for slot in entries::channel_slots(conn, &channel)? {
         for entry in entries::slot_entries(conn, &channel, &slot)? {
             if entry.delete || !of(&entry.author) {
@@ -183,14 +214,17 @@ fn words(
             let Ok(inside) = entry.open(&personal) else {
                 continue;
             };
-            if let Some(name) = inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
-                said.push((name.to_string(), entry.author));
+            match inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
+                Some(name) if is_a_name(name) => names.push((name.to_string(), entry.author)),
+                Some(_) => not_names.push(entry.author),
+                None => {}
             }
         }
     }
-    said.sort();
-    said.dedup();
-    Ok(said)
+    names.sort();
+    names.dedup();
+    not_names.sort();
+    Ok(Words { names, not_names })
 }
 
 /// The names that this device says it syncs: those its own word lists.
@@ -203,7 +237,7 @@ pub fn said_here(
         return Ok(BTreeSet::new());
     };
     let own = identity.public_key();
-    let said = words(conn, &standing, |key| *key == own)?;
+    let said = words(conn, &standing, |key| *key == own)?.names;
     Ok(said.into_iter().map(|(name, _)| name).collect())
 }
 
@@ -223,7 +257,7 @@ pub fn listed(conn: &Connection) -> Result<Vec<Listed>, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
         return Ok(Vec::new());
     };
-    let said = words(conn, &standing, |key| standing.counting.counts(key))?;
+    let said = words(conn, &standing, |key| standing.counting.counts(key))?.names;
     let mut listed: Vec<Listed> = Vec::new();
     for (name, key) in said {
         match listed.last_mut() {
@@ -235,6 +269,41 @@ pub fn listed(conn: &Connection) -> Result<Vec<Listed>, PersonError> {
         }
     }
     Ok(listed)
+}
+
+/// The words of the personal channel of the generation applied that are
+/// under `name/` and list no name ([`is_a_name`]), of keys that count:
+/// each such key, in order, with how many of its words they are. None on
+/// a device that follows no phrase.
+///
+/// They are counted so that a person can be told that there are some, and
+/// of which device: what they hold is never shown.
+pub fn not_names(conn: &Connection) -> Result<Vec<([u8; 32], usize)>, PersonError> {
+    let Ok(standing) = Standing::of(conn) else {
+        return Ok(Vec::new());
+    };
+    let said = words(conn, &standing, |key| standing.counting.counts(key))?.not_names;
+    let mut by_key: Vec<([u8; 32], usize)> = Vec::new();
+    for key in said {
+        match by_key.last_mut() {
+            Some((last, words)) if *last == key => *words += 1,
+            _ => by_key.push((key, 1)),
+        }
+    }
+    Ok(by_key)
+}
+
+/// How many names that were noted as listed in a generation this device
+/// left are no names ([`is_a_name`]): an earlier build noted whatever a
+/// word held. They are counted, and never shown.
+pub fn not_names_before(conn: &Connection) -> Result<usize, PersonError> {
+    let noted = held_rows::names_before(conn)?;
+    let not_names: BTreeSet<&str> = noted
+        .iter()
+        .map(|before| before.name.as_str())
+        .filter(|name| !is_a_name(name))
+        .collect();
+    Ok(not_names.len())
 }
 
 /// The names that this device's own folders are mapped to: each mapping's
@@ -377,8 +446,13 @@ pub(crate) fn note_listed_before(
             let Ok(inside) = entry.open(&personal) else {
                 continue;
             };
-            if let Some(name) = inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
-                held_rows::note_name_before(conn, name, &entry.author, now)?;
+            // Only a name is noted: what a word holds that is no name is
+            // not kept.
+            match inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
+                Some(name) if is_a_name(name) => {
+                    held_rows::note_name_before(conn, name, &entry.author, now)?;
+                }
+                _ => {}
             }
         }
     }
@@ -414,7 +488,9 @@ pub fn not_listed_yet(conn: &Connection) -> Result<Vec<NotListedYet>, PersonErro
     let kept_for = i64::from(LEFT_SECRET_KEPT_DAYS) * 24 * 60 * 60;
     let mut not_yet: Vec<NotListedYet> = Vec::new();
     for before in held_rows::names_before(conn)? {
-        if now_listed.contains(&before.name) {
+        // What was noted and is no name is counted apart, and not shown
+        // ([`not_names_before`]).
+        if now_listed.contains(&before.name) || !is_a_name(&before.name) {
             continue;
         }
         if not_yet.last().is_none_or(|last| last.name != before.name) {
@@ -716,6 +792,79 @@ mod tests {
         assert_eq!(s[0].text("stays", "notes.md").as_deref(), Some("one"));
         // Stopped already: there is no channel to say.
         assert_eq!(stop(&s[0].conn, &s[0].identity, "lab", now).unwrap(), None);
+    }
+
+    /// A word is read as a name only where it is one that this version
+    /// would itself map, in its one spelling (decision 2026-10-04 §16).
+    /// What a device wrote under `name/` that is none is counted for that
+    /// device, and is in no list of names: not in what the personal
+    /// channel lists, and not in what is noted of a generation that is
+    /// left.
+    #[test]
+    fn test_a_word_that_is_no_name_is_counted_and_is_in_no_list_of_names() {
+        use crate::several::{words_that_are_no_names, writes_words_that_are_no_names};
+        for name in ["lab", "~", "github.com/sam/lab", "notes_2026", "a"] {
+            assert!(is_a_name(name), "{name}");
+        }
+        for no_name in words_that_are_no_names() {
+            assert!(!is_a_name(&no_name), "{no_name:?}");
+        }
+        for no_name in [
+            "", "Lab", "lab.git", "lab/", " lab", "-lab", "a b", "a\tb", "\u{7}",
+        ] {
+            assert!(!is_a_name(no_name), "{no_name:?}");
+        }
+        let longest = "x".repeat(200);
+        assert!(is_a_name(&longest) && !is_a_name(&format!("{longest}x")));
+
+        let mut s = Several::of_one_person(2);
+        let now = s.tick();
+        for (n, name) in [(0, "team"), (1, "lab")] {
+            s.hold(&[n], name);
+            say(&s[n].conn, &s[n].identity, name, now).unwrap();
+        }
+        let no_names = writes_words_that_are_no_names(&mut s, 1, 0);
+        assert_eq!(no_names, 6);
+        // On the device that was given them: the names, and no other.
+        assert_eq!(
+            listed_on(&s, 0),
+            [("lab".to_string(), vec![1]), ("team".to_string(), vec![0])]
+        );
+        assert_eq!(not_names(&s[0].conn).unwrap(), [(s.key(1), no_names)]);
+        // The device that wrote them does not say that it syncs them.
+        let said: Vec<String> = said_here(&s[1].conn, &s[1].identity)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(said, ["lab"]);
+        // A device that follows no phrase counts none.
+        assert!(not_names(&Machine::new(7).conn).unwrap().is_empty());
+
+        // Device 1 is removed. What the personal channel listed is noted:
+        // the two names, and nothing of what was no name.
+        s.change(0, &[0], &[1]);
+        let noted: Vec<String> = held_rows::names_before(&s[0].conn)
+            .unwrap()
+            .into_iter()
+            .map(|before| before.name)
+            .collect();
+        assert_eq!(noted, ["lab", "team"]);
+        assert!(not_names(&s[0].conn).unwrap().is_empty());
+        assert_eq!(not_names_before(&s[0].conn).unwrap(), 0);
+        // What an earlier build noted is not read as a name either: it is
+        // counted, once for each thing it noted.
+        for no_name in &words_that_are_no_names()[..2] {
+            for by in [s.key(0), s.key(1)] {
+                held_rows::note_name_before(&s[0].conn, no_name, &by, s.now).unwrap();
+            }
+        }
+        let not_yet: Vec<String> = not_listed_yet(&s[0].conn)
+            .unwrap()
+            .into_iter()
+            .map(|name| name.name)
+            .collect();
+        assert_eq!(not_yet, ["lab"]);
+        assert_eq!(not_names_before(&s[0].conn).unwrap(), 2);
     }
 
     /// The list of names in a new personal channel is what the devices

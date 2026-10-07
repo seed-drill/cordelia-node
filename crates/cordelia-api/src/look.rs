@@ -273,6 +273,10 @@ pub struct Look {
     /// The names that no device lists yet in the generation applied, in
     /// order of name.
     pub names_not_listed: Vec<NameNotListed>,
+    /// How many words of the personal channel, and names noted from a
+    /// generation that was left, are no names as this version would map
+    /// one (decision 2026-10-04 §16): they are counted, and never shown.
+    pub names_not_shown: usize,
     /// The files whose record could not be carried when the device
     /// applied the statement, as it noted them then.
     pub not_carried: Vec<NotCarried>,
@@ -338,6 +342,7 @@ pub fn look(
             accepting: accepting(conn, now)?,
             notices: Vec::new(),
             names_not_listed: Vec::new(),
+            names_not_shown: 0,
             not_carried: Vec::new(),
             cannot_go_on: None,
             short: None,
@@ -519,6 +524,19 @@ fn of_its_person(
     Ok(())
 }
 
+/// What is said of the things that a device lists as names and that are
+/// no names as this version would map one (decision 2026-10-04 §16):
+/// their number, and nothing of what they hold.
+pub fn names_not_shown(how_many: usize) -> String {
+    format!(
+        "{} that cannot be shown {} listed by a device: what {} called is not a name as this \
+         version writes one",
+        counted(how_many, "name"),
+        if how_many == 1 { "is" } else { "are" },
+        if how_many == 1 { "it is" } else { "they are" },
+    )
+}
+
 /// What a device that follows a phrase holds of the names of its person
 /// that are not all in the generation it has applied (decision 2026-10-04
 /// §4.2, §7.3, §8): the names that no device lists there yet, and the
@@ -550,6 +568,13 @@ fn of_its_names(
         });
     }
     look.not_carried = not_carried(conn)?;
+    // What a device listed that is no name: said as a number, and not
+    // shown.
+    let not_names: usize = names::not_names(conn)?.iter().map(|(_, words)| words).sum();
+    look.names_not_shown = not_names + names::not_names_before(conn)?;
+    if look.names_not_shown > 0 {
+        look.says.push(names_not_shown(look.names_not_shown));
+    }
 
     let (ours, gone): (Vec<&NameNotListed>, Vec<&NameNotListed>) = look
         .names_not_listed

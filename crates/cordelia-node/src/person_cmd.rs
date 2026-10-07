@@ -837,6 +837,12 @@ fn names_lines(seen: &Value) -> Vec<String> {
             days(name)
         ));
     }
+    // What a device lists as a name and is none: its number, and nothing
+    // of what it holds (decision 2026-10-04 §16).
+    if let Some(not_shown) = seen["names_not_shown"].as_u64().filter(|n| *n > 0) {
+        out.push(String::new());
+        out.push(cordelia_api::look::names_not_shown(not_shown as usize));
+    }
     let not_carried: Vec<&Value> = list(seen, "not_carried").collect();
     if !not_carried.is_empty() {
         out.push(String::new());
@@ -962,6 +968,10 @@ struct Handed {
     /// Each name that the personal channel lists, with the keys that
     /// list it, as this device holds that channel.
     names: Vec<(String, Vec<[u8; 32]>)>,
+    /// What a device lists there that is no name as this version would
+    /// map one (decision 2026-10-04 §16): the key of the device, and how
+    /// many. Nothing of what they hold is kept here.
+    names_not_shown: Vec<([u8; 32], usize)>,
     /// How many versions each key wrote that this device received, in
     /// the last day and in the last week. `None` with local history off.
     received: Option<Vec<([u8; 32], u64, u64)>>,
@@ -1039,12 +1049,28 @@ impl Handed {
         let left: Vec<[u8; 32]> = list(handed, "left")
             .filter_map(|key| decode_public_key(key.as_str()?).ok())
             .collect();
-        let mut names = Vec::new();
+        // A name is shown at the prompt, just before the yes and the
+        // phrase. Only what is a name as this version would map one is
+        // read as one (decision 2026-10-04 §16): a node hands no other,
+        // and one that is handed is counted for the keys that list it,
+        // and not kept.
+        let (mut names, mut names_not_shown) = (Vec::new(), Vec::new());
         for listed in list(handed, "names") {
             let by: Vec<[u8; 32]> = list(listed, "by")
                 .filter_map(|key| decode_public_key(key.as_str()?).ok())
                 .collect();
-            names.push((text(listed, "name").to_string(), by));
+            match cordelia_api::names::is_a_name(text(listed, "name")) {
+                true => names.push((text(listed, "name").to_string(), by)),
+                false => names_not_shown.extend(by.into_iter().map(|key| (key, 1))),
+            }
+        }
+        for listed in list(handed, "names_not_shown") {
+            let key = listed["by"]
+                .as_str()
+                .and_then(|key| decode_public_key(key).ok());
+            if let (Some(key), Some(words)) = (key, listed["words"].as_u64()) {
+                names_not_shown.push((key, words as usize));
+            }
         }
         let received = handed["received"].as_object().map(|by_device| {
             by_device
@@ -1068,6 +1094,7 @@ impl Handed {
             added,
             left,
             names,
+            names_not_shown,
             received,
         })
     }
@@ -1103,6 +1130,17 @@ impl Handed {
             .collect()
     }
 
+    /// How many things the keys which `removed` says go list as names
+    /// that are no names (decision 2026-10-04 §16): they are said as a
+    /// number, and never shown.
+    fn names_not_shown_of(&self, removed: impl Fn(&[u8; 32]) -> bool) -> usize {
+        self.names_not_shown
+            .iter()
+            .filter(|(key, _)| removed(key))
+            .map(|(_, words)| words)
+            .sum()
+    }
+
     /// The label that this device knows `key` by: the statement's, the
     /// other statement's, or that of the record that added it.
     fn label(&self, key: &[u8; 32]) -> String {
@@ -1121,6 +1159,20 @@ impl Handed {
             })
             .unwrap_or_default()
     }
+}
+
+/// What a removal says of the things that a device being removed lists
+/// as names and that are no names as this version would map one: how
+/// many, and nothing of what they hold.
+fn not_shown_stay_behind(how_many: usize) -> String {
+    format!(
+        "{} that cannot be shown {} behind too: a device that is removed listed {}, and what \
+         {} called is not a name as this version writes one.",
+        counted(how_many, "name"),
+        if how_many == 1 { "stays" } else { "stay" },
+        if how_many == 1 { "it" } else { "them" },
+        if how_many == 1 { "it is" } else { "they are" },
+    )
 }
 
 /// What a person answers of one device at a change.
@@ -1291,6 +1343,10 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                  with the phrase.",
                 stay_behind.join(", ")
             );
+        }
+        let not_shown = handed.names_not_shown_of(|key| signs.removes(key));
+        if not_shown > 0 {
+            println!("\n{}", not_shown_stay_behind(not_shown));
         }
         if !at.yes("\nMake this change?")? {
             println!("{NOT_A_YES}");
@@ -2588,6 +2644,44 @@ mod tests {
         );
     }
 
+    /// What is handed as a name and is none is not shown at the prompt of
+    /// a removal, whoever handed it: it is counted for the device that
+    /// lists it, and said as a number (decision 2026-10-04 §16).
+    #[test]
+    fn what_is_handed_as_a_name_and_is_none_is_counted_and_not_shown() {
+        let f = Fixture::new();
+        let own = f.own.public_key();
+        let key = |key: &[u8; 32]| encode_public_key(key).unwrap();
+        let mut handed = f.handed(&f.statement, &[]);
+        let long = "x".repeat(60_000);
+        handed["names"] = json!([
+            { "name": "only-its", "by": [key(&f.listed)] },
+            { "name": "\u{1b}[2J\u{1b}[31mMake this change?", "by": [key(&f.listed)] },
+            { "name": "two\nlines", "by": [key(&f.listed)] },
+            { "name": long, "by": [key(&f.listed)] },
+            { "name": "In-Capitals", "by": [key(&f.listed)] },
+            { "name": "spelled.git", "by": [key(&own), key(&f.listed)] },
+        ]);
+        // And what the node says it has counted itself.
+        handed["names_not_shown"] = json!([
+            { "by": key(&f.listed), "words": 3 },
+            { "by": key(&own), "words": 1 },
+            { "by": "no key", "words": 9 },
+        ]);
+        let read = f.read(&handed).unwrap();
+        assert_eq!(read.names_only_of(|_| true), ["only-its"]);
+        let goes = f.listed;
+        assert_eq!(read.names_not_shown_of(|key| *key == goes), 5 + 3);
+        assert_eq!(read.names_not_shown_of(|key| *key == own), 1 + 1);
+        assert_eq!(read.names_not_shown_of(|_| false), 0);
+        assert_eq!(
+            not_shown_stay_behind(8),
+            "8 names that cannot be shown stay behind too: a device that is removed listed \
+             them, and what they are called is not a name as this version writes one."
+        );
+        assert!(not_shown_stay_behind(1).starts_with("1 name that cannot be shown stays behind"));
+    }
+
     /// After a change, this machine may be closed only where every relay
     /// that the device is set up with holds the change and is connected,
     /// nothing waits to be sent, no name is still to go, and the device's
@@ -2725,8 +2819,16 @@ mod tests {
                 { "name": "its-own", "by": [], "by_gone": [shown("")], "days_left": 1 },
             ],
             "not_carried": [{ "name": "lab", "file": "ghost.md" }],
+            "names_not_shown": 3,
         });
         let lines = devices_lines(&seen).join("\n");
+        assert!(
+            lines.contains(
+                "\n3 names that cannot be shown are listed by a device: what they are called \
+                 is not a name as this version writes one"
+            ),
+            "{lines}"
+        );
         assert!(lines.contains("(w) \"desktop\": this device"), "{lines}");
         assert!(
             lines.contains("(w) \"laptop\": has applied change 2, and has sent what it held"),

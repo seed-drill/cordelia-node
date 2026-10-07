@@ -832,13 +832,7 @@ pub async fn change_prepare(
         .map(|kept| hex::encode(&kept.record))
         .collect();
     let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
-    // The names that the personal channel lists, each with the keys that
-    // list it, as this device holds that channel now.
-    let mut names: Vec<serde_json::Value> = Vec::new();
-    for listed in names::listed(&conn).map_err(refused)? {
-        let by: Vec<String> = listed.by.iter().map(written).collect::<Result<_, _>>()?;
-        names.push(json!({ "name": listed.name, "by": by }));
-    }
+    let (names, names_not_shown) = names_handed(&conn)?;
     Ok(HttpResponse::Ok().json(json!({
         "this_device": written(&state.identity.public_key())?,
         "statement": hex::encode(statement),
@@ -854,9 +848,30 @@ pub async fn change_prepare(
         "left": seen.said_left(),
         "could_not_fetch": could_not_fetch,
         "names": names,
+        "names_not_shown": names_not_shown,
         "received": received(&state, now()),
         "look": seen,
     })))
+}
+
+/// What a command that makes a change is handed of the names that the
+/// personal channel lists, as this device holds that channel now: each
+/// name with the keys that list it; and, of what a device lists there
+/// that is no name as this version would map one, for each such device
+/// how many, and nothing of what they hold (decision 2026-10-04 §16).
+fn names_handed(
+    conn: &rusqlite::Connection,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), ApiError> {
+    let mut names: Vec<serde_json::Value> = Vec::new();
+    for listed in names::listed(conn).map_err(refused)? {
+        let by: Vec<String> = listed.by.iter().map(written).collect::<Result<_, _>>()?;
+        names.push(json!({ "name": listed.name, "by": by }));
+    }
+    let mut not_shown: Vec<serde_json::Value> = Vec::new();
+    for (key, words) in names::not_names(conn).map_err(refused)? {
+        not_shown.push(json!({ "by": written(&key)?, "words": words }));
+    }
+    Ok((names, not_shown))
 }
 
 /// The records of additions that a command asks a person about at a
@@ -1138,6 +1153,27 @@ mod tests {
         peers[1].role = "node".into();
         drop(peers);
         assert_eq!(channels_waiting(&state), 0);
+    }
+
+    /// A command that makes a change is handed the names that the
+    /// personal channel lists, and, of what a device lists there that is
+    /// no name, only how many and by which device (decision 2026-10-04
+    /// §16): nothing of what it holds reaches the prompt of a removal.
+    #[test]
+    fn test_a_change_is_handed_no_word_that_is_no_name() {
+        use crate::several::writes_words_that_are_no_names;
+        let mut s = Several::of_one_person(2);
+        let now = s.tick();
+        s.hold(&[1], "lab");
+        names::say(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        let no_names = writes_words_that_are_no_names(&mut s, 1, 0);
+
+        let (names, not_shown) = names_handed(&s[0].conn).unwrap();
+        let listing = encode_public_key(&s.key(1)).unwrap();
+        assert_eq!(names, [json!({ "name": "lab", "by": [listing] })]);
+        assert_eq!(not_shown, [json!({ "by": listing, "words": no_names })]);
+        let handed = json!([names, not_shown]).to_string();
+        assert!(!handed.to_uppercase().contains("NOT-A-NAME"), "{handed}");
     }
 
     /// A relay that the device is set up with and that the node is not

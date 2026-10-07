@@ -454,6 +454,45 @@ pub(crate) fn text(said: &str) -> Value {
     Value::Text(said.to_string())
 }
 
+/// What a device can write after `name/` in the personal channel that is
+/// no name as this version would map one (decision 2026-10-04 §16): an
+/// escape sequence, a new line, a name of great length, and names in
+/// another spelling. Each holds `NOT-A-NAME`, so that a test can look for
+/// any of them in what is shown.
+pub(crate) fn words_that_are_no_names() -> Vec<String> {
+    vec![
+        "\x1b[2J\x1b[31mNOT-A-NAME-escape".to_string(),
+        "NOT-A-NAME-two\nlines".to_string(),
+        format!("NOT-A-NAME-long-{}", "x".repeat(60_000)),
+        "NOT-A-NAME-In-Capitals".to_string(),
+        "not-a-name-NOT-A-NAME.git".to_string(),
+        " NOT-A-NAME-with-space ".to_string(),
+    ]
+}
+
+/// Device `by` writes a word in its personal channel for each of
+/// [`words_that_are_no_names`], as only a device that does not run this
+/// code would, and device `to` is given all that `by` holds. Returns how
+/// many it wrote.
+pub(crate) fn writes_words_that_are_no_names(s: &mut Several, by: usize, to: usize) -> usize {
+    let now = s.tick();
+    let personal = s[by].personal();
+    let no_names = words_that_are_no_names();
+    for no_name in &no_names {
+        let word = entry_by(
+            &s[by].identity,
+            &personal,
+            1,
+            &format!("{}{no_name}", cordelia_core::protocol::PERSONAL_NAME_PREFIX),
+            text(""),
+            &[],
+        );
+        entries::store(&s[by].conn, &word, now).unwrap();
+    }
+    s.pass(by, to);
+    no_names.len()
+}
+
 /// The link of a version that held the text `said`, taken from an entry
 /// that the key `signer` signed.
 pub(crate) fn link(said: &str, signer: [u8; 32]) -> Link {
@@ -1761,6 +1800,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// What another device wrote as a name and is none is not shown by a
+    /// look, in anything it says or lists: it is counted, and said as a
+    /// number (decision 2026-10-04 §16). So neither `cordelia devices` nor
+    /// `cordelia status`, with `--json` or without, shows it.
+    #[test]
+    fn test_a_look_counts_what_is_listed_and_is_no_name_and_shows_none_of_it() {
+        let mut s = Several::of_one_person(2);
+        let now = s.tick();
+        s.hold(&[1], "lab");
+        names::say(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        let no_names = writes_words_that_are_no_names(&mut s, 1, 0);
+        let look_of = |s: &Several| {
+            let seen = look(&s[0].conn, &s[0].identity, &AtRelays::default(), s.now).unwrap();
+            let as_json = serde_json::to_string(&seen).unwrap();
+            (seen, as_json)
+        };
+
+        let (seen, as_json) = look_of(&s);
+        assert_eq!(seen.names_not_shown, no_names);
+        assert!(
+            seen.says.contains(&format!(
+                "{no_names} names that cannot be shown are listed by a device: what they are \
+                 called is not a name as this version writes one"
+            )),
+            "{:?}",
+            seen.says
+        );
+        assert!(!as_json.to_uppercase().contains("NOT-A-NAME"), "{as_json}");
+        assert!(as_json.len() < 10_000, "{}", as_json.len());
+
+        // Device 1 is removed: what it listed and was a name is shown as
+        // listed by no device yet, and what was none is not noted at all.
+        s.change(0, &[0], &[1]);
+        let (seen, as_json) = look_of(&s);
+        let shown: Vec<&str> = seen
+            .names_not_listed
+            .iter()
+            .map(|name| name.name.as_str())
+            .collect();
+        assert_eq!(shown, ["lab"]);
+        assert_eq!(seen.names_not_shown, 0);
+        assert!(!as_json.to_uppercase().contains("NOT-A-NAME"), "{as_json}");
+        // One that an earlier build noted is counted, and not shown.
+        let noted = &words_that_are_no_names()[0];
+        held_rows::note_name_before(&s[0].conn, noted, &s.key(1), s.now).unwrap();
+        let (seen, as_json) = look_of(&s);
+        assert_eq!(seen.names_not_listed.len(), 1);
+        assert_eq!(seen.names_not_shown, 1);
+        assert!(
+            seen.says
+                .iter()
+                .any(|line| line.starts_with("1 name that cannot be shown is listed")),
+            "{:?}",
+            seen.says
+        );
+        assert!(!as_json.to_uppercase().contains("NOT-A-NAME"), "{as_json}");
     }
 
     fn maps(on: &Machine, name: &str, sync_on: bool) {
