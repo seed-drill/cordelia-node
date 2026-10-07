@@ -1522,9 +1522,12 @@ fn a_command_asks_no_address_but_the_nodes_own() {
             said["not_asked"].as_str().unwrap().contains(&named),
             "{said}"
         );
+        // A node that was not asked has a state of its own, and no
+        // level: the bar's `active` goes with red alone.
+        assert!(said["level"].is_null(), "{said}");
         let out = n.command_given(&given, &["status", "--waybar"]);
         let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(said["class"][0], "attention", "{said}");
+        assert_eq!(said["class"], "attention", "{said}");
         let tooltip = said["tooltip"].as_str().unwrap();
         assert!(
             tooltip.contains("not asked") && tooltip.contains(&named),
@@ -1996,8 +1999,38 @@ fn claude_memory_syncs_between_two_machines() {
         assert!(s["sync"]["last_change_at"].is_string(), "{s}");
         assert_eq!(s["outbox_waiting"], 0, "{s}");
     }
+    // The level (decision 2026-10-04 §10.1). A device was added since
+    // the last change, and nobody has cleared it: that is amber on each
+    // device, with a mark of its own in the line and a class of its own
+    // in the bar, and the state is as it was.
+    for n in [&a, &b] {
+        let s = state(n);
+        assert_eq!(
+            (&s["state"], &s["level"]),
+            (&serde_json::json!("synced"), &serde_json::json!("amber"))
+        );
+        assert_eq!(s["summary"], "memory: 1 device added, not yet cleared");
+        assert_eq!(s["holds"][0]["what"], "added", "{s}");
+        assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
+    }
     let line = a.cli(&["status", "--line"]);
-    assert!(line.contains("memory synced"), "{line}");
+    assert!(line.contains("◆ memory: 1 device added"), "{line}");
+    let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
+    assert_eq!(
+        bar["class"],
+        serde_json::json!(["synced", "amber"]),
+        "{bar}"
+    );
+    // Cleared on a device, nothing holds there: no level.
+    for n in [&a, &b] {
+        clears_what_it_tells(n);
+        let s = state(n);
+        assert!(s["level"].is_null(), "{s}");
+        assert_eq!(s["holds"], serde_json::json!([]), "{s}");
+        assert_eq!(s["summary"], "memory synced", "{s}");
+    }
+    let line = a.cli(&["status", "--line"]);
+    assert!(line.contains("● memory synced"), "{line}");
     let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
     assert_eq!(bar["class"], "synced", "{bar}");
     assert!(

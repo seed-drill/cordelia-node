@@ -520,10 +520,22 @@ fn default_entity_name() -> String {
 
 fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
     let status = gather_status(config_path);
-    let (state, summary) = indicator::derive(&status.facts);
+    // The state, the level, and what the line says: the level is worked
+    // out here, in the command, and nowhere else (decision 2026-10-04
+    // §10.1).
+    let shown = indicator::shown(&status.facts);
+    let (state, level, summary) = (shown.state, shown.level, shown.summary.clone());
+    // Everything that holds beside what the line says: a tooltip and the
+    // plain status list it all.
+    let also: Vec<String> = shown
+        .holds
+        .iter()
+        .filter(|holds| holds.says != summary)
+        .map(indicator::Holds::detail)
+        .collect();
 
     if waybar {
-        let mut details = Vec::new();
+        let mut details = also.clone();
         if let Some(why) = &status.not_asked {
             details.push(format!("Not asked: {why}"));
         }
@@ -575,7 +587,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 details.push(format!("Stopped syncing: {stopped}"));
             }
         }
-        let text = indicator::bar(state, &summary, &details);
+        let text = indicator::bar(state, level, &summary, &details);
         if !text.is_empty() {
             println!("{text}");
         }
@@ -584,16 +596,34 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
 
     if line {
         let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-        let text = indicator::line(state, &summary, color);
+        let text = indicator::line(state, level, &summary, color);
         if !text.is_empty() {
             println!("{text}");
         }
         return Ok(());
     }
     if json {
+        let holds: Vec<serde_json::Value> = shown
+            .holds
+            .iter()
+            .map(|holds| {
+                serde_json::json!({
+                    "level": holds.level.as_str(),
+                    "what": holds.what,
+                    "says": holds.says,
+                })
+            })
+            .collect();
         let mut out = serde_json::json!({
             "state": state.as_str(),
+            // The level: `red`, `amber`, or null where none holds. A
+            // panel draws it, and works nothing out itself.
+            "level": level.map(indicator::Level::as_str),
+            // The first thing of that level; with no level, what the
+            // state says.
             "summary": summary,
+            // Everything that holds, red first, each with its level.
+            "holds": holds,
             "version": env!("CARGO_PKG_VERSION"),
             "running": status.facts.running,
         });
@@ -693,12 +723,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 out["peers"]["list"] = peers["peers"].clone();
                 out["peers"]["relays"] = peers["relays"].clone();
             }
-            // What this device holds of its person, under a recovery
-            // phrase (decision 2026-10-04 §8): where it stands, what it
-            // says in words, and what it is to tell a person.
-            if let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout) {
-                out["person"] = person;
-            }
+        }
+        // What this device holds of its person, under a recovery phrase
+        // (decision 2026-10-04 §8): where it stands, what it says in
+        // words, and what it is to tell a person.
+        if let Some(person) = &status.person {
+            out["person"] = person.clone();
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -790,6 +820,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             }
             if config.network.role == "personal" {
                 println!("  Memory:    {summary}");
+                for more in &also {
+                    println!("    also:     {more}");
+                }
                 for c in &status.facts.conflicts {
                     println!("    conflict: {c}");
                 }
@@ -812,7 +845,8 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 // What this device says of itself and its person's
                 // devices (decision 2026-10-04 §5.1, §5.2, §8).
                 let timeout = std::time::Duration::from_secs(3);
-                if let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout) {
+                let asked_again = || local_api(&config, true, "/api/v1/devices/list", timeout).ok();
+                if let Some(person) = status.person.clone().or_else(asked_again) {
                     let (short, says) = person_cmd::status_lines(&person);
                     println!("  Devices:   {short}");
                     for line in says {
@@ -844,6 +878,9 @@ struct GatheredStatus {
     /// Why the node was not asked, where its API address is not one a
     /// command asks ([`api_host`]).
     not_asked: Option<String>,
+    /// `POST /api/v1/devices/list` from the running node, where it is a
+    /// personal one: what it holds of its person.
+    person: Option<serde_json::Value>,
 }
 
 impl GatheredStatus {
@@ -865,6 +902,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         live: None,
         sync: None,
         not_asked: None,
+        person: None,
     };
     let Ok(mut config) = Config::load(&config::expand_tilde(config_path)) else {
         return out;
@@ -888,6 +926,11 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         return out;
     };
     out.facts.running = true;
+    out.facts.uptime_secs = live["uptime_secs"].as_u64();
+    // By the node's own clock. A node that does not say gives none.
+    out.facts.no_relay_secs = live["no_relay_secs"].as_u64();
+    // Only the command knows that the node is another version than it.
+    out.facts.other_version = live["version"].as_str() != Some(env!("CARGO_PKG_VERSION"));
     out.facts.held = live["held"]["by"].as_str().map(str::to_string);
     out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
     out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
@@ -902,6 +945,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {
         let report = &sync["report"];
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
+        out.facts.mapped = sync["mappings"].as_array().map_or(0, Vec::len);
         out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
         out.facts.moved_on = sync["moved_on"].as_bool().unwrap_or(false);
         // The notice of what stopped syncing, while the node stores one.
@@ -941,7 +985,50 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         }
         out.sync = Some(sync);
     }
+    // What the node holds of this person's devices (decision 2026-10-04
+    // §8): a level goes by it.
+    if out.facts.role == "personal"
+        && let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout)
+    {
+        out.facts.devices = devices_facts(&person, chrono::Utc::now().timestamp());
+        out.person = Some(person);
+    }
     out
+}
+
+/// What a status goes by of a person's devices, from the node's look at
+/// them (`POST /api/v1/devices/list`) at `now`, in seconds
+/// ([`indicator::Devices`]).
+fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
+    let list = |key: &str| person[key].as_array().into_iter().flatten();
+    let ago = |at: &serde_json::Value| at.as_i64().map(|at| now.saturating_sub(at).max(0) as u64);
+    let change = person["change"].as_u64();
+    let applied_secs = ago(&person["applied_at"]);
+    // A removal stands where the statement lists a key as removed, and
+    // is not applied by a device that does not say it has applied that
+    // statement.
+    let removal = list("removed").next().is_some();
+    let not_by_all = list("devices").any(|device| device["applied"].as_u64() != change);
+    let said_left = list("devices").chain(list("added"));
+    indicator::Devices {
+        not_applied: person["state"] == "applied" && person["cannot_go_on"].is_string(),
+        removal_not_applied_secs: applied_secs.filter(|_| removal && not_by_all),
+        added_not_cleared: list("notices")
+            .filter(|notice| notice["kind"] == "added")
+            .count(),
+        said_left: said_left.filter(|device| device["left"] == true).count(),
+        without_latest_secs: list("relays")
+            .filter(|relay| relay["holds_latest"] == false)
+            .filter_map(|relay| relay["connected_secs"].as_u64())
+            .collect(),
+        no_room_secs: list("relays")
+            .filter_map(|relay| ago(&relay["no_room_at"]))
+            .collect(),
+        names_not_listed: list("names_not_listed").count(),
+        applied_secs,
+        names_to_go: person["names"]["to_go"].as_array().map_or(0, Vec::len),
+        to_go_secs: ago(&person["names"]["to_go_since"]),
+    }
 }
 
 /// `3h 12m`, `4m 05s`, `40s`.
@@ -4694,6 +4781,104 @@ mod tests {
             said.contains(restart_command(std::env::consts::OS)),
             "{said}"
         );
+    }
+
+    /// What a status goes by of a person's devices, from the node's look
+    /// at them (decision 2026-10-04 §8, §10.1): each thing as the look
+    /// gives it, and nothing where the look says nothing.
+    #[test]
+    fn test_what_a_status_goes_by_of_a_persons_devices() {
+        let now = 1_000_000;
+        assert_eq!(
+            devices_facts(&serde_json::json!({}), now),
+            indicator::Devices::default()
+        );
+        // A device that follows no phrase: nothing holds.
+        let alone = serde_json::json!({
+            "state": "no_phrase", "change": null, "devices": [], "added": [], "removed": [],
+            "notices": [], "relays": [{ "relay": "a", "holds_latest": null, "connected_secs": 900,
+            "no_room_at": null }], "names_not_listed": [], "names": { "sent": [], "to_go": [],
+            "to_go_since": null }, "cannot_go_on": "no recovery phrase yet",
+        });
+        assert_eq!(devices_facts(&alone, now), indicator::Devices::default());
+
+        let look = serde_json::json!({
+            "state": "applied",
+            "change": 3,
+            "applied_at": now - 3_600,
+            "cannot_go_on": null,
+            "devices": [
+                { "this_device": true, "applied": 3, "left": false },
+                { "this_device": false, "applied": null, "left": false },
+                { "this_device": false, "applied": 3, "left": true },
+            ],
+            "added": [{ "applied": 3, "left": true }, { "applied": 3, "left": false }],
+            "removed": [{ "key": "k" }],
+            "notices": [
+                { "id": "1", "kind": "added" },
+                { "id": "2", "kind": "left" },
+                { "id": "3", "kind": "added" },
+                { "id": "4", "kind": "left_out" },
+            ],
+            "relays": [
+                { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null },
+                { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60 },
+                { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null },
+                { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5 },
+            ],
+            "names_not_listed": [{ "name": "lab" }, { "name": "team" }],
+            "names": { "sent": ["x"], "to_go": ["lab"], "to_go_since": now - 30 },
+        });
+        assert_eq!(
+            devices_facts(&look, now),
+            indicator::Devices {
+                not_applied: false,
+                removal_not_applied_secs: Some(3_600),
+                added_not_cleared: 2,
+                said_left: 2,
+                // Only a relay that is connected and says that it does
+                // not hold it.
+                without_latest_secs: vec![400],
+                // A refusal in the clock's future was a moment ago.
+                no_room_secs: vec![60, 0],
+                names_not_listed: 2,
+                applied_secs: Some(3_600),
+                names_to_go: 1,
+                to_go_secs: Some(30),
+            }
+        );
+
+        let edit = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut look = look.clone();
+            change(&mut look);
+            devices_facts(&look, now)
+        };
+        // A removal that every device has applied is none; nor is a
+        // change that some device has not applied and that removes none;
+        // nor one of which this device does not know when it applied it.
+        let all_applied = edit(&|look| look["devices"][1]["applied"] = 3.into());
+        assert_eq!(all_applied.removal_not_applied_secs, None);
+        let none_removed = edit(&|look| look["removed"] = serde_json::json!([]));
+        assert_eq!(none_removed.removal_not_applied_secs, None);
+        let not_known = edit(&|look| look["applied_at"] = serde_json::Value::Null);
+        assert_eq!(not_known.removal_not_applied_secs, None);
+        assert_eq!(not_known.applied_secs, None);
+        // A device that says it has applied another change has not
+        // applied this one.
+        let another = edit(&|look| {
+            look["devices"][1]["applied"] = 2.into();
+        });
+        assert_eq!(another.removal_not_applied_secs, Some(3_600));
+        // Answered with a change that it could not apply.
+        let not_applied = edit(&|look| look["cannot_go_on"] = "it could not".into());
+        assert!(not_applied.not_applied);
+        // A device that has stopped says why it cannot go on, and that
+        // is said of where it stands, not here.
+        let removed = edit(&|look| {
+            look["state"] = "removed".into();
+            look["cannot_go_on"] = "this device was removed".into();
+        });
+        assert!(!removed.not_applied);
     }
 
     #[test]

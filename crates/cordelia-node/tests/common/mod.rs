@@ -1025,6 +1025,18 @@ pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> Option<String> {
     words
 }
 
+/// A person clears, at a terminal and with a yes, the one thing that `n`
+/// has to tell them (`cordelia devices --clear`): after a device was
+/// added, each device tells of it until it is cleared there, and the
+/// status line is amber meanwhile (decision 2026-10-04 §10.1).
+pub fn clears_what_it_tells(n: &Node) {
+    let told = person_of(n)["notices"].as_array().map_or(0, Vec::len);
+    assert_eq!(told, 1, "{}: one thing to clear", n.name);
+    let mut at = n.at_terminal(&["devices", "--clear"]);
+    at.says("Type yes to go on").types("yes");
+    assert!(at.done().contains("Cleared on this device."));
+}
+
 /// The folder Claude Code keeps for a session started in `dir`.
 pub fn claude_project(home: &std::path::Path, dir: &std::path::Path) -> PathBuf {
     let name: String = dir

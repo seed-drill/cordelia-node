@@ -257,13 +257,23 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
             (s["summary"] == "memory: 1 conflict").then_some(())
         });
     }
-    // With the copy merged away on one device, both are synced.
+    // With the copy merged away on one device, both are synced. Each
+    // still tells of the device that was added, which nobody has
+    // cleared: that is amber, and says so (decision 2026-10-04 §10.1).
     std::fs::remove_file(a_mem.join(&copies[0])).unwrap();
     for n in [&a, &b] {
         wait_for("the device is synced", &all, 90, || {
             let s = state(n);
-            (s["state"] == "synced" && s["summary"] == "memory synced").then_some(())
+            (s["state"] == "synced" && s["level"] == "amber").then_some(())
         });
+        assert_eq!(
+            state(n)["summary"],
+            "memory: 1 device added, not yet cleared"
+        );
+        clears_what_it_tells(n);
+        let s = state(n);
+        assert!(s["level"].is_null(), "{s}");
+        assert_eq!(s["summary"], "memory synced", "{s}");
     }
     assert_eq!(files(&a_mem), files(&b_mem));
     assert_eq!(files(&a_mem).len(), 4);
