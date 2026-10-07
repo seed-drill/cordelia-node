@@ -903,7 +903,7 @@ fn a_node_that_starts_with_sync_on_writes_the_stored_scope_off() {
     assert_eq!(scope(&device).as_deref(), Some("off"));
     // The node is stopped, and its database is left as `stored` has the
     // scope; then it is started.
-    let mut started_from = |device: &mut Node, stored: Option<&str>| {
+    let started_from = |device: &mut Node, stored: Option<&str>| {
         device.stop();
         {
             let conn = Connection::open(device.data_dir().join("cordelia.db")).unwrap();
