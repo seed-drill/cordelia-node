@@ -936,7 +936,10 @@ enum Which {
     Settle,
 }
 
-/// `cordelia remove-device <key>` (decision 2026-10-04 §7.1).
+/// `cordelia remove-device <key>` (decision 2026-10-04 §7.1). Given a
+/// key that is in no list and was not added since, it removes the key
+/// all the same, after saying what that means and a typed answer
+/// ([`refuses_a_key_it_does_not_know`], §10).
 pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
     made_at_a_terminal(config_path, || {
         let device = decode_public_key(key).map_err(|e| {
@@ -1535,14 +1538,17 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         }
         let known =
             applied.lists(&goes) || handed.added.iter().any(|r| r.addition.device.key == goes);
-        if !known {
-            anyhow::bail!(
-                "that key is no device of yours that this device knows of: `cordelia devices` \
-                 lists them, each with its key."
-            );
+        match known {
+            true => {
+                println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
+                println!("  {}", handed.received_from(&goes));
+            }
+            // A key that this device knows nothing of is removed by key
+            // (decision 2026-10-04 §10): a key that is in no list is not
+            // refused by anything, and could be added by the two
+            // commands. A person who wants it refused removes it once.
+            false => refuses_a_key_it_does_not_know(at, &goes)?,
         }
-        println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
-        println!("  {}", handed.received_from(&goes));
         removed.push(goes);
     }
     let asked = questions(handed, goes);
@@ -1566,6 +1572,46 @@ fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepar
         }
     }
     Ok(prepare_change(&handed.applied, &own, stay, &removed)?)
+}
+
+/// What `cordelia remove-device` says of a key that is in no list of the
+/// last change and was not added since (decision 2026-10-04 §10).
+const NO_DEVICE_IT_KNOWS: &str = "is no device of yours that this device knows of: it is in no \
+    list of the last change, and was not added since (`cordelia devices` lists those, each with \
+    its key).";
+
+/// What removing such a key does, said before its answer is asked.
+const REFUSED_FOR_GOOD: &str = "Removing it refuses that key for good: the change lists it among \
+    its removed keys, no device of yours adds it after that, and no later change brings it back. \
+    That is for a key that was one of your devices before every device was added again, and \
+    that is not to be added.";
+
+/// The answer that removes a key which this device does not know.
+const REFUSES_THE_KEY: &str = "refuse";
+
+/// `cordelia remove-device` was given the key `goes`, which this device
+/// knows nothing of (decision 2026-10-04 §10): it says that this is no
+/// device it knows of, and that removing it refuses that key for good,
+/// and asks a typed answer before anything else. **No answer is
+/// suggested:** pressing Enter answers nothing, and anything but the one
+/// word stops the command, with nothing made.
+///
+/// The change then goes on as any removal: the key is among the removed
+/// keys of the statement that is shown, before the yes and the phrase.
+fn refuses_a_key_it_does_not_know(at: &Terminal, goes: &[u8; 32]) -> anyhow::Result<()> {
+    println!(
+        "\nThe key ({}) {NO_DEVICE_IT_KNOWS}",
+        fingerprint::shown(goes)
+    );
+    println!("  {REFUSED_FOR_GOOD}");
+    let typed = at.answer(&format!(
+        "  Type `{REFUSES_THE_KEY}` to refuse this key for good, or anything else to stop: "
+    ))?;
+    match typed.as_deref() {
+        Some(REFUSES_THE_KEY) => Ok(()),
+        Some(_) => anyhow::bail!("That was not `{REFUSES_THE_KEY}`. Nothing was done."),
+        None => anyhow::bail!("the input ended before an answer was typed. Nothing was made."),
+    }
 }
 
 /// This device as a change will list it, where the statement applied

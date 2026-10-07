@@ -897,11 +897,20 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["remove-device", &laptop_key])
         .refused();
     assert!(said.contains("that is this device's own key"), "{said}");
-    // A key that is nobody's device.
-    let said = laptop
-        .at_terminal(&["remove-device", &key_of(&relay)])
-        .refused();
-    assert!(said.contains("no device of yours"), "{said}");
+    // A key that is nobody's device: the command says so, and asks a
+    // typed answer before anything else. No answer is suggested: Enter
+    // answers nothing, and nothing is made.
+    let mut at = laptop.at_terminal(&["remove-device", &key_of(&relay)]);
+    at.says("is no device of yours that this device knows of");
+    at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+        .types("");
+    let said = at.refused();
+    assert!(
+        said.contains("That was not `refuse`. Nothing was done."),
+        "{said}"
+    );
+    assert!(!said.contains("Make this change?"), "{said}");
+    assert_eq!(look(&laptop)["change"], 1);
 
     // A wrong phrase: one that is a phrase, and not this device's.
     let other_phrase =
@@ -1112,6 +1121,112 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["remove-device", &desktop_key])
         .refused();
     assert!(said.contains("that key was removed already"), "{said}");
+}
+
+/// A key that this device knows nothing of is removed by key (decision
+/// 2026-10-04 §10): a key that is in no list is refused by nothing, and
+/// the two commands would add it. `cordelia remove-device <key>` says that
+/// this is no device it knows of, and that removing it refuses that key
+/// for good, and asks a typed answer, with none suggested: a yes is not
+/// the answer. It then goes on as any removal: the key is among the
+/// removed keys that the phrase signs, every device of the person's
+/// applies the change, and the key is added by none of them after it.
+#[test]
+fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    // A machine that was a device of the person's before every device
+    // was added again, say: it has a key, and is in no list.
+    let old = device_started("tablet", &relay);
+    let all = [&relay, &laptop, &desktop, &old];
+    let words = makes_a_phrase(&laptop, "laptop");
+    let (laptop_key, desktop_key, old_key) = (key_of(&laptop), key_of(&desktop), key_of(&old));
+    adds(&laptop, &desktop, "desktop");
+
+    let asks_its_answer = |answer: &str| {
+        let mut at = laptop.at_terminal(&["remove-device", &old_key]);
+        at.says(&format!(
+            "The key ({}) is no device of yours that this device knows of: it is in no list \
+             of the last change, and was not added since",
+            words_of(&old_key)
+        ));
+        at.says("Removing it refuses that key for good");
+        at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+            .types(answer);
+        at
+    };
+    // A yes is not the answer, and nor is the word that removes a device
+    // which is known: nothing is made, and nothing more is asked.
+    for not_it in ["yes", "removed"] {
+        let said = asks_its_answer(not_it).refused();
+        assert!(
+            said.contains("That was not `refuse`. Nothing was done."),
+            "{said}"
+        );
+        assert!(!said.contains("Type `stays` or `removed`"), "{said}");
+        assert!(
+            !said.contains("The recovery phrase, twelve words"),
+            "{said}"
+        );
+    }
+    assert_eq!(look(&laptop)["change"], 1);
+
+    // The answer, typed: it goes on as any removal. The desktop was added
+    // since the last change, and is asked about; the lists that the
+    // phrase will sign have the key among the removed, by its words, with
+    // no label, for this device knew none.
+    let mut at = asks_its_answer("refuse");
+    at.says(&format!(
+        "({}) \"desktop\", added since the last change",
+        words_of(&desktop_key)
+    ));
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("The change that the recovery phrase will sign (change 2):");
+    at.says("devices (2):");
+    at.says("removed keys (1):");
+    at.says(&format!("({})", words_of(&old_key)));
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("The change is made (change 2).");
+    let said = at.done();
+    assert!(
+        !said.contains(&format!("({}), known here as", words_of(&old_key))),
+        "{said}"
+    );
+    assert!(said.contains("this machine may be closed."), "{said}");
+
+    // The statement that the laptop has applied lists the key as removed,
+    // and the desktop applies it.
+    assert_eq!(look(&laptop)["change"], 2);
+    applies(&desktop, 2, &all);
+    for device in [&laptop, &desktop] {
+        let removed = look(device)["removed"].clone();
+        assert_eq!(removed.as_array().unwrap().len(), 1, "{removed}");
+        assert_eq!(removed[0]["key"], old_key.as_str(), "{removed}");
+    }
+    let listed = laptop.cli(&["devices"]);
+    assert!(listed.contains("Removed keys:"), "{listed}");
+    assert!(listed.contains(&old_key), "{listed}");
+
+    // The key is refused for good: no device of the person's adds it.
+    for device in [&laptop, &desktop] {
+        let said = device
+            .at_terminal(&["add-device", &old_key, "--name", "tablet"])
+            .refused();
+        assert!(
+            said.contains("that key was removed, and a removed key is not added again"),
+            "{said}"
+        );
+    }
+    // And it is removed once: a second time says that it was.
+    let said = laptop.at_terminal(&["remove-device", &old_key]).refused();
+    assert!(said.contains("that key was removed already"), "{said}");
+    // The machine of that key followed no phrase, and follows none.
+    assert_eq!(text(&look(&old), "state"), "no_phrase");
+    let _ = laptop_key;
 }
 
 // ── cordelia renew ───────────────────────────────────────────────────

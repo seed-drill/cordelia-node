@@ -117,9 +117,10 @@ enum Commands {
         key: String,
     },
     /// Remove one of your devices, with the recovery phrase. Asks at a
-    /// terminal.
+    /// terminal. Given a key that this device knows nothing of, it
+    /// refuses that key for good, after a typed answer.
     RemoveDevice {
-        /// The device's key, as `cordelia devices` lists it
+        /// The device's key, as `cordelia devices` or `cordelia id` shows it
         key: String,
     },
     /// Give the devices that stay a new secret, with the recovery
