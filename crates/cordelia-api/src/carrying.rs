@@ -29,8 +29,12 @@
 //!
 //! The device's own store is brought up to what the relays hold of the
 //! new channel first (a whole pass), so that what is judged against is
-//! what the new channel holds now. What is carried waits in the store and
-//! is sent like anything the device writes.
+//! what the new channel holds now. **Where that could not be done, nothing
+//! is taken** ([`fetched_whole`]): no relay answered, or the pass did not
+//! end with every channel read to its end, so which slots of the new
+//! channel hold nothing is not known. The command says that the new
+//! channel could not be read. What is carried waits in the store and is
+//! sent like anything the device writes.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -40,7 +44,9 @@ use serde::Deserialize;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use cordelia_core::protocol::{CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS};
+use cordelia_core::protocol::{
+    CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS, OUTBOX_FLUSH_INTERVAL_SECS,
+};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::fingerprint;
@@ -49,7 +55,7 @@ use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, State};
 
 use crate::carry::{self, Allows, Handed, Removed, Rule, Tally, WasRead, Word};
-use crate::commands;
+use crate::commands::{self, Waited};
 use crate::error::ApiError;
 use crate::names;
 use crate::person::{self, Held, PersonError};
@@ -108,6 +114,50 @@ pub async fn sessions(state: &AppState) -> Vec<(String, Option<[u8; 32]>)> {
     match tokio::time::timeout(Duration::from_secs(30), answered).await {
         Ok(Ok(sessions)) => sessions,
         _ => Vec::new(),
+    }
+}
+
+/// What is said where the new channel could not be fetched whole before
+/// a carry ([`fetched_whole`]).
+pub const NEW_CHANNEL_NOT_READ: &str = "the new channel could not be read at a relay (no relay \
+    answered, or the read did not end), so which of its slots hold nothing is not known: nothing \
+    was taken. Run this again once a relay can be read";
+
+/// Bring the device's store up to what the relays hold of its channels,
+/// the new channel of a name that it has just come to hold among them,
+/// and say whether that was done by `deadline` (decision 2026-10-04
+/// §7.3): a whole pass that began after this was asked read every channel
+/// to its end at every relay it reached ([`commands::fetch`]). **Which
+/// slots of a new channel hold nothing is judged only where this says
+/// yes.**
+///
+/// - Where no relay is connected, no relay answers: nothing is waited
+///   for.
+/// - A pass that ends early is asked for again, after the time between
+///   two sends, for as long as `deadline` allows: a turn that it found
+///   running at a relay has ended by then, and a device that has just
+///   woken has heard from each relay or waited its time.
+/// - A node with no network has no relay to read, and nothing to wait
+///   for: what it holds is all there is.
+pub(crate) async fn fetched_whole(state: &AppState, deadline: Instant) -> bool {
+    if state.push_tx.is_none() {
+        return true;
+    }
+    let connected = sessions(state).await;
+    if !connected.iter().any(|(_, session)| session.is_some()) {
+        return false;
+    }
+    loop {
+        match commands::fetch(state, true, deadline).await {
+            Waited::Done => return true,
+            Waited::NotEnded => return false,
+            Waited::EndedEarly => {}
+        }
+        let again = Instant::now() + Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS);
+        if again >= deadline {
+            return false;
+        }
+        tokio::time::sleep_until(again.into()).await;
     }
 }
 
@@ -333,9 +383,14 @@ pub async fn carry_name(
     done.held_anew = holds(state, name)?;
 
     // What the relays hold of the new channel is fetched first: what a
-    // version is judged against is what the new channel holds now.
+    // version is judged against is what the new channel holds now. Where
+    // it could not be fetched whole, nothing is taken.
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    commands::fetch(state, true, deadline).await;
+    if !fetched_whole(state, deadline).await {
+        done.read_all = false;
+        done.nothing = Some(NEW_CHANNEL_NOT_READ.into());
+        return Ok(done);
+    }
 
     let counts = |key: &[u8; 32]| counting.counts(key);
     let mut read: Vec<WasRead> = Vec::new();
@@ -510,9 +565,12 @@ pub async fn look_from(
     }
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     let mut held_anew = false;
+    // Whether the new channel was fetched whole just before: only then
+    // is it judged which of its slots hold nothing (§7.3).
+    let mut new_read = true;
     if !keys.is_empty() {
         held_anew = holds(state, name)?;
-        commands::fetch(state, true, deadline).await;
+        new_read = fetched_whole(state, deadline).await;
     }
     let read = read_generations(state, name, &left, deadline).await?;
 
@@ -540,13 +598,14 @@ pub async fn look_from(
         .collect();
 
     // What the named keys signed, judged against the new channel, with
-    // nothing written.
+    // nothing written: and not judged at all where the new channel could
+    // not be read.
     let mut tally = Tally::default();
     let has_folder = {
         let conn = db(state);
-        for version in newest_of(&read, &keys)? {
+        for version in newest_of(&read, &keys)?.iter().filter(|_| new_read) {
             let would =
-                carry::would_bring(&conn, &state.identity, name, &version, Rule::EmptySlots)?;
+                carry::would_bring(&conn, &state.identity, name, version, Rule::EmptySlots)?;
             tally.count(&version.name, would);
         }
         names::has_folder(&conn, name)?
@@ -576,6 +635,9 @@ pub async fn look_from(
         "has_folder": has_folder,
         "generations": read.iter().map(|g| g.says(0)).collect::<Vec<_>>(),
         "read_all": read.iter().all(Generation::read_all),
+        // Whether the new channel was fetched whole: where it was not,
+        // nothing above was judged, and nothing is taken.
+        "new_read": new_read,
         "nothing": null,
     }))
 }
@@ -683,8 +745,15 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
         return Ok(done.says(name));
     }
     done.held_anew = holds(state, name)?;
+    // Which slots are empty is judged only where the new channel was
+    // fetched whole just before (§7.3): where it could not be, nothing
+    // is taken.
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    commands::fetch(state, true, deadline).await;
+    if !fetched_whole(state, deadline).await {
+        done.read_all = false;
+        done.nothing = Some(NEW_CHANNEL_NOT_READ.into());
+        return Ok(done.says(name));
+    }
     let read = read_generations(state, name, &left, deadline).await?;
     for generation in &read {
         done.read_all &= generation.read_all();
@@ -733,7 +802,9 @@ pub async fn from_take(
 ///
 /// The device comes to hold the name, and fetches its new channel, so
 /// that what is handed to it afterwards is judged against what the
-/// relays hold now.
+/// relays hold now. Refused where the new channel could not be fetched
+/// whole ([`fetched_whole`]): the command is handed nothing, and gives
+/// no word.
 pub async fn look_for_phrase(
     state: &AppState,
     name: &str,
@@ -746,8 +817,13 @@ pub async fn look_for_phrase(
         }
     }
     let held_anew = holds(state, name)?;
+    // What the command hands back is judged against the new channel:
+    // where that could not be fetched whole, nothing is handed out, and
+    // so nothing is taken.
     let deadline = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    commands::fetch(state, true, deadline).await;
+    if !fetched_whole(state, deadline).await {
+        return Err(PersonError::NotCarried(format!("{NEW_CHANNEL_NOT_READ}.")));
+    }
     let sessions = sessions(state).await;
     let conn = db(state);
     let entry = person::latest_entry(&conn)?;
@@ -1254,6 +1330,106 @@ mod tests {
         assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("over it"));
         // A file that the word does not name stays where it is.
         assert_eq!(node.text(LAB, "deleted.md"), None);
+    }
+
+    /// **Which slots of the new channel hold nothing is judged only
+    /// where the new channel was fetched whole just before** (decision
+    /// 2026-10-04 §7.3). Where no relay answers, a plain carry, a
+    /// mapping's carry, `--from` and `--phrase` take nothing, and each
+    /// says that the new channel could not be read: nothing is read of
+    /// what was left, and nothing is written. Once the relay answers,
+    /// each does what it does.
+    #[actix_web::test]
+    async fn test_nothing_is_taken_where_the_new_channel_could_not_be_fetched_whole() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (node, phrase, removed, _) = after_a_removal();
+        let before = node.stored();
+        node.not_connected.store(true, SeqCst);
+
+        for only_where_empty in [false, true] {
+            let done = carry_name(&node.state, LAB, only_where_empty)
+                .await
+                .unwrap();
+            assert_eq!(done.nothing.as_deref(), Some(NEW_CHANNEL_NOT_READ));
+            assert!(!done.read_all);
+            assert_eq!(done.tally, Tally::default());
+        }
+        // `--from`: nothing is judged before the phrase, and nothing is
+        // taken with its word.
+        let found = look_from(&node.state, LAB, &["device 2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(found["new_read"], false, "{found}");
+        assert_eq!((&found["empty"], &found["above"]), (&json!(0), &json!([])));
+        assert_eq!(found["deletes"], 0);
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let taken = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(taken["nothing"], NEW_CHANNEL_NOT_READ, "{taken}");
+        assert_eq!(taken["carried"], 0);
+        // `--phrase`: the command is handed nothing.
+        let refused = look_for_phrase(&node.state, LAB).await;
+        assert!(
+            matches!(&refused, Err(PersonError::NotCarried(why)) if why.starts_with(NEW_CHANNEL_NOT_READ)),
+            "{refused:?}"
+        );
+        assert_eq!(node.stored(), before);
+        assert_eq!(node.text(LAB, "only.md"), None);
+        // No pass was waited for, and nothing that was left was taken:
+        // only the look before the phrase read it, to list who signed.
+        assert_eq!(*node.did.lock().unwrap(), ["read"]);
+
+        // The relay answers: the same word takes what it allows.
+        node.not_connected.store(false, SeqCst);
+        let found = look_from(&node.state, LAB, &["device 2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(found["new_read"], true);
+        assert_eq!(found["empty"], 1, "{found}");
+        let taken = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(
+            (&taken["carried"], &taken["nothing"]),
+            (&json!(1), &json!(null))
+        );
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("of device 2"));
+        assert!(look_for_phrase(&node.state, LAB).await.is_ok());
+    }
+
+    /// The new channel was fetched whole where a whole pass that began
+    /// after the asking read every channel to its end (decision
+    /// 2026-10-04 §7.3). A pass that ends early is asked for again: three
+    /// at once, and then again after the time between two sends, for as
+    /// long as the time allows. Where none goes to its end in that time,
+    /// or no relay is connected, it was not.
+    #[actix_web::test]
+    async fn test_the_new_channel_is_fetched_whole_by_a_pass_that_read_everything() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (node, _, _, _) = after_a_removal();
+        let within = |secs: u64| Instant::now() + Duration::from_secs(secs);
+        let passes = |node: &Node| node.did.lock().unwrap().len();
+
+        assert!(fetched_whole(&node.state, within(30)).await);
+        assert_eq!(passes(&node), 1);
+        // Three passes end early, and the next goes to its end: it is
+        // asked for after a wait.
+        node.short_passes.store(3, SeqCst);
+        let began = Instant::now();
+        assert!(fetched_whole(&node.state, within(30)).await);
+        assert_eq!(passes(&node), 5);
+        assert!(began.elapsed() >= Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS));
+        // Every pass ends early: not fetched, once the time has gone by.
+        node.short_passes.store(usize::MAX, SeqCst);
+        let began = Instant::now();
+        assert!(!fetched_whole(&node.state, within(1)).await);
+        assert!(began.elapsed() < Duration::from_secs(5));
+        // No relay is connected: no pass is waited for.
+        node.short_passes.store(0, SeqCst);
+        node.not_connected.store(true, SeqCst);
+        let asked = passes(&node);
+        assert!(!fetched_whole(&node.state, within(30)).await);
+        assert_eq!(passes(&node), asked);
+        // A node with no network has nothing to fetch.
+        let alone = crate::several::state_of(Machine::new(9));
+        assert!(fetched_whole(&alone, within(30)).await);
     }
 
     /// A generation whose secret this device never held is read by the

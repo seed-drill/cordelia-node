@@ -724,6 +724,19 @@ fn goes_on_in_a_new_process(
 /// key's words are worked out here, from the key.
 fn look_lines(found: &Value) -> Vec<String> {
     let number = |field: &str| found[field].as_u64().unwrap_or(0) as usize;
+    // Where the new channels could not be read, the look took nothing
+    // (§7.3): which of their slots hold nothing was not known.
+    if found["new_not_read"] == true {
+        return vec![
+            "The look took nothing: the new channels could not be read at a relay (no relay \
+             answered, or the read did not end), so which of their slots hold nothing was not \
+             known. It is not made again by itself. What the relays hold of each device that is \
+             gone is brought in by `cordelia sync carry <name> --from <device>`, with the \
+             phrase, once a relay can be read: with no device named, it lists the removed \
+             keys that signed there."
+                .to_string(),
+        ];
+    }
     let mut lines = vec![format!(
         "The look is made: {} read, and {} carried, in {}.",
         counted(number("names"), "name"),
@@ -1163,6 +1176,22 @@ mod tests {
         );
         // What is no key is not shown.
         assert!(!all.contains("odd"), "{all}");
+
+        // A look that could not read the new channels took nothing, and
+        // says so, with the command that brings in what the relays hold.
+        let not_read = json!({ "finished": true, "new_not_read": true, "names": 3, "carried": 0 });
+        let lines = look_lines(&not_read);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "The look took nothing: the new channels could not be read at a relay"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("`cordelia sync carry <name> --from <device>`"),
+            "{lines:?}"
+        );
 
         // A look that found nothing more says the one line.
         let plain = json!({ "names": 1, "carried": 1, "carried_names": 1 });

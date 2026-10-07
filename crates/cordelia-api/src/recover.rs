@@ -849,6 +849,12 @@ pub async fn progress(
 /// it, where the new channel holds neither that version nor an entry at
 /// a higher revision. **From any other key it takes nothing.**
 ///
+/// **Where the new channels could not be fetched whole in that pass,
+/// nothing is taken** ([`carrying::fetched_whole`], §7.3): which of their
+/// slots hold nothing is not known. The look says so, reads nothing, and
+/// is not noted as ended: the machine never writes, under this
+/// statement, that it has sent what it carried.
+///
 /// What it found is kept for the command, and given back: how many
 /// versions were carried; which relays and which names it could not read
 /// to their end; and, for each removed key, how many versions that key
@@ -861,7 +867,19 @@ pub async fn progress(
 /// ([`crate::at_relays::say_sent`]).
 pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_json::Value {
     let first = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    commands::fetch(state, true, first).await;
+    if !carrying::fetched_whole(state, first).await {
+        let found = json!({
+            "change": number,
+            "finished": true,
+            "new_not_read": true,
+            "names": to_look.names.len(),
+            "read": 0,
+            "carried": 0,
+            "carried_names": 0,
+        });
+        state.own_channels.set_look(found.clone());
+        return found;
+    }
 
     let (left, removed) = {
         let conn = db(state);
@@ -2309,6 +2327,8 @@ mod tests {
             asked: Default::default(),
             did: Default::default(),
             in_part: Default::default(),
+            short_passes: Default::default(),
+            not_connected: Default::default(),
         };
         let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
         let (number, to_look) = follows(&alone, &made).unwrap();
@@ -2320,6 +2340,42 @@ mod tests {
             missed
                 .iter()
                 .all(|one| one["read"] == "no relay was reached")
+        );
+    }
+
+    /// Where the new channels could not be fetched whole before the look
+    /// (decision 2026-10-04 §7.3, §9), the look takes nothing: it reads
+    /// nothing of what was left, says that the new channels could not be
+    /// read, and is not noted as ended, so that the machine never writes,
+    /// under this statement, that it has sent what it carried.
+    #[actix_web::test]
+    async fn test_the_look_takes_nothing_where_the_new_channels_could_not_be_fetched() {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let node = new_machine(9, &gone);
+        let answers = [Answer::Lost, Answer::Lost];
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        let before = node.stored();
+        node.not_connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        node.asked.lock().unwrap().clear();
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["new_not_read"], true, "{found}");
+        assert_eq!(
+            (&found["finished"], &found["carried"]),
+            (&json!(true), &json!(0))
+        );
+        assert_eq!(node.state.own_channels.look(), Some(found.clone()));
+        assert!(node.asked.lock().unwrap().is_empty());
+        assert_eq!(node.stored(), before);
+        assert_eq!(node.text(LAB, "a.md"), None);
+        // The look is not noted as ended.
+        let conn = db(&node.state);
+        assert!(
+            meta::get(&conn, meta::PERSON_LOOK_PENDING)
+                .unwrap()
+                .is_some()
         );
     }
 

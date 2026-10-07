@@ -236,6 +236,13 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
         );
         return Ok(());
     };
+    // Which slots are empty is judged only where the new channel was
+    // fetched whole just before (§7.3): where it could not be, nothing
+    // is asked, and nothing is taken.
+    if let Some(says) = new_not_read_says(&found, name) {
+        println!("{says}");
+        return Ok(());
+    }
 
     // What it found, before anything is asked (§7.3).
     let found = Found::of(&found)?;
@@ -336,6 +343,22 @@ fn word_for(
     }
     let now = chrono::Utc::now().timestamp();
     Ok(Word::give(&phrase, own, under, allows.says()?, now)?)
+}
+
+/// What `--from` says where the new channel could not be fetched whole
+/// before anything was judged (decision 2026-10-04 §7.3): which of its
+/// slots hold nothing is not known, so nothing is taken. `None` where it
+/// was read.
+fn new_not_read_says(found: &Value, name: &str) -> Option<String> {
+    if found["new_read"] != false {
+        return None;
+    }
+    Some(format!(
+        "The new channel of {} could not be read at a relay: no relay answered, or the read did \
+         not end. Which of its slots hold nothing is not known, so nothing is taken. Run this \
+         again once a relay can be read.",
+        file_shown(name)
+    ))
 }
 
 /// What `--from` found, read from the node's answer. The keys are read
@@ -867,6 +890,21 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the new channel could not be fetched whole, `--from` says so
+    /// before it asks for anything, and takes nothing (decision
+    /// 2026-10-04 §7.3). Where it was read, nothing is said of it.
+    #[test]
+    fn test_from_says_where_the_new_channel_could_not_be_read() {
+        assert_eq!(new_not_read_says(&json!({ "new_read": true }), "lab"), None);
+        assert_eq!(new_not_read_says(&json!({}), "lab"), None);
+        let says = new_not_read_says(&json!({ "new_read": false }), "lab").unwrap();
+        assert!(
+            says.starts_with("The new channel of lab could not be read at a relay"),
+            "{says}"
+        );
+        assert!(says.contains("so nothing is taken"), "{says}");
+    }
 
     /// What a carry of one name did is said in lines (decision 2026-10-04
     /// §7.3): what was brought in, what was left and why, and what could

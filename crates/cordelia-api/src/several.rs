@@ -488,6 +488,11 @@ pub(crate) struct Node {
     pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
     /// Whether the relay hands a channel in part, and not to its end.
     pub(crate) in_part: Arc<std::sync::atomic::AtomicBool>,
+    /// How many of the next whole passes end before they have read every
+    /// channel to its end.
+    pub(crate) short_passes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the relay is not connected: it has no session.
+    pub(crate) not_connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The session of the connection to the relay of a test.
@@ -506,11 +511,20 @@ impl Node {
         let asked: Asked = Default::default();
         let did: Arc<Mutex<Vec<&'static str>>> = Default::default();
         let (passes, order) = (Arc::clone(&state), Arc::clone(&did));
+        let short_passes: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let short = Arc::clone(&short_passes);
         tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
             loop {
                 passes.own_channels.wait_asked().await;
                 let pass = passes.own_channels.whole_pass_begins();
                 order.lock().unwrap().push("pass");
+                let ends_short = short
+                    .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                    .is_ok();
+                if ends_short {
+                    passes.own_channels.whole_pass_was_short(pass);
+                }
                 passes.own_channels.whole_pass_ended(pass);
             }
         });
@@ -518,11 +532,17 @@ impl Node {
         let order = Arc::clone(&did);
         let in_part: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let part = Arc::clone(&in_part);
+        let not_connected: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let away = Arc::clone(&not_connected);
         tokio::spawn(async move {
             loop {
                 match node.own_channels.wait_door().await {
                     DoorAsk::Sessions { answer } => {
-                        let _ = answer.send(vec![("relay".to_string(), Some(SESSION))]);
+                        let session = match away.load(std::sync::atomic::Ordering::SeqCst) {
+                            true => None,
+                            false => Some(SESSION),
+                        };
+                        let _ = answer.send(vec![("relay".to_string(), session)]);
                     }
                     DoorAsk::Read {
                         channel,
@@ -554,6 +574,8 @@ impl Node {
             asked,
             did,
             in_part,
+            short_passes,
+            not_connected,
         }
     }
 
