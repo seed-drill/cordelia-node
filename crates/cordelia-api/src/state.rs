@@ -167,6 +167,12 @@ impl HeldUp {
 /// folder with no record in a channel yet waits for that before its
 /// first cycle there ([`OwnChannels::first_fetch_done`], decision
 /// 2026-10-04 §6).
+///
+/// And it carries since when each relay has been connected, and since
+/// when none has, by the node's own clock ([`OwnChannels::
+/// relays_connected`]): what a status says of a device that is offline,
+/// and of a relay that does not hold the latest change (decision
+/// 2026-10-04 §10.1).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -185,6 +191,19 @@ pub struct OwnChannels {
     /// For each channel of a name, by its ID: the relays that have handed
     /// the whole of it, and when the first of them had.
     fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
+    /// Since when each relay has been connected, and since when none has.
+    connected: Mutex<Connected>,
+}
+
+/// Since when the node's relays have been connected, by the node's own
+/// clock.
+#[derive(Debug, Default)]
+struct Connected {
+    /// Each relay that is connected, by its name, with since when.
+    since: std::collections::HashMap<String, Instant>,
+    /// Since when no relay has been connected: `None` while one is, and
+    /// before the node has said.
+    none_since: Option<Instant>,
 }
 
 /// Which relays have handed the whole of one channel, by name, and when
@@ -331,6 +350,50 @@ impl OwnChannels {
     pub fn forget_fetched(&self, channel: &[u8; 32]) {
         let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
         fetched.remove(channel);
+    }
+
+    /// The node says which of the relays it is set up with are connected
+    /// at `now`, each by its name: it does so as often as it looks.
+    ///
+    /// A relay that was connected the last time it said so has been
+    /// connected since it first said so; one that is connected now and
+    /// was not has been since `now`. And where none is connected, none
+    /// has been since the node first said so: at its start, a node says
+    /// that none is.
+    ///
+    /// `now` is the node's own clock, which does not run while the
+    /// machine sleeps: a machine that wakes has not been without a relay
+    /// for the time it slept (decision 2026-10-04 §10.1).
+    pub fn relays_connected(&self, relays: &[&str], now: Instant) {
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        connected
+            .since
+            .retain(|relay, _| relays.contains(&relay.as_str()));
+        for relay in relays {
+            connected.since.entry(relay.to_string()).or_insert(now);
+        }
+        match relays.is_empty() {
+            true => {
+                connected.none_since.get_or_insert(now);
+            }
+            false => connected.none_since = None,
+        }
+    }
+
+    /// For how long no relay has been connected, at `now`. `None` while
+    /// one is connected, and where the node has not said.
+    pub fn no_relay_for(&self, now: Instant) -> Option<std::time::Duration> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let since = connected.none_since?;
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// For how long the relay called `relay` has been connected, at
+    /// `now`. `None` where it is not connected.
+    pub fn connected_for(&self, relay: &str, now: Instant) -> Option<std::time::Duration> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let since = connected.since.get(relay)?;
+        Some(now.saturating_duration_since(*since))
     }
 
     /// Keep nothing of which relays have handed any channel: the device
@@ -1173,6 +1236,52 @@ mod tests {
                 .kept_beside("/m", "channel", "a.md")
                 .is_none()
         );
+    }
+
+    /// Since when no relay has been connected, and since when each has
+    /// been, by the clock that the node gives (decision 2026-10-04
+    /// §10.1). Nothing is said before the node has: a relay that stays
+    /// connected has been since it first was, one that comes back has
+    /// been since it came back, and none has been connected since the
+    /// last of them went.
+    #[test]
+    fn test_since_when_each_relay_is_connected_and_since_when_none_is() {
+        let own = OwnChannels::default();
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let secs = |time: Option<std::time::Duration>| time.map(|time| time.as_secs());
+        assert_eq!(secs(own.no_relay_for(at(100))), None);
+        assert_eq!(secs(own.connected_for("one", at(100))), None);
+
+        // The node starts: none is connected.
+        own.relays_connected(&[], at(0));
+        own.relays_connected(&[], at(2));
+        assert_eq!(secs(own.no_relay_for(at(40))), Some(40));
+        // One connects, and then the other: no relay is missing, and
+        // each has been connected since it was first said to be.
+        own.relays_connected(&["one"], at(50));
+        own.relays_connected(&["one", "two"], at(60));
+        own.relays_connected(&["one", "two"], at(70));
+        assert_eq!(secs(own.no_relay_for(at(400))), None);
+        assert_eq!(secs(own.connected_for("one", at(400))), Some(350));
+        assert_eq!(secs(own.connected_for("two", at(400))), Some(340));
+        // One goes and comes back: it has been connected since it came
+        // back. With the other still there, a relay was connected
+        // throughout.
+        own.relays_connected(&["two"], at(500));
+        assert_eq!(secs(own.connected_for("one", at(510))), None);
+        assert_eq!(secs(own.no_relay_for(at(510))), None);
+        own.relays_connected(&["one", "two"], at(520));
+        assert_eq!(secs(own.connected_for("one", at(600))), Some(80));
+        assert_eq!(secs(own.connected_for("two", at(600))), Some(540));
+        // Both go: none has been connected since then, however often
+        // the node says so.
+        own.relays_connected(&[], at(700));
+        own.relays_connected(&[], at(900));
+        assert_eq!(secs(own.no_relay_for(at(1000))), Some(300));
+        assert_eq!(secs(own.connected_for("two", at(1000))), None);
+        // A time before the one that was noted is no time at all.
+        assert_eq!(secs(own.no_relay_for(at(650))), Some(0));
     }
 
     /// Work that has the device leave the phrase it follows is done as a

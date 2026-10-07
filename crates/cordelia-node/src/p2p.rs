@@ -3768,6 +3768,16 @@ fn publish_relays(
     let list = relay_snapshots(set_up, resolved, tries, &|relay| {
         relay_connected(conn_mgr, relay)
     });
+    // Which of them are connected now: the node keeps since when each
+    // has been, and since when none has, by its own clock.
+    let connected: Vec<&str> = list
+        .iter()
+        .filter(|relay| relay.state == "connected")
+        .map(|relay| relay.host.as_str())
+        .collect();
+    state
+        .own_channels
+        .relays_connected(&connected, std::time::Instant::now());
     if let Ok(mut current) = state.relays.write()
         && *current != list
     {
