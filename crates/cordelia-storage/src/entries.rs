@@ -284,6 +284,44 @@ pub fn channel_entries_after_place(
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// The highest place that an entry of a channel has here, in the
+/// channel's own order, and 0 where the store holds nothing of it. The
+/// next entry that is stored of the channel takes the place above it
+/// ([`store`]).
+pub fn highest_place(conn: &Connection, channel: &[u8; 32]) -> Result<i64, CordeliaError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(channel_place), 0) FROM entries WHERE channel_id = ?1",
+        params![channel.as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// The entry that has the highest place of a channel takes the place
+/// `place`, where that is above its own. Returns whether it did.
+///
+/// A relay's sweep does this where it removed the entries that had the
+/// channel's highest places (decision 2026-10-04 §2.4 item 3): `place` is
+/// the highest that there was. The next entry that is stored then takes
+/// the place above it, and not one that was given before. Whoever kept a
+/// place below `place` is handed the entry once more, and nothing else
+/// changes: it is the last of the channel's entries before and after.
+pub fn move_last_to(
+    conn: &Connection,
+    channel: &[u8; 32],
+    place: i64,
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "UPDATE entries SET channel_place = ?2
+         WHERE channel_id = ?1 AND channel_place < ?2
+           AND channel_place = (SELECT MAX(channel_place) FROM entries
+                                WHERE channel_id = ?1)",
+        params![channel.as_slice(), place],
+    )
+    .map(|moved| moved > 0)
+    .map_err(storage)
+}
+
 /// Remove every entry of a channel. Returns how many there were.
 pub fn remove_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
     conn.execute(

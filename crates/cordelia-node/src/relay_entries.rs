@@ -4131,6 +4131,53 @@ mod tests {
         assert_eq!(this.held(5).unwrap().bytes, 2 * SMALL);
     }
 
+    /// A relay that pulls from a relay it works with is handed what
+    /// that relay stores after a sweep took the entry it had stored last
+    /// of a channel (decision 2026-10-04 §2.4 items 3 and 6): the place
+    /// of the swept entry is not given again there, so the place that
+    /// this relay keeps is below the next entry's, and it asks for it.
+    #[tokio::test]
+    async fn a_relay_pulls_what_is_stored_after_a_sweep_took_the_last_place() {
+        let other = relay_of(u64::MAX, &[9]);
+        let this = relay_of(u64::MAX, &[8]);
+        let then = now() - HOUR;
+        let delete = Inside {
+            name: "gone.md".to_string(),
+            value: Value::Delete,
+            chain: Some(Vec::new()),
+        };
+        let gone = Entry::seal(&secret(1), &device(1), 7, &delete).unwrap();
+        other.hold(&small(1, 1, 5), then);
+        other.hold(&gone.check().unwrap(), then);
+
+        let link = Link::to(&other);
+        this.entries.pull_from(&link, peer(8), &this.db).await;
+        let mark = other.held(1).unwrap().mark;
+        assert_eq!(link.pulls(), [(channel(1), mark, 0)]);
+        assert_eq!(
+            lock(&this.entries.places)
+                .get(&peer(8), &channel(1))
+                .map(|kept| kept.after),
+            Some(2)
+        );
+
+        // The delete goes there at its 90 days, and an entry is stored
+        // after it. The holding is the one it was.
+        other.entries.sweep_deletes_at(&other.db, then + 90 * DAY);
+        assert_eq!(other.held(1).unwrap().bytes, SMALL);
+        let new = made(1, 2, 1, "new.md", "written after the sweep");
+        other.hold(&new, now());
+        assert_eq!(other.held(1).unwrap().mark, mark);
+
+        // This relay asks from the place it kept, and is handed the new
+        // entry.
+        this.entries.pull_from(&link, peer(8), &this.db).await;
+        assert_eq!(link.pulls(), [(channel(1), mark, 2)]);
+        let here =
+            relay::pull(&lock(&this.db), &channel(1), true, &relay::NO_MARK, 0, 100).unwrap();
+        assert!(here.entries.iter().any(|entry| entry.id() == new.id()));
+    }
+
     /// What a relay it works with says of a channel's two times is kept
     /// for a channel that this relay holds: the earlier "held since", and
     /// the later "last used". And a channel that is told of as unused for
