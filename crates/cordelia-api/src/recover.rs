@@ -710,6 +710,15 @@ pub struct Shown {
 /// which follows this one finds them, whether or not this machine ever
 /// maps a folder.
 ///
+/// **A folder's first cycle in a name of the look waits for the look**
+/// (§7.3): this machine may map folders already, and what a folder
+/// publishes is to be written over what the look carried, not beside it.
+/// A file published first, at the first revision, would tie with the
+/// version of before at that revision, which no command could then
+/// bring. Each name's channel is held back from here on ([`held_back`]),
+/// under the hold of the database's lock that the statement was applied
+/// under: no cycle runs between the two.
+///
 /// Refused, with nothing changed: whatever [`person::follow_recovered`]
 /// refuses, and a word for the look that does not hold ([`to_look`]).
 pub fn follow(
@@ -724,7 +733,7 @@ pub fn follow(
     let at = now();
     let identity = &state.identity;
     let number = state.as_a_change(|conn| {
-        in_one(conn, || {
+        let applied = in_one(conn, || {
             let applied = person::follow_recovered(conn, identity, entry, statement_key, left, at)?;
             // The word for the look is taken once (§16), as one with
             // the statement that it was given under.
@@ -760,9 +769,33 @@ pub fn follow(
             // carried (§8).
             meta::set(conn, meta::PERSON_LOOK_PENDING, "1")?;
             Ok(applied.number)
-        })
+        });
+        if applied.is_ok() {
+            held_back(state, &channels_of(conn, &to_look.names));
+        }
+        applied
     })?;
     Ok((number, to_look))
+}
+
+/// The channel of each of `names` that this device holds, in their order:
+/// `None` for one that it does not hold.
+fn channels_of(conn: &rusqlite::Connection, names: &[String]) -> Vec<Option<[u8; 32]>> {
+    let of = |name: &String| held_rows::channel_of_name(conn, name).ok().flatten();
+    names.iter().map(of).collect()
+}
+
+/// A folder's first cycle in each of `channels` waits from now on
+/// ([`crate::state::OwnChannels::carrying`], decision 2026-10-04 §7.3):
+/// the look of a recovery has still to read the name. The wait lasts
+/// until the look says that it has read the name, and for no longer than
+/// a carry may take: so the look says it again for the names it has not
+/// read yet, each time it begins one.
+fn held_back(state: &AppState, channels: &[Option<[u8; 32]>]) {
+    let now = Instant::now();
+    for channel in channels.iter().flatten() {
+        state.own_channels.carrying(channel, now);
+    }
 }
 
 /// `POST /api/v1/recover/make`: the node's half of `cordelia recover`
@@ -868,9 +901,18 @@ pub async fn progress(
 /// carried:** it is sent as what a device carries is sent, and only then
 /// may the machine come to write that it has sent what it carried
 /// ([`crate::at_relays::say_sent`]).
+///
+/// **A folder's first cycle in a name waits until the look has read that
+/// name** ([`held_back`]): each name that is still to be read is held
+/// back afresh when the look begins a name, and let go once it is read.
+/// Where the look takes nothing, every name is let go at once.
 pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_json::Value {
+    let channels = channels_of(&db(state), &to_look.names);
     let first = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     if !carrying::fetched_whole(state, first).await {
+        for channel in channels.iter().flatten() {
+            state.own_channels.carried(channel);
+        }
         let found = json!({
             "change": number,
             "finished": true,
@@ -902,6 +944,8 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
     // in which names.
     let mut lacking: BTreeMap<[u8; 32], (usize, Vec<String>)> = BTreeMap::new();
     for (done, name) in to_look.names.iter().enumerate() {
+        // This name, and each after it, is still to be read.
+        held_back(state, &channels[done..]);
         let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
         let read = match carrying::read_generations(state, name, &left, until).await {
             Ok(read) => read,
@@ -973,8 +1017,8 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
             carried_names += 1;
             state.own_channels.written();
         }
-        if let Ok(Some(channel)) = held_rows::channel_of_name(&db(state), name) {
-            state.own_channels.carried(&channel);
+        if let Some(channel) = &channels[done] {
+            state.own_channels.carried(channel);
         }
         state.own_channels.set_look(json!({
             "change": number,
@@ -2345,6 +2389,7 @@ mod tests {
             no_room: Default::default(),
             remade: Default::default(),
             remake_takes: Default::default(),
+            held_back_at_reads: Default::default(),
         };
         let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
         let (number, to_look) = follows(&alone, &made).unwrap();
@@ -2357,6 +2402,90 @@ mod tests {
                 .iter()
                 .all(|one| one["read"] == "no relay was reached")
         );
+    }
+
+    /// **A folder's first cycle in a name of the look waits until the
+    /// look has read that name** (decision 2026-10-04 §7.3, §9): a machine
+    /// that recovers may map folders already, and what a folder publishes
+    /// is to be written over what the look carried. The wait begins when
+    /// the statement is applied, for each name of the look and for no
+    /// other. While the look reads a name, that name and each one after
+    /// it are held back afresh, so that a look which takes long holds
+    /// them for as long; a name that was read is let go. And where the
+    /// look takes nothing, every name is let go at once.
+    #[actix_web::test]
+    async fn test_a_folders_first_cycle_waits_until_the_look_has_read_its_name() {
+        use cordelia_core::protocol::CARRY_FIRST_MAX_SECS;
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let answers = [Answer::Lost, Answer::Lost];
+        // Whether a folder with no record in the channel would have its
+        // first cycle there now: the relay has handed the channel.
+        let cycles = |node: &Node, channel: &[u8; 32]| {
+            let now = Instant::now();
+            node.state.own_channels.fetched_from(channel, "relay", now);
+            node.state.own_channels.first_fetch_done(channel, now)
+        };
+        let channel = |node: &Node, name: &str| {
+            held_rows::channel_of_name(&db(&node.state), name)
+                .unwrap()
+                .unwrap()
+        };
+
+        let node = new_machine(9, &gone);
+        node.state.own_channels.set_up_with(1);
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        assert_eq!(to_look.names, ["desk", LAB]);
+        let (desk, lab) = (channel(&node, "desk"), channel(&node, LAB));
+        // From the moment the statement is applied, neither name's
+        // folder has its first cycle. A name that is not of the look
+        // does not wait.
+        assert!(!cycles(&node, &desk) && !cycles(&node, &lab));
+        let other = person::hold_name(&db(&node.state), "other", now()).unwrap();
+        assert!(cycles(&node, &other));
+        // The wait lasts as long as a carry may take, from when it was
+        // last said: a second on, what was said when the statement was
+        // applied would end a second sooner than what the look says.
+        let nearly = Duration::from_secs(CARRY_FIRST_MAX_SECS - 1);
+        let held_back = |node: &Node, at: Instant| node.state.own_channels.carried_into(at);
+        assert_eq!(
+            held_back(&node, Instant::now() + nearly),
+            BTreeSet::from([desk, lab])
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(held_back(&node, Instant::now() + nearly).is_empty());
+
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["carried"], 4, "{found}");
+        // The look read `desk` in two generations, and then `lab` in
+        // two. While it read `desk`, both names were held back afresh;
+        // while it read `lab`, that name alone: `desk` was let go.
+        let at_reads = node.held_back_at_reads.lock().unwrap().clone();
+        let both = BTreeSet::from([desk, lab]);
+        let last = BTreeSet::from([lab]);
+        assert_eq!(at_reads, [both.clone(), both, last.clone(), last]);
+        // Once the look has ended, each folder has its first cycle.
+        assert!(cycles(&node, &desk) && cycles(&node, &lab));
+        assert!(held_back(&node, Instant::now()).is_empty());
+
+        // Where the look takes nothing, every name is let go at once.
+        let node = new_machine(10, &gone);
+        node.state.own_channels.set_up_with(1);
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        let (desk, lab) = (channel(&node, "desk"), channel(&node, LAB));
+        assert!(!cycles(&node, &desk) && !cycles(&node, &lab));
+        node.not_connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["new_not_read"], true, "{found}");
+        assert!(cycles(&node, &desk) && cycles(&node, &lab));
+
+        // A recovery that is refused holds nothing back: here on a
+        // machine that follows the phrase already, and holds the names.
+        assert!(follows(&node, &made).is_err());
+        assert!(held_back(&node, Instant::now()).is_empty());
     }
 
     /// Where the new channels could not be fetched whole before the look

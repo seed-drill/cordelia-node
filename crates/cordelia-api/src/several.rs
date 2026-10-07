@@ -504,6 +504,11 @@ pub(crate) struct Node {
     /// session is said, and a read finds the old connection, with no
     /// room.
     pub(crate) remake_takes: Arc<std::sync::atomic::AtomicUsize>,
+    /// At each read through the door: the channels that a folder's first
+    /// cycle waits for a carry in, and would still wait for a second
+    /// short of the longest that a carry holds one back, measured from
+    /// the read.
+    pub(crate) held_back_at_reads: Arc<Mutex<Vec<std::collections::BTreeSet<[u8; 32]>>>>,
 }
 
 /// The session of the connection to the relay of a test.
@@ -557,6 +562,9 @@ impl Node {
         let made_again = Arc::clone(&remade);
         let remake_takes: Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let takes = Arc::clone(&remake_takes);
+        let held_back_at_reads: Arc<Mutex<Vec<std::collections::BTreeSet<[u8; 32]>>>> =
+            Default::default();
+        let held_back = Arc::clone(&held_back_at_reads);
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
             // How many askings for the sessions are still answered with
@@ -621,6 +629,12 @@ impl Node {
                         let by_secret = matches!(by, ProvedBy::Secret(_));
                         log.lock().unwrap().push((channel, by_secret));
                         order.lock().unwrap().push("read");
+                        let nearly = std::time::Duration::from_secs(
+                            cordelia_core::protocol::CARRY_FIRST_MAX_SECS - 1,
+                        );
+                        let then = std::time::Instant::now() + nearly;
+                        let waits = node.own_channels.carried_into(then);
+                        held_back.lock().unwrap().push(waits);
                         let read = match holds.lock().unwrap().get(&channel) {
                             None => LeftRead::NotHeld,
                             Some(entries) => LeftRead::Read {
@@ -647,6 +661,7 @@ impl Node {
             no_room,
             remade,
             remake_takes,
+            held_back_at_reads,
         }
     }
 

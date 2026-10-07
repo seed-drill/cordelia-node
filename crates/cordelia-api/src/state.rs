@@ -446,6 +446,17 @@ impl OwnChannels {
         carrying.insert(*channel, now);
     }
 
+    /// The channels that a carry is being made into at `now`, for a test.
+    #[cfg(test)]
+    pub(crate) fn carried_into(&self, now: Instant) -> std::collections::BTreeSet<[u8; 32]> {
+        let carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
+        let began = |channel: &[u8; 32]| carrying.get(channel).copied();
+        let lasts = |channel: &&[u8; 32]| {
+            began(channel).is_some_and(|began| now.saturating_duration_since(began) < CARRYING_WAIT)
+        };
+        carrying.keys().filter(lasts).copied().collect()
+    }
+
     /// The carry into the channel whose ID is `channel` has ended.
     pub fn carried(&self, channel: &[u8; 32]) {
         let mut carrying = self.carrying.lock().unwrap_or_else(|e| e.into_inner());
