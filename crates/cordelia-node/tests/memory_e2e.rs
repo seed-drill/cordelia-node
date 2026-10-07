@@ -567,6 +567,101 @@ fn holds_the_change(relay: &Node, device: &Node, number: u64) -> bool {
         .unwrap()
 }
 
+/// **A removal cut short straight after its transaction** (decision
+/// 2026-10-04 §7.2, §8). A device is removed with no relay in reach, and
+/// the node is killed as soon as the command says that the change is
+/// made: nothing of it has been shown to a relay, and nothing that the
+/// device carried has been sent.
+///
+/// The node is started again, and no command is run. It shows the change
+/// entry to its relay, and sends what it carried: the relay holds the
+/// change and the name's new channel, and the device says that it has
+/// applied the change and sent what it held.
+#[test]
+fn a_removal_cut_short_after_its_transaction_is_shown_and_sent_when_the_node_starts_again() {
+    let beside = |node: &Node| {
+        let conn = rusqlite::Connection::open_with_flags(
+            node.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        conn
+    };
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let mut b = device_started("b", &relay);
+    let words = pair(&a, &b, "laptop", &[&relay, &a, &b]).unwrap();
+    let (notes, memory) = notes_of(&a);
+    std::fs::write(memory.join("first.md"), "kept through the change\n").unwrap();
+    syncs_notes_as_lab(&a, &notes);
+    wait_for("a has sent its folder", &[&relay, &a], 90, || {
+        (held(&a).len() == 1)
+            .then_some(())
+            .and(has_sent_everything(&a))
+    });
+    assert!(holds_the_change(&relay, &a, 1));
+    let lab_before = cordelia_storage::person::channel_of_name(&beside(&a), "lab")
+        .unwrap()
+        .unwrap();
+    let b_key = key_of(&b);
+    b.stop();
+
+    // No relay is in reach. The laptop is removed, and the node is
+    // killed as soon as the change is made.
+    relay.stop();
+    let mut at = removes(&a, &b_key, &[], &words);
+    at.says("The change is made (change 2)");
+    a.crash();
+    drop(at);
+
+    // The relay comes back: it holds the change from before, and
+    // nothing of the new one.
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    assert!(!holds_the_change(&relay, &a, 2));
+
+    // The node is started again. Nothing is run but what asks how the
+    // device stands.
+    a.start();
+    wait_for("device healthy again", &[&a], 30, || healthy(&a));
+    wait_for("the relay holds the change", &[&relay, &a], 120, || {
+        holds_the_change(&relay, &a, 2).then_some(())
+    });
+    wait_for(
+        "the device has sent what it carried",
+        &[&relay, &a],
+        180,
+        || {
+            let seen = person_of(&a);
+            (seen["change"] == 2 && seen["devices"][0]["sent"] == true)
+                .then_some(())
+                .and(has_sent_everything(&a))
+        },
+    );
+    // The file is as it was, in the name's new channel, and the relay
+    // holds what the device carried there.
+    let texts: Vec<Option<String>> = held(&a).into_iter().map(|(_, _, text)| text).collect();
+    assert_eq!(texts, [Some("kept through the change\n".to_string())]);
+    let lab_now = cordelia_storage::person::channel_of_name(&beside(&a), "lab")
+        .unwrap()
+        .unwrap();
+    assert_ne!(lab_now, lab_before);
+    let at_the_relay: i64 = beside(&relay)
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE channel_id = ?1",
+            [lab_now.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(at_the_relay, 1);
+    assert_eq!(
+        read(&memory.join("first.md")).as_deref(),
+        Some("kept through the change\n")
+    );
+}
+
 /// What a remaining device, a removed device and two relays are before
 /// the remaining device comes back (decision 2026-10-04 §4.6, §7.4).
 struct LateWrite {
