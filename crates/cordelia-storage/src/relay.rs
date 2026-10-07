@@ -2665,6 +2665,85 @@ mod tests {
         assert_eq!(held(&conn), [1, 2]);
     }
 
+    /// **A relay that makes room drops the phrase's channel last among a
+    /// person's channels** (decision 2026-10-04 §2.5): it is the channel
+    /// of the person's that the relay has held longest. A device shows a
+    /// relay its change entry before it does anything else there, so the
+    /// phrase's channel is taken before the personal channel and before
+    /// each name, also where all are taken in one second.
+    ///
+    /// **So too where the relay took the phrase's channel from a device
+    /// before it took the person's channels from a relay it works with,**
+    /// which has held them for longer: that relay says how long it has
+    /// held each, the phrase's channel among them, and the earlier time
+    /// is kept for a channel that is held already (§2.4, item 6).
+    ///
+    /// The limit: a relay that has dropped the phrase's channel and
+    /// takes it again counts it as new from then.
+    #[test]
+    fn test_making_room_drops_the_phrases_channel_last_of_a_persons_channels() {
+        // The phrase's channel, the personal channel, and two names.
+        const PHRASE: u16 = 1;
+        let others = [2, 3, 4];
+        let all_gone = [channel(4), channel(3), channel(2), channel(PHRASE)];
+
+        // From a device, in the order a device sends them: over some
+        // seconds, and all in one.
+        for step in [1, 0] {
+            let (conn, mut room) = relay();
+            // A stranger's channel, taken before: it is held longest.
+            take(&conn, &mut room, &small(9, 1, 5), &from(2), NOW - 10).unwrap();
+            for c in std::iter::once(PHRASE).chain(others) {
+                let at = NOW + step * i64::from(c);
+                take(&conn, &mut room, &small(c, 1, 5), &from(1), at).unwrap();
+            }
+            // Room is made a channel at a time: each of the person's
+            // others goes, and the phrase's is the last of them.
+            let mut gone = Vec::new();
+            for left in (1..=4).rev() {
+                gone.extend(make_room(&conn, left * SMALL).unwrap());
+            }
+            assert_eq!(gone, all_gone, "step {step}");
+            assert_eq!(held(&conn), [9]);
+        }
+
+        // The phrase's channel from a device, now. Then the person's
+        // channels from a relay that this one works with, which has held
+        // each for a year: the names and the personal channel, with how
+        // long, and the phrase's channel, which is held here already.
+        let (conn, mut room) = relay();
+        let year_ago = NOW - 365 * DAY;
+        take(&conn, &mut room, &small(PHRASE, 1, 5), &from(1), NOW).unwrap();
+        for c in others {
+            let said = listed_since(year_ago + i64::from(c));
+            take(&conn, &mut room, &small(c, 1, 5), &said, NOW + 10).unwrap();
+        }
+        assert!(listed_relay_says(&conn, &channel(PHRASE), year_ago).unwrap());
+        assert_eq!(since(&conn, PHRASE), Some(year_ago));
+        assert_eq!(make_room(&conn, 0).unwrap(), all_gone);
+
+        // The same, where the other relay hands the phrase's channel
+        // with its entry, which this relay holds: the earlier time is
+        // kept all the same.
+        let (conn, mut room) = relay();
+        let change = small(PHRASE, 1, 5);
+        take(&conn, &mut room, &change, &from(1), NOW).unwrap();
+        for c in others {
+            let said = listed_since(year_ago + i64::from(c));
+            take(&conn, &mut room, &small(c, 1, 5), &said, NOW + 10).unwrap();
+        }
+        let held_already = take(&conn, &mut room, &change, &listed_since(year_ago), NOW + 10);
+        assert_eq!(held_already.unwrap(), Taken::AlreadyHeld);
+        assert_eq!(make_room(&conn, 0).unwrap(), all_gone);
+
+        // The limit: dropped and taken again, the phrase's channel is
+        // new from then, and is the first to go.
+        take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 20).unwrap();
+        take(&conn, &mut room, &small(PHRASE, 1, 5), &from(1), NOW + 30).unwrap();
+        assert_eq!(since(&conn, PHRASE), Some(NOW + 30));
+        assert_eq!(make_room(&conn, SMALL).unwrap(), [channel(PHRASE)]);
+    }
+
     /// An address is counted for a channel that it made the relay take
     /// only where the write is written for good. Inside a transaction of
     /// the caller's the channels taken so far are part of the address's
