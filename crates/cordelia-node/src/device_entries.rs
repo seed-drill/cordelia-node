@@ -344,7 +344,7 @@ impl DeviceEntries {
                 asking.spawn(async move { engine.asks_for_hand_overs(&link, &typed).await });
             }
         }
-        self.pass_at(relays, &links, kind).await;
+        let read_all = self.pass_at(relays, &links, kind).await;
         let mut taken = false;
         while let Some(done) = asking.join_next().await {
             taken |= done.unwrap_or(false);
@@ -360,6 +360,13 @@ impl DeviceEntries {
             self.state.own_channels.ask_whole();
         }
         if let Some(number) = number {
+            // A whole pass that did not read every channel to its end,
+            // at every relay it reached, says so before it ends: a
+            // command that waited for it has not been fetched everything
+            // (decision 2026-10-04 §7.1, step 1).
+            if !read_all {
+                self.state.own_channels.whole_pass_was_short(number);
+            }
             self.state.own_channels.whole_pass_ended(number);
         }
     }
@@ -404,21 +411,23 @@ impl DeviceEntries {
         taken
     }
 
-    /// [`Self::pass`], for the channels of the device's own.
-    async fn pass_at(self: &Arc<Self>, relays: &[Relay], links: &[&Link], kind: Pass) {
+    /// [`Self::pass`], for the channels of the device's own. Says
+    /// whether the pass read every channel to its end at every relay it
+    /// reached: where it has no channel to read, it has.
+    async fn pass_at(self: &Arc<Self>, relays: &[Relay], links: &[&Link], kind: Pass) -> bool {
         let stands = at_relays::stands(&lock(&self.state.db));
         let stands = match stands {
             Ok(stands) => stands,
             Err(e) => {
                 tracing::debug!(error = %e, "could not read where this device stands");
-                return;
+                return false;
             }
         };
         // A device that follows no phrase has no channel of its own: it
         // opens no stream, and nothing is said of it but in the status.
         if stands == Stands::NoPhrase {
             self.say(relays, stands);
-            return;
+            return true;
         }
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
         self.leave.reaches(&names, links);
@@ -437,7 +446,7 @@ impl DeviceEntries {
         // is a person's.
         if matches!(stands, Stands::Stopped(state) if state != State::Fork) {
             self.say(relays, stands);
-            return;
+            return true;
         }
 
         // A device that wakes asks every relay first, in either pass, and
@@ -447,7 +456,7 @@ impl DeviceEntries {
         let mut shown: HashMap<LinkId, bool> = HashMap::new();
         if self.leave.is_waking() {
             let Ok(_waking) = self.waking.try_lock() else {
-                return;
+                return false;
             };
             let mut shows = tokio::task::JoinSet::new();
             for link in links {
@@ -463,7 +472,7 @@ impl DeviceEntries {
             }
             if self.leave.is_waking() {
                 self.say(relays, stands);
-                return;
+                return false;
             }
         }
 
@@ -474,12 +483,16 @@ impl DeviceEntries {
             let (engine, link) = (Arc::clone(self), (*link).clone());
             turns.spawn(async move { engine.turn(&link, kind, shown).await });
         }
-        while turns.join_next().await.is_some() {}
+        let mut read_all = true;
+        while let Some(turn) = turns.join_next().await {
+            read_all &= turn.unwrap_or(false);
+        }
         if whole {
             self.say_sent(relays);
         }
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
+        read_all
     }
 
     /// Write that this device has sent what it carried, once it has
@@ -522,13 +535,16 @@ impl DeviceEntries {
     /// and not how long ago another relay answered. The pass that sends
     /// makes no show of its own, and shows where it finds something to
     /// send and no leave.
-    async fn turn(&self, link: &Link, kind: Pass, shown: Option<bool>) {
+    ///
+    /// Says whether the turn read every channel to its end at the relay
+    /// ([`Self::relay_pass`]): a turn that did nothing has not.
+    async fn turn(&self, link: &Link, kind: Pass, shown: Option<bool>) -> bool {
         let turn = {
             let mut turns = lock(&self.turns);
             Arc::clone(turns.entry(link.name().to_string()).or_default())
         };
         let Ok(_turn) = turn.try_lock() else {
-            return;
+            return false;
         };
         let whole = kind == Pass::Whole;
         let gave_leave = match shown {
@@ -541,9 +557,9 @@ impl DeviceEntries {
         // runs has no leave from then on, anywhere: the one way in
         // refuses what the turn asks.)
         if whole && gave_leave != Some(true) {
-            return;
+            return false;
         }
-        self.relay_pass(link, kind).await;
+        self.relay_pass(link, kind).await
     }
 
     // ── What the adder of a device owes ─────────────────────────────
@@ -982,7 +998,11 @@ impl DeviceEntries {
     /// built under that entry ([`Leave::open`]). Where the device comes
     /// to keep another, by a show on this connection or on any other,
     /// the pass ends there: the next reads the device's channels afresh.
-    async fn relay_pass(&self, link: &Link, kind: Pass) {
+    ///
+    /// Says whether a whole pass read every channel that it pulls to its
+    /// end here: not where it ended early, and not where a pull stopped
+    /// short of the end of what the relay holds.
+    async fn relay_pass(&self, link: &Link, kind: Pass) -> bool {
         let read = {
             let db = lock(&self.state.db);
             let own = at_relays::channels(&db, &self.state.identity);
@@ -990,26 +1010,28 @@ impl DeviceEntries {
         };
         let (own, under) = match read {
             Ok((own, Some(under))) => (own, under),
-            Ok((_, None)) => return,
+            Ok((_, None)) => return true,
             Err(e) => {
                 tracing::debug!(error = %e, "could not read this device's channels");
-                return;
+                return false;
             }
         };
         let at = At { link, under };
         let whole = kind == Pass::Whole;
+        let mut read_all = true;
         for channel in &own {
             let mut read_to_its_end = false;
             if whole && channel.is_pulled() {
                 match self.prove(&at, channel, true).await {
                     Step::Done(true) => {}
                     Step::Done(false) => continue,
-                    Step::Stop => return,
+                    Step::Stop => return false,
                 }
                 match self.pull(&at, channel).await {
                     Step::Done(caught_up) => read_to_its_end = caught_up,
-                    Step::Stop => return,
+                    Step::Stop => return false,
                 }
+                read_all &= read_to_its_end;
                 // The relay has handed the whole of a name's channel: a
                 // folder with no record there yet waits for that before
                 // its first cycle (decision 2026-10-04 §6).
@@ -1022,7 +1044,7 @@ impl DeviceEntries {
             }
             let sent = match self.push(&at, channel, Which::Since).await {
                 Step::Done(sent) => sent,
-                Step::Stop => return,
+                Step::Stop => return false,
             };
             // What was carried into a name goes after the channel was
             // fetched from the relay, and after what came since (§7.3).
@@ -1031,12 +1053,13 @@ impl DeviceEntries {
                 && matches!(channel.kind, Kind::Name(_))
                 && matches!(self.push(&at, channel, Which::Carried).await, Step::Stop)
             {
-                return;
+                return false;
             }
         }
         if whole {
             self.prove_listed(&at, own.len()).await;
         }
+        read_all
     }
 
     /// Ask `request` on a stream for a channel of the device's own, at

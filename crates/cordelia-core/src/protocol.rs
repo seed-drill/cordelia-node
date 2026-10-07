@@ -1487,6 +1487,14 @@ pub const FINGERPRINT_WORDS_SHOWN: usize = 4;
 /// and a removal is never held up by what another device goes on writing.
 pub const CHANGE_FETCH_MAX_SECS: u64 = 120;
 
+/// How many whole passes that fetch asks for, at most, where a pass ends
+/// before it has read every channel to its end (decision 2026-10-04 §7.1,
+/// step 1): a pass that found a relay at another turn, or a channel
+/// longer than one pass takes, is read on by the next. After the last,
+/// the command says that not everything was fetched. A relay that keeps
+/// giving no leave is so asked three times, and not for two minutes.
+pub const CHANGE_FETCH_PASSES: usize = 3;
+
 /// A command that makes a statement says how many more the phrase can
 /// make once fewer than this are left (decision 2026-10-04 §4.1).
 pub const STATEMENTS_LEFT_SAID_BELOW: u64 = 16;

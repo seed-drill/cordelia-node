@@ -33,7 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use cordelia_core::protocol::{
-    CHANGE_FETCH_MAX_SECS, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS, RECEIVED_LAST_WEEK_SECS,
+    CHANGE_FETCH_MAX_SECS, CHANGE_FETCH_PASSES, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS,
+    RECEIVED_LAST_WEEK_SECS,
 };
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -629,29 +630,59 @@ pub struct PrepareRequest {
     pub settle: bool,
 }
 
+/// What became of something that a command had the node do, and waited
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// One that began after the asking ended, and went to its end.
+    Done,
+    /// One that began after the asking ended early: it did not do all
+    /// that it is asked for.
+    EndedEarly,
+    /// None ended in the time.
+    NotEnded,
+}
+
 /// Have the device show its change entry to each relay and fetch its
 /// channels, in a whole pass that began after this was asked: two
 /// minutes at most (decision 2026-10-04 §7.1, step 1). Says whether a
-/// pass ended in that time.
+/// pass ended in that time, and whether it had read every channel to its
+/// end at every relay it reached: a pass that a relay gave no leave for,
+/// or that left a channel longer than one pass takes part read, has not
+/// fetched what the relays hold.
 ///
-/// It is asked for once: the node keeps one asking until it takes it up,
-/// and a pass that began after the asking has a number above the count
-/// at that moment. A node with no network has nobody to ask, and nothing
-/// is waited for.
-async fn fetch(state: &AppState) -> bool {
+/// The node keeps one asking until it takes it up, and a pass that began
+/// after the asking has a number above the count at that moment. **A
+/// pass that ended early is asked for again,** up to
+/// CHANGE_FETCH_PASSES passes in all, where `again` says so: the next
+/// reads on. (A device in a fork has no leave anywhere, and is not asked
+/// again.) A node with no network has nobody to ask, and nothing is
+/// waited for.
+async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
     if state.push_tx.is_none() {
-        return true;
+        return Waited::Done;
     }
-    let (begun, _) = state.own_channels.whole_passes();
-    let deadline = Instant::now() + Duration::from_secs(CHANGE_FETCH_MAX_SECS);
+    let (mut begun, _) = state.own_channels.whole_passes();
+    let mut ended_early = 0;
     state.own_channels.ask_whole();
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if state.own_channels.whole_passes().1 > begun {
-            return true;
+            if state.own_channels.last_short_pass() <= begun {
+                return Waited::Done;
+            }
+            ended_early += 1;
+            if !again || ended_early >= CHANGE_FETCH_PASSES {
+                return Waited::EndedEarly;
+            }
+            begun = state.own_channels.whole_passes().0;
+            state.own_channels.ask_whole();
         }
         if Instant::now() >= deadline {
-            return false;
+            return match ended_early {
+                0 => Waited::NotEnded,
+                _ => Waited::EndedEarly,
+            };
         }
     }
 }
@@ -659,26 +690,64 @@ async fn fetch(state: &AppState) -> bool {
 /// Have the node run a sync cycle that began after this was asked, and
 /// wait for it until `deadline`: the folders here are then as current as
 /// they can be made (decision 2026-10-04 §7.1, step 1). Says whether one
-/// ended in that time.
+/// ended in that time, and whether it went to its end: a cycle that
+/// stopped part-way has not brought the folders up to what was fetched.
 ///
 /// A node with no network runs no cycle of its own, and nothing is
 /// waited for; nor where sync is off, since no folder syncs.
-async fn cycle(state: &AppState, deadline: Instant) -> bool {
+async fn cycle(state: &AppState, deadline: Instant) -> Waited {
     let off = !sync_is_on(&db(state)).unwrap_or(false);
     if state.push_tx.is_none() || off {
-        return true;
+        return Waited::Done;
     }
     let (begun, _) = state.sync_control.cycles();
     state.sync_control.ask_cycle();
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if state.sync_control.cycles().1 > begun {
-            return true;
+            return match state.sync_control.last_cycle_cut_short() > begun {
+                true => Waited::EndedEarly,
+                false => Waited::Done,
+            };
         }
         if Instant::now() >= deadline {
-            return false;
+            return Waited::NotEnded;
         }
     }
+}
+
+/// What a command is told of a fetch, and of the cycle after it, that
+/// did not do all that was asked (decision 2026-10-04 §7.1, step 1): one
+/// line for each, or none where both went to their end. `fork` is
+/// whether the device is in a fork: it then has no leave anywhere, and
+/// fetches nothing, which is no failure of the fetch.
+fn not_fetched(fetched: Waited, cycled: Waited, fork: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    match fetched {
+        Waited::Done => {}
+        Waited::EndedEarly if fork => {}
+        Waited::EndedEarly => lines.push(
+            "the fetch ended before every channel was read to its end at every relay: a relay \
+             gave no leave or stopped answering, or holds more of a channel than one pass takes"
+                .to_string(),
+        ),
+        Waited::NotEnded => lines.push(format!(
+            "the fetch did not end within {CHANGE_FETCH_MAX_SECS} seconds"
+        )),
+    }
+    match cycled {
+        Waited::Done => {}
+        Waited::EndedEarly => lines.push(
+            "the sync cycle stopped before its end: the folders here may not hold what was \
+             fetched"
+                .to_string(),
+        ),
+        Waited::NotEnded => lines.push(format!(
+            "no sync cycle ended within {CHANGE_FETCH_MAX_SECS} seconds: the folders here may \
+             not hold what was fetched"
+        )),
+    }
+    lines
 }
 
 /// How much each device has written that this device received in the
@@ -768,27 +837,16 @@ pub async fn change_prepare(
             (state, _) => Err(refused(PersonError::Stopped(state))),
         }
     };
-    stands(&db(&state))?;
+    let fork = stands(&db(&state))? == State::Fork;
 
     // A device in a fork has no leave anywhere: it goes on showing each
     // relay the entry it had applied, and fetches nothing.
     let deadline = Instant::now() + Duration::from_secs(CHANGE_FETCH_MAX_SECS);
-    let fetched = fetch(&state).await;
+    let fetched = fetch(&state, !fork, deadline).await;
     // Then a sync cycle, so that what was fetched is in the folders.
     let cycled = cycle(&state, deadline).await;
     let at = state.own_channels.read();
-    let mut could_not_fetch: Vec<String> = Vec::new();
-    if !fetched {
-        could_not_fetch.push(format!(
-            "the fetch did not end within {CHANGE_FETCH_MAX_SECS} seconds"
-        ));
-    }
-    if !cycled {
-        could_not_fetch.push(format!(
-            "no sync cycle ended within {CHANGE_FETCH_MAX_SECS} seconds: the folders here may \
-             not hold what was fetched"
-        ));
-    }
+    let mut could_not_fetch: Vec<String> = not_fetched(fetched, cycled, fork);
     for relay in &at.relays {
         if !relay.heard_since_woke {
             could_not_fetch.push(format!("{} did not answer", relay.relay));
@@ -1303,13 +1361,13 @@ mod tests {
         let mut no_network = state_of(Machine::new(1));
         meta::set(&db(&no_network), meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
         no_network.push_tx = None;
-        assert!(cycle(&no_network, soon()).await);
-        assert!(cycle(&with_network(false), soon()).await);
+        assert_eq!(cycle(&no_network, soon()).await, Waited::Done);
+        assert_eq!(cycle(&with_network(false), soon()).await, Waited::Done);
 
         // Sync on, and no cycle runs: it waits until the time is up.
         let state = with_network(true);
         let began = Instant::now();
-        assert!(!cycle(&state, soon()).await);
+        assert_eq!(cycle(&state, soon()).await, Waited::NotEnded);
         assert!(began.elapsed() >= Duration::from_millis(400));
         assert!(
             began.elapsed() < Duration::from_secs(2),
@@ -1329,8 +1387,119 @@ mod tests {
             node.sync_control.cycle_ended(next);
         });
         let began = Instant::now();
-        assert!(cycle(&state, Instant::now() + Duration::from_secs(20)).await);
+        let waited = cycle(&state, Instant::now() + Duration::from_secs(20)).await;
+        assert_eq!(waited, Waited::Done);
         assert!(began.elapsed() >= Duration::from_millis(150));
         ran.await.unwrap();
+
+        // A cycle that stopped before its end has ended, and early.
+        let state = with_network(true);
+        let node = std::sync::Arc::clone(&state);
+        let ran = tokio::spawn(async move {
+            node.sync_control.woken().await;
+            let stopped = node.sync_control.cycle_begins();
+            node.sync_control.cycle_was_cut_short(stopped);
+            node.sync_control.cycle_ended(stopped);
+        });
+        let waited = cycle(&state, Instant::now() + Duration::from_secs(20)).await;
+        assert_eq!(waited, Waited::EndedEarly);
+        ran.await.unwrap();
+    }
+
+    /// A command that prepares a change has the device make a whole pass
+    /// that began after it asked (decision 2026-10-04 §7.1, step 1). A
+    /// pass that ended before it had read every channel to its end has
+    /// not fetched what the relays hold: it is asked for again, so many
+    /// times, and then the command is told so. A device in a fork is not
+    /// asked again.
+    #[actix_web::test]
+    async fn test_a_pass_that_ended_early_is_asked_for_again_and_then_said() {
+        let with_network = || {
+            let mut state = state_of(Machine::new(1));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            state.push_tx = Some(tx);
+            std::sync::Arc::new(state)
+        };
+        // The node, as its loop does it: at each asking it makes a whole
+        // pass, of which the first `short` end early.
+        let node_makes = |state: &std::sync::Arc<AppState>, short: usize| {
+            let node = std::sync::Arc::clone(state);
+            tokio::spawn(async move {
+                let mut made = 0;
+                loop {
+                    node.own_channels.wait_asked().await;
+                    let pass = node.own_channels.whole_pass_begins();
+                    if made < short {
+                        node.own_channels.whole_pass_was_short(pass);
+                    }
+                    node.own_channels.whole_pass_ended(pass);
+                    made += 1;
+                }
+            })
+        };
+        let soon = || Instant::now() + Duration::from_secs(20);
+
+        // A node with no network has nobody to ask.
+        let mut no_network = state_of(Machine::new(1));
+        no_network.push_tx = None;
+        assert_eq!(fetch(&no_network, true, soon()).await, Waited::Done);
+        // No pass ends: the time is up.
+        let state = with_network();
+        let briefly = Instant::now() + Duration::from_millis(300);
+        assert_eq!(fetch(&state, true, briefly).await, Waited::NotEnded);
+
+        // A pass that read everything is asked for once.
+        let state = with_network();
+        let node = node_makes(&state, 0);
+        assert_eq!(fetch(&state, true, soon()).await, Waited::Done);
+        assert_eq!(state.own_channels.whole_passes(), (1, 1));
+        node.abort();
+        // One that ended early is asked for again, and the next read on.
+        let state = with_network();
+        let node = node_makes(&state, CHANGE_FETCH_PASSES - 1);
+        assert_eq!(fetch(&state, true, soon()).await, Waited::Done);
+        assert_eq!(
+            state.own_channels.whole_passes().1,
+            CHANGE_FETCH_PASSES as u64
+        );
+        node.abort();
+        // So many times, and no more.
+        let state = with_network();
+        let node = node_makes(&state, usize::MAX);
+        assert_eq!(fetch(&state, true, soon()).await, Waited::EndedEarly);
+        assert_eq!(
+            state.own_channels.whole_passes().1,
+            CHANGE_FETCH_PASSES as u64
+        );
+        node.abort();
+        // A device in a fork is asked once.
+        let state = with_network();
+        let node = node_makes(&state, usize::MAX);
+        assert_eq!(fetch(&state, false, soon()).await, Waited::EndedEarly);
+        assert_eq!(state.own_channels.whole_passes().1, 1);
+        node.abort();
+
+        // What the command is told: a line for each that did not do all
+        // that was asked.
+        assert!(not_fetched(Waited::Done, Waited::Done, false).is_empty());
+        let early = not_fetched(Waited::EndedEarly, Waited::EndedEarly, false);
+        assert_eq!(early.len(), 2, "{early:?}");
+        assert!(
+            early[0].starts_with(
+                "the fetch ended before every channel was read to its end at every relay"
+            ),
+            "{early:?}"
+        );
+        assert!(
+            early[1].starts_with("the sync cycle stopped before its end"),
+            "{early:?}"
+        );
+        let not_ended = not_fetched(Waited::NotEnded, Waited::NotEnded, false);
+        assert!(not_ended[0].starts_with("the fetch did not end within 120 seconds"));
+        assert!(not_ended[1].starts_with("no sync cycle ended within 120 seconds"));
+        // A device in a fork fetches nothing, and that is no failure of
+        // the fetch.
+        assert!(not_fetched(Waited::EndedEarly, Waited::Done, true).is_empty());
+        assert_eq!(not_fetched(Waited::NotEnded, Waited::Done, true).len(), 1);
     }
 }

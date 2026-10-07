@@ -2870,6 +2870,11 @@ async fn a_relay_that_dropped_a_channel_says_so_and_is_sent_it_again() {
 /// every pull of a channel with a full page of entries that the device
 /// holds, under no mark, or under a mark with a place that does not
 /// move, is asked for that channel once in a pass, and not ten times.
+///
+/// Such a pass has not read the channel to its end, and says so: a
+/// command that waited for it is not told that everything was fetched
+/// (decision 2026-10-04 §7.1, step 1). A pass that read every channel to
+/// its end does not say so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
     let relay = StandIn::started().await;
@@ -2899,8 +2904,16 @@ async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
         next: 0,
         mark: [0; 8],
     });
+    // The whole passes that the device has ended, and the last of them
+    // that ended before it had read every channel to its end.
+    let passes = |device: &Device| {
+        let own = &device.state.own_channels;
+        (own.whole_passes().1, own.last_short_pass())
+    };
+    assert_eq!(passes(&device), (0, 0));
     device.passes().await;
     assert_eq!(pulls_of_notes(&relay), 1);
+    assert_eq!(passes(&device), (1, 1));
     let pulled = device.counts("relay").pulled;
     assert_eq!(pulled, 3);
     // And once in the next pass.
@@ -2953,9 +2966,14 @@ async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
         }
     });
     device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    let (before, short) = passes(&device);
+    assert_eq!(short, before);
     device.passes().await;
     // Three pages of one entry each, and the page of nothing at the end.
     assert_eq!(pulls_of_notes(&relay), 4);
+    // That pass read the channel to its end: it is not one that ended
+    // early.
+    assert_eq!(passes(&device), (before + 1, before));
 }
 
 /// What a device takes from one relay in a minute is bounded at what a

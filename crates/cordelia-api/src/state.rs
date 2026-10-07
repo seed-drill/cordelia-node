@@ -116,6 +116,9 @@ pub struct OwnChannels {
     /// last that it ended.
     begun: AtomicU64,
     ended: AtomicU64,
+    /// The number of the last whole pass that ended before it had read
+    /// every channel to its end at every relay it reached.
+    short: AtomicU64,
     /// For each channel of a name, by its ID: the relays that have handed
     /// the whole of it, and when the first of them had.
     fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
@@ -193,6 +196,23 @@ impl OwnChannels {
     /// The node has ended the whole pass numbered `pass`.
     pub fn whole_pass_ended(&self, pass: u64) {
         self.ended.fetch_max(pass, Ordering::SeqCst);
+    }
+
+    /// The whole pass numbered `pass` ends before it has read every
+    /// channel of the device's own to its end at every relay it reached:
+    /// a relay gave no leave or stopped answering, or holds more of a
+    /// channel than one pass takes. The node says so before it says that
+    /// the pass has ended, so that whoever waited for the pass reads
+    /// both.
+    pub fn whole_pass_was_short(&self, pass: u64) {
+        self.short.fetch_max(pass, Ordering::SeqCst);
+    }
+
+    /// The number of the last whole pass that ended short
+    /// ([`Self::whole_pass_was_short`]): 0 where none has. A pass that
+    /// began after a moment has a number above the count at that moment.
+    pub fn last_short_pass(&self) -> u64 {
+        self.short.load(Ordering::SeqCst)
     }
 
     /// How many whole passes the node has begun, and the number of the
@@ -409,6 +429,8 @@ pub struct SyncControl {
     /// that it ended.
     cycles_begun: AtomicU64,
     cycles_ended: AtomicU64,
+    /// The number of the last cycle that stopped before its end.
+    cycles_cut_short: AtomicU64,
 }
 
 impl SyncControl {
@@ -592,6 +614,20 @@ impl SyncControl {
     /// The node has ended the cycle numbered `cycle`.
     pub fn cycle_ended(&self, cycle: u64) {
         self.cycles_ended.fetch_max(cycle, Ordering::SeqCst);
+    }
+
+    /// The cycle numbered `cycle` stops before its end: the settings
+    /// changed under it, or it could not be run. The node says so before
+    /// it says that the cycle has ended, so that whoever waited for the
+    /// cycle reads both.
+    pub fn cycle_was_cut_short(&self, cycle: u64) {
+        self.cycles_cut_short.fetch_max(cycle, Ordering::SeqCst);
+    }
+
+    /// The number of the last cycle that stopped before its end
+    /// ([`Self::cycle_was_cut_short`]): 0 where none has.
+    pub fn last_cycle_cut_short(&self) -> u64 {
+        self.cycles_cut_short.load(Ordering::SeqCst)
     }
 
     /// How many cycles the node has begun, and the number of the last
@@ -821,6 +857,16 @@ mod tests {
         // The number of the last pass ended never goes back.
         own.whole_pass_ended(first);
         assert_eq!(own.whole_passes(), (2, 2));
+        // A pass that ended early is known by its number, as one that
+        // ended is.
+        assert_eq!(own.last_short_pass(), 0);
+        let third = own.whole_pass_begins();
+        own.whole_pass_was_short(third);
+        own.whole_pass_ended(third);
+        assert_eq!((own.whole_passes(), own.last_short_pass()), ((3, 3), 3));
+        let fourth = own.whole_pass_begins();
+        own.whole_pass_ended(fourth);
+        assert_eq!((own.whole_passes(), own.last_short_pass()), ((4, 4), 3));
     }
 
     /// How many relays a node is configured with is not known until it
@@ -979,6 +1025,15 @@ mod tests {
         assert!(control.cycles().1 > begun);
         control.cycle_ended(first);
         assert_eq!(control.cycles(), (2, 2));
+        // A cycle that stopped before its end is known by its number.
+        assert_eq!(control.last_cycle_cut_short(), 0);
+        let third = control.cycle_begins();
+        control.cycle_was_cut_short(third);
+        control.cycle_ended(third);
+        assert_eq!(
+            (control.cycles(), control.last_cycle_cut_short()),
+            ((3, 3), 3)
+        );
     }
 
     /// The sweep of local history takes its turn with a sync cycle and a

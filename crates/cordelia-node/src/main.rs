@@ -1396,7 +1396,11 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         // §7.1, step 1).
         let cycle = state.sync_control.cycle_begins();
         let counted = state.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        // Whether the turn went to its end: a cycle that stopped where
+        // the settings changed under it, or that could not be run, did
+        // not, and a command that waited for it is told so (decision
+        // 2026-10-04 §7.1, step 1).
+        let to_its_end = tokio::task::spawn_blocking(move || {
             // In its own turn, whether or not sync is on: history ages
             // either way.
             if sweep {
@@ -1407,9 +1411,11 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                     meta::get(&db, meta::SYNC_CLAUDE_DIR).ok().flatten(),
                     state.sync_control.generation_under(&db),
                 ),
-                Err(_) => return,
+                Err(_) => return false,
             };
-            let Ok(mut slot) = adapter.lock() else { return };
+            let Ok(mut slot) = adapter.lock() else {
+                return false;
+            };
             let Some(dir) = dir else {
                 // Sync was just turned off: this person's other devices
                 // stop listing what this one synced. If the settings
@@ -1417,7 +1423,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                 // looks again.
                 if slot.is_some() {
                     match cordelia_sync::claude::withdraw(&state, generation) {
-                        Ok(false) => return,
+                        Ok(false) => return false,
                         Ok(true) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "sync: could not withdraw this device's names");
@@ -1425,7 +1431,7 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                     }
                     *slot = None;
                 }
-                return;
+                return true;
             };
             // One adapter, for the directory that is set, as it is stored:
             // a cycle of any other does nothing.
@@ -1459,8 +1465,13 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
                     let _ = meta::set(&db, meta::SYNC_CLAUDE_LAST_CHANGE, &now);
                 }
             }
+            !report.stopped
         })
-        .await;
+        .await
+        .unwrap_or(false);
+        if !to_its_end {
+            counted.sync_control.cycle_was_cut_short(cycle);
+        }
         counted.sync_control.cycle_ended(cycle);
     }
 }

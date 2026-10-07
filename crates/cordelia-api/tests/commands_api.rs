@@ -288,6 +288,29 @@ async fn test_a_change_is_prepared_after_a_whole_pass_that_the_node_was_asked_fo
         .collect();
     assert_eq!(could_not, ["no relay was reached"]);
     assert!(handed["statement"].is_string() && handed["entry"].is_string());
+
+    // Passes that end before every channel was read to its end: the
+    // node is asked again, so many times, and then the command is told
+    // that not everything was fetched.
+    let node = state.clone();
+    let passes = tokio::spawn(async move {
+        loop {
+            node.own_channels.wait_asked().await;
+            let pass = node.own_channels.whole_pass_begins();
+            node.own_channels.whole_pass_was_short(pass);
+            node.own_channels.whole_pass_ended(pass);
+        }
+    });
+    let (status, handed) = asks!(app, "/api/v1/change/prepare", json!({}));
+    assert_eq!(status, 200, "{handed}");
+    passes.abort();
+    let asked = cordelia_core::protocol::CHANGE_FETCH_PASSES as u64;
+    assert_eq!(state.own_channels.whole_passes(), (1 + asked, 1 + asked));
+    let could_not = handed["could_not_fetch"].to_string();
+    assert!(
+        could_not.contains("the fetch ended before every channel was read to its end"),
+        "{could_not}"
+    );
 }
 
 /// The routes of a person's commands, each with a body that it reads.
