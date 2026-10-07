@@ -592,6 +592,9 @@ pub struct SyncControl {
     cycles_ended: AtomicU64,
     /// The number of the last cycle that stopped before its end.
     cycles_cut_short: AtomicU64,
+    /// When the node last stored a cycle's report in this run, by its
+    /// own clock.
+    report_stored: Mutex<Option<Instant>>,
 }
 
 impl SyncControl {
@@ -764,6 +767,27 @@ impl SyncControl {
     /// cycle that began after it asked ([`Self::cycles`]).
     pub fn ask_cycle(&self) {
         self.wake.notify_one();
+    }
+
+    /// The node has stored a cycle's report, at `now` by its own clock.
+    pub fn report_stored(&self, now: Instant) {
+        *self.report_stored.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
+
+    /// For how long the node has stored no report of a cycle, at `now`:
+    /// since the later of `started`, when the node started, and the last
+    /// report it stored in this run (decision 2026-10-04 §10.1).
+    ///
+    /// Both are read by the node's own clock, which does not run while
+    /// the machine sleeps. A status says that the cycle has stalled by
+    /// this alone: were the report's age read by the wall clock, a
+    /// machine that wakes would be stalled until its next cycle, and
+    /// were only the start read by the node's own, a report of an
+    /// earlier run would make a node that has just started stalled.
+    pub fn no_report_for(&self, started: Instant, now: Instant) -> std::time::Duration {
+        let stored = *self.report_stored.lock().unwrap_or_else(|e| e.into_inner());
+        let since = stored.map_or(started, |stored| stored.max(started));
+        now.saturating_duration_since(since)
     }
 
     /// The node begins a cycle. Returns the cycle's number, which it
@@ -1259,6 +1283,31 @@ mod tests {
                 .kept_beside("/m", "channel", "a.md")
                 .is_none()
         );
+    }
+
+    /// For how long the node has stored no report of a cycle (decision
+    /// 2026-10-04 §10.1): since it started, until it stores one, and
+    /// then since the last it stored. A time before the start counts
+    /// from the start.
+    #[test]
+    fn test_for_how_long_no_report_was_stored_is_by_the_nodes_own_clock() {
+        let control = SyncControl::default();
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let secs = |now: Instant| control.no_report_for(at(100), now).as_secs();
+        // Started at 100, and no report yet.
+        assert_eq!(secs(at(100)), 0);
+        assert_eq!(secs(at(170)), 70);
+        assert_eq!(secs(at(50)), 0);
+        control.report_stored(at(160));
+        assert_eq!(secs(at(170)), 10);
+        assert_eq!(secs(at(400)), 240);
+        control.report_stored(at(395));
+        assert_eq!(secs(at(400)), 5);
+        // A report from before the start, were there one: from the
+        // start.
+        control.report_stored(at(20));
+        assert_eq!(secs(at(400)), 300);
     }
 
     /// Since when no relay has been connected, and since when each has

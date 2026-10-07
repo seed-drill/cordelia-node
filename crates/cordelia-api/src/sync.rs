@@ -90,6 +90,10 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
             generation: state.sync_control.generation(),
             report,
+            no_report_secs: state
+                .sync_control
+                .no_report_for(state.started_at, std::time::Instant::now())
+                .as_secs(),
             last_change_at,
             stands,
             held: state.held.why().map(|held| held.says().to_string()),

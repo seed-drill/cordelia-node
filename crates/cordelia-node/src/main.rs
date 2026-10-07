@@ -973,6 +973,8 @@ fn gather_status(config_path: &str) -> GatheredStatus {
             .as_str()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds());
+        // For how long the node has stored none, by its own clock.
+        out.facts.no_report_secs = sync["no_report_secs"].as_u64();
         let strings = |v: &serde_json::Value| -> Vec<String> {
             v.as_array()
                 .map(|a| {
@@ -1857,6 +1859,11 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             if let Ok(db) = state.db.lock() {
                 if report_stands(&report, state.sync_control.generation_under(&db)) {
                     let _ = meta::set(&db, meta::SYNC_CLAUDE_REPORT, &json.to_string());
+                    // By the node's own clock: a status says by it
+                    // whether the cycle has stalled.
+                    state
+                        .sync_control
+                        .report_stored(std::time::Instant::now());
                 }
                 if changed {
                     let _ = meta::set(&db, meta::SYNC_CLAUDE_LAST_CHANGE, &now);

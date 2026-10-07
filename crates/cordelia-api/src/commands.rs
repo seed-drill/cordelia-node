@@ -230,6 +230,25 @@ fn not_reached(state: &AppState, at: &crate::state::AtRelays) -> Vec<String> {
         .collect()
 }
 
+/// The relays that this node is connected to now, each by its node key
+/// and by when it was last connected, in seconds, at `now`: the node
+/// counts for how long each has been connected by its own clock, which
+/// does not run while the machine sleeps.
+fn relays_reached_since(state: &AppState, now: i64) -> Vec<([u8; 32], i64)> {
+    let peers = state.peers.read().unwrap_or_else(|e| e.into_inner());
+    peers
+        .iter()
+        .filter(|peer| peer.role == "relay")
+        .filter_map(|peer| {
+            let connected_for = i64::try_from(peer.connected_secs).unwrap_or(i64::MAX);
+            Some((
+                decode_public_key(&peer.key).ok()?,
+                now.saturating_sub(connected_for),
+            ))
+        })
+        .collect()
+}
+
 /// How many of this device's own channels have something that waits to
 /// be sent to a relay the node is connected to: the most that wait at
 /// any one of them. None on a node that follows no phrase, and none
@@ -254,10 +273,14 @@ fn names_sent(state: &AppState) -> Result<serde_json::Value, ApiError> {
         .into_iter()
         .map(|(_, key)| key)
         .collect();
+    let reached_since = relays_reached_since(state, now());
     let conn = db(state);
     let names = leaving::names_to_go(&conn, &state.identity, &relays).map_err(refused)?;
-    // Since when the first of what is still to go has waited.
-    let since = leaving::names_waiting_since(&conn, &state.identity, &relays).map_err(refused)?;
+    // Since when the first of what is still to go has waited: at each
+    // relay, from the later of when it was stored and when that relay
+    // was last connected.
+    let since =
+        leaving::names_waiting_since(&conn, &state.identity, &reached_since).map_err(refused)?;
     let (to_go, sent): (Vec<_>, Vec<_>) = names.into_iter().partition(|(_, to_go)| *to_go);
     let named = |names: Vec<(String, bool)>| -> Vec<String> {
         names.into_iter().map(|(name, _)| name).collect()
@@ -1242,12 +1265,31 @@ mod tests {
             names_sent(&state).unwrap(),
             json!({ "sent": [], "to_go": ["lab", "team"] })
         );
+        // Since when: at a relay, from the later of when the entry was
+        // stored and when that relay was last connected (decision
+        // 2026-10-04 §10.1). These relays connected a second ago, long
+        // after the entries were stored: they have waited a second.
+        let since = |state: &AppState| super::names_sent(state).unwrap()["to_go_since"].clone();
+        let stored_at = 1_000;
+        db(&state)
+            .execute("UPDATE entries SET stored_at = ?1", [stored_at])
+            .unwrap();
+        let a_moment_ago = since(&state).as_i64().unwrap();
+        assert!(
+            (now() - 5..=now()).contains(&a_moment_ago),
+            "{a_moment_ago}"
+        );
+        // One of them has been connected since before they were stored:
+        // there they have waited since then.
+        state.peers.write().unwrap()[1].connected_secs = (now() - stored_at + 60) as u64;
+        assert_eq!(since(&state), json!(stored_at));
         // A peer that is no relay is not asked about.
         let mut peers = state.peers.write().unwrap();
         peers[0].role = "node".into();
         peers[1].role = "node".into();
         drop(peers);
         assert_eq!(channels_waiting(&state), 0);
+        assert!(since(&state).is_null());
     }
 
     /// A command that makes a change is handed the names that the

@@ -1930,6 +1930,48 @@ async fn test_the_status_says_for_how_long_no_relay_has_been_connected() {
     assert!(secs < 60, "{secs}");
 }
 
+/// A sync status says for how long the node has stored no report of a
+/// cycle, by its own clock (decision 2026-10-04 §10.1): since the node
+/// started, until it stores one, and then since the last it stored. A
+/// status says by this that the cycle has stalled.
+#[actix_web::test]
+async fn test_a_sync_status_says_for_how_long_no_report_was_stored() {
+    let state = test_state();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let no_report_secs = || async {
+        let req = test::TestRequest::post()
+            .uri("/api/v1/sync/status")
+            .insert_header(auth_header())
+            .set_json(json!({}))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        body["no_report_secs"].as_u64().unwrap()
+    };
+    // The node has just started.
+    let secs = no_report_secs().await;
+    assert!(secs < 60, "{secs}");
+    // A report was stored some minutes ago, by the node's own clock: a
+    // time before the node's start counts from its start.
+    let now = std::time::Instant::now();
+    let earlier = now
+        .checked_sub(std::time::Duration::from_secs(400))
+        .unwrap();
+    state.sync_control.report_stored(earlier);
+    let secs = no_report_secs().await;
+    assert!(secs < 60, "{secs}");
+    // And one is stored now, after a start that was long ago.
+    assert!(state.sync_control.no_report_for(earlier, now).as_secs() >= 400);
+    state.sync_control.report_stored(now);
+    assert_eq!(state.sync_control.no_report_for(earlier, now).as_secs(), 0);
+}
+
 /// Local history over HTTP (decision 2026-09-30 §4.5b): none of its four
 /// endpoints answers without the node's token, and a restore or a drop
 /// that is refused does nothing. With the token a kept text is listed,

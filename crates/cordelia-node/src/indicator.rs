@@ -57,8 +57,14 @@ pub struct Facts {
     pub outbox_refused: u64,
     /// `cordelia sync claude` is on.
     pub sync_enabled: bool,
-    /// Age of the last sync cycle's report; `None` before the first cycle.
+    /// Age of the last sync cycle's report, by the wall clock; `None`
+    /// before the first cycle.
     pub report_age_secs: Option<i64>,
+    /// For how long the node has stored no report, in seconds, by its
+    /// own clock, which does not run while the machine sleeps: since the
+    /// later of its start and the last report it stored. `None` beside a
+    /// node that does not say.
+    pub no_report_secs: Option<u64>,
     pub errors: Vec<String>,
     /// Conflict files waiting for someone to merge them.
     pub conflicts: Vec<String>,
@@ -216,12 +222,28 @@ const NOT_LISTED_SHOWN_SECS: u64 = REMOVAL_SHOWN_SECS;
 /// A relay's refusal for room is taken to stand for this long.
 const NO_ROOM_STANDS_SECS: u64 = cordelia_core::protocol::NO_ROOM_STANDS_SECS;
 
-/// Whether the sync cycle has stalled: its last report is older than a
-/// cycle takes, **and the node has run for longer than that.** A cycle
-/// counts as stalled from the node's start, and not from the time of a
-/// report that an earlier run stored: otherwise every start after a stop
-/// of more than a minute would be stalled for some seconds.
+/// Whether the sync cycle has stalled: there is a report, and the node
+/// has stored none for longer than a cycle takes, **counted from the
+/// later of its start and the last it stored, by the node's own clock**
+/// (decision 2026-10-04 §10.1).
+///
+/// One clock is read for both halves. A cycle counts as stalled from the
+/// node's start, and not from the time of a report that an earlier run
+/// stored: otherwise every start after a stop of more than a minute
+/// would be stalled for some seconds. And the node's own clock does not
+/// run while the machine sleeps: a machine that wakes is not stalled for
+/// the time it slept, until its next cycle.
+///
+/// Beside a node that does not say for how long it has stored none, the
+/// report's age is read by the wall clock, and the node's start by its
+/// own, as an earlier version read them.
 fn stalled(f: &Facts) -> bool {
+    if f.report_age_secs.is_none() {
+        return false;
+    }
+    if let Some(secs) = f.no_report_secs {
+        return secs > STALE_REPORT_SECS as u64;
+    }
     let old = f.report_age_secs.is_some_and(|age| age > STALE_REPORT_SECS);
     old && f.uptime_secs.is_none_or(|up| up > STALE_REPORT_SECS as u64)
 }
@@ -1849,7 +1871,59 @@ mod tests {
         assert_eq!(level(&|f| f.devices.no_room_secs = vec![9_000, 20]), amber);
     }
 
-    /// A cycle counts as stalled from the node's start (decision
+    /// One clock says whether the cycle has stalled (decision 2026-10-04
+    /// §10.1): for how long the node has stored no report, by its own
+    /// clock, which does not run while the machine sleeps. A machine
+    /// that wakes holds a report that is hours old by the wall clock,
+    /// and is not stalled; and a cycle that has stored none for more
+    /// than a minute of the node's own time has stalled, however fresh
+    /// the wall clock makes its report. With no report at all, nothing
+    /// has stalled: the cycle is starting.
+    #[test]
+    fn a_machine_that_wakes_is_not_stalled_for_the_time_it_slept() {
+        let of = |age: Option<i64>, none_for: Option<u64>| {
+            let shown = with(&|f| {
+                f.report_age_secs = age;
+                f.no_report_secs = none_for;
+            });
+            (shown.level, shown.state, shown.summary)
+        };
+        let synced = (None, State::Synced, "memory synced".to_string());
+        let stalled = (
+            Some(Level::Red),
+            State::Attention,
+            "memory sync stalled".to_string(),
+        );
+        // It slept for eight hours, and its last cycle was three
+        // seconds of its own time ago.
+        assert_eq!(of(Some(8 * 3_600), Some(3)), synced);
+        assert_eq!(of(Some(8 * 3_600), Some(STALE_REPORT_SECS as u64)), synced);
+        assert_eq!(
+            of(Some(8 * 3_600), Some(STALE_REPORT_SECS as u64 + 1)),
+            stalled
+        );
+        // The wall clock was set back: the report looks fresh, and no
+        // cycle has stored one for two minutes.
+        assert_eq!(of(Some(1), Some(120)), stalled);
+        assert_eq!(of(Some(-500), Some(120)), stalled);
+        // No report: starting, whatever the node says.
+        assert_eq!(of(None, Some(900)).2, "memory sync starting");
+        // A node that has just started beside a report of an earlier
+        // run: it has stored none for as long as it has run.
+        let just_started = with(&|f| {
+            f.report_age_secs = Some(600);
+            f.uptime_secs = Some(10);
+            f.no_report_secs = Some(10);
+        });
+        assert_eq!(just_started.level, None);
+        // A node that does not say is read as an earlier version read
+        // it: by the report's age, and the node's start.
+        assert_eq!(of(Some(8 * 3_600), None), stalled);
+        assert_eq!(of(Some(3), None), synced);
+    }
+
+    /// Beside a node that does not say for how long it has stored no
+    /// report, a cycle counts as stalled from the node's start (decision
     /// 2026-10-04 §10.1): a report that an earlier run stored does not
     /// make a node that has just started stalled, in the level or in the
     /// state.

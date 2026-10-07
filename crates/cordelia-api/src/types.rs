@@ -474,6 +474,12 @@ pub struct SyncStatusResponse {
     pub generation: u64,
     /// The last cycle's report, once one has run.
     pub report: Option<serde_json::Value>,
+    /// For how long the node has stored no report, in seconds, by its
+    /// own clock, which does not run while the machine sleeps: since the
+    /// later of its start and the last report it stored (decision
+    /// 2026-10-04 §10.1). A status says by this that the cycle has
+    /// stalled.
+    pub no_report_secs: u64,
     /// When a cycle last sent or received a memory (RFC 3339).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<String>,

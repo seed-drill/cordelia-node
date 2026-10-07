@@ -429,18 +429,25 @@ pub fn names_to_go(
 }
 
 /// Since when something of a name's channel has waited to be sent to one
-/// of `relays`, by their node keys: when this device stored the earliest
-/// entry that is the first to wait at one of them, in seconds. `None`
-/// where nothing of a name waits. What a relay had no room for waits
-/// from when it was stored.
+/// of `relays`, in seconds: the earliest time, over those relays, from
+/// which the first entry that waits at one of them has waited there.
+/// `None` where nothing of a name waits. What a relay had no room for
+/// waits as any entry does.
+///
+/// Each relay is given by its node key and by when it was last
+/// connected, in seconds. **An entry waits at a relay from the later of
+/// when this device stored it and when that relay was last connected**
+/// (decision 2026-10-04 §10.1): nothing could be sent to a relay that
+/// was not there, so what was written while the device was offline has
+/// waited, when its relay comes back, for no time yet.
 ///
 /// A status says that names are not yet sent only once they have waited
-/// for some minutes (decision 2026-10-04 §10.1): what was written a
-/// moment ago is being sent.
+/// for some minutes: what was written a moment ago, and what a relay
+/// that has just connected is being sent, is on its way.
 pub fn names_waiting_since(
     conn: &Connection,
     identity: &NodeIdentity,
-    relays: &[[u8; 32]],
+    relays: &[([u8; 32], i64)],
 ) -> Result<Option<i64>, PersonError> {
     let carried_up_to = kept_rows::carried_up_to(conn)?;
     let mut since: Option<i64> = None;
@@ -452,7 +459,7 @@ pub fn names_waiting_since(
             let next = entries::channel_entries_after(conn, &channel.id, place, 1)?;
             Ok(next.first().map(|held| (held.seq, held.stored_at)))
         };
-        for relay in relays {
+        for (relay, connected_at) in relays {
             let kept = kept_rows::kept(conn, relay, &channel.id)?;
             // As [`waits_in`] finds what waits: what came since the
             // statement was applied, and what was carried then.
@@ -472,7 +479,8 @@ pub fn names_waiting_since(
                     waits.push(at);
                 }
             }
-            since = waits.into_iter().chain(since).min();
+            let at_this_relay = waits.into_iter().map(|at| at.max(*connected_at));
+            since = at_this_relay.chain(since).min();
         }
     }
     Ok(since)

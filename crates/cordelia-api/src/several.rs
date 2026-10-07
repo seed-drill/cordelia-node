@@ -1841,9 +1841,11 @@ mod tests {
     }
 
     /// Since when names have waited to be sent (decision 2026-10-04
-    /// §10.1): when the device stored the earliest entry that is the
-    /// first to wait at one of the relays asked about. Nothing where
-    /// nothing waits, and nothing where no relay is asked about.
+    /// §10.1): the earliest time from which the first entry that waits
+    /// at one of the relays asked about has waited there. An entry waits
+    /// at a relay from the later of when the device stored it and when
+    /// that relay was last connected. Nothing where nothing waits, and
+    /// nothing where no relay is asked about.
     #[test]
     fn test_since_when_names_have_waited_to_be_sent() {
         use crate::leaving::names_waiting_since;
@@ -1855,7 +1857,14 @@ mod tests {
         s.write(0, "team", "more.md", "two");
         let (conn, identity) = (&s[0].conn, &s[0].identity);
         let (relay, other_relay) = ([7u8; 32], [8u8; 32]);
-        let since = |relays: &[[u8; 32]]| names_waiting_since(conn, identity, relays).unwrap();
+        // Each relay with when it was last connected.
+        let since =
+            |relays: &[([u8; 32], i64)]| names_waiting_since(conn, identity, relays).unwrap();
+        // Both connected before anything was stored.
+        let long = |relays: &[[u8; 32]]| {
+            let relays: Vec<([u8; 32], i64)> = relays.iter().map(|relay| (*relay, 0)).collect();
+            since(&relays)
+        };
         let channel = |name: &str| held_rows::channel_of_name(conn, name).unwrap().unwrap();
         let (lab, team) = (channel("lab"), channel("team"));
         // Each entry was stored at a time of its own.
@@ -1874,27 +1883,43 @@ mod tests {
         stored(&team, &[300, 400]);
 
         // The first that waits, of the earliest name.
-        assert_eq!(since(&[relay]), Some(300));
-        assert_eq!(since(&[]), None);
+        assert_eq!(long(&[relay]), Some(300));
+        assert_eq!(long(&[]), None);
+        // A relay that connected after the entries were stored: they
+        // have waited there since it connected, and no longer.
+        assert_eq!(since(&[(relay, 450)]), Some(450));
+        assert_eq!(since(&[(relay, 350)]), Some(350));
+        assert_eq!(since(&[(relay, 9_000)]), Some(9_000));
+        // Of two relays, the earlier of the two times: at the one that
+        // has been there throughout, since the entry was stored.
+        assert_eq!(since(&[(relay, 9_000), (other_relay, 0)]), Some(300));
+        assert_eq!(since(&[(relay, 9_000), (other_relay, 8_000)]), Some(8_000));
         // The first of `team` is sent: its second waits, from when it
         // was stored.
         kept_rows::sent(conn, &relay, &team, held(&team)[0].seq).unwrap();
-        assert_eq!(since(&[relay]), Some(400));
+        assert_eq!(long(&[relay]), Some(400));
+        // What was stored after the relay connected waits from when it
+        // was stored.
+        assert_eq!(since(&[(relay, 350)]), Some(400));
+        assert_eq!(since(&[(relay, 450)]), Some(450));
         // At another relay everything waits still.
-        assert_eq!(since(&[relay, other_relay]), Some(300));
-        assert_eq!(since(&[other_relay, relay]), Some(300));
+        assert_eq!(long(&[relay, other_relay]), Some(300));
+        assert_eq!(long(&[other_relay, relay]), Some(300));
         // Everything is sent to the one: nothing waits there.
         kept_rows::sent(conn, &relay, &team, i64::MAX / 2).unwrap();
-        assert_eq!(since(&[relay]), Some(500));
+        assert_eq!(long(&[relay]), Some(500));
         kept_rows::sent(conn, &relay, &lab, i64::MAX / 2).unwrap();
-        assert_eq!(since(&[relay]), None);
-        // What a relay had no room for waits from when it was stored.
+        assert_eq!(long(&[relay]), None);
+        assert_eq!(since(&[(relay, 9_000)]), None);
+        // What a relay had no room for waits from when it was stored,
+        // or from when the relay connected.
         kept_rows::refused(conn, &relay, &team, held(&team)[1].seq).unwrap();
-        assert_eq!(since(&[relay]), Some(400));
+        assert_eq!(long(&[relay]), Some(400));
+        assert_eq!(since(&[(relay, 700)]), Some(700));
         // The personal channel is no name: what waits of it is not said.
         let alone = Machine::new(7);
         assert_eq!(
-            names_waiting_since(&alone.conn, &alone.identity, &[relay]).unwrap(),
+            names_waiting_since(&alone.conn, &alone.identity, &[(relay, 0)]).unwrap(),
             None
         );
     }
