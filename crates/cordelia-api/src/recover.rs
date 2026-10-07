@@ -1527,6 +1527,8 @@ mod tests {
         let statement_key = *phrase().statement_key().unwrap();
         let read = read_generation(&from, &statement_key, &s[0].secret(), &handed, s.now).unwrap();
         assert_eq!(read.rows.len(), RECOVERY_MAX_DEVICES_SHOWN);
+        // 256 rows, and no more: the number itself is what is promised.
+        assert_eq!(read.rows.len(), 256);
         let counted = cordelia_core::protocol::MAX_COUNTED_DEVICES;
         let kept = cordelia_core::protocol::MAX_NOT_COUNTED_RECORDS;
         assert_eq!(

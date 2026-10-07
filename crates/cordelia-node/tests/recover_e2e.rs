@@ -320,9 +320,16 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
         "{said}"
     );
     assert!(
-        said.contains("\"desktop\", added since change 1, from "),
+        said.contains("\"desktop\", added since change 1, from ("),
         "{said}"
     );
+    // The device that added it is named, by its words and its label.
+    let added = said
+        .split("\"desktop\", added since change 1, from (")
+        .nth(1)
+        .unwrap();
+    let by = added.split(" at ").next().unwrap();
+    assert!(by.ends_with(") \"laptop\""), "{by}: {said}");
     assert!(
         said.contains("No answer is suggested: each is typed."),
         "{said}"

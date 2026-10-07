@@ -1351,6 +1351,13 @@ mod tests {
             ..word.clone()
         };
         assert!(!forged.holds(&phrase_key, &device, &under, now));
+        // A word whose time has gone by, said to stand a little longer:
+        // the signature is over the time.
+        let stretched = Word {
+            until: word.until + 300,
+            ..word.clone()
+        };
+        assert!(!stretched.holds(&phrase_key, &device, &under, now + CARRY_WORD_SECS + 100));
         // A time set further ahead than a word stands: the signature is
         // over the time, and a word that says more than ten minutes is
         // none, whoever signed it.
@@ -1629,6 +1636,22 @@ mod tests {
         );
         assert_eq!(s[0].text(LAB, "only-1.md").as_deref(), Some("one"));
         assert_eq!(s[0].text(LAB, "only-2.md").as_deref(), Some("two"));
+        // Where each key's versions were read apart, as where each wrote
+        // in a generation of its own, the newest among them is still the
+        // one that is taken for a file.
+        let old = s[1].own(LAB);
+        let mut at_the_relays = s[1].stored_in(&old);
+        at_the_relays.extend(s[2].stored_in(&old));
+        let mut apart: Vec<Version> = Vec::new();
+        for key in [s.key(1), s.key(2)] {
+            let was = read(&at_the_relays, &old, 1, |signer| *signer == key).unwrap();
+            apart.extend(was.versions);
+        }
+        assert_eq!(apart.iter().filter(|one| one.name == FILE).count(), 2);
+        let taken = newest(apart);
+        let of_the_file = taken.iter().find(|one| one.name == FILE).unwrap();
+        assert_eq!(of_the_file.value, text("of device 2, written over it"));
+        assert_eq!(taken.len(), 3);
         // One at a time: the first key's version fills the slot, and the
         // second's then stands above it, and is left.
         let (s, brought) = run(true);
