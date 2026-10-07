@@ -400,19 +400,25 @@ pub struct SyncClaudeRequest {
     /// Claude Code directory; defaults to ~/.claude of the user running the node.
     #[serde(default)]
     pub dir: Option<String>,
-    /// Project remotes this device never syncs (`host/owner/repo`, or a
-    /// prefix ending in `*`). Replaces the current list when given.
+    /// A list of exclusions, as a panel that is not yet brought up to
+    /// date sends one. It is stored in the place of the current list, and
+    /// nothing reads it to say what syncs: only mapped folders do
+    /// (decision 2026-10-04 §10.1).
     #[serde(default)]
     pub exclude: Option<Vec<String>>,
-    /// Whether home-folder memory syncs on this device (default: yes).
+    /// The switch for home memory. `false` unmaps the home directory and
+    /// stores the switch off; `true` stores it on. Home memory syncs
+    /// where the home directory is mapped.
     #[serde(default)]
     pub home: Option<bool>,
-    /// Sync everything found (home and git projects), now and later, as
-    /// well as the declared mappings. Default when first enabled: no.
+    /// `true` asked for everything found to sync, and is refused where
+    /// the request turns sync on or leaves it on: nothing is changed.
+    /// `false` is taken: only mapped folders sync, which is the only
+    /// scope there is.
     #[serde(default)]
     pub all: Option<bool>,
-    /// Put the directory, home and exclude settings back to their defaults.
-    /// Without it, a setting not given keeps its stored value.
+    /// Put the Claude Code directory back to its default. Nothing else is
+    /// touched: a setting that is not given keeps its stored value.
     #[serde(default)]
     pub reset: bool,
 }
@@ -448,16 +454,19 @@ pub struct SyncStatusResponse {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
-    /// Whether everything found syncs, or only the declared mappings.
+    /// Always false: only the declared mappings sync (decision 2026-10-04
+    /// §10.1). It is kept for whoever reads a status as an earlier
+    /// version wrote it.
     pub all: bool,
     pub mappings: Vec<SyncMapping>,
-    /// Never found by `all`: project names or prefixes, and folders
-    /// (absolute paths) that were unmapped.
+    /// The list of exclusions that is stored, as a panel sent it:
+    /// nothing reads it to say what syncs.
     pub exclude: Vec<String>,
+    /// The switch for home memory, as it is stored.
     pub home: bool,
     /// The name home memory syncs under on this device, or last did: the
-    /// name the home directory is or was mapped under, or `~` where it was
-    /// found and not mapped. Turning home memory on again uses it.
+    /// name the home directory is or was mapped under. Turning home
+    /// memory on again uses it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_name: Option<String>,
     /// How many times the settings have changed since the node started.

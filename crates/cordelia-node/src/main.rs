@@ -210,30 +210,29 @@ enum HistoryCommand {
 #[derive(clap::Subcommand)]
 enum SyncCommand {
     /// Turn on Claude Code memory sync. Nothing syncs until you map a
-    /// folder (`cordelia sync map`) or pass --all. Running it again keeps
-    /// your settings.
+    /// folder (`cordelia sync map`): only mapped folders sync. Running it
+    /// again keeps your settings.
     Claude {
         /// Claude Code directory (default: ~/.claude)
         #[arg(long)]
         dir: Option<String>,
-        /// Sync everything found, now and later: home memory and every git
-        /// project, as well as the folders you map
-        #[arg(long)]
+        /// No more: only mapped folders sync. It is refused, and says
+        /// what to do instead.
+        #[arg(long, hide = true)]
         all: bool,
-        /// Sync only the folders you map (turns --all off)
+        /// Sync only the folders you map: the only scope there is
         #[arg(long, conflicts_with = "all")]
         mapped_only: bool,
-        /// With --all: never sync this project from this device (its git
-        /// remote, e.g. github.com/client-co/app, or a prefix ending in *).
-        /// Repeatable; replaces the names in the current list. A folder
-        /// that was unmapped stays out (unless --reset is given).
-        #[arg(long)]
+        /// No more: there is nothing left to exclude. It is refused, and
+        /// says what to do instead.
+        #[arg(long, hide = true)]
         exclude: Vec<String>,
-        /// Do not sync home-folder memory on this device (unmaps it too)
+        /// Do not sync home-folder memory on this device: unmaps the home
+        /// directory
         #[arg(long)]
         no_home: bool,
-        /// Back to the defaults: ~/.claude, only mapped folders, nothing
-        /// excluded. Mapped folders stay mapped.
+        /// Back to the default Claude Code directory, ~/.claude. Mapped
+        /// folders stay mapped.
         #[arg(long)]
         reset: bool,
     },
@@ -263,15 +262,19 @@ enum SyncCommand {
     Off,
     /// Show what syncs, what was found, and what your other devices sync
     Status,
-    /// Sync home-folder memory on this device, or not
+    /// Sync home-folder memory on this device, or not: `on` maps the home
+    /// directory, and `off` unmaps it
     Home {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// With --all: stop syncing one project from this device (its git
-    /// remote, e.g. github.com/client-co/app, or a prefix ending in *)
+    /// No more: there is nothing left to exclude. It is refused, and says
+    /// what to do instead.
+    #[command(hide = true)]
     Exclude { project: String },
-    /// With --all: sync a project again after `exclude`
+    /// No more: there is nothing left to exclude. It is refused, and says
+    /// what to do instead.
+    #[command(hide = true)]
     Include { project: String },
 }
 
@@ -2071,8 +2074,8 @@ fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
 // Thin clients of the running node's local API: all logic lives in the
 // node (cordelia_api::membership), which must be started first.
 
-/// A project's name in its one spelling: as the exclude list stores it,
-/// as the node cleans one, and as a project is found from its remote.
+/// A project's name in its one spelling: as a name's channel is made
+/// from it, and as a project is found from its remote.
 fn normalise_project(project: &str) -> String {
     cordelia_core::sync_name::tidy(project)
 }
@@ -2145,21 +2148,6 @@ fn mapping_named<'a>(mappings: &'a [(String, String)], word: &str) -> Option<&'a
         .find_map(|spelt| mappings.iter().find(|(_, name)| name == spelt))
 }
 
-/// The mapping that stands in the way of an exclusion: one whose name or
-/// folder is what would be stored (`project`), or that the word as typed
-/// names. A mapped folder syncs whatever is excluded, so excluding it
-/// would say something that is not so.
-fn mapping_in_the_way<'a>(
-    mappings: &'a [(String, String)],
-    project: &str,
-    typed: &str,
-) -> Option<&'a (String, String)> {
-    mappings
-        .iter()
-        .find(|(folder, name)| name == project || folder == project)
-        .or_else(|| mapping_named(mappings, typed))
-}
-
 /// The mapping of a folder, given the folder's spellings in the order
 /// they are meant: the first spelling that is a mapping's folder decides.
 /// So a folder that is mapped is found before the repository it is in,
@@ -2171,32 +2159,6 @@ fn mapping_at<'a>(
     spellings
         .iter()
         .find_map(|spelt| mappings.iter().find(|(folder, _)| folder == spelt))
-}
-
-/// The exclude list that `cordelia sync claude --exclude` sends: what was
-/// typed, each taken as `cordelia sync exclude` takes it, in place of the
-/// names in the stored list; and the folders in the stored list. A folder
-/// is there because it was unmapped, or was excluded as a folder, and it
-/// stays out until it is mapped again or included. With `--reset` nothing
-/// of the stored list is kept.
-fn exclude_list_to_send(
-    typed: &[String],
-    stored: &[String],
-    reset: bool,
-) -> anyhow::Result<Vec<String>> {
-    let mut list: Vec<String> = Vec::new();
-    for given in typed {
-        let entry = exclusion(given)?;
-        if !list.contains(&entry) {
-            list.push(entry);
-        }
-    }
-    for folder in stored.iter().filter(|e| !reset && e.starts_with('/')) {
-        if !list.contains(folder) {
-            list.push(folder.clone());
-        }
-    }
-    Ok(list)
 }
 
 /// The mappings as the node's own check takes them.
@@ -2249,8 +2211,8 @@ enum MapStep {
 /// Whether to advise an unmap. `request` is what would be sent, and
 /// `mappings` what the node holds.
 ///
-/// Unmapping is not free: the folder stops syncing, forgets what it agreed
-/// and is excluded. So it is advised only when the request would be taken
+/// Unmapping is not free: the folder stops syncing, and forgets what it
+/// agreed. So it is advised only when the request would be taken
 /// once the folder was unmapped, which is asked of the node's own check
 /// (`cordelia_api::sync::check_mapping`) with the folder's mapping left
 /// out. A request that would be refused anyway is sent, and the node says
@@ -2294,16 +2256,6 @@ fn declared_mappings(settings: &serde_json::Value) -> Vec<(String, String)> {
         .into_iter()
         .flatten()
         .map(|m| (text(&m["folder"]), text(&m["name"])))
-        .collect()
-}
-
-/// The exclude list in `settings`.
-fn excluded_projects(settings: &serde_json::Value) -> Vec<String> {
-    settings["exclude"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.as_str().map(String::from))
         .collect()
 }
 
@@ -2743,6 +2695,12 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
 
+    // What is no more is refused here, before anything is sent, and
+    // before the node is asked anything at all (decision 2026-10-04
+    // §10.1).
+    if let Some(no_more) = refused_before_sending(&what) {
+        anyhow::bail!("{no_more}");
+    }
     // A node goes on running the version it was started as until it is
     // restarted, and a node of another version may take a request and
     // mean something else by it. So a command that changes anything is
@@ -2760,11 +2718,12 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     match what {
         SyncCommand::Claude {
             dir,
-            all,
             mapped_only,
-            exclude,
             no_home,
             reset,
+            // Refused above, where either was given.
+            all: _,
+            exclude: _,
         } => {
             let mut body = serde_json::json!({ "enabled": true, "reset": reset });
             if let Some(dir) = dir {
@@ -2775,23 +2734,23 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     .to_string()
                     .into();
             }
-            if all || mapped_only {
-                body["all"] = all.into();
+            // The only scope there is: sent as it always was, for a node
+            // to store.
+            if mapped_only {
+                body["all"] = false.into();
             }
             if no_home {
                 body["home"] = false.into();
             }
             // Nothing changes silently: say what this run changed.
             let before = api_post(config_path, "/api/v1/sync/status", serde_json::json!({}))?;
-            if !exclude.is_empty() {
-                let stored = excluded_projects(&before);
-                body["exclude"] =
-                    serde_json::json!(exclude_list_to_send(&exclude, &stored, reset)?);
-            }
             let after = set(body)?;
             since = after["generation"].as_u64();
             for line in setting_changes(&before, &after) {
                 println!("{line}");
+            }
+            if mapped_only {
+                println!("{ONLY_MAPPED_FOLDERS_SYNC}");
             }
             println!();
         }
@@ -3031,12 +2990,6 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 short_path(mapped),
                 sync_label(name)
             );
-            if settings["all"].as_bool() == Some(true) {
-                println!(
-                    "This device syncs everything it finds; this folder now stays out until \
-                     it is mapped again."
-                );
-            }
             println!();
         }
         SyncCommand::Off => {
@@ -3057,10 +3010,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             };
             let before = sync_settings(config_path)?;
             let after = if on && mapped_as(&before).is_none() {
-                // On maps it, so that it syncs whichever scope this device
-                // uses: under the name it last had here, so that off and
-                // on again leaves it in the channel it was in. Mapping it
-                // is also what turns the setting on, in one step.
+                // On maps it: under the name it last had here, so that
+                // off and on again leaves it in the channel it was in.
+                // Mapping it is also what turns the setting on, in one
+                // step.
                 let name = before["home_name"].as_str().unwrap_or(HOME_NAME);
                 api_post(
                     config_path,
@@ -3096,70 +3049,34 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        SyncCommand::Exclude { project } => {
-            let typed = project;
-            let project = exclusion(&typed)?;
-            let settings = sync_settings(config_path)?;
-            let mappings = declared_mappings(&settings);
-            if let Some((folder, name)) = mapping_in_the_way(&mappings, &project, &typed) {
-                anyhow::bail!(
-                    "{} is mapped on this device. To stop syncing it: cordelia sync unmap {}",
-                    short_path(folder),
-                    shell_word(name)
-                );
-            }
-            let mut exclude = excluded_projects(&settings);
-            if !exclude.contains(&project) {
-                exclude.push(project.clone());
-            }
-            set(serde_json::json!({ "enabled": true, "exclude": exclude }))?;
-            println!("Not synced from this device: {}", short_path(&project));
-            return Ok(());
-        }
-        SyncCommand::Include { project } => {
-            let project = exclusion(&project)?;
-            let settings = sync_settings(config_path)?;
-            let mut exclude = excluded_projects(&settings);
-            exclude.retain(|e| *e != project);
-            set(serde_json::json!({ "enabled": true, "exclude": exclude }))?;
-            if settings["all"].as_bool() == Some(true) {
-                println!("Synced from this device again: {}", short_path(&project));
-            } else {
-                println!(
-                    "No longer excluded: {}. Only mapped folders sync on this device: \
-                     `cordelia sync map <folder>` syncs it.",
-                    short_path(&project)
-                );
-            }
-            return Ok(());
-        }
+        // Refused above, before anything was sent.
+        SyncCommand::Exclude { .. } | SyncCommand::Include { .. } => return Ok(()),
     }
     print_sync_scope(config_path, since)
 }
 
-/// What `cordelia sync exclude` and `include` are given, as the exclude
-/// list stores it: a folder as the real path of the repository it is in;
-/// or a project's name, which is the name it is found under. A remote that
-/// is pasted (`https://...`, `git@host:...`) is taken for the name it
-/// gives. Anything else is a name or a prefix, cleaned as the node cleans
-/// one, with no space round it: what is typed and is no folder on disk is
-/// not a folder whose name ends in a space. It is an error if nothing is
-/// left.
-fn exclusion(given: &str) -> anyhow::Result<String> {
-    let looks_like_a_path = given.starts_with(['/', '~', '.']);
-    let typed = given.trim();
-    let as_stored = match std::fs::canonicalize(config::expand_tilde(given)) {
-        Ok(real) if looks_like_a_path => Some(
-            cordelia_sync::discover::memory_root(&real)
-                .display()
-                .to_string(),
-        ),
-        _ => cordelia_sync::discover::normalize_remote(typed)
-            .or_else(|| cordelia_api::sync::clean_exclusion(typed)),
-    };
-    as_stored.ok_or_else(|| {
-        anyhow::anyhow!("{given:?} is not a project's name, a prefix ending in *, or a folder")
-    })
+/// What `--mapped-only` says: it is taken, and changes nothing that syncs.
+const ONLY_MAPPED_FOLDERS_SYNC: &str = "Only mapped folders sync: that is the only scope there is.";
+
+/// What is said in the place of an exclusion, where one is asked for.
+const NOTHING_LEFT_TO_EXCLUDE: &str = "there is nothing left to exclude: only mapped folders \
+    sync, and nothing was changed. To stop a mapped folder syncing: cordelia sync unmap \
+    <folder>. To sync one: cordelia sync map <folder>.";
+
+/// What a `sync` command asks for that is no more, where it does
+/// (decision 2026-10-04 §10.1): the words it is refused with, before
+/// anything is sent to the node. Everything found no longer syncs, so
+/// `--all` is refused; and with nothing synced that is not mapped, there
+/// is nothing to exclude or to include.
+fn refused_before_sending(what: &SyncCommand) -> Option<&'static str> {
+    match what {
+        SyncCommand::Claude { all: true, .. } => {
+            Some(cordelia_api::sync::EVERYTHING_FOUND_IS_REFUSED)
+        }
+        SyncCommand::Claude { exclude, .. } if !exclude.is_empty() => Some(NOTHING_LEFT_TO_EXCLUDE),
+        SyncCommand::Exclude { .. } | SyncCommand::Include { .. } => Some(NOTHING_LEFT_TO_EXCLUDE),
+        _ => None,
+    }
 }
 
 /// What a run of `cordelia sync claude` changed, one line each, from the
@@ -3181,15 +3098,6 @@ fn setting_changes(before: &serde_json::Value, after: &serde_json::Value) -> Vec
         });
     }
 
-    let all = |v: &serde_json::Value| v["all"].as_bool() == Some(true);
-    if all(after) != all(before) {
-        out.push(if all(after) {
-            "Scope: everything found (was mapped folders only).".to_string()
-        } else {
-            "Scope: mapped folders only (was everything found).".to_string()
-        });
-    }
-
     let home = |v: &serde_json::Value| v["home"].as_bool() != Some(false);
     if home(after) != home(before) {
         out.push(if home(after) {
@@ -3197,22 +3105,6 @@ fn setting_changes(before: &serde_json::Value, after: &serde_json::Value) -> Vec
         } else {
             "Home memory: kept off this device.".to_string()
         });
-    }
-
-    let (excluded, was_excluded) = (excluded_projects(after), excluded_projects(before));
-    if excluded != was_excluded {
-        let list = |l: &[String]| {
-            if l.is_empty() {
-                "nothing".to_string()
-            } else {
-                l.join(", ")
-            }
-        };
-        out.push(format!(
-            "Excluded: {} (was {}).",
-            list(&excluded),
-            list(&was_excluded)
-        ));
     }
 
     let mapped = declared_mappings(after);
@@ -3358,7 +3250,6 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
 
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
     let list = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
-    let all = resp["all"].as_bool() == Some(true);
 
     println!(
         "Syncing Claude Code memory in {}",
@@ -3417,13 +3308,6 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
             println!("  conflict to merge: {}", short_path(&text(&c)));
         }
     }
-    let excluded: Vec<String> = list(&report["excluded"])
-        .iter()
-        .map(|e| sync_label(&text(e)))
-        .collect();
-    if !excluded.is_empty() {
-        println!("  Excluded on this device: {}", excluded.join(", "));
-    }
 
     // What the other devices sync is marked where it was found here, and
     // listed on its own only when it was not.
@@ -3458,7 +3342,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
                     }
                     Some(name) if !mappable => (
                         name.to_string(),
-                        "outside your home directory: only --all syncs it".to_string(),
+                        "outside your home directory: it cannot be mapped".to_string(),
                     ),
                     Some(name) => (
                         name.to_string(),
@@ -3517,17 +3401,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
     }
 
     println!();
-    if all {
-        println!(
-            "Scope: everything found (home memory and git projects), now and later. \
-             `cordelia sync claude --mapped-only` limits it to mapped folders."
-        );
-    } else {
-        println!(
-            "Scope: mapped folders only. `cordelia sync claude --all` syncs everything \
-             found (home memory and git projects), now and later."
-        );
-    }
+    println!("Only mapped folders sync. `cordelia sync map <folder>` syncs one.");
     for e in list(&report["errors"]) {
         println!("error: {}", text(&e));
     }
@@ -3907,28 +3781,80 @@ mod tests {
         );
         assert_eq!(setting_changes(&on, &on), ["No settings changed."]);
 
-        let wider = settings(serde_json::json!({ "enabled": true, "dir": "/srv/other",
+        // The scope that a node says, and the list of exclusions that it
+        // stores, are no setting of the command's: nothing is said of
+        // either.
+        let other = settings(serde_json::json!({ "enabled": true, "dir": "/srv/other",
             "all": true, "home": false, "exclude": ["github.com/o/x"],
             "mappings": [{ "folder": "/srv/notes", "name": "lab-notes" }] }));
         assert_eq!(
-            setting_changes(&on, &wider),
+            setting_changes(&on, &other),
             [
                 "Claude Code directory: /srv/other (was /srv/claude).",
-                "Scope: everything found (was mapped folders only).",
                 "Home memory: kept off this device.",
-                "Excluded: github.com/o/x (was nothing).",
             ]
         );
         assert_eq!(
-            setting_changes(&wider, &on),
+            setting_changes(&other, &on),
             [
                 "Claude Code directory: /srv/claude (was /srv/other).",
-                "Scope: mapped folders only (was everything found).",
                 "Home memory: no longer kept off this device.",
-                "Excluded: nothing (was github.com/o/x).",
                 "Unmapped: /srv/notes (lab-notes).",
             ]
         );
+    }
+
+    /// What is no more is refused by the command, before anything is sent
+    /// (decision 2026-10-04 §10.1): `--all`, with whatever beside it;
+    /// `--exclude`; and `exclude` and `include`, each with what to do
+    /// instead. `--mapped-only` is taken, and so is everything else.
+    #[test]
+    fn test_what_is_no_more_is_refused_before_anything_is_sent() {
+        use clap::Parser;
+        let asked = |args: &[&str]| -> Option<&'static str> {
+            let line = [&["cordelia", "sync"], args].concat();
+            match super::Cli::parse_from(line).command {
+                Some(super::Commands::Sync { what }) => refused_before_sending(&what),
+                _ => panic!("{args:?} is no sync command"),
+            }
+        };
+        for everything in [
+            &["claude", "--all"][..],
+            &["claude", "--all", "--dir", "/srv/claude"],
+            &["claude", "--all", "--reset"],
+            &["claude", "--all", "--no-home"],
+            &["claude", "--all", "--exclude", "x"],
+        ] {
+            let said = asked(everything).unwrap_or_else(|| panic!("{everything:?} is sent"));
+            assert!(said.contains("only mapped folders sync"), "{said}");
+            assert!(said.contains("nothing was changed"), "{said}");
+            assert!(said.contains("cordelia sync map <folder>"), "{said}");
+        }
+        for exclusion in [
+            &["claude", "--exclude", "github.com/client-co/app"][..],
+            &["claude", "--exclude", "a", "--exclude", "b", "--reset"],
+            &["exclude", "github.com/client-co/app"],
+            &["include", "github.com/client-co/app"],
+        ] {
+            let said = asked(exclusion).unwrap_or_else(|| panic!("{exclusion:?} is sent"));
+            assert!(said.contains("nothing left to exclude"), "{said}");
+            assert!(said.contains("cordelia sync unmap <folder>"), "{said}");
+            assert!(said.contains("cordelia sync map <folder>"), "{said}");
+        }
+        for sent in [
+            &["claude"][..],
+            &["claude", "--mapped-only"],
+            &["claude", "--dir", "/srv/claude", "--no-home", "--reset"],
+            &["map", "/srv/notes", "lab"],
+            &["unmap", "lab"],
+            &["home", "on"],
+            &["home", "off"],
+            &["off"],
+            &["status"],
+        ] {
+            assert_eq!(asked(sent), None, "{sent:?}");
+        }
+        assert!(ONLY_MAPPED_FOLDERS_SYNC.contains("the only scope there is"));
     }
 
     #[test]
@@ -4289,123 +4215,6 @@ mod tests {
         for word in ["other", "/home/sam/a", "", "team/", "old.git/", " team/ "] {
             assert_eq!(mapping_named(&mappings, word), None, "{word:?}");
         }
-    }
-
-    /// An exclusion is refused for a mapping whose name or folder is what
-    /// would be stored, and for one the word as typed names: a name that
-    /// an earlier version stored with `.git` is not what the exclusion is
-    /// stored as, and is still in the way.
-    #[test]
-    fn test_a_mapping_stands_in_the_way_of_an_exclusion() {
-        let pair = |folder: &str, name: &str| (folder.to_string(), name.to_string());
-        let mappings = [pair("/home/sam/a", "team"), pair("/home/sam/b", "old.git")];
-        for (typed, folder) in [
-            ("team", Some("/home/sam/a")),
-            ("Team.git", Some("/home/sam/a")),
-            ("/home/sam/a", Some("/home/sam/a")),
-            // Stored as `old`, which is no mapping's name: found by the
-            // word as typed.
-            ("old.git", Some("/home/sam/b")),
-            ("OLD.GIT", Some("/home/sam/b")),
-            ("old", None),
-            ("github.com/o/r", None),
-        ] {
-            let project = cordelia_api::sync::clean_exclusion(typed).unwrap();
-            let found = mapping_in_the_way(&mappings, &project, typed).map(|(f, _)| f.as_str());
-            assert_eq!(found, folder, "{typed:?}");
-        }
-    }
-
-    /// What `exclude` and `include` take: a project's name as it is found
-    /// (a pasted remote gives it), a prefix, or a folder, each as the
-    /// exclude list stores it. Nothing is an error, not an empty entry.
-    #[test]
-    fn test_what_exclude_and_include_take() {
-        for (given, stored) in [
-            ("github.com/Client-Co/App.git", "github.com/client-co/app"),
-            ("github.com/client-co/app/", "github.com/client-co/app"),
-            (
-                "https://github.com/Client-Co/App.git",
-                "github.com/client-co/app",
-            ),
-            (
-                "git@github.com:client-co/app.GIT",
-                "github.com/client-co/app",
-            ),
-            ("Client-Co/*", "client-co/*"),
-            ("X.GIT", "x"),
-            // A folder that is not there, spelled as the node spells one.
-            ("/cordelia-test-not-there//x/", "/cordelia-test-not-there/x"),
-            // What is typed and is no folder on disk has no space round
-            // it: it is not taken for a folder whose name ends in one.
-            ("/cordelia-test-not-there/x ", "/cordelia-test-not-there/x"),
-            (" client-co/app ", "client-co/app"),
-        ] {
-            assert_eq!(exclusion(given).unwrap(), stored, "{given:?}");
-        }
-        for nothing in [".GIT", "  ", ""] {
-            assert!(exclusion(nothing).is_err(), "{nothing:?}");
-        }
-        // A folder that is on disk, and whose name does end in a space, is
-        // taken as it is. (It is made a repository of its own, so that it
-        // is the folder Claude Code keeps memory for wherever the test's
-        // temporary directory happens to be.)
-        let dir = tempfile::tempdir().unwrap();
-        let odd = dir.path().canonicalize().unwrap().join("odd ");
-        std::fs::create_dir(&odd).unwrap();
-        let made = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&odd)
-            .args(["init", "-q"])
-            .status()
-            .unwrap();
-        assert!(made.success());
-        let given = odd.display().to_string();
-        assert_eq!(exclusion(&given).unwrap(), given);
-    }
-
-    /// `cordelia sync claude --exclude` replaces the names in the exclude
-    /// list and keeps the folders in it. A folder is there because it was
-    /// unmapped, and it stays out of what `--all` finds until it is mapped
-    /// again or included, whatever names are then excluded.
-    #[test]
-    fn test_what_the_exclude_option_sends() {
-        let list =
-            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
-        let stored = list(&[
-            "old-name",
-            "/cordelia-test-not-there/notes",
-            "client-co/*",
-            "/cordelia-test-not-there/odd ",
-        ]);
-        let typed = list(&["Team.GIT", "https://github.com/Client-Co/App.git", "team"]);
-        // Each typed as `exclude` takes it, once; then the folders, as
-        // they are stored. The names that were stored go.
-        assert_eq!(
-            exclude_list_to_send(&typed, &stored, false).unwrap(),
-            list(&[
-                "team",
-                "github.com/client-co/app",
-                "/cordelia-test-not-there/notes",
-                "/cordelia-test-not-there/odd ",
-            ])
-        );
-        // A folder that is typed and is already there is there once.
-        let typed_folder = list(&["/cordelia-test-not-there/notes"]);
-        assert_eq!(
-            exclude_list_to_send(&typed_folder, &stored, false).unwrap(),
-            list(&[
-                "/cordelia-test-not-there/notes",
-                "/cordelia-test-not-there/odd "
-            ])
-        );
-        // With a reset nothing of the stored list is kept.
-        assert_eq!(
-            exclude_list_to_send(&typed, &stored, true).unwrap(),
-            list(&["team", "github.com/client-co/app"])
-        );
-        // What leaves nothing is refused, and does not empty the list.
-        assert!(exclude_list_to_send(&list(&["x", " .GIT.git"]), &stored, false).is_err());
     }
 
     /// `cordelia sync unmap <folder>` means the mapping of that folder

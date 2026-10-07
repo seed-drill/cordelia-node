@@ -389,9 +389,8 @@ fn map(d: &Device, folder: &Path, name: &str) {
 
 /// Remove a mapping on a device, as `cordelia sync unmap` does, through
 /// the node's own handler: the folder forgets what it had agreed with its
-/// channel, and is also excluded, so nothing picks it up under another
-/// name. The device says no longer that it syncs the name, and holds it
-/// no more.
+/// channel. The device says no longer that it syncs the name, and holds
+/// it no more.
 fn unmap(d: &Device, folder: &Path) {
     let request = cordelia_api::types::SyncUnmapRequest {
         folder: folder.display().to_string(),

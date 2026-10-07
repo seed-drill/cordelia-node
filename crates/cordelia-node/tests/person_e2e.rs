@@ -3016,14 +3016,13 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 
     // Each command that changes something: refused, with the note, and
     // the node is asked for nothing but its version.
-    let changes: [&[&str]; 16] = [
+    let changes: [&[&str]; 15] = [
         &["sync", "claude"],
         &["sync", "claude", "--mapped-only"],
         &["sync", "map", folder, "notes"],
         &["sync", "unmap", "notes"],
         &["sync", "home", "on"],
-        &["sync", "exclude", "github.com/someone/something"],
-        &["sync", "include", "github.com/someone/something"],
+        &["sync", "home", "off"],
         &["restore", "an-id"],
         &["history", "drop", "--all"],
         &["init", "--new-key"],
@@ -3057,6 +3056,34 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     assert_eq!(text(&look(&laptop), "state"), "no_phrase");
     let settings = laptop.post("/api/v1/sync/status", json!({}));
     assert_eq!(settings["enabled"], true, "{settings}");
+
+    // What is no more is refused before the node is asked anything at
+    // all, its version included (decision 2026-10-04 §10.1): whatever
+    // version the node is, nothing is sent to it.
+    let no_more: [&[&str]; 4] = [
+        &["sync", "claude", "--all"],
+        &[
+            "sync",
+            "claude",
+            "--exclude",
+            "github.com/someone/something",
+        ],
+        &["sync", "exclude", "github.com/someone/something"],
+        &["sync", "include", "github.com/someone/something"],
+    ];
+    for args in no_more {
+        let before = another.asked().len();
+        let said = laptop
+            .at_terminal_through(another.port, args)
+            .refused_within(soon);
+        assert!(
+            said.contains("only mapped folders sync"),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("nothing was changed"), "{args:?}: {said}");
+        assert!(!said.contains(note), "{args:?}: {said}");
+        assert_eq!(another.asked().len(), before, "{args:?} asked the node");
+    }
 
     // What only shows is answered, with the note.
     let shows: [&[&str]; 5] = [

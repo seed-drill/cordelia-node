@@ -1821,7 +1821,7 @@ fn claude_memory_syncs_between_two_machines() {
         "cordelia sync map ~ --home",
         "cordelia sync map ~/Work/cordelia-node",
         "cordelia sync map ~/notes <name>",
-        "Scope: mapped folders only.",
+        "Only mapped folders sync.",
     ] {
         assert!(
             found.contains(expected),
@@ -2031,66 +2031,75 @@ fn claude_memory_syncs_between_two_machines() {
     assert_eq!(project["failed_more"], 0, "{snapshot}");
 
     // One setting changes at a time; the others stay as they were. Turning
-    // home memory off unmaps it; a mapped folder is unmapped, not excluded.
+    // home memory off unmaps it.
     a.cli(&["sync", "home", "off"]);
-    a.cli(&["sync", "exclude", "github.com/Client-Co/App.git"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], false, "{s}");
     assert_eq!(mapped_names(&s), [PROJECT, "lab-notes"], "{s}");
-    assert_eq!(
-        s["sync"]["exclude"],
-        serde_json::json!(["github.com/client-co/app"])
-    );
     assert_eq!(s["sync"]["enabled"], true);
-    let said = a.refused(&["sync", "exclude", "lab-notes"]);
-    assert!(said.contains("cordelia sync unmap lab-notes"), "{said}");
-    a.cli(&["sync", "include", "github.com/client-co/app"]);
-    // A name has one spelling, so what excludes a project includes it
-    // again, typed the same way: with its ending in capitals too, and
-    // whichever command stored it.
-    let exclude_by: [&[&str]; 2] = [
-        &["sync", "exclude", "Client-Co/App.GIT"],
-        &["sync", "claude", "--exclude", "Client-Co/App.GIT"],
-    ];
-    for exclude in exclude_by {
-        a.cli(exclude);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!(["client-co/app"]),
-            "{exclude:?}"
-        );
-        a.cli(&["sync", "include", "Client-Co/App.GIT"]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!([]),
-            "{exclude:?}"
-        );
-    }
-    // A remote that is pasted is the name the project is found under,
-    // and what is left of nothing is refused, not stored.
-    for remote in [
-        "https://github.com/Client-Co/App.git",
-        "git@github.com:client-co/app.GIT",
+
+    // What is no more is refused, with what to do instead, and changes
+    // nothing: everything found does not sync, and there is nothing left
+    // to exclude (decision 2026-10-04 §10.1).
+    let generation = a.post("/api/v1/sync/status", serde_json::json!({}))["generation"].clone();
+    let dir = path(&a.home().join(".claude"));
+    for everything in [
+        &["sync", "claude", "--all"][..],
+        &["sync", "claude", "--all", "--dir", &dir],
+        &["sync", "claude", "--all", "--reset"],
+        &["sync", "claude", "--all", "--no-home"],
     ] {
-        a.cli(&["sync", "exclude", remote]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!(["github.com/client-co/app"]),
-            "{remote}"
-        );
-        a.cli(&["sync", "include", remote]);
-        assert_eq!(
-            state(&a)["sync"]["exclude"],
-            serde_json::json!([]),
-            "{remote}"
-        );
+        let said = a.refused(everything);
+        assert!(said.contains("only mapped folders sync"), "{said}");
+        assert!(said.contains("cordelia sync map <folder>"), "{said}");
     }
-    let said = a.refused(&["sync", "exclude", ".GIT"]);
-    assert!(said.contains("is not a project's name"), "{said}");
+    for exclusion in [
+        &["sync", "exclude", "github.com/Client-Co/App.git"][..],
+        &["sync", "exclude", "lab-notes"],
+        &["sync", "include", "github.com/client-co/app"],
+        &["sync", "claude", "--exclude", "Client-Co/App.GIT"],
+    ] {
+        let said = a.refused(exclusion);
+        assert!(said.contains("nothing left to exclude"), "{said}");
+        assert!(said.contains("cordelia sync unmap <folder>"), "{said}");
+    }
+    let s = state(&a);
+    assert_eq!(s["sync"]["all"], false, "{s}");
+    assert_eq!(s["sync"]["exclude"], serde_json::json!([]), "{s}");
+    assert_eq!(s["sync"]["home"], false, "{s}");
+    assert_eq!(mapped_names(&s), [PROJECT, "lab-notes"], "{s}");
+    let after = a.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(after["generation"], generation, "nothing was sent: {after}");
+    // The node refuses the same, from whoever asks it: a panel that is
+    // not yet brought up to date. Nothing is changed, and no change is
+    // counted.
+    let asks: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut answer = asks
+        .post(&format!("http://127.0.0.1:{}/api/v1/sync/claude", a.http))
+        .header("Authorization", &format!("Bearer {}", a.token()))
+        .send_json(serde_json::json!({ "enabled": true, "all": true, "home": true }))
+        .unwrap();
+    assert_eq!(answer.status().as_u16(), 400);
+    let asked: serde_json::Value = answer.body_mut().read_json().unwrap();
+    let refused = asked["error"]["message"].as_str().unwrap_or_default();
+    assert!(refused.contains("only mapped folders sync"), "{asked}");
+    let after = a.post("/api/v1/sync/status", serde_json::json!({}));
+    assert_eq!(after["generation"], generation, "{after}");
+    assert_eq!(after["home"], false, "{after}");
+    // `--mapped-only` is taken, and says that it is the only scope.
+    let out = a.cli(&["sync", "claude", "--mapped-only"]);
+    assert!(out.starts_with("No settings changed.\n"), "{out}");
+    assert!(
+        out.contains("Only mapped folders sync: that is the only scope there is."),
+        "{out}"
+    );
     a.cli(&["sync", "home", "on"]);
     let s = state(&a);
     assert_eq!(s["sync"]["home"], true, "{s}");
-    assert_eq!(s["sync"]["exclude"], serde_json::json!([]));
     assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
 
     // Turning sync on again changes nothing: not the directory (which is
@@ -2126,23 +2135,9 @@ fn claude_memory_syncs_between_two_machines() {
     );
     let said = a.refused(&["sync", "unmap", "lab-notes"]);
     assert!(said.contains("not mapped on this device"), "{said}");
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!([path(&a_notes)]),
-        "an unmapped folder stays out until it is mapped again"
-    );
-    // `--exclude` replaces the names in the list and keeps a folder that
-    // was unmapped, and `include` of the name leaves the folder too.
-    a.cli(&["sync", "claude", "--exclude", "Client-Co/App.GIT"]);
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!(["client-co/app", path(&a_notes)])
-    );
-    a.cli(&["sync", "include", "client-co/app"]);
-    assert_eq!(
-        state(&a)["sync"]["exclude"],
-        serde_json::json!([path(&a_notes)])
-    );
+    // An unmapped folder does not sync, and needs no exclusion to stay
+    // out: nothing is written of it.
+    assert_eq!(state(&a)["sync"]["exclude"], serde_json::json!([]));
     a.cli(&["sync", "unmap", &path(&sub)]);
     assert_eq!(mapped_names(&state(&a)), ["~"]);
     a.cli(&["sync", "map", &path(&a_repo)]);

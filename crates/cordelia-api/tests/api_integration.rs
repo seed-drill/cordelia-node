@@ -1439,10 +1439,9 @@ async fn test_sync_turned_on_syncs_nothing_until_mapped() {
     );
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["mappings"], json!([]));
-    // An unmapped folder is excluded, so a device that syncs everything it
-    // finds does not pick it up again under another name. Mapping it again
-    // ends the exclusion.
-    assert_eq!(body["exclude"], json!([app_dir]));
+    // An unmapped folder does not sync, and nothing is written of it to
+    // the list of exclusions. Nor does mapping it again write there.
+    assert_eq!(body["exclude"], json!([]));
     let (_, body) = sync_post!(
         &app,
         "/api/v1/sync/map",
@@ -1533,9 +1532,9 @@ async fn test_sync_settings_survive_being_turned_on_again() {
     assert_eq!(body["home"], false);
     assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
 
-    // Home memory turned off is off however it was on: not found by
-    // `all`, and no longer mapped. (The node's own home directory is the
-    // only folder that maps as `~`.)
+    // Home memory turned off is off: the home directory is mapped no
+    // longer. (The node's own home directory is the only folder that maps
+    // as `~`.)
     let (code, body) = sync_post!(
         &app,
         "/api/v1/sync/map",
@@ -1563,15 +1562,32 @@ async fn test_sync_settings_survive_being_turned_on_again() {
         json!([{ "folder": app_dir, "name": "app" }])
     );
 
-    // Reset puts the scope, home and exclude settings back to the
-    // defaults. Mappings stay: they are removed one at a time.
+    // A request that asks for everything found to sync is refused, and
+    // changes nothing: only mapped folders sync.
+    let (code, body) = sync_post!(
+        &app,
+        "/api/v1/sync/claude",
+        json!({ "enabled": true, "all": true })
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(
+        body.to_string().contains("only mapped folders sync"),
+        "{body}"
+    );
+
+    // Reset puts the Claude Code directory back to its default, and
+    // leaves the rest: the list of exclusions that is stored, the switch
+    // for home memory, and the mappings, which are removed one at a time.
     let (_, body) = sync_post!(
         &app,
         "/api/v1/sync/claude",
         json!({ "enabled": true, "dir": "/srv/claude", "reset": true })
     );
-    assert_eq!(body["home"], true);
-    assert_eq!(body["exclude"], json!([]));
+    assert_eq!(body["home"], false);
+    assert_eq!(
+        body["exclude"],
+        json!(["github.com/client-co/*", "github.com/o/secret"])
+    );
     assert_eq!(body["all"], false);
     assert_eq!(body["mappings"].as_array().unwrap().len(), 1);
     assert_eq!(body["dir"], "/srv/claude");

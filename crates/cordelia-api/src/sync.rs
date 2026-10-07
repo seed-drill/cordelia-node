@@ -38,10 +38,9 @@ fn store_mappings(db: &rusqlite::Connection, list: &[SyncMapping]) -> Result<(),
 
 /// The exclude list, each entry read as it would be stored now
 /// ([`clean_exclusion`]). A name is read in its one spelling: an earlier
-/// version could store one that ended in `.git`, which is read here as the
-/// name a project is found under. A folder keeps a space at the end of
-/// its name, since that is the text the adapter compares a directory
-/// with; its separators are tidied, and one with `..` in it is dropped.
+/// version could store one that ended in `.git`. A folder keeps a space
+/// at the end of its name; its separators are tidied, and one with `..`
+/// in it is dropped.
 fn exclusions(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
     let stored: Vec<String> = meta::get(db, meta::SYNC_CLAUDE_EXCLUDE)?
         .and_then(|j| serde_json::from_str(&j).ok())
@@ -97,6 +96,12 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
 /// What is stored as the scope: that only mapped folders sync. There is
 /// no other scope (decision 2026-10-04 §10.1).
 const SCOPE_OFF: &str = "off";
+
+/// What a request that asks for everything found to sync is told. The
+/// command line says the same before it sends anything.
+pub const EVERYTHING_FOUND_IS_REFUSED: &str = "syncing everything found is no more: only mapped \
+    folders sync, and nothing was changed. `cordelia sync status` lists what is found on this \
+    machine, with the command that maps each folder (`cordelia sync map <folder>`).";
 
 /// The stored scope is off whenever sync is on (decision 2026-10-04
 /// §10.1): a node writes it so when it starts with sync on, whatever was
@@ -172,20 +177,16 @@ fn clean_path(path: &str) -> Option<String> {
     })
 }
 
-/// An exclusion as it is stored: a folder (an absolute path) that is never
-/// found by `all`, or a project name or prefix in its one spelling
-/// (`cordelia_core::sync_name::tidy`), which is the spelling a project is
-/// found under. `None` for what is neither: a name of which nothing is
-/// left, or a path with `..` in it.
+/// An exclusion as it is stored, for a panel that still sends a list of
+/// them: a folder (an absolute path), or a project name or prefix in its
+/// one spelling (`cordelia_core::sync_name::tidy`). `None` for what is
+/// neither: a name of which nothing is left, or a path with `..` in it.
+/// Nothing reads the list to say what syncs (decision 2026-10-04 §10.1).
 ///
 /// A folder keeps a space at the end of its name: a folder's name can end
-/// in one, and what is stored is the text a directory is compared with.
-/// Its separators are tidied. So a list that is sent back as it was
-/// stored is stored as it was.
-///
-/// The command line uses this too, so that what `include` looks for in
-/// the list is spelled as the list spells it.
-pub fn clean_exclusion(entry: &str) -> Option<String> {
+/// in one. Its separators are tidied. So a list that is sent back as it
+/// was stored is stored as it was.
+fn clean_exclusion(entry: &str) -> Option<String> {
     if entry.starts_with('/') {
         return clean_path(entry);
     }
@@ -241,10 +242,22 @@ fn forget_what_is_not_mapped(db: &rusqlite::Connection, claude_dir: &str) -> Res
 /// `home` is the home directory, when it is known.
 ///
 /// A setting that is not given keeps its stored value, so running it again
-/// changes nothing. `reset` puts the directory, scope, home and exclude
-/// settings back to their defaults (declared mappings stay). When first
-/// turned on, only declared mappings sync. Turning home memory off also
-/// unmaps the home directory, whatever name it has.
+/// changes nothing. Only declared mappings sync (decision 2026-10-04
+/// §10.1):
+///
+/// - **A request that turns sync on, or leaves it on, and asks for
+///   everything found (`all: true`) is refused whole.** Nothing is
+///   written, and no change is counted, whatever else it carries. A
+///   request that turns sync off is never refused for it.
+/// - `all: false` is taken: it is the only scope there is, and the
+///   stored scope is written off whatever is asked.
+/// - `reset` puts the Claude Code directory back to its default, and
+///   touches nothing else: declared mappings stay, and so do the stored
+///   list of exclusions and the switch for home memory.
+/// - An `exclude` list and the `home` switch are stored as they were,
+///   for a panel that still sends them: nothing reads either to say what
+///   syncs. Turning home memory off also unmaps the home directory,
+///   whatever name it has.
 pub fn set_claude(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -252,6 +265,11 @@ pub fn set_claude(
     home: Option<&std::path::Path>,
 ) -> Result<(), ApiError> {
     if body.enabled {
+        // Refused before anything is read or written, and before the
+        // change is counted: a cycle that is running goes on.
+        if body.all == Some(true) {
+            return Err(ApiError::BadRequest(EVERYTHING_FOUND_IS_REFUSED.into()));
+        }
         let stored = meta::get(db, meta::SYNC_CLAUDE_DIR)?;
         // The directory in use, or the one in use when sync was last on.
         let remembered = match &stored {
@@ -292,11 +310,8 @@ pub fn set_claude(
         let excluded_before = exclusions(db)?;
         let home_was = meta::get(db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
 
-        if body.reset {
-            meta::remove(db, meta::SYNC_CLAUDE_EXCLUDE)?;
-            meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
-            tracing::info!("sync: exclusions and the home setting reset");
-        }
+        // Stored as before, for a panel that still sends one: nothing
+        // reads the list to say what syncs.
         if let Some(exclude) = &body.exclude {
             let cleaned: Vec<String> = exclude.iter().filter_map(|e| clean_exclusion(e)).collect();
             if cleaned != excluded_before {
@@ -602,10 +617,9 @@ fn home_dir() -> Result<std::path::PathBuf, ApiError> {
 /// The folder is taken as given: the adapter syncs the Claude Code folder
 /// named after it and no other. (Claude Code keeps one memory per git
 /// repository, under its main working tree; `cordelia sync map` resolves
-/// a folder to that before calling this.) Mapping a folder ends any
-/// exclusion of it. Mapping the home directory, under any name, turns the
-/// home setting on, and that name is the one it is put back under after
-/// home memory has been turned off.
+/// a folder to that before calling this.) Mapping the home directory,
+/// under any name, turns the home setting on, and that name is the one it
+/// is put back under after home memory has been turned off.
 pub fn add_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -622,14 +636,6 @@ pub fn add_mapping(
     control.changed(db);
     if let Some(mapping) = checked {
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping added");
-        let excluded = exclusions(db)?;
-        if excluded.contains(&mapping.folder) {
-            let kept: Vec<String> = excluded
-                .into_iter()
-                .filter(|e| *e != mapping.folder)
-                .collect();
-            store_exclusions(db, &kept)?;
-        }
         if is_home_mapping(&mapping, home_dir) {
             meta::remove(db, meta::SYNC_CLAUDE_HOME)?;
             meta::set(db, meta::SYNC_CLAUDE_HOME_NAME, &mapping.name)?;
@@ -670,10 +676,9 @@ pub async fn map(
 /// Its files stay where they are, and the name stays with this person's
 /// other devices. What the folder had agreed with its channel is forgotten,
 /// so that mapped again it merges, and nothing it lost in between is sent
-/// as a delete. The folder is also excluded, so that a device set to sync
-/// everything it finds does not pick it up again under another name; it
-/// syncs again when it is mapped again. That exclusion is a narrowing like
-/// any other (see [`forget_what_is_not_mapped`]).
+/// as a delete ([`forget_what_is_not_mapped`]). Nothing else is written
+/// of it: a folder that is not mapped does not sync, and needs no
+/// exclusion to stay out (decision 2026-10-04 §10.1).
 pub fn remove_mapping(
     control: &SyncControl,
     db: &rusqlite::Connection,
@@ -690,18 +695,11 @@ pub fn remove_mapping(
         )));
     }
     control.changed(db);
-    let mut excluded = exclusions(db)?;
     for mapping in &gone {
-        if !excluded.contains(&mapping.folder) {
-            excluded.push(mapping.folder.clone());
-        }
         tracing::info!(folder = %mapping.folder, name = %mapping.name, "sync: mapping removed");
     }
-    store_exclusions(db, &excluded)?;
     store_mappings(db, &kept)?;
-    // The folder forgets, and so does whatever else is not mapped: the
-    // exclusion also keeps out anything found for the same directory (a
-    // Claude Code folder laid out by hand can name it).
+    // The folder forgets, and so does whatever else is not mapped.
     if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
         forget_what_is_not_mapped(db, &dir)?;
     }
@@ -1411,8 +1409,7 @@ mod tests {
             "sync off" => claude(s, serde_json::json!({ "enabled": false })),
             "sync left on" => claude(s, serde_json::json!({ "enabled": true })),
             "home memory off" => claude(s, serde_json::json!({ "enabled": true, "home": false })),
-            // Its first write is the list of mappings; of a folder that
-            // was unmapped, the exclusion that goes; of home, its name.
+            // Its first write is the list of mappings; of home, its name.
             "a mapping" => {
                 let body = request("/home/sam/new", "new", false);
                 add_mapping(&s.control, &s.db, &body, home)
@@ -1495,56 +1492,56 @@ mod tests {
         assert_eq!(s.control.generation(), before);
     }
 
-    /// An exclusion is stored in the one spelling a project is found
-    /// under, however it was typed and however often it is sent: the
-    /// command tidies it, the node tidies it, and the node tidies the whole
-    /// list again each time the list changes.
+    /// A list of exclusions that a panel sends is stored, each entry in
+    /// its one spelling, however it was typed and however often it is
+    /// sent: sent back as it was stored, it is stored as it was. Nothing
+    /// reads the list to say what syncs, and nothing else writes it: not
+    /// a folder that is unmapped, and not one that is mapped (decision
+    /// 2026-10-04 §10.1).
     #[test]
-    fn test_an_exclusion_has_one_spelling() {
+    fn test_a_list_of_exclusions_is_stored_as_it_is_sent() {
         let s = Settings::on();
         let typed = ["X.GIT", " Repo.git ", "client-co/*", "/home/sam//old/"];
         let stored = ["x", "repo", "client-co/*", "/home/sam/old"];
         s.claude(serde_json::json!({ "exclude": typed }));
         assert_eq!(exclusions(&s.db).unwrap(), stored);
-        // Sent again as it is stored, as `exclude` and `include` send it.
         s.claude(serde_json::json!({ "exclude": stored }));
         assert_eq!(exclusions(&s.db).unwrap(), stored);
-        // What the command looks for in the list is what the list holds:
-        // the name as typed, tidied once by the command.
         for typed in ["X.GIT", "x.git", "X", "x.git.GIT", "x .git", "x/", "X.git/"] {
-            let looked_for = cordelia_core::sync_name::tidy(typed);
-            assert_eq!(looked_for, "x", "{typed}");
             assert_eq!(clean_exclusion(typed).as_deref(), Some("x"), "{typed}");
-            assert_eq!(clean_exclusion(&looked_for).as_deref(), Some("x"));
         }
         // Nothing left is no exclusion.
         for nothing in [".git", "  ", ".GIT.git"] {
             assert_eq!(clean_exclusion(nothing), None, "{nothing:?}");
         }
         // A name an earlier version stored with `.git` at its end is read
-        // as the name a project is found under, so the command finds it.
-        // A folder keeps a space at the end of its name: it is the text
-        // a directory is compared with.
+        // in its one spelling. A folder keeps a space at the end of its
+        // name.
         let stored = r#"["x.git","owner/repo/","/home/sam/old","/home/sam/odd "]"#;
         meta::set(&s.db, meta::SYNC_CLAUDE_EXCLUDE, stored).unwrap();
+        let read = ["x", "owner/repo", "/home/sam/old", "/home/sam/odd "];
+        assert_eq!(exclusions(&s.db).unwrap(), read);
+        // A folder that is mapped, and one that is unmapped, write
+        // nothing to the list: what is stored is as it was.
+        s.map("/home/sam/old", "old");
         assert_eq!(
-            exclusions(&s.db).unwrap(),
-            ["x", "owner/repo", "/home/sam/old", "/home/sam/odd "]
+            meta::get(&s.db, meta::SYNC_CLAUDE_EXCLUDE)
+                .unwrap()
+                .as_deref(),
+            Some(stored)
         );
-        // And it is there, as it was, after a change that writes the list
-        // again.
         s.map("/home/sam/notes", "lab");
         s.unmap("lab");
-        let after = exclusions(&s.db).unwrap();
-        assert!(after.contains(&"/home/sam/odd ".to_string()), "{after:?}");
-        // The same when the whole list is sent back as it was read, which
-        // is what `exclude` and `include` do.
-        s.claude(serde_json::json!({ "exclude": after }));
-        assert_eq!(exclusions(&s.db).unwrap(), after);
+        s.unmap("old");
         assert_eq!(
-            clean_exclusion("/home/sam/odd ").as_deref(),
-            Some("/home/sam/odd ")
+            meta::get(&s.db, meta::SYNC_CLAUDE_EXCLUDE)
+                .unwrap()
+                .as_deref(),
+            Some(stored)
         );
+        // The whole list sent back as it was read is stored so.
+        s.claude(serde_json::json!({ "exclude": read }));
+        assert_eq!(exclusions(&s.db).unwrap(), read);
         // Space before a path is not part of it; `..` is not taken.
         assert_eq!(
             clean_exclusion(" /home/sam//old/").as_deref(),
@@ -1559,6 +1556,115 @@ mod tests {
             exclusions(&s.db).unwrap(),
             ["/home/sam/old", "/home/sam/notes"]
         );
+    }
+
+    /// Asking for everything found to sync is refused whole (decision
+    /// 2026-10-04 §10.1): a request that turns sync on, or leaves it on,
+    /// with `all: true` changes nothing and counts no change, alone and
+    /// with a directory, a reset, home memory turned off or a list of
+    /// exclusions beside it. A request that turns sync off is never
+    /// refused for it. `all: false` is taken.
+    #[test]
+    fn test_a_request_for_everything_found_is_refused_whole() {
+        let home = std::path::Path::new(HOME);
+        let asks = |s: &Settings, body: serde_json::Value| {
+            let body: SyncClaudeRequest = serde_json::from_value(body).unwrap();
+            set_claude(&s.control, &s.db, &body, Some(home))
+        };
+        let everything = |s: &Settings| -> Vec<(String, Option<String>)> {
+            let mut stmt =
+                s.db.prepare("SELECT key, value FROM node_meta ORDER BY key")
+                    .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        let other = "/home/sam/.claude-other";
+        for sync_on in [true, false] {
+            let s = Settings::on();
+            s.map(HOME, "team");
+            s.map("/home/sam/notes", "lab");
+            s.claude(serde_json::json!({ "exclude": ["kept-out"] }));
+            // What a cycle stored, and what the folders agreed.
+            meta::set(&s.db, meta::SYNC_CLAUDE_REPORT, r#"{"folders":[]}"#).unwrap();
+            s.agreed("/home/sam/notes");
+            if !sync_on {
+                s.claude(serde_json::json!({ "enabled": false }));
+                meta::set(&s.db, meta::SYNC_CLAUDE_REPORT, r#"{"folders":[]}"#).unwrap();
+            }
+            let (before, count) = (everything(&s), s.control.generation());
+            for with in [
+                serde_json::json!({}),
+                serde_json::json!({ "dir": other }),
+                serde_json::json!({ "reset": true }),
+                serde_json::json!({ "home": false }),
+                serde_json::json!({ "exclude": [] }),
+                serde_json::json!({ "dir": other, "reset": true, "home": false, "exclude": ["x"] }),
+            ] {
+                let mut body = with.clone();
+                body["enabled"] = true.into();
+                body["all"] = true.into();
+                let refused = asks(&s, body).unwrap_err();
+                assert!(matches!(refused, ApiError::BadRequest(_)), "{with}");
+                assert!(
+                    refused.to_string().contains("only mapped folders sync"),
+                    "{refused}"
+                );
+                assert_eq!(everything(&s), before, "{with}, sync on: {sync_on}");
+                assert_eq!(s.control.generation(), count, "{with}");
+                assert_eq!(s.remembers("/home/sam/notes"), sync_on, "{with}");
+            }
+        }
+
+        // Turning sync off is never refused for it.
+        let s = Settings::on();
+        asks(&s, serde_json::json!({ "enabled": false, "all": true })).unwrap();
+        assert_eq!(meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap(), None);
+        // And the only scope there is, is taken: with sync off, and on.
+        asks(&s, serde_json::json!({ "enabled": true, "all": false })).unwrap();
+        asks(&s, serde_json::json!({ "enabled": true, "all": false })).unwrap();
+        assert_eq!(
+            meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap().as_deref(),
+            Some(DIR)
+        );
+        assert_eq!(
+            meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap().as_deref(),
+            Some("off")
+        );
+    }
+
+    /// A reset puts the Claude Code directory back to its default, and
+    /// touches nothing else: not the list of exclusions that is stored,
+    /// not the switch for home memory, and not the mappings. The switch
+    /// is stored as it is sent: off unmaps the home directory, and on
+    /// maps nothing.
+    #[test]
+    fn test_a_reset_leaves_the_stored_exclusions_and_the_home_switch() {
+        let s = Settings::on();
+        let other = "/home/sam/.claude-other";
+        let switch = |s: &Settings| meta::get(&s.db, meta::SYNC_CLAUDE_HOME).unwrap();
+        let dir = |s: &Settings| meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap();
+        s.map(HOME, "team");
+        s.map("/home/sam/notes", "lab");
+        s.claude(serde_json::json!({ "dir": other, "exclude": ["kept-out"], "home": false }));
+        assert_eq!(s.names(), ["lab"]);
+        assert_eq!(switch(&s).as_deref(), Some("off"));
+
+        s.claude(serde_json::json!({ "reset": true, "dir": DIR }));
+        assert_eq!(dir(&s).as_deref(), Some(DIR));
+        assert_eq!(exclusions(&s.db).unwrap(), ["kept-out"]);
+        assert_eq!(switch(&s).as_deref(), Some("off"));
+        assert_eq!(s.names(), ["lab"]);
+
+        // The switch turned on is stored so, and maps nothing: `cordelia
+        // sync home on` maps the home directory.
+        s.claude(serde_json::json!({ "home": true }));
+        assert_eq!(switch(&s), None);
+        assert_eq!(s.names(), ["lab"]);
+        s.claude(serde_json::json!({ "reset": true, "dir": other }));
+        assert_eq!(switch(&s), None);
+        assert_eq!(exclusions(&s.db).unwrap(), ["kept-out"]);
     }
 
     /// Every handler counts its change, with the lock held, so that a
