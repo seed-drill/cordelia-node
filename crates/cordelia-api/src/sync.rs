@@ -1592,13 +1592,29 @@ mod tests {
         state.own_channels.fetched_from(&lab, "relay", now);
         assert!(state.own_channels.first_fetch_done(&lab, now));
 
+        // Both names were listed before the last change, as the device
+        // noted when it applied it.
+        let noted = |db: &rusqlite::Connection| -> Vec<String> {
+            let before = held_rows::names_before(db).unwrap();
+            before.into_iter().map(|before| before.name).collect()
+        };
+        {
+            let db = state.db.lock().unwrap();
+            for name in ["lab", "team"] {
+                held_rows::note_name_before(&db, name, &state.identity.public_key(), 1).unwrap();
+            }
+        }
+
         // Unmapped: said no longer, held no more, and fetched again
-        // before a folder's first cycle there.
+        // before a folder's first cycle there. Nor is it noted any more
+        // as a name that was listed before: it is not shown as one that
+        // no device lists yet, where a person stopped it on purpose.
         unmaps(&state, "lab");
         {
             let db = state.db.lock().unwrap();
             assert_eq!(held(&db), ["team"]);
             assert_eq!(said(&state, &db), ["team"]);
+            assert_eq!(noted(&db), ["team"]);
         }
         assert!(!state.own_channels.first_fetch_done(&lab, now));
 

@@ -406,6 +406,12 @@ pub fn unsay_all(
 /// §6). A record that outlived the channel's entries would say that a
 /// file was agreed which the folder has lost since, and a delete would be
 /// published for it.
+///
+/// **A name that this device stops is noted no longer as listed before**
+/// ([`note_listed_before`]): it was mapped here in the generation
+/// applied, and a person has it synced here no more. Otherwise it would
+/// be shown for 90 days as a name that no device lists yet
+/// ([`not_listed_yet`]), on the device that stopped it on purpose.
 pub fn stop(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -414,6 +420,7 @@ pub fn stop(
 ) -> Result<Option<[u8; 32]>, PersonError> {
     in_one(conn, || {
         unsay(conn, identity, name, now)?;
+        held_rows::forget_name_before(conn, name)?;
         let Some(channel) = held_rows::channel_of_name(conn, name)? else {
             return Ok(None);
         };
@@ -999,6 +1006,56 @@ mod tests {
         let now = s.tick();
         crate::leaving::forget(&s[0].conn, &s[0].identity, false, now).unwrap();
         assert!(held_rows::names_before(&s[0].conn).unwrap().is_empty());
+    }
+
+    /// A name that this device stops syncing is noted no longer as one
+    /// that was listed before the last change: it is not shown, on the
+    /// device that stopped it on purpose, as a name that no device lists
+    /// yet (decision 2026-10-04 §7.3, §8). A name that the device only
+    /// says no longer that it syncs, with sync turned off, is still
+    /// mapped here, and is shown.
+    #[test]
+    fn test_a_name_that_this_device_stops_is_not_shown_as_listed_by_no_device() {
+        let mut s = Several::of_one_person(2);
+        let now = s.tick();
+        for name in ["lab", "team"] {
+            s.hold(&[0], name);
+            say(&s[0].conn, &s[0].identity, name, now).unwrap();
+        }
+        s.meet(&[0, 1]);
+        // A change is made on device 0, which carries its own words: it
+        // lists both names in the new generation.
+        s.change(0, &[0, 1], &[]);
+        let noted = |s: &Several| -> Vec<String> {
+            let before = held_rows::names_before(&s[0].conn).unwrap();
+            before.into_iter().map(|before| before.name).collect()
+        };
+        let not_yet = |s: &Several| -> Vec<String> {
+            let not_yet = not_listed_yet(&s[0].conn).unwrap();
+            not_yet.into_iter().map(|name| name.name).collect()
+        };
+        assert_eq!(noted(&s), ["lab", "team"]);
+        assert!(not_yet(&s).is_empty());
+
+        // It stops one of them: that name is noted no longer, and shown
+        // by nothing.
+        let now = s.tick();
+        assert!(
+            stop(&s[0].conn, &s[0].identity, "lab", now)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(noted(&s), ["team"]);
+        assert!(not_yet(&s).is_empty());
+        // The other it says no longer, and holds still: no device lists
+        // it now, and it is shown.
+        assert!(unsay(&s[0].conn, &s[0].identity, "team", now).unwrap());
+        assert_eq!(not_yet(&s), ["team"]);
+        // Stopped on a device that holds it no more: the note goes all
+        // the same.
+        assert!(held_rows::drop_name(&s[0].conn, "team").unwrap());
+        assert_eq!(stop(&s[0].conn, &s[0].identity, "team", now).unwrap(), None);
+        assert!(noted(&s).is_empty());
     }
 
     /// Where a device comes to sync a name it holds it, so that its
