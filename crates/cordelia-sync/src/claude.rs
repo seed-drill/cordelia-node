@@ -4186,6 +4186,146 @@ mod tests {
         assert_eq!(kept.as_deref(), Some("mine\n"));
     }
 
+    /// **A device that signs two versions at one revision** (decision
+    /// 2026-10-04 §2.3, §7.3). A store keeps one entry of an author in a
+    /// slot at a revision, the one it took first: so one device can hold
+    /// the one version, and another the other. A folder that holds the
+    /// one keeps its text when it takes an edit that was written over the
+    /// other: the edit's chain names the other, and not what this folder
+    /// agreed. An edit written over the version that the folder holds is
+    /// taken with nothing kept.
+    #[test]
+    fn a_folder_keeps_its_text_from_an_edit_over_the_other_of_two_versions_at_one_revision() {
+        let p = Pair::new();
+        let secret = name_secret(&p.st, NAME);
+        let files = ["over-the-other.md", "over-this.md"];
+        // The other device signs a version at revision 1, of each file:
+        // this device takes it, and its folder holds it.
+        for file in files {
+            entry_at(&p.other, NAME, file, text("the one\n"), 1, Some(Vec::new()));
+        }
+        deliver(&p.other, &p.st, NAME);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (2, 0), "{report:?}");
+        // It signs another version at that revision. This device's store
+        // keeps the one it has, and the folder holds what it held.
+        for file in files {
+            let inside = Inside {
+                name: file.into(),
+                value: text("the other\n"),
+                chain: Some(Vec::new()),
+            };
+            let twin = Entry::seal(&secret, &p.other.identity, 1, &inside)
+                .unwrap()
+                .check()
+                .unwrap();
+            let db = p.st.db.lock().unwrap();
+            let taken = take::take(&db, &p.st.identity, &twin, now()).unwrap();
+            let held_already = stored::Outcome::AlreadyHeld;
+            assert!(
+                matches!(taken, take::Taken::Own { stored: s, .. } if s == held_already),
+                "{taken:?}"
+            );
+        }
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.published), (0, 0), "{report:?}");
+        for file in files {
+            assert_eq!(p.read(file).as_deref(), Some("the one\n"));
+        }
+
+        // An edit that was written over the other: its chain names the
+        // other, as that device signed it. And an edit that was written
+        // over the version this folder holds.
+        let over = |said: &str| Some(vec![link(Some(said), &p.other)]);
+        let edit = text("an edit\n");
+        entry_at(
+            &p.other,
+            NAME,
+            files[0],
+            edit.clone(),
+            2,
+            over("the other\n"),
+        );
+        entry_at(&p.other, NAME, files[1], edit, 2, over("the one\n"));
+        deliver(&p.other, &p.st, NAME);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (2, 1), "{report:?}");
+        // The folder's text is kept beside the first, and nothing beside
+        // the second.
+        assert_eq!(p.read(files[0]).as_deref(), Some("an edit\n"));
+        let kept = p.read("over-the-other.conflict-abcd.md");
+        assert_eq!(kept.as_deref(), Some("the one\n"));
+        assert_eq!(p.read(files[1]).as_deref(), Some("an edit\n"));
+        assert_eq!(p.read("over-this.conflict-abcd.md"), None);
+    }
+
+    /// **A folder restored from a backup, whose device then writes**
+    /// (decision 2026-10-04 §2.3, §7.3). The other device published a
+    /// file three times, and this device's folder holds the third. That
+    /// device's store is then put back as it was after its first, and it
+    /// writes from there: at the revisions it had used before, and then
+    /// above them.
+    ///
+    /// This device keeps the entries it holds at those revisions, and
+    /// takes the first that is above them. That entry says it was written
+    /// over the texts of after the backup, and over the first: the
+    /// versions that the device had published before are not in its
+    /// chain, so it is not known to follow what this folder agreed, and
+    /// the folder's text is kept beside the file.
+    #[test]
+    fn a_device_restored_from_a_backup_writes_and_another_keeps_its_text_beside_the_file() {
+        let p = Pair::new();
+        p.other_writes("notes.md", Some("first\n"));
+        let first = held(&p.other, NAME).pop().unwrap();
+        assert_eq!(first.rev, 1);
+        p.other_writes("notes.md", Some("second\n"));
+        p.other_writes("notes.md", Some("third\n"));
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 0), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("third\n"));
+        assert_eq!(p.record("notes.md").unwrap().rev, 3);
+
+        // The backup: the other device's store holds its first entry of
+        // the file, and nothing that it wrote since.
+        {
+            let db = p.other.db.lock().unwrap();
+            assert_eq!(
+                stored::remove_slot(&db, &first.channel, &first.slot).unwrap(),
+                1
+            );
+            let put_back = stored::store(&db, &first, now()).unwrap();
+            assert_eq!(put_back, stored::Outcome::Stored);
+        }
+        // It writes from there, and this device is handed each entry.
+        // The first two are at revisions at which this device holds an
+        // entry of that author: it keeps what it holds, and its folder
+        // holds what it held.
+        for (rev, said) in [(2, "again\n"), (3, "and again\n")] {
+            write(&p.other, NAME, "notes.md", text(said));
+            assert_eq!(version(&p.other, NAME, "notes.md").unwrap().1, rev);
+            deliver(&p.other, &p.st, NAME);
+            let report = p.cycle();
+            assert_eq!((report.pulled, report.conflicts), (0, 0), "{report:?}");
+            assert_eq!(p.read("notes.md").as_deref(), Some("third\n"));
+        }
+        // The next is above them: it is taken. What it says it was
+        // written over holds neither the second nor the third.
+        write(&p.other, NAME, "notes.md", text("a third time\n"));
+        let chain = said(&p.other, NAME, "notes.md").unwrap();
+        let after_the_backup = ["and again\n", "again\n", "first\n"];
+        let expected: Vec<Link> = after_the_backup
+            .iter()
+            .map(|said| link(Some(said), &p.other))
+            .collect();
+        assert_eq!(chain, expected);
+        deliver(&p.other, &p.st, NAME);
+        let report = p.cycle();
+        assert_eq!((report.pulled, report.conflicts), (1, 1), "{report:?}");
+        assert_eq!(p.read("notes.md").as_deref(), Some("a third time\n"));
+        let kept = p.read("notes.conflict-abcd.md");
+        assert_eq!(kept.as_deref(), Some("third\n"));
+    }
+
     /// Where what a file holds was to be kept before a version at a higher
     /// revision is taken, and cannot be kept, the file is left as it is:
     /// not written over, and not removed. The text is kept first, and only
