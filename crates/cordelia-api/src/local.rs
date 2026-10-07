@@ -507,6 +507,14 @@ mod tests {
         let over = format!("{most}x");
         let (status, said) = publishes(&state, Some("other.md"), json!(over)).await;
         assert_eq!(status, 400, "{said}");
+        // It is refused for the bound, in the local API's own words,
+        // before anything is read or sealed.
+        assert!(
+            said["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("may together be 60 KB")),
+            "{said}"
+        );
         let (_, held) = lists(&state).await;
         assert_eq!(held["entries"].as_array().map(Vec::len), Some(1));
     }

@@ -698,12 +698,19 @@ mod tests {
         let relay = [8u8; 32];
         kept_rows::sending(&s[0].conn, &relay, &lab).unwrap();
         assert!(kept_rows::keeps_any_anywhere(&s[0].conn, &lab).unwrap());
+        // What the store holds of the name's channel, by the channel's ID.
+        let stored_of_lab = |on: &Machine| {
+            entries::channel_entries_after(&on.conn, &lab, 0, 100_000)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(stored_of_lab(&s[0]), 1);
 
         let stopped = stop(&s[0].conn, &s[0].identity, "lab", now).unwrap();
         assert_eq!(stopped, Some(lab));
         assert!(matches!(word(&s[0], "lab"), Some((_, Value::Delete))));
         assert_eq!(held_rows::channel_of_name(&s[0].conn, "lab").unwrap(), None);
-        assert!(s[0].stored_in(&lab).is_empty());
+        assert_eq!(stored_of_lab(&s[0]), 0);
         assert!(!kept_rows::keeps_any_anywhere(&s[0].conn, &lab).unwrap());
         // The other name is as it was.
         assert_eq!(s[0].text("stays", "notes.md").as_deref(), Some("one"));

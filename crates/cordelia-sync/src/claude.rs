@@ -6241,7 +6241,10 @@ mod tests {
         let nothing: BTreeSet<String> = BTreeSet::new();
         let started = now;
         st.sync_control.changed(&st.db.lock().unwrap());
-        exchange_names(&st, &nothing, started).unwrap();
+        // Nor is the device offered the name, which only it lists: what
+        // is offered is what another device syncs.
+        let offered = exchange_names(&st, &nothing, started).unwrap();
+        assert!(offered.is_empty(), "{offered:?}");
         forget_other_folders(&st, &[], started).unwrap();
         assert_eq!((said(&st).len(), agreed(&st)), (1, 1));
         assert!(held(&st, "one"));

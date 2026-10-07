@@ -1625,6 +1625,29 @@ mod tests {
         let now = s.tick();
         let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
         assert!(seen.devices.iter().all(|device| !device.sent));
+        // So too where that word stands in the personal channel of the
+        // statement applied: device 0 says there that it applied the
+        // statement before, and sent what it carried then.
+        let of_the_one_before = entry_by(
+            &s[0].identity,
+            &s[1].personal(),
+            (3 << cordelia_core::protocol::REV_COUNT_BITS) + 1,
+            &crate::person::applied_name(&s.key(0)).unwrap(),
+            Value::Text(crate::person::applied_word(2, true)),
+            &[],
+        );
+        let now = s.tick();
+        assert_eq!(
+            take(&s[1].conn, &s[1].identity, &of_the_one_before, now).unwrap(),
+            STORED
+        );
+        let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
+        let sent: Vec<(Option<u64>, bool)> = seen
+            .devices
+            .iter()
+            .map(|device| (device.applied, device.sent))
+            .collect();
+        assert_eq!(sent, [(Some(2), false), (Some(3), false)]);
     }
 
     /// A look shows each name that a device had listed before the last
@@ -1723,8 +1746,10 @@ mod tests {
         let lab = held_rows::channel_of_name(conn, "lab").unwrap().unwrap();
         kept_rows::sent(conn, &relay, &lab, i64::MAX / 2).unwrap();
         assert_eq!(to_go(&[relay]), both(false, true));
-        // It waits at another relay still.
+        // It waits at another relay still, wherever that relay comes
+        // among those asked about.
         assert_eq!(to_go(&[relay, other_relay]), both(true, true));
+        assert_eq!(to_go(&[other_relay, relay]), both(true, true));
         // What a relay had no room for waits too.
         let held = entries::channel_entries_after(conn, &lab, 0, 1).unwrap();
         kept_rows::refused(conn, &relay, &lab, held[0].seq).unwrap();
