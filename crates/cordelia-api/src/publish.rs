@@ -1008,6 +1008,90 @@ mod tests {
         );
     }
 
+    /// **A forged chain in a twin entry** (decision 2026-10-04 §2.3). Two
+    /// entries are one version: one text at one revision, each signed by
+    /// a device that counts. One of them has a chain that claims that the
+    /// version follows a folder's text; the other, which is honest, says
+    /// nothing of that text.
+    ///
+    /// A device that holds both does not take the version as following
+    /// that text: it is known to follow only if each entry shows it. And
+    /// a device that writes over the version builds its chain from one
+    /// entry of it, with that entry's signer and that entry's chain: the
+    /// forged chain is put behind the honest signer in neither case,
+    /// whichever of the two has the lower key.
+    #[test]
+    fn test_a_forged_chain_in_a_twin_entry_is_put_behind_no_other_signer() {
+        for forger_is_lower in [true, false] {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[0, 1, 2], "notes");
+            // The device that reads and writes has the highest key: it
+            // holds no entry of the version, and the entry it writes over
+            // is the one whose signer has the lowest.
+            let mut by_key = [0, 1, 2];
+            by_key.sort_by_key(|n| s.key(*n));
+            let (low, between, writer) = (by_key[0], by_key[1], by_key[2]);
+            let (forger, honest) = match forger_is_lower {
+                true => (low, between),
+                false => (between, low),
+            };
+            let channel = s[writer].own("notes");
+            let folder = hash("what the folder holds");
+            let honest_chain = vec![link("something else", s.key(honest))];
+            let forged_chain = vec![link("what the folder holds", s.key(writer))];
+            let of = |n: usize, chain: &[Link]| {
+                entry_by(&s[n].identity, &channel, 5, "a.md", text("the same"), chain)
+            };
+            let follows_the_folder = |s: &Several| {
+                let read = read(&s[writer].conn, "notes", "a.md").unwrap();
+                read.follows(&folder)
+            };
+
+            // The honest entry alone: the version does not follow the
+            // folder's text.
+            holds(&s, writer, &of(honest, &honest_chain));
+            assert!(!follows_the_folder(&s));
+            // The twin arrives. Its chain alone would show it; held with
+            // the honest entry, the version is not known to follow.
+            holds(&s, writer, &of(forger, &forged_chain));
+            let version = s[writer].slot("notes", "a.md").current.unwrap();
+            assert_eq!(version.entries.len(), 2);
+            let counting = crate::person::who_counts(&s[writer].conn).unwrap();
+            let mut the_twin_alone = version.clone();
+            the_twin_alone
+                .entries
+                .retain(|one| one.author == s.key(forger));
+            assert!(follows(&the_twin_alone, &folder, &counting));
+            assert!(!follows(&version, &folder, &counting));
+            assert!(!follows_the_folder(&s));
+
+            // The device writes over the version: from the entry whose
+            // signer has the lowest key, with that entry's chain.
+            made(published(&mut s, writer, "a.md", text("an edit")));
+            let chain = chain_of(&s, writer, "a.md");
+            let (first, rest) = match forger_is_lower {
+                true => (s.key(forger), &forged_chain),
+                false => (s.key(honest), &honest_chain),
+            };
+            let mut expected = vec![link("the same", first)];
+            expected.extend(rest.iter().copied());
+            assert_eq!(
+                chain, expected,
+                "the forger's key is lower: {forger_is_lower}"
+            );
+            // The forged chain stands behind the honest signer in
+            // neither case.
+            let mut behind_the_honest = vec![link("the same", s.key(honest))];
+            behind_the_honest.extend(forged_chain.iter().copied());
+            assert_ne!(chain, behind_the_honest);
+            // What was written over the honest entry is not known to
+            // follow the folder's text. What was written over the twin
+            // says so through the twin's own link: a device that counts
+            // signed that.
+            assert_eq!(follows_the_folder(&s), forger_is_lower);
+        }
+    }
+
     /// A merge is written over a version: where the slot holds none there
     /// is nothing to merge with, and nothing is written.
     #[test]

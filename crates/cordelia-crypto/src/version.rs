@@ -323,6 +323,69 @@ mod tests {
         );
     }
 
+    /// **A forged chain in a twin entry** (decision 2026-10-04 §2.3). A
+    /// device that counts signs a text at the revision at which another
+    /// device signed that very text, and gives its entry a chain that
+    /// claims to follow a folder's text. The two are one version, and
+    /// each entry is given with its own signer and its own chain: what
+    /// the one says is said of the other nowhere. So the version is
+    /// known to follow the folder's text by one of its entries and not
+    /// by the other, and a chain that is written over either entry is of
+    /// that entry's signer and that entry's chain alone.
+    #[test]
+    fn a_twin_entry_with_a_forged_chain_says_nothing_for_the_other_entry() {
+        use crate::chain::written_over;
+        use crate::entry::known_to_follow;
+        let folder = named("what the folder holds");
+        let honest = Inside {
+            chain: Some(vec![link("something else", 1)]),
+            ..text(NAME, "the same text")
+        };
+        let forged = Inside {
+            chain: Some(vec![link("what the folder holds", 3)]),
+            ..honest.clone()
+        };
+        let counts = |_: &[u8; 16]| true;
+        for (honest_by, forged_by) in [(1, 2), (2, 1)] {
+            let entries = [entry(honest_by, 5, &honest), entry(forged_by, 5, &forged)];
+            for order in in_every_order(&entries) {
+                let slot = read(&order);
+                assert!(slot.lost.is_empty());
+                let version = slot.current.unwrap();
+                assert_eq!(version.entries.len(), 2);
+                let of = |n: u8| {
+                    let by = |one: &&VersionEntry| one.author == key(n);
+                    version.entries.iter().find(by).unwrap()
+                };
+                // Each entry with its own chain.
+                assert_eq!(of(honest_by).chain, honest.chain);
+                assert_eq!(of(forged_by).chain, forged.chain);
+                // The twin's chain shows the folder's text, and the
+                // honest entry's does not: the version is not known to
+                // follow it by each of its entries.
+                let shows = |n: u8| known_to_follow(of(n).chain.as_deref(), &folder, counts);
+                assert!(shows(forged_by) && !shows(honest_by));
+                // Written over the honest entry: its signer, and then
+                // its chain. Nothing of the twin's is in it.
+                let over = |n: u8| written_over(&version.value, &key(n), of(n).chain.as_deref());
+                assert_eq!(
+                    over(honest_by),
+                    [link("the same text", honest_by), link("something else", 1)]
+                );
+                assert!(!known_to_follow(Some(&over(honest_by)), &folder, counts));
+                // Written over the twin: the twin's signer, and then
+                // the twin's chain.
+                assert_eq!(
+                    over(forged_by),
+                    [
+                        link("the same text", forged_by),
+                        link("what the folder holds", 3)
+                    ]
+                );
+            }
+        }
+    }
+
     /// Two devices carried one version, or made the same edit apart: one
     /// text at one revision, in two entries that differ in who signed
     /// them, in how they were sealed and in what they say.
