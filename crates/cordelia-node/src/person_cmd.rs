@@ -85,7 +85,7 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 const ACCEPT_STAYS: Duration = Duration::from_secs(60);
 
 /// How often a mistyped phrase may be typed again at one prompt.
-pub(crate) const PHRASE_TRIES: usize = 3;
+const PHRASE_TRIES: usize = 3;
 
 /// How often the node is asked again whether it made what a command
 /// handed it, where its answer was lost: once every [`ASK_EVERY`].
@@ -1711,23 +1711,20 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
     Ok(out)
 }
 
-/// Ask for the recovery phrase, and sign and seal with it what was
-/// shown. The phrase is in this function and nowhere else: it is typed
-/// with echo off, signs the statement, seals the part of the change
-/// entry that is for it, signs the entry, and is dropped, and
-/// overwritten, as this returns.
+/// Ask for the recovery phrase at the terminal: twelve words, typed with
+/// echo off. It is the one way that a command reads a phrase.
 ///
 /// A mistyped phrase is told from a wrong one: words that are no
-/// recovery phrase fail its checksum, and may be typed again. A phrase
-/// that is one, and not the one that this device follows, makes nothing.
-fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
+/// recovery phrase fail its checksum, and may be typed again, three times
+/// in all. What is given back is overwritten when it is dropped.
+pub(crate) fn typed_phrase(at: &Terminal) -> anyhow::Result<Phrase> {
     let mut tries = 0;
-    let phrase = loop {
+    loop {
         tries += 1;
         let typed =
             at.phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
         match Phrase::parse(&typed) {
-            Ok(phrase) => break phrase,
+            Ok(phrase) => return Ok(phrase),
             Err(e) if tries < PHRASE_TRIES => {
                 let why = match e {
                     PhraseError::Checksum => {
@@ -1741,7 +1738,20 @@ fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<
             }
             Err(e) => anyhow::bail!("{e}. It was mistyped: nothing was made."),
         }
-    };
+    }
+}
+
+/// Ask for the recovery phrase, and sign and seal with it what was
+/// shown. The phrase is in this function and nowhere else: it is typed
+/// with echo off, signs the statement, seals the part of the change
+/// entry that is for it, signs the entry, and is dropped, and
+/// overwritten, as this returns.
+///
+/// A mistyped phrase is told from a wrong one: words that are no
+/// recovery phrase fail its checksum, and may be typed again. A phrase
+/// that is one, and not the one that this device follows, makes nothing.
+fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
+    let phrase = typed_phrase(at)?;
     let apart = handed.apart.as_ref().map(|(_, entry, _)| entry);
     match prepared.sign(&phrase, &handed.held, apart) {
         Ok(entry) => Ok(entry),

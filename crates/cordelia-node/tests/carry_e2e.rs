@@ -286,3 +286,360 @@ fn a_device_that_comes_to_sync_a_name_carries_it_first() {
         .collect();
     assert!(beside.is_empty(), "{beside:?}");
 }
+
+/// The first six words of the fingerprint of `n`'s key: what names a
+/// removed key at `--from`.
+fn six_words_of(n: &Node) -> String {
+    let key = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
+    cordelia_api::carry::naming_words(&key)
+}
+
+/// The copies that a folder keeps beside its files.
+fn kept_beside(memory: &Path) -> Vec<String> {
+    let mut beside: Vec<String> = std::fs::read_dir(memory)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.contains(".conflict-"))
+        .collect();
+    beside.sort();
+    beside
+}
+
+/// What a removed device wrote, and no remaining device had taken, comes
+/// in only by `cordelia sync carry <name> --from`, at a terminal, with
+/// the recovery phrase (decision 2026-10-04 §7.3). The desktop writes a
+/// new file and writes over one that the laptop holds, the relay is sent
+/// both, and the desktop is removed with no relay in reach.
+///
+/// - The plain command takes nothing of it, and says how much other keys
+///   signed.
+/// - `--from` with no key lists the removed key by the first six words of
+///   its fingerprint, and takes nothing.
+/// - With the key named it refuses without a terminal; at one, it says
+///   what it found before it asks for anything, and a phrase that is
+///   not this device's takes nothing.
+/// - With the phrase, the new file comes in, into its empty slot. The
+///   version that stands above the laptop's comes in only on the second
+///   yes, and the laptop's text is then kept beside the file.
+#[test]
+fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
+    let mut relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let (l_notes, l_mem) = notes_of(&laptop);
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(l_mem.join("first.md"), "what both hold\n").unwrap();
+    for (n, notes) in [(&laptop, &l_notes), (&desktop, &d_notes)] {
+        sync_is_turned_on(n);
+        let out = n.cli(&["sync", "map", &path(notes), "lab"]);
+        assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    }
+    wait_for(
+        "the desktop has the laptop's file",
+        &[&relay, &laptop, &desktop],
+        120,
+        || (read(&d_mem.join("first.md"))?.as_str() == "what both hold\n").then_some(()),
+    );
+
+    // The laptop is off. The desktop writes a new file, and writes over
+    // the one that both hold; the relay is sent both.
+    laptop.stop();
+    std::fs::write(d_mem.join("late.md"), "the desktop's last words\n").unwrap();
+    std::fs::write(d_mem.join("first.md"), "edited on the desktop\n").unwrap();
+    wait_for(
+        "the desktop has sent what it wrote",
+        &[&relay, &desktop],
+        120,
+        || {
+            let held = held(&desktop);
+            let late = held.iter().any(|(key, _, _)| key == "late.md");
+            let edited = held
+                .iter()
+                .any(|(key, rev, _)| key == "first.md" && *rev == 2);
+            (late && edited && has_sent_everything(&desktop).is_some()).then_some(())
+        },
+    );
+    let desktop_key = key_of(&desktop);
+    let six_words = six_words_of(&desktop);
+    desktop.stop();
+
+    // The desktop is removed, on the laptop, with no relay in reach: the
+    // laptop carries what it holds, and nothing of what the desktop
+    // wrote since.
+    relay.stop();
+    laptop.start();
+    wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
+    let mut at = removes(&laptop, &desktop_key, &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    relay.start();
+    let all = [&relay, &laptop];
+    wait_for("relay healthy again", &all, 30, || healthy(&relay));
+    wait_for("the laptop has sent what it carried", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+    let before = held(&laptop);
+    assert_eq!(before.len(), 1, "{before:?}");
+
+    // The plain command takes nothing that the removed key signed.
+    let said = laptop.cli(&["sync", "carry", "lab"]);
+    assert!(said.contains("lab: nothing to bring in"), "{said}");
+    assert!(
+        said.contains("2 entries that other keys signed were left behind"),
+        "{said}"
+    );
+    assert!(said.contains("cordelia sync carry lab --from"), "{said}");
+    assert_eq!(held(&laptop), before);
+
+    // With no key: the removed key that signed there, by its six words
+    // and the label that this device knew it by, and nothing is taken.
+    let listed = laptop.cli(&["sync", "carry", "lab", "--from"]);
+    println!("{listed}");
+    assert!(
+        listed.contains("Removed keys that signed in lab"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(&format!("({six_words}) \"desktop\": 2 entries")),
+        "{listed}"
+    );
+    assert!(listed.contains("Nothing was taken."), "{listed}");
+    assert_eq!(held(&laptop), before);
+
+    // With the key named, it asks for the phrase: not without a
+    // terminal, and a name is needed.
+    let no_terminal = laptop.refused(&["sync", "carry", "lab", "--from", "desktop"]);
+    assert!(no_terminal.contains("terminal"), "{no_terminal}");
+    let no_name = laptop.refused(&["sync", "carry", "--phrase"]);
+    assert!(no_name.contains("is for one name"), "{no_name}");
+    let both = laptop.refused(&["sync", "carry", "lab", "--from", "desktop", "--phrase"]);
+    assert!(both.contains("are two carries"), "{both}");
+    // A label that names no removed key.
+    let nobody = laptop
+        .at_terminal(&["sync", "carry", "lab", "--from", "phone"])
+        .refused();
+    assert!(nobody.contains("names no removed key"), "{nobody}");
+    assert!(nobody.contains("Nothing was taken."), "{nobody}");
+
+    // What it found is said before anything is asked. A phrase that is
+    // not this device's takes nothing.
+    let another = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("What this removed key signed in lab:")
+        .says(&format!("({six_words}) \"desktop\""))
+        .says("1 version would go into a slot where the new channel holds nothing.")
+        .says("1 version stands above a version that the new channel holds: first.md.")
+        .says("Those come in only on a second yes, which names them.")
+        .says("A device in someone else's hands may have written any of these since")
+        .says("say no unless you know it was not.")
+        .says("Bring in 1 version into the slot where the new channel holds nothing?")
+        .types("yes");
+    at.says("Also bring in 1 version above the version that the new channel holds?")
+        .says("first.md")
+        .types("no");
+    at.says("Those stay where they are.")
+        .says("The recovery phrase, twelve words")
+        .types(another);
+    let refused = at.refused();
+    assert!(
+        refused.contains("it is not the one that this device follows: nothing was taken."),
+        "{refused}"
+    );
+    assert_eq!(held(&laptop), before);
+
+    // Anything but a yes takes nothing, and asks for no phrase.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("Bring in 1 version into the slot").types("y");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert!(
+        !said.contains("The recovery phrase, twelve words"),
+        "{said}"
+    );
+    assert_eq!(held(&laptop), before);
+
+    // With the phrase: the new file comes in, into its empty slot. The
+    // version above the laptop's stays where it is without the second
+    // yes.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("Bring in 1 version into the slot").types("yes");
+    at.says("Also bring in 1 version above").types("no");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    println!("{said}");
+    assert!(
+        said.contains(
+            "lab: 1 version brought in, each as this device's own entry at the revision it had."
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("1 version left: it stands above a version that the new channel holds"),
+        "{said}"
+    );
+    wait_for("the new file is in the laptop's folder", &all, 120, || {
+        (read(&l_mem.join("late.md"))?.as_str() == "the desktop's last words\n").then_some(())
+    });
+    assert_eq!(
+        read(&l_mem.join("first.md")).as_deref(),
+        Some("what both hold\n")
+    );
+    assert!(kept_beside(&l_mem).is_empty());
+
+    // Named by its six words, with the second yes: the version comes in
+    // above the laptop's, and the laptop's text is kept beside the file.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", &six_words]);
+    at.says("0 versions would go into slots where the new channel holds nothing.")
+        .says("Also bring in 1 version above the version that the new channel holds?")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    assert!(said.contains("lab: 1 version brought in"), "{said}");
+    wait_for("the folder takes the version", &all, 120, || {
+        (read(&l_mem.join("first.md"))?.as_str() == "edited on the desktop\n").then_some(())
+    });
+    let beside = kept_beside(&l_mem);
+    assert_eq!(beside.len(), 1, "{beside:?}");
+    assert_eq!(
+        read(&l_mem.join(&beside[0])).as_deref(),
+        Some("what both hold\n")
+    );
+
+    // Run again, there is nothing more of that key's to bring.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
+    at.says("0 versions would go into slots where the new channel holds nothing.");
+    let said = at.done();
+    assert!(said.contains("Nothing was taken."), "{said}");
+    assert!(
+        !said.contains("The recovery phrase, twelve words"),
+        "{said}"
+    );
+}
+
+/// A generation whose secret a device never held is read with the
+/// recovery phrase (decision 2026-10-04 §7.3). The desktop is off
+/// through two changes. Between them the phone, which still counts,
+/// writes a file that only the relay is sent, and never returns. The
+/// desktop applies the second change directly: it left the first
+/// generation, and never held the secret of the one between. `cordelia
+/// sync carry lab` reads only the generation it left, and finds
+/// nothing. With `--phrase`, the command opens the part of the change
+/// entry that is for the phrase, reads the generation between, and the
+/// phone's file comes in.
+#[test]
+fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let mut phone = device_started("phone", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    adds(&laptop, &phone, "phone");
+    let (d_notes, d_mem) = notes_of(&desktop);
+    let (p_notes, p_mem) = notes_of(&phone);
+    std::fs::write(d_mem.join("first.md"), "what both hold\n").unwrap();
+    for (n, notes) in [(&desktop, &d_notes), (&phone, &p_notes)] {
+        sync_is_turned_on(n);
+        let out = n.cli(&["sync", "map", &path(notes), "lab"]);
+        assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    }
+    wait_for(
+        "the phone has the desktop's file",
+        &[&relay, &desktop, &phone],
+        120,
+        || (read(&p_mem.join("first.md"))?.as_str() == "what both hold\n").then_some(()),
+    );
+
+    // The desktop is off. A change is made, and the phone applies it.
+    desktop.stop();
+    let mut at = renews(&laptop, &["stays", "stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for(
+        "the phone applies change 2",
+        &[&relay, &laptop, &phone],
+        120,
+        || (change_of(&phone) == 2).then_some(()),
+    );
+    // The phone writes under it, the relay is sent it, and the phone
+    // never returns.
+    std::fs::write(p_mem.join("late.md"), "the phone's last words\n").unwrap();
+    wait_for(
+        "the phone has sent its last file",
+        &[&relay, &phone],
+        120,
+        || {
+            let sent = held(&phone).iter().any(|(key, _, _)| key == "late.md");
+            (sent && has_sent_everything(&phone).is_some()).then_some(())
+        },
+    );
+    phone.stop();
+
+    // A second change, and the desktop returns: it applies it directly.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    wait_for("the relay holds change 3", &[&relay, &laptop], 120, || {
+        has_sent_everything(&laptop)
+    });
+    desktop.start();
+    let all = [&relay, &laptop, &desktop];
+    wait_for("desktop healthy", &all, 30, || healthy(&desktop));
+    wait_for("the desktop applies change 3", &all, 120, || {
+        (change_of(&desktop) == 3).then_some(())
+    });
+    wait_for("the desktop has sent what it carried", &all, 180, || {
+        has_sent_everything(&desktop)
+    });
+    assert_eq!(read(&d_mem.join("late.md")), None);
+
+    // The plain command reads the generation that the desktop left: the
+    // phone's file is not there.
+    let said = desktop.cli(&["sync", "carry", "lab"]);
+    assert!(said.contains("lab: nothing to bring in"), "{said}");
+
+    // With the phrase: not without a terminal, and not with another's.
+    let no_terminal = desktop.refused(&["sync", "carry", "lab", "--phrase"]);
+    assert!(no_terminal.contains("terminal"), "{no_terminal}");
+    let another = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
+    at.says("the generations whose secret this device never held")
+        .says("Read those generations of lab")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(another);
+    let refused = at.refused();
+    assert!(
+        refused.contains("it is not the one that this device follows: nothing was taken."),
+        "{refused}"
+    );
+    assert_eq!(read(&d_mem.join("late.md")), None);
+
+    // With the phrase, the generation between is read, and the phone's
+    // file comes in.
+    let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
+    at.says("Read those generations of lab").types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    println!("{said}");
+    assert!(
+        said.contains(
+            "lab: 1 version brought in, each as this device's own entry at the revision it had."
+        ),
+        "{said}"
+    );
+    wait_for("the file is in the desktop's folder", &all, 120, || {
+        (read(&d_mem.join("late.md"))?.as_str() == "the phone's last words\n").then_some(())
+    });
+    // Run again, the new channel holds it.
+    let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
+    at.says("Read those generations of lab").types("yes");
+    at.says("The recovery phrase, twelve words").types(&words);
+    let said = at.done();
+    assert!(said.contains("lab: nothing to bring in"), "{said}");
+}

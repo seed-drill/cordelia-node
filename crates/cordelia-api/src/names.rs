@@ -393,6 +393,13 @@ pub fn hold_mapped(
     })
 }
 
+/// Whether a folder of this device's is mapped to `name` (decision
+/// 2026-10-04 §7.3): only there is a text that a carried version replaces
+/// kept beside its file.
+pub fn has_folder(conn: &Connection, name: &str) -> Result<bool, PersonError> {
+    Ok(mapped(conn)?.iter().any(|mapped| mapped == name))
+}
+
 /// Sync was turned off here: this device says of no name that it syncs
 /// it. Returns how many words were written over. The names stay held:
 /// their folders are still mapped.

@@ -137,7 +137,21 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
     );
     // A carry that a person asks for (decision 2026-10-04 §7.3): of one
     // name, from the generations that the device left.
-    cfg.route("/api/v1/carry", web::post().to(carrying::carry));
+    // With the recovery phrase, which the command is typed and the node
+    // never sees: what a removed key signed (`/from`), and what the
+    // command read in a generation that this device never held
+    // (`/phrase/look`, `/read`, `/handed`). What comes in by those comes
+    // in under a word that the phrase signed.
+    cfg.service(
+        web::scope("/api/v1/carry")
+            .route("", web::post().to(carrying::carry))
+            .route("/from/look", web::post().to(carrying::from_look))
+            .route("/from", web::post().to(carrying::from_take))
+            .route("/phrase/look", web::post().to(carrying::phrase_look))
+            .route("/read", web::post().to(carrying::read_proved))
+            .route("/read/part", web::post().to(carrying::read_part))
+            .route("/handed", web::post().to(carrying::handed_take)),
+    );
 
     // Sync adapters (decision 2026-09-30-agent-memory-sync §4.5)
     cfg.service(

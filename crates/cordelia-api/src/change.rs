@@ -280,6 +280,29 @@ fn opened(
     Ok((statement, for_phrase))
 }
 
+/// A change entry of this phrase, read with the phrase (decision
+/// 2026-10-04 §4.6, §9): its statement, and its part for the phrase, which
+/// holds the statement's secret and the secrets of the generations before
+/// it, as many as eight, the newest first, each with its statement's
+/// number. It is what a command reads that was typed the phrase: for a
+/// carry from a generation whose secret the device never held (§7.3), and
+/// for a recovery.
+///
+/// Refused: an entry that is not this phrase's; a statement whose
+/// signature does not hold; and a secret that does not open to the
+/// statement's commitment.
+pub fn read_with(
+    phrase: &Phrase,
+    entry: &CheckedEntry,
+) -> Result<(SignedStatement, ForPhrase), PersonError> {
+    let (statement, for_phrase) = opened(phrase, entry)?;
+    statement.verify()?;
+    if !statement.statement.commits_to(&for_phrase.secret) {
+        return Err(PersonError::SecretNotCommitted);
+    }
+    Ok((statement, for_phrase))
+}
+
 /// The device that makes a statement is always among its devices
 /// (decision 2026-10-04 §6): a maker that would not be is refused as that,
 /// before its key is asked about as a device of the statement applied.

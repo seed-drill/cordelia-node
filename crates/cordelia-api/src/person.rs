@@ -135,6 +135,16 @@ pub enum PersonError {
     #[error("this device does not hold the name {0}")]
     NameNotHeld(String),
 
+    #[error(
+        "the word that was given with the recovery phrase does not hold here: the phrase that \
+         this device follows did not give it, or it was given for another device or before the \
+         last change, or its ten minutes have gone by. Nothing was taken."
+    )]
+    NoWord,
+
+    #[error("{0}")]
+    NotCarried(String),
+
     #[error("a merge is written over a version, and the slot holds none")]
     MergeOverNoVersion,
 

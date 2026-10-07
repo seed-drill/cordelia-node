@@ -404,7 +404,24 @@ fn routes() -> Vec<(&'static str, Value)> {
             json!({ "entry": "00", "over": "00" }),
         ),
         ("/api/v1/carry", json!({ "name": "lab" })),
+        ("/api/v1/carry/from/look", json!({ "name": "lab" })),
+        ("/api/v1/carry/from", json!({ "word": no_word() })),
+        ("/api/v1/carry/phrase/look", json!({ "name": "lab" })),
+        (
+            "/api/v1/carry/read",
+            json!({ "channel": "00", "proofs": [] }),
+        ),
+        ("/api/v1/carry/read/part", json!({ "read": 1, "from": 0 })),
+        (
+            "/api/v1/carry/handed",
+            json!({ "word": no_word(), "versions": [] }),
+        ),
     ]
+}
+
+/// A word that nobody gave, as a request carries one.
+fn no_word() -> Value {
+    json!({ "what": "", "until": 0, "signature": "" })
 }
 
 /// A carry that a person asks for, at the route (decision 2026-10-04

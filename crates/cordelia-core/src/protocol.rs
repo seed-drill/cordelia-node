@@ -1632,6 +1632,14 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
 
+/// The most bytes of entries that the node hands a command in one answer
+/// (decision 2026-10-04 §7.3, §9), where the command reads a channel
+/// whose secret the node does not hold: a channel may hold more than one
+/// answer of the local API carries, so it is handed a part at a time. An
+/// entry over the bound is handed alone.
+/// Derived: half of what one message of the wire holds, MAX_MESSAGE_BYTES.
+pub const CARRY_PART_MAX_BYTES: usize = MAX_MESSAGE_BYTES as usize / 2;
+
 /// The most names a recovery carries (decision 2026-10-04 §9): a device
 /// that is gone listed names too, and can have listed any number of its
 /// own. The names it leaves are named.
@@ -2324,6 +2332,9 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(CARRY_PART_MAX_BYTES, 512 * 1024);
+        // A part holds an entry of any size that a channel carries.
+        const { assert!(CARRY_PART_MAX_BYTES >= MAX_ITEM_BYTES) };
         assert_eq!(RECOVERY_MAX_NAMES, 1_024);
         assert_eq!(RECOVERY_MAX_DEVICES_SHOWN, 256);
         // A recovery shows every device that a reader may count, and

@@ -230,6 +230,9 @@ pub struct OwnChannels {
     /// The channels that a carry is being made into, each with when that
     /// began.
     carrying: Mutex<std::collections::HashMap<[u8; 32], Instant>>,
+    /// What was last read at the relays for a command, with what that
+    /// reading is named by: kept until the command has been handed it.
+    shelf: Mutex<(u64, Vec<Vec<u8>>)>,
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -415,6 +418,52 @@ impl OwnChannels {
         carrying
             .get(channel)
             .is_some_and(|began| now.saturating_duration_since(*began) < CARRYING_WAIT)
+    }
+
+    /// Keep `entries`, which were read at the relays for a command that
+    /// holds a secret the node does not (decision 2026-10-04 §7.3, §9),
+    /// until the command has been handed them, a part at a time
+    /// ([`Self::shelved`]). What was kept of an earlier reading goes.
+    /// Returns what this reading is named by.
+    pub fn shelve(&self, entries: Vec<Vec<u8>>) -> u64 {
+        let mut shelf = self.shelf.lock().unwrap_or_else(|e| e.into_inner());
+        shelf.0 += 1;
+        shelf.1 = entries;
+        shelf.0
+    }
+
+    /// A part of the reading named `id`, from the entry numbered `from`
+    /// on: as many entries as hold `max_bytes` between them, and one at
+    /// least; and where the next part begins, where there is one. `None`
+    /// where that reading is kept no longer. **Once its last part is
+    /// handed, nothing is kept of it.**
+    pub fn shelved(
+        &self,
+        id: u64,
+        from: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<Vec<u8>>, Option<usize>)> {
+        let mut shelf = self.shelf.lock().unwrap_or_else(|e| e.into_inner());
+        if shelf.0 != id || from > shelf.1.len() {
+            return None;
+        }
+        let mut part: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0;
+        for entry in &shelf.1[from..] {
+            if !part.is_empty() && bytes + entry.len() > max_bytes {
+                break;
+            }
+            bytes += entry.len();
+            part.push(entry.clone());
+        }
+        let next = from + part.len();
+        if next >= shelf.1.len() {
+            shelf.1 = Vec::new();
+            // What it was named by names nothing from now on.
+            shelf.0 += 1;
+            return Some((part, None));
+        }
+        Some((part, Some(next)))
     }
 
     /// The node begins a whole pass. Returns the pass's number, which it

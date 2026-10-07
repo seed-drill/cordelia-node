@@ -480,6 +480,57 @@ impl Word {
     }
 }
 
+/// What a person's word allows ([`Word`]), as the text that is signed.
+/// The node reads what it is to do from the signed text itself, and from
+/// nothing beside it: a request that carried the same things apart could
+/// say another thing than the phrase signed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Allows {
+    /// `cordelia sync carry <name> --from`: what the removed keys in
+    /// `keys` signed in the channel of `name`, in the generations that
+    /// this device left, comes into slots where the new channel holds
+    /// nothing; and, for each file in `above`, which a second yes named,
+    /// above the version that the new channel holds. Each key in hex.
+    From {
+        name: String,
+        keys: Vec<String>,
+        above: Vec<String>,
+    },
+    /// `cordelia sync carry <name> --phrase`: what the command read of
+    /// the channel of `name`, in generations whose secret this device
+    /// never held and the phrase opened, comes in as a carry by command
+    /// does, where a key that counts signed it.
+    Handed { name: String },
+    /// `cordelia recover`: the look, made once. The names that are
+    /// carried, in their order, and the keys that it takes from, each in
+    /// hex: the devices that the person still has, and those that are
+    /// lost or broken.
+    Look {
+        names: Vec<String>,
+        takes: Vec<String>,
+    },
+}
+
+impl Allows {
+    /// The text that the phrase signs for it.
+    pub fn says(&self) -> Result<String, PersonError> {
+        serde_json::to_string(self)
+            .map_err(|e| PersonError::Held(format!("what a word allows: {e}")))
+    }
+
+    /// What `word` allows, read from the text that was signed: `None`
+    /// where that text is none of these.
+    pub fn of(word: &Word) -> Option<Self> {
+        serde_json::from_str(&word.what).ok()
+    }
+}
+
+/// A key in hex, as a word names one: `None` where it is none.
+pub fn key_named(written: &str) -> Option<[u8; 32]> {
+    hex::decode(written).ok()?.try_into().ok()
+}
+
 /// What the phrase's key signs for a word: its label, the device's key,
 /// what the change entry is named by, until when, and the hash of what
 /// it allows.
@@ -1054,6 +1105,212 @@ mod tests {
             matches!(none, Err(PersonError::FollowsNoPhrase)),
             "{none:?}"
         );
+    }
+
+    /// A person's word for a carry is the phrase's (decision 2026-10-04
+    /// §7.3, §9): it holds for the device it was given on, under the
+    /// change entry that the device kept then, for ten minutes, and for
+    /// the text that was signed. Another phrase's, another device's, one
+    /// given under another change entry, one whose time has gone by or is
+    /// set further ahead than a word stands, and one whose text was
+    /// changed, do not hold.
+    #[test]
+    fn test_a_word_holds_only_as_the_phrase_gave_it() {
+        use cordelia_crypto::phrase::Phrase;
+        let s = three();
+        let phrase_key = s.phrase.public_key().unwrap();
+        let (device, under) = (s.key(0), s[0].latest().id());
+        let allows = Allows::From {
+            name: LAB.into(),
+            keys: vec![hex::encode(s.key(2))],
+            above: vec![FILE.into()],
+        };
+        let now = 1_000;
+        let word = Word::give(&s.phrase, &device, &under, allows.says().unwrap(), now).unwrap();
+        assert_eq!(word.until, now + CARRY_WORD_SECS);
+        assert!(word.holds(&phrase_key, &device, &under, now));
+        assert!(word.holds(&phrase_key, &device, &under, now + CARRY_WORD_SECS));
+        assert_eq!(Allows::of(&word), Some(allows.clone()));
+        // It travels as JSON, and holds there.
+        let over: Word = serde_json::from_str(&serde_json::to_string(&word).unwrap()).unwrap();
+        assert!(over.holds(&phrase_key, &device, &under, now));
+
+        // Its time has gone by.
+        assert!(!word.holds(&phrase_key, &device, &under, now + CARRY_WORD_SECS + 1));
+        // Another device, and another change entry.
+        assert!(!word.holds(&phrase_key, &s.key(1), &under, now));
+        assert!(!word.holds(&phrase_key, &device, &[7; 32], now));
+        // Another phrase gave it.
+        let other = Phrase::parse(crate::several::OTHER_WORDS).unwrap();
+        let theirs = Word::give(&other, &device, &under, allows.says().unwrap(), now).unwrap();
+        assert!(!theirs.holds(&phrase_key, &device, &under, now));
+        // The text was changed after it was signed: the name, a key, a
+        // file.
+        let changed = Allows::From {
+            name: LAB.into(),
+            keys: vec![hex::encode(s.key(2)), hex::encode(s.key(1))],
+            above: vec![FILE.into()],
+        };
+        let forged = Word {
+            what: changed.says().unwrap(),
+            ..word.clone()
+        };
+        assert!(!forged.holds(&phrase_key, &device, &under, now));
+        // A time set further ahead than a word stands: the signature is
+        // over the time, and a word that says more than ten minutes is
+        // none, whoever signed it.
+        let later = Word {
+            until: word.until + 60,
+            ..word.clone()
+        };
+        assert!(!later.holds(&phrase_key, &device, &under, now + 30));
+        let far = Word::give(
+            &s.phrase,
+            &device,
+            &under,
+            allows.says().unwrap(),
+            now + 3_600,
+        )
+        .unwrap();
+        assert!(!far.holds(&phrase_key, &device, &under, now));
+        // A signature that is none.
+        let none = Word {
+            signature: "zz".into(),
+            ..word.clone()
+        };
+        assert!(!none.holds(&phrase_key, &device, &under, now));
+        // What a word allows that is none of the things a word allows.
+        let odd = Word {
+            what: "{\"anything\":1}".into(),
+            ..word
+        };
+        assert_eq!(Allows::of(&odd), None);
+    }
+
+    /// A removed key is named by the label that this device knew it by,
+    /// or by the first six words of its key's fingerprint (decision
+    /// 2026-10-04 §7.3). Where a label, or the words, match two removed
+    /// keys, or none, it is refused.
+    #[test]
+    fn test_a_removed_key_is_named_by_its_label_or_by_six_words() {
+        let s = three();
+        let removed = vec![
+            Removed {
+                key: s.key(0),
+                label: "laptop".into(),
+            },
+            Removed {
+                key: s.key(1),
+                label: "desktop".into(),
+            },
+            // A key that this device never knew by a label, and one that
+            // goes by a label another has.
+            Removed {
+                key: s.key(2),
+                label: String::new(),
+            },
+            Removed {
+                key: [9; 32],
+                label: "desktop".into(),
+            },
+        ];
+        assert_eq!(named_key("laptop", &removed), Ok(s.key(0)));
+        // By its words: six of them, however they are spaced, in either
+        // case.
+        let words = naming_words(&s.key(2));
+        assert_eq!(words.split(' ').count(), CARRY_FROM_WORDS);
+        assert_eq!(named_key(&words, &removed), Ok(s.key(2)));
+        let spaced = format!("  {}  ", words.to_uppercase().replace(' ', "   "));
+        assert_eq!(named_key(&spaced, &removed), Ok(s.key(2)));
+        // A key with a label is named by its words too.
+        assert_eq!(named_key(&naming_words(&s.key(1)), &removed), Ok(s.key(1)));
+        // A label that two removed keys go by is refused, and each is
+        // still named by its words.
+        let two = named_key("desktop", &removed).unwrap_err();
+        assert!(two.contains("names 2 removed keys"), "{two}");
+        assert_eq!(named_key(&naming_words(&[9; 32]), &removed), Ok([9; 32]));
+        // What names none: another label, fewer words than six, a label
+        // in another case, and an empty one.
+        let four = cordelia_crypto::fingerprint::shown(&s.key(2));
+        for none in ["phone", four.as_str(), "Laptop", ""] {
+            let refused = named_key(none, &removed).unwrap_err();
+            assert!(
+                refused.contains("names no removed key"),
+                "{none}: {refused}"
+            );
+        }
+        // A key is in hex where a word names one.
+        assert_eq!(key_named(&hex::encode(s.key(1))), Some(s.key(1)));
+        assert_eq!(key_named("zz"), None);
+        assert_eq!(key_named("00"), None);
+    }
+
+    /// Where two removed keys are named in one run, the newest version
+    /// among them is taken for each empty slot, judged once (decision
+    /// 2026-10-04 §7.3, §9). Named one at a time, the first key's
+    /// versions fill the slots, and a newer version of the second's then
+    /// stands above a version that the new channel holds: it needs the
+    /// second yes.
+    #[test]
+    fn test_two_keys_named_in_one_run_give_the_newest_version_for_each_empty_slot() {
+        // Devices 1 and 2 each wrote in a name that device 0 does not
+        // sync, and each wrote the same file: device 2 last.
+        let run = |one_at_a_time: bool| -> (Several, Vec<Brought>) {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[1, 2], LAB);
+            let old = s[1].own(LAB);
+            s.write(1, LAB, FILE, "of device 1");
+            s.write(1, LAB, "only-1.md", "one");
+            s.pass(1, 2);
+            s.write(2, LAB, FILE, "of device 2, written over it");
+            s.write(2, LAB, "only-2.md", "two");
+            let mut at_the_relays = s[1].stored_in(&old);
+            at_the_relays.extend(s[2].stored_in(&old));
+            s.change(0, &[0], &[1, 2]);
+            s.hold(&[0], LAB);
+            let (first, second) = (s.key(1), s.key(2));
+            let of = |keys: &[[u8; 32]]| -> Vec<Version> {
+                let was = read(&at_the_relays, &old, 1, |key| keys.contains(key)).unwrap();
+                newest(was.versions)
+            };
+            let mut brought = Vec::new();
+            match one_at_a_time {
+                false => {
+                    for version in of(&[first, second]) {
+                        brought.push(bring_on(&mut s, 0, &version, Rule::EmptySlots));
+                    }
+                }
+                true => {
+                    for version in of(&[first]).into_iter().chain(of(&[second])) {
+                        brought.push(bring_on(&mut s, 0, &version, Rule::EmptySlots));
+                    }
+                }
+            }
+            (s, brought)
+        };
+        // In one run: three files, each into an empty slot, and the file
+        // that both wrote holds the newer text.
+        let (s, brought) = run(false);
+        assert_eq!(brought, [Brought::Carried; 3]);
+        assert_eq!(
+            s[0].text(LAB, FILE).as_deref(),
+            Some("of device 2, written over it")
+        );
+        assert_eq!(s[0].text(LAB, "only-1.md").as_deref(), Some("one"));
+        assert_eq!(s[0].text(LAB, "only-2.md").as_deref(), Some("two"));
+        // One at a time: the first key's version fills the slot, and the
+        // second's then stands above it, and is left.
+        let (s, brought) = run(true);
+        assert_eq!(
+            brought,
+            [
+                Brought::Carried,
+                Brought::Carried,
+                Brought::Above,
+                Brought::Carried
+            ]
+        );
+        assert_eq!(s[0].text(LAB, FILE).as_deref(), Some("of device 1"));
     }
 
     /// A version that a command read in its own process is handed to the

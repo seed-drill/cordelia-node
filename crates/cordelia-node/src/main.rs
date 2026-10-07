@@ -264,9 +264,29 @@ enum SyncCommand {
     /// and that no device carried: the last edits of a device that never
     /// returned, or a name that no device syncs any more. It reads each
     /// generation that this device left in the last 90 days.
+    ///
+    /// What a removed device wrote comes in only with `--from`, at a
+    /// terminal, with the recovery phrase.
     Carry {
         /// The name to carry (default: every name this device holds)
         name: Option<String>,
+        /// Also take what a removed device signed there: its label, or
+        /// the first six words of its key's fingerprint, in quotes. Give
+        /// `--from` once for each device. With no device after it, list
+        /// the removed keys that signed there, and take nothing. Asks for
+        /// the recovery phrase
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "LABEL_OR_SIX_WORDS"
+        )]
+        from: Vec<String>,
+        /// Read the generations whose secret this device never held (it
+        /// was off through a change), and take what your devices that
+        /// count signed there. Asks for the recovery phrase
+        #[arg(long)]
+        phrase: bool,
     },
     /// Stop syncing (files already synced are left in place)
     Off,
@@ -3055,6 +3075,19 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     use cordelia_sync::claude::HOME_NAME;
     use cordelia_sync::discover::{self, Project};
 
+    // A carry that a person asks for changes no setting, asks for the
+    // recovery phrase where it takes what a removed key signed, and
+    // prints what it did itself: it asks the node's version at its own
+    // moment, after its terminal (decision 2026-10-04 §16).
+    let what = match what {
+        SyncCommand::Carry { name, from, phrase } => {
+            // `--from` given, with or without a device after it.
+            let from = (!from.is_empty()).then_some(from);
+            return carry_cmd::carry(config_path, name, from, phrase);
+        }
+        other => other,
+    };
+
     // What is no more is refused here, before anything is sent, and
     // before the node is asked anything at all (decision 2026-10-04
     // §10.1).
@@ -3076,9 +3109,8 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     // the end waits for a report made after it.
     let since: Option<u64>;
     match what {
-        // A carry that a person asks for changes no setting, and prints
-        // what it did itself.
-        SyncCommand::Carry { name } => return carry_cmd::carry(config_path, name),
+        // Taken up above.
+        SyncCommand::Carry { .. } => return Ok(()),
         SyncCommand::Claude {
             dir,
             mapped_only,
