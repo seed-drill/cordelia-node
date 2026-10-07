@@ -3357,7 +3357,13 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
         SyncCommand::Status { seen } => {
             // The one act that takes the notice away: a request of its
             // own, which changes no setting (decision 2026-10-04 §10.1).
+            // **It shows the notice that it is about to put away, and
+            // then puts it away:** what is put away is what was read.
             if seen {
+                let status = serde_json::json!({});
+                if let Ok(stored) = api_post(config_path, "/api/v1/sync/status", status) {
+                    print_notice(&stored, Notice::BeingPutAway);
+                }
                 match api_post_told(
                     config_path,
                     "/api/v1/sync/seen",
@@ -3527,6 +3533,17 @@ fn day_of(at: &str) -> &str {
     at.get(..10).unwrap_or(at)
 }
 
+/// Whether a notice is printed as one that stays until it is said to
+/// have been seen, or as one that is being put away now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notice {
+    /// `cordelia sync status`: it says how to put the notice away.
+    Stays,
+    /// `cordelia sync status --seen`: it is shown once more, and then
+    /// put away. Nothing says how to put it away.
+    BeingPutAway,
+}
+
 /// What `cordelia sync status` says of the notice, first, with sync on
 /// and with it off (decision 2026-10-04 §10.1): each folder it names
 /// that is not mapped now, in rows ([`notice_row`]), with what is said
@@ -3534,6 +3551,7 @@ fn day_of(at: &str) -> &str {
 fn notice_lines(
     notice: &serde_json::Value,
     sync_on: bool,
+    shown: Notice,
 ) -> (Vec<String>, Vec<Vec<String>>, Vec<String>) {
     let Some(named) = notice["folders"].as_array() else {
         return Default::default();
@@ -3543,11 +3561,14 @@ fn notice_lines(
     let mut before = Vec::new();
     let mut after = Vec::new();
     if rows.is_empty() && !not_known {
-        before.push(
-            "Every folder that stopped syncing on this device is mapped again. To put this \
-             notice away: cordelia sync status --seen"
+        before.push(match shown {
+            Notice::Stays => "Every folder that stopped syncing on this device is mapped \
+                              again. To put this notice away: cordelia sync status --seen"
                 .to_string(),
-        );
+            Notice::BeingPutAway => {
+                "Every folder that stopped syncing on this device is mapped again.".to_string()
+            }
+        });
         return (before, rows, after);
     }
     let since = notice["records"][0]["at"]
@@ -3603,15 +3624,17 @@ fn notice_lines(
                 .to_string(),
         );
     }
-    after.push("Once you have seen this: cordelia sync status --seen".to_string());
+    if shown == Notice::Stays {
+        after.push("Once you have seen this: cordelia sync status --seen".to_string());
+    }
     (before, rows, after)
 }
 
 /// Print the notice of what stopped syncing, where the node carries one
 /// ([`notice_lines`]).
-fn print_notice(status: &serde_json::Value) {
+fn print_notice(status: &serde_json::Value, shown: Notice) {
     let sync_on = status["enabled"].as_bool() == Some(true);
-    let (before, rows, after) = notice_lines(&status["notice"], sync_on);
+    let (before, rows, after) = notice_lines(&status["notice"], sync_on, shown);
     if before.is_empty() && rows.is_empty() && after.is_empty() {
         return;
     }
@@ -3992,7 +4015,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
     let status = || api_post(config_path, "/api/v1/sync/status", serde_json::json!({}));
     let mut resp = status()?;
     // What stopped syncing is said first, with sync on or off.
-    print_notice(&resp);
+    print_notice(&resp, Notice::Stays);
     if resp["enabled"].as_bool() != Some(true) {
         println!("Sync is off. Turn it on with `cordelia sync claude`.");
         return Ok(());
@@ -5072,7 +5095,7 @@ mod tests {
             "stopped": 7,
             "folders": named,
         });
-        let (before, printed, after) = notice_lines(&notice, true);
+        let (before, printed, after) = notice_lines(&notice, true, Notice::Stays);
         assert!(
             before[0].starts_with("7 folders stopped syncing on this device (2026-10-05)"),
             "{before:?}"
@@ -5084,7 +5107,7 @@ mod tests {
             ["Once you have seen this: cordelia sync status --seen"]
         );
         // With sync off: to turn sync on first, since `map` is refused.
-        let (_, printed, after) = notice_lines(&notice, false);
+        let (_, printed, after) = notice_lines(&notice, false, Notice::Stays);
         assert_eq!(printed, rows);
         assert!(
             after[0].starts_with("Sync is off: turn it on first"),
@@ -5098,7 +5121,7 @@ mod tests {
             "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": null }],
             "not_known": true, "dir": claude, "stopped": 0, "folders": [],
         });
-        let (before, printed, after) = notice_lines(&unknown, true);
+        let (before, printed, after) = notice_lines(&unknown, true, Notice::Stays);
         assert!(
             before[0].starts_with("Folders stopped syncing on this device"),
             "{before:?}"
@@ -5110,7 +5133,7 @@ mod tests {
             "{after:?}"
         );
         assert!(after[0].contains("listed below"), "{after:?}");
-        let (_, _, after) = notice_lines(&unknown, false);
+        let (_, _, after) = notice_lines(&unknown, false, Notice::Stays);
         assert!(after[0].contains("once sync is on"), "{after:?}");
 
         // Every folder mapped since: only how to put it away.
@@ -5120,7 +5143,7 @@ mod tests {
             "folders": [{ "folder": folder("-x-notes"), "cwd": null, "name": "lab",
                           "mappable": false, "mapped": true }],
         });
-        let (before, printed, after) = notice_lines(&all_mapped, true);
+        let (before, printed, after) = notice_lines(&all_mapped, true, Notice::Stays);
         assert!(printed.is_empty() && after.is_empty());
         assert!(before[0].contains("is mapped again"), "{before:?}");
         assert!(before[0].ends_with("cordelia sync status --seen"));
@@ -5129,9 +5152,38 @@ mod tests {
             "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 1 }],
             "not_known": false, "dir": claude, "stopped": 1, "folders": [odd],
         });
-        assert!(notice_lines(&one, true).0[0].starts_with("1 folder stopped syncing"));
+        assert!(
+            notice_lines(&one, true, Notice::Stays).0[0].starts_with("1 folder stopped syncing")
+        );
         // No notice: nothing.
-        let none = notice_lines(&serde_json::Value::Null, true);
+        let none = notice_lines(&serde_json::Value::Null, true, Notice::Stays);
+        assert!(none.0.is_empty() && none.1.is_empty() && none.2.is_empty());
+
+        // `cordelia sync status --seen` shows the notice that it is
+        // about to put away: the same folders, and nothing that says how
+        // to put it away.
+        let shown = notice_lines(&notice, true, Notice::BeingPutAway);
+        let stays = notice_lines(&notice, true, Notice::Stays);
+        assert_eq!((&shown.0, &shown.1), (&stays.0, &stays.1));
+        assert!(shown.2.is_empty(), "{:?}", shown.2);
+        for put_away in [
+            notice_lines(&notice, false, Notice::BeingPutAway),
+            notice_lines(&unknown, true, Notice::BeingPutAway),
+            notice_lines(&all_mapped, true, Notice::BeingPutAway),
+        ] {
+            let lines = put_away.0.iter().chain(&put_away.2);
+            assert!(put_away.0.len() + put_away.2.len() > 0);
+            assert!(
+                lines.clone().all(|line| !line.contains("--seen")),
+                "{put_away:?}"
+            );
+        }
+        let mapped_again = notice_lines(&all_mapped, true, Notice::BeingPutAway);
+        assert_eq!(
+            mapped_again.0,
+            ["Every folder that stopped syncing on this device is mapped again."]
+        );
+        let none = notice_lines(&serde_json::Value::Null, true, Notice::BeingPutAway);
         assert!(none.0.is_empty() && none.1.is_empty() && none.2.is_empty());
 
         // Plain `cordelia status` and a bar's tooltip name each folder

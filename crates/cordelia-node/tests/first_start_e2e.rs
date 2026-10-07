@@ -1623,12 +1623,17 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
         said.starts_with("Every folder that stopped syncing on this device is mapped again."),
         "{said}"
     );
-    // Seen: it is put away, and the status carries none.
+    // Seen: the notice is shown once more, and then put away, and the
+    // status carries none.
     let said = laptop.cli(&["sync", "status", "--seen"]);
     assert!(
-        said.starts_with("The notice of the folders that stopped syncing is put away."),
+        said.starts_with(
+            "Every folder that stopped syncing on this device is mapped again.\n\nThe notice \
+             of the folders that stopped syncing is put away."
+        ),
         "{said}"
     );
+    assert!(!said.contains("--seen"), "{said}");
     let status = status_of(&laptop);
     assert!(status["sync"]["notice"].is_null(), "{status}");
     assert!(!laptop.cli(&["sync", "status"]).contains("stopped syncing"));
