@@ -526,21 +526,95 @@ mod tests {
 
     /// Where the channel's index already has every line of this device's,
     /// the merge is the channel's version: the file takes it, and nothing
-    /// is published.
+    /// is published. It is so where both changed, and at a lost race.
+    ///
+    /// A line of the channel's that points at a file which is deleted in
+    /// the channel is dropped by the merge. The merge is then not the
+    /// channel's version, and is published.
     #[test]
     fn an_index_the_channel_already_has_whole_is_pulled() {
+        let index = memory_md::INDEX_FILE;
         let a = agreed(1, "- [a](a.md)\n");
         let theirs = "- [a](a.md)\n- [b](b.md)\n- [c](c.md)\n";
         let r = live_after(2, theirs, &["- [a](a.md)\n"]);
+        let mine = "- [a](a.md)\n- [c](c.md)\n";
         assert_eq!(
-            planned(
-                memory_md::INDEX_FILE,
-                Some("- [a](a.md)\n- [c](c.md)\n"),
+            planned(index, Some(mine), Some(&r), Some(&a)),
+            vec![pull(&r)]
+        );
+        // A lost race: this device published its index at that revision,
+        // and its record is of that. The channel's version, which won the
+        // tie, has this device's line.
+        let ours = held_as(2, Some(mine), vec![entry(ME, after(&["- [a](a.md)\n"]))]);
+        let raced = agreed_as(&ours, mine);
+        assert_eq!(
+            planned(index, Some(mine), Some(&r), Some(&raced)),
+            vec![pull(&r)]
+        );
+
+        // The file that one of the channel's lines points at is deleted
+        // in the channel: both ways, the merge is another text than the
+        // channel's, and it is published.
+        let deleted: HashSet<String> = ["b.md".to_string()].into();
+        let local = c(mine);
+        for record in [&a, &raced] {
+            assert_eq!(
+                plan(
+                    index,
+                    Some(&local),
+                    Some(&r),
+                    Some(record),
+                    &deleted,
+                    &counting()
+                ),
+                vec![Action::Merge("- [a](a.md)\n- [c](c.md)\n".into())]
+            );
+        }
+        // A file that is deleted and that no line points at changes
+        // nothing.
+        let another: HashSet<String> = ["z.md".to_string()].into();
+        assert_eq!(
+            plan(
+                index,
+                Some(&local),
                 Some(&r),
-                Some(&a)
+                Some(&a),
+                &another,
+                &counting()
             ),
             vec![pull(&r)]
         );
+    }
+
+    /// The merge of two indexes that each have a line of their own drops
+    /// each line that points at a file deleted in the channel, whichever
+    /// of the two has it, and keeps the rest.
+    #[test]
+    fn a_merged_index_has_no_line_for_a_file_deleted_in_the_channel() {
+        let index = memory_md::INDEX_FILE;
+        let a = agreed(1, "- [a](a.md)\n");
+        let r = live_after(2, "- [a](a.md)\n- [b](b.md)\n", &["- [a](a.md)\n"]);
+        let local = c("- [a](a.md)\n- [c](c.md)\n");
+        let merge = |deleted: &[&str]| {
+            let deleted: HashSet<String> = deleted.iter().map(|file| file.to_string()).collect();
+            plan(
+                index,
+                Some(&local),
+                Some(&r),
+                Some(&a),
+                &deleted,
+                &counting(),
+            )
+        };
+        let merged = |text: &str| vec![Action::Merge(text.into())];
+        assert_eq!(
+            merge(&[]),
+            merged("- [a](a.md)\n- [b](b.md)\n- [c](c.md)\n")
+        );
+        assert_eq!(merge(&["b.md"]), merged("- [a](a.md)\n- [c](c.md)\n"));
+        assert_eq!(merge(&["c.md"]), vec![pull(&r)]);
+        assert_eq!(merge(&["a.md"]), merged("- [b](b.md)\n- [c](c.md)\n"));
+        assert_eq!(merge(&["b.md", "c.md"]), merged("- [a](a.md)\n"));
     }
 
     /// The revision moved and the content did not: a version is carried
