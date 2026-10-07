@@ -1049,7 +1049,15 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         "{listed}"
     );
     assert!(listed.contains("Removed keys:"), "{listed}");
-    assert!(listed.contains(&desktop_key), "{listed}");
+    // A statement lists a removed key bare: it is shown by the label
+    // that this device knew it by.
+    assert!(
+        listed.contains(&format!(
+            "  ({}) \"desktop\"  {desktop_key}",
+            words_of(&desktop_key)
+        )),
+        "{listed}"
+    );
 
     // The removed device stops, and says why.
     wait_for("the desktop learns that it was removed", &all, 120, || {

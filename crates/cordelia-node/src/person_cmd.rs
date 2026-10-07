@@ -643,14 +643,19 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
         // (§8): it says so itself, once it has.
         Some(number) if number == change => match device["sent"] == true {
             true => format!("has applied change {change}, and has sent what it held"),
+            // A device that is lost in that state has left what it had
+            // not sent: what it had sent before comes in by command
+            // (§7.3, §8).
             false => format!(
                 "has applied change {change}, and is still sending what it held (if it is \
-                 lost now, what it had not sent is lost with it)"
+                 lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
+                 in what it had sent before)"
             ),
         },
         _ => format!(
             "has not applied change {change} yet, as far as this device has heard: adding it \
-             again from a device that has (`cordelia add-device`) hands it the change"
+             again from a device that has (`cordelia add-device`) hands it the change, and \
+             `cordelia sync carry` brings in what it had sent to the relays"
         ),
     };
     let left = |device: &Value| match device["left"] == true {
@@ -701,12 +706,12 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
         out.push(String::new());
         out.push("Removed keys:".into());
     }
+    // A statement lists a removed key bare: it is shown by the label
+    // that this device knew it by, where it knew it by one. That label,
+    // or the first six words of the key's fingerprint, names it at
+    // `cordelia sync carry <name> --from` (§7.3).
     for device in removed {
-        out.push(format!(
-            "  ({})  {}",
-            text(device, "words"),
-            text(device, "key")
-        ));
+        out.push(format!("  {}  {}", shown(device), text(device, "key")));
     }
     let left_out: Vec<&Value> = list(seen, "left_out").collect();
     if !left_out.is_empty() {
@@ -840,7 +845,12 @@ fn names_lines(seen: &Value) -> Vec<String> {
         .partition(|name| list(name, "by").next().is_some());
     if !ours.is_empty() {
         out.push(String::new());
-        out.push("Names that no device lists yet since the last change:".into());
+        out.push(
+            "Names that no device lists yet since the last change (`cordelia sync carry \
+             <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
+             sync it):"
+                .into(),
+        );
     }
     for name in ours {
         out.push(format!(
@@ -853,7 +863,10 @@ fn names_lines(seen: &Value) -> Vec<String> {
     if !gone.is_empty() {
         out.push(String::new());
         out.push(
-            "Names that only a device which no longer counts had synced (they stay behind):".into(),
+            "Names that only a device which no longer counts had synced (they stay behind: \
+             `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
+             phrase):"
+                .into(),
         );
     }
     for name in gone {
@@ -3122,7 +3135,9 @@ mod tests {
         );
         assert!(
             lines.contains(
-                "(w) \"tablet\": has applied change 2, and is still sending what it held"
+                "(w) \"tablet\": has applied change 2, and is still sending what it held (if it \
+                 is lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
+                 in what it had sent before)"
             ),
             "{lines}"
         );
@@ -3133,21 +3148,27 @@ mod tests {
             "{lines}"
         );
         assert!(
+            lines.contains("`cordelia sync carry` brings in what it had sent to the relays"),
+            "{lines}"
+        );
+        assert!(
             lines.contains("Still to send from this device (1 name sent, 2 to go):\n  team\n  ~"),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "Names that no device lists yet since the last change:\n  old-notes: synced \
-                 before by (w w w w) \"laptop\"; what the relays hold of it can be brought in for \
-                 89 more days"
+                "Names that no device lists yet since the last change (`cordelia sync carry \
+                 <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
+                 sync it):\n  old-notes: synced before by (w w w w) \"laptop\"; what the relays \
+                 hold of it can be brought in for 89 more days"
             ),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "Names that only a device which no longer counts had synced (they stay \
-                 behind):\n  its-own: synced before by the device (w w w w); it can be brought \
+                "Names that only a device which no longer counts had synced (they stay behind: \
+                 `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
+                 phrase):\n  its-own: synced before by the device (w w w w); it can be brought \
                  in for 1 more day"
             ),
             "{lines}"
