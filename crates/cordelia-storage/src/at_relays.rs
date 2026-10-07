@@ -276,6 +276,34 @@ pub fn sent_everywhere(
     .map_err(storage)
 }
 
+/// How many entries the store holds of `channel`, the channel of a name,
+/// that no relay was sent: what would be nowhere but here were the store
+/// to drop the channel. An entry was sent to a relay where what the
+/// device keeps of that relay for the channel reaches it (what it carried
+/// when it applied a statement has a turn of its own there,
+/// [`carried_up_to`]) and the relay did not refuse it for room
+/// ([`waiting_refused`]). Nothing is written.
+pub fn sent_to_no_relay(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
+    let carried_up_to = carried_up_to(conn)?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM entries AS held
+         WHERE held.channel_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM at_relays AS there
+               WHERE there.channel = ?1
+                 AND held.seq <= CASE WHEN held.seq <= ?2 THEN there.carried_to
+                                      ELSE there.sent_to END
+                 AND NOT EXISTS (
+                     SELECT 1 FROM at_relays_refused AS refused
+                     WHERE refused.relay = there.relay AND refused.channel = ?1
+                       AND refused.seq = held.seq))",
+        params![channel.as_slice(), carried_up_to],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|waits| waits.max(0) as usize)
+    .map_err(storage)
+}
+
 /// The device is about to send `relay` something of `channel`: it keeps
 /// that it did, whatever comes back, and whether or not anything does.
 pub fn sending(
@@ -713,6 +741,53 @@ mod tests {
             with(Some((MARK, 9)))
         );
         assert_eq!(forget_places_of(&conn, &channel(1)).unwrap(), 0);
+    }
+
+    /// What no relay was sent of a channel is counted by entry: one that
+    /// any relay was sent is not among it, and one that a relay had no
+    /// room for is not sent there. What the device carried when it
+    /// applied a statement is sent by a turn of its own, and is counted
+    /// by how far that turn has come.
+    #[test]
+    fn test_what_no_relay_was_sent_of_a_channel_is_counted() {
+        let conn = db::open_in_memory().unwrap();
+        let waits = |c: u8| sent_to_no_relay(&conn, &channel(c)).unwrap();
+        assert_eq!(waits(1), 0);
+        // Two that the device carried when it applied, and three since:
+        // at the places 1 to 5 of the store's order. Another channel
+        // holds one, at the place 6.
+        for name in ["a.md", "b.md"] {
+            entries::store(&conn, &made(1, 1, 5, name), 100).unwrap();
+        }
+        carried_to_here(&conn).unwrap();
+        assert_eq!(carried_up_to(&conn).unwrap(), 2);
+        for name in ["c.md", "d.md", "e.md"] {
+            entries::store(&conn, &made(1, 1, 5, name), 100).unwrap();
+        }
+        entries::store(&conn, &made(2, 1, 5, "a.md"), 100).unwrap();
+        // Nothing is kept of any relay: every entry waits.
+        assert_eq!((waits(1), waits(2)), (5, 1));
+        // A relay was sent what came since, up to the fourth: the fifth
+        // waits, and so do the two that were carried.
+        sent(&conn, &RELAY, &channel(1), 4).unwrap();
+        assert_eq!(waits(1), 3);
+        // It had no room for the third: that one waits too.
+        refused(&conn, &RELAY, &channel(1), 3).unwrap();
+        assert_eq!(waits(1), 4);
+        // Another relay was sent the first of what was carried, and
+        // everything since: the second of what was carried waits.
+        carried(&conn, &OTHER_RELAY, &channel(1), 1).unwrap();
+        sent(&conn, &OTHER_RELAY, &channel(1), 5).unwrap();
+        assert_eq!(waits(1), 1);
+        carried(&conn, &RELAY, &channel(1), 2).unwrap();
+        assert_eq!(waits(1), 0);
+        // What a relay was sent of one channel says nothing of another.
+        assert_eq!(waits(2), 1);
+        sent(&conn, &RELAY, &channel(2), 6).unwrap();
+        assert_eq!(waits(2), 0);
+        // A relay that holds the channel anew was sent nothing of it.
+        start_again(&conn, &OTHER_RELAY, &channel(1)).unwrap();
+        assert_eq!(waits(1), 2);
     }
 
     /// What a relay had no room for is kept by its place in the store's

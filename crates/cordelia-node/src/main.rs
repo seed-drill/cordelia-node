@@ -3158,15 +3158,40 @@ fn name_to_let_go(
 
 /// What `cordelia sync unmap <name>` says where the node let go of a
 /// name that this device held by a carry, with no folder mapped to it
-/// (decision 2026-10-04 §7.3).
-fn let_go_says(name: &str) -> String {
+/// (decision 2026-10-04 §7.3). `alone` is whether the statement lists
+/// this device alone: there is then no other device to keep anything of
+/// the name, and nothing is said of one.
+fn let_go_says(name: &str, alone: bool) -> String {
     let name = sync_label(name);
+    let others = match alone {
+        true => "",
+        false => " Your other devices keep what they hold of it.",
+    };
     format!(
         "This device holds {name} no longer. It held it by a carry, with no folder mapped to \
          it: nothing more of {name} is sent from here or fetched, and what it had brought in \
-         and had not yet sent to a relay is not sent. Your other devices keep what they hold \
-         of it."
+         and had not yet sent to a relay is not sent.{others}"
     )
+}
+
+/// What `cordelia sync unmap <name>` says of the node's answer where it
+/// asked the node to let go of a name (decision 2026-10-04 §7.3). The
+/// node let go of it: [`let_go_says`]. The node holds the name by a
+/// carry and did not let go of it, because something of it waits to be
+/// sent: the node's own words, as this command's refusal. `None` where
+/// the node holds no such name: the word names nothing of that kind.
+fn let_go_answered(asked: &Told) -> Option<anyhow::Result<String>> {
+    match asked {
+        Told::Yes(after) => {
+            let name = after["let_go"].as_str()?;
+            Some(Ok(let_go_says(name, after["let_go_alone"] == true)))
+        }
+        Told::No {
+            status: 409,
+            message,
+        } => Some(Err(anyhow::anyhow!("{message}"))),
+        Told::No { .. } => None,
+    }
 }
 
 /// The mapping `cordelia sync unmap <word>` means, given the mapping whose
@@ -3510,10 +3535,8 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     serde_json::json!({ "folder": name }),
                     None,
                 )?;
-                if let Told::Yes(after) = asked
-                    && let Some(name) = after["let_go"].as_str()
-                {
-                    println!("{}", let_go_says(name));
+                if let Some(said) = let_go_answered(&asked) {
+                    println!("{}", said?);
                     return Ok(());
                 }
             }
@@ -6293,7 +6316,7 @@ mod tests {
     /// brought in and not yet sent is not sent.
     #[test]
     fn test_what_unmap_says_of_a_name_that_a_carry_held() {
-        let said = let_go_says("lab");
+        let said = let_go_says("lab", false);
         assert!(
             said.starts_with(
                 "This device holds lab no longer. It held it by a carry, with no folder mapped \
@@ -6306,6 +6329,47 @@ mod tests {
             "{said}"
         );
         assert!(said.ends_with("Your other devices keep what they hold of it."));
+        // Where the statement lists this device alone there is no other
+        // device, and nothing is said of one.
+        let alone = let_go_says("lab", true);
+        assert!(!alone.contains("other devices"), "{alone}");
+        assert!(
+            alone.ends_with("had not yet sent to a relay is not sent."),
+            "{alone}"
+        );
+    }
+
+    /// What the node answered where it was asked to let go of a name
+    /// (decision 2026-10-04 §7.3). It let go: that is said, and of the
+    /// person's other devices only where the statement lists any. It
+    /// did not, because something of the name waits to be sent: its own
+    /// words are the command's refusal. Any other answer says nothing of
+    /// a name held by a carry.
+    #[test]
+    fn test_what_unmap_says_of_the_nodes_answer_to_letting_go() {
+        let yes = |answer: serde_json::Value| {
+            let_go_answered(&Told::Yes(answer)).map(|said| said.unwrap())
+        };
+        let others = yes(serde_json::json!({ "let_go": "lab", "let_go_alone": false })).unwrap();
+        assert_eq!(others, let_go_says("lab", false));
+        let alone = yes(serde_json::json!({ "let_go": "lab", "let_go_alone": true })).unwrap();
+        assert_eq!(alone, let_go_says("lab", true));
+        // A node that does not say is taken to have other devices.
+        let unsaid = yes(serde_json::json!({ "let_go": "lab" })).unwrap();
+        assert_eq!(unsaid, let_go_says("lab", false));
+        assert_eq!(yes(serde_json::json!({ "enabled": true })), None);
+
+        let waits = "lab is not let go: 2 versions of it wait to be sent";
+        let refused = let_go_answered(&Told::No {
+            status: 409,
+            message: waits.into(),
+        });
+        assert_eq!(refused.unwrap().unwrap_err().to_string(), waits);
+        let not_mapped = let_go_answered(&Told::No {
+            status: 400,
+            message: "lab is not mapped on this device".into(),
+        });
+        assert!(not_mapped.is_none());
     }
 
     /// A command asks the node only at one of the two addresses that the

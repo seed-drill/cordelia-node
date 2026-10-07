@@ -608,13 +608,50 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     assert_eq!(status, 200, "{said}");
     assert_eq!((&said["relays"], &said["entries"]), (&json!([]), &json!(0)));
 
-    // The name is held by the carry, with no folder mapped to it:
-    // unmapping it lets go of it, and the answer says so. Asked again,
-    // nothing is mapped so, as for any word that names no mapping.
+    // The name is held by the carry, with no folder mapped to it. While
+    // a version that was brought in there has been sent to no relay, the
+    // name is not let go: the node refuses, and says how much waits.
+    let lab = held(&state).unwrap();
+    {
+        use cordelia_api::publish::{PlannedAgainst, Published, Write, publish};
+        let db = state.db.lock().unwrap();
+        let write = Write {
+            name: "lab",
+            file: "a.md",
+            value: cordelia_crypto::entry::Value::Text("brought in by a carry".into()),
+            planned: PlannedAgainst::NoVersion,
+            merge: None,
+        };
+        let made = publish(&db, &state.identity, &write, 1_800_000_000).unwrap();
+        assert!(matches!(made, Published::Made(_)), "{made:?}");
+    }
     let unmap = json!({ "folder": "lab" });
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
+    assert_eq!(status, 409, "{said}");
+    assert!(
+        said.to_string()
+            .contains("lab is not let go: 1 version of it waits to be sent"),
+        "{said}"
+    );
+    assert!(
+        said.to_string()
+            .contains("The name can be let go once it is sent"),
+        "{said}"
+    );
+    assert_eq!(held(&state), Some(lab));
+    // A relay was sent it: unmapping the name lets go of it, and the
+    // answer says so, and that the statement lists this device alone.
+    // Asked again, nothing is mapped so, as for any word that names no
+    // mapping.
+    {
+        let db = state.db.lock().unwrap();
+        let last = kept_rows::last_taken(&db, &lab).unwrap();
+        kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
+    }
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
     assert_eq!(status, 200, "{said}");
     assert_eq!(said["let_go"], "lab");
+    assert_eq!(said["let_go_alone"], true);
     assert_eq!(held(&state), None);
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap);
     assert_eq!(status, 400, "{said}");

@@ -481,6 +481,24 @@ pub fn hold_for_a_carry(
     })
 }
 
+/// How many versions this device holds of `name` that wait to be sent:
+/// those in the name's channel that it has sent to no relay
+/// ([`kept_rows::sent_to_no_relay`]). Were it to hold the name no more
+/// ([`stop`]), they would go with what its store holds of the channel,
+/// and be nowhere in the generation applied (decision 2026-10-04 §7.3).
+///
+/// None on a device that follows no phrase, or has stopped: it sends
+/// nothing in a channel of its own, so nothing waits there to be sent.
+pub fn waits_to_be_sent(conn: &Connection, name: &str) -> Result<usize, PersonError> {
+    if crate::at_relays::stands(conn)? != crate::at_relays::Stands::Applied {
+        return Ok(0);
+    }
+    let Some(channel) = held_rows::channel_of_name(conn, name)? else {
+        return Ok(0);
+    };
+    Ok(kept_rows::sent_to_no_relay(conn, &channel)?)
+}
+
 /// This device syncs `name` no longer, and no folder of its own is mapped
 /// to it: it says so, where it had said that it syncs it, and holds the
 /// name no more. What its store holds of the name's channel goes, with
