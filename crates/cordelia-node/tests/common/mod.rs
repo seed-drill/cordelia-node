@@ -1027,8 +1027,39 @@ pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
     assert_eq!(accept, key_of(adder));
     let mut at = new.at_terminal(&["accept", &accept]);
     at.says("Type yes to go on").types("yes");
-    let accepted = at.done();
+    let accepted = became_of_the_key(new, &accept, at.done());
     (added, accepted)
+}
+
+/// What became of a key typed at `cordelia accept` on `device`, given
+/// what the command said: where the command ended with nothing taken yet
+/// (it stays a minute, and the node goes on asking for the rest of the
+/// hour), this waits until the node says that a hand-over was read with
+/// the key, and gives back what the command said with what the node says
+/// became of it. It waits for that state, and for no length of time: on
+/// a loaded machine a hand-over can arrive after the command has ended,
+/// and a test that went on at once would go on before the device stands
+/// where the test takes it to stand.
+pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
+    if !said.contains("Nothing was taken yet") {
+        return said;
+    }
+    let became = wait_for(
+        "a hand-over is read with the key typed at accept",
+        &[device],
+        600,
+        || {
+            let seen = person_of(device);
+            let of_the_key = seen["accepting"]
+                .as_array()?
+                .iter()
+                .find(|typed| typed["key"] == key)?
+                .clone();
+            let became = of_the_key["said"].as_str().unwrap_or_default().to_string();
+            (of_the_key["taken"] == true || !became.is_empty()).then_some(became)
+        },
+    );
+    format!("{said}\n{became}.")
 }
 
 /// `cordelia remove-device` on `device`, for the device whose key is

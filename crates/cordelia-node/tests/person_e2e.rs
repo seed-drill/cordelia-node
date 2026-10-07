@@ -1226,7 +1226,9 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&laptop_key)
     ));
     at.says("Type yes to go on").types("yes");
-    let said = at.done();
+    // The command stays a minute: where the hand-over is read later than
+    // that, the node says what became of the key.
+    let said = became_of_the_key(&tablet, &laptop_key, at.done());
     assert!(
         said.contains("this device has applied change 2, which it was handed"),
         "{said}"
@@ -1727,7 +1729,10 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         .at_terminal(&["add-device", &key_of(&relay)])
         .refused();
     assert!(said.contains("two changes were made apart"), "{said}");
-    let said = forked.at_terminal(&["accept", &key_of(other)]).refused();
+    // (It asks nothing, and so ends at once.)
+    let said = forked
+        .at_terminal(&["accept", &key_of(other)])
+        .refused_within(std::time::Duration::from_secs(60));
     assert!(said.contains("the fork is settled"), "{said}");
     let said = forked.at_terminal(&["renew"]).refused();
     assert!(said.contains("two changes were made apart"), "{said}");
