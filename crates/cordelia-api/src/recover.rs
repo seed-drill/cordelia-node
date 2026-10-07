@@ -223,7 +223,9 @@ pub struct Generation {
     /// out.
     pub not_shown: Vec<Row>,
     /// Each name that the personal channel lists, with the keys that
-    /// count and list it.
+    /// count and list it. A name that only keys list which do not count
+    /// is here too, with no key: nothing is taken for it, and it is
+    /// named among the names that are left.
     pub names: Vec<(String, Vec<[u8; 32]>)>,
     /// The one device of the statement, where the statement lists one
     /// alone and was made after another, and that device never wrote
@@ -372,10 +374,21 @@ pub fn read_generation(
     rows.extend(not_counted.into_iter().map(|(row, _)| row));
     let not_shown = rows.split_off(RECOVERY_MAX_DEVICES_SHOWN.min(rows.len()));
 
-    let names = names::listed(&conn)?
+    let mut names: Vec<(String, Vec<[u8; 32]>)> = names::listed(&conn)?
         .into_iter()
         .map(|listed| (listed.name, listed.by))
         .collect();
+    // A name that only keys list which do not count (§9): their words
+    // are in what the relays handed, and in no store, since nothing that
+    // such a key signed is taken. It is read from there, as the names of
+    // a generation before are, and listed by no key: the look leaves it,
+    // and the person is told that it did.
+    let of_no_count = |key: &[u8; 32]| !counting.counts(key);
+    for name in names_before(handed, secret, statement.number, of_no_count)? {
+        if !names.iter().any(|(listed, _)| *listed == name) {
+            names.push((name, Vec::new()));
+        }
+    }
 
     // Whether the one device of a statement that was made after another
     // wrote that it had sent what it carried (§8).
@@ -504,7 +517,8 @@ pub struct Names {
     /// The names that are left because the bound was reached.
     pub over_the_bound: Vec<String>,
     /// The names of the generation recovered from that only a device
-    /// lists from which nothing is taken.
+    /// lists from which nothing is taken: one that may be in someone
+    /// else's hands, and a key that does not count.
     pub only_other_hands: Vec<String>,
 }
 
@@ -1244,6 +1258,51 @@ mod tests {
         assert_eq!(on_neither, 0);
         let three = of(&[&fourth, &after_other, &other, &apart_from_second]).unwrap();
         assert_eq!(three.second().unwrap().1, 1);
+    }
+
+    /// **A name that only a key lists which does not count is named
+    /// among the names that the look leaves** (decision 2026-10-04 §9).
+    /// Such a key's word is in what the relays hand, and nothing that it
+    /// signed is taken: the name is read all the same, listed by no key,
+    /// not carried, and said. A name that a device which counts lists
+    /// too is listed once, by that device.
+    #[test]
+    fn test_a_name_that_only_a_key_which_does_not_count_lists_is_named_as_left() {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let (_, for_phrase) = read_with(&phrase(), &from.entry).unwrap();
+        let statement_key = *phrase().statement_key().unwrap();
+        let personal = derive::personal_secret(&for_phrase.secret).unwrap();
+        // A key that holds the generation's secret, and is no device of
+        // the statement nor added by one, says that it syncs a name of
+        // its own, and one that the devices list.
+        let stranger = identity_of(77);
+        let says = |name: &str| {
+            let word = names::word_name(name);
+            entry_by(&stranger, &personal, 1, &word, text("it syncs this"), &[])
+        };
+        let handed = &gone.at_the_relay[1].1;
+        let mut with_theirs = handed.clone();
+        with_theirs.extend([says("theirs"), says(LAB)]);
+        let reads = |handed: &[CheckedEntry]| {
+            read_generation(&from, &statement_key, &for_phrase.secret, handed, now()).unwrap()
+        };
+
+        let before = reads(handed);
+        assert!(before.names.iter().all(|(_, by)| !by.is_empty()));
+        let read = reads(&with_theirs);
+        // The stranger's own name, listed by no key, after those that
+        // devices list; and the other name once, by its devices.
+        let mut expected = before.names.clone();
+        expected.push(("theirs".to_string(), Vec::new()));
+        assert_eq!(read.names, expected);
+        assert_eq!(read.rows, before.rows);
+
+        let answers = [Answer::Lost, Answer::Lost];
+        let names = names_in_order(&read, &answers, &[], RECOVERY_MAX_NAMES);
+        assert_eq!(names.carried, ["desk", LAB]);
+        assert_eq!(names.only_other_hands, ["theirs"]);
+        assert!(names.over_the_bound.is_empty());
     }
 
     /// Six devices: 0, 1 and 2 are the statement's; device 1 added 3,

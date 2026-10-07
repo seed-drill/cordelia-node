@@ -386,7 +386,8 @@ fn will_do_lines(
     }
     if !names.only_other_hands.is_empty() {
         lines.push(format!(
-            "{} left, which only a device listed from which nothing is taken: {}.",
+            "{} left, which only a device listed from which nothing is taken, or a key that \
+             does not count: {}.",
             match names.only_other_hands.len() {
                 1 => "1 name is".to_string(),
                 n => format!("{n} names are"),
@@ -1235,7 +1236,8 @@ mod tests {
         );
         assert!(
             all.contains(
-                "1 name is left, which only a device listed from which nothing is taken: theirs."
+                "1 name is left, which only a device listed from which nothing is taken, or a \
+                 key that does not count: theirs."
             ),
             "{all}"
         );
