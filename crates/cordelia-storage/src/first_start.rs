@@ -621,6 +621,25 @@ pub fn step(
     Ok(Stepped { rows, notice })
 }
 
+/// Remove the key files of the older channels (decision 2026-10-04
+/// §10.1). Returns how many went, and how many are left: those that could
+/// not be removed. Nothing here fails: one that cannot be removed is
+/// counted, for the node to say, and looked for again at the next start.
+/// (Where the folder itself cannot be read, that counts as one left.)
+pub fn remove_older_key_files(data_dir: &Path) -> (usize, usize) {
+    let Ok(files) = older_key_files(data_dir) else {
+        return (0, 1);
+    };
+    let (mut removed, mut left) = (0, 0);
+    for file in files {
+        match std::fs::remove_file(&file) {
+            Ok(()) => removed += 1,
+            Err(_) => left += 1,
+        }
+    }
+    (removed, left)
+}
+
 // ── A node of the released version, for tests ────────────────────────
 
 /// A database and its key files as the released version (0.2.0-alpha.8)
@@ -1213,6 +1232,14 @@ mod tests {
         // No folder of channel keys is no key file.
         let none = tempfile::tempdir().unwrap();
         assert!(older_key_files(none.path()).unwrap().is_empty());
+
+        // Removing them removes those, and nothing else.
+        assert_eq!(remove_older_key_files(data), (released::KEY_FILES.len(), 0));
+        let mut left = names_in(&keys);
+        left.retain(|name| name != "linked.key");
+        assert_eq!(left, ["a-folder.key", "key", "notes.txt"]);
+        assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), [9u8; 32]);
+        assert_eq!(remove_older_key_files(none.path()), (0, 0));
     }
 
     // ── The step ─────────────────────────────────────────────────────
@@ -1596,5 +1623,33 @@ mod tests {
         );
         assert_eq!(read("done"), (false, "done".to_string()));
         assert_eq!(read(""), (false, String::new()));
+    }
+
+    // ── The key files, after the step ────────────────────────────────
+
+    /// The key files of the older channels are removed, and one that
+    /// cannot be removed is counted and left (decision 2026-10-04
+    /// §10.1): nothing fails by it.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_that_cannot_be_removed_is_counted_and_left() {
+        let (dir, _conn) = released_node(|_| {});
+        let data = dir.path();
+        let files = released::KEY_FILES.len();
+        // The folder of channel keys cannot be written: none can go.
+        set_mode(&data.join("channel-keys"), 0o500);
+        assert_eq!(remove_older_key_files(data), (0, files));
+        assert_eq!(older_key_files(data).unwrap().len(), files);
+        // Nor can it be read: that counts as one left.
+        set_mode(&data.join("channel-keys"), 0o000);
+        assert_eq!(remove_older_key_files(data), (0, 1));
+        set_mode(&data.join("channel-keys"), 0o700);
+
+        assert_eq!(remove_older_key_files(data), (files, 0));
+        assert!(older_key_files(data).unwrap().is_empty());
+        // The folder itself stays, and so does the device's own key.
+        assert!(names_in(&data.join("channel-keys")).is_empty());
+        assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), [9u8; 32]);
+        assert_eq!(remove_older_key_files(data), (0, 0));
     }
 }
