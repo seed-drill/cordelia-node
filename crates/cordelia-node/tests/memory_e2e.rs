@@ -529,6 +529,34 @@ fn connected_to_each(device: &Node, relays: usize) {
     });
 }
 
+/// Whether the store of `relay` holds the change entry numbered `number`
+/// of the phrase that `device` follows: the two databases are read
+/// beside their nodes. The change entry is the one entry of the phrase's
+/// channel, and its revision is the statement's number (decision
+/// 2026-10-04 §4.6).
+fn holds_the_change(relay: &Node, device: &Node, number: u64) -> bool {
+    let beside = |node: &Node| {
+        let conn = rusqlite::Connection::open_with_flags(
+            node.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        conn
+    };
+    let channel: Vec<u8> = beside(device)
+        .query_row("SELECT phrase_channel FROM person", [], |row| row.get(0))
+        .unwrap();
+    beside(relay)
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE channel_id = ?1 AND rev = ?2)",
+            rusqlite::params![channel, number as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 /// What a remaining device, a removed device and two relays are before
 /// the remaining device comes back (decision 2026-10-04 §4.6, §7.4).
 struct LateWrite {
@@ -597,17 +625,14 @@ fn a_removed_device_writes_late_while_another_is_off() -> LateWrite {
     // desktop removes the tablet: the change reaches one relay.
     laptop.stop();
     lacks.stop();
-    let held_by = format!("127.0.0.1:{}", has.p2p);
     {
         let mut at = removes(&desktop, &key_of(&tablet), &["stays"], &words);
         at.says("The change is made (change 2)");
-        wait_for("the relay holds the change", &[&has, &desktop], 60, || {
-            let seen = person_of(&desktop);
-            let relays = seen["relays"].as_array()?;
-            let there = relays
-                .iter()
-                .find(|relay| relay["relay"] == held_by.as_str())?;
-            (seen["change"] == 2 && there["holds_latest"] == true).then_some(())
+        // The relay's own store is asked, and not the desktop's status:
+        // what a device says of a relay is what the relay last answered,
+        // and the desktop is turned off as soon as the relay holds it.
+        wait_for("the relay holds the change", &[&has, &desktop], 90, || {
+            holds_the_change(&has, &desktop, 2).then_some(())
         });
     }
     desktop.stop();
