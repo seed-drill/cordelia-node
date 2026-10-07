@@ -2161,6 +2161,95 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     assert_eq!(other.stands(), Stands::Stopped(State::Fork));
 }
 
+/// **A statement that no relay held, shown later** (decision 2026-10-04
+/// §7.6). The desktop makes a change with no relay in reach, and is
+/// lost. The laptop, which has seen no statement, makes the change
+/// again: it has the number that the lost one had, and its relay holds
+/// it. The other relay holds the entry from before.
+///
+/// The lost device comes to light at that other relay: **the relay,
+/// which holds an earlier change entry, takes the one it is shown.** The
+/// tablet, **which is behind, is answered with it there and applies
+/// it:** it is with the lost device. The laptop, **which has applied the
+/// other statement at that number, is shown it there and is in a
+/// fork;** and so is the tablet, once it is shown the laptop's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
+    let (near, far) = (relay_started("near", None), relay_started("far", None));
+    let (mut lost, mut remains, mut behind) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    lost.makes_the_phrase(&phrase());
+    lost.adds(&remains);
+    lost.adds(&behind);
+    // The laptop is at one relay and the tablet at the other. The
+    // desktop is at both: each relay holds the first change entry.
+    lost.connects("near", &near).await;
+    lost.connects("far", &far).await;
+    remains.connects("near", &near).await;
+    behind.connects("far", &far).await;
+    all_pass(&[&lost, &remains, &behind], 3).await;
+    let first = lost.latest();
+    for relay in [&near, &far] {
+        assert!(holds_at(relay, &first.channel, &first.id()));
+    }
+
+    // The desktop makes a change with no relay in reach, and is lost:
+    // no relay held it. The tablet is off.
+    lost.disconnects("near");
+    lost.disconnects("far");
+    behind.disconnects("far");
+    let unheard = lost.changes(&phrase(), &[&lost, &remains, &behind], &[]);
+    // The laptop has seen no statement. The change that it makes, which
+    // removes the desktop, has the number that the lost one had. Its
+    // relay holds it, and the other holds the entry from before.
+    let again = remains.changes(&phrase(), &[&remains, &behind], &[&lost]);
+    assert_eq!(again.rev, unheard.rev);
+    assert_ne!(again.id(), unheard.id());
+    remains.passes().await;
+    assert!(holds_at(&near, &again.channel, &again.id()));
+    assert!(holds_at(&far, &first.channel, &first.id()));
+
+    // The lost device comes to light at the relay that holds the
+    // earlier entry: the relay takes the one it is shown.
+    lost.connects("far", &far).await;
+    lost.passes().await;
+    let at_far = held_at(&far, &unheard.channel);
+    assert_eq!(at_far.len(), 1);
+    assert_eq!(at_far[0].id(), unheard.id());
+
+    // The tablet, which is behind, is answered with it there, and
+    // applies it: it is with the lost device.
+    assert_eq!(behind.latest().id(), first.id());
+    behind.connects("far", &far).await;
+    behind.passes().await;
+    assert_eq!(behind.latest().id(), unheard.id());
+    assert_eq!(behind.stands(), Stands::Applied);
+
+    // The laptop has applied the other statement at that number. Shown
+    // the lost one's at that relay, it is in a fork, and keeps both.
+    remains.connects("far", &far).await;
+    remains.passes().await;
+    assert_eq!(remains.stands(), Stands::Stopped(State::Fork));
+    let shows = at_relays::to_show(&remains.db()).unwrap().unwrap();
+    assert_eq!(
+        (shows.entry.id(), shows.apart),
+        (again.id(), Some(unheard.id()))
+    );
+    // And the tablet, which applied the lost one's, is in a fork once it
+    // is shown the laptop's, at the relay that holds that one.
+    behind.connects("near", &near).await;
+    behind.passes().await;
+    assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
+    let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
+    assert_eq!(
+        (shows.entry.id(), shows.apart),
+        (unheard.id(), Some(again.id()))
+    );
+}
+
 /// The channels that `request` names: the one that is proved or pulled,
 /// and the channel of each entry that is pushed. None for a show.
 fn channels_named(request: &WireMessage) -> Vec<[u8; 32]> {
