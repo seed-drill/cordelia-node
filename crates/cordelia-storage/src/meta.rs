@@ -55,6 +55,13 @@ pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 /// at each statement applied.
 pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 
+/// Present where the statement that this device has applied removes a key
+/// that the statement it held before did not (decision 2026-10-04
+/// §10.1), as the device found it at the moment it applied the
+/// statement: a renewal removes nobody, though its list of removed keys
+/// names every key removed so far. Written at each statement applied.
+pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

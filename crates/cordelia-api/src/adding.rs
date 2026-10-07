@@ -1250,6 +1250,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     sync_state::forget_folders_except(conn, &[])?;
     held_rows::forget_names_before(conn, None)?;
     meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
+    meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?;
     Ok(())
 }
 

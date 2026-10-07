@@ -1926,6 +1926,65 @@ mod tests {
         assert_eq!(seen(&s, 0).change, Some(3));
     }
 
+    /// A look says whether the change that the device applied removed a
+    /// key that the statement before had not, as the device found it
+    /// when it applied the change (decision 2026-10-04 §10.1). A renewal
+    /// removes nobody, though its statement lists every key removed so
+    /// far: a status does not then say that a removal is not yet applied.
+    #[test]
+    fn test_a_look_says_whether_the_change_removed_a_key() {
+        let mut s = Several::of_one_person(3);
+        let seen = |s: &Several, n: usize| {
+            look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
+        };
+        let removed = |s: &Several, n: usize| {
+            let seen = seen(s, n);
+            (seen.removed_a_key, seen.removed.len())
+        };
+        // Under the first statement nobody was removed.
+        assert_eq!(removed(&s, 0), (false, 0));
+        // Device 2 is removed: on the device that made the change, and
+        // on one that applies it.
+        let removal = s.change(0, &[0, 1], &[2]);
+        assert_eq!(removed(&s, 0), (true, 1));
+        assert_eq!(removed(&s, 1), (false, 0));
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &removal, now).unwrap();
+        assert_eq!(removed(&s, 1), (true, 1));
+        // A renewal: its statement lists the key removed before, and
+        // removes nobody.
+        let renewal = s.change(0, &[0, 1], &[]);
+        assert_eq!(removed(&s, 0), (false, 1));
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+        assert_eq!(seen(&s, 1).change, Some(3));
+        assert_eq!(removed(&s, 1), (false, 1));
+        // A device that leaves its phrase keeps nothing of it.
+        s.change(0, &[0], &[1]);
+        assert_eq!(removed(&s, 0), (true, 2));
+        let now = s.tick();
+        crate::leaving::forget(&s[0].conn, &s[0].identity, false, now).unwrap();
+        assert_eq!(
+            meta::get(&s[0].conn, meta::PERSON_REMOVED_A_KEY).unwrap(),
+            None
+        );
+    }
+
+    /// A device that applies a removal after it was behind sees the key
+    /// removed against the statement it held (decision 2026-10-04 §10.1):
+    /// where it comes to a renewal that was made after a removal it never
+    /// applied, a key was removed since what it held.
+    #[test]
+    fn test_a_device_that_was_behind_sees_a_key_removed_since_what_it_held() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let renewal = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+        let seen = look(&s[1].conn, &s[1].identity, &AtRelays::default(), now).unwrap();
+        assert_eq!((seen.change, seen.removed_a_key), (Some(3), true));
+    }
+
     /// What another device wrote as a name and is none is not shown by a
     /// look, in anything it says or lists: it is counted, and said as a
     /// number (decision 2026-10-04 §16). So neither `cordelia devices` nor

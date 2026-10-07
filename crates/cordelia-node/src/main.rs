@@ -1019,10 +1019,12 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
     let ago = |at: &serde_json::Value| at.as_i64().map(|at| now.saturating_sub(at).max(0) as u64);
     let change = person["change"].as_u64();
     let applied_secs = ago(&person["applied_at"]);
-    // A removal stands where the statement lists a key as removed, and
-    // is not applied by a device that does not say it has applied that
-    // statement.
-    let removal = list("removed").next().is_some();
+    // A removal stands where the change that this device applied removed
+    // a key that the statement before had not, as the node kept it then:
+    // a renewal removes nobody, though it lists every key removed so
+    // far. It is not applied by a device that does not say it has
+    // applied that statement.
+    let removal = person["removed_a_key"] == true;
     let not_by_all = list("devices").any(|device| device["applied"].as_u64() != change);
     let said_left = list("devices").chain(list("added"));
     indicator::Devices {
@@ -5037,6 +5039,7 @@ mod tests {
             "state": "applied",
             "change": 3,
             "applied_at": now - 3_600,
+            "removed_a_key": true,
             "cannot_go_on": null,
             "devices": [
                 { "this_device": true, "applied": 3, "left": false },
@@ -5095,8 +5098,18 @@ mod tests {
         // nor one of which this device does not know when it applied it.
         let all_applied = edit(&|look| look["devices"][1]["applied"] = 3.into());
         assert_eq!(all_applied.removal_not_applied_secs, None);
-        let none_removed = edit(&|look| look["removed"] = serde_json::json!([]));
+        // A renewal: the statement lists the keys removed so far, and
+        // removed none itself. So too beside a node that does not say.
+        let none_removed = edit(&|look| look["removed_a_key"] = false.into());
         assert_eq!(none_removed.removal_not_applied_secs, None);
+        let not_said = edit(&|look| {
+            look.as_object_mut().unwrap().remove("removed_a_key");
+        });
+        assert_eq!(not_said.removal_not_applied_secs, None);
+        // And a statement that lists no key as removed, were it said to
+        // have removed one, is read as the node says it.
+        let listed_none = edit(&|look| look["removed"] = serde_json::json!([]));
+        assert_eq!(listed_none.removal_not_applied_secs, Some(3_600));
         let not_known = edit(&|look| look["applied_at"] = serde_json::Value::Null);
         assert_eq!(not_known.removal_not_applied_secs, None);
         assert_eq!(not_known.applied_secs, None);

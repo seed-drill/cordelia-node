@@ -1355,6 +1355,16 @@ fn come_to(
     // What a name's folders had agreed in a slot that held no version is
     // noted, for `cordelia devices` to say which files (§4.2).
     crate::look::note_not_carried(conn, &applied.not_carried)?;
+    // Whether this statement removes a key that the one before did not
+    // is kept now, while both are at hand (§10.1): a status says that a
+    // removal is not yet applied by every device only where it does. A
+    // renewal removes nobody, and a device that comes to its first
+    // statement saw nobody removed.
+    let removes_a_key = before.is_some_and(|before| {
+        let had = &before.statement.statement;
+        statement.removed.iter().any(|key| !had.removes(key))
+    });
+    crate::look::note_removed_a_key(conn, removes_a_key)?;
     // A name that a device lists in the generation it has come to, or
     // that it left 90 days ago, is noted no more.
     held_rows::forget_names_before(conn, Some(now))?;

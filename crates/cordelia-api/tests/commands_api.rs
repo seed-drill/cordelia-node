@@ -532,6 +532,8 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
     assert_eq!(seen["change"], 1);
     assert!(seen["applied_at"].is_null(), "{seen}");
     assert!(seen.as_object().unwrap().contains_key("applied_at"));
+    // And it removed nobody.
+    assert_eq!(seen["removed_a_key"], false, "{seen}");
     // Nothing waits to be sent: no time since when.
     assert_eq!(seen["names"]["to_go"], json!([]));
     assert!(seen["names"]["to_go_since"].is_null(), "{seen}");

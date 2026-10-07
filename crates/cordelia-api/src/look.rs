@@ -259,6 +259,11 @@ pub struct Look {
     /// it left a generation for it and still keeps that generation's
     /// secret: when it left. `None` on a device that has left none.
     pub applied_at: Option<i64>,
+    /// Whether that statement removed a key that the statement which
+    /// this device held before it did not, as the device found it when
+    /// it applied the statement (decision 2026-10-04 §10.1). A renewal
+    /// removes nobody, though it lists every key removed so far.
+    pub removed_a_key: bool,
     /// What the change entry of that statement is named by, in hex: the
     /// latest that the device keeps. A command that made a change, and
     /// lost the node's answer, learns by it whether the node made it
@@ -376,6 +381,7 @@ pub fn look(
             may_add: false,
             change: None,
             applied_at: None,
+            removed_a_key: false,
             latest: None,
             phrase_words: None,
             statements_left: None,
@@ -454,6 +460,7 @@ fn of_its_person(
     // It left the generation before when it applied this one.
     let left = held_rows::secrets(conn)?;
     look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
+    look.removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?.is_some();
     look.latest = Some(hex::encode(latest_entry(conn)?.id()));
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
@@ -730,6 +737,18 @@ pub(crate) fn note_not_carried(
     let noted = serde_json::to_string(&noted)
         .map_err(|e| PersonError::Held(format!("the files that were not carried: {e}")))?;
     meta::set(conn, meta::PERSON_NOT_CARRIED, &noted)?;
+    Ok(())
+}
+
+/// Keep whether the statement that this device has just applied removes
+/// a key that the statement before did not, for a status to go by
+/// (decision 2026-10-04 §10.1). What was kept at the statement before is
+/// replaced.
+pub(crate) fn note_removed_a_key(conn: &Connection, removes: bool) -> Result<(), PersonError> {
+    match removes {
+        true => meta::set(conn, meta::PERSON_REMOVED_A_KEY, "1")?,
+        false => meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?,
+    }
     Ok(())
 }
 
