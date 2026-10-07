@@ -11,6 +11,7 @@ use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
+mod carry_cmd;
 mod history_cmd;
 mod indicator;
 mod p2p;
@@ -258,6 +259,14 @@ enum SyncCommand {
     Unmap {
         /// The folder, or the name it is mapped to
         folder: String,
+    },
+    /// Bring in what your devices had sent to the relays before a change,
+    /// and that no device carried: the last edits of a device that never
+    /// returned, or a name that no device syncs any more. It reads each
+    /// generation that this device left in the last 90 days.
+    Carry {
+        /// The name to carry (default: every name this device holds)
+        name: Option<String>,
     },
     /// Stop syncing (files already synced are left in place)
     Off,
@@ -2742,7 +2751,7 @@ fn still_waiting() {
 /// takes: what the node carries out to the end whether or not anyone
 /// waits (a restore) is waited for, so that the command says what it did.
 /// With no limit it says, once, that it is still waiting.
-fn api_post_within(
+pub(crate) fn api_post_within(
     config_path: &str,
     path: &str,
     body: serde_json::Value,
@@ -3067,6 +3076,9 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     // the end waits for a report made after it.
     let since: Option<u64>;
     match what {
+        // A carry that a person asks for changes no setting, and prints
+        // what it did itself.
+        SyncCommand::Carry { name } => return carry_cmd::carry(config_path, name),
         SyncCommand::Claude {
             dir,
             mapped_only,
@@ -3259,7 +3271,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 if let MapStep::UnmapFirst(mapped) = map_step(&request, &home_dir, &mappings) {
                     return Err(unmap_first(&mapped));
                 }
-                let settings = api_post(
+                // A device that comes to sync a name carries it first,
+                // before this is answered: so it waits for as long as
+                // that may take (decision 2026-10-04 §7.3).
+                let settings = api_post_within(
                     config_path,
                     "/api/v1/sync/map",
                     serde_json::json!({
@@ -3267,6 +3282,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                         "name": request.name,
                         "home": request.home,
                     }),
+                    Some(carry_cmd::MAP_WAITS),
                 )?;
                 since = settings["generation"].as_u64();
                 if root != given {
@@ -3279,6 +3295,11 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     short_path(&mapped_folder),
                     sync_label(&name)
                 );
+                // What the mapping carried for the name, from what the
+                // relays hold of the generations that this device left.
+                for line in carry_cmd::carried_lines(&settings["carried"]) {
+                    println!("{line}");
+                }
                 // Say so when the folder synced may not be the one Claude Code
                 // uses, rather than report "syncing" and leave it to be found.
                 let claude_dir = settings["dir"].as_str().unwrap_or_default();

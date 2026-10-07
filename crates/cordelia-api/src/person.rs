@@ -1446,6 +1446,10 @@ fn note_left_out(
             .label;
         counted.push((record.key, label));
     }
+    // What this device called each key that the statement removes is
+    // kept: a statement lists removed keys bare, and a person names one
+    // by its label where they bring in what it wrote (§7.3).
+    crate::look::note_removed_labels(conn, statement, &counted)?;
     // Each is noted. One that the statement lists, in either list, is
     // shown no more by the time the statement is applied: that is asked
     // for every key that is noted, this statement's and an earlier
@@ -1583,7 +1587,7 @@ impl Carry<'_> {
 /// from ([`chain::carried_from`]): the entry's chain as it is where this
 /// device signed it, and otherwise that entry's link first and then its
 /// chain. One entry's chain is never put behind another entry's signer.
-fn carried_entry(
+pub(crate) fn carried_entry(
     identity: &NodeIdentity,
     to: &[u8; 32],
     version: &Version,

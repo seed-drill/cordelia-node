@@ -481,8 +481,13 @@ fn of_its_person(
             left: reader.left(conn, &device.key)?.is_some() || kept_left.contains(&device.key),
         });
     }
+    // A statement lists a removed key bare: it is shown by what this
+    // device called it, where it knew it by a label.
+    let labels = removed_labels(conn)?;
     for key in &statement.removed {
-        look.removed.push(Shown::of(key, "")?);
+        let label = labels.iter().find(|(known, _)| known == key);
+        look.removed
+            .push(Shown::of(key, label.map_or("", |(_, label)| label))?);
     }
 
     // Those added since: for each key that the statement does not list,
@@ -737,6 +742,55 @@ pub(crate) fn note_not_carried(
     let noted = serde_json::to_string(&noted)
         .map_err(|e| PersonError::Held(format!("the files that were not carried: {e}")))?;
     meta::set(conn, meta::PERSON_NOT_CARRIED, &noted)?;
+    Ok(())
+}
+
+/// What this device called each key that a statement it applied
+/// removed, where it knew the key by a label (decision 2026-10-04 §7.3,
+/// §8): a statement lists removed keys bare.
+pub fn removed_labels(conn: &Connection) -> Result<Vec<([u8; 32], String)>, PersonError> {
+    let kept: std::collections::BTreeMap<String, String> =
+        meta::get(conn, meta::PERSON_REMOVED_LABELS)?
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+    Ok(kept
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let key: [u8; 32] = hex::decode(key).ok()?.try_into().ok()?;
+            Some((key, label))
+        })
+        .collect())
+}
+
+/// Keep what this device called each of `removed`, keys that the
+/// statement it has just applied removes, beside what it kept of those
+/// removed before (decision 2026-10-04 §7.3). `statement` is that
+/// statement: a label is kept only of a key that it lists as removed, and
+/// what is kept of a key that it does not list so goes. An empty label is
+/// none.
+pub(crate) fn note_removed_labels(
+    conn: &Connection,
+    statement: &Statement,
+    removed: &[([u8; 32], String)],
+) -> Result<(), PersonError> {
+    let mut kept = removed_labels(conn)?;
+    for (key, label) in removed {
+        if !label.is_empty() && !kept.iter().any(|(known, _)| known == key) {
+            kept.push((*key, label.clone()));
+        }
+    }
+    kept.retain(|(key, _)| statement.removes(key));
+    if kept.is_empty() {
+        meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
+        return Ok(());
+    }
+    let as_kept: std::collections::BTreeMap<String, &String> = kept
+        .iter()
+        .map(|(key, label)| (hex::encode(key), label))
+        .collect();
+    let as_kept = serde_json::to_string(&as_kept)
+        .map_err(|e| PersonError::Held(format!("the labels of the removed keys: {e}")))?;
+    meta::set(conn, meta::PERSON_REMOVED_LABELS, &as_kept)?;
     Ok(())
 }
 
@@ -1679,8 +1733,10 @@ mod tests {
         assert_eq!(look.notices.len(), told_before);
     }
 
-    /// The keys that the statement removed are listed, bare: a statement
-    /// lists them so.
+    /// The keys that the statement removed are listed. A statement lists
+    /// them bare: each is shown with the label that this device knew it
+    /// by when it applied the statement that removed it (decision
+    /// 2026-10-04 §7.3), and with none on a device that never knew it.
     #[test]
     fn test_the_keys_that_the_statement_removed_are_listed() {
         let mut s = Several::of_one_person(3);
@@ -1689,8 +1745,20 @@ mod tests {
         assert_eq!(look.removed.len(), 1);
         assert_eq!(look.removed[0].key, encode_public_key(&s.key(2)).unwrap());
         assert_eq!(look.removed[0].words, fingerprint::shown(&s.key(2)));
-        assert_eq!(look.removed[0].label, "");
+        assert_eq!(look.removed[0].label, "device 2");
         assert_eq!(look.devices.len(), 2);
+        assert_eq!(
+            removed_labels(&s[0].conn).unwrap(),
+            [(s.key(2), "device 2".to_string())]
+        );
+        // The label is kept across a later change, for as long as the
+        // statement lists the key as removed.
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(seen(&s, 0).removed[0].label, "device 2");
+        // A device that leaves forgets them with everything else.
+        let now = s.tick();
+        crate::leaving::forget(&s[0].conn, &s[0].identity, false, now).unwrap();
+        assert!(removed_labels(&s[0].conn).unwrap().is_empty());
     }
 
     /// A key that the device counted before a statement, and that is in

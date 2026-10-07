@@ -505,4 +505,9 @@ pub struct SyncStatusResponse {
     /// (`POST /api/v1/sync/seen`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<crate::found::NoticeShown>,
+    /// What a mapping carried for the name that the device came to sync
+    /// by it (decision 2026-10-04 §7.3): only in the answer to the
+    /// request that mapped the folder, and only where a carry was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried: Option<serde_json::Value>,
 }

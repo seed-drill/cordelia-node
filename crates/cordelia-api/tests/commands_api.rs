@@ -403,7 +403,108 @@ fn routes() -> Vec<(&'static str, Value)> {
             "/api/v1/change/make",
             json!({ "entry": "00", "over": "00" }),
         ),
+        ("/api/v1/carry", json!({ "name": "lab" })),
     ]
+}
+
+/// A carry that a person asks for, at the route (decision 2026-10-04
+/// §7.3). It is refused on a device that follows no phrase, and for what
+/// is no name. A device that has left no generation has nothing to read,
+/// and says so, with nothing held. One that has left one comes to hold
+/// the name, and lists it, so that its new channel is fetched and what
+/// is carried is sent; with no network it reads nothing, of no relay,
+/// and says that it did not read to the end.
+#[actix_web::test]
+async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_was_left() {
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let carry = json!({ "name": "lab" });
+    // No phrase.
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string().contains("follows no recovery phrase"),
+        "{said}"
+    );
+
+    // Under its first statement: no generation was left.
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    woken(&state).await;
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 200, "{said}");
+    assert!(
+        said["nothing"]
+            .as_str()
+            .unwrap()
+            .contains("holds the secret of no generation that it left"),
+        "{said}"
+    );
+    assert_eq!(said["held_anew"], false);
+    let held = |state: &AppState| {
+        let db = state.db.lock().unwrap();
+        cordelia_storage::person::channel_of_name(&db, "lab").unwrap()
+    };
+    assert_eq!(held(&state), None);
+    assert_eq!(woken(&state).await, (false, false));
+
+    // A change is made: the device has left a generation.
+    let (_, handed) = asks!(app, "/api/v1/change/prepare", json!({}));
+    let applied =
+        SignedStatement::from_bytes(&hex::decode(handed["statement"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let kept = Entry::from_wire(&hex::decode(handed["entry"].as_str().unwrap()).unwrap())
+        .unwrap()
+        .check()
+        .unwrap();
+    let own = state.identity.public_key();
+    let phrase = Phrase::parse(WORDS).unwrap();
+    let entry = prepare_change(&applied, &own, applied.statement.devices.clone(), &[])
+        .unwrap()
+        .sign(&phrase, &kept, None)
+        .unwrap();
+    let body = json!({ "entry": hex::encode(entry.to_wire()), "over": handed["over"] });
+    let (status, made) = asks!(app, "/api/v1/change/make", body);
+    assert_eq!(status, 200, "{made}");
+    woken(&state).await;
+
+    // What is no name is refused, with nothing held.
+    let (status, said) = asks!(app, "/api/v1/carry", json!({ "name": "Not A Name" }));
+    assert_eq!(status, 400, "{said}");
+
+    // The name: it is held and listed, the node is woken to send that,
+    // and each generation that was left is said, with what was read
+    // there: nothing, of no relay.
+    let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["name"], "lab");
+    assert_eq!(said["held_anew"], true);
+    assert_eq!(said["carried"], 0);
+    assert_eq!(said["read_all"], false);
+    assert!(said["nothing"].is_null(), "{said}");
+    assert_eq!(
+        said["generations"],
+        json!([{ "number": 1, "relays": [], "by_other_keys": 0 }])
+    );
+    assert!(held(&state).is_some());
+    assert!(woken(&state).await.0);
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    let names: Vec<&str> = seen["names"]["sent"]
+        .as_array()
+        .into_iter()
+        .chain(seen["names"]["to_go"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(names, ["lab"]);
+    // Asked again, the name is held already.
+    let (_, said) = asks!(app, "/api/v1/carry", carry);
+    assert_eq!(said["held_anew"], false);
 }
 
 /// Once a device was given a new key, the node that still runs under the

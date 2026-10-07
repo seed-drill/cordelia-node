@@ -62,6 +62,21 @@ pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 /// names every key removed so far. Written at each statement applied.
 pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
 
+/// JSON array of the names that this device holds by a carry that a
+/// person asked for, or by a recovery, with no folder of its own mapped
+/// to them (decision 2026-10-04 §7.3, §9): it holds each, and lists it
+/// in the personal channel, whether or not sync is on here. A name goes
+/// from the list when the device stops it, and the list goes when the
+/// device leaves its phrase.
+pub const PERSON_NAMES_CARRIED: &str = "person.names_carried";
+
+/// JSON object of what this device called each key that a statement it
+/// applied removed, by the key in hex (decision 2026-10-04 §7.3): a
+/// statement lists removed keys bare, and a person names one by its
+/// label at `cordelia sync carry --from`. A key that the device never
+/// knew by a label is not in it.
+pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

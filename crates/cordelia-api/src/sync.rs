@@ -99,6 +99,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             held: state.held.why().map(|held| held.says().to_string()),
             moved_on: crate::look::moved_on(&db)?,
             notice: None,
+            carried: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
         let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
@@ -954,6 +955,17 @@ const MAP_TRIES: usize = 3;
 /// second hold, where no setting has changed in between. Where one has,
 /// the check is made again, a few times; and then the request is refused,
 /// with nothing mapped.
+///
+/// **A device that comes to sync a name carries it first** (decision
+/// 2026-10-04 §7.3). Where the mapping has the device hold a name that
+/// it did not hold, and it still holds the secret of a generation that
+/// it left, the name's channel in those generations is read at the
+/// relays before this answers, and what keys that count signed there is
+/// carried, where the new channel holds nothing for the name
+/// ([`crate::carrying::carry_name`]). The folder's first cycle waits for
+/// that ([`crate::state::OwnChannels::carrying`]), so that what it
+/// publishes is written over what was carried. The answer says what was
+/// carried.
 pub async fn map(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -967,6 +979,7 @@ pub async fn map(
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))
     };
+    let mut carries_first: Vec<(String, [u8; 32])> = Vec::new();
     for tried in 1..=MAP_TRIES {
         let asked = map_asked(&state.sync_control, &*lock()?, &body, &home_dir)?;
         let looked = asked.as_ref().map(|asked| map_looked(asked, &home_dir));
@@ -979,9 +992,64 @@ pub async fn map(
         let before = mapped_names(&db)?;
         add_mapping_looked(&state.sync_control, &db, &body, &home_dir, looked.as_ref())?;
         names_follow(&state, &db, &before);
+        carries_first = carries_first_for(&state, &db, &before);
         break;
     }
-    Ok(HttpResponse::Ok().json(status(&state)?))
+    // The carry, with the lock let go: it waits on the relays.
+    let mut carried = None;
+    for (name, channel) in carries_first {
+        let done = crate::carrying::carry_name(&state, &name, true).await;
+        state.own_channels.carried(&channel);
+        match done {
+            Ok(done) => carried = Some(done.says(&name)),
+            Err(error) => {
+                tracing::warn!(%error, "sync: the name that was mapped could not be carried")
+            }
+        }
+    }
+    let mut status = status(&state)?;
+    status.carried = carried;
+    Ok(HttpResponse::Ok().json(status))
+}
+
+/// The names that a mapping has this device hold anew, each with the ID
+/// of its channel, where the device carries a name before its folder's
+/// first cycle (decision 2026-10-04 §7.3): it has applied a statement,
+/// and still holds the secret of a generation that it left. `before` is
+/// the names its folders were mapped to before the mapping.
+///
+/// The folder's first cycle is held back for each from here on
+/// ([`crate::state::OwnChannels::carrying`]), under the hold of the
+/// database's lock that the mapping was stored under: no cycle runs
+/// between the two.
+fn carries_first_for(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    before: &[String],
+) -> Vec<(String, [u8; 32])> {
+    use cordelia_storage::person as held_rows;
+    let applied = matches!(
+        crate::at_relays::stands(db),
+        Ok(crate::at_relays::Stands::Applied)
+    );
+    let left_one = held_rows::secrets(db)
+        .is_ok_and(|secrets| secrets.iter().any(|secret| secret.left_at.is_some()));
+    if !applied || !left_one {
+        return Vec::new();
+    }
+    let mut anew = Vec::new();
+    for name in mapped_names(db).unwrap_or_default() {
+        if before.contains(&name) {
+            continue;
+        }
+        if let Ok(Some(channel)) = held_rows::channel_of_name(db, &name) {
+            state
+                .own_channels
+                .carrying(&channel, std::time::Instant::now());
+            anew.push((name, channel));
+        }
+    }
+    anew
 }
 
 // ── POST /api/v1/sync/unmap ────────────────────────────────────────

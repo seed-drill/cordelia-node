@@ -30,6 +30,13 @@
 //!   that a device can show the names that no device lists yet in the new
 //!   generation ([`not_listed_yet`]).
 //!
+//! - **A name that a device holds by a carry, with no folder mapped to
+//!   it,** is listed all the same ([`hold_for_a_carry`], decision
+//!   2026-10-04 §7.3, §9): a person asked for the name by a command, or
+//!   recovered it, and the device holds its channel and sends it,
+//!   whether or not sync is on here. Its word is taken back by nothing
+//!   but the device's stopping the name.
+//!
 //! Plain functions over the node's database and the device's own key.
 //! Nothing here sends anything: what is written waits in the store, and
 //! the node sends it.
@@ -389,17 +396,81 @@ pub fn hold_mapped(
 /// Sync was turned off here: this device says of no name that it syncs
 /// it. Returns how many words were written over. The names stay held:
 /// their folders are still mapped.
+///
+/// **A name that the device holds by a carry keeps its word**
+/// ([`hold_for_a_carry`]): no folder of this device's syncs it, with
+/// sync on or off, and the device goes on holding its channel and
+/// sending it all the same.
 pub fn unsay_all(
     conn: &Connection,
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<usize, PersonError> {
     in_one(conn, || {
+        let kept = carried(conn)?;
         let mut written = 0;
         for name in said_here(conn, identity)? {
+            if kept.contains(&name) {
+                continue;
+            }
             written += usize::from(unsay(conn, identity, &name, now)?);
         }
         Ok(written)
+    })
+}
+
+/// The names that this device holds by a carry that a person asked for,
+/// or by a recovery, with no folder of its own mapped to them (decision
+/// 2026-10-04 §7.3, §9).
+pub fn carried(conn: &Connection) -> Result<BTreeSet<String>, PersonError> {
+    Ok(meta::get(conn, meta::PERSON_NAMES_CARRIED)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default())
+}
+
+/// Keep `names` as the names that this device holds by a carry.
+fn keep_carried(conn: &Connection, names: &BTreeSet<String>) -> Result<(), PersonError> {
+    if names.is_empty() {
+        meta::remove(conn, meta::PERSON_NAMES_CARRIED)?;
+        return Ok(());
+    }
+    let kept = serde_json::to_string(names)
+        .map_err(|e| PersonError::Held(format!("the names held by a carry: {e}")))?;
+    meta::set(conn, meta::PERSON_NAMES_CARRIED, &kept)?;
+    Ok(())
+}
+
+/// This device comes to hold `name` for a carry that a person asked for
+/// (decision 2026-10-04 §7.3, §9): it holds the name, so that its channel
+/// is fetched and what is carried into it is sent, and it lists the name
+/// in the personal channel, so that every device of the person's, and a
+/// recovery that follows, finds the name in the generation applied.
+/// Returns the ID of the name's channel.
+///
+/// Where no folder of this device's is mapped to the name, that it holds
+/// the name by a carry is kept ([`carried`]): its word then stands with
+/// sync on or off, and a cycle that finds no folder for it does not stop
+/// it. A name that a folder is mapped to is held for the folder, and
+/// nothing more is kept of it.
+///
+/// Refused on a device that follows no phrase, or has stopped, and for a
+/// name that is none in its one spelling.
+pub fn hold_for_a_carry(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    now: i64,
+) -> Result<[u8; 32], PersonError> {
+    in_one(conn, || {
+        let channel = hold_name(conn, name, now)?;
+        say(conn, identity, name, now)?;
+        if !mapped(conn)?.iter().any(|mapped| mapped == name) {
+            let mut kept = carried(conn)?;
+            if kept.insert(name.to_string()) {
+                keep_carried(conn, &kept)?;
+            }
+        }
+        Ok(channel)
     })
 }
 
@@ -440,6 +511,11 @@ pub fn stop(
         // A file under it whose record could not be carried has no
         // channel to meet here now: it is noted no longer.
         crate::look::forget_not_carried_of(conn, name)?;
+        // Nor is the name held by a carry any longer.
+        let mut kept = carried(conn)?;
+        if kept.remove(name) {
+            keep_carried(conn, &kept)?;
+        }
         let Some(channel) = held_rows::channel_of_name(conn, name)? else {
             return Ok(None);
         };
@@ -1304,6 +1380,60 @@ mod tests {
         let mut after = noted(&s);
         after.sort_by_key(|(name, key)| (name.clone(), *key));
         assert_eq!(after, [("lab".into(), 2), ("tablets".into(), 2)]);
+    }
+
+    /// A name that a device holds for a carry that a person asked for is
+    /// held and listed with no folder mapped to it (decision 2026-10-04
+    /// §7.3, §9): its word stands with sync off, and is taken back only
+    /// where the device stops the name. A name that a folder is mapped
+    /// to is held for the folder, and its word goes with sync.
+    #[test]
+    fn test_a_name_held_for_a_carry_is_listed_with_no_folder_and_with_sync_off() {
+        let mut s = Several::of_one_person(1);
+        let now = s.tick();
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        maps(&s[0], &["mapped"], true);
+        hold_mapped(conn, identity, now).unwrap();
+        assert!(carried(conn).unwrap().is_empty());
+
+        let channel = hold_for_a_carry(conn, identity, "brought", now).unwrap();
+        assert_eq!(channel, derive::channel_id(&s[0].own("brought")).unwrap());
+        assert_eq!(
+            held_rows::channel_of_name(conn, "brought").unwrap(),
+            Some(channel)
+        );
+        let kept =
+            |conn: &Connection| -> Vec<String> { carried(conn).unwrap().into_iter().collect() };
+        assert_eq!(kept(conn), ["brought"]);
+        let said = |conn: &Connection| -> Vec<String> {
+            said_here(conn, identity).unwrap().into_iter().collect()
+        };
+        assert_eq!(said(conn), ["brought", "mapped"]);
+        // Held again, nothing more is kept; and a name that a folder is
+        // mapped to is held for the folder.
+        hold_for_a_carry(conn, identity, "brought", now).unwrap();
+        hold_for_a_carry(conn, identity, "mapped", now).unwrap();
+        assert_eq!(kept(conn), ["brought"]);
+
+        // Sync is turned off: the word of the name that a folder syncs
+        // is taken back, and the other stands.
+        assert_eq!(unsay_all(conn, identity, now).unwrap(), 1);
+        assert_eq!(said(conn), ["brought"]);
+        // The device stops the name: it is held and listed no more.
+        assert!(stop(conn, identity, "brought", now).unwrap().is_some());
+        assert!(kept(conn).is_empty());
+        assert!(said(conn).is_empty());
+        assert_eq!(meta::get(conn, meta::PERSON_NAMES_CARRIED).unwrap(), None);
+        // Refused on a device that follows no phrase, and for what is no
+        // name in its one spelling.
+        let alone = Machine::new(9);
+        assert!(hold_for_a_carry(&alone.conn, &alone.identity, "brought", now).is_err());
+        assert!(hold_for_a_carry(conn, identity, "Not-A-Name", now).is_err());
+        assert!(kept(conn).is_empty());
+        // And a device that leaves its phrase keeps none.
+        hold_for_a_carry(conn, identity, "brought", now).unwrap();
+        crate::leaving::forget(conn, identity, false, now).unwrap();
+        assert!(kept(conn).is_empty());
     }
 
     /// Where a device comes to sync a name it holds it, so that its

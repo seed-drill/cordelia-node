@@ -74,7 +74,7 @@ pub const KEY_FILE: &str = "identity.key";
 /// node is to be started again: until then it makes nothing for a
 /// command, under a key that is the device's no longer. A node whose
 /// directory holds no key file has the key it was given, and is asked.
-fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
+pub(crate) fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     auth::check_bearer(req, state)?;
     let on_disk = std::fs::read(state.home_dir.join(KEY_FILE))
         .ok()
@@ -92,7 +92,7 @@ fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
 /// A refusal, as the API answers it: what a person did that is refused is
 /// a bad request, what changed under a prompt is a conflict, and what the
 /// device could not read or write is the node's own failure.
-fn refused(e: PersonError) -> ApiError {
+pub(crate) fn refused(e: PersonError) -> ApiError {
     match &e {
         PersonError::ChangedSincePrompt => ApiError::Conflict(says(&e)),
         PersonError::Storage(_) | PersonError::Held(_) | PersonError::Crypto(_) => {
@@ -679,7 +679,7 @@ pub struct PrepareRequest {
 /// What became of something that a command had the node do, and waited
 /// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Waited {
+pub(crate) enum Waited {
     /// One that began after the asking ended, and went to its end.
     Done,
     /// One that began after the asking ended early: it did not do all
@@ -704,7 +704,7 @@ enum Waited {
 /// reads on. (A device in a fork has no leave anywhere, and is not asked
 /// again.) A node with no network has nobody to ask, and nothing is
 /// waited for.
-async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
+pub(crate) async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
     if state.push_tx.is_none() {
         return Waited::Done;
     }

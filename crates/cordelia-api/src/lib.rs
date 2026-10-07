@@ -26,6 +26,8 @@
 pub mod adding;
 pub mod at_relays;
 pub mod auth;
+pub mod carry;
+pub mod carrying;
 pub mod change;
 pub mod commands;
 pub mod entries;
@@ -133,6 +135,9 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/prepare", web::post().to(commands::change_prepare))
             .route("/make", web::post().to(commands::change_make)),
     );
+    // A carry that a person asks for (decision 2026-10-04 §7.3): of one
+    // name, from the generations that the device left.
+    cfg.route("/api/v1/carry", web::post().to(carrying::carry));
 
     // Sync adapters (decision 2026-09-30-agent-memory-sync §4.5)
     cfg.service(

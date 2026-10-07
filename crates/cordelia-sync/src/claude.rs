@@ -972,7 +972,8 @@ pub fn withdraw(state: &AppState, generation: u64) -> Result<bool, CordeliaError
 /// speaks only for itself: a word is read only from the key that signed
 /// it, of keys that count, and only where its name could be mapped.
 ///
-/// A name that this device said it syncs and that is not in `wanted` is
+/// A name that this device said it syncs and that is not in `wanted`,
+/// and that it does not hold by a carry, is
 /// mapped no longer, and the command that unmapped it could not write so:
 /// the device says so no longer, and holds the name no more
 /// ([`said_names::stop`]). Nothing is written if the settings are no
@@ -988,8 +989,15 @@ fn exchange_names(
     let db = lock(state)?;
     if state.sync_control.generation_under(&db) == generation {
         let said = said_names::said_here(&db, &state.identity).map_err(of_person)?;
+        // A name that the device holds by a carry that a person asked
+        // for has no folder here, and is listed all the same (decision
+        // 2026-10-04 §7.3, §9): it is not stopped for want of one.
+        let carried = said_names::carried(&db).map_err(of_person)?;
         let mut written = false;
-        for name in said.difference(wanted) {
+        for name in said
+            .difference(wanted)
+            .filter(|name| !carried.contains(*name))
+        {
             let stopped = said_names::stop(&db, &state.identity, name, now).map_err(of_person)?;
             if let Some(channel) = stopped {
                 state.own_channels.forget_fetched(&channel);
