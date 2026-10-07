@@ -1661,6 +1661,78 @@ fn a_folder_taken_out_and_put_back_at_once_does_not_replay_what_it_lost() {
     assert_eq!(read(&b_mem, "x.md").as_deref(), Some("kept\n"));
 }
 
+/// A name that is stopped and held again in one generation of the
+/// settings, with a file lost in between: the device holds nothing of the
+/// name's channel once it has stopped the name, and neither does a folder
+/// keep a record of what it had agreed there. So the folder that comes
+/// back has no record in the channel. It waits for the channel to be
+/// fetched and meets it as on any first sync: the file is fetched back,
+/// and nothing is published as a delete (decision 2026-10-04 §6).
+#[test]
+fn a_name_stopped_and_held_again_in_one_generation_deletes_nothing() {
+    let (mut a, mut b) = paired_explicit();
+    // Each node is set up with one relay, the stand-in: a folder with no
+    // record in a channel waits until the stand-in has handed it.
+    for d in [&a, &b] {
+        d.state.own_channels.set_up_with(1);
+    }
+    let a_one = a.plain_dir("one");
+    let a_mem = a.claude_folder(&a_one);
+    std::fs::write(a_mem.join("x.md"), "kept\n").unwrap();
+    std::fs::write(a_mem.join("y.md"), "stays\n").unwrap();
+    map(&a, &a_one, "one");
+    let b_one = b.plain_dir("one");
+    let b_mem = b.folder_of(&b_one).join("memory");
+    map(&b, &b_one, "one");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    let channel = channel_of(&mut a, "one");
+    let folder = a_mem.display().to_string();
+    let recorded = |d: &Device| {
+        let db = d.state.db.lock().unwrap();
+        cordelia_storage::sync_state::load(&db, &folder, &channel)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(recorded(&a), 2);
+
+    // The name is stopped, as a cycle stops a name that this device said
+    // it syncs and that it finds no folder for; and no setting changes.
+    let generation = a.state.sync_control.generation();
+    {
+        let db = a.state.db.lock().unwrap();
+        let stopped = names::stop(&db, &a.state.identity, "one", now()).unwrap();
+        let stopped = stopped.expect("the device held the name");
+        a.state.own_channels.forget_fetched(&stopped);
+    }
+    assert_eq!(recorded(&a), 0, "what the folder agreed went with the name");
+    std::fs::remove_file(a_mem.join("x.md")).unwrap();
+
+    // Its folder is mapped still: the next cycle holds the name again. It
+    // waits for the channel, and publishes nothing meanwhile.
+    let waits = a.cycle().folders.remove(0);
+    assert!(waits.waiting, "{waits:?}");
+    assert_eq!(a.state.sync_control.generation(), generation);
+    settle(&mut a, &mut b);
+    assert_eq!(read(&a_mem, "x.md").as_deref(), Some("kept\n"));
+    assert_eq!(files(&b_mem), ["x.md", "y.md"]);
+    for d in [&a, &b] {
+        assert_eq!(
+            version_of(d, "one", "x.md"),
+            Some((1, Value::Text("kept\n".into()))),
+            "nothing was published over the file"
+        );
+    }
+    // The file that was there all along is agreed again as it is: it is
+    // not published a second time.
+    assert_eq!(
+        version_of(&a, "one", "y.md"),
+        Some((1, Value::Text("stays\n".into())))
+    );
+    assert_eq!(entries_of(&a, "one", "y.md").len(), 1);
+    assert_eq!(recorded(&a), 2);
+}
+
 /// Whether sync is on is a setting like the others. A cycle reads it with
 /// the rest, under the lock: turned off, there is nothing for it to do,
 /// even if the loop that started it saw sync on a moment before.

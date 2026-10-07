@@ -40,6 +40,7 @@ use rusqlite::Connection;
 
 use cordelia_core::protocol::{LEFT_SECRET_KEPT_DAYS, PERSONAL_NAME_PREFIX};
 use cordelia_core::revision::next_under;
+use cordelia_crypto::bech32::encode_channel_id;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
@@ -48,6 +49,7 @@ use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, State};
+use cordelia_storage::sync_state;
 
 use crate::person::{Counting, PersonError, hold_name, in_one};
 use crate::publish::Standing;
@@ -392,12 +394,18 @@ pub fn unsay_all(
 /// This device syncs `name` no longer, and no folder of its own is mapped
 /// to it: it says so, where it had said that it syncs it, and holds the
 /// name no more. What its store holds of the name's channel goes, with
-/// what it kept of each relay for it. Returns the ID of the channel that
-/// it held for the name, where it held one: whoever calls this keeps
-/// nothing more of that channel either.
+/// what it kept of each relay for it, and with what every folder had
+/// agreed in that channel and its records of index lines there: all of
+/// it in one transaction. Returns the ID of the channel that it held for
+/// the name, where it held one: whoever calls this keeps nothing more of
+/// that channel either.
 ///
-/// What a folder had agreed in that channel is the caller's to forget:
-/// mapped again, the folder meets the channel as on any first sync.
+/// So a folder that comes to sync the name again, in the same generation
+/// or a later one, has no record in the channel: it waits for the channel
+/// to be fetched, and meets it as on any first sync (decision 2026-10-04
+/// §6). A record that outlived the channel's entries would say that a
+/// file was agreed which the folder has lost since, and a delete would be
+/// published for it.
 pub fn stop(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -411,6 +419,7 @@ pub fn stop(
         };
         entries::remove_channel(conn, &channel)?;
         kept_rows::forget_channel(conn, &channel)?;
+        sync_state::forget_channel(conn, &encode_channel_id(&channel)?)?;
         held_rows::drop_name(conn, name)?;
         Ok(Some(channel))
     })
@@ -522,9 +531,6 @@ pub fn may_say(conn: &Connection) -> Result<bool, PersonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use cordelia_crypto::bech32::encode_channel_id;
-    use cordelia_storage::sync_state;
 
     use crate::several::{Machine, Several, entry_by};
     use crate::take::{NotTaken, Taken, take};
@@ -758,7 +764,9 @@ mod tests {
 
     /// A name that is unmapped is synced no longer: the device takes its
     /// word back and holds the name no more. What its store held of the
-    /// name's channel goes, with what it kept of each relay for it.
+    /// name's channel goes, with what it kept of each relay for it, and
+    /// with what every folder had agreed there and its records of index
+    /// lines.
     #[test]
     fn test_a_name_that_is_stopped_is_said_no_longer_and_held_no_more() {
         let mut s = Several::of_one_person(1);
@@ -774,6 +782,37 @@ mod tests {
         let relay = [8u8; 32];
         kept_rows::sending(&s[0].conn, &relay, &lab).unwrap();
         assert!(kept_rows::keeps_any_anywhere(&s[0].conn, &lab).unwrap());
+        // What two folders agreed in the name's channel, and a record of
+        // an index line there; and what a folder agreed in the other
+        // name's channel.
+        let written = |on: &Machine, name: &str| {
+            let channel = held_rows::channel_of_name(&on.conn, name).unwrap().unwrap();
+            encode_channel_id(&channel).unwrap()
+        };
+        let (in_lab, in_stays) = (written(&s[0], "lab"), written(&s[0], "stays"));
+        let agreed = sync_state::Agreed {
+            hash: Some([7; 32]),
+            rev: 1,
+            signer: None,
+            chain: None,
+        };
+        for (folder, channel) in [("/m", &in_lab), ("/n", &in_lab), ("/m", &in_stays)] {
+            sync_state::save(&s[0].conn, folder, channel, "notes.md", &agreed).unwrap();
+        }
+        cordelia_storage::index_lines::line_removed(
+            &s[0].conn, "/m", &in_lab, "notes.md", "- a line", now,
+        )
+        .unwrap();
+        let lines_in = |on: &Machine, channel: &str| -> i64 {
+            on.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM index_lines WHERE channel_id = ?1",
+                    [channel],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(lines_in(&s[0], &in_lab), 1);
         // What the store holds of the name's channel, by the channel's ID.
         let stored_of_lab = |on: &Machine| {
             entries::channel_entries_after(&on.conn, &lab, 0, 100_000)
@@ -788,7 +827,15 @@ mod tests {
         assert_eq!(held_rows::channel_of_name(&s[0].conn, "lab").unwrap(), None);
         assert_eq!(stored_of_lab(&s[0]), 0);
         assert!(!kept_rows::keeps_any_anywhere(&s[0].conn, &lab).unwrap());
-        // The other name is as it was.
+        // No folder has a record in the channel that went, nor a record
+        // of an index line there: held again, the name's channel is met
+        // as on any first sync.
+        for folder in ["/m", "/n"] {
+            assert!(!sync_state::any(&s[0].conn, folder, &in_lab).unwrap());
+        }
+        assert_eq!(lines_in(&s[0], &in_lab), 0);
+        // The other name is as it was, and what a folder agreed there.
+        assert!(sync_state::any(&s[0].conn, "/m", &in_stays).unwrap());
         assert_eq!(s[0].text("stays", "notes.md").as_deref(), Some("one"));
         // Stopped already: there is no channel to say.
         assert_eq!(stop(&s[0].conn, &s[0].identity, "lab", now).unwrap(), None);
