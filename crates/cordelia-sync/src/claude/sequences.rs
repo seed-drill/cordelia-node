@@ -3048,6 +3048,9 @@ fn a_memory_that_is_back_is_listed() {
         reached += usize::from(a_line_that_is_due_goes_back(&name, n, seed, &steps));
     }
     eprintln!("a line went back in {reached} of {run} generated sequences");
+    // With none run, a quarter of none would be reached, and the check
+    // would say nothing.
+    assert!(run > 0, "no generated sequence was run");
     assert!(4 * reached >= run, "a line went back in {reached} of {run}");
 }
 
