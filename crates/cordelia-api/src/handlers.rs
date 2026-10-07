@@ -506,6 +506,32 @@ pub async fn identity(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
+    identity_with(req, state, true).await
+}
+
+/// How many channels a node says it has. A node that carries the older
+/// kind (`older_kind`) counts the channels of that kind that it is a
+/// member of. A personal node carries none of them (decision 2026-10-04
+/// §10): it counts the names that it holds, each with its channel from
+/// the person's secret, and reads nothing of the older kind.
+fn channels_it_has(
+    db: &rusqlite::Connection,
+    own: &[u8; 32],
+    older_kind: bool,
+) -> Result<usize, ApiError> {
+    Ok(match older_kind {
+        true => channels::list_for_entity(db, own)?.len(),
+        false => cordelia_storage::person::names(db)?.len(),
+    })
+}
+
+/// A node's identity. `older_kind` says which channels it counts
+/// ([`channels_it_has`]).
+pub(crate) async fn identity_with(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    older_kind: bool,
+) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
     let pk = state.identity.public_key();
@@ -519,8 +545,7 @@ pub async fn identity(
         .db
         .lock()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let all = channels::list_for_entity(&db, &pk)?;
-    let subscribed = all.len() as i64;
+    let subscribed = channels_it_has(&db, &pk, older_kind)? as i64;
 
     Ok(HttpResponse::Ok().json(IdentityResponse {
         entity_id: String::new(), // TODO: load from config
@@ -1207,6 +1232,18 @@ pub async fn metrics(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
+    metrics_with(req, state, true).await
+}
+
+/// A node's metrics. `older_kind` says whether the node carries channels
+/// of the older kind. A personal node carries none (decision 2026-10-04
+/// §10): its channels are the names it holds, what it stores is the
+/// entries of its own channels, and nothing of the older kind is read.
+pub(crate) async fn metrics_with(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    older_kind: bool,
+) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
 
     let db = state
@@ -1216,8 +1253,11 @@ pub async fn metrics(
     let pk = state.identity.public_key();
 
     let uptime = state.uptime_secs();
-    let all_channels = channels::list_for_entity(&db, &pk)?;
-    let channel_count = all_channels.len();
+    let all_channels = match older_kind {
+        true => channels::list_for_entity(&db, &pk)?,
+        false => Vec::new(),
+    };
+    let channel_count = channels_it_has(&db, &pk, older_kind)?;
 
     // Per-channel item counts (first 8 hex chars of channel_id as label)
     let mut items_lines = String::new();
@@ -1238,7 +1278,11 @@ pub async fn metrics(
     let sync_errors = state.sync_error_count();
     let peers_hot = state.peers_hot.load(std::sync::atomic::Ordering::Relaxed);
     let peers_warm = state.peers_warm.load(std::sync::atomic::Ordering::Relaxed);
-    let usage = cordelia_storage::usage::snapshot(&db, chrono::Utc::now().timestamp())?;
+    let now = chrono::Utc::now().timestamp();
+    let usage = match older_kind {
+        true => cordelia_storage::usage::snapshot(&db, now)?,
+        false => cordelia_storage::usage::snapshot_of_a_device(&db, now)?,
+    };
     let usage_lines = format!(
         "# HELP cordelia_peers_seen Distinct peers connected in the window (counts only)\n\
          # TYPE cordelia_peers_seen gauge\n\
@@ -1480,9 +1524,7 @@ pub(crate) async fn status_with(
     let own_waiting = crate::commands::channels_waiting(&state);
     let db = state.db.lock().unwrap();
     let pk = state.identity.public_key();
-    let channels = cordelia_storage::channels::list_for_entity(&db, &pk)
-        .map(|c| c.len())
-        .unwrap_or(0);
+    let channels = channels_it_has(&db, &pk, older_kind).unwrap_or(0);
     let older_waiting = match older_kind {
         true => cordelia_storage::items::outbox_len(&db, &pk).unwrap_or(0),
         false => 0,

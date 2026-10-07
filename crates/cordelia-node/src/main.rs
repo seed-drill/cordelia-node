@@ -1744,6 +1744,17 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let db_path = data_dir.join("cordelia.db");
     let conn = open_database(&db_path)?;
 
+    // A personal node carries no channel of the older kind (decision
+    // 2026-10-04 §10): what it has is the names that it holds, each with
+    // its channel from the person's secret. Nothing of the older kind is
+    // read.
+    if config.network.role == "personal" {
+        for line in names_held(&conn)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
 
     println!(
@@ -1772,6 +1783,30 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `cordelia channels` says on a personal node: the names that the
+/// device holds, each with how many entries it stores of the name's
+/// channel and when it stored the last; or, where it holds none, the way
+/// to hold one.
+fn names_held(conn: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
+    let names = cordelia_storage::person::names(conn)?;
+    if names.is_empty() {
+        return Ok(vec![
+            "No names. A device holds a name once it follows a recovery phrase and a folder \
+             is mapped to it (`cordelia sync map <folder> <name>`)."
+                .to_string(),
+        ]);
+    }
+    let mut lines = vec![format!("{:<40} {:>8}   LAST STORED", "NAME", "ENTRIES")];
+    for held in names {
+        let (entries, last) = cordelia_storage::usage::stored_of_channel(conn, &held.channel)?;
+        let last = last
+            .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+            .map_or_else(|| "-".to_string(), |at| at.to_rfc3339());
+        lines.push(format!("{:<40} {:>8}   {last}", held.name, entries));
+    }
+    Ok(lines)
+}
+
 // ── cordelia stats ────────────────────────────────────────────────
 
 fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
@@ -1791,8 +1826,22 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let conn = open_database(&db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?.len();
-    let usage = cordelia_storage::usage::snapshot(&conn, chrono::Utc::now().timestamp())?;
+    // A personal node carries no channel of the older kind (decision
+    // 2026-10-04 §10): its channels are the names it holds, and what it
+    // stores is the entries of its own channels. Nothing of the older
+    // kind is read.
+    let personal = config.network.role == "personal";
+    let now = chrono::Utc::now().timestamp();
+    let (channels, usage) = match personal {
+        true => (
+            cordelia_storage::person::names(&conn)?.len(),
+            cordelia_storage::usage::snapshot_of_a_device(&conn, now)?,
+        ),
+        false => (
+            cordelia_storage::channels::list_for_entity(&conn, &pk)?.len(),
+            cordelia_storage::usage::snapshot(&conn, now)?,
+        ),
+    };
     // What a relay's storage cap counts, and the cap: what its items are
     // counted at, each its content and what an entry takes beyond it. It
     // falls when a channel is dropped (the file does not shrink).
@@ -1829,11 +1878,15 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
         );
     }
     println!(
-        "Stored:           {} items, {} of encrypted content",
+        "Stored:           {} {}, {} of encrypted content",
         usage.items_stored,
+        if personal { "entries" } else { "items" },
         format_bytes(usage.bytes_stored)
     );
-    println!("Channels:         {channels} subscribed");
+    match personal {
+        true => println!("Names:            {channels} held"),
+        false => println!("Channels:         {channels} subscribed"),
+    }
     println!(
         "Peers seen:       {} in the last day, {} in the last week (plus {} and {} relays)",
         usage.peers_1d, usage.peers_7d, usage.relays_1d, usage.relays_7d
@@ -1857,6 +1910,12 @@ fn format_bytes(bytes: u64) -> String {
 
 // ── cordelia swarm-init ────────────────────────────────────────────
 
+/// What `cordelia swarm-init` says where the node's role is `personal`.
+const NO_SWARM_ON_A_PERSONAL_NODE: &str = "a personal node carries no swarm channel in this \
+    version, and nothing was set up. A device's channels come from its recovery phrase: \
+    `cordelia phrase` on the first device, and `cordelia add-device` and `cordelia accept` \
+    for each one after.";
+
 fn cmd_swarm_init(
     config_path: &str,
     index: u32,
@@ -1867,6 +1926,15 @@ fn cmd_swarm_init(
     let mut config = Config::load(&config_file)?;
     config.apply_env_overrides();
     let data_dir = config.data_dir();
+
+    // A personal node carries no channel of the older kind (decision
+    // 2026-10-04 §10), and a swarm channel is one: this command would
+    // write rows and key files that such a node never reads, and that
+    // its first start on this version copies and removes. It is refused
+    // there, before anything is written.
+    if config.network.role == "personal" {
+        anyhow::bail!(NO_SWARM_ON_A_PERSONAL_NODE);
+    }
 
     // Load lead identity and derive child
     let lead_path = config::expand_tilde(lead_identity_path);
@@ -3735,6 +3803,52 @@ mod tests {
     }
 
     use super::*;
+
+    /// On a personal node `cordelia channels` says the names that the
+    /// device holds, each with what it stores of the name's channel, and
+    /// nothing of the older kind of channel (decision 2026-10-04 §10):
+    /// with none held, it says how one comes to be held.
+    #[test]
+    fn test_channels_on_a_device_lists_the_names_it_holds() {
+        let conn = cordelia_storage::db::open_in_memory().unwrap();
+        let none = names_held(&conn).unwrap();
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(none[0].starts_with("No names."), "{none:?}");
+        assert!(none[0].contains("cordelia sync map"), "{none:?}");
+
+        let identity = NodeIdentity::generate().unwrap();
+        let phrase = cordelia_crypto::phrase::Phrase::generate().unwrap();
+        let now = 1_790_000_000;
+        cordelia_api::person::first_statement(&conn, &identity, &phrase, "desktop", now).unwrap();
+        cordelia_api::person::hold_name(&conn, "team", now).unwrap();
+        cordelia_api::person::hold_name(&conn, "lab", now).unwrap();
+        // A channel of the older kind in the same database is not listed.
+        conn.execute(
+            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access,
+                                   creator_id, created_at, updated_at)
+             VALUES ('older', 'older', 'named', 'realtime', 'open', X'AA', '2026-10-01',
+                     '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        let listed = names_held(&conn).unwrap();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert!(listed[0].starts_with("NAME"), "{listed:?}");
+        assert!(
+            listed[1].starts_with("lab ") && listed[1].ends_with(" -"),
+            "{listed:?}"
+        );
+        assert!(listed[2].starts_with("team "), "{listed:?}");
+        assert!(!listed.join("\n").contains("older"), "{listed:?}");
+        // What it stores of a name's channel is counted.
+        let team = cordelia_storage::person::channel_of_name(&conn, "team")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cordelia_storage::usage::stored_of_channel(&conn, &team).unwrap(),
+            (0, None)
+        );
+    }
 
     #[test]
     fn test_p2p_bind_addr() {

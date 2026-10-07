@@ -621,3 +621,55 @@ async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_i
         "{status}"
     );
 }
+
+/// The routes of a personal node say what a device has now, and nothing
+/// of the older kind of channel (decision 2026-10-04 §10): its status,
+/// its identity and its metrics count the names it holds, though its
+/// database holds a channel of the older kind that it is a member of.
+/// The routes of a node that carries that kind count it, as they did.
+#[actix_web::test]
+async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
+    let (state, _dir) = state_of(false);
+    {
+        let db = state.db.lock().unwrap();
+        let own = state.identity.public_key();
+        let group = "grp_550e8400-e29b-41d4-a716-446655440000";
+        cordelia_storage::channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
+        cordelia_storage::channels::add_member(&db, group, &own, "owner").unwrap();
+    }
+    let get = |path: &'static str| {
+        test::TestRequest::get()
+            .uri(path)
+            .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+            .to_request()
+    };
+    for (device, counted) in [(true, 0), (false, 1)] {
+        let routes = match device {
+            true => cordelia_api::configure_device_routes,
+            false => cordelia_api::configure_routes,
+        };
+        let app = test::init_service(App::new().app_data(state.clone()).configure(routes)).await;
+        let answer = test::call_service(&app, get("/api/v1/status")).await;
+        let status: Value = test::read_body_json(answer).await;
+        assert_eq!(status["channels_subscribed"], counted, "{device}: {status}");
+        let (code, identity) = asks!(app, "/api/v1/channels/identity", json!({}));
+        assert_eq!(code, 200, "{device}: {identity}");
+        assert_eq!(
+            identity["channels_subscribed"], counted,
+            "{device}: {identity}"
+        );
+        let answer = test::call_service(&app, get("/api/v1/metrics")).await;
+        assert_eq!(answer.status().as_u16(), 200, "{device}");
+        let body = test::read_body(answer).await;
+        let metrics = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            metrics.contains(&format!("cordelia_channels_subscribed {counted}\n")),
+            "{device}: {metrics}"
+        );
+        assert_eq!(
+            metrics.contains("cordelia_items_total{channel=\"550e8400\"}"),
+            !device,
+            "{device}: {metrics}"
+        );
+    }
+}

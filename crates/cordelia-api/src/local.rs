@@ -204,6 +204,26 @@ pub async fn status(
     crate::handlers::status_with(state, req, false).await
 }
 
+// ── POST /api/v1/channels/identity, GET /api/v1/metrics ─────────────
+
+/// The identity of a personal node: the channels it counts are the names
+/// that it holds, and nothing of the older kind is read.
+pub async fn identity(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    crate::handlers::identity_with(req, state, false).await
+}
+
+/// The metrics of a personal node: of the names that it holds and the
+/// entries of its own channels, and nothing of the older kind.
+pub async fn metrics(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    crate::handlers::metrics_with(req, state, false).await
+}
+
 // ── POST /api/v1/channels/publish ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -471,6 +491,151 @@ mod tests {
         assert_eq!(held["entries"][0]["content"], serde_json::Value::Null);
         // Deleted already: nothing live is under it.
         assert_eq!(deletes(&state, "notes.md").await.0, 404);
+    }
+
+    /// What a personal node says it has is what a device has now: the
+    /// names that it holds, and the entries of its own channels (decision
+    /// 2026-10-04 §10). Its status, its identity and its metrics read
+    /// nothing of the older kind of channel, whatever its database holds
+    /// of one, and write nothing.
+    #[actix_web::test]
+    async fn test_a_devices_status_identity_and_metrics_count_nothing_of_the_older_kind() {
+        let state = node();
+        // What an earlier version left: a channel of the older kind that
+        // this device is a member of, with an item in it.
+        let own = state.identity.public_key();
+        {
+            use cordelia_storage::{channels, items};
+            let db = state.db.lock().unwrap();
+            let group = "grp_550e8400-e29b-41d4-a716-446655440000";
+            channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
+            channels::add_member(&db, group, &own, "owner").unwrap();
+            let item = items::NewItem {
+                item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
+                channel_id: group,
+                author_id: &own,
+                item_type: "memory",
+                published_at: "2026-10-01T00:00:00Z",
+                parent_id: None,
+                key_version: 1,
+                content_hash: &[1u8; 32],
+                signature: &[7u8; 64],
+                encrypted_blob: b"what an earlier version sealed",
+                is_tombstone: false,
+                slot: None,
+                rev: None,
+            };
+            assert!(items::insert_item(&db, &item).unwrap());
+            assert_eq!(channels::list_for_entity(&db, &own).unwrap().len(), 1);
+        }
+        let everything = |state: &AppState| -> Vec<i64> {
+            let db = state.db.lock().unwrap();
+            [
+                "channels",
+                "channel_members",
+                "items",
+                "node_meta",
+                "entries",
+            ]
+            .iter()
+            .map(|table| {
+                db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+            })
+            .collect()
+        };
+        let says = |state: &web::Data<AppState>| {
+            let state = state.clone();
+            async move {
+                let (_, of_status) = answer(status(state.clone(), asked()).await).await;
+                let (_, of_identity) = answer(identity(asked(), state.clone()).await).await;
+                let response = metrics(asked(), state.clone()).await.unwrap();
+                let body = to_bytes(response.into_body()).await.unwrap();
+                let of_metrics = String::from_utf8(body.to_vec()).unwrap();
+                (of_status, of_identity, of_metrics)
+            }
+        };
+
+        // A device that holds no name has none, and stores nothing.
+        let before = everything(&state);
+        let (of_status, of_identity, of_metrics) = says(&state).await;
+        assert_eq!(of_status["channels_subscribed"], 0, "{of_status}");
+        assert_eq!(of_status["outbox_waiting"], 0, "{of_status}");
+        assert_eq!(of_identity["channels_subscribed"], 0, "{of_identity}");
+        assert!(
+            of_metrics.contains("cordelia_channels_subscribed 0\n"),
+            "{of_metrics}"
+        );
+        assert!(
+            of_metrics.contains("cordelia_items_stored 0\n"),
+            "{of_metrics}"
+        );
+        assert!(
+            !of_metrics.contains("cordelia_items_total{"),
+            "{of_metrics}"
+        );
+        assert_eq!(everything(&state), before);
+
+        // It holds a name, and publishes under it: that is what it has.
+        with_phrase(&state);
+        assert_eq!(
+            publishes(&state, Some("notes.md"), json!("one\n")).await.0,
+            200
+        );
+        let before = everything(&state);
+        let (of_status, of_identity, of_metrics) = says(&state).await;
+        assert_eq!(of_status["channels_subscribed"], 1, "{of_status}");
+        assert_eq!(of_identity["channels_subscribed"], 1, "{of_identity}");
+        assert!(
+            of_metrics.contains("cordelia_channels_subscribed 1\n"),
+            "{of_metrics}"
+        );
+        let stored: i64 = {
+            let db = state.db.lock().unwrap();
+            db.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(stored >= 1);
+        assert!(
+            of_metrics.contains(&format!("cordelia_items_stored {stored}\n")),
+            "{of_metrics}"
+        );
+        // Its own channels in which it stored something today: the
+        // name's, and those of what it holds of its person.
+        let active: i64 = {
+            let db = state.db.lock().unwrap();
+            db.query_row(
+                "SELECT COUNT(DISTINCT channel_id) FROM entries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(active >= 1);
+        assert!(
+            of_metrics.contains(&format!(
+                "cordelia_channels_active{{window=\"1d\"}} {active}\n"
+            )),
+            "{of_metrics}"
+        );
+        assert_eq!(everything(&state), before);
+
+        // A node that carries the older kind counts the channels of that
+        // kind, as it did.
+        let (_, older) = answer(crate::handlers::identity(asked(), state.clone()).await).await;
+        assert_eq!(older["channels_subscribed"], 1, "{older}");
+        let response = crate::handlers::metrics(asked(), state.clone())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let older = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            older.contains("cordelia_items_total{channel=\"550e8400\"} 1\n"),
+            "{older}"
+        );
+        assert!(older.contains("cordelia_items_stored 1\n"), "{older}");
     }
 
     /// What is refused, with nothing written: a device that follows no

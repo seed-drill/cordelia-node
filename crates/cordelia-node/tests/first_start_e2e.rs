@@ -562,11 +562,13 @@ fn a_database_from_a_later_version_is_refused_by_the_node_and_by_each_command() 
 
 /// `cordelia swarm-init` opens the database before it writes anything:
 /// one from a later version is refused, and no key and no token is
-/// written (decision 2026-10-04 §10.1).
+/// written (decision 2026-10-04 §10.1). The node is of a role that
+/// carries the older kind: on a personal node the command sets up
+/// nothing at all.
 #[test]
 fn a_swarm_node_is_not_set_up_over_a_database_from_a_later_version() {
     let lead = node("lead", "personal", None);
-    let child = node("child", "personal", None);
+    let child = node("child", "relay", None);
     let (later, database) = as_a_later_version_left_it(&child);
     // A folder that holds a database and no key yet.
     for file in ["identity.key", "node-token"] {
@@ -596,4 +598,88 @@ fn a_swarm_node_is_not_set_up_over_a_database_from_a_later_version() {
         std::fs::read(child.data_dir().join("cordelia.db")).unwrap(),
         database
     );
+}
+
+/// A personal node carries no channel of the older kind, and the commands
+/// that read or wrote that kind say what a device has now (decision
+/// 2026-10-04 §10): `cordelia channels` and `cordelia stats` say the
+/// names it holds and the entries of its own channels, and `cordelia
+/// swarm-init` sets up nothing. None of them writes: after the first
+/// start's step the tables of the older kind are empty, and stay so.
+#[test]
+fn the_commands_of_the_older_kind_say_what_a_device_has_now_and_write_nothing() {
+    let relay = relay_started();
+    let mut device = node("laptop", "personal", Some(relay.p2p));
+    drop(in_the_released_form(&device));
+    device.start();
+    wait_for("device healthy", &[&relay, &device], 30, || {
+        healthy(&device)
+    });
+    let nothing_older = |device: &Node| {
+        let now = older_rows(&database_of(device));
+        assert!(now.iter().all(|(_, rows)| *rows == 0), "{now:?}");
+        assert!(names_in(&device.data_dir().join("channel-keys")).is_empty());
+    };
+    nothing_older(&device);
+
+    // It follows no phrase yet, and so holds no name.
+    let channels = device.cli(&["channels"]);
+    assert!(channels.starts_with("No names."), "{channels}");
+    assert!(!channels.contains("cordelia subscribe"), "{channels}");
+    let stats = device.cli(&["stats"]);
+    assert!(stats.contains("Names:            0 held"), "{stats}");
+    assert!(stats.contains("Stored:           0 entries"), "{stats}");
+    let stats: serde_json::Value = serde_json::from_str(&device.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["channels_subscribed"], 0, "{stats}");
+    assert_eq!(stats["items_stored"], 0, "{stats}");
+    let status = device.get("/api/v1/status").unwrap();
+    assert_eq!(status["channels_subscribed"], 0, "{status}");
+    let metrics = device.get_text("/api/v1/metrics");
+    assert!(
+        metrics.contains("cordelia_channels_subscribed 0"),
+        "{metrics}"
+    );
+
+    // `cordelia swarm-init` sets up nothing on it, and says why.
+    let lead_key = device.data_dir().join("identity.key").display().to_string();
+    let key = std::fs::read(device.data_dir().join("identity.key")).unwrap();
+    let out = device.command(&[
+        "swarm-init",
+        "--index",
+        "1",
+        "--lead-identity",
+        &lead_key,
+        "--lead-entity-id",
+        "lead",
+    ]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("a personal node carries no swarm channel in this version"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(device.data_dir().join("identity.key")).unwrap(),
+        key
+    );
+    nothing_older(&device);
+    // With no key yet in the node's folder, too: nothing is written.
+    let fresh = node("another", "personal", None);
+    for file in ["identity.key", "node-token"] {
+        std::fs::remove_file(fresh.data_dir().join(file)).unwrap();
+    }
+    let out = fresh.command(&[
+        "swarm-init",
+        "--index",
+        "1",
+        "--lead-identity",
+        &lead_key,
+        "--lead-entity-id",
+        "lead",
+    ]);
+    assert!(!out.status.success());
+    for file in ["identity.key", "node-token"] {
+        assert!(!fresh.data_dir().join(file).exists(), "{file}");
+    }
+    assert!(names_in(&fresh.data_dir().join("channel-keys")).is_empty());
 }

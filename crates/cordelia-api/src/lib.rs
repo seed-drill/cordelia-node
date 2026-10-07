@@ -81,6 +81,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 
     // Status (GET, authenticated, operations.md §8)
     cfg.route("/api/v1/status", web::get().to(handlers::status));
+    // Prometheus metrics (GET, outside /channels scope per spec §3.15)
+    cfg.route("/api/v1/metrics", web::get().to(handlers::metrics));
     shared_routes(cfg);
 }
 
@@ -97,10 +99,12 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/publish", web::post().to(local::publish))
             .route("/entries", web::post().to(local::entries))
             .route("/delete-key", web::post().to(local::delete_key))
-            .route("/identity", web::post().to(handlers::identity)),
+            .route("/identity", web::post().to(local::identity)),
     );
-    // Status (GET, authenticated): of the device's own channels.
+    // Status and metrics (GET, authenticated): of the device's own
+    // channels, and of nothing of the older kind.
     cfg.route("/api/v1/status", web::get().to(local::status));
+    cfg.route("/api/v1/metrics", web::get().to(local::metrics));
     shared_routes(cfg);
 }
 
@@ -150,7 +154,4 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
 
     // Connected peers (GET, authenticated)
     cfg.route("/api/v1/peers", web::get().to(handlers::peers));
-
-    // Prometheus metrics (GET, outside /channels scope per spec §3.15)
-    cfg.route("/api/v1/metrics", web::get().to(handlers::metrics));
 }

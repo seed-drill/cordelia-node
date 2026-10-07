@@ -2986,6 +2986,21 @@ fn entity_id(n: &Node) -> String {
         .entity_id
 }
 
+/// How many swarm channels a node's database holds: a look at the
+/// database itself. (`cordelia channels` says nothing of them on a
+/// personal node, where it lists the names that the device holds.)
+fn swarm_channels_held(n: &Node) -> i64 {
+    let prefix = cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
+    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM channels WHERE substr(channel_id, 1, ?1) = ?2",
+        rusqlite::params![prefix.len() as i64, prefix],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 /// The key files a node keeps for swarm channels.
 fn swarm_key_files(n: &Node) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(n.data_dir().join("channel-keys")) else {
@@ -3120,6 +3135,7 @@ fn a_node_makes_no_swarm_channel_and_tells_its_relay_of_none() {
     assert_told_no_id_that_holds_a_name(&relay, &a, &told);
 
     // The node holds none, and so had none to remove.
+    assert_eq!(swarm_channels_held(&a), 0);
     let channels = a.cli(&["channels"]);
     assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
     assert_eq!(swarm_key_files(&a), Vec::<String>::new());
@@ -3187,8 +3203,7 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     // keeps a key for it.
     let swarm = swarm_channel_as_an_earlier_version_made_it(&b);
     assert!(swarm.ends_with(&entity_id(&b)), "{swarm}");
-    let channels = b.cli(&["channels"]);
-    assert!(channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert_eq!(swarm_channels_held(&b), 1);
     assert_eq!(swarm_key_files(&b), vec![format!("{swarm}.key")]);
 
     b.start();
@@ -3199,8 +3214,7 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     assert_told_no_id_that_holds_a_name(&relay, &b, &told);
 
     // The channel is gone from the node, and its key with it.
-    let channels = b.cli(&["channels"]);
-    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert_eq!(swarm_channels_held(&b), 0);
     assert_eq!(swarm_key_files(&b), Vec::<String>::new());
     // The node said so once, and nowhere in its log is the channel's ID:
     // its database was copied and moved on, and the key file removed.
@@ -3251,7 +3265,6 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
 async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     use cordelia_network::channel_announce::{announcement, send_channel_joined};
     use cordelia_network::messages::Protocol;
-    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -3285,8 +3298,7 @@ async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
 
     // The node holds the channel and its entry all the while: the relay
     // was not told because such an ID is not told, not for want of one.
-    let channels = c.cli(&["channels"]);
-    assert!(channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert_eq!(swarm_channels_held(&c), 1);
     assert!(!files_holding(&c, &held).is_empty());
     // And the entry that is not sent is not counted as waiting to be.
     wait_for("nothing is left waiting to be sent", &all, 60, || {
@@ -3367,11 +3379,7 @@ fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
         a.start();
         wait_for("node healthy", &[&a], 30, || healthy(&a));
 
-        let channels = a.cli(&["channels"]);
-        assert!(
-            !channels.contains(SWARM_CHANNEL_PREFIX),
-            "{role}: {channels}"
-        );
+        assert_eq!(swarm_channels_held(&a), 0, "{role}");
         assert_eq!(swarm_key_files(&a), vec![format!("{swarm}.slot")], "{role}");
         let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
         let warned: Vec<&str> = log
@@ -3785,11 +3793,14 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
         "{log}"
     );
 
-    // Nothing of what was pushed is stored, and the device holds the
-    // channel and its own entry all the while.
+    // Nothing of what was pushed is stored, and the device's database
+    // holds the channel and its own entry all the while. (`cordelia
+    // channels` says nothing of them: on a personal node it lists the
+    // names that the device holds.)
     assert_eq!(files_holding(&a, &pushed.item_id), Vec::<PathBuf>::new());
+    assert_eq!(swarm_channels_held(&a), 1);
     let channels = a.cli(&["channels"]);
-    assert!(channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
+    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
     assert!(!files_holding(&a, &held).is_empty());
 }
 
