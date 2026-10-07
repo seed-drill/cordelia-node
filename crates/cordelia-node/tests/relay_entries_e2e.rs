@@ -2025,6 +2025,13 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
         page.items.is_empty() && !page.has_more && page.last_seq.is_none(),
         "a personal node served a sync of the older kind: {page:?}"
     );
+    // The stream of the sync is ended: the device takes up the next
+    // stream once it is through with this one.
+    let _ = send.finish();
+    drop(recv);
+    // The push is refused at once, and for what it is: whoever sent it
+    // does not wait for an answer that is not coming.
+    let asked = std::time::Instant::now();
     let pushed = ask_on(
         &conn,
         Protocol::ItemPush,
@@ -2034,6 +2041,11 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
     assert!(
         pushed.is_err(),
         "a personal node took a push of the older kind: {pushed:?}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "a push of the older kind was left to wait, and not refused: {:?}",
+        asked.elapsed()
     );
 
     // The control: on the same connection, the device answers its relay

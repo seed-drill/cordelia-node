@@ -1709,9 +1709,22 @@ mod tests {
         }
 
         // It changes nothing: done once, while a cycle holds the turn,
-        // with nothing counted and nothing forgotten.
+        // with nothing counted and nothing forgotten. (It is done on a
+        // thread of its own, and given a time: work that waited for the
+        // cycle here would wait for ever, since this test holds the
+        // turn, and the test is to fail then, and not to hang.)
         let turn = state.history.turn();
-        assert_eq!(state.as_a_change_where(done, |_| Came::Nothing), 1);
+        let other = std::sync::Arc::clone(&state);
+        let nothing = std::thread::spawn(move || other.as_a_change_where(done, |_| Came::Nothing));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !nothing.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "work that changes nothing waited for the cycle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(nothing.join().unwrap(), 1);
         assert_eq!(state.sync_control.generation(), before);
         assert!(
             state
