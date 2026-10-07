@@ -575,13 +575,17 @@ fn removed_keys(conn: &rusqlite::Connection, held: &Held) -> Result<Vec<Removed>
 }
 
 /// A removed key, as a command is told of one: its key in hex, the first
-/// six words of its fingerprint, which name it, and its label.
-fn removed_says(removed: &Removed) -> serde_json::Value {
+/// six words of its fingerprint, its label, and whether those words name
+/// it and no other among `all`, the removed keys that this device knows
+/// of ([`carry::words_tell`]): where they do not, a command names the key
+/// written whole.
+fn removed_says(removed: &Removed, all: &[Removed]) -> serde_json::Value {
     json!({
         "key": hex::encode(removed.key),
         "words": carry::naming_words(&removed.key),
         "shown": fingerprint::shown(&removed.key),
         "label": removed.label,
+        "by_words": carry::words_tell(&removed.key, all),
     })
 }
 
@@ -811,7 +815,7 @@ pub async fn look_from(
         .iter()
         .filter_map(|one| {
             let entries = *signed.get(&one.key)?;
-            let mut says = removed_says(one);
+            let mut says = removed_says(one, &removed);
             says["entries"] = entries.into();
             Some(says)
         })
@@ -845,7 +849,7 @@ pub async fn look_from(
     let named: Vec<serde_json::Value> = removed
         .iter()
         .filter(|one| keys.contains(&one.key))
-        .map(removed_says)
+        .map(|one| removed_says(one, &removed))
         .collect();
     Ok(json!({
         "name": name,
@@ -1545,6 +1549,7 @@ mod tests {
         assert_eq!(signed["words"], carry::naming_words(&removed));
         assert_eq!(signed["label"], "device 2");
         assert_eq!(signed["entries"], 3);
+        assert_eq!(signed["by_words"], true);
         assert_eq!(listed["keys"], json!([]));
         assert_eq!(listed["empty"], 0);
         // Nothing was written.
@@ -1562,8 +1567,14 @@ mod tests {
         let held = held_rows::channel_of_name(&db(&node.state), "another");
         assert_eq!(held.unwrap(), None);
 
-        // Named by its label, and by its six words.
-        for named in ["device 2".to_string(), carry::naming_words(&removed)] {
+        // Named by its label, by its six words, and by its key written
+        // whole.
+        let written = cordelia_crypto::bech32::encode_public_key(&removed).unwrap();
+        for named in [
+            "device 2".to_string(),
+            carry::naming_words(&removed),
+            written,
+        ] {
             let found = look_from(&node.state, LAB, &[named]).await.unwrap();
             assert_eq!(found["keys"][0]["key"], hex::encode(removed), "{found}");
             assert_eq!(found["empty"], 1, "{found}");
@@ -1587,6 +1598,24 @@ mod tests {
                 "{refused:?}"
             );
         }
+        // **Where the six words would not tell the key apart, the look
+        // says so,** for a command to name the key written whole: here
+        // this device knows another removed key by a label that is those
+        // very words. The words then name two keys, and the key does not.
+        {
+            let conn = db(&node.state);
+            let held = person::held(&conn).unwrap().unwrap();
+            let mut all = removed_keys(&conn, &held).unwrap();
+            assert_eq!(all.len(), 1);
+            assert!(removed_says(&all[0], &all)["by_words"] == true);
+            all.push(Removed {
+                key: [8; 32],
+                label: carry::naming_words(&removed),
+            });
+            assert!(removed_says(&all[0], &all)["by_words"] == false);
+            assert!(removed_says(&all[1], &all)["by_words"] == true);
+        }
+
         // What is no name, and a device that follows no phrase.
         let no_name = look_from(&node.state, "Not A Name", &[]).await;
         assert!(matches!(no_name, Err(PersonError::NameNotHeld(_))));

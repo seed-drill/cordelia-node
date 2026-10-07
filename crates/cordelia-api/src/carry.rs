@@ -735,47 +735,58 @@ pub fn naming_words(key: &[u8; 32]) -> String {
 }
 
 /// The removed key that `named` names, among `removed` (decision
-/// 2026-10-04 §7.3): by the label that this device knew it by, or by the
+/// 2026-10-04 §7.3): by the label that this device knew it by; by the
 /// first six words of its key's fingerprint, however the words are
-/// spaced and in either case.
+/// spaced and in either case; or **by the key itself, written whole**
+/// (`cordelia_pk1...`).
 ///
 /// **Refused where a label, or the words, match two removed keys,** and
-/// where they match none: a person then names the key by its words,
-/// which `cordelia sync carry <name> --from` with no key lists.
+/// where they match none. A removed key can go by a label that is another
+/// key's six words, and those words then name two keys for good: a key
+/// written whole is taken for that key and for nothing else, whatever a
+/// key is labelled, so it always names one. `cordelia sync carry <name>
+/// --from` with no key lists each removed key that signed there.
 pub fn named_key(named: &str, removed: &[Removed]) -> Result<[u8; 32], String> {
     let tidy = |said: &str| -> String {
         let words: Vec<String> = said.split_whitespace().map(str::to_lowercase).collect();
         words.join(" ")
     };
     let asked = tidy(named);
-    let by_words: Vec<&Removed> = removed
-        .iter()
-        .filter(|one| naming_words(&one.key) == asked)
-        .collect();
-    let by_label: Vec<&Removed> = removed
-        .iter()
-        .filter(|one| !one.label.is_empty() && one.label == named)
-        .collect();
-    let mut matched: Vec<[u8; 32]> = by_words
-        .iter()
-        .chain(&by_label)
-        .map(|one| one.key)
-        .collect();
+    let names = |one: &&Removed| -> bool {
+        // What is a key, written whole, names that key alone: it is no
+        // label, and no words.
+        match cordelia_crypto::bech32::decode_public_key(named.trim()) {
+            Ok(key) => one.key == key,
+            Err(_) => {
+                naming_words(&one.key) == asked || (!one.label.is_empty() && one.label == named)
+            }
+        }
+    };
+    let mut matched: Vec<[u8; 32]> = removed.iter().filter(names).map(|one| one.key).collect();
     matched.sort_unstable();
     matched.dedup();
     match matched.as_slice() {
         [only] => Ok(*only),
         [] => Err(format!(
-            "{named:?} names no removed key that this device knows of: give its label, or the \
-             first {CARRY_FROM_WORDS} words of its key's fingerprint. `--from` with no key lists \
-             the removed keys that signed there, each with its words."
+            "{named:?} names no removed key that this device knows of: give its label, the \
+             first {CARRY_FROM_WORDS} words of its key's fingerprint, or its key written whole. \
+             `--from` with no key lists the removed keys that signed there."
         )),
         _ => Err(format!(
-            "{named:?} names {} removed keys: name the one that is meant by the first \
-             {CARRY_FROM_WORDS} words of its key's fingerprint.",
+            "{named:?} names {} removed keys: name the one that is meant by its key, written \
+             whole. `--from` with no key lists the removed keys that signed there, and \
+             `cordelia devices` shows each removed key with its key.",
             matched.len()
         )),
     }
+}
+
+/// Whether the first six words of the fingerprint of `key` name it among
+/// `removed`, and no other key (decision 2026-10-04 §7.3). They do not
+/// where another removed key goes by those words as its label: a command
+/// then names the key written whole.
+pub fn words_tell(key: &[u8; 32], removed: &[Removed]) -> bool {
+    named_key(&naming_words(key), removed) == Ok(*key)
 }
 
 /// A link of a chain as it is handed: the hex of its hash and then of the
@@ -1441,6 +1452,37 @@ mod tests {
                 "{none}: {refused}"
             );
         }
+        // **A key written whole names that key, and no other.** Here a
+        // removed key goes by a label that is another key's six words:
+        // those words name two keys, for good, and do not tell the key
+        // apart. Its key, written whole, does.
+        let written = |key: &[u8; 32]| cordelia_crypto::bech32::encode_public_key(key).unwrap();
+        let mut removed = removed;
+        removed.push(Removed {
+            key: [8; 32],
+            label: naming_words(&s.key(0)),
+        });
+        let two = named_key(&naming_words(&s.key(0)), &removed).unwrap_err();
+        assert!(two.contains("names 2 removed keys"), "{two}");
+        assert!(two.contains("by its key, written whole"), "{two}");
+        assert!(!words_tell(&s.key(0), &removed));
+        assert!(words_tell(&s.key(1), &removed) && words_tell(&[8; 32], &removed));
+        for one in &removed {
+            assert_eq!(named_key(&written(&one.key), &removed), Ok(one.key));
+            let spaced = format!("  {}\n", written(&one.key));
+            assert_eq!(named_key(&spaced, &removed), Ok(one.key));
+        }
+        // A key that is no removed key names none. And a key is never
+        // taken for a label: a removed key that is labelled with another
+        // key, written whole, is not named by it.
+        let refused = named_key(&written(&[7; 32]), &removed).unwrap_err();
+        assert!(refused.contains("names no removed key"), "{refused}");
+        assert!(refused.contains("or its key written whole"), "{refused}");
+        removed.push(Removed {
+            key: [6; 32],
+            label: written(&s.key(1)),
+        });
+        assert_eq!(named_key(&written(&s.key(1)), &removed), Ok(s.key(1)));
         // A key is in hex where a word names one.
         assert_eq!(key_named(&hex::encode(s.key(1))), Some(s.key(1)));
         assert_eq!(key_named("zz"), None);

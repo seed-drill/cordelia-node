@@ -824,9 +824,16 @@ fn look_lines(found: &Value) -> Vec<String> {
             .filter_map(Value::as_str)
             .map(file_shown)
             .collect();
+        // The command that brings it in names the key by its six words:
+        // and by the key written whole, where the node says that those
+        // words name another removed key too (§7.3).
+        let named = match lacks["by_words"] == false {
+            true => crate::carry_cmd::key_written(&key),
+            false => format!("\"{words}\""),
+        };
         lines.push(format!(
             "  {} signed {} that the new channels lack, in: {}. It is brought in only with the \
-             phrase: cordelia sync carry <name> --from \"{words}\"",
+             phrase: cordelia sync carry <name> --from {named}",
             crate::person_cmd::words_then(&words, text(lacks, "label")),
             counted(lacks["versions"].as_u64().unwrap_or(0) as usize, "version"),
             names.join(", ")
@@ -1232,6 +1239,8 @@ mod tests {
                 { "key": hex::encode(key), "label": "desktop", "versions": 3,
                   "names": ["lab", "notes"] },
                 { "key": "no key", "label": "odd", "versions": 9, "names": [] },
+                { "key": hex::encode([9u8; 32]), "label": "tablet", "versions": 1,
+                  "names": ["lab"], "by_words": false },
             ],
         });
         let lines = look_lines(&found);
@@ -1263,6 +1272,16 @@ mod tests {
                 "({words}) \"desktop\" signed 3 versions that the new channels lack, in: lab, \
                  notes. It is brought in only with the phrase: cordelia sync carry <name> --from \
                  \"{words}\""
+            )),
+            "{all}"
+        );
+        // A key whose six words name another removed key too is named
+        // by the key written whole, which the command works out too.
+        let whole = cordelia_crypto::bech32::encode_public_key(&[9u8; 32]).unwrap();
+        assert!(
+            all.contains(&format!(
+                "\"tablet\" signed 1 version that the new channels lack, in: lab. It is \
+                 brought in only with the phrase: cordelia sync carry <name> --from {whole}"
             )),
             "{all}"
         );

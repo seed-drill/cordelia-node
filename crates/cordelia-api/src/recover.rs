@@ -1028,13 +1028,27 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
         }));
     }
     let labels = crate::look::removed_labels(&db(state)).unwrap_or_default();
+    let label_of = |key: &[u8; 32]| -> String {
+        let label = labels.iter().find(|(known, _)| known == key);
+        label.map(|(_, label)| label.clone()).unwrap_or_default()
+    };
+    // Every removed key that this machine knows of, with its label:
+    // whether a key's six words name it, and no other, is said of each
+    // key that the new channels lack something of (§7.3).
+    let all: Vec<carry::Removed> = removed
+        .iter()
+        .map(|key| carry::Removed {
+            key: *key,
+            label: label_of(key),
+        })
+        .collect();
     let lacking: Vec<serde_json::Value> = lacking
         .into_iter()
         .map(|(key, (versions, names))| {
-            let label = labels.iter().find(|(known, _)| *known == key);
             json!({
                 "key": hex::encode(key),
-                "label": label.map(|(_, label)| label.as_str()).unwrap_or_default(),
+                "label": label_of(&key),
+                "by_words": carry::words_tell(&key, &all),
                 "versions": versions,
                 "names": names,
             })
@@ -1920,7 +1934,8 @@ mod tests {
         assert_eq!(
             found["lacking"],
             json!([{
-                "key": hex::encode(k1), "label": "device 1", "versions": 1, "names": [LAB],
+                "key": hex::encode(k1), "label": "device 1", "by_words": true, "versions": 1,
+                "names": [LAB],
             }])
         );
         assert_eq!(found["not_read"], json!([]));

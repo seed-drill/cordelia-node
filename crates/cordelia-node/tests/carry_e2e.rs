@@ -573,6 +573,18 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
     );
     assert_eq!(held(&laptop), before);
 
+    // The removed device is named by its key, written whole, too.
+    let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", &desktop_key]);
+    at.says("What this removed key signed in lab:")
+        .says(&format!("({six_words}) \"desktop\""))
+        .says("Bring in 1 version into the slot")
+        .types("no");
+    let said = at.done();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+
     // Anything but a yes takes nothing, and asks for no phrase.
     let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 1 version into the slot").types("y");

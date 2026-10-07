@@ -93,8 +93,9 @@ const CARRY_WAITS: Duration = Duration::from_secs(CARRY_READ_MAX_SECS + 90);
 
 /// `cordelia sync carry [<name>] [--from [<key>]...] [--phrase]`
 /// (decision 2026-10-04 §7.3). Each `--from` names one removed key, by
-/// its label or by the first six words of its key's fingerprint; with no
-/// key after it, the removed keys that signed there are listed.
+/// its label, by the first six words of its key's fingerprint, or by the
+/// key written whole; with no key after it, the removed keys that signed
+/// there are listed.
 pub(crate) fn carry(
     config_path: &str,
     name: Option<String>,
@@ -247,7 +248,7 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
     let Some(at) = at else {
         println!(
             "Nothing was taken. To bring in what one of them wrote: cordelia sync carry {} \
-             --from \"<its label, or those six words>\"",
+             --from \"<its label, those six words, or its key>\"",
             file_shown(name)
         );
         return Ok(());
@@ -521,11 +522,20 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             continue;
         };
         let entries = signed["entries"].as_u64().unwrap_or(0) as usize;
-        lines.push(format!(
+        let mut line = format!(
             "  {}: {}",
             words_then(&carry::naming_words(&key), text(signed, "label")),
             counted(entries, "entry").replace("entrys", "entries")
-        ));
+        );
+        // Where the node says that those words name another removed key
+        // too, the key is given written whole: that names it alone.
+        if signed["by_words"] == false {
+            line.push_str(&format!(
+                ". Those words name another removed key here too: name this one by its key, {}",
+                key_written(&key)
+            ));
+        }
+        lines.push(line);
     }
     match lines.is_empty() {
         true => vec![format!(
@@ -541,6 +551,11 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             lines
         }
     }
+}
+
+/// A key written whole, as `--from` takes one (decision 2026-10-04 §7.3).
+pub(crate) fn key_written(key: &[u8; 32]) -> String {
+    cordelia_crypto::bech32::encode_public_key(key).unwrap_or_else(|_| hex::encode(key))
 }
 
 /// What could not be read, by generation and relay, in lines.
@@ -1259,11 +1274,24 @@ mod tests {
         let key = [7u8; 32];
         let found = json!({ "signed": [
             { "key": hex::encode(key), "words": "not these", "label": "desktop", "entries": 2 },
-            { "key": hex::encode([8u8; 32]), "label": "", "entries": 1 },
+            { "key": hex::encode([8u8; 32]), "label": "", "entries": 1, "by_words": true },
             { "key": "no key", "label": "odd", "entries": 9 },
+            { "key": hex::encode([9u8; 32]), "label": "old", "entries": 4, "by_words": false },
         ]});
         let lines = signed_lines(&found, "lab");
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        // A key whose six words name another removed key too is given
+        // written whole, as `--from` takes one: worked out from the key.
+        let whole = cordelia_crypto::bech32::encode_public_key(&[9u8; 32]).unwrap();
+        assert!(whole.starts_with("cordelia_pk1"), "{whole}");
+        assert_eq!(
+            lines[3],
+            format!(
+                "  ({}) \"old\": 4 entries. Those words name another removed key here too: \
+                 name this one by its key, {whole}",
+                carry::naming_words(&[9u8; 32])
+            )
+        );
         assert!(
             lines[0].starts_with("Removed keys that signed in lab"),
             "{lines:?}"
