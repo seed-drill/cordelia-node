@@ -1405,8 +1405,11 @@ mod tests {
         assert!(node.asked.lock().unwrap().is_empty());
         assert_eq!(node.stored(), before + 1);
         // Run again, with a word given anew, it takes what the new
-        // channel still lacks: nothing.
-        let anew = Word::give(&phrase, &own, &under, says.clone(), now() - 1).unwrap();
+        // channel still lacks: nothing. (Another word than the first:
+        // one that stands until another second.)
+        let given = word.until - cordelia_core::protocol::CARRY_WORD_SECS - 2;
+        let anew = Word::give(&phrase, &own, &under, says.clone(), given).unwrap();
+        assert_ne!(anew.signature, word.signature);
         let again = take_from(&node.state, &anew).await.unwrap();
         assert_eq!((&again["carried"], &again["held"]), (&json!(0), &json!(1)));
 
