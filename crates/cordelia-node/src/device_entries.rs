@@ -859,10 +859,11 @@ impl DeviceEntries {
 
     // ── Old deletes ─────────────────────────────────────────────────
 
-    /// Drop from the device's own store each slot whose delete it has
-    /// held for 90 days (decision 2026-10-04 §2.3, §7.3;
-    /// [`cordelia_api::swept`]): on the node's hourly timer. A node that
-    /// is held up sweeps nothing.
+    /// Drop from the device's own store each delete that it has held for
+    /// 90 days and that may go (decision 2026-10-04 §2.3, §7.3, §16;
+    /// [`cordelia_api::swept`]): on the node's hourly timer. A channel
+    /// that a delete went from is read again from its start by the next
+    /// whole pass. A node that is held up sweeps nothing.
     pub fn sweep_deletes(&self) {
         let held_up = self.state.held.why().is_some();
         if held_up {
@@ -873,7 +874,9 @@ impl DeviceEntries {
             Ok(swept) if swept.slots > 0 => tracing::info!(
                 slots = swept.slots,
                 entries = swept.entries,
-                "swept the deletes that this device has held for 90 days"
+                channels = swept.read_again,
+                "swept the deletes that this device has held for 90 days: each channel that \
+                 one went from is read again from its start"
             ),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "could not sweep old deletes"),

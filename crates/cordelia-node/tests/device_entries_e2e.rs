@@ -4853,6 +4853,108 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     assert_eq!(device.text("notes", "gone.md"), None);
 }
 
+/// **A file made again under a swept name reaches a device that swept
+/// later** (decision 2026-10-04 §16), against a relay. The laptop writes
+/// a file and deletes it. Ninety days on, by the laptop's clock and by
+/// the relay's, each has swept the delete, and the laptop makes the file
+/// again: at the first revision. The desktop is behind: it still holds
+/// the delete, of the same author, at a higher revision. It pulls the new
+/// entry, keeps nothing of it, and its place at the relay moves past it.
+///
+/// When the desktop's own 90 days have passed, its sweep takes the
+/// delete and forgets its place in that channel, and in no other. Its
+/// next whole pass reads the channel from the start: the file is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_made_again_under_a_swept_name_reaches_a_device_that_swept_later() {
+    use cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS;
+    const HELD_SECS: u64 = KEYED_TOMBSTONE_RETENTION_DAYS as u64 * 24 * 60 * 60;
+    let mut relay = relay_started("relay", None);
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.connects("relay", &relay).await;
+        device.holds("lab");
+    }
+    let first = laptop.writes("lab", "again.md", "first");
+    laptop.writes("lab", "other.md", "stays");
+    all_pass(&[&laptop, &desktop], 3).await;
+    laptop.deletes("lab", "again.md");
+    all_pass(&[&laptop, &desktop], 3).await;
+    let lab = laptop.channel("lab");
+    for device in [&laptop, &desktop] {
+        assert_eq!(device.holds_of(&lab).len(), 2);
+        assert_eq!(device.text("lab", "again.md").as_deref(), Some("Delete"));
+    }
+    assert_eq!(held_at(&relay, &lab).len(), 2);
+
+    // Ninety days on for the laptop: its delete goes, and its slot holds
+    // nothing.
+    laptop.clock.run_ahead(Duration::from_secs(HELD_SECS + 60));
+    laptop.engine.sweep_deletes();
+    assert_eq!(laptop.holds_of(&lab).len(), 1);
+    // And for the relay. (While it is stopped, time goes by for the
+    // delete that it holds.)
+    relay.stop();
+    {
+        let db = rusqlite::Connection::open(relay.data_dir().join("cordelia.db")).unwrap();
+        let changed = db
+            .execute(
+                "UPDATE entries SET stored_at = stored_at - ?1
+                 WHERE channel_id = ?2 AND is_delete = 1",
+                rusqlite::params![(HELD_SECS + 60) as i64, lab.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    wait_for("the relay sweeps the old delete", &[&relay], 30, || {
+        (held_at(&relay, &lab).len() == 1).then_some(())
+    });
+    for device in [&mut laptop, &mut desktop] {
+        device.connects("relay", &relay).await;
+    }
+
+    // The laptop makes the file again: at the first revision. The relay
+    // takes it.
+    let again = laptop.writes("lab", "again.md", "made again");
+    assert_eq!(again.rev, first.rev);
+    all_pass(&[&laptop], 2).await;
+    assert!(holds_at(&relay, &lab, &again.id()));
+
+    // The desktop still holds the delete. Whatever it is handed from
+    // the place it has reached, it keeps nothing of the new entry: that
+    // is below the delete, and of the delete's author.
+    all_pass(&[&desktop], 2).await;
+    let at = desktop.place("relay", &lab);
+    assert_ne!(at, ([0u8; 8], 0));
+    assert!(!desktop.holds_of(&lab).contains(&again.id()));
+    assert_eq!(desktop.text("lab", "again.md").as_deref(), Some("Delete"));
+    let personal = derive::channel_id(&desktop.personal_secret()).unwrap();
+    let in_personal = desktop.place("relay", &personal);
+    assert_ne!(in_personal.1, 0);
+
+    // The desktop's own 90 days: its delete goes, and its place in that
+    // channel is forgotten. Its place in its personal channel stays.
+    desktop.clock.run_ahead(Duration::from_secs(HELD_SECS + 60));
+    desktop.engine.sweep_deletes();
+    assert_eq!(desktop.holds_of(&lab).len(), 1);
+    assert_eq!(desktop.text("lab", "again.md"), None);
+    assert_eq!(desktop.place("relay", &lab), ([0u8; 8], 0));
+    assert_eq!(desktop.place("relay", &personal), in_personal);
+    // The next whole pass reads the channel from its start: the file is
+    // there.
+    desktop.passes().await;
+    assert_ne!(desktop.place("relay", &lab), ([0u8; 8], 0));
+    assert!(desktop.holds_of(&lab).contains(&again.id()));
+    assert_eq!(
+        desktop.text("lab", "again.md").as_deref(),
+        Some("made again")
+    );
+    assert_eq!(desktop.text("lab", "other.md").as_deref(), Some("stays"));
+}
+
 /// A node that is held up makes no pass (decision 2026-10-04 §10.1):
 /// nothing is shown, asked, sent or taken, by the whole pass or by the
 /// pass that sends, and no whole pass is counted. Held up no longer, it

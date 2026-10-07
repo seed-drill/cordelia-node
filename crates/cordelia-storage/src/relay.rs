@@ -4591,6 +4591,39 @@ mod tests {
         assert_eq!(counted(&conn), cost(&over));
     }
 
+    /// Whoever keeps a place in a channel is handed what the relay
+    /// stores after it (decision 2026-10-04 §2.4 item 3): also once a
+    /// sweep has taken the entry at that place, which was the last that
+    /// the relay had stored of the channel.
+    #[test]
+    #[ignore = "shows that a sweep of the last-stored entry of a channel lets its place be given \
+                again under the same mark: a reader at that place is not handed the next entry"]
+    fn test_a_reader_at_the_place_of_a_swept_delete_is_handed_what_is_stored_next() {
+        let (conn, mut room) = relay();
+        let text = small(1, 1, 5);
+        let gone = deleted(1, 1, 3, "gone.md");
+        for entry in [&text, &gone] {
+            let taken = take(&conn, &mut room, entry, &from(1), NOW).unwrap();
+            assert_eq!(taken, Taken::Stored);
+        }
+        // A reader reads the channel to its end, and keeps its place.
+        let read = paged(&conn, 1, true, 0, 100);
+        assert_eq!(read.entries.len(), 2);
+        let (mark, place) = (read.mark, read.next);
+        // The delete goes at its 90 days. The channel is still held.
+        let swept = sweep_deletes(&conn, NOW + 90 * DAY).unwrap();
+        assert_eq!((swept.entries, swept.channels.len()), (1, 0));
+        // The next entry that is stored is handed to the reader, from
+        // the place it kept.
+        let new = made(1, 2, 1, "new.md", "written after the sweep");
+        let taken = take(&conn, &mut room, &new, &from(1), NOW + 91 * DAY).unwrap();
+        assert_eq!(taken, Taken::Stored);
+        let next = pull(&conn, &channel(1), true, &mark, place, 100).unwrap();
+        assert_eq!(next.mark, mark);
+        let handed: Vec<[u8; 32]> = next.entries.iter().map(Entry::id).collect();
+        assert_eq!(handed, [new.id()]);
+    }
+
     /// A relay holds no list of who counts, so a slot goes only where
     /// every author's entry in it is a delete that the relay has held
     /// for 90 days (the rule of decision 2026-09-30 §4.4). Where one

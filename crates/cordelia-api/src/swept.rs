@@ -1,5 +1,5 @@
 //! The sweep of old deletes in a device's own store (decision 2026-10-04
-//! §2.3, §7.3; decision 2026-09-30 §4.4).
+//! §2.3, §7.3, §16; decision 2026-09-30 §4.4).
 //!
 //! A delete is a version: it is stored, sent and carried like a text, so
 //! that a device which was away learns that a file was deleted. It is
@@ -8,39 +8,54 @@
 //! delete that is carried at a statement is a new entry, so its 90 days
 //! start again there.
 //!
-//! **A slot goes whole, or not at all.** Were a delete to go alone, a
-//! lower revision by another author would be the slot's version again,
-//! and a file that was deleted would come back. Which slots go turns on
-//! what the device can know of them:
+//! **A sweep takes only deletes** (§16). An entry that is no delete
+//! stays where it is, whatever goes around it. Which deletes go turns on
+//! what the device can know of their slot:
 //!
 //! - **In the channel of a name it holds,** the device reads the slot as
 //!   it reads it for a folder: with the name's secret, under the
-//!   statement it has applied, and with its word on who counts. The slot
-//!   goes where its current version is a delete, and the device has held
-//!   every entry that is that delete for 90 days.
-//!   - **It stays while a folder's record names a text there.** Such a
-//!     folder has not taken the delete yet: with the slot gone, its file
-//!     would meet the channel as a new file does, and be published again.
-//!     Once every folder has agreed that the file is deleted, the slot
-//!     goes, and those records go with it: no folder's record names a
-//!     version that the store holds no more.
+//!   statement it has applied, and with its word on who counts. The
+//!   slot's old deletes go where its current version is a delete, and the
+//!   device has held every entry that is that delete for 90 days.
+//!   - **They stay while the slot holds an entry that is no delete and
+//!     that the store took before the delete.** Were the delete to go,
+//!     that entry would be the slot's version again, and a file that was
+//!     deleted would come back. (An entry that is no delete and that came
+//!     after the delete is another thing: a file made again under the
+//!     name, by a device whose own delete had gone already. It stays, and
+//!     is the slot's version once the delete has gone.)
+//!   - **They stay while a folder's record names a text there.** Such a
+//!     folder has not taken the delete yet: with the delete gone, its
+//!     file would meet the channel as a new file does, and be published
+//!     again. Once every folder has agreed that the file is deleted, the
+//!     delete goes, and those records go with it: no folder's record
+//!     names a version that the store holds no more.
 //! - **In any other channel of its own** (the personal channel, and the
 //!   pair channel of a hand-over it made), an entry is one device's own
-//!   word, whatever another key wrote in its slot. A slot goes there
-//!   only where every entry in it is a delete that the device has held
-//!   for 90 days, as a relay sweeps a slot.
+//!   word, whatever another key wrote in its slot. A slot's deletes go
+//!   there only where every entry in it is a delete that the device has
+//!   held for 90 days, as a relay sweeps a slot.
+//!
+//! **A channel that a sweep took anything of is read again from its
+//! start, at every relay** (§16). A device whose delete went earlier may
+//! have made the file again since, at the first revision. Where one
+//! author wrote that entry and the delete, this device's store kept the
+//! delete and nothing of the entry below it, and its place at each relay
+//! is past the entry. So it forgets its places in the channel, and the
+//! node's next pass reads the entry.
 //!
 //! A device that follows no phrase holds no channel of its own, and one
 //! that has stopped keeps what it holds until a person acts: neither
 //! sweeps anything.
 //!
-//! **What a sweep costs.** A slot that has gone has no revision: the next
-//! entry written there starts again at the first. A node that stored the
-//! delete later than this device still holds it for as long, and to that
-//! node a file that is made again under the same name in that time is
-//! below the delete until its own 90 days have passed.
+//! **What a sweep costs.** A slot of which nothing is left has no
+//! revision: the next entry written there starts again at the first. A
+//! node that stored the delete later than this device still holds it for
+//! as long, and to that node a file that is made again under the same
+//! name in that time is below the delete until its own 90 days have
+//! passed. It has the file then: late, by as long as it was behind.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::Connection;
 
@@ -49,6 +64,7 @@ use cordelia_crypto::bech32::encode_channel_id;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::Value;
 use cordelia_crypto::version;
+use cordelia_storage::at_relays as places;
 use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, State};
 use cordelia_storage::sync_state;
@@ -62,18 +78,25 @@ const DELETE_HELD_SECS: i64 = KEYED_TOMBSTONE_RETENTION_DAYS as i64 * 24 * 60 * 
 /// What a sweep of old deletes did on a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Swept {
-    /// How many slots went.
+    /// How many slots it took deletes of.
     pub slots: usize,
-    /// How many entries went with them.
+    /// How many entries went: each of them a delete.
     pub entries: usize,
-    /// How many slots stay, though their delete is old, because a
+    /// How many slots keep their delete, though it is old, because a
     /// folder's record names a text there.
     pub kept_for_a_folder: usize,
+    /// How many slots keep their delete, though it is old, because an
+    /// entry that is no delete was stored there before it.
+    pub kept_over_an_entry: usize,
+    /// How many channels it took something of: each is read again from
+    /// its start, at every relay.
+    pub read_again: usize,
 }
 
-/// Drop from this device's store each slot whose delete it has held for
-/// 90 days (see the module's documentation), at `now`, the device's time
-/// in seconds. All of it happens, or none.
+/// Drop from this device's store each delete that it has held for 90
+/// days and that may go (see the module's documentation), at `now`, the
+/// device's time in seconds, and forget the device's places in each
+/// channel that something went from. All of it happens, or none.
 pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<Swept, PersonError> {
     in_one(conn, || {
         let standing = match Standing::of(conn) {
@@ -90,6 +113,8 @@ pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<Swept, PersonError> 
         }
 
         let mut swept = Swept::default();
+        // The channels that something went from.
+        let mut taken_of: BTreeSet<[u8; 32]> = BTreeSet::new();
         for (channel, slot) in entries::slots_with_a_delete_stored(conn, by)? {
             let goes = match names.get(&channel) {
                 Some(secret) => match of_a_name(conn, &standing, &channel, &slot, secret, by)? {
@@ -98,35 +123,54 @@ pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<Swept, PersonError> 
                         swept.kept_for_a_folder += 1;
                         false
                     }
+                    Judged::KeptOverAnEntry => {
+                        swept.kept_over_an_entry += 1;
+                        false
+                    }
                     Judged::Stays => false,
                 },
                 None => entries::holds_only_deletes_stored(conn, &channel, &slot, by)?,
             };
             if goes {
-                swept.entries += entries::remove_slot(conn, &channel, &slot)?;
+                // The deletes, and nothing else: an entry that is no
+                // delete stays.
+                swept.entries += entries::remove_deletes_stored(conn, &channel, &slot, by)?;
                 swept.slots += 1;
+                taken_of.insert(channel);
             }
         }
+        // Each channel that something went from is read again from its
+        // start, at every relay: a file made again there since may lie
+        // behind the place that the device has reached.
+        for channel in &taken_of {
+            places::forget_places_of(conn, channel)?;
+        }
+        swept.read_again = taken_of.len();
         Ok(swept)
     })
 }
 
 /// What a sweep makes of one slot in the channel of a name.
 enum Judged {
-    /// Its current version is a delete held for 90 days, and no folder's
-    /// record names a text there: it goes, with each folder's record that
-    /// the file is deleted.
+    /// Its current version is a delete held for 90 days, no entry that is
+    /// no delete came before it, and no folder's record names a text
+    /// there: its old deletes go, with each folder's record that the file
+    /// is deleted.
     Goes,
-    /// It would go, and a folder's record names a text there.
+    /// They would go, and a folder's record names a text there.
     KeptForAFolder,
+    /// Its current version is a delete held for 90 days, and the slot
+    /// holds an entry that is no delete and that came before it: with the
+    /// delete gone, that entry would be the file again.
+    KeptOverAnEntry,
     /// Its current version is no delete, or one that is not old yet.
     Stays,
 }
 
 /// Judge one slot of the channel of a name that the device holds, whose
 /// secret is `secret`: `by` is the time at or before which a delete that
-/// goes was stored. A slot that goes has its folders' records of the
-/// delete forgotten here.
+/// goes was stored. A slot whose deletes go has its folders' records of
+/// the delete forgotten here.
 fn of_a_name(
     conn: &Connection,
     standing: &Standing,
@@ -151,6 +195,10 @@ fn of_a_name(
     }
     // The device has held the delete for 90 days in every entry that is
     // it: one that arrived since says that a device still wrote it then.
+    let of_the_delete = |held: &&entries::StoredEntry| {
+        let id = held.entry.id();
+        current.entries.iter().any(|one| one.id == id)
+    };
     let held_long = current.entries.iter().all(|one| {
         stored
             .iter()
@@ -158,6 +206,20 @@ fn of_a_name(
     });
     if !held_long {
         return Ok(Judged::Stays);
+    }
+    // An entry that is no delete, and that the store took before the
+    // last entry of the delete: whoever signed it, and whether or not it
+    // is read today. The delete is what keeps it from being the file.
+    let delete_came = stored
+        .iter()
+        .filter(of_the_delete)
+        .map(|held| held.seq)
+        .max();
+    let under = stored
+        .iter()
+        .any(|held| !held.entry.delete && Some(held.seq) < delete_came);
+    if under {
+        return Ok(Judged::KeptOverAnEntry);
     }
     let written = encode_channel_id(channel)?;
     if sync_state::names_a_text(conn, &written, &current.name)? {
@@ -175,6 +237,19 @@ mod tests {
     use cordelia_storage::sync_state::Agreed;
 
     const DAY: i64 = 24 * 60 * 60;
+    const RELAY: [u8; 32] = [0xa1; 32];
+    const OTHER_RELAY: [u8; 32] = [0xa2; 32];
+    const MARK: [u8; 8] = [0x4d, 1, 2, 3, 4, 5, 6, 7];
+
+    /// The place that `on` keeps at `relay` in `channel`.
+    fn place_at(on: &Machine, relay: &[u8; 32], channel: &[u8; 32]) -> Option<([u8; 8], u64)> {
+        places::kept(&on.conn, relay, channel).unwrap().place
+    }
+
+    /// The channel of `name` on `on`.
+    fn channel_of(on: &Machine, name: &str) -> [u8; 32] {
+        derive::channel_id(&on.own(name)).unwrap()
+    }
 
     /// Device `n` writes a delete under `file` in `name`, over what it
     /// reads there.
@@ -218,72 +293,247 @@ mod tests {
         on.stored_in(&on.own(name)).len()
     }
 
-    /// In the channel of a name, a slot goes where its current version is
-    /// a delete that the device has held for 90 days, and not a second
-    /// before (decision 2026-10-04 §2.3, §7.3). It goes whole: the text
-    /// that the delete was written over goes with it, and no file comes
-    /// back. A slot whose current version is a text stays, however old a
-    /// delete below it is.
+    /// In the channel of a name, a slot's delete goes where it is the
+    /// slot's current version and the device has held it for 90 days, and
+    /// not a second before (decision 2026-10-04 §2.3, §7.3, §16). **Only
+    /// deletes go.** A slot whose current version is a text stays,
+    /// however old a delete below it is. And a delete stays while the
+    /// slot holds an entry that is no delete and that came before it:
+    /// that entry would be the file again, and no file comes back.
+    ///
+    /// The device forgets its places, at every relay, in a channel that
+    /// the sweep took something of, and in no other; and none where the
+    /// sweep took nothing.
     #[test]
-    fn test_a_slot_whose_delete_was_held_for_90_days_goes_whole() {
+    fn test_a_sweep_takes_the_deletes_held_for_90_days_and_nothing_else() {
         assert_eq!(KEYED_TOMBSTONE_RETENTION_DAYS, 90);
         let mut s = Several::of_one_person(2);
         s.hold(&[0, 1], "lab");
-        // Device 0 writes two files. Device 1 deletes one: its delete
-        // stands beside device 0's text in the slot.
-        s.write(0, "lab", "gone.md", "a text that is deleted");
+        s.write(0, "lab", "gone.md", "a text that its writer deletes");
+        s.write(0, "lab", "under.md", "a text that another device deletes");
         s.write(0, "lab", "kept.md", "a text that stays");
         s.meet(&[0, 1]);
-        deletes(&mut s, 1, "lab", "gone.md");
+        // Device 0 deletes a file of its own: a store holds one entry for
+        // an author in a slot, so the delete is all that the slot holds.
+        deletes(&mut s, 0, "lab", "gone.md");
+        let deleted = s.now;
+        // Device 1 deletes another: its delete stands beside device 0's
+        // text in the slot.
+        deletes(&mut s, 1, "lab", "under.md");
         // And it deletes another that device 0 then writes again, above
         // the delete: the slot's current version is a text.
         s.write(1, "lab", "back.md", "first");
         deletes(&mut s, 1, "lab", "back.md");
-        // Device 0 stores the deletes after this moment.
-        let not_yet_stored = s.now;
         s.meet(&[0, 1]);
         s.write(0, "lab", "back.md", "written again");
         s.meet(&[0, 1]);
         let stored = s.now;
         for n in 0..2 {
-            assert_eq!(
-                s[n].slot("lab", "gone.md").current.unwrap().value,
-                Value::Delete
-            );
-            assert_eq!(held_of(&s[n], "lab"), 5, "device {n}");
+            for file in ["gone.md", "under.md"] {
+                assert_eq!(s[n].slot("lab", file).current.unwrap().value, Value::Delete);
+            }
+            assert_eq!(held_of(&s[n], "lab"), 6, "device {n}");
         }
-
-        // Short of 90 days from when this device stored the delete,
-        // nothing goes.
         let on = &s[0];
-        let none = sweep_deletes(&on.conn, not_yet_stored + 90 * DAY).unwrap();
+        let (lab, personal) = (
+            channel_of(on, "lab"),
+            derive::channel_id(&on.personal()).unwrap(),
+        );
+        let reaches = |channel: &[u8; 32]| {
+            for relay in [RELAY, OTHER_RELAY] {
+                places::keep_place(&on.conn, &relay, channel, &MARK, 7).unwrap();
+                places::sent(&on.conn, &relay, channel, 5).unwrap();
+            }
+        };
+        reaches(&lab);
+        reaches(&personal);
+        let there = Some((MARK, 7));
+
+        // A second short of 90 days from when this device stored its
+        // delete, nothing goes, and no place is forgotten.
+        let none = sweep_deletes(&on.conn, deleted + 90 * DAY - 1).unwrap();
         assert_eq!(none, Swept::default());
-        assert_eq!(held_of(on, "lab"), 5);
-        // At 90 days from when everything was stored: the slot of
-        // `gone.md` goes, with device 0's text below the delete. The
-        // others stay.
-        let swept = sweep_deletes(&on.conn, stored + 90 * DAY).unwrap();
+        assert_eq!(held_of(on, "lab"), 6);
+        assert_eq!(place_at(on, &RELAY, &lab), there);
+        // At 90 days the delete of `gone.md` goes: the slot holds
+        // nothing. The delete that device 1 wrote is not old here yet.
+        let swept = sweep_deletes(&on.conn, deleted + 90 * DAY).unwrap();
         assert_eq!(
             swept,
             Swept {
                 slots: 1,
-                entries: 2,
-                kept_for_a_folder: 0
+                entries: 1,
+                read_again: 1,
+                ..Swept::default()
             }
         );
         assert!(on.slot("lab", "gone.md").current.is_none());
+        assert_eq!(held_of(on, "lab"), 5);
+        // The name's channel is read again from its start, at each
+        // relay: what was sent there is kept. A place in another channel
+        // stays.
+        for relay in [RELAY, OTHER_RELAY] {
+            let kept = places::kept(&on.conn, &relay, &lab).unwrap();
+            assert_eq!((kept.place, kept.sent_to), (None, 5));
+            assert_eq!(place_at(on, &relay, &personal), there);
+        }
+
+        // Once everything is 90 days old: the delete of `under.md` stays,
+        // over the text that came before it, and that text is not the
+        // file again. The others stay. Nothing went, so no place is
+        // forgotten.
+        reaches(&lab);
+        for long_after in [stored + 90 * DAY, stored + 3650 * DAY] {
+            let swept = sweep_deletes(&on.conn, long_after).unwrap();
+            assert_eq!(
+                swept,
+                Swept {
+                    kept_over_an_entry: 1,
+                    ..Swept::default()
+                }
+            );
+        }
+        assert_eq!(
+            on.slot("lab", "under.md").current.unwrap().value,
+            Value::Delete
+        );
         assert_eq!(
             on.text("lab", "kept.md").as_deref(),
             Some("a text that stays")
         );
         assert_eq!(on.text("lab", "back.md").as_deref(), Some("written again"));
-        assert_eq!(held_of(on, "lab"), 3);
-        // Again, and long after: nothing more.
-        let again = sweep_deletes(&on.conn, stored + 3650 * DAY).unwrap();
-        assert_eq!(again, Swept::default());
-        assert_eq!(held_of(on, "lab"), 3);
+        assert_eq!(held_of(on, "lab"), 5);
+        assert_eq!(place_at(on, &RELAY, &lab), there);
         // The other device is as it was until its own sweep.
-        assert_eq!(held_of(&s[1], "lab"), 5);
+        assert_eq!(held_of(&s[1], "lab"), 6);
+    }
+
+    /// **A file made again under a swept name reaches a device that
+    /// swept later** (decision 2026-10-04 §16). Device 0 writes a file
+    /// and deletes it, and device 1 stores that delete ten days after
+    /// device 0 did. At its 90 days device 0's delete goes, and the file
+    /// is made again there, at the first revision. To device 1 that entry
+    /// is below the delete, and of the delete's own author: its store
+    /// keeps nothing of it, and its place at a relay moves past it. When
+    /// its own 90 days have passed, its delete goes too, and its place in
+    /// the channel is forgotten: the channel is read again from its
+    /// start, and the file is there.
+    #[test]
+    fn test_a_file_made_again_under_a_swept_name_reaches_a_device_that_swept_later() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        let first = s.write(0, "lab", "again.md", "first");
+        s.write(0, "lab", "other.md", "stays");
+        deletes(&mut s, 0, "lab", "again.md");
+        let early = s.now;
+        s.now += 10 * DAY;
+        s.pass(0, 1);
+        let late = s.now;
+        assert_eq!(held_of(&s[1], "lab"), 2);
+
+        // Device 0's 90 days: its delete goes, and the slot holds
+        // nothing. The file is made again there, at the first revision.
+        let swept = sweep_deletes(&s[0].conn, early + 90 * DAY).unwrap();
+        assert_eq!((swept.slots, swept.entries, swept.read_again), (1, 1, 1));
+        assert!(s[0].slot("lab", "again.md").current.is_none());
+        s.now = early + 91 * DAY;
+        let again = s.write(0, "lab", "again.md", "made again");
+        assert_eq!(again.rev, first.rev);
+
+        // Device 1 is handed it, and keeps nothing of it: it holds the
+        // delete, of that author, at a higher revision.
+        s.pass(0, 1);
+        let on = &s[1];
+        assert_eq!(
+            on.slot("lab", "again.md").current.unwrap().value,
+            Value::Delete
+        );
+        let holds_it = |on: &Machine| {
+            let held = on.stored_in(&on.own("lab"));
+            held.iter().any(|held| held.id() == again.id())
+        };
+        assert!(!holds_it(on));
+        // Its place at a relay is past the entry.
+        let lab = channel_of(on, "lab");
+        places::keep_place(&on.conn, &RELAY, &lab, &MARK, 4).unwrap();
+
+        // A second short of its own 90 days nothing goes, and its place
+        // is kept: read from there, the entry would never come.
+        let none = sweep_deletes(&on.conn, late + 90 * DAY - 1).unwrap();
+        assert_eq!(none, Swept::default());
+        assert_eq!(place_at(on, &RELAY, &lab), Some((MARK, 4)));
+        // At its 90 days the delete goes, and the place with it.
+        let swept = sweep_deletes(&on.conn, late + 90 * DAY).unwrap();
+        assert_eq!(
+            swept,
+            Swept {
+                slots: 1,
+                entries: 1,
+                read_again: 1,
+                ..Swept::default()
+            }
+        );
+        assert_eq!(place_at(on, &RELAY, &lab), None);
+        assert!(on.slot("lab", "again.md").current.is_none());
+
+        // The channel is read again from its start: the file is there.
+        s.now = late + 91 * DAY;
+        s.pass(0, 1);
+        assert!(holds_it(&s[1]));
+        assert_eq!(s[1].text("lab", "again.md").as_deref(), Some("made again"));
+        assert_eq!(s[1].text("lab", "other.md").as_deref(), Some("stays"));
+    }
+
+    /// **An entry that is no delete stays** (decision 2026-10-04 §16).
+    /// Here another device than the delete's author makes the file
+    /// again, once its own delete has gone. A device that still holds
+    /// the delete keeps that entry, below the delete: it came after it.
+    /// When this device's delete goes, the entry is what the slot holds,
+    /// and the file is there at once.
+    #[test]
+    fn test_an_entry_that_came_after_the_delete_stays_when_the_delete_goes() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "lab");
+        let first = s.write(0, "lab", "again.md", "first");
+        deletes(&mut s, 0, "lab", "again.md");
+        s.pass(0, 2);
+        let early = s.now;
+        s.now += 10 * DAY;
+        s.pass(0, 1);
+        let late = s.now;
+
+        // Device 2's delete goes, and it makes the file again: an entry
+        // of its own, at the first revision.
+        let swept = sweep_deletes(&s[2].conn, early + 90 * DAY).unwrap();
+        assert_eq!((swept.slots, swept.entries), (1, 1));
+        s.now = early + 91 * DAY;
+        let again = s.write(2, "lab", "again.md", "made again by another");
+        assert_eq!(again.rev, first.rev);
+        // Device 1 keeps it below the delete that it still holds.
+        s.pass(2, 1);
+        let on = &s[1];
+        assert_eq!(held_of(on, "lab"), 2);
+        assert_eq!(
+            on.slot("lab", "again.md").current.unwrap().value,
+            Value::Delete
+        );
+
+        // Its own 90 days: the delete goes, and the entry stays.
+        let swept = sweep_deletes(&on.conn, late + 90 * DAY).unwrap();
+        assert_eq!(
+            swept,
+            Swept {
+                slots: 1,
+                entries: 1,
+                read_again: 1,
+                ..Swept::default()
+            }
+        );
+        assert_eq!(held_of(on, "lab"), 1);
+        assert_eq!(
+            on.text("lab", "again.md").as_deref(),
+            Some("made again by another")
+        );
     }
 
     /// A slot stays while a folder's record names a text there: that
@@ -309,9 +559,8 @@ mod tests {
         assert_eq!(
             swept,
             Swept {
-                slots: 0,
-                entries: 0,
-                kept_for_a_folder: 1
+                kept_for_a_folder: 1,
+                ..Swept::default()
             }
         );
         assert_eq!(
@@ -326,8 +575,13 @@ mod tests {
         records(on, "/home/sam/two", "lab", "gone.md", None);
         let swept = sweep_deletes(&on.conn, long_after).unwrap();
         assert_eq!(
-            (swept.slots, swept.entries, swept.kept_for_a_folder),
-            (1, 1, 0)
+            swept,
+            Swept {
+                slots: 1,
+                entries: 1,
+                read_again: 1,
+                ..Swept::default()
+            }
         );
         assert!(on.slot("lab", "gone.md").current.is_none());
         assert_eq!(
@@ -372,6 +626,49 @@ mod tests {
         );
         let swept = sweep_deletes(&on.conn, arrived + 90 * DAY).unwrap();
         assert_eq!((swept.slots, swept.entries), (1, 2));
+    }
+
+    /// Where two devices wrote a delete apart, it is one version in two
+    /// entries, and it came whole with the last of them. A text that the
+    /// store took before that keeps the delete, though it came after the
+    /// first entry of it: it was written by a device that had seen
+    /// neither, and with the delete gone it would be the file.
+    #[test]
+    fn test_a_delete_stays_over_an_entry_that_came_before_the_last_entry_of_it() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "lab");
+        // Devices 0 and 2 each write the file, apart. Device 1 sees
+        // device 0's text, and each of the two deletes it.
+        s.write(0, "lab", "apart.md", "of device 0");
+        s.write(2, "lab", "apart.md", "of device 2");
+        s.meet(&[0, 1]);
+        deletes(&mut s, 0, "lab", "apart.md");
+        deletes(&mut s, 1, "lab", "apart.md");
+        // Device 0 is handed device 2's text, and then device 1's delete.
+        s.pass(2, 0);
+        s.pass(1, 0);
+        let stored = s.now;
+        let on = &s[0];
+        let current = on.slot("lab", "apart.md").current.unwrap();
+        assert_eq!(
+            (current.value.clone(), current.entries.len()),
+            (Value::Delete, 2)
+        );
+        assert_eq!(held_of(on, "lab"), 3);
+
+        let swept = sweep_deletes(&on.conn, stored + 90 * DAY).unwrap();
+        assert_eq!(
+            swept,
+            Swept {
+                kept_over_an_entry: 1,
+                ..Swept::default()
+            }
+        );
+        assert_eq!(held_of(on, "lab"), 3);
+        assert_eq!(
+            on.slot("lab", "apart.md").current.unwrap().value,
+            Value::Delete
+        );
     }
 
     /// In the personal channel an entry is one device's own word, whatever

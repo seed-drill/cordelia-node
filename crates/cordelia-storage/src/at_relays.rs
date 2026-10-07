@@ -138,6 +138,18 @@ pub fn forget_places(conn: &Connection) -> Result<usize, CordeliaError> {
     .map_err(storage)
 }
 
+/// Forget every place in `channel`, at every relay: that channel is read
+/// again from the start (decision 2026-10-04 §16). What was sent is kept
+/// as it is, and so is every place in another channel. Returns how many
+/// places there were.
+pub fn forget_places_of(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "UPDATE at_relays SET mark = NULL, place = 0 WHERE channel = ?1 AND mark IS NOT NULL",
+        params![channel.as_slice()],
+    )
+    .map_err(storage)
+}
+
 /// Everything that the store took of `channel` up to `up_to`, in its own
 /// order, is sent to `relay`, or needs no sending there. It never goes
 /// back: an earlier place than the one kept changes nothing.
@@ -673,6 +685,34 @@ mod tests {
             );
         }
         assert_eq!(kept(&conn, &OTHER_RELAY, &channel(1)).unwrap(), sent_only);
+    }
+
+    /// One channel is read again: its place is forgotten at every relay,
+    /// and nothing of what was sent there. Every place in another channel
+    /// stays (decision 2026-10-04 §16).
+    #[test]
+    fn test_the_places_in_one_channel_are_forgotten_at_every_relay_and_no_others() {
+        let conn = db::open_in_memory().unwrap();
+        for (relay, c) in [(RELAY, 1), (RELAY, 2), (OTHER_RELAY, 1)] {
+            keep_place(&conn, &relay, &channel(c), &MARK, 9).unwrap();
+            sent(&conn, &relay, &channel(c), 20).unwrap();
+            carried(&conn, &relay, &channel(c), 8).unwrap();
+        }
+        let with = |place: Option<(Mark, u64)>| KeptThere {
+            place,
+            sent_to: 20,
+            carried_to: 8,
+        };
+        assert_eq!(forget_places_of(&conn, &channel(3)).unwrap(), 0);
+        assert_eq!(forget_places_of(&conn, &channel(1)).unwrap(), 2);
+        for relay in [RELAY, OTHER_RELAY] {
+            assert_eq!(kept(&conn, &relay, &channel(1)).unwrap(), with(None));
+        }
+        assert_eq!(
+            kept(&conn, &RELAY, &channel(2)).unwrap(),
+            with(Some((MARK, 9)))
+        );
+        assert_eq!(forget_places_of(&conn, &channel(1)).unwrap(), 0);
     }
 
     /// What a relay had no room for is kept by its place in the store's
