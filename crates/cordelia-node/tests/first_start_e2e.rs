@@ -1659,6 +1659,23 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
     let conn = database_of(&laptop);
     assert!(first_start::notices(&conn).unwrap().is_empty());
 
+    // The node notes each report that it stores: it says for how long it
+    // has stored none, and that is counted from the last one, and not
+    // from its start. It has run for a while by now, and a cycle stores
+    // a report every few seconds: so it has stored none for less than
+    // half the time that it has run.
+    wait_for(
+        "the laptop says when it last stored a report",
+        &all,
+        120,
+        || {
+            let run_for = status_of(&laptop)["uptime_secs"].as_f64()?;
+            let sync = laptop.post("/api/v1/sync/status", json!({}));
+            let none_for = sync["no_report_secs"].as_u64()? as f64;
+            (run_for >= 20.0 && none_for * 2.0 < run_for).then_some(())
+        },
+    );
+
     if !before_mappings {
         // The tree laid out by hand stands in the way of its directory
         // only while Claude Code's own folder for that directory is not

@@ -1530,6 +1530,11 @@ fn what_is_found_says_whether_map_would_sync_it() {
     // A directory that is gone.
     let gone = a.home.join("was-here");
     a.claude_folder(&gone);
+    // And one where a file is now: the path is there, and is no
+    // directory.
+    let a_file = a.home.join("now-a-file");
+    std::fs::write(&a_file, "no directory\n").unwrap();
+    a.claude_folder(&a_file);
     // A folder with memory and no transcript: no directory is known.
     let unknown = a.home.join(".claude/projects/-home-nobody-knows");
     std::fs::create_dir_all(unknown.join("memory")).unwrap();
@@ -1593,6 +1598,7 @@ fn what_is_found_says_whether_map_would_sync_it() {
     for (folder, directory, why) in [
         (a.folder_of(&outside), Some(&outside), "outside_home"),
         (a.folder_of(&gone), Some(&gone), "directory_gone"),
+        (a.folder_of(&a_file), Some(&a_file), "directory_gone"),
         (unknown.clone(), None, "no_directory"),
         (a.folder_of(&link), Some(&link), "through_a_link"),
         (tree_of_home.clone(), Some(&a.home), "laid_out_by_hand"),
@@ -1607,7 +1613,7 @@ fn what_is_found_says_whether_map_would_sync_it() {
     }
     // The tree that records the home directory is a tree, and not home.
     assert!(!entry(&tree_of_home).home);
-    assert_eq!(report.unmapped.len(), 10, "{:?}", report.unmapped);
+    assert_eq!(report.unmapped.len(), 11, "{:?}", report.unmapped);
     let through = entry(&a.folder_of(&link)).says.clone().unwrap();
     assert!(
         through.contains(&format!("syncs the folder of {}", shown(&real))),
