@@ -121,7 +121,8 @@ to add a device.
   it is, and says so.
 - Memory that the new machine had gathered alone is published, not lost: a
   file with the same text on both is agreed, and where a file differs the
-  machine's own text is kept beside it as a copy.
+  machine's own text is kept beside it as a conflict copy (see "What
+  syncs").
 
 ### What syncs
 
@@ -165,6 +166,16 @@ A memory file syncs if it fits in one entry, which holds 60 KB of text with
 the file's name. A larger file, or one that is not plain text, is left as it
 is on the machine that has it, and your other machines keep the last version
 that did sync; `cordelia sync status` names it.
+
+Where two machines changed a file apart, neither text is lost: one stays in
+the file, and the other is kept beside it as a **conflict copy**, named
+`<file>.conflict-<tag>.md`. The copy is a file like any other in the folder:
+
+- it reaches every device that syncs the name;
+- each of them shows the conflict (`cordelia status`, and `cordelia sync
+  status` names the file);
+- merge what you want of it into the file, on any one device, and delete
+  the copy there: that clears the conflict on all of them.
 
 Sync makes one machine's mistake every machine's: an edit or a delete is
 taken by the others within seconds. So each machine keeps, for 30 days, the

@@ -697,7 +697,7 @@ A second recovery does not do the second of those by itself, from a list of keys
 4. **On one device, at a terminal, the person runs `cordelia phrase`.** That device publishes its folders, and what it holds is then the channels' earliest version of each file. So it is run on the device whose memory is the most up to date, and the prompt says so.
 5. **Each other device is added** with the two commands (section 6): `add-device` on the first, `accept` on the other, at a terminal, with its yes. Its folders then meet the channels as on any first sync:
    - a file with the same text on both: agreed;
-   - a file that differs: this device's text is kept beside the file as a copy, and the file takes the channel's;
+   - a file that differs: this device's text is kept beside the file as a conflict copy, and the file takes the channel's. The copy is a file like any other in the folder (the record of 2026-09-30, 4.3): it reaches every device that syncs the name, each shows the conflict, and merging on one device and deleting the copy there clears it on all;
    - a file only here: published;
    - `MEMORY.md`: merged, as two indexes are.
 
