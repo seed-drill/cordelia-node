@@ -747,6 +747,19 @@ pub struct AtTerminal {
     found_to: usize,
 }
 
+/// What came of waiting for more of what a command says at its terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// Something more.
+    More,
+    /// Nothing in the time that was waited.
+    Nothing,
+    /// Nothing, and nothing more can come: the command's end of the
+    /// terminal is closed, which it is once the command has ended, and
+    /// everything that was written there has been taken in.
+    All,
+}
+
 impl AtTerminal {
     fn running(name: &'static str, mut command: Command, args: &[&str]) -> Self {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
@@ -801,20 +814,29 @@ impl AtTerminal {
     }
 
     /// Take in what the command has said since, waiting up to `wait` for
-    /// more. Says whether anything came.
-    fn hears(&mut self, wait: Duration) -> bool {
+    /// more. Says whether anything came, and where nothing did, whether
+    /// anything more can come ([`Heard`]).
+    fn hears(&mut self, wait: Duration) -> Heard {
+        use std::sync::mpsc::RecvTimeoutError;
         match self.reads.recv_timeout(wait) {
             Ok(bytes) => {
                 self.said.push_str(&String::from_utf8_lossy(&bytes));
-                true
+                Heard::More
             }
-            Err(_) => false,
+            Err(RecvTimeoutError::Timeout) => Heard::Nothing,
+            Err(RecvTimeoutError::Disconnected) => Heard::All,
         }
     }
 
     /// Wait until the command has said `what`, after whatever was waited
-    /// for before. Fails, with everything it said, where it ends or two
-    /// minutes go by first.
+    /// for before. Fails, with everything it said, where three minutes
+    /// go by first, or the command has ended without saying it.
+    ///
+    /// **A command that has ended has said nothing more only once its
+    /// end of the terminal is closed and everything it wrote there was
+    /// taken in** ([`Heard::All`]). This waits for that, and for no
+    /// length of silence: on a loaded machine what a command said last
+    /// can arrive after the command has ended.
     pub fn says(&mut self, what: &str) -> &mut Self {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
@@ -822,9 +844,8 @@ impl AtTerminal {
                 self.found_to += at + what.len();
                 return self;
             }
-            let ended = self.child.try_wait().unwrap().is_some();
-            let heard = self.hears(Duration::from_millis(200));
-            if (ended && !heard) || Instant::now() > deadline {
+            let no_more = self.hears(Duration::from_millis(200)) == Heard::All;
+            if no_more || Instant::now() > deadline {
                 panic!(
                     "{}: cordelia {} did not say {what:?}. It said:\n{}",
                     self.name, self.args, self.said
@@ -838,7 +859,10 @@ impl AtTerminal {
     pub fn hears_for(&mut self, long: Duration) -> &str {
         let until = Instant::now() + long;
         while Instant::now() < until {
-            self.hears(Duration::from_millis(100));
+            // Nothing more can come: the rest of the time is waited out.
+            if self.hears(Duration::from_millis(100)) == Heard::All {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
         &self.said
     }
@@ -894,7 +918,7 @@ impl AtTerminal {
     pub fn ends_within(mut self, long: Duration) -> (bool, String) {
         let deadline = Instant::now() + long;
         let status = loop {
-            self.hears(Duration::from_millis(100));
+            let heard = self.hears(Duration::from_millis(100));
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
@@ -905,8 +929,29 @@ impl AtTerminal {
                     self.name, self.args, self.said
                 );
             }
+            // Its end of the terminal is closed, and it has not ended
+            // yet: it is asked again in a moment.
+            if heard == Heard::All {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         };
-        while self.hears(Duration::from_millis(200)) {}
+        // Everything that it said, to the end: the command has ended, so
+        // its end of the terminal is closed, and what it wrote there is
+        // read up to that. This waits for that, and for no length of
+        // silence: on a loaded machine what a command said last can
+        // arrive after the command has ended, and whoever looks at what
+        // it said would not find its last lines. It is given as long
+        // again, at most: it takes a moment.
+        let all_by = Instant::now() + long;
+        while self.hears(Duration::from_millis(200)) != Heard::All {
+            if Instant::now() > all_by {
+                panic!(
+                    "{}: cordelia {} ended, and its terminal was not read to its end. It \
+                     said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+        }
         (status.success(), std::mem::take(&mut self.said))
     }
 
