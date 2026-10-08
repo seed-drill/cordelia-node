@@ -4940,6 +4940,130 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     }
 }
 
+/// A command that opens the node's database itself does not open it
+/// beside a running node of another version than its own (decision
+/// 2026-10-04 §10.1, rule 6): opening runs the schema's steps, and a
+/// later command would step the database under an earlier node. `cordelia
+/// stats`, `cordelia channels` and `cordelia init --force` say the note
+/// that names the restart, end in failure, and open nothing: the
+/// database stays at its schema version, byte for byte. `cordelia
+/// status` still answers: it says the note, and that the database was
+/// not read. **Where no node answers, each goes on as it did,** and the
+/// database is stepped as any opening steps it.
+///
+/// The node here is of this version, behind a stand-in that says it is
+/// of another. The database is one of the test's own, in the released
+/// version's form, in a directory beside the node's with a key and a
+/// token: no command here opens the database that the node runs on.
+#[test]
+fn a_command_that_opens_the_database_opens_none_beside_a_node_of_another_version() {
+    use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let another = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.0-another".into();
+        }
+    });
+
+    // A data directory as the released version left one.
+    let beside = laptop.dir.path().join("beside");
+    std::fs::create_dir(&beside).unwrap();
+    for file in ["identity.key", "node-token"] {
+        std::fs::copy(laptop.data_dir().join(file), beside.join(file)).unwrap();
+    }
+    let database = beside.join("cordelia.db");
+    drop(cordelia_storage::first_start::released::database(&database).unwrap());
+    let schema_version = || -> u32 {
+        let db = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
+    const { assert!(RELEASED_SCHEMA_VERSION < SCHEMA_VERSION) };
+    let as_it_was = std::fs::read(&database).unwrap();
+    let key = std::fs::read(beside.join("identity.key")).unwrap();
+
+    // Beside the node that says it is of another version.
+    let port = another.port.to_string();
+    let directory = beside.to_str().unwrap();
+    let through = [
+        ("CORDELIA_DATA_DIR", directory),
+        ("CORDELIA_HTTP_PORT", port.as_str()),
+    ];
+    let note = "The running node is version 0.0.0-another and this command is version";
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    let opens: [&[&str]; 4] = [
+        &["stats"],
+        &["stats", "--json"],
+        &["channels"],
+        &["init", "--force"],
+    ];
+    for args in opens {
+        let before = another.asked().len();
+        let out = laptop.command_given(&through, args);
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?}: {said}");
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert!(said.contains(restart), "{args:?}: {said}");
+        assert!(
+            said.contains("does not open it beside a node of another version: nothing was opened."),
+            "{args:?}: {said}"
+        );
+        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
+        // The node was asked its version, and nothing else.
+        let asked = another.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    // `init --force` wrote no new key either.
+    assert_eq!(std::fs::read(beside.join("identity.key")).unwrap(), key);
+
+    // `cordelia status` still answers, and reads nothing of the database.
+    let out = laptop.command_given(&through, &["status"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains(
+            "Storage:\n  Not read:  a node of another version is running, and its database \
+             is not opened beside it."
+        ),
+        "{said}"
+    );
+    assert!(said.contains(note), "{said}");
+    assert!(!said.contains("DB size:"), "{said}");
+    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
+    assert_eq!(std::fs::read(&database).unwrap(), as_it_was);
+
+    // The control: where no node answers, each goes on as it did, and
+    // the opening steps the database.
+    let nobody = {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        free.local_addr().unwrap().port().to_string()
+    };
+    let alone = [
+        ("CORDELIA_DATA_DIR", directory),
+        ("CORDELIA_HTTP_PORT", nobody.as_str()),
+    ];
+    let out = laptop.command_given(&alone, &["stats"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(said.contains("Database:"), "{said}");
+    assert_eq!(schema_version(), SCHEMA_VERSION);
+}
+
 // ── A change made while a pass is in flight ──────────────────────────
 
 /// A node's database, opened for reading while the node runs.

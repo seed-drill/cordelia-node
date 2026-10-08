@@ -542,6 +542,12 @@ fn cmd_init(
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file).unwrap_or_default();
     config.apply_env_overrides();
+    // `init` opens the database where it makes one, and with `--force`:
+    // it opens none beside a node of another version, and writes nothing
+    // there either (decision 2026-10-04 §10.1, rule 6).
+    if force || !config.data_dir().join("cordelia.db").exists() {
+        refuse_to_open_beside_another_version(config_path)?;
+    }
     init_with(
         &config_file,
         config,
@@ -958,9 +964,21 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     // A database from a later version is not opened: the status says so,
     // and goes on to what the node says of itself (decision 2026-10-04
     // §10.1).
-    let opened = match db_path.exists() {
-        true => Some(open_database(&db_path)),
-        false => None,
+    // Nor is it opened beside a running node of another version: the
+    // schema's steps would be run under that node (rule 6). Where the
+    // node said nothing in the moment that a status gives it, it is
+    // asked once more, for as long as a command waits for a node.
+    let beside = match &status.live {
+        Some(live) => version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION"))
+            .map(|_| NOT_READ_BESIDE_ANOTHER_VERSION.to_string()),
+        None if status.not_asked.is_some() => None,
+        None => another_version_answered(&node_status(config_path, VERSION_ASKED_FOR))
+            .map(|note| format!("{note} So {NOT_READ_BESIDE_ANOTHER_VERSION}")),
+    };
+    let opened = match (db_path.exists(), beside) {
+        (false, _) => None,
+        (true, Some(why)) => Some(Err(anyhow::anyhow!(why))),
+        (true, None) => Some(open_database(&db_path)),
     };
     if let Some(Err(why)) = &opened {
         println!();
@@ -2227,6 +2245,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
+    refuse_to_open_beside_another_version(config_path)?;
     let conn = open_database(&db_path)?;
 
     // A personal node carries no channel of the older kind (decision
@@ -2308,6 +2327,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
+    refuse_to_open_beside_another_version(config_path)?;
     let conn = open_database(&db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -2493,6 +2513,11 @@ fn cmd_swarm_init(
     let child_pk_bech32 = encode_public_key(&child_pk)?;
     let child_suffix = child.entity_id_suffix();
     let entity_id = format!("swarm{index}_{child_suffix}");
+
+    // The database is opened below: none is opened, and nothing is made,
+    // beside a node of another version (decision 2026-10-04 §10.1, rule
+    // 6).
+    refuse_to_open_beside_another_version(config_path)?;
 
     // Write child identity
     std::fs::create_dir_all(&data_dir)?;
@@ -3233,6 +3258,51 @@ fn refuse_by_how_it_stands(status: &anyhow::Result<serde_json::Value>) -> anyhow
             let why = held["why"].as_str().unwrap_or("it does not say why");
             anyhow::bail!("{why}\n{NOT_WHILE_HELD_UP}")
         }
+    }
+}
+
+/// What a command that opens the node's database itself says of a running
+/// node of another version, after the note that says how to restart it.
+const NOT_OPENED_BESIDE_ANOTHER_VERSION: &str = "This command opens the node's database itself, \
+                                                 and does not open it beside a node of another \
+                                                 version: nothing was opened.";
+
+/// What `cordelia status` says in the place of what the database stores,
+/// beside a running node of another version.
+const NOT_READ_BESIDE_ANOTHER_VERSION: &str = "a node of another version is running, and its \
+                                               database is not opened beside it.";
+
+/// The note on a running node of another version than this command
+/// ([`version_note`]), given what answered when the node was asked its
+/// status. `None` where the node is of this command's version, and where
+/// no node answered: there is then none to say it of.
+fn another_version_answered(status: &anyhow::Result<serde_json::Value>) -> Option<String> {
+    let node = status.as_ref().ok()?;
+    version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+}
+
+/// Refuse to open the node's database beside a running node of another
+/// version than this command (decision 2026-10-04 §10.1, rule 6). A
+/// command that opens the database runs the schema's steps on it, and a
+/// node goes on running the version it was started as until it is
+/// restarted: a later command would step the database under an earlier
+/// node. The refusal is the note that says how to restart the node, and
+/// nothing is opened.
+///
+/// The commands that open the database themselves are `stats`,
+/// `channels`, `swarm-init`, and `init` where it makes the database or
+/// is given `--force`. `cordelia status` opens it too, to say what it
+/// stores: beside such a node it says the note, and reads nothing of the
+/// database.
+///
+/// **Where no node answers, the command goes on as it did:** there is
+/// no node to open the database beside. (A command that is sent to the
+/// node is refused there, [`refuse_another_version`]: these are sent to
+/// no node.)
+fn refuse_to_open_beside_another_version(config_path: &str) -> anyhow::Result<()> {
+    match another_version_answered(&node_status(config_path, VERSION_ASKED_FOR)) {
+        None => Ok(()),
+        Some(note) => anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}"),
     }
 }
 
