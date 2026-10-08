@@ -103,6 +103,13 @@ fn drop_what_was_typed_ahead() {}
 /// are off, it hands on no whole lines, and it echoes nothing. It is put
 /// back as it was when this is dropped, whatever became of the reading.
 /// What was typed before is dropped as it is set.
+///
+/// **And what was typed and not read is dropped before the terminal is
+/// put back,** on every way out (decision 2026-10-04 §16): after the
+/// last word, after Ctrl-C, where a word is too long, where a write
+/// fails, where the input ends. The rest of a line that was pasted is
+/// words of a phrase: it is not handed to whatever reads the terminal
+/// next, which is the shell.
 #[cfg(unix)]
 struct ReadsKeys(rustix::termios::Termios);
 
@@ -183,6 +190,8 @@ impl ReadsKeys {
 impl Drop for ReadsKeys {
     fn drop(&mut self) {
         use rustix::termios::{OptionalActions, tcsetattr};
+        // While what is typed is still hidden.
+        drop_what_was_typed_ahead();
         let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &self.0);
     }
 }
@@ -395,7 +404,7 @@ fn enter() -> anyhow::Result<()> {
 /// as a key: this fails with [`INTERRUPTED`].
 ///
 /// `word` is never moved as it grows: it has room for a line, and a word
-/// that is longer is refused. Whoever gave it overwrites it.
+/// that is longer is refused, as a word. Whoever gave it overwrites it.
 #[cfg(unix)]
 fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result<bool> {
     let stdin = rustix::stdio::stdin();
@@ -428,7 +437,7 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
             0x04 => {}
             typed => {
                 if word.len() + 1 >= MAX_LINE {
-                    anyhow::bail!("that line is longer than anything this command asks for");
+                    anyhow::bail!("that word is longer than anything this command asks for");
                 }
                 // A byte that is no letter of a word, a digit or a mark
                 // of a key is kept as a mark that nothing is.
@@ -621,9 +630,8 @@ impl Terminal {
             words.push_str(&word);
             word.zeroize();
         }
-        // What was typed after the twelfth word is not shown when the
-        // terminal is put back, and answers nothing that is asked next.
-        drop_what_was_typed_ahead();
+        // What was typed after the twelfth word is dropped as the
+        // terminal is put back ([`ReadsKeys`]).
         Ok(words)
     }
 
@@ -675,7 +683,6 @@ impl Terminal {
             // back; one before it is said after its pause.
             misses += 1;
             if misses == PHRASE_TYPED_BACK_MISSES {
-                drop_what_was_typed_ahead();
                 say("✗\n")?;
                 return Ok(false);
             }
@@ -693,7 +700,6 @@ impl Terminal {
                  again.\n"
             ))?;
         }
-        drop_what_was_typed_ahead();
         Ok(true)
     }
 

@@ -3200,6 +3200,85 @@ fn the_words_are_shown_numbered_and_are_gone_from_the_screen_afterwards() {
     );
 }
 
+/// **Every way out of a prompt for the phrase drops what was typed
+/// ahead** (decision 2026-10-04 §16), before the terminal is put back:
+/// the rest of a line that was pasted is words of a phrase, and is not
+/// handed to the shell. Here the terminal is read once the command has
+/// ended, as a shell would read it, and nothing is there:
+///
+/// - after Ctrl-C in the middle of a pasted line;
+/// - after a word that is too long, which the command says is a word;
+/// - where the input is ended, with a line typed after that.
+#[test]
+fn every_way_out_of_the_prompt_drops_what_was_typed_ahead() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    // `cordelia phrase`, run to where the words are typed back; then
+    // `typed` is sent at once, as a line that is pasted is. What the
+    // command said from the line that asks, and what it left.
+    let typed_back = |typed: &dyn Fn(&[&str]) -> Vec<u8>| -> (String, String) {
+        let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+        let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
+        let shown: Vec<&str> = words.split(' ').collect();
+        at.says("   1. ");
+        at.sends(&typed(&shown));
+        let (success, said, left) = at.ends_and_leaves();
+        assert!(!success, "{said}");
+        let asked = said
+            .find(ASKS_THE_WORDS_BACK)
+            .expect("the words are asked for");
+        (said[asked..].to_string(), left)
+    };
+
+    // Ctrl-C after the second word of a pasted line.
+    let (said, left) = typed_back(&|shown| {
+        format!("{} {} \x03{}\n", shown[0], shown[1], shown[2..].join(" ")).into_bytes()
+    });
+    assert_eq!(
+        said,
+        format!(
+            "{ASKS_THE_WORDS_BACK}\r\n\r\n{}   3. \r\nError: Interrupted: the terminal is as it \
+             was, and nothing was made.\r\n",
+            ticks(1, 2)
+        )
+    );
+    assert_eq!(left, "", "after Ctrl-C");
+
+    // A word that is longer than any line this command asks for, and a
+    // line after it.
+    let (said, left) = typed_back(&|shown| {
+        format!(
+            "{} {}\n{}\n",
+            shown[0],
+            "a".repeat(2000),
+            shown[2..].join(" ")
+        )
+        .into_bytes()
+    });
+    assert_eq!(
+        said,
+        format!(
+            "{ASKS_THE_WORDS_BACK}\r\n\r\n{}   2. \r\nError: that word is longer than anything \
+             this command asks for\r\n",
+            ticks(1, 1)
+        )
+    );
+    assert_eq!(left, "", "after a word that is too long");
+
+    // The input is ended before anything is typed, and a line is typed
+    // after that.
+    let (said, left) = typed_back(&|shown| format!("\x04{}\n", shown.join(" ")).into_bytes());
+    assert!(
+        said.starts_with(&format!(
+            "{ASKS_THE_WORDS_BACK}\r\n\r\n   1. \r\nError: nothing was typed"
+        )),
+        "{said:?}"
+    );
+    assert_eq!(left, "", "after the end of the input");
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+}
+
 // ── A chain of two, at a removal ─────────────────────────────────────
 
 /// A chain of two at a removal (decision 2026-10-04 §6, §16). The desktop
