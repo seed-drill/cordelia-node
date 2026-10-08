@@ -133,8 +133,15 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > configuration and its database, and no channel: there is no personal
 > channel until there is a recovery phrase. `cordelia start` runs the node.
 > A device that follows no phrase publishes nothing, and its status says "no
-> recovery phrase yet: memory stays on this machine. Make one here
-> (`cordelia phrase`), or add this machine from one that has one."
+> recovery phrase yet: memory stays on this machine", and then three ways
+> on, each on a line of its own, in this order:
+>
+> - "This is your first machine: make a phrase here (`cordelia phrase`)."
+> - "Another machine has the phrase: add this one from it (`cordelia
+>   add-device` there, `cordelia accept` here)."
+> - "Every device that has the phrase is lost: recover here with it
+>   (`cordelia recover`). Do not make a new phrase first."
+>
 > `cordelia init --new-key` gives a device a new key: it leaves the devices
 > it is with, keeps its memory folders and their mappings, and then follows
 > no phrase. It asks at a terminal.

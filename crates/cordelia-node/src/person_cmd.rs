@@ -74,6 +74,27 @@ Your recovery phrase is twelve words.
   - Nobody else has it, and this device does not keep it. It is shown once, now.
   - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's words here.";
 
+/// What `cordelia phrase` says on a machine that follows no phrase, after
+/// what a phrase is for and before any word of a new one is shown
+/// (decision 2026-10-04 §5.2, §9): a person who has a phrase already,
+/// and has lost every device, wants `cordelia recover`. A phrase made
+/// here first would be another: `cordelia recover` refuses a machine that
+/// follows one.
+const HAS_ONE_ALREADY: &str = "\
+If you have a recovery phrase already and every device is lost, do not make a new one.
+Press Ctrl-C, and recover with the phrase you have:
+  cordelia recover";
+
+/// What `cordelia phrase` says before it goes on, by where the device
+/// stands among its person's devices (`among`): [`WHOSE_WORDS`], and on
+/// a machine that follows no phrase [`HAS_ONE_ALREADY`] after it.
+fn phrase_opening(among: &str) -> String {
+    match among {
+        "no_phrase" => format!("{WHOSE_WORDS}\n\n{HAS_ONE_ALREADY}\n"),
+        _ => format!("{WHOSE_WORDS}\n"),
+    }
+}
+
 /// What is said where a person did not say yes.
 pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
 
@@ -407,7 +428,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
-    println!("{WHOSE_WORDS}\n");
+    println!("{}", phrase_opening(&among));
     // What a device that follows a phrase already would let go of.
     if let Some(waits) = waits_before_a_new_phrase(&seen) {
         println!("{waits}");
@@ -3698,5 +3719,28 @@ mod tests {
             assert!(WHOSE_WORDS.contains(says), "{says}");
         }
         assert_eq!(WHOSE_WORDS.lines().count(), 6);
+    }
+
+    /// On a machine that follows no phrase, `cordelia phrase` says, before
+    /// any word is shown, that a person who has a phrase already and has
+    /// lost every device wants `cordelia recover` (decision 2026-10-04
+    /// §5.2, §9), with the command on a line of its own. A device that
+    /// follows a phrase is told nothing of it: its yes says what a new
+    /// phrase does there.
+    #[test]
+    fn a_person_who_has_a_phrase_and_no_device_is_pointed_to_recover() {
+        let opening = phrase_opening("no_phrase");
+        assert!(opening.starts_with(WHOSE_WORDS), "{opening}");
+        assert!(
+            opening.ends_with(
+                "\n\nIf you have a recovery phrase already and every device is lost, do not \
+                 make a new one.\nPress Ctrl-C, and recover with the phrase you have:\n  \
+                 cordelia recover\n"
+            ),
+            "{opening}"
+        );
+        for among in ["alone", "several", "stopped"] {
+            assert_eq!(phrase_opening(among), format!("{WHOSE_WORDS}\n"), "{among}");
+        }
     }
 }

@@ -47,12 +47,11 @@ fn now() -> i64 {
 /// A refusal, as the API answers it, in words that say the way on.
 fn refused(e: PersonError) -> ApiError {
     match e {
-        PersonError::FollowsNoPhrase => ApiError::BadRequest(
+        PersonError::FollowsNoPhrase => ApiError::BadRequest(format!(
             "this device follows no recovery phrase yet, and publishes nothing: memory stays on \
-             this machine. Make one here (`cordelia phrase`), or add this device from one that \
-             has one."
-                .into(),
-        ),
+             this machine.\n{}",
+            crate::look::WAYS_ON
+        )),
         PersonError::Stopped(State::Fork) => ApiError::BadRequest(
             "two changes were made apart, and this device has seen both: it publishes nothing \
              until that is settled with the phrase (`cordelia settle`)."
