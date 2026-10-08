@@ -152,13 +152,21 @@ fn look_asks(what_waits: bool) -> Value {
 fn looks(config_path: &str, what_waits: bool) -> anyhow::Result<Value> {
     let seen = api_post(config_path, "/api/v1/devices/list", look_asks(what_waits))?;
     if seen["state"].as_str().is_none() {
-        anyhow::bail!(
-            "what answered at the node's address says nothing of where this device stands: it \
-             is no node of this command's version. Nothing was done. Stop the node and start \
-             it again (`cordelia start`)."
-        );
+        anyhow::bail!(no_look_says(std::env::consts::OS));
     }
     Ok(seen)
+}
+
+/// What a command says where what answered at the node's address is no
+/// look of a node of this command's version ([`look`]), on the system
+/// named: nothing was done, and how the node is restarted
+/// ([`cordelia_api::commands::restart_says`]).
+fn no_look_says(os: &str) -> String {
+    format!(
+        "what answered at the node's address says nothing of where this device stands: it is \
+         no node of this command's version. Nothing was done. Restart the node:\n{}",
+        cordelia_api::commands::restart_says(os)
+    )
 }
 
 pub(crate) fn text<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -234,12 +242,21 @@ pub(crate) fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Resul
     if decode_public_key(text(answer, "this_device")).ok() == Some(*own) {
         return Ok(());
     }
-    anyhow::bail!(
+    anyhow::bail!(not_this_devices_key_says(own, std::env::consts::OS))
+}
+
+/// What a command says where what answered at the node's address names
+/// another key as this device than `own`, or none ([`names_this_device`]),
+/// on the system named: nothing was done, and how the node is restarted
+/// ([`cordelia_api::commands::restart_says`]), since a node that still
+/// runs under the key the device had before answers so.
+fn not_this_devices_key_says(own: &[u8; 32], os: &str) -> String {
+    format!(
         "what answered at the node's address does not name this device's key, which is the \
          one in its key file ({}). Nothing was done. A node goes on under the key it was \
-         started with: if this device was given a new key, stop the node and start it again \
-         (`cordelia start`).",
-        fingerprint::shown(own)
+         started with. If this device was given a new key, restart the node:\n{}",
+        fingerprint::shown(own),
+        cordelia_api::commands::restart_says(os)
     )
 }
 
@@ -3961,6 +3978,65 @@ mod tests {
             assert!(WHOSE_WORDS.contains(says), "{says}");
         }
         assert_eq!(WHOSE_WORDS.lines().count(), 6);
+    }
+
+    /// Where what answered at the node's address is no look of this
+    /// command's version, or names another key as this device, the
+    /// refusal says how the node is restarted on each system (decision
+    /// 2026-10-04 §16): the command that restarts the service, on a line
+    /// of its own, and `cordelia status` after it, as the node's own
+    /// refusal says it. Neither names a command that restarts no service.
+    #[test]
+    fn a_refusal_of_what_answered_names_the_command_that_restarts_the_node() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            let how = format!(
+                "\n  {restart}\nThen run `cordelia status`.\nWhere the node does not run as \
+                 the service that the install script set up, stop it and start it again with \
+                 whatever started it."
+            );
+            assert_eq!(
+                how,
+                format!("\n{}", cordelia_api::commands::restart_says(os))
+            );
+            assert_eq!(
+                no_look_says(os),
+                format!(
+                    "what answered at the node's address says nothing of where this device \
+                     stands: it is no node of this command's version. Nothing was done. \
+                     Restart the node:{how}"
+                )
+            );
+            assert_eq!(
+                not_this_devices_key_says(&own, os),
+                format!(
+                    "what answered at the node's address does not name this device's key, \
+                     which is the one in its key file ({}). Nothing was done. A node goes on \
+                     under the key it was started with. If this device was given a new key, \
+                     restart the node:{how}",
+                    fingerprint::shown(&own)
+                )
+            );
+            for says in [no_look_says(os), not_this_devices_key_says(&own, os)] {
+                assert!(!says.contains("cordelia start"), "{says}");
+            }
+        }
+        // And the refusal itself is those words.
+        let refused = names_this_device(&json!({ "this_device": "no key" }), &own).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            not_this_devices_key_says(&own, std::env::consts::OS)
+        );
     }
 
     /// `cordelia init --new-key` ends, on each system, with the command

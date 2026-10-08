@@ -4363,6 +4363,16 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
         .at_terminal_through(stand_in.port, &["renew"])
         .refused_within(soon);
     assert!(said.contains(refusal), "{said}");
+    // It says how the node is restarted on this system, and names no
+    // command that restarts no service.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        said.contains(&format!(
+            "If this device was given a new key, restart the node:\r\n  {restart}\r\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
     for never in [
         "Type your recovery phrase, one word at a time",
         "Make this change?",
@@ -4932,6 +4942,14 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
             said.contains("says nothing of where this device stands"),
             "{args:?}: {said}"
         );
+        // It says how the node is restarted on this system, and names no
+        // command that restarts no service.
+        let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+        assert!(
+            said.contains(&format!("Restart the node:\r\n  {restart}\r\n")),
+            "{args:?}: {said}"
+        );
+        assert!(!said.contains("cordelia start"), "{args:?}: {said}");
         assert!(!said.contains("Type yes to go on"), "{args:?}: {said}");
         assert!(!said.contains("shown once"), "{args:?}: {said}");
         let looks = looks_asked(&no_state, before);
