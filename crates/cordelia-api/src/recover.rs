@@ -259,9 +259,12 @@ pub struct Generation {
     /// named among the names that are left.
     pub names: Vec<(String, Vec<[u8; 32]>)>,
     /// The one device of the statement, where the statement lists one
-    /// alone and was made after another, and that device never wrote
-    /// that it had sent what it carried: a recovery, or a change, that
-    /// was made on it was cut short.
+    /// alone and was made after another, and that device's word that it
+    /// had sent what it carried is not among what was handed: a
+    /// recovery, or a change, that was made on it was cut short, unless
+    /// the word is in what was not read. (Whoever had the channel read
+    /// knows whether it was read to its end at a relay, and says which
+    /// of the two it is.)
     pub cut_short: Option<[u8; 32]>,
 }
 

@@ -149,10 +149,14 @@ enum Commands {
     RecoverMade {
         /// The change's number
         number: u64,
-        /// The device that was recovered from, where it never wrote that
-        /// it had sent what it carried
+        /// The device that was recovered from, where its word that it
+        /// had sent what it carried is not among what was read
         #[arg(long)]
         cut_short: Option<String>,
+        /// With `--cut-short`: the personal channel of the change that
+        /// was recovered from was read to its end at no relay
+        #[arg(long)]
+        read_in_part: bool,
     },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
@@ -368,7 +372,12 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
-        Some(Commands::RecoverMade { number, cut_short }) => {
+        Some(Commands::RecoverMade {
+            number,
+            cut_short,
+            read_in_part,
+        }) => {
+            let cut_short = recover_cmd::CutShort::handed(cut_short, read_in_part);
             recover_cmd::recover_made(&cli.config, number, cut_short)
         }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
@@ -3177,6 +3186,22 @@ fn let_go_says(name: &str, alone: bool) -> String {
     )
 }
 
+/// What `cordelia sync unmap` says once a folder is unmapped, where the
+/// node says that this device still holds the name that the folder was
+/// mapped to (decision 2026-10-04 §16): a carry or a recovery brought
+/// the name, and it is held as it was before the folder. The unmapping
+/// of the name is what lets it go, where nothing of it waits to be sent.
+/// `None` where the name went with its folder.
+fn still_held_says(after: &serde_json::Value) -> Option<String> {
+    let name = after["still_held"].as_str()?;
+    Some(format!(
+        "This device still holds {}, since a carry or a recovery brought it: `cordelia sync \
+         unmap {}` lets it go, once nothing of it waits to be sent.",
+        sync_label(name),
+        shell_word(name)
+    ))
+}
+
 /// What `cordelia sync unmap <name>` says of the node's answer where it
 /// asked the node to let go of a name (decision 2026-10-04 §7.3). The
 /// node let go of it: [`let_go_says`]. The node holds the name by a
@@ -3574,6 +3599,9 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 short_path(mapped),
                 sync_label(name)
             );
+            if let Some(still_held) = still_held_says(&after) {
+                println!("{still_held}");
+            }
             println!();
         }
         SyncCommand::Off => {
@@ -6373,6 +6401,74 @@ mod tests {
             message: "lab is not mapped on this device".into(),
         });
         assert!(not_mapped.is_none());
+    }
+
+    /// Once a folder is unmapped that was mapped to a name which a carry
+    /// or a recovery holds, `cordelia sync unmap` says that this device
+    /// still holds the name, and what lets it go (decision 2026-10-04
+    /// §16): the node's answer names the name. Nothing is said where the
+    /// name went with its folder.
+    #[test]
+    fn test_what_unmap_says_of_a_name_that_is_still_held_after_its_folder() {
+        let after = |still_held: serde_json::Value| serde_json::json!({ "enabled": true, "generation": 4, "still_held": still_held });
+        assert_eq!(
+            still_held_says(&after("lab".into())).unwrap(),
+            "This device still holds lab, since a carry or a recovery brought it: `cordelia \
+             sync unmap lab` lets it go, once nothing of it waits to be sent."
+        );
+        // Home memory is said as that, and its name is one that a shell
+        // would read: it is quoted in the command to copy.
+        assert_eq!(
+            still_held_says(&after("~".into())).unwrap(),
+            "This device still holds home memory, since a carry or a recovery brought it: \
+             `cordelia sync unmap '~'` lets it go, once nothing of it waits to be sent."
+        );
+        // The name went with its folder: the answer names none.
+        let gone = serde_json::json!({ "enabled": true, "generation": 4 });
+        assert_eq!(still_held_says(&gone), None);
+        assert_eq!(still_held_says(&after(serde_json::Value::Null)), None);
+    }
+
+    /// What a recovery hands the process that waits for its look is read
+    /// there as it was handed (decision 2026-10-04 §9, step 5; §16): the
+    /// device that was recovered from, where its word that it had sent
+    /// what it carried was not read, and whether the channel that the
+    /// word is written in was read to its end at no relay.
+    #[test]
+    fn test_what_a_recovery_hands_the_process_that_waits_is_read_there() {
+        use clap::Parser;
+        for read_in_part in [false, true] {
+            let handed = recover_cmd::CutShort {
+                device: "(w1 w2 w3 w4) \"laptop\"".to_string(),
+                read_in_part,
+            };
+            let mut line = vec!["cordelia".to_string()];
+            line.extend([recover_cmd::MADE_COMMAND.to_string(), "3".to_string()]);
+            line.extend(handed.args());
+            match super::Cli::parse_from(line).command {
+                Some(super::Commands::RecoverMade {
+                    number,
+                    cut_short,
+                    read_in_part: in_part,
+                }) => {
+                    assert_eq!(number, 3);
+                    let read = recover_cmd::CutShort::handed(cut_short, in_part);
+                    assert_eq!(read, Some(handed));
+                }
+                _ => panic!("what was handed is not read as that command"),
+            }
+        }
+        assert_eq!(recover_cmd::CutShort::handed(None, true), None);
+        // With no such device, as it was.
+        let line = ["cordelia", recover_cmd::MADE_COMMAND, "3"];
+        match super::Cli::parse_from(line).command {
+            Some(super::Commands::RecoverMade {
+                number: 3,
+                cut_short: None,
+                read_in_part: false,
+            }) => {}
+            _ => panic!("that is not read as the command"),
+        }
     }
 
     /// **A status asks the node for no count of what the device has sent

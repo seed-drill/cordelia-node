@@ -671,6 +671,32 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         "{said}"
     );
     assert_eq!(held(&state), Some(lab));
+    // A folder is mapped to the name, and unmapped again: the name is
+    // still held, as it was before the folder, and the answer to the
+    // folder's unmapping names it (decision 2026-10-04 §16), so that the
+    // command says so and what lets go of it. No other answer names one.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let home = home.canonicalize().unwrap_or(home);
+    let folder = home.join("notes-of-a-test").display().to_string();
+    let on = json!({ "enabled": true, "dir": "/srv/claude" });
+    let (status, said) = asks!(app, "/api/v1/sync/claude", on);
+    assert_eq!(status, 200, "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    let maps = json!({ "folder": folder, "name": "lab" });
+    let (status, said) = asks!(app, "/api/v1/sync/map", maps);
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["mappings"][0]["name"], "lab", "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", json!({ "folder": folder }));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["mappings"], json!([]), "{said}");
+    assert_eq!(said["still_held"], "lab", "{said}");
+    assert!(said.get("let_go").is_none(), "{said}");
+    assert_eq!(held(&state), Some(lab));
+    let (status, said) = asks!(app, "/api/v1/sync/claude", json!({ "enabled": false }));
+    assert_eq!(status, 200, "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    assert_eq!(held(&state), Some(lab));
     // A relay was sent it: unmapping the name lets go of it, and the
     // answer says so, and that the statement lists this device alone.
     // Asked again, nothing is mapped so, as for any word that names no

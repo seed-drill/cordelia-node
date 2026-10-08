@@ -406,6 +406,33 @@ fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
         has_sent_everything(&laptop)
     });
 
+    // A folder is mapped to the name, and unmapped again: the name is
+    // still held, as it was before the folder, and the command says so,
+    // and what lets go of it (decision 2026-10-04 §16).
+    sync_is_turned_on(&laptop);
+    let (l_notes, _) = notes_of(&laptop);
+    let out = laptop.cli(&["sync", "map", &path(&l_notes), "lab"]);
+    assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    let said = laptop.cli(&["sync", "unmap", &path(&l_notes)]);
+    assert!(
+        said.contains("No longer synced from this device: ~/notes (lab)."),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "This device still holds lab, since a carry or a recovery brought it: `cordelia \
+             sync unmap lab` lets it go, once nothing of it waits to be sent."
+        ),
+        "{said}"
+    );
+    assert_eq!(names_held(&laptop), ["lab"]);
+    let off = laptop.cli(&["sync", "off"]);
+    assert!(off.contains("Sync is off."), "{off}");
+    assert_eq!(names_held(&laptop), ["lab"]);
+    wait_for("the laptop has nothing more to send", &all, 180, || {
+        has_sent_everything(&laptop)
+    });
+
     // The name has no folder to unmap: unmapping its name lets go of it.
     let said = laptop.cli(&["sync", "unmap", "lab"]);
     assert!(
