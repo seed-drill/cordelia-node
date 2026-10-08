@@ -1016,7 +1016,16 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
     if relays.is_empty() {
         out.push("  none is reached".into());
     }
-    for relay in relays {
+    // A relay is listed once, by its name, and what waits to be sent
+    // there is said on its line. A row of what waits is that relay's
+    // where the node gives it the relay's name, or where the address it
+    // is reached at is the name.
+    let is_of = |waits: &Value, relay: &Value| {
+        let name = text(relay, "relay");
+        text(waits, "name") == name || text(waits, "relay") == name
+    };
+    let to_send = |waits: &Value| waits["waits"].as_u64().filter(|n| *n > 0);
+    for relay in &relays {
         let holds = match (
             relay["heard_since_woke"] == true,
             relay["holds_latest"].as_bool(),
@@ -1029,7 +1038,12 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
             (true, Some(false)) => "does not hold the latest change yet",
             (true, None) => "has not said whether it holds the latest change",
         };
-        out.push(format!("  {}: {holds}", text(relay, "relay")));
+        let waits = list(seen, "waiting").filter(|waits| is_of(waits, relay));
+        let still = match waits.filter_map(to_send).max() {
+            Some(n) => format!("; {n} of this device's channels still to send there"),
+            None => String::new(),
+        };
+        out.push(format!("  {}: {holds}{still}", text(relay, "relay")));
         for more in [&relay["no_room"], &relay["refuses"]] {
             if let Some(more) = more.as_str() {
                 out.push(format!("      {more}"));
@@ -1048,8 +1062,10 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
             )),
         }
     }
-    for waits in list(seen, "waiting") {
-        if let Some(n) = waits["waits"].as_u64().filter(|n| *n > 0) {
+    // What waits at an address that is no relay's name is listed after.
+    let of_no_relay = |waits: &&Value| !relays.iter().any(|relay| is_of(waits, relay));
+    for waits in list(seen, "waiting").filter(of_no_relay) {
+        if let Some(n) = to_send(waits) {
             out.push(format!(
                 "  {}: {n} of this device's channels still to send there",
                 text(waits, "relay")
@@ -3691,6 +3707,57 @@ mod tests {
         heard["added"][0]["applied"] = json!(1);
         let line = says_of(&heard, 1, "desktop", now + 1);
         assert!(line.contains("has applied change 1"), "{line}");
+    }
+
+    /// `cordelia devices` lists each relay once, by its name, with both
+    /// things said on its line: whether it holds the latest change, and
+    /// what waits to be sent there (decision 2026-10-04 §8). What waits
+    /// at an address that is no relay's name is listed after the relays.
+    #[test]
+    fn devices_lists_each_relay_once_with_what_waits_there() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let relay = |name: &str, holds: Value| json!({ "relay": name, "heard_since_woke": true, "holds_latest": holds });
+        let seen = json!({
+            "this_device": encode_public_key(&key(1)).unwrap(),
+            "change": 1,
+            "devices": [],
+            "relays": [
+                relay("one.example:9474", json!(true)),
+                relay("two.example:9474", json!(false)),
+                relay("three.example:9474", json!(true)),
+                relay("192.0.2.4:9474", json!(true)),
+            ],
+            "waiting": [
+                { "relay": "192.0.2.1:9474", "name": "one.example:9474", "waits": 1 },
+                { "relay": "192.0.2.2:9474", "name": "two.example:9474", "waits": 3 },
+                { "relay": "192.0.2.3:9474", "name": "three.example:9474", "waits": 0 },
+                { "relay": "192.0.2.4:9474", "name": null, "waits": 2 },
+                { "relay": "192.0.2.9:9474", "name": null, "waits": 5 },
+                { "relay": "192.0.2.8:9474", "name": null, "waits": 0 },
+            ],
+        });
+        let lines = devices_lines(&seen, &key(1));
+        let from = lines.iter().position(|line| line == "Relays:").unwrap();
+        assert_eq!(
+            lines[from..],
+            [
+                "Relays:",
+                "  one.example:9474: holds the latest change; 1 of this device's channels still \
+                 to send there",
+                "  two.example:9474: does not hold the latest change yet; 3 of this device's \
+                 channels still to send there",
+                "  three.example:9474: holds the latest change",
+                "  192.0.2.4:9474: holds the latest change; 2 of this device's channels still to \
+                 send there",
+                "  192.0.2.9:9474: 5 of this device's channels still to send there",
+            ]
+        );
+        // No relay is on two lines, by its name and by its address.
+        let said = lines.join("\n");
+        for address in ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.8"] {
+            assert!(!said.contains(address), "{address}: {said}");
+        }
+        assert_eq!(said.matches("192.0.2.4").count(), 1, "{said}");
     }
 
     /// The twelve words are shown numbered, four to a row, with the
