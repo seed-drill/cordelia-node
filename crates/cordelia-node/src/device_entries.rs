@@ -888,24 +888,27 @@ impl DeviceEntries {
     /// sleeps: so a channel in which deletes come of age one after
     /// another is read again from its start once a day at most. A node
     /// sweeps when it starts, and where its clock was set back.
+    ///
+    /// **The time is noted once the sweep has succeeded** (decision
+    /// 2026-10-04 §16): one that failed is tried again when the device is
+    /// next asked, and not a day later.
     pub fn sweep_deletes(&self) {
         let held_up = self.state.held.why().is_some();
         if held_up {
             return;
         }
         let now = self.clock.unix();
-        {
-            let mut kept = lock(&self.kept);
-            let lately = kept.swept_at.is_some_and(|at| {
-                let since = u64::try_from(now.saturating_sub(at));
-                since.is_ok_and(|since| since < DEVICE_DELETE_SWEEP_INTERVAL_SECS)
-            });
-            if lately {
-                return;
-            }
-            kept.swept_at = Some(now);
+        let lately = lock(&self.kept).swept_at.is_some_and(|at| {
+            let since = u64::try_from(now.saturating_sub(at));
+            since.is_ok_and(|since| since < DEVICE_DELETE_SWEEP_INTERVAL_SECS)
+        });
+        if lately {
+            return;
         }
         let swept = cordelia_api::swept::sweep_deletes(&lock(&self.state.db), now);
+        if swept.is_ok() {
+            lock(&self.kept).swept_at = Some(now);
+        }
         match swept {
             Ok(swept) if swept.slots > 0 => tracing::info!(
                 slots = swept.slots,

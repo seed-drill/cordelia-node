@@ -4937,7 +4937,9 @@ async fn a_personal_node_makes_its_passes_on_its_timers_and_none_without_a_phras
 /// **Once a day** (§16): the node's hourly timer asks, and the device
 /// sweeps where a day has gone by since it last did, so that a channel
 /// is read again from its start once a day at most. A node that is held
-/// up sweeps nothing, and sweeps when it is held up no more.
+/// up sweeps nothing, and sweeps when it is held up no more. **The time
+/// of a sweep is noted once it has succeeded:** one that failed is tried
+/// again when the device is next asked, and not a day later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     use cordelia_api::state::Held;
@@ -4978,8 +4980,29 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     device.engine.sweep_deletes();
     assert_eq!(device.holds_of(&channel).len(), 2, "swept while held up");
     device.state.held.release();
+    // A sweep that fails: the store cannot be written. Nothing went, and
+    // no time is noted for it. Asked again, with no time gone by, the
+    // device sweeps.
+    let written = |can_be: bool| {
+        device
+            .db()
+            .pragma_update(None, "query_only", !can_be)
+            .unwrap()
+    };
+    written(false);
     device.engine.sweep_deletes();
-    assert_eq!(device.holds_of(&channel).len(), 1);
+    assert_eq!(
+        device.holds_of(&channel).len(),
+        2,
+        "swept a store that cannot be written"
+    );
+    written(true);
+    device.engine.sweep_deletes();
+    assert_eq!(
+        device.holds_of(&channel).len(),
+        1,
+        "a sweep that failed is tried a day later"
+    );
     assert_eq!(device.text("notes", "stays.md").as_deref(), Some("a text"));
     assert_eq!(device.text("notes", "gone.md"), None);
 }
