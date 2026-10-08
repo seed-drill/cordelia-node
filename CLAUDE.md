@@ -211,6 +211,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
 | `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |
+| `DEVICE_DELETE_SWEEP_INTERVAL_SECS` | 86400s (a device's sweep of old deletes) | parameter-rationale.md §12.9 |
 | `LOCAL_API_BODY_MAX_BYTES`, `CARRY_HANDED_MAX_BYTES` | 2MB, 512KB (derived) | parameter-rationale.md §12.9 |
 | `RECOVERY_MAX_NAMES`, `RECOVERY_MAX_DEVICES_SHOWN`, `RECOVERY_MAX_LEFT_SECRETS` | 1024, 256, 9 (derived) | parameter-rationale.md §12.9 |
 | `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |

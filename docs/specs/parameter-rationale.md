@@ -1610,6 +1610,14 @@ is marked as cut.
 **Why 120:** neither the code nor the record gives a reason for the number;
 no measurement behind it yet.
 
+#### DEVICE_DELETE_SWEEP_INTERVAL_SECS = 86,400
+
+**Rationale:** A device sweeps the deletes that it has held for 90 days
+(`KEYED_TOMBSTONE_RETENTION_DAYS`) once a day, and at its start (decision §16).
+Each sweep that takes a delete has that channel read again from its start at
+every relay, so a folder with steady deletes is read again once a day at most.
+A day is fine-grained enough for a bound of 90 days.
+
 #### LEFT_PROOFS_MARGIN_SHARE = 64
 
 **Rationale:** A relay remembers the proofs of 1,024 channels for one
