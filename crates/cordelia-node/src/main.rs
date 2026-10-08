@@ -21,8 +21,13 @@ mod recover_cmd;
 mod relay_entries;
 mod terminal;
 
+/// What the program is, in one line: the head of `cordelia --help`, and
+/// what `cordelia` with no command prints.
+const ABOUT: &str =
+    "Keeps your AI agent's memory in step across your machines, end to end encrypted";
+
 #[derive(Parser)]
-#[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
+#[command(name = "cordelia", version, about = ABOUT)]
 struct Cli {
     /// Path to config file (accepted before or after the subcommand)
     #[arg(
@@ -584,7 +589,7 @@ fn main() -> anyhow::Result<()> {
         }) => cmd_swarm_init(&cli.config, index, &lead_identity, &lead_entity_id),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
-            println!("Encrypted pub/sub for AI agents");
+            println!("{ABOUT}");
             println!();
             println!("Run `cordelia --help` for usage.");
             Ok(())
@@ -7378,6 +7383,21 @@ mod tests {
             cannot_listen_says("127.0.0.1:80", &refused, "linux"),
             format!("the node's API cannot listen at 127.0.0.1:80: {refused}")
         );
+    }
+
+    /// `cordelia --help`, and `cordelia` with no command, are headed by
+    /// what the program is now, in one short line: it keeps an agent's
+    /// memory in step across a person's machines, end to end encrypted.
+    #[test]
+    fn test_the_program_says_what_it_is_in_one_line() {
+        use clap::CommandFactory;
+        let about = Cli::command().get_about().map(|about| about.to_string());
+        assert_eq!(about.as_deref(), Some(ABOUT));
+        assert_eq!(
+            ABOUT,
+            "Keeps your AI agent's memory in step across your machines, end to end encrypted"
+        );
+        assert!(!ABOUT.contains('\n') && !ABOUT.contains("pub/sub"));
     }
 
     /// Run by a person, `cordelia init` ends by saying how the node is
