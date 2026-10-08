@@ -454,6 +454,84 @@ fn node_is_ready(by_a_script: bool) -> &'static str {
     }
 }
 
+/// Whether anyone but its owner may read, write or enter what is at
+/// `path`: any bit of its mode that is the group's or everyone else's.
+/// What is not there is open to nobody.
+#[cfg(unix)]
+fn open_to_others(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|found| found.permissions().mode() & 0o077 != 0)
+}
+
+/// Let only its owner read and write the file, or read, write and enter
+/// the directory, at `path`: mode 0600 for a file and 0700 for a
+/// directory.
+#[cfg(unix)]
+fn owners_alone(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::metadata(path)?.is_dir() {
+        true => 0o700,
+        false => 0o600,
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Make the data directory at `dir`, with every directory above it that
+/// is missing, and let only its owner read, write or enter it (mode
+/// 0700): it holds the device's key, the node's token and the database.
+/// One that is there already is set so. Nothing in it is touched.
+fn private_data_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut made = std::fs::DirBuilder::new();
+    made.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        made.mode(0o700);
+    }
+    made.create(dir)?;
+    #[cfg(unix)]
+    owners_alone(dir)?;
+    Ok(())
+}
+
+/// What a node that starts does about a data directory that others can
+/// read, write or enter: **it sets the directory to its owner's alone
+/// (mode 0700), and with it the configuration file, where that file is
+/// in the directory (mode 0600).** Nothing else's mode changes: not a
+/// file in the directory that has its own mode already, and not a
+/// configuration file that is kept elsewhere, which is whoever put it
+/// there's to set.
+///
+/// Returns what the node's log says of it, once: what was set, or what
+/// could not be. `None` where the directory is its owner's alone
+/// already: nothing is looked at further, and nothing is said. A mode
+/// that cannot be set keeps no node from starting.
+#[cfg(unix)]
+fn keep_private(data_dir: &std::path::Path, config_file: &std::path::Path) -> Option<String> {
+    if !open_to_others(data_dir) {
+        return None;
+    }
+    let mut says = format!(
+        "the data directory {} could be read, written or entered by others",
+        data_dir.display()
+    );
+    match owners_alone(data_dir) {
+        Ok(()) => says.push_str(": it is now its owner's alone (mode 0700)"),
+        Err(e) => says.push_str(&format!(
+            ", and could not be set to its owner's alone ({e})"
+        )),
+    }
+    if config_file.starts_with(data_dir) && config_file.is_file() {
+        match owners_alone(config_file) {
+            Ok(()) => says.push_str(", and so is the configuration file in it (mode 0600)"),
+            Err(e) => says.push_str(&format!(
+                "; the configuration file in it could not be set so ({e})"
+            )),
+        }
+    }
+    Some(says)
+}
+
 fn cmd_init(
     config_path: &str,
     name: Option<String>,
@@ -464,6 +542,32 @@ fn cmd_init(
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file).unwrap_or_default();
     config.apply_env_overrides();
+    init_with(
+        &config_file,
+        config,
+        name,
+        non_interactive,
+        force,
+        show_secrets,
+    )
+}
+
+/// What `cordelia init` does, given the configuration as it stands and
+/// the file that it is written to: the device's key, the node's token,
+/// the database and the configuration, each made where it is not there
+/// (or made again with `force`).
+///
+/// **The data directory is its owner's alone (mode 0700), and so is the
+/// configuration file that this writes (mode 0600).** The key, the token
+/// and the database are each 0600.
+fn init_with(
+    config_file: &std::path::Path,
+    mut config: Config,
+    name: Option<String>,
+    non_interactive: bool,
+    force: bool,
+    show_secrets: bool,
+) -> anyhow::Result<()> {
     let data_dir = config.data_dir();
 
     // A database that this command would open is opened before anything
@@ -473,6 +577,10 @@ fn cmd_init(
     if db_path.exists() && force {
         drop(open_database(&db_path)?);
     }
+
+    // The data directory is made its owner's alone before anything is
+    // put in it.
+    private_data_dir(&data_dir)?;
 
     // 1. Generate or load Ed25519 identity
     let identity_path = data_dir.join("identity.key");
@@ -552,7 +660,10 @@ fn cmd_init(
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
-        config.save(&config_file)?;
+        config.save(config_file)?;
+        // The file that this wrote is its owner's alone to read.
+        #[cfg(unix)]
+        owners_alone(config_file)?;
         println!("Config written to {}", config_file.display());
     }
 
@@ -1298,6 +1409,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // as long as the process lives. A second node on the same directory,
     // whatever port it was given, says so here and changes nothing.
     let _one_node = lock_data_dir(&data_dir)?;
+
+    // A data directory that others can read, write or enter is set to
+    // its owner's alone, with the configuration file in it, and the log
+    // says so once. It is done here, after the port is bound and the lock
+    // is held: a node that does not start changes nothing.
+    #[cfg(unix)]
+    if let Some(says) = keep_private(&data_dir, &config_file) {
+        tracing::warn!("{says}");
+    }
 
     // Open database. One from a later version is refused (decision
     // 2026-10-04 §10.1). A personal node then stays up, over a database
@@ -6724,6 +6844,117 @@ mod tests {
         assert!(!sweep.is_due(start + hour + second));
         assert!(!sweep.is_due(start + hour * 2 - second));
         assert!(sweep.is_due(start + hour * 2));
+    }
+
+    /// The mode of what is at `path`, as far as who may read, write and
+    /// enter it.
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `cordelia init` makes the data directory its owner's alone (mode
+    /// 0700), and the configuration file that it writes (0600): a
+    /// directory that was there and open to others, as an install script
+    /// may leave one, and a directory that it makes itself. The key, the
+    /// token and the database are 0600 as they were, and run again it
+    /// leaves each as it is.
+    #[cfg(unix)]
+    #[test]
+    fn test_init_makes_the_data_directory_and_the_configuration_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("there");
+        std::fs::create_dir(&there).unwrap();
+        set_mode(&there, 0o775);
+        let made = dir.path().join("not").join("there");
+        for data in [there, made] {
+            let config_file = data.join("config.toml");
+            let mut config = Config::default();
+            config.node.data_dir = data.display().to_string();
+            let init = || {
+                init_with(
+                    &config_file,
+                    config.clone(),
+                    Some("laptop".into()),
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap()
+            };
+            init();
+            assert_eq!(mode(&data), 0o700, "{}", data.display());
+            assert_eq!(mode(&config_file), 0o600);
+            for file in ["identity.key", "node-token", "cordelia.db"] {
+                assert_eq!(mode(&data.join(file)), 0o600, "{file}");
+            }
+            assert_eq!(mode(&data.join("channel-keys")), 0o700);
+            // Run again: the same key, and the same modes.
+            let key = std::fs::read(data.join("identity.key")).unwrap();
+            init();
+            assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), key);
+            assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
+        }
+    }
+
+    /// A node that starts on a data directory that others can read, write
+    /// or enter sets it to its owner's alone (mode 0700), and the
+    /// configuration file in it (0600), and says so once. Nothing else's
+    /// mode changes: not another file in the directory, and not a
+    /// configuration file that is kept elsewhere. A directory that is its
+    /// owner's alone already is looked at no further, and nothing is
+    /// said.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_node_that_starts_keeps_its_data_directory_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let (config_file, other) = (data.join("config.toml"), data.join("notes"));
+        let elsewhere = dir.path().join("config.toml");
+        for file in [&config_file, &other, &elsewhere] {
+            std::fs::write(file, "").unwrap();
+            set_mode(file, 0o664);
+        }
+        set_mode(&data, 0o775);
+
+        let said = keep_private(&data, &config_file).expect("it says what it set");
+        assert_eq!(
+            said,
+            format!(
+                "the data directory {} could be read, written or entered by others: it is now \
+                 its owner's alone (mode 0700), and so is the configuration file in it (mode \
+                 0600)",
+                data.display()
+            )
+        );
+        assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
+        assert_eq!((mode(&other), mode(&elsewhere)), (0o664, 0o664));
+        // Its owner's alone already: nothing is set, and nothing is said,
+        // whatever the mode of the configuration file in it.
+        set_mode(&config_file, 0o664);
+        assert_eq!(keep_private(&data, &config_file), None);
+        assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o664));
+
+        // A configuration file that is kept elsewhere is left as it is.
+        for open in [0o750, 0o705, 0o701, 0o720] {
+            set_mode(&data, open);
+            let said = keep_private(&data, &elsewhere).expect("it says what it set");
+            assert!(
+                said.ends_with("it is now its owner's alone (mode 0700)"),
+                "{said}"
+            );
+            assert_eq!((mode(&data), mode(&elsewhere)), (0o700, 0o664), "{open:o}");
+        }
+        // A directory that is not there is open to nobody.
+        assert_eq!(keep_private(&dir.path().join("none"), &elsewhere), None);
     }
 
     /// Run by a person, `cordelia init` ends by saying how the node is
