@@ -465,7 +465,10 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 >
 > **The data directory is its owner's alone.** `cordelia init` makes it with
 > mode 0700, or sets it so where it is there already, and the configuration
-> file that it writes is 0600; the install script sets both as well. A node
+> file that it writes is 0600; the install script sets both as well. Where
+> `init` cannot set the directory's mode (the directory is another's, or its
+> volume refuses the change) it says so in one line, with why, and goes on:
+> only a directory that cannot be made is an error. A node
 > that starts on a data directory that others can read, write or enter sets
 > it to 0700, and the configuration file to 0600 where that file is in the
 > directory, and says so once in its log. It does so after its port is bound

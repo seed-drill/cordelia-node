@@ -656,11 +656,36 @@ fn owners_alone(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// Where a system has no such modes, there is none to set.
+#[cfg(not(unix))]
+fn owners_alone(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// What `cordelia init` says where the data directory at `dir` could not
+/// be made its owner's alone: one line, with why. It then goes on.
+fn not_private_says(dir: &std::path::Path, why: &std::io::Error) -> String {
+    format!(
+        "Could not make {} private: {why}. Other users of this machine may be able to read it.",
+        dir.display()
+    )
+}
+
 /// Make the data directory at `dir`, with every directory above it that
 /// is missing, and let only its owner read, write or enter it (mode
 /// 0700): it holds the device's key, the node's token and the database.
 /// One that is there already is set so. Nothing in it is touched.
-fn private_data_dir(dir: &std::path::Path) -> std::io::Result<()> {
+///
+/// **Only a directory that cannot be made is an error.** Where its mode
+/// cannot be set (the directory is another's, or its volume refuses the
+/// change), the directory is used as it is, and this gives back what to
+/// say of it ([`not_private_says`]): a node that starts there does the
+/// same ([`keep_private`]). `set` sets the mode: [`owners_alone`], but in
+/// the test of this.
+fn private_data_dir(
+    dir: &std::path::Path,
+    set: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<Option<String>> {
     let mut made = std::fs::DirBuilder::new();
     made.recursive(true);
     #[cfg(unix)]
@@ -669,9 +694,10 @@ fn private_data_dir(dir: &std::path::Path) -> std::io::Result<()> {
         made.mode(0o700);
     }
     made.create(dir)?;
-    #[cfg(unix)]
-    owners_alone(dir)?;
-    Ok(())
+    match set(dir) {
+        Ok(()) => Ok(None),
+        Err(why) => Ok(Some(not_private_says(dir, &why))),
+    }
 }
 
 /// What a node that starts does about a data directory that others can
@@ -765,8 +791,10 @@ fn init_with(
     }
 
     // The data directory is made its owner's alone before anything is
-    // put in it.
-    private_data_dir(&data_dir)?;
+    // put in it. Where it cannot be made so, init says so and goes on.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
+    }
 
     // 1. Generate or load Ed25519 identity
     let identity_path = data_dir.join("identity.key");
@@ -7168,6 +7196,37 @@ mod tests {
             assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), key);
             assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
         }
+    }
+
+    /// `cordelia init` goes on where the data directory is there and its
+    /// mode cannot be set (it is another's, or its volume refuses the
+    /// change): it says so in one line, with why, and uses the directory
+    /// as it is. Only a directory that cannot be made is an error.
+    #[test]
+    fn test_init_goes_on_where_the_data_directory_cannot_be_made_private() {
+        use std::io::{Error, ErrorKind};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let refused = |_: &std::path::Path| Err(Error::from(ErrorKind::PermissionDenied));
+        let said = private_data_dir(&data, refused).expect("init goes on");
+        assert!(data.is_dir());
+        assert_eq!(
+            said,
+            Some(format!(
+                "Could not make {} private: {}. Other users of this machine may be able to \
+                 read it.",
+                data.display(),
+                Error::from(ErrorKind::PermissionDenied)
+            ))
+        );
+        // Where the mode is set, nothing is said.
+        assert_eq!(private_data_dir(&data, |_| Ok(())).unwrap(), None);
+        // A directory that cannot be made is an error: here a file is in
+        // the way.
+        let in_the_way = dir.path().join("file");
+        std::fs::write(&in_the_way, "").unwrap();
+        let not_made = private_data_dir(&in_the_way.join("data"), |_| Ok(()));
+        assert!(not_made.is_err(), "{not_made:?}");
     }
 
     /// A node that starts on a data directory that others can read, write
