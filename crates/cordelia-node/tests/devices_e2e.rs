@@ -1213,9 +1213,11 @@ fn the_harness_refuses_what_the_node_would_take_for_a_name() {
 
 /// A node, and each command that the harness runs, is run without three
 /// things of the caller's: any `CORDELIA_` variable, `RUST_LOG` and any
-/// proxy; and none of git's own variables, which would point the `git`
-/// that a node runs, and the one a test runs, at the caller's repository.
-/// It is given its own data directory and home, and the rest is left.
+/// proxy; none of git's own variables, which would point the `git` that
+/// a node runs, and the one a test runs, at the caller's repository; and
+/// not `STY`, which would tell a command that it runs inside GNU
+/// `screen` because the tests do. It is given its own data directory and
+/// home, and the rest is left.
 ///
 /// This is a test of the function that removes them, given the names: no
 /// node is spawned here with such a variable set, and that the harness
@@ -1234,6 +1236,8 @@ fn a_node_is_given_none_of_the_callers_settings() {
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GITHUB_SHA",
+        "STY",
+        "STYLE",
     ];
     let command = n.binary_given(inherited.iter().map(std::ffi::OsString::from));
     let set = |name: &str| -> Option<Option<PathBuf>> {
@@ -1249,15 +1253,18 @@ fn a_node_is_given_none_of_the_callers_settings() {
         "RUST_LOG",
         "GIT_DIR",
         "GIT_WORK_TREE",
+        "STY",
     ] {
         assert_eq!(set(name), Some(None), "{name}");
     }
     // Its own.
     assert_eq!(set("CORDELIA_DATA_DIR"), Some(Some(n.data_dir())));
     assert_eq!(set("HOME"), Some(Some(n.home())));
-    // Left as it is: what is not git's own is not taken for it.
+    // Left as it is: what is not git's own is not taken for it, nor what
+    // only begins as the variable of `screen` does.
     assert_eq!(set("PATH"), None);
     assert_eq!(set("GITHUB_SHA"), None);
+    assert_eq!(set("STYLE"), None);
 }
 
 /// A node with no identity does not start: it stops before it opens a
@@ -1375,6 +1382,75 @@ fn a_relay_that_would_dial_another_machine_is_not_started() {
 fn the_harness_starts_a_node_with_no_variable_it_does_not_know() {
     let mut n = node("alone", "personal", None);
     n.start_given(&[("CORDELIA_BOOTNODES", "relay.example:9474")]);
+}
+
+/// The harness reads what a command left at its terminal: what was typed
+/// there and not read, which whoever reads the terminal next is handed,
+/// as a shell is once a command has ended. Here a command asks one yes.
+/// Two lines are typed at once: the first answers it, and the second is
+/// left. So a test that finds nothing left has looked where something
+/// would be. And keys that are sent at once are sent with no moment
+/// before them.
+#[test]
+fn the_harness_reads_what_a_command_left_typed_at_its_terminal() {
+    let mut n = node("alone", "personal", None);
+    n.start();
+    wait_for("the node is up", &[&n], 30, || healthy(&n));
+    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
+
+    let mut at = n.at_terminal(&["accept", &other]);
+    at.says("Type yes to go on");
+    let asked = std::time::Instant::now();
+    let sent = at.sends(b"no\nleft behind\n");
+    assert!(sent >= asked && sent.elapsed() < std::time::Duration::from_secs(1));
+    let (success, said, left) = at.ends_and_leaves();
+    assert!(success, "{said}");
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert_eq!(left, "left behind\n");
+
+    // With one line typed, nothing is left.
+    let mut at = n.at_terminal(&["accept", &other]);
+    at.says("Type yes to go on").types("no");
+    let (_, said, left) = at.ends_and_leaves();
+    assert!(
+        said.contains("That was not a yes. Nothing was done."),
+        "{said}"
+    );
+    assert_eq!(left, "");
+}
+
+/// What a command says at its terminal arrives in pieces, and a piece can
+/// end in the middle of a character of several bytes, as a mark is. The
+/// harness keeps the bytes that begin one until the rest has come: they
+/// are never read as two characters that are none.
+#[test]
+fn the_harness_keeps_a_character_that_arrived_in_part_for_its_rest() {
+    let tick = "\u{2713}".as_bytes();
+    assert_eq!(tick.len(), 3);
+    let said = [b"   1. ", tick, b"\r\n"].concat();
+    // Whole: nothing is kept back, after plain text or after a mark.
+    for whole in [&b""[..], &said[..6], &said[..9], &said[..]] {
+        assert_eq!(begun_at_the_end(whole), 0, "{whole:?}");
+    }
+    // Cut in the mark: its one byte, or its two, wait for the rest.
+    assert_eq!(begun_at_the_end(&said[..7]), 1);
+    assert_eq!(begun_at_the_end(&said[..8]), 2);
+    // A character of two bytes, and one of four.
+    let (two, four) = ("\u{e9}".as_bytes(), "\u{1f511}".as_bytes());
+    assert_eq!((two.len(), four.len()), (2, 4));
+    assert_eq!(begun_at_the_end(&two[..1]), 1);
+    assert_eq!(begun_at_the_end(two), 0);
+    for cut in 1..4 {
+        assert_eq!(begun_at_the_end(&four[..cut]), cut);
+    }
+    assert_eq!(begun_at_the_end(four), 0);
+    // Bytes that are the middle of nothing are kept back by nothing.
+    assert_eq!(begun_at_the_end(&[b'a', 0x80, 0x80]), 0);
+    assert_eq!(begun_at_the_end(&[0x80, 0x80, 0x80, 0x80]), 0);
 }
 
 /// The harness makes personal nodes and relays: what those will dial can

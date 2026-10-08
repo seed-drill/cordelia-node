@@ -317,7 +317,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia start` | Run the node. (`cordelia stop` is not built: a node is stopped by its service, or by a signal) | |
 > | `cordelia status [--line \| --json \| --waybar]` | This device, its peers and memory sync. `--line` for a status bar, `--json` for tools, `--waybar` for a bar module (§4.3) | |
 > | `cordelia id` | Print this device's public key | |
-> | `cordelia phrase [--name <label>]` | Make the recovery phrase of your devices on this one: twelve words, shown once and typed back | Yes |
+> | `cordelia phrase [--name <label>]` | Make the recovery phrase of your devices on this one: twelve words, shown once with their numbers and typed back one at a time | Yes |
 > | `cordelia add-device <key> [--name <label>]` | Add another of your devices; then `cordelia accept` on it, within the hour | Yes |
 > | `cordelia accept <key>` | Take what the device that added this one hands over | Yes |
 > | `cordelia devices [--clear]` | Your devices, what each has applied, and what each relay holds. `--clear` goes through what this device has to tell you | `--clear` does |
@@ -339,8 +339,12 @@ Phase 4: device management UI, selective revocation via key rotation.
 > - **A command that asks at a terminal refuses when its input is not one,**
 >   before it asks or does anything. A yes is the word `yes`.
 > - **The recovery phrase is typed at the command's own prompt, with echo
->   off:** never as an argument, never over the local API. The command signs
->   in its own process and forgets the words before it waits for anything.
+>   off:** never as an argument, never over the local API. Its words are
+>   asked for by number, one at a time, and nothing that is typed is shown.
+>   After each word the command says whether it is a word of the list, and
+>   where the phrase is being proved it says nothing more of it (decision
+>   2026-10-04 §16). The command signs in its own process and forgets the
+>   words before it waits for anything.
 >   `remove-device`, `renew`, `settle` and `sync carry --from` ask for it
 >   last, after what they show and their yes. `recover` asks for it first and
 >   holds it through its prompts, since it reads at the relays with it. What

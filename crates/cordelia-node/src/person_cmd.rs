@@ -18,10 +18,11 @@
 //! is run by mistake, and nothing else.
 //!
 //! **The recovery phrase stays in this process** (§5). It is made here
-//! (`cordelia phrase`), or typed here with echo off (`remove-device`,
-//! `renew`, `settle`), and is in memory that is overwritten when it is
-//! dropped. It is never an argument, is never sent to the node, and is
-//! in no error and no file. A command that needs it:
+//! (`cordelia phrase`), or typed here with echo off, one word at a time
+//! (`remove-device`, `renew`, `settle`), and is in memory that is
+//! overwritten when it is dropped. It is never an argument, is never
+//! sent to the node, and is in no error and no file. A command that
+//! needs it:
 //!
 //! 1. is handed by the node what is to be signed over: the statement
 //!    that the device has applied and the change entry it keeps, as their
@@ -42,12 +43,13 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use cordelia_api::change::{Prepared, prepare_change, prepare_settlement};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
-use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS};
+use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS};
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -56,21 +58,21 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
-use crate::terminal::Terminal;
+use crate::terminal::{Terminal, TypedBack};
 use crate::{
     Told, api_post, api_post_told, note_another_version, refuse_another_version,
     refuse_before_a_phrase,
 };
 
-/// Whose words a recovery phrase is, and what it is for: said wherever
-/// one is made (decision 2026-10-04 §5).
+/// What a recovery phrase is for, who has it, and that it is no wallet's:
+/// said wherever one is made (decision 2026-10-04 §5).
 const WHOSE_WORDS: &str = "\
-A recovery phrase is twelve words. They are Cordelia's recovery phrase for your devices.
-The words are from the list that a wallet's seed phrase uses, and are no wallet's: never
-type these into a wallet, and never type a wallet's words here.
+Your recovery phrase is twelve words.
 
-Without the phrase a device can be added, and none can ever be removed or recovered.
-Nobody else holds it, and this device does not keep it: it is shown once, now.";
+  - You need it to remove a device, or to recover on a new machine.
+    (You can add a device without it.)
+  - Nobody else has it, and this device does not keep it. It is shown once, now.
+  - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's words here.";
 
 /// What is said where a person did not say yes.
 pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
@@ -373,11 +375,32 @@ fn alone_says(seen: &Value, from: &str) -> String {
 /// `cordelia phrase`: make the recovery phrase of this person's devices
 /// here (decision 2026-10-04 §5, §5.2).
 ///
-/// The phrase is made in this process, shown once, and typed back whole
-/// before anything is made. The node is handed the first statement's
-/// change entry and the statement key, and never the words.
+/// The phrase is made in this process, shown once with each word's
+/// number, and typed back whole, a word at a time, before anything is
+/// made. The node is handed the first statement's change entry and the
+/// statement key, and never the words.
+///
+/// **Nothing is shown on a terminal that keeps what is shown** (decision
+/// 2026-10-04 §16): inside GNU `screen` the command stops before it
+/// asks the node anything, and no phrase is made
+/// ([`Terminal::keeps_what_is_shown`]). The commands that only read a
+/// phrase show none, and are not stopped there.
+///
+/// **Each word typed back is held against the word that was shown at its
+/// number** (decision 2026-10-04 §16), here and at no other command: a
+/// phrase written down wrongly is found out word by word. The third
+/// try that is not the word shown stops the command, and nothing is
+/// made ([`Terminal::phrase_back`]).
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
+    // A terminal that keeps what is shown is shown nothing: before the
+    // node is asked anything, and before there is a phrase to show.
+    if at.keeps_what_is_shown() {
+        anyhow::bail!(
+            "this terminal can keep what is shown in its scrollback.\nRun `cordelia phrase` in \
+             a terminal outside `screen`. Nothing was made."
+        );
+    }
     refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
@@ -422,30 +445,34 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // is shown.
     Device::new(this_device, &label)?;
 
+    // What is said above the words, and below them.
+    let says = "Your recovery phrase (shown once):";
+    let asks = "Write the twelve words down, in order. Keep them where only you can read \
+                them.\nPress Enter when you have. The words are then cleared from the screen. ";
+    // The terminal's size is read before there is a phrase: where it has
+    // no room for the twelve words, none is made.
+    let in_a_row = match words_in_a_row(at.size(), says, asks) {
+        Ok(in_a_row) => in_a_row,
+        Err(too_small) => anyhow::bail!(too_small),
+    };
+
     let phrase = Phrase::generate()?;
     at.once(
-        "The recovery phrase, shown once:",
-        phrase.words()?.as_str(),
-        "Write the twelve words down, in their order, and keep them where only you can \
-         read them.\nPress Enter when they are written down: they are then taken off the \
-         screen. ",
+        says,
+        numbered(phrase.words()?.as_str(), in_a_row).as_str(),
+        asks,
     )?;
     let made = {
-        let typed = at.phrase(
-            "Type the twelve words back, from what you wrote (what you type is not shown): ",
+        // Each word is held against the word shown by its place in the
+        // list: the words themselves are not set beside each other.
+        let typed_back = at.phrase_back(
+            "Now type the words back, one at a time. What you type is not shown.",
+            &*phrase.places()?,
         )?;
-        // The same words give the same key: the words themselves are
-        // not set beside each other.
-        let same = Phrase::parse(&typed)
-            .ok()
-            .and_then(|typed| Some(typed.public_key().ok()? == phrase.public_key().ok()?));
-        if same != Some(true) {
-            anyhow::bail!(
-                "the words typed are not the words that were shown. Nothing was made, and the \
-                 words that were shown are no phrase of anything: do not keep them. Run \
-                 `cordelia phrase` again."
-            );
+        if let Some(why) = not_typed_back_says(&typed_back) {
+            anyhow::bail!(why);
         }
+        println!("\nAll twelve match.");
         first_entry(&phrase, &this_device, &label)?
     };
     // The phrase has signed and sealed: it is dropped here, and
@@ -495,6 +522,101 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          key>`."
     );
     Ok(())
+}
+
+/// What `cordelia phrase` says where the words that it showed were not
+/// all typed back, and `None` where they were (decision 2026-10-04 §5):
+/// at the third miss, or where the input ended first. Either way nothing
+/// is made, and the words that were shown are a phrase of nothing: a
+/// person is told so, and not to keep them.
+fn not_typed_back_says(typed_back: &TypedBack) -> Option<String> {
+    let nothing_made = "Nothing was made, and the words you were shown are not a recovery \
+                        phrase: do not keep them.";
+    match typed_back {
+        TypedBack::All => None,
+        TypedBack::Missed => Some(format!(
+            "Three tries did not match. {nothing_made} Run `cordelia phrase` again."
+        )),
+        TypedBack::Ended(said) => Some(format!("{said}. {nothing_made}")),
+    }
+}
+
+/// How many of the twelve words are shown to a row on a terminal of
+/// `size`, its columns and lines, with `says` above them and `asks`
+/// below (decision 2026-10-04 §5):
+///
+/// - four, as a rule, and where the terminal says nothing of its size;
+/// - **one, where the terminal is narrower than a row of four,** so that
+///   no row is broken over two lines, and a number parted from its word;
+/// - and **where it has no room for them even so, what to say:** nothing
+///   is shown, and nothing is made. What does not fit scrolls off the top
+///   of a screen that keeps no lines, and is not seen.
+///
+/// A line of `says` or `asks` that is longer than the terminal is wide
+/// goes on to the next line, and is counted so.
+fn words_in_a_row(size: Option<(usize, usize)>, says: &str, asks: &str) -> Result<usize, String> {
+    let Some((columns, lines)) = size else {
+        return Ok(4);
+    };
+    let in_a_row = if columns >= widest_row(4) { 4 } else { 1 };
+    // What the words need: at the width that the terminal has, or, where
+    // it is narrower than one word with its number, at that width.
+    let needs_columns = columns.max(widest_row(1));
+    let needs_lines = lines_taken(says, needs_columns)
+        + 1
+        + PHRASE_WORDS.div_ceil(in_a_row)
+        + 1
+        + lines_taken(asks, needs_columns);
+    if columns < needs_columns || lines < needs_lines {
+        return Err(format!(
+            "this terminal is too small to show the twelve words: it has {columns} columns and \
+             {lines} lines.\nThey need {needs_columns} columns and {needs_lines} lines. Nothing \
+             was made."
+        ));
+    }
+    Ok(in_a_row)
+}
+
+/// How many columns the widest row of the words can take, `in_a_row` of
+/// them to a row: the rows of twelve of the longest words of the list.
+fn widest_row(in_a_row: usize) -> usize {
+    let longest = ["abstract"; PHRASE_WORDS].join(" ");
+    let rows = numbered(&longest, in_a_row);
+    rows.lines().map(str::len).max().unwrap_or(0)
+}
+
+/// How many lines `text` takes on a terminal of `columns`: a line that is
+/// longer than the terminal is wide goes on to the next.
+fn lines_taken(text: &str, columns: usize) -> usize {
+    text.lines()
+        .map(|line| line.len().div_ceil(columns).max(1))
+        .sum()
+}
+
+/// The twelve `words` as they are shown: each with its number,
+/// `in_a_row` to a row, the columns lined up. So the numbers that a
+/// person writes down are the numbers that the words are asked for by.
+///
+/// The text is overwritten when it is dropped, and is never moved as it
+/// grows: it has room for sixteen bytes a word, which is a number, a full
+/// stop and a space, the eight letters of the longest word, and what
+/// parts it from the next.
+fn numbered(words: &str, in_a_row: usize) -> Zeroizing<String> {
+    use std::fmt::Write;
+    let (longest, between) = (8, 3);
+    let mut rows = Zeroizing::new(String::with_capacity(PHRASE_WORDS * 16));
+    let mut after_the_last = 0;
+    for (at, word) in words.split(' ').enumerate() {
+        match at % in_a_row {
+            0 if at == 0 => rows.push_str("  "),
+            0 => rows.push_str("\n  "),
+            _ => rows.extend(std::iter::repeat_n(' ', after_the_last)),
+        }
+        // Written where it is: no copy of a word is made on the way.
+        let _ = write!(rows, "{:>2}. {word}", at + 1);
+        after_the_last = longest.max(word.len()) - word.len() + between;
+    }
+    rows
 }
 
 // ── cordelia add-device ─────────────────────────────────────────────
@@ -1817,8 +1939,14 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
     Ok(out)
 }
 
-/// Ask for the recovery phrase at the terminal: twelve words, typed with
-/// echo off. It is the one way that a command reads a phrase.
+/// Ask for the recovery phrase at the terminal: twelve words, each asked
+/// for by its number and typed with echo off. It is the one way that a
+/// command reads a phrase that is to be proved.
+///
+/// **Nothing is said of any word but that it is a word of the list**
+/// (decision 2026-10-04 §16): this has nothing to hold a word against,
+/// and the phrase is judged only when all twelve are typed
+/// ([`Terminal::phrase`]).
 ///
 /// A mistyped phrase is told from a wrong one: words that are no
 /// recovery phrase fail its checksum, and may be typed again, three times
@@ -1827,8 +1955,9 @@ pub(crate) fn typed_phrase(at: &Terminal) -> anyhow::Result<Phrase> {
     let mut tries = 0;
     loop {
         tries += 1;
-        let typed =
-            at.phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
+        let typed = at.phrase(
+            "\nType your recovery phrase, one word at a time. What you type is not shown.",
+        )?;
         match Phrase::parse(&typed) {
             Ok(phrase) => return Ok(phrase),
             Err(e) if tries < PHRASE_TRIES => {
@@ -3403,5 +3532,171 @@ mod tests {
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
             "names": { "sent": ["lab"], "to_go": [] } });
         assert!(names_lines(&quiet).is_empty());
+    }
+
+    /// The twelve words are shown numbered, four to a row, with the
+    /// columns lined up and the numbers right-aligned (decision
+    /// 2026-10-04 §5): the number that a word is shown by is the number
+    /// that it is asked for by. No row ends in a space. And the text has
+    /// room for any twelve words of the list from the start: it is never
+    /// moved as it grows.
+    #[test]
+    fn the_words_are_shown_numbered_four_to_a_row_with_the_columns_lined_up() {
+        let legal = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        assert_eq!(
+            numbered(legal, 4).as_str(),
+            "   1. legal       2. winner      3. thank       4. year\n   \
+             5. wave        6. sausage     7. worth       8. useful\n   \
+             9. legal      10. winner     11. thank      12. yellow"
+        );
+        // Twelve of the longest words, and twelve of the shortest: the
+        // numbers are in the same columns whatever the words are.
+        let longest = ["abstract"; 12].join(" ");
+        let shortest = ["zoo"; 12].join(" ");
+        let columns = |rows: &str| -> Vec<Vec<usize>> {
+            rows.lines()
+                .map(|row| row.match_indices(". ").map(|(at, _)| at).collect())
+                .collect()
+        };
+        let of_the_longest = numbered(&longest, 4);
+        assert_eq!(columns(&of_the_longest), [[4, 19, 34, 49]; 3]);
+        for words in [legal, &longest, &shortest] {
+            let rows = numbered(words, 4);
+            assert_eq!(columns(&rows), columns(&of_the_longest), "{words}");
+            assert_eq!(rows.lines().count(), 3);
+            assert!(rows.lines().all(|row| !row.ends_with(' ')), "{rows:?}");
+            // Each word after its number, in the order they were given.
+            let read: Vec<&str> = rows.split_whitespace().collect();
+            let numbers: Vec<String> = (1..=12).map(|number| format!("{number}.")).collect();
+            let shown: Vec<&str> = read.iter().skip(1).step_by(2).copied().collect();
+            assert_eq!(
+                read.iter().step_by(2).collect::<Vec<_>>(),
+                numbers.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(shown.join(" "), words);
+            // Within the room it was given, and so never moved.
+            assert!(rows.len() <= PHRASE_WORDS * 16, "{}", rows.len());
+            assert_eq!(rows.capacity(), numbered(legal, 4).capacity());
+        }
+        // Two spaces, three columns of fifteen and one of twelve: and
+        // with the two ends of rows, within the room for sixteen a word.
+        assert_eq!(of_the_longest.lines().next().unwrap().len(), 59);
+        assert_eq!(of_the_longest.len(), 3 * 59 + 2);
+    }
+
+    /// **The terminal's size says how the words are shown** (decision
+    /// 2026-10-04 §5): four to a row; one to a line where it is narrower
+    /// than a row of four; and nothing, with the size they need, where
+    /// it has too few lines, or is narrower than one word with its
+    /// number. A terminal that says nothing of its size is shown the
+    /// rows of four.
+    #[test]
+    fn the_terminals_size_says_how_the_words_are_shown_or_that_they_are_not() {
+        let says = "Your recovery phrase (shown once):";
+        let asks = "Write the twelve words down, in order. Keep them where only you can read \
+                    them.\nPress Enter when you have. The words are then cleared from the \
+                    screen. ";
+        assert_eq!((says.len(), asks.lines().count()), (34, 2));
+        let lines: Vec<usize> = asks.lines().map(str::len).collect();
+        assert_eq!(lines, [78, 71]);
+        let shown =
+            |columns: usize, lines: usize| words_in_a_row(Some((columns, lines)), says, asks);
+        let too_small = |has: (usize, usize), needs: (usize, usize)| {
+            Err(format!(
+                "this terminal is too small to show the twelve words: it has {} columns and {} \
+                 lines.\nThey need {} columns and {} lines. Nothing was made.",
+                has.0, has.1, needs.0, needs.1
+            ))
+        };
+        // A row of four is 59 columns, and a word with its number 14.
+        assert_eq!((widest_row(4), widest_row(1)), (59, 14));
+        assert_eq!(words_in_a_row(None, says, asks), Ok(4));
+
+        // Wide enough for every line: a heading, three rows, two lines
+        // below, and a line between each.
+        assert_eq!(shown(80, 24), Ok(4));
+        assert_eq!(shown(80, 8), Ok(4));
+        assert_eq!(shown(78, 8), Ok(4));
+        assert_eq!(shown(80, 7), too_small((80, 7), (80, 8)));
+        // Narrower than the first line below: it takes two.
+        assert_eq!(shown(77, 9), Ok(4));
+        assert_eq!(shown(77, 8), too_small((77, 8), (77, 9)));
+        // As wide as a row of four, and no wider.
+        assert_eq!(shown(59, 10), Ok(4));
+        assert_eq!(shown(59, 9), too_small((59, 9), (59, 10)));
+        // Narrower than a row of four: one to a line.
+        assert_eq!(shown(58, 19), Ok(1));
+        assert_eq!(shown(58, 18), too_small((58, 18), (58, 19)));
+        assert_eq!(shown(40, 24), Ok(1));
+        // As wide as a word with its number: three lines of heading,
+        // twelve words, six and six below.
+        assert_eq!(shown(14, 29), Ok(1));
+        assert_eq!(shown(14, 28), too_small((14, 28), (14, 29)));
+        // Narrower than that: however many lines it has.
+        assert_eq!(shown(13, 1000), too_small((13, 1000), (14, 29)));
+        assert_eq!(shown(1, 1), too_small((1, 1), (14, 29)));
+
+        // One to a line: each word after its number, with no space
+        // after it.
+        let legal = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let rows = numbered(legal, 1);
+        assert_eq!(
+            rows.as_str(),
+            "   1. legal\n   2. winner\n   3. thank\n   4. year\n   5. wave\n   6. sausage\n   \
+             7. worth\n   8. useful\n   9. legal\n  10. winner\n  11. thank\n  12. yellow"
+        );
+        assert!(numbered(&["abstract"; 12].join(" "), 1).len() <= PHRASE_WORDS * 16);
+        assert_eq!(rows.capacity(), numbered(legal, 4).capacity());
+        assert_eq!(lines_taken("", 10), 0);
+        assert_eq!(lines_taken("\n", 10), 1);
+        assert_eq!(lines_taken("0123456789", 10), 1);
+        assert_eq!(lines_taken("0123456789a", 10), 2);
+    }
+
+    /// Where the words that `cordelia phrase` showed are not all typed
+    /// back, nothing is made, and a person is told that those words are
+    /// no recovery phrase and are not to be kept (decision 2026-10-04
+    /// §5): at the third miss, and where the input ended, after what a
+    /// command says of that anywhere.
+    #[test]
+    fn where_the_words_are_not_typed_back_they_are_said_to_be_no_phrase() {
+        assert_eq!(not_typed_back_says(&TypedBack::All), None);
+        assert_eq!(
+            not_typed_back_says(&TypedBack::Missed).as_deref(),
+            Some(
+                "Three tries did not match. Nothing was made, and the words you were shown are \
+                 not a recovery phrase: do not keep them. Run `cordelia phrase` again."
+            )
+        );
+        for said in [
+            "nothing was typed",
+            "a recovery phrase is twelve words, and this is 5",
+        ] {
+            assert_eq!(
+                not_typed_back_says(&TypedBack::Ended(said.to_string())),
+                Some(format!(
+                    "{said}. Nothing was made, and the words you were shown are not a recovery \
+                     phrase: do not keep them."
+                ))
+            );
+        }
+    }
+
+    /// What `cordelia phrase` says before anything is shown: what a
+    /// phrase is for, who has it, and that it is no wallet's (decision
+    /// 2026-10-04 §5).
+    #[test]
+    fn what_a_phrase_is_for_is_said_before_one_is_shown() {
+        for says in [
+            "Your recovery phrase is twelve words.",
+            "You need it to remove a device, or to recover on a new machine.",
+            "(You can add a device without it.)",
+            "Nobody else has it, and this device does not keep it. It is shown once, now.",
+            "It is not a wallet phrase. Never type it into a wallet, and never type a wallet's \
+             words here.",
+        ] {
+            assert!(WHOSE_WORDS.contains(says), "{says}");
+        }
+        assert_eq!(WHOSE_WORDS.lines().count(), 6);
     }
 }

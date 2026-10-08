@@ -17,6 +17,10 @@
 //! overwritten when it is dropped, and nothing prints it but
 //! [`Phrase::words`].
 //!
+//! A word that a person types is looked up in the list by itself
+//! ([`place_in_list`]), before there are twelve to read as a phrase: a
+//! command says of each word whether it is a word of the list.
+//!
 //! **Everything that comes from the phrase is overwritten with it**
 //! (decision 2026-10-04 §16): each of the secrets below is given back in
 //! memory that is overwritten when it is dropped, and so is the signing
@@ -48,6 +52,45 @@ pub enum PhraseError {
 
     #[error("these words are not a recovery phrase: at least one of them is not the word it was")]
     Checksum,
+}
+
+/// The place of `word` in the list that the words of a recovery phrase
+/// are from, the first word's being 0, or `None` for a word that is not
+/// in the list. The word is as the list has it: in lower case, with
+/// nothing around it.
+///
+/// **Every word of the list is looked at, with no early stop** (decision
+/// 2026-10-04 §16): the search does not end sooner for a word that
+/// stands early in the list, nor for one that is found, and each word
+/// of the list is compared over the same eight bytes ([`same_word`]).
+///
+/// That is what the code does, and all that is claimed for it. **It is
+/// not a proof against timing:** how long these steps take on a given
+/// processor, and what a compiler makes of them, is not measured here
+/// or held equal.
+pub fn place_in_list(word: &str) -> Option<u16> {
+    let mut place = None;
+    for (at, listed) in Language::English.word_list().iter().enumerate() {
+        if same_word(listed.as_bytes(), word.as_bytes()) {
+            // The list has 2048 words: each place is within 16 bits.
+            place = Some(at as u16);
+        }
+    }
+    place
+}
+
+/// Whether what was typed is the listed word, byte for byte. The two are
+/// compared over the eight bytes of the longest word of the list,
+/// whatever their lengths and wherever they first differ: one that is
+/// shorter counts as nothing from its end on. (No early stop is written
+/// here: that is not a proof against timing.)
+fn same_word(listed: &[u8], typed: &[u8]) -> bool {
+    let byte = |word: &[u8], at: usize| word.get(at).copied().unwrap_or(0);
+    let mut differ = listed.len() ^ typed.len();
+    for at in 0..8 {
+        differ |= usize::from(byte(listed, at) ^ byte(typed, at));
+    }
+    differ == 0
 }
 
 /// A recovery phrase: the 16 bytes that its twelve words encode.
@@ -121,6 +164,22 @@ impl Phrase {
             words.push_str(word);
         }
         Ok(words)
+    }
+
+    /// The place in the list of each of the twelve words, in their order
+    /// ([`place_in_list`]). A word that is typed back is held against
+    /// the word that was shown by its place, so that the words that were
+    /// typed and the words that were shown are not set beside each other
+    /// as text. The places are overwritten when they are dropped.
+    pub fn places(&self) -> Result<Zeroizing<[u16; PHRASE_WORDS]>, CryptoError> {
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &self.bytes)
+            .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
+        let mut places = Zeroizing::new([0u16; PHRASE_WORDS]);
+        for (place, at) in places.iter_mut().zip(mnemonic.word_indices()) {
+            // The list has 2048 words: each place is within 16 bits.
+            *place = at as u16;
+        }
+        Ok(places)
     }
 
     /// The phrase's signing key: an Ed25519 key pair. It signs statements,
@@ -208,6 +267,85 @@ mod tests {
             assert_eq!(hex::encode(bytes_of(&phrase)), bytes);
             assert_eq!(phrase.words().unwrap().as_str(), words);
         }
+    }
+
+    /// Every word of the list has its place, and nothing else has one:
+    /// not a word in upper case, a word with something around it, the
+    /// beginning of a word, or nothing. The places are those of BIP39.
+    #[test]
+    fn a_word_of_the_list_has_its_place_and_nothing_else_has_one() {
+        let list = Language::English.word_list();
+        assert_eq!(list.len(), 2048);
+        for (at, word) in list.iter().enumerate() {
+            assert_eq!(place_in_list(word), Some(at as u16), "{word}");
+            assert_eq!(Language::English.find_word(word), Some(at as u16));
+            assert!(word.len() <= 8 && word.len() >= 3, "{word}");
+        }
+        assert_eq!(place_in_list("abandon"), Some(0));
+        assert_eq!(place_in_list("zoo"), Some(2047));
+        for no_word in [
+            "",
+            " ",
+            "legul",
+            "Legal",
+            "LEGAL",
+            "legal,",
+            " legal",
+            "legal ",
+            "lega",
+            "legall",
+            "abandonabandon",
+            "abstracts",
+            "zo",
+            "zooo",
+            "zoö",
+            "zoo\0",
+            "\0",
+            "0",
+            "?",
+        ] {
+            assert_eq!(place_in_list(no_word), None, "{no_word:?}");
+        }
+        // Two words that differ in one letter, at its start, in its
+        // middle and at its end, are two words: and so are a word and
+        // its beginning, a word and more, and a word and nothing.
+        assert!(same_word(b"legal", b"legal"));
+        assert!(same_word(b"abstract", b"abstract"));
+        for other in ["regal", "lexal", "legax", "lega", "legals", "legal\0", ""] {
+            assert!(!same_word(b"legal", other.as_bytes()), "{other:?}");
+        }
+        // What is longer than any word of the list is none, whatever
+        // its first eight letters are.
+        assert!(!same_word(b"abstract", b"abstracts"));
+        assert!(!same_word(b"abstract", b"abstrac"));
+    }
+
+    /// The places of a phrase's words are the places in the list of the
+    /// words that it shows, in their order.
+    #[test]
+    fn the_places_of_a_phrase_are_those_of_its_words_in_their_order() {
+        let list = Language::English.word_list();
+        for (_, words) in VECTORS {
+            let phrase = Phrase::parse(words).unwrap();
+            let places = phrase.places().unwrap();
+            let by_place: Vec<&str> = places.iter().map(|at| list[usize::from(*at)]).collect();
+            assert_eq!(by_place.join(" "), words);
+            let looked_up: Vec<u16> = words
+                .split(' ')
+                .map(|word| place_in_list(word).unwrap())
+                .collect();
+            assert_eq!(looked_up, *places);
+        }
+        // The vector of zeros: eleven times the first word, and then the
+        // word that the checksum makes.
+        let zeros = Phrase::parse(VECTORS[0].1).unwrap().places().unwrap();
+        assert_eq!(zeros[..11], [0u16; 11]);
+        assert_eq!(zeros[11], place_in_list("about").unwrap());
+        // They are overwritten when they are dropped.
+        let places = Phrase::parse(LEGAL).unwrap().places().unwrap();
+        assert_ne!(*places, [0u16; PHRASE_WORDS]);
+        let left = left_by(places);
+        assert_eq!(left, [0u8; 2 * PHRASE_WORDS]);
     }
 
     #[test]

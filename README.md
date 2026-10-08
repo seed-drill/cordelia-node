@@ -48,10 +48,11 @@ On one machine, make your recovery phrase:
 laptop$  cordelia phrase
 ```
 
-It shows twelve words, once. Write them down, in their order. They are then
-taken off the screen, and you type them back from what you wrote, so that a
-phrase written down wrongly is found out at once, and not on the day of a
-removal. No device stores them. Keep them where only you can read them.
+It shows twelve words, once, each with its number. Write them down, in their
+order. They are then taken off the screen, and you type them back from what
+you wrote, one word at a time, so that a phrase written down wrongly is found
+out at once, and not on the day of a removal. No device stores them. Keep
+them where only you can read them.
 
 - **Without the twelve words a device can be added, and none can ever be
   removed or recovered.** Whoever holds a copy of them can read your memory,
@@ -61,6 +62,26 @@ removal. No device stores them. Keep them where only you can read them.
   program.
 - They are typed only at the prompt of a `cordelia` command, at a terminal:
   never as an argument, never into a chat with an agent.
+- `cordelia phrase` shows the words on a terminal that lets go of them when
+  you are done. Inside GNU `screen` it stops before it shows anything:
+  `screen` can keep what is shown in its scrollback. Run it in a terminal
+  outside `screen`. On a terminal too small for the twelve words it stops
+  too, and says the size they need.
+- A command asks for them by number, one word at a time, and shows nothing
+  of what you type. After each word it puts a tick beside the number, or, for
+  a word that is not in the list, a cross, and asks for that number again
+  once you have stopped typing for a second: what you type on after a cross
+  is dropped.
+  Twelve words typed on one line are taken in their order, and anything
+  more on that line is dropped, unseen.
+  - **Where the phrase is typed to prove it** (`remove-device`, `renew`,
+    `settle`, `recover`, `sync carry`) **a tick says that a word is in the
+    list, and never that it is the right one.** The phrase is judged when all
+    twelve are typed.
+  - Only when you type the words back at `cordelia phrase` does a cross also
+    say that a word is not the one you were shown at that number. It says so
+    after a short pause, and asks again. At the third such word in all the
+    command stops and nothing is made: run it again.
 - Until a machine has a phrase, or is added from one that has, its memory
   stays on it: sync can be on and folders mapped, and nothing is sent.
   `cordelia status` says "no recovery phrase yet".

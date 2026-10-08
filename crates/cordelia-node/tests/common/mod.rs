@@ -66,14 +66,16 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and without four things of whoever runs the tests: any
+    /// and home, and without five things of whoever runs the tests: any
     /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
     /// the node's configuration), any proxy (the tests of what a command
-    /// does with one set their own), and git's own variables (the binary
+    /// does with one set their own), git's own variables (the binary
     /// hands its environment to `git` where it asks which repository a
-    /// folder is in, and `GIT_DIR` would answer for the caller's). The
-    /// rest of the environment is left. Of it the binary reads `NO_COLOR`
-    /// and the user's name.
+    /// folder is in, and `GIT_DIR` would answer for the caller's), and
+    /// `STY`, which says that the tests themselves are run inside GNU
+    /// `screen` (a command that shows something once reads it: the test
+    /// of that sets its own). The rest of the environment is left. Of it
+    /// the binary reads `NO_COLOR` and the user's name.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -97,6 +99,7 @@ impl Node {
                 name.starts_with("CORDELIA_")
                     || name.starts_with("GIT_")
                     || name == "RUST_LOG"
+                    || name == "STY"
                     || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
@@ -169,7 +172,22 @@ impl Node {
     /// 2026-10-04 §5). A program that has a shell can give a command a
     /// terminal, and this does.
     pub fn at_terminal(&self, args: &[&str]) -> AtTerminal {
-        AtTerminal::running(self.name, self.binary(), args)
+        AtTerminal::running(self.name, self.binary(), args, None)
+    }
+
+    /// [`Self::at_terminal`], with `vars` set for the command: the
+    /// caller's own are taken out first, as for any command.
+    pub fn at_terminal_given(&self, vars: &[(&str, &str)], args: &[&str]) -> AtTerminal {
+        let mut command = self.binary();
+        command.envs(vars.iter().copied());
+        AtTerminal::running(self.name, command, args, None)
+    }
+
+    /// [`Self::at_terminal`], at a terminal that says it has this many
+    /// columns and lines. (The terminal that the others are run at says
+    /// nothing of its size.)
+    pub fn at_terminal_of(&self, columns: u16, lines: u16, args: &[&str]) -> AtTerminal {
+        AtTerminal::running(self.name, self.binary(), args, Some((columns, lines)))
     }
 
     /// Run a CLI command against this node with a terminal for its input,
@@ -237,7 +255,7 @@ impl Node {
         let config = self.dir.path().join("config-through.toml");
         std::fs::write(&config, through).unwrap();
         let inherited = std::env::vars_os().map(|(name, _)| name);
-        AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
+        AtTerminal::running(self.name, self.binary_at(&config, inherited), args, None)
     }
 
     /// Start a second node on this node's data directory, with ports of
@@ -738,13 +756,37 @@ pub struct AtTerminal {
     child: Child,
     /// The test's end of the terminal, to type at.
     types: std::fs::File,
+    /// The command's end of the terminal, by its name: for whoever reads
+    /// the terminal once the command has ended.
+    theirs: PathBuf,
     /// What the command says, as it arrives.
     reads: std::sync::mpsc::Receiver<Vec<u8>>,
     /// Everything it has said so far, and what was typed where the
     /// terminal showed it.
     pub said: String,
+    /// The first bytes of a character that has arrived in part: they are
+    /// in `said` once the rest has come.
+    begun: Vec<u8>,
     /// How far into `said` what was waited for has been found.
     found_to: usize,
+}
+
+/// How many bytes at the end of `bytes` begin a character and do not end
+/// it: what a command says arrives in pieces, and a piece can end in the
+/// middle of a character that takes more than one byte.
+pub fn begun_at_the_end(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let needs = match bytes[bytes.len() - back] {
+            // A byte in the middle of a character: its first is before it.
+            0x80..=0xbf => continue,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => return 0,
+        };
+        return if needs > back { back } else { 0 };
+    }
+    0
 }
 
 /// What came of waiting for more of what a command says at its terminal.
@@ -761,11 +803,28 @@ enum Heard {
 }
 
 impl AtTerminal {
-    fn running(name: &'static str, mut command: Command, args: &[&str]) -> Self {
+    /// Run `command` with `args` at a terminal of its own, which says
+    /// that it has `size` columns and lines where one is given, and
+    /// nothing of its size otherwise.
+    fn running(
+        name: &'static str,
+        mut command: Command,
+        args: &[&str],
+        size: Option<(u16, u16)>,
+    ) -> Self {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
         grantpt(&ours).unwrap();
         unlockpt(&ours).unwrap();
+        if let Some((columns, lines)) = size {
+            let size = rustix::termios::Winsize {
+                ws_row: lines,
+                ws_col: columns,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            rustix::termios::tcsetwinsize(&ours, size).expect("the terminal takes its size");
+        }
         let theirs = ptsname(&ours, Vec::new()).unwrap();
         let theirs = std::path::PathBuf::from(theirs.to_str().unwrap());
         let end = || {
@@ -802,8 +861,10 @@ impl AtTerminal {
             args: args.join(" "),
             child,
             types: ours,
+            theirs,
             reads,
             said: String::new(),
+            begun: Vec::new(),
             found_to: 0,
         }
     }
@@ -820,11 +881,23 @@ impl AtTerminal {
         use std::sync::mpsc::RecvTimeoutError;
         match self.reads.recv_timeout(wait) {
             Ok(bytes) => {
-                self.said.push_str(&String::from_utf8_lossy(&bytes));
+                // A character that has arrived in part waits for its
+                // rest: a mark of three bytes is one mark in `said`,
+                // however it arrived.
+                self.begun.extend_from_slice(&bytes);
+                let whole = self.begun.len() - begun_at_the_end(&self.begun);
+                self.said
+                    .push_str(&String::from_utf8_lossy(&self.begun[..whole]));
+                self.begun.drain(..whole);
                 Heard::More
             }
             Err(RecvTimeoutError::Timeout) => Heard::Nothing,
-            Err(RecvTimeoutError::Disconnected) => Heard::All,
+            Err(RecvTimeoutError::Disconnected) => {
+                // Nothing more can come: what had begun is all there is.
+                let rest = std::mem::take(&mut self.begun);
+                self.said.push_str(&String::from_utf8_lossy(&rest));
+                Heard::All
+            }
         }
     }
 
@@ -838,16 +911,40 @@ impl AtTerminal {
     /// length of silence: on a loaded machine what a command said last
     /// can arrive after the command has ended.
     pub fn says(&mut self, what: &str) -> &mut Self {
+        self.says_one_of(&[what]);
+        self
+    }
+
+    /// Wait until the command has said one of `whats`, after whatever was
+    /// waited for before, and say which: the one that it said first.
+    /// Fails as [`Self::says`] does where it says none of them.
+    ///
+    /// It is for a test that goes one of two ways by what a command says:
+    /// the test then fails on what was said, at once, and not on what
+    /// was never said, after three minutes.
+    pub fn says_one_of(&mut self, whats: &[&str]) -> usize {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
-            if let Some(at) = self.said[self.found_to..].find(what) {
-                self.found_to += at + what.len();
-                return self;
+            let first = whats
+                .iter()
+                .enumerate()
+                .filter_map(|(which, what)| {
+                    let at = self.said[self.found_to..].find(what)?;
+                    Some((at, which, what.len()))
+                })
+                .min();
+            if let Some((at, which, long)) = first {
+                self.found_to += at + long;
+                return which;
             }
             let no_more = self.hears(Duration::from_millis(200)) == Heard::All;
             if no_more || Instant::now() > deadline {
+                let none_of = match whats {
+                    [what] => format!("{what:?}"),
+                    _ => format!("any of {whats:?}"),
+                };
                 panic!(
-                    "{}: cordelia {} did not say {what:?}. It said:\n{}",
+                    "{}: cordelia {} did not say {none_of}. It said:\n{}",
                     self.name, self.args, self.said
                 );
             }
@@ -883,11 +980,21 @@ impl AtTerminal {
     /// Press keys that are no line: `bytes` go to the terminal as they
     /// are, with no Enter after them.
     pub fn presses(&mut self, bytes: &[u8]) -> &mut Self {
-        use std::io::Write;
         std::thread::sleep(Duration::from_millis(150));
+        self.sends(bytes);
+        self
+    }
+
+    /// Send `bytes` to the terminal at once, with no moment taken before
+    /// them, as a person does who goes on typing: when they were sent.
+    /// The command cannot have read them before then, so what it says of
+    /// them is timed from then.
+    pub fn sends(&mut self, bytes: &[u8]) -> Instant {
+        use std::io::Write;
+        let sent = Instant::now();
         self.types.write_all(bytes).unwrap();
         self.types.flush().unwrap();
-        self
+        sent
     }
 
     /// Whether the terminal shows what is typed, and makes signals of the
@@ -914,8 +1021,23 @@ impl AtTerminal {
         self.ends_within(Duration::from_secs(300))
     }
 
+    /// [`Self::ends`], and what the command left at its terminal: what
+    /// was typed there and is still waiting, unread, for whoever reads
+    /// the terminal next, as a shell does once a command has ended.
+    pub fn ends_and_leaves(mut self) -> (bool, String, String) {
+        let (success, said) = self.has_ended_within(Duration::from_secs(300));
+        // The terminal is there for as long as the test holds its end.
+        (success, said, left_typed_at(&self.theirs))
+    }
+
     /// [`Self::ends`], for a command that must end within `long`.
     pub fn ends_within(mut self, long: Duration) -> (bool, String) {
+        self.has_ended_within(long)
+    }
+
+    /// Wait for the command to end, within `long`: whether it succeeded,
+    /// and everything that its terminal showed.
+    fn has_ended_within(&mut self, long: Duration) -> (bool, String) {
         let deadline = Instant::now() + long;
         let status = loop {
             let heard = self.hears(Duration::from_millis(100));
@@ -980,6 +1102,37 @@ impl AtTerminal {
         );
         said
     }
+}
+
+/// What waits, typed and unread, at the terminal named `theirs`: read as
+/// the next reader of the terminal would read it, a key at a time and
+/// without waiting for more.
+fn left_typed_at(theirs: &std::path::Path) -> String {
+    use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
+    use std::io::Read;
+    let mut end = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(theirs)
+        .unwrap();
+    // Each key as it lies there, whether or not a line was ended: and a
+    // read that finds none comes back at once.
+    let mut reads = tcgetattr(&end).expect("the terminal says how it is set");
+    reads
+        .local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO);
+    reads.special_codes[SpecialCodeIndex::VMIN] = 0;
+    reads.special_codes[SpecialCodeIndex::VTIME] = 0;
+    tcsetattr(&end, OptionalActions::Now, &reads).expect("the terminal is set");
+    let mut left = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = end.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        left.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&left).into_owned()
 }
 
 impl Drop for AtTerminal {
@@ -1069,19 +1222,90 @@ pub fn key_of(node: &Node) -> String {
 
 // ── Commands, as a person runs them ──────────────────────────────────
 
-/// The twelve words that `cordelia phrase` showed, read off its
-/// terminal.
-pub fn words_shown(said: &str) -> String {
+/// The line above the twelve numbers where a command asks for a recovery
+/// phrase that is to be proved (`remove-device`, `renew`, `settle`,
+/// `recover`, a carry), and the one where `cordelia phrase` asks for the
+/// words it showed to be typed back.
+pub const ASKS_THE_PHRASE: &str =
+    "Type your recovery phrase, one word at a time. What you type is not shown.";
+pub const ASKS_THE_WORDS_BACK: &str =
+    "Now type the words back, one at a time. What you type is not shown.";
+
+/// What a terminal shows where each number from `from` to `to` was
+/// answered with a word that got a tick, and nothing that was typed was
+/// shown: each number, right-aligned, with its tick, on a line of its
+/// own.
+pub fn ticks(from: usize, to: usize) -> String {
+    (from..=to)
+        .map(|number| format!("  {number:>2}. \u{2713}\r\n"))
+        .collect()
+}
+
+/// A word of the list that is not `word`: what a person who miswrote a
+/// word types in its place.
+pub fn another_word_than(word: &str) -> &'static str {
+    match word {
+        "zoo" => "abandon",
+        _ => "zoo",
+    }
+}
+
+/// The phrase `words` as a person mistypes it: with another word of the
+/// list at `place` (the first is 0), so that the twelve are no recovery
+/// phrase at all. (One in sixteen such changes makes another phrase:
+/// that is not what is given back.)
+pub fn mistyped(words: &str, place: usize) -> String {
+    [
+        "zoo", "wrong", "able", "about", "above", "absent", "abandon",
+    ]
+    .iter()
+    .map(|other| {
+        let mut mistyped: Vec<&str> = words.split(' ').collect();
+        mistyped[place] = other;
+        mistyped.join(" ")
+    })
+    .find(|mistyped| mistyped != words && cordelia_crypto::phrase::Phrase::parse(mistyped).is_err())
+    .expect("one of seven words in the place of another fails the checksum")
+}
+
+/// The rows in which `cordelia phrase` showed the twelve words, as its
+/// terminal showed them: from the space before the first number to the
+/// last word.
+pub fn rows_shown(said: &str) -> &str {
     let after = said
-        .split("shown once:")
+        .split("(shown once):")
         .nth(1)
         .unwrap_or_else(|| panic!("no phrase was shown:\n{said}"));
-    let words = after
-        .lines()
-        .map(str::trim)
-        .find(|line| line.split_whitespace().count() == 12)
-        .unwrap_or_else(|| panic!("no twelve words were shown:\n{said}"));
-    words.to_string()
+    let rows = after
+        .split("Write the twelve words down")
+        .next()
+        .unwrap_or_default();
+    rows.trim_matches(['\r', '\n'])
+}
+
+/// The twelve words that `cordelia phrase` showed, read off its terminal
+/// as a person reads them: each after its number, the numbers in their
+/// order.
+pub fn words_shown(said: &str) -> String {
+    let read: Vec<&str> = rows_shown(said).split_whitespace().collect();
+    assert_eq!(
+        read.len(),
+        24,
+        "twelve numbers and twelve words were not shown:\n{said}"
+    );
+    let words: Vec<&str> = read
+        .chunks(2)
+        .enumerate()
+        .map(|(at, numbered)| {
+            assert_eq!(
+                numbered[0],
+                format!("{}.", at + 1),
+                "the words are not numbered in their order:\n{said}"
+            );
+            numbered[1]
+        })
+        .collect();
+    words.join(" ")
 }
 
 /// `cordelia phrase` on a device that follows none: the words are read
@@ -1089,10 +1313,10 @@ pub fn words_shown(said: &str) -> String {
 /// Returns the words.
 pub fn makes_a_phrase(device: &Node, label: &str) -> String {
     let mut at = device.at_terminal(&["phrase", "--name", label]);
-    at.says("Press Enter when they are written down");
+    at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
-    at.says("Type the twelve words back");
+    at.says("Now type the words back");
     at.types(&words);
     let said = at.done();
     assert!(said.contains("follows the new recovery phrase"), "{said}");
@@ -1178,7 +1402,7 @@ fn changes(at: &mut AtTerminal, answers: &[&str], words: &str) {
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
-    at.says("The recovery phrase, twelve words").types(words);
+    at.says(ASKS_THE_PHRASE).types(words);
 }
 
 /// What the node says of its device and its person

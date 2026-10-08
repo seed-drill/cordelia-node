@@ -1055,6 +1055,54 @@ phrase is derived from the 16 bytes that the words encode.
 **Why twelve:** chosen with BIP39's shortest form, which a person writes
 down and types back when the phrase is made; no measurement behind it yet.
 
+#### PHRASE_TYPED_BACK_MISSES = 3
+
+**Rationale:** `cordelia phrase` shows the twelve words once and has them
+typed back, one at a time. A word typed back that is a word of the list and
+not the word shown at that number is a miss: the command says so, and asks
+for the same number again. The third miss, counted over the whole typing
+back and not for each word, stops the command, and nothing is made
+(decision §5, §16). A word that is not in the list is no miss: it is no
+guess at a word, and it is asked again without bound.
+
+**Why three:** three answers are no way to find a word, which is one of
+2048, and a person who miswrote one word has room to mistype twice. No
+measurement behind it yet.
+
+#### PHRASE_MISS_PAUSE_SECS = 2
+
+**Rationale:** How long `cordelia phrase` waits before it says that a word
+typed back is not the word shown: two seconds before the first miss is
+said, twice as long before the second, and nothing before the third, which
+ends the command. What is typed during the pause is dropped, and not taken
+as the next word. The bound of three misses is what keeps a guess from
+finding a word; the pause makes each answer cost time, and keeps a held key
+or a pasted line from spending all three at once. A word that is the word
+shown, and a word that is not in the list, are answered at once. Nothing
+waits where a phrase is proved (`remove-device`, `renew`, `settle`,
+`recover`, a carry): no word is judged there, and a pause after some words
+and not after others would itself say something.
+
+**Why two seconds:** long enough that a miss is seen before more is typed,
+and six seconds in all for a person who misses twice; no measurement behind
+it yet.
+
+#### PHRASE_QUIET_AFTER_CROSS_SECS = 1
+
+**Rationale:** Once a command has said of a word of the phrase that it is
+not in the list, or at `cordelia phrase` that it is not the word shown,
+what is typed is dropped until nothing has been typed for this long; then
+the same number is asked again (decision §16). A person who types the words
+from paper without looking goes on typing after a slip: without this, the
+words they go on with are taken for the number that is asked again, each is
+a miss, and one slip spends all three. It applies after every cross. Where a
+phrase is proved the only cross is for a word that is not in the list, which
+says nothing of right or wrong.
+
+**Why one second:** longer than the gap between two words of a person who
+is typing, and short enough to wait for after reading the cross; no
+measurement behind it yet.
+
 #### The labels (`LABEL_*`)
 
 **Rationale:** Everything that is derived, signed or sealed has a label of
