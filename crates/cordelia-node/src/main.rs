@@ -1379,6 +1379,22 @@ fn room_on_volume(folder: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// What a node says where the port of its local API cannot be bound, on
+/// the system named. **Where the port is taken, a node is probably
+/// running already, as the service:** the words say so, and name
+/// `cordelia status` and the command that restarts the service there.
+fn cannot_listen_says(listen_addr: &str, why: &std::io::Error, os: &str) -> String {
+    let says = format!("the node's API cannot listen at {listen_addr}: {why}");
+    match why.kind() {
+        std::io::ErrorKind::AddrInUse => format!(
+            "{says}\nA node is probably running already, as the service: `cordelia status` \
+             says. To restart it:\n  {}",
+            restart_command(os)
+        ),
+        _ => says,
+    }
+}
+
 fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
@@ -1420,7 +1436,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // node that cannot bind, because another is running, changes
     // nothing.
     let api_listener = std::net::TcpListener::bind(&listen_addr)
-        .map_err(|e| anyhow::anyhow!("the node's API cannot listen at {listen_addr}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(cannot_listen_says(&listen_addr, &e, std::env::consts::OS)))?;
 
     // A data directory is one node's (decision 2026-10-04 §10.1): the
     // lock on it is taken before the database is opened, and is held for
@@ -7025,6 +7041,41 @@ mod tests {
         }
         // A directory that is not there is open to nobody.
         assert_eq!(keep_private(&dir.path().join("none"), &elsewhere), None);
+    }
+
+    /// Where the port of its local API is taken, a node says that one is
+    /// probably running already, as the service, and names `cordelia
+    /// status` and the command that restarts the service on each system.
+    /// Where the port cannot be bound for another reason it says why,
+    /// and nothing of a service.
+    #[test]
+    fn test_a_port_that_is_taken_is_said_to_be_a_node_that_runs_already() {
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            assert_eq!(
+                cannot_listen_says("127.0.0.1:9473", &taken, os),
+                format!(
+                    "the node's API cannot listen at 127.0.0.1:9473: {taken}\nA node is \
+                     probably running already, as the service: `cordelia status` says. To \
+                     restart it:\n  {restart}"
+                )
+            );
+        }
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            cannot_listen_says("127.0.0.1:80", &refused, "linux"),
+            format!("the node's API cannot listen at 127.0.0.1:80: {refused}")
+        );
     }
 
     /// Run by a person, `cordelia init` ends by saying how the node is

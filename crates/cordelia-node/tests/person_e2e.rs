@@ -453,7 +453,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     let accepted = at.done();
     println!("{accepted}");
     assert!(
-        accepted.contains("this device has joined") && accepted.contains("applied change 1"),
+        accepted.contains("\nThis device has joined") && accepted.contains("applied change 1"),
         "{accepted}"
     );
 
@@ -517,14 +517,18 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     let json: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["person"]["notices"][0]["says"], told.as_str());
     assert_eq!(json["person"]["notices"][0]["kind"], "added");
-    // Not cleared without a yes.
+    // Not cleared without a yes. What is asked begins with the notice,
+    // on the first line and with a capital.
+    let asked = told.replacen("new device", "New device", 1);
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says(&told).says("Type yes to go on").types("no");
-    assert!(at.done().contains("It stays."));
+    at.says(&asked).says("Type yes to go on").types("no");
+    let said = at.done();
+    assert!(said.starts_with(&asked), "{said:?}");
+    assert!(said.contains("It stays."), "{said}");
     assert_eq!(notices(&laptop), std::slice::from_ref(&told));
     // Cleared with one, on that device and on no other.
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says(&told).says("Type yes to go on").types("yes");
+    at.says(&asked).says("Type yes to go on").types("yes");
     assert!(at.done().contains("Cleared on this device."));
     assert!(notices(&laptop).is_empty());
     assert!(!laptop.cli(&["status"]).contains("new device:"));
@@ -1449,7 +1453,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // that, the node says what became of the key.
     let said = became_of_the_key(&tablet, &laptop_key, at.done());
     assert!(
-        said.contains("this device has applied change 2, which it was handed"),
+        said.contains("\nThis device has applied change 2, which it was handed."),
         "{said}"
     );
     let seen = look(&tablet);
@@ -1730,11 +1734,11 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // person clears the last there, and it is shown there no more.
     assert_eq!(notices(&laptop).len(), 3);
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says("new device: (")
+    at.says("New device: (")
         .says(") \"desktop\", added from")
         .says("Type yes to go on")
         .types("no");
-    at.says("new device: (")
+    at.says("New device: (")
         .says(") \"tablet\", added from")
         .says("Type yes to go on")
         .types("no");
@@ -1772,7 +1776,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     at.says("Type yes to go on").types("yes");
     let said = at.done();
     assert!(
-        said.contains("this device has left the recovery phrase it followed alone, and has joined"),
+        said.contains("This device has left the recovery phrase it followed alone, and has joined"),
         "{said}"
     );
     assert_eq!(text(&look(&desktop), "among"), "several");

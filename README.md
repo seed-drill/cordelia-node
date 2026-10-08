@@ -265,6 +265,7 @@ returned, or a name that no device syncs any more.
 cordelia sync carry                       # every name this device holds
 cordelia sync carry lab-notes             # one name
 cordelia sync carry lab-notes --from      # list the removed keys that signed there; takes nothing
+                                          #   (one whose work is all there is "already brought back")
 cordelia sync carry lab-notes --from "desktop"   # what that removed device wrote there (asks for the phrase)
 cordelia sync carry lab-notes --phrase    # read what this device never held the secret of (asks for the phrase)
 ```
@@ -277,8 +278,10 @@ cordelia sync carry lab-notes --phrase    # read what this device never held the
   what it found before it asks anything: what would go where the channel
   holds nothing, and which files stand above a version that the channel
   holds. The first comes in on a yes. The second comes in only on a second
-  yes, for a name that has a folder on this device, and the text it replaces
-  is kept beside the file. Then it asks for the phrase. A device in someone
+  yes, for a name that has a folder on this device. The text it replaces is
+  kept beside the file as a conflict copy, and the status shows a conflict
+  to merge until that copy is dealt with: the command says so before that
+  yes. Then it asks for the phrase. A device in someone
   else's hands may have changed what the relays hold of it: say no unless
   you know it was not.
 - `--phrase` is for a device that never held one of the secrets that were

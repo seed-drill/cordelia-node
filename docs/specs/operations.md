@@ -355,7 +355,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia sync off` | Stop syncing | |
 > | `cordelia sync status [--seen]` | Show what syncs, what was found and what your other devices sync. `--seen` shows the notice of the folders that stopped syncing once more, and puts it away | |
 > | `cordelia sync carry [name]` | Bring into the channels of the last change what your devices that count had sent to the relays before it, in each generation that this device left in the last 90 days; with no name, for every name this device holds | |
-> | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing | With a device named: twice a yes at most, and then the phrase |
+> | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing: a key whose versions the new channel holds already, all of them, is marked "already brought back". Before its second yes it says that the text which a version replaces is kept beside the file as a conflict copy, and that the status shows a conflict to merge until that copy is dealt with | With a device named: twice a yes at most, and then the phrase |
 > | `cordelia sync carry <name> --phrase` | Read the generations whose secret this device never held, and take what your devices that count signed there. `--from` and `--phrase` together are refused | Yes, and the phrase |
 > | `cordelia history [<name or folder>] [--removed] [--since <time>]`, `cordelia history show <id>`, `cordelia history drop`, `cordelia restore <id>...` | Local history: the versions that sync replaced or removed here, printing one, removing kept versions, and putting versions back | |
 > | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
@@ -1227,10 +1227,11 @@ on and where the copy is.
 | `Error: database locked` | Stale lock from crashed process | Remove `~/.cordelia/cordelia.db-wal` and `cordelia.db-shm`, restart |
 | `Error: config parse error` | Invalid TOML | Check `config.toml` syntax. Run `cordelia init` to regenerate |
 
-> **v1 status.** Three more, of this version:
+> **v1 status.** Four more, of this version:
 >
 > | What is said | Why | What to do |
 > |--------------|-----|------------|
+> | `the node's API cannot listen at ...: Address already in use` | The port is taken: a node is probably running already, as the service. The message says so, and names the command that restarts the service on this system | `cordelia status` says whether one runs. Restart the service; do not start a second node |
 > | `another node is running on the data directory ...` | A data directory is one node's: the node that runs holds the lock on it | Stop that node first, or give this one a directory of its own. Nothing was changed |
 > | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back the copy that it made, as §10.5 says |
 > | `cordelia status` says `Held up:` | The first start on this version is not done (the copy could not be made), or the database is from a later version | For the first: make the room that the status names. The node tries again by itself |

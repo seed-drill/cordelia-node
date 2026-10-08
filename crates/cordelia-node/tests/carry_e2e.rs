@@ -588,8 +588,14 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         .says("say no unless you know it was not.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");
+    // Before the second yes it says what becomes of the text that the
+    // version replaces: a conflict copy, which the status shows until it
+    // is dealt with.
     at.says("Also bring in 1 version above the version that the new channel holds?")
         .says("first.md")
+        .says("The text that each replaces is kept beside its file as a conflict copy")
+        .says("The status shows a conflict to merge until that copy is merged into the file")
+        .says("Type yes to go on")
         .types("no");
     at.says("Those stay where they are.")
         .says("Type your recovery phrase, one word at a time")

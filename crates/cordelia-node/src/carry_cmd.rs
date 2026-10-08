@@ -294,16 +294,7 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
     let mut above: Vec<String> = Vec::new();
     if !found.above.is_empty() && found.has_folder {
         let files: Vec<String> = found.above.iter().map(|file| file_shown(file)).collect();
-        let second = at.yes(&format!(
-            "\nAlso bring in {} above {} that the new channel holds? The text that each replaces \
-             is kept beside its file, here and on each device that holds it:\n  {}",
-            counted(files.len(), "version"),
-            match files.len() {
-                1 => "the version",
-                _ => "the versions",
-            },
-            files.join("\n  ")
-        ))?;
+        let second = at.yes(&above_asks(&files))?;
         match second {
             true => above = found.above.clone(),
             false if found.empty == 0 => {
@@ -332,6 +323,27 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
         println!("{line}");
     }
     Ok(())
+}
+
+/// What the second yes of `--from` asks (decision 2026-10-04 §7.3): to
+/// bring in the versions that stand above one that the new channel
+/// holds, each named by its file. **It says what becomes of the text that
+/// each replaces:** it is kept beside its file as a conflict copy, on
+/// each device that holds the file, and the status shows a conflict to
+/// merge until that copy is merged into the file, or deleted.
+fn above_asks(files: &[String]) -> String {
+    format!(
+        "\nAlso bring in {} above {} that the new channel holds?\n  {}\nThe text that each \
+         replaces is kept beside its file as a conflict copy, here and on each device that \
+         holds it.\nThe status shows a conflict to merge until that copy is merged into the \
+         file, or deleted.",
+        counted(files.len(), "version"),
+        match files.len() {
+            1 => "the version",
+            _ => "the versions",
+        },
+        files.join("\n  ")
+    )
 }
 
 /// Ask for the recovery phrase, and give its word for `allows` on this
@@ -527,6 +539,11 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             words_then(&carry::naming_words(&key), text(signed, "label")),
             counted(entries, "entry").replace("entrys", "entries")
         );
+        // What the new channel holds already, all of it, is said to be
+        // so: nothing of that key's is missing.
+        if signed["brought_back"] == true {
+            line.push_str(", already brought back");
+        }
         // Where the node says that those words name another removed key
         // too, the key is given written whole: that names it alone.
         if signed["by_words"] == false {
@@ -1288,6 +1305,83 @@ mod tests {
         let mut bad = found(json!([]), true);
         bad["under"] = "00".into();
         assert!(Found::of(&bad).is_err());
+    }
+
+    /// A removed key whose versions the new channel holds already is
+    /// marked as that, in the list of the removed keys that signed
+    /// (decision 2026-10-04 §7.3): its work is not missing. One whose
+    /// versions it lacks is not.
+    #[test]
+    fn test_a_removed_key_whose_work_is_held_already_is_marked() {
+        let found = json!({ "signed": [
+            { "key": hex::encode([7u8; 32]), "label": "desktop", "entries": 2,
+              "by_words": true, "brought_back": true },
+            { "key": hex::encode([8u8; 32]), "label": "laptop", "entries": 1,
+              "by_words": true, "brought_back": false },
+            { "key": hex::encode([9u8; 32]), "label": "old", "entries": 4,
+              "by_words": false, "brought_back": true },
+        ]});
+        let lines = signed_lines(&found, "lab");
+        assert_eq!(
+            lines[1],
+            format!(
+                "  ({}) \"desktop\": 2 entries, already brought back",
+                carry::naming_words(&[7u8; 32])
+            )
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "  ({}) \"laptop\": 1 entry",
+                carry::naming_words(&[8u8; 32])
+            )
+        );
+        assert!(
+            lines[3].contains(
+                "\"old\": 4 entries, already brought back. Those words name another removed key"
+            ),
+            "{lines:?}"
+        );
+    }
+
+    /// The second yes of `--from` names each file, and says what becomes
+    /// of the text that each version replaces (decision 2026-10-04
+    /// §7.3): it is kept beside its file as a conflict copy, and the
+    /// status shows a conflict to merge until that copy is dealt with.
+    #[test]
+    fn test_the_second_yes_says_what_becomes_of_the_text_that_is_replaced() {
+        assert_eq!(
+            above_asks(&["notes.md".to_string()]),
+            "\nAlso bring in 1 version above the version that the new channel holds?\n  \
+             notes.md\nThe text that each replaces is kept beside its file as a conflict copy, \
+             here and on each device that holds it.\nThe status shows a conflict to merge \
+             until that copy is merged into the file, or deleted."
+        );
+        let two = above_asks(&["a.md".to_string(), "b.md".to_string()]);
+        assert!(
+            two.starts_with(
+                "\nAlso bring in 2 versions above the versions that the new channel holds?\n  \
+                 a.md\n  b.md\nThe text"
+            ),
+            "{two}"
+        );
+    }
+
+    /// Where a mapping carried nothing, because the new channel holds
+    /// something for the name already, it is said once that nothing was
+    /// carried (decision 2026-10-04 §7.3).
+    #[test]
+    fn test_that_nothing_was_carried_is_said_once() {
+        let done = json!({
+            "name": "lab",
+            "nothing": "the new channel holds something for this name already",
+        });
+        let lines = carried_lines(&done);
+        assert_eq!(
+            lines,
+            ["lab: nothing was carried: the new channel holds something for this name already."]
+        );
+        assert_eq!(lines[0].matches("nothing was carried").count(), 1);
     }
 
     /// With no key, `--from` lists each removed key that signed there,
