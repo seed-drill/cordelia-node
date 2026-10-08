@@ -389,10 +389,39 @@ fn enter() -> anyhow::Result<()> {
     anyhow::bail!("this command asks at the terminal of a Unix system");
 }
 
+/// How the typing of a word ended.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// At a space: the line it is on goes on.
+    Space,
+    /// At Enter, which ends its line too.
+    Line,
+    /// The input ended before the word did.
+    Input,
+}
+
+/// **A prompt for the phrase ends with the line that its last word was
+/// typed on** (decision 2026-10-04 §16). Where that word ended at a
+/// space, this reads on, with what is typed still hidden, to the Enter:
+/// whatever else is on the line is dropped. So a thirteenth word (a word
+/// typed twice, or one that was split into two words of the list) is
+/// never shown, and is never handed to whatever reads the terminal next.
+/// The end of the input ends it as Enter does, and Ctrl-C is read as a
+/// key ([`enter`]).
+#[cfg(unix)]
+fn to_the_end_of_its_line(last: Ended) -> anyhow::Result<()> {
+    match last {
+        Ended::Space => enter(),
+        Ended::Line | Ended::Input => Ok(()),
+    }
+}
+
 /// Read one word from the terminal into `word`, which is empty: what is
 /// typed up to a space or Enter, with upper case taken as lower. A space
-/// or an Enter with nothing typed before it is passed over. `false` where
-/// the input ended before a word did.
+/// or an Enter with nothing typed before it is passed over. How it
+/// ended: at a space, at Enter, or with the input before a word was
+/// typed.
 ///
 /// The terminal hands on each key as it is pressed ([`ReadsKeys`]), and
 /// what is typed is not shown. The keys that a terminal would have acted
@@ -406,13 +435,13 @@ fn enter() -> anyhow::Result<()> {
 /// `word` is never moved as it grows: it has room for a line, and a word
 /// that is longer is refused, as a word. Whoever gave it overwrites it.
 #[cfg(unix)]
-fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result<bool> {
+fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result<Ended> {
     let stdin = rustix::stdio::stdin();
     // Overwritten however this returns.
     let mut byte = Zeroizing::new([0u8; 1]);
     loop {
         match rustix::io::read(stdin, &mut *byte) {
-            Ok(0) => return Ok(false),
+            Ok(0) => return Ok(Ended::Input),
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => anyhow::bail!("could not read from the terminal: {e}"),
@@ -423,7 +452,10 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
             // nothing was typed before it.
             b' ' | b'\t' | b'\n' | b'\r' => {
                 if !word.is_empty() {
-                    return Ok(true);
+                    return Ok(match byte[0] {
+                        b'\n' | b'\r' => Ended::Line,
+                        _ => Ended::Space,
+                    });
                 }
             }
             // Backspace, in either of its codes: a letter.
@@ -433,7 +465,7 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
             // Ctrl-W and Ctrl-U: the word that is being typed.
             0x17 | 0x15 => word.zeroize(),
             // Ctrl-D: the end of the input, before anything is typed.
-            0x04 if nothing_yet && word.is_empty() => return Ok(false),
+            0x04 if nothing_yet && word.is_empty() => return Ok(Ended::Input),
             0x04 => {}
             typed => {
                 if word.len() + 1 >= MAX_LINE {
@@ -451,8 +483,8 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
 }
 
 /// Ask for word `number` of a recovery phrase until a word of the list is
-/// typed: its place in the list, with the word itself left in `word`,
-/// which whoever gave it overwrites.
+/// typed: its place in the list and how its typing ended, with the word
+/// itself left in `word`, which whoever gave it overwrites.
 ///
 /// The number is said, right-aligned, and nothing that is typed after
 /// it is shown. **A word that is not in the list gets a cross and a few
@@ -463,17 +495,21 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
 ///
 /// Where the input ends, this fails, and says how many words there were.
 #[cfg(unix)]
-fn word_of_the_list(number: usize, word: &mut Zeroizing<String>) -> anyhow::Result<Zeroizing<u16>> {
+fn word_of_the_list(
+    number: usize,
+    word: &mut Zeroizing<String>,
+) -> anyhow::Result<(Zeroizing<u16>, Ended)> {
     loop {
         word.zeroize();
         say(&format!("  {number:>2}. "))?;
         let typed = word_typed(word, number == 1);
-        if !matches!(typed, Ok(true)) {
+        if !matches!(typed, Ok(Ended::Space | Ended::Line)) {
             // No mark follows the number: what is said next starts on a
             // line of its own.
             say("\n")?;
         }
-        if !typed? {
+        let ended = typed?;
+        if ended == Ended::Input {
             match number {
                 1 => anyhow::bail!("nothing was typed"),
                 _ => anyhow::bail!("{}", PhraseError::WordCount(number - 1)),
@@ -481,7 +517,7 @@ fn word_of_the_list(number: usize, word: &mut Zeroizing<String>) -> anyhow::Resu
         }
         // The whole list is gone through, whatever the word.
         if let Some(place) = place_in_list(word) {
-            return Ok(Zeroizing::new(place));
+            return Ok((Zeroizing::new(place), ended));
         }
         word.zeroize();
         drop_what_was_typed_ahead();
@@ -594,7 +630,9 @@ impl Terminal {
     /// the line above the twelve numbers. Each word is asked for by its
     /// number, and what is typed is not shown. A word ends at a space or
     /// at Enter, so twelve words typed or pasted on one line are taken
-    /// in their order, each to the next number. What is given back is
+    /// in their order, each to the next number. The prompt ends with the
+    /// line that the twelfth word is on: whatever else is on it is
+    /// dropped ([`to_the_end_of_its_line`]). What is given back is
     /// the twelve words with one space between them, in memory that is
     /// overwritten when it is dropped and was never moved as it grew.
     ///
@@ -619,8 +657,9 @@ impl Terminal {
         // of what was typed is left behind.
         let mut words = Zeroizing::new(String::with_capacity(PHRASE_WORDS * 9));
         let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
+        let mut last = Ended::Line;
         for number in 1..=PHRASE_WORDS {
-            word_of_the_list(number, &mut word)?;
+            (_, last) = word_of_the_list(number, &mut word)?;
             // A word of the list: that is all the tick says, and all
             // that is known of the word here.
             say("✓\n")?;
@@ -630,8 +669,10 @@ impl Terminal {
             words.push_str(&word);
             word.zeroize();
         }
-        // What was typed after the twelfth word is dropped as the
-        // terminal is put back ([`ReadsKeys`]).
+        // The rest of the twelfth word's line is dropped here, unseen.
+        // What was typed after that is dropped as the terminal is put
+        // back ([`ReadsKeys`]).
+        to_the_end_of_its_line(last)?;
         Ok(words)
     }
 
@@ -672,10 +713,13 @@ impl Terminal {
         let mut number = 1;
         while number <= PHRASE_WORDS {
             // What is kept of the word is its place in the list.
-            let place = word_of_the_list(number, &mut word)?;
+            let (place, ended) = word_of_the_list(number, &mut word)?;
             word.zeroize();
             if *place == shown[number - 1] {
                 say("✓\n")?;
+                if number == PHRASE_WORDS {
+                    to_the_end_of_its_line(ended)?;
+                }
                 number += 1;
                 continue;
             }

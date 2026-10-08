@@ -3200,6 +3200,90 @@ fn the_words_are_shown_numbered_and_are_gone_from_the_screen_afterwards() {
     );
 }
 
+/// **A prompt for the phrase ends with the line that the twelfth word
+/// is on** (decision 2026-10-04 §16): once that word is taken the
+/// command reads on, with what is typed still hidden, to the Enter, and
+/// drops whatever else is on the line. So a thirteenth word (a word
+/// typed twice, or one split into two words of the list) is never
+/// shown, and never reaches the shell. At both prompts:
+///
+/// - thirteen words on one line: twelve ticks, and nothing else;
+/// - twelve words and a space, with no Enter: the twelfth has its tick,
+///   and the command waits for the line's end, saying nothing more. A
+///   thirteenth word typed then, with its Enter, is not shown.
+///
+/// Each time the terminal is read once the command has ended, as a
+/// shell would read it: nothing is there.
+#[test]
+fn the_prompt_ends_with_the_line_that_the_twelfth_word_is_on() {
+    use std::time::Duration;
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    // The twelve words and a space are sent, and no Enter: the twelfth
+    // gets its tick, and nothing follows it while the line is not ended.
+    let twelve_and_a_space = |at: &mut AtTerminal, words: &str| {
+        at.sends(format!("{words} ").as_bytes());
+        at.says(&ticks(12, 12));
+        let so_far = at.hears_for(Duration::from_millis(700)).to_string();
+        assert!(
+            so_far.ends_with(&ticks(1, 12)),
+            "the command did not wait for the end of the line:\n{so_far:?}"
+        );
+    };
+
+    // The words typed back. Thirteen on one line.
+    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
+    at.sends(format!("{words} thirteenth\n").as_bytes());
+    let (made, said, left) = at.ends_and_leaves();
+    assert!(made, "{said}");
+    let typed_back = format!(
+        "{ASKS_THE_WORDS_BACK}\r\n\r\n{}\r\nAll twelve match.\r\n",
+        ticks(1, 12)
+    );
+    assert!(said.contains(&typed_back), "{said:?}");
+    assert!(!said.contains("thirteenth"), "{said}");
+    assert_eq!(left, "", "after thirteen words on a line");
+    // A thirteenth after the twelfth's space.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("Type yes to go on").types("yes");
+    let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
+    twelve_and_a_space(&mut at, &words);
+    at.types("thirteenth");
+    let (made, said, left) = at.ends_and_leaves();
+    assert!(made, "{said}");
+    assert!(said.contains(&typed_back), "{said:?}");
+    assert!(!said.contains("thirteenth"), "{said}");
+    assert_eq!(left, "", "after a thirteenth word on the twelfth's line");
+    assert_eq!(look(&laptop)["change"], 1);
+
+    // Where a phrase is proved. Thirteen on one line.
+    let mut at = renews_to_the_phrase(&laptop);
+    at.sends(format!("{words} thirteenth\n").as_bytes());
+    let (made, said, left) = at.ends_and_leaves();
+    assert!(made, "{said}");
+    let typed = |change: u64| {
+        format!(
+            "{ASKS_THE_PHRASE}\r\n\r\n{}\r\nThe change is made (change {change}).",
+            ticks(1, 12)
+        )
+    };
+    assert!(said.contains(&typed(2)), "{said:?}");
+    assert!(!said.contains("thirteenth"), "{said}");
+    assert_eq!(left, "", "after thirteen words on a line");
+    // A thirteenth after the twelfth's space: the phrase is not judged
+    // before the line is ended.
+    let mut at = renews_to_the_phrase(&laptop);
+    twelve_and_a_space(&mut at, &words);
+    at.types("thirteenth");
+    let (made, said, left) = at.ends_and_leaves();
+    assert!(made, "{said}");
+    assert!(said.contains(&typed(3)), "{said:?}");
+    assert!(!said.contains("thirteenth"), "{said}");
+    assert_eq!(left, "", "after a thirteenth word on the twelfth's line");
+    assert_eq!(look(&laptop)["change"], 3);
+}
+
 /// **Every way out of a prompt for the phrase drops what was typed
 /// ahead** (decision 2026-10-04 §16), before the terminal is put back:
 /// the rest of a line that was pasted is words of a phrase, and is not

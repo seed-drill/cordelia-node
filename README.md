@@ -69,7 +69,8 @@ them where only you can read them.
 - A command asks for them by number, one word at a time, and shows nothing
   of what you type. After each word it puts a tick beside the number, or, for
   a word that is not in the list, a cross, and asks for that number again.
-  Twelve words typed on one line are taken in their order.
+  Twelve words typed on one line are taken in their order, and anything
+  more on that line is dropped, unseen.
   - **Where the phrase is typed to prove it** (`remove-device`, `renew`,
     `settle`, `recover`, `sync carry`) **a tick says that a word is in the
     list, and never that it is the right one.** The phrase is judged when all
