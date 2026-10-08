@@ -1032,18 +1032,13 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     assert_eq!(two_words_in_a_row(said.as_bytes(), &other_words), None);
 
     // A mistyped phrase is told from a wrong one, and is typed again:
-    // a word changed for another of the list. And a word that is none
-    // is asked for again by its number.
-    let mistyped = ["zoo", "wrong", "able", "about", "above", "absent"]
-        .iter()
-        .map(|other| {
-            let mut mistyped: Vec<&str> = words.split(' ').collect();
-            mistyped[3] = other;
-            mistyped.join(" ")
-        })
-        .find(|mistyped| cordelia_crypto::phrase::Phrase::parse(mistyped).is_err())
-        .expect("one of six words in the place of another fails the checksum");
-    let mut at = removes(&[&mistyped, "xyzzy"]);
+    // a word changed for another of the list. It may be typed three
+    // times in all: here twice mistyped, and the third time as it is,
+    // which is taken. And a word that is none is asked for again by its
+    // number, and is no try: the third try is still to come after it.
+    let (first, second) = (mistyped(&words, 3), mistyped(&words, 8));
+    assert_ne!(first, second);
+    let mut at = removes(&[&first, &second, "xyzzy"]);
     at.says("That is not a word from the list. Type word 1 again.\r\n   1. ")
         .types(&words);
     at.says("The change is made (change 2).");
@@ -1061,15 +1056,15 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         said.contains("these words are not a recovery phrase") && said.contains("It was mistyped"),
         "{said}"
     );
-    // The mistyped phrase got its twelve ticks before anything was said
-    // of it, and so did the phrase itself, after the word that is none.
-    assert!(
-        said.contains(&format!(
-            "{typed}these words are not a recovery phrase: at least one of them is not the word \
-             it was. It was mistyped: nothing was made. Type it again.\r\n"
-        )),
-        "{said:?}"
+    // Each mistyped phrase got its twelve ticks before anything was
+    // said of it, and so did the phrase itself, after the word that is
+    // none: three times the phrase was asked for.
+    let mistyped_says = format!(
+        "{typed}these words are not a recovery phrase: at least one of them is not the word it \
+         was. It was mistyped: nothing was made. Type it again.\r\n"
     );
+    assert_eq!(said.matches(&mistyped_says).count(), 2, "{said:?}");
+    assert_eq!(said.matches(ASKS_THE_PHRASE).count(), 3, "{said:?}");
     assert!(
         said.contains(&format!(
             "{ASKS_THE_PHRASE}\r\n\r\n   1. \u{2717}  That is not a word from the list. Type \
@@ -3030,15 +3025,18 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
 
 /// **A miss is said after a pause** (decision 2026-10-04 §16), at
 /// `cordelia phrase` and nowhere else: two seconds before the first is
-/// said, and four before the second. Measured here, from before each
-/// word is typed to when the terminal shows what is said of it:
+/// said, four before the second, and none before the third, which ends
+/// the command. Measured here, from when each word is sent to when the
+/// terminal shows what is said of it:
 ///
 /// - a word that is the word shown, and a word that is not in the list,
 ///   are answered with no pause: of three of each, the quickest is
 ///   answered in less than the pause;
-/// - the first miss is said no sooner than the pause after it was typed,
-///   and nothing is shown meanwhile;
-/// - the second is said no sooner than twice the pause.
+/// - the first miss is said no sooner than the pause after it was sent,
+///   and nothing is shown for the whole of the pause, less a margin;
+/// - the second is said no sooner than twice the pause, with nothing
+///   shown meanwhile;
+/// - the third is said at once: in less than the pause.
 #[test]
 fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
     use cordelia_core::protocol::PHRASE_MISS_PAUSE_SECS;
@@ -3051,23 +3049,39 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
     let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
-    // What follows a cross: its words, and the same number asked again.
-    // (The number before the cross is not in these: it was said, and
-    // waited for, before its word was typed.)
+    let line = |word: &str| format!("{word}\n").into_bytes();
+    // What follows a cross: its words, and then the same number asked
+    // again. (The number before the cross is not in these: it was said,
+    // and waited for, before its word was sent.)
     let no_word_says = "That is not a word from the list. Type word 1 again.\r\n";
-    let a_miss_says =
-        "That does not match word 4. Check what you wrote, and type it again.\r\n   4. ";
+    let a_miss_says = "That does not match word 4. Check what you wrote, and type it again.\r\n";
+    // Hear the terminal out to a quarter of a second before `long` has
+    // gone by since `sent`: nothing was shown by then, and it shows what
+    // it showed when the word was sent, which ends with `asked`. (Where
+    // the test itself was held up to the end of the pause, this says
+    // nothing: the miss may have been said by then.)
+    let nothing_is_shown = |at: &mut AtTerminal, sent: Instant, long: Duration, asked: &str| {
+        let margin = Duration::from_millis(250);
+        let until = sent + long - margin;
+        let meanwhile = at
+            .hears_for(until.saturating_duration_since(Instant::now()))
+            .to_string();
+        if sent.elapsed() < long {
+            assert!(
+                meanwhile.ends_with(asked),
+                "{:?} after the word was sent, the terminal showed:\n{meanwhile:?}",
+                sent.elapsed()
+            );
+        }
+    };
 
     // No pause: a word that is not in the list, and the word shown.
     let mut quickest = Duration::MAX;
     for no_word in ["xyzzy", "legul", "qqq"] {
-        let typed = Instant::now();
-        at.types(no_word);
-        at.says(no_word_says);
-        quickest = quickest.min(typed.elapsed());
-        // The number is asked again once nothing has been typed for a
-        // second.
         at.says("   1. ");
+        let sent = at.sends(&line(no_word));
+        at.says(no_word_says);
+        quickest = quickest.min(sent.elapsed());
     }
     assert!(
         quickest < pause,
@@ -3075,54 +3089,53 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
     );
     let mut quickest = Duration::MAX;
     for (typed_so_far, word) in shown[..3].iter().enumerate() {
-        let typed = Instant::now();
-        at.types(word);
-        // Its tick, and the next number.
-        at.says(&format!("\u{2713}\r\n  {:>2}. ", typed_so_far + 2));
-        quickest = quickest.min(typed.elapsed());
+        at.says(&format!("  {:>2}. ", typed_so_far + 1));
+        let sent = at.sends(&line(word));
+        at.says("\u{2713}\r\n");
+        quickest = quickest.min(sent.elapsed());
     }
     assert!(quickest < pause, "the word shown waited {quickest:?}");
 
-    // The first miss: nothing is said for the pause, and then that it
+    // The first miss: nothing is shown for the pause, and then that it
     // does not match.
     let another = another_word_than(shown[3]);
-    let typed = Instant::now();
-    at.types(another);
-    let meanwhile = at.hears_for(pause / 4).to_string();
-    // (Where the test itself was held up for the whole pause, this says
-    // nothing: the miss may have been said by then.)
-    if typed.elapsed() < pause {
-        let asked = format!("{}   4. ", ticks(3, 3));
-        assert!(meanwhile.ends_with(&asked), "{meanwhile:?}");
-    }
+    at.says("   4. ");
+    let sent = at.sends(&line(another));
+    nothing_is_shown(&mut at, sent, pause, &format!("{}   4. ", ticks(3, 3)));
     at.says(a_miss_says);
-    let waited = typed.elapsed();
+    let waited = sent.elapsed();
     assert!(waited >= pause, "the first miss was said after {waited:?}");
 
     // The second: twice as long.
-    let typed = Instant::now();
-    at.types(another);
+    at.says("   4. ");
+    let sent = at.sends(&line(another));
+    let asked_again = format!("{}   4. ", does_not_match(4));
+    nothing_is_shown(&mut at, sent, 2 * pause, &asked_again);
     at.says(a_miss_says);
-    let waited = typed.elapsed();
+    let waited = sent.elapsed();
     assert!(
         waited >= 2 * pause,
         "the second miss was said after {waited:?}"
     );
 
-    // Each word from the fourth on, as it was shown.
-    at.types(&shown[3..].join(" "));
-    let typed_back = at.says_one_of(&["All twelve match.", "Three tries did not match"]);
-    assert_eq!(typed_back, 0, "{}", at.said);
-    let said = at.done();
+    // The third: at once, and the command ends.
+    at.says("   4. ");
+    let sent = at.sends(&line(another));
+    let stopped = at.says_one_of(&["Three tries did not match.", a_miss_says]);
+    let waited = sent.elapsed();
+    assert_eq!(stopped, 0, "{}", at.said);
+    assert!(waited < pause, "the third miss was said after {waited:?}");
+    let said = at.refused_within(Duration::from_secs(60));
     let all = format!(
-        "{ASKS_THE_WORDS_BACK}\r\n\r\n{}{}{}{}\r\nAll twelve match.\r\n",
+        "{ASKS_THE_WORDS_BACK}\r\n\r\n{}{}{}   4. \u{2717}\r\nError: Three tries did not match. \
+         Nothing was made, and the words you were shown are not a recovery phrase: do not keep \
+         them. Run `cordelia phrase` again.\r\n",
         not_in_the_list(1).repeat(3),
         ticks(1, 3),
         does_not_match(4).repeat(2),
-        ticks(4, 12),
     );
-    assert!(said.contains(&all), "{said:?}");
-    assert_eq!(look(&laptop)["change"], 1);
+    assert!(said.ends_with(&all), "{said:?}");
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
 }
 
 /// **What is typed while a miss waits is not taken as the next word**
@@ -3140,11 +3153,13 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
 #[test]
 fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
     use cordelia_core::protocol::PHRASE_MISS_PAUSE_SECS;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let pause = Duration::from_secs(PHRASE_MISS_PAUSE_SECS);
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let line = |words: &str| format!("{words}\n").into_bytes();
+    let a_moment = Duration::from_millis(100);
     // What follows a miss at word `number`: its words, and the same
     // number asked again.
     let a_miss_says = |number: usize| {
@@ -3163,14 +3178,14 @@ fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
     at.types(another);
     at.says(&a_miss_says(2));
     // The second miss, and what is typed while it waits.
-    let typed = Instant::now();
-    at.types(another);
-    at.types("xyzzy");
-    at.types(shown[1]);
-    at.types(&shown[2..].join(" "));
-    assert!(typed.elapsed() < 2 * pause, "the test was slow");
+    let sent = at.sends(&line(another));
+    for typed_meanwhile in ["xyzzy", shown[1], &shown[2..].join(" ")] {
+        std::thread::sleep(a_moment);
+        at.sends(&line(typed_meanwhile));
+    }
+    assert!(sent.elapsed() < 2 * pause, "the test was slow");
     at.says(&a_miss_says(2));
-    assert!(typed.elapsed() >= 2 * pause, "{:?}", typed.elapsed());
+    assert!(sent.elapsed() >= 2 * pause, "{:?}", sent.elapsed());
     // Each word from the second on, as it was shown.
     at.types(&shown[1..].join(" "));
     let typed_back = at.says_one_of(&[
@@ -3201,14 +3216,14 @@ fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
     let another = another_word_than(words.split(' ').next().unwrap());
     at.types(another);
     at.says(&a_miss_says(1));
-    let typed = Instant::now();
-    at.types(another);
-    at.presses(&[0x03]);
+    let sent = at.sends(&line(another));
+    std::thread::sleep(3 * a_moment);
+    at.sends(&[0x03]);
     let ended = at.says_one_of(&[
         "Interrupted: the terminal is as it was, and nothing was made.",
         "That does not match word 1.",
     ]);
-    let waited = typed.elapsed();
+    let waited = sent.elapsed();
     assert_eq!(ended, 0, "{}", at.said);
     assert!(waited < 2 * pause, "Ctrl-C was acted on after {waited:?}");
     assert_eq!(at.is_as_it_was(), (true, true));
@@ -3224,6 +3239,105 @@ fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
         text(&look(&laptop), "phrase_words"),
         cordelia_crypto::fingerprint::shown(&key)
     );
+}
+
+/// **A phrase that is mistyped may be typed three times in all, and no
+/// more** (decision 2026-10-04 §5). Where a phrase is proved, here at
+/// `cordelia renew`, twelve words of the list that are no recovery
+/// phrase are told from a wrong phrase by its checksum, and are asked
+/// for again: twice. After the third the command says the same of them,
+/// asks no more, and ends: nothing is made.
+#[test]
+fn a_phrase_mistyped_three_times_is_refused_and_nothing_is_made() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let no_phrase = mistyped(&words, 3);
+    let says = "these words are not a recovery phrase: at least one of them is not the word it was. \
+                It was mistyped: nothing was made.";
+
+    let mut at = renews_to_the_phrase(&laptop);
+    for _ in 0..2 {
+        at.types(&no_phrase);
+        // Said, and asked for again.
+        let again = at.says_one_of(&[
+            &format!("{says} Type it again.\r\n"),
+            &format!("{says}\r\n"),
+        ]);
+        assert_eq!(again, 0, "{}", at.said);
+        at.says(ASKS_THE_PHRASE);
+    }
+    at.types(&no_phrase);
+    let again = at.says_one_of(&[
+        &format!("Error: {says}\r\n"),
+        &format!("{says} Type it again."),
+    ]);
+    assert_eq!(again, 0, "{}", at.said);
+    let said = at.refused_within(std::time::Duration::from_secs(60));
+    // Three times it was asked for, each time with its twelve ticks,
+    // and the third was the last.
+    assert_eq!(said.matches(ASKS_THE_PHRASE).count(), 3, "{said:?}");
+    let all_ticks = format!("{ASKS_THE_PHRASE}\r\n\r\n{}", ticks(1, 12));
+    assert_eq!(said.matches(&all_ticks).count(), 3, "{said:?}");
+    assert!(
+        said.ends_with(&format!("{all_ticks}Error: {says}\r\n")),
+        "{said:?}"
+    );
+    assert_eq!(look(&laptop)["change"], 1);
+}
+
+/// **Where a phrase is proved, a right word and a wrong word of the list
+/// get their ticks alike in time** (decision 2026-10-04 §16): nothing
+/// waits for some words and not for others. Here at `cordelia renew`
+/// another person's phrase, of which every word is a wrong one, and
+/// then the device's own are typed one word at a time, and the time
+/// from when each word is sent to when its tick is shown is taken. At
+/// each of the twelve numbers the two times are within three quarters
+/// of the pause that a miss has where words are typed back.
+///
+/// The bound is a wide one: it is there to catch a wait that is added
+/// after some words, and not to measure the looking up of a word.
+#[test]
+fn where_a_phrase_is_proved_a_right_word_and_a_wrong_one_are_ticked_alike_in_time() {
+    use cordelia_core::protocol::PHRASE_MISS_PAUSE_SECS;
+    use std::time::Duration;
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let anothers = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    // Type `words` one at a time: how long each took to get its tick.
+    let ticked_in = |at: &mut AtTerminal, words: &str| -> Vec<Duration> {
+        let mut each = Vec::new();
+        for (typed, word) in words.split(' ').enumerate() {
+            at.says(&format!("  {:>2}. ", typed + 1));
+            let sent = at.sends(format!("{word}\n").as_bytes());
+            at.says("\u{2713}\r\n");
+            each.push(sent.elapsed());
+        }
+        each
+    };
+
+    let mut at = renews_to_the_phrase(&laptop);
+    let wrong = ticked_in(&mut at, anothers);
+    let said = at.refused_within(Duration::from_secs(60));
+    assert!(
+        said.contains("it is not the one that this device follows: nothing was made."),
+        "{said}"
+    );
+    let mut at = renews_to_the_phrase(&laptop);
+    let right = ticked_in(&mut at, &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+
+    let bound = Duration::from_secs(PHRASE_MISS_PAUSE_SECS) * 3 / 4;
+    assert_eq!((right.len(), wrong.len()), (12, 12));
+    for (number, (right, wrong)) in right.iter().zip(&wrong).enumerate() {
+        assert!(
+            right.abs_diff(*wrong) < bound,
+            "word {}: a right word got its tick in {right:?}, and a wrong one in {wrong:?}",
+            number + 1
+        );
+    }
 }
 
 /// At `cordelia phrase` the words are shown numbered, in rows of four

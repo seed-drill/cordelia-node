@@ -1250,6 +1250,24 @@ pub fn another_word_than(word: &str) -> &'static str {
     }
 }
 
+/// The phrase `words` as a person mistypes it: with another word of the
+/// list at `place` (the first is 0), so that the twelve are no recovery
+/// phrase at all. (One in sixteen such changes makes another phrase:
+/// that is not what is given back.)
+pub fn mistyped(words: &str, place: usize) -> String {
+    [
+        "zoo", "wrong", "able", "about", "above", "absent", "abandon",
+    ]
+    .iter()
+    .map(|other| {
+        let mut mistyped: Vec<&str> = words.split(' ').collect();
+        mistyped[place] = other;
+        mistyped.join(" ")
+    })
+    .find(|mistyped| mistyped != words && cordelia_crypto::phrase::Phrase::parse(mistyped).is_err())
+    .expect("one of seven words in the place of another fails the checksum")
+}
+
 /// The rows in which `cordelia phrase` showed the twelve words, as its
 /// terminal showed them: from the space before the first number to the
 /// last word.
