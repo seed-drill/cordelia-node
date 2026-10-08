@@ -26,7 +26,7 @@
 ### 1.1 One-Line Install
 
 ```bash
-curl -sSL https://install.seeddrill.ai | sh
+curl -fsSL https://seeddrill.ai/install.sh | sh
 ```
 
 The install script:
@@ -82,7 +82,7 @@ If verification fails, the script aborts with exit code 1 and prints the mismatc
 
 GPG signature verification is Phase 2 (requires Seed Drill signing key infrastructure).
 
-**Integrity note:** The install script is served over HTTPS (TLS). The SHA-256 checksum of the install script itself is published at `https://install.seeddrill.ai/install.sh.sha256` for out-of-band verification. For maximum security, download the script first, inspect it, then run it. Or use the manual install procedure (§1.4) which performs checksum verification externally. This pattern is standard practice (Rust's rustup, Homebrew, nvm).
+**Integrity note:** The install script is served over HTTPS (TLS), at `https://seeddrill.ai/install.sh`. For maximum security, download the script first, inspect it, then run it. Or use the manual install procedure (§1.4) which performs checksum verification externally. This pattern is standard practice (Rust's rustup, Homebrew, nvm).
 
 **Enterprise note:** Enterprise deployments should use the manual install procedure (§1.4) until GPG signature verification is available (Phase 2). SHA-256 checksums from the same server as the binary provide integrity verification against transport corruption but not against server compromise.
 
@@ -977,7 +977,7 @@ The node does not auto-update. Operators choose when to upgrade.
 ### 10.2 Upgrade Procedure
 
 ```bash
-curl -sSL https://install.seeddrill.ai | sh    # downloads latest, verifies checksum, restarts the service
+curl -fsSL https://seeddrill.ai/install.sh | sh  # downloads latest, verifies checksum, restarts the service
 cordelia status                                  # verify
 ```
 
@@ -1005,6 +1005,10 @@ The install script detects an existing installation and performs an in-place bin
 
 ### 10.4 Rollback
 
+> **v1 status.** After an upgrade to this version, go back by §10.5: it puts
+> the database back as well, and has each step. The short way below is for
+> an upgrade that stepped no database.
+
 If an upgrade causes issues:
 
 ```bash
@@ -1017,9 +1021,6 @@ mv ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia
 systemctl --user start cordelia                                       # Linux
 launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
 ```
-
-> **v1 status.** Going back from this version to the one before puts the
-> database back as well: §10.5 has each step.
 
 **Database rollback caveat:** If the new version applied a schema migration, rolling back the binary may fail if the old version doesn't understand the new schema. Schema migrations are designed to be forward-compatible where possible (additive columns, not destructive). If a migration is not forward-compatible, the release notes will state this explicitly.
 
@@ -1118,30 +1119,60 @@ before makes a copy and then one step, when it starts (data-formats.md §12):
   the same, and stops. A command that opens the database itself is refused
   likewise.
 
-**Going back.** Eight steps, in this order. Each is a command for Linux
-(systemd) and for macOS (launchd), with why. The paths are those of a node
-that the install script set up: its data directory is `~/.cordelia`.
-`<version>` is the version that made the copy: `ls ~/.cordelia` shows the
-folder, `before-<version>`.
+**Going back.** Nine steps, in this order. Each gives the command for Linux
+(systemd) and for macOS (launchd), and says why. The paths are those of a
+node that the install script set up: its data directory is `~/.cordelia`.
 
-1. **Stop the service.** The database is replaced below, and a node that
-   runs would write to it meanwhile.
+The steps name two versions:
+
+- `<version>` is the version that made the copy. `ls ~/.cordelia` shows the
+  copy's folder, `before-<version>`.
+- `<the version before>` is the version you go back to: the one this
+  machine ran before it took `<version>`. `~/.cordelia/bin/cordelia.prev
+  --version` prints it, unless the install script has run again since with
+  another version.
+
+1. **Check that the copy is there.** Do this before you stop or change
+   anything.
+
+   ```bash
+   ls ~/.cordelia/before-<version>/cordelia.db
+   ```
+
+   If the file is not there, stop. There is nothing to go back by, and you
+   have changed nothing. A machine has no copy if its first install was this
+   version, if you deleted the copy, or if the copy could not be made.
+
+   If `ls ~/.cordelia` shows more than one `before-` folder, use the one
+   named exactly `before-<version>`. Do not use one whose name ends in
+   `.partial` or `.earlier`. A `.partial` folder is a copy that was not
+   finished. An `.earlier` folder is an older copy, which a later start kept
+   when it made a new one.
+
+2. **Stop the service.** The next steps replace the database, and a node
+   that runs would write to it meanwhile.
 
    ```bash
    systemctl --user stop cordelia                                        # Linux
    launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
    ```
 
-2. **Put the older binary back.** The install script kept it beside the new
-   one, as `cordelia.prev`, when it installed this version.
+3. **Put the older binary back.** The install script kept it beside the new
+   one, as `cordelia.prev`, when it installed this version. Check its
+   version first.
 
    ```bash
    ~/.cordelia/bin/cordelia.prev --version      # the version before?
-   cp ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia
+   cp ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia.new
+   mv -f ~/.cordelia/bin/cordelia.new ~/.cordelia/bin/cordelia
    ```
 
-   Where `cordelia.prev` is another version, install the one before by its
-   number instead:
+   Copy it beside the binary and then move it into place, as the install
+   script does. A plain copy over `cordelia` fails while a `cordelia`
+   process runs from that file.
+
+   If `cordelia.prev` is not the version before, install the version before
+   by its number instead:
 
    ```bash
    curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v<the version before> sh
@@ -1149,19 +1180,25 @@ folder, `before-<version>`.
 
    **Do not run the "Next steps" that it prints.** They would start the older
    version on the database that this version stepped, and it would stop with
-   an error. Go on with step 3.
+   an error. Go on with step 4.
 
-3. **Remove the database and its two side files,** where they are there.
-   Left there, the side files would be replayed over what is put back. (A
-   node that stopped cleanly leaves neither of the two, so `rm -f`.)
+4. **Move the database and its two side files aside.** Do not delete them:
+   if the copy in step 5 fails, you have lost nothing.
 
    ```bash
-   rm -f ~/.cordelia/cordelia.db ~/.cordelia/cordelia.db-wal ~/.cordelia/cordelia.db-shm
+   mkdir -p ~/cordelia-stepped-<version>
+   mv ~/.cordelia/cordelia.db* ~/cordelia-stepped-<version>/
    ```
 
-4. **Copy the database and the older channels' key files back from the
-   copy,** each to where the node keeps it: the database to
-   `~/.cordelia/cordelia.db`, and the key files into
+   The pattern matches the database and whichever of its side files are
+   there (`cordelia.db-wal` and `cordelia.db-shm`). A node that stopped
+   cleanly leaves neither. They must not stay: the node would replay them
+   over the database that you put back. You can delete
+   `~/cordelia-stepped-<version>` once the older version runs (step 9).
+
+5. **Copy the database and the older channels' key files back from the
+   copy.** Put each where the node keeps it: the database at
+   `~/.cordelia/cordelia.db`, and the key files in
    `~/.cordelia/channel-keys/`. The older version reads both.
 
    ```bash
@@ -1169,10 +1206,10 @@ folder, `before-<version>`.
    cp -p ~/.cordelia/before-<version>/channel-keys/* ~/.cordelia/channel-keys/
    ```
 
-   Run the second command only where the copy has a `channel-keys` folder:
-   it has one only where the device held key files.
+   Run the second command only if the copy has a `channel-keys` folder. It
+   has one only where the device had key files.
 
-5. **Move the copy out of the data directory,** to your home directory, say.
+6. **Move the copy out of the data directory,** to your home directory, say.
    It is what you went back by. A later upgrade then makes a fresh copy, and
    does not rename this one or put another in its place.
 
@@ -1180,7 +1217,7 @@ folder, `before-<version>`.
    mv ~/.cordelia/before-<version> ~/cordelia-before-<version>
    ```
 
-6. **Have the service manager read the service's file again,** on Linux: the
+7. **On Linux, have the service manager read the service's file again.** The
    install script writes that file anew each time it runs. (launchd reads it
    at the next step.)
 
@@ -1188,25 +1225,28 @@ folder, `before-<version>`.
    systemctl --user daemon-reload                                        # Linux
    ```
 
-7. **Start the service.** It runs the older binary, on the database that
-   was put back.
+8. **Start the service.** It runs the older binary, on the database that
+   you put back.
 
    ```bash
    systemctl --user start cordelia                                       # Linux
    launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
    ```
 
-8. **Check.** The status names the version, and says whether the node runs.
+9. **Check.** The status names the version, and says whether the node runs.
 
    ```bash
    cordelia status
    ```
 
+   Once it runs the older version, you can delete
+   `~/cordelia-stepped-<version>`.
+
 What that does not give back: the device's key and its configuration file
 were never in the copy, so a device that was given a new key since cannot go
 back. The mappings and the sync settings are rows of the database, so they
-are as the copy has them, and those made since go with the database that is
-removed. And the memory folders are as they are now, so what changed in
+are as the copy has them, and those made since are in the database that was
+moved aside. And the memory folders are as they are now, so what changed in
 them since is published into the older channels as edits.
 
 A version from before this one that is started by mistake on a database
