@@ -819,6 +819,12 @@ fn read_to_its_end(said: &Value) -> bool {
     matches!(text(said, "read"), "whole" | "not held")
 }
 
+/// How many entries of the channel the node says that a relay handed
+/// (decision 2026-10-04 §16): none where it says nothing of that.
+pub(crate) fn entries_handed(said: &Value) -> u64 {
+    said["entries"].as_u64().unwrap_or(0)
+}
+
 /// [`read_with_secret`], with what reads and what asks for the sessions
 /// given: `read` reads the channel with proofs over the sessions it is
 /// handed, and `ask` gives the sessions as the node says them now.
@@ -829,7 +835,10 @@ fn read_to_its_end(said: &Value) -> bool {
 /// was handed is kept from every reading, each entry once. Of each relay
 /// the last thing said stands, but that a relay which was read to its
 /// end stays so: and where the connection still changed at the last
-/// reading, that is what is said of the relay.
+/// reading, that is what is said of the relay. **How many entries of the
+/// channel a relay handed is the most that it handed at any one
+/// reading** (decision 2026-10-04 §16): what it handed is kept, whatever
+/// a later reading says of it.
 fn read_again_where_changed(
     sessions: &mut Sessions,
     mut read: impl FnMut(&Sessions) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
@@ -848,7 +857,13 @@ fn read_again_where_changed(
         for relay in relays {
             match said.iter_mut().find(|of| of["relay"] == relay["relay"]) {
                 Some(of) if read_to_its_end(of) => {}
-                Some(of) => *of = relay,
+                Some(of) => {
+                    let handed_before = entries_handed(of);
+                    *of = relay;
+                    if handed_before > entries_handed(of) {
+                        of["entries"] = handed_before.into();
+                    }
+                }
                 None => said.push(relay),
             }
         }
@@ -1454,6 +1469,27 @@ mod tests {
         ]);
         assert_eq!(relays, [said("one", "part"), said("two", "whole")]);
         assert_eq!(asked, 2);
+        // How many entries a relay handed is the most that it handed at
+        // one reading: what it handed is kept, whatever is said of the
+        // relay afterwards.
+        let handed = |relay: &str, read: &str, entries: u64| json!({ "relay": relay, "read": read, "entries": entries });
+        let (ids, relays, _, _, _) = run(vec![
+            (
+                vec![first.clone(), second.clone()],
+                vec![handed("one", "part", 2), handed("two", changed, 0)],
+            ),
+            (
+                vec![third.clone()],
+                vec![handed("one", "not reached", 0), handed("two", "part", 1)],
+            ),
+        ]);
+        assert_eq!(ids, [first.id(), second.id(), third.id()]);
+        assert_eq!(
+            relays,
+            [handed("one", "not reached", 2), handed("two", "part", 1)]
+        );
+        assert_eq!(entries_handed(&relays[0]), 2);
+        assert_eq!(entries_handed(&said("one", "part")), 0);
     }
 
     /// Versions are handed to the node a batch at a time, each within

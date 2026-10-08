@@ -265,10 +265,16 @@ pub(crate) async fn fetched_whole(state: &AppState, deadline: Instant) -> bool {
 /// and what is said of each relay: `whole` where it handed the channel to
 /// its end, `part` where it did not, `not held`, `not reached`, or why
 /// nothing was read there.
+///
+/// **With how many entries of the channel the relay handed** (decision
+/// 2026-10-04 §16): a read that is said to be in `part` ended before the
+/// channel's end, and may have ended before any entry of it was handed.
+/// Whoever goes on with what was read in part asks how many.
 pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
     let mut entries = Vec::new();
     let mut said = Vec::new();
     for at in read {
+        let mut of_the_channel = 0;
         let how = match &at.read {
             LeftRead::NotReached => "not reached".to_string(),
             LeftRead::NotHeld => "not held".to_string(),
@@ -282,14 +288,16 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
                 let checked = wire
                     .iter()
                     .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok());
+                let before = entries.len();
                 entries.extend(checked);
+                of_the_channel = entries.len() - before;
                 match whole {
                     true => "whole".to_string(),
                     false => "part".to_string(),
                 }
             }
         };
-        said.push(json!({ "relay": at.relay, "read": how }));
+        said.push(json!({ "relay": at.relay, "read": how, "entries": of_the_channel }));
     }
     (entries, said)
 }
@@ -1420,6 +1428,68 @@ mod tests {
         }
     }
 
+    /// What is said of each relay says how many entries of the channel
+    /// that relay handed (decision 2026-10-04 §16). A read in part can
+    /// have ended before any entry was handed: the word alone does not
+    /// tell which. What does not pass the check is no entry, and is not
+    /// counted; and a relay that was not read handed none.
+    #[test]
+    fn test_what_is_said_of_a_relay_says_how_many_entries_it_handed() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[1], LAB);
+        let secret = s[1].own(LAB);
+        s.write(1, LAB, "a.md", "one");
+        s.write(1, LAB, "b.md", "two");
+        let wire: Vec<Vec<u8>> = s[1]
+            .stored_in(&secret)
+            .iter()
+            .map(|entry| entry.to_wire())
+            .collect();
+        assert_eq!(wire.len(), 2);
+        let mut with_what_is_none = wire.clone();
+        with_what_is_none.push(vec![1, 2, 3]);
+        let at = |relay: &str, read: LeftRead| LeftAt {
+            relay: relay.into(),
+            read,
+        };
+        let read_as = |entries: &[Vec<u8>], whole: bool| LeftRead::Read {
+            entries: entries.to_vec(),
+            whole,
+        };
+        let read = [
+            at("one", read_as(&wire, true)),
+            at("two", read_as(&with_what_is_none, false)),
+            at("three", read_as(&[], false)),
+            at("four", read_as(&[], true)),
+            at("five", LeftRead::NotHeld),
+            at("six", LeftRead::NotReached),
+            at("seven", LeftRead::NotRead("why".into())),
+            at("eight", LeftRead::Changed),
+        ];
+        let (entries, said) = handed(&read);
+        assert_eq!(entries.len(), 4);
+        let said: Vec<(&str, &str, u64)> = said
+            .iter()
+            .map(|of| {
+                let text = |field: &str| of[field].as_str().unwrap();
+                (text("relay"), text("read"), of["entries"].as_u64().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("one", "whole", 2),
+                ("two", "part", 2),
+                ("three", "part", 0),
+                ("four", "whole", 0),
+                ("five", "not held", 0),
+                ("six", "not reached", 0),
+                ("seven", "not read: why", 0),
+                ("eight", CONNECTION_CHANGED, 0),
+            ]
+        );
+    }
+
     /// A carry by command, on the node (decision 2026-10-04 §7.3): the
     /// name is held, its new channel is fetched, and its channel in each
     /// generation that the device left is read at the relay, with the
@@ -1463,7 +1533,7 @@ mod tests {
             said["generations"],
             json!([{
                 "number": 1,
-                "relays": [{ "relay": "relay", "read": "whole" }],
+                "relays": [{ "relay": "relay", "read": "whole", "entries": 2 }],
                 "by_other_keys": 1,
             }])
         );
@@ -1475,14 +1545,15 @@ mod tests {
         assert_eq!(node.stored(), before + 2);
 
         // A relay that hands the channel in part: the carry says that it
-        // did not read to the end, and where.
+        // did not read to the end, and where, with how many entries of
+        // the channel the relay handed before the read ended.
         node.in_part
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let part = carry_name(&node.state, LAB, false).await.unwrap();
         assert!(!part.read_all);
         assert_eq!(
             part.says(LAB)["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "part" }])
+            json!([{ "relay": "relay", "read": "part", "entries": 2 }])
         );
     }
 
@@ -2038,7 +2109,7 @@ mod tests {
         let said = done.says(LAB);
         assert_eq!(
             said["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "whole" }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
         );
 
         // With proofs that a command made: the connection is made again,
@@ -2057,7 +2128,7 @@ mod tests {
         let read = read_with_proofs(&node.state, channel, made_over(before)).await;
         assert_eq!(*node.did.lock().unwrap(), ["no room", "remake"]);
         assert_eq!(read["entries"], 0, "{read}");
-        let changed = json!([{ "relay": "relay", "read": CONNECTION_CHANGED }]);
+        let changed = json!([{ "relay": "relay", "read": CONNECTION_CHANGED, "entries": 0 }]);
         assert_eq!(CONNECTION_CHANGED, "not read: the connection changed");
         assert_eq!(read["relays"], changed);
         let now = crate::several::session_after(3);
@@ -2080,7 +2151,7 @@ mod tests {
         assert_eq!(read["entries"], 1, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole" }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
         );
 
         // The read goes on only once the connection is another: while
@@ -2109,6 +2180,7 @@ mod tests {
             [json!({
                 "relay": "relay",
                 "read": "not read: the connection has no room left for a proof",
+                "entries": 0,
             })]
         );
     }
@@ -2223,7 +2295,7 @@ mod tests {
         assert_eq!(read["entries"], 3, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole" }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 3 }])
         );
         assert_eq!(*node.asked.lock().unwrap(), [(channel, false)]);
         // A part at a time, and nothing is kept of it after the last.

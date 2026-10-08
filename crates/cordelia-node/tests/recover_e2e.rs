@@ -1404,17 +1404,31 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
 }
 
 /// **A recovery says at which relay the personal channel was not read**
-/// (decision 2026-10-04 §9, step 3). A person's two devices are set up
-/// with two relays, and both are lost. One relay is down when the new
-/// machine recovers: the personal channel of the change recovered from
-/// is read to its end at the other, and the command goes on. Before its
-/// yes it says at which relay the channel could not be read, and that
-/// devices added since and names may be missing.
+/// (decision 2026-10-04 §9, step 3; §16). A person's two devices are set
+/// up with two relays, make a second change, and are both lost. One
+/// relay is down when the new machine recovers: the personal channel of
+/// the change recovered from is read to its end at the other, and the
+/// command goes on. Before its yes it says at which relay the channel
+/// could not be read, and that devices added since and names may be
+/// missing. **It says the same of the personal channel of the generation
+/// before, which is read for names,** by that change's number.
 #[test]
 fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let first = relay_named("relay-one");
     let mut second = relay_named("relay-two");
     let mut two = two_devices(&[&first, &second], None);
+    // A second change, which lists both: the first is a generation
+    // before, whose personal channel a recovery reads for names.
+    let mut at = renews(&two.laptop, &["stays"], &two.words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&first, &second, &two.laptop, &two.desktop];
+    wait_for("the desktop applies change 2", &all, 120, || {
+        (person_of(&two.desktop)["change"] == 2).then_some(())
+    });
+    wait_for("the relays were sent everything", &all, 180, || {
+        has_sent_everything(&two.laptop).and(has_sent_everything(&two.desktop))
+    });
     two.laptop.stop();
     two.desktop.stop();
     let new = device_at("new", &[&first, &second]);
@@ -1431,10 +1445,11 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     );
 
     let mut at = recovers(&new, None, &two.words, &["lost", "lost"]);
-    at.says("The change is made (change 2)")
+    at.says("The change is made (change 3)")
         .says("The look is made");
     let said = at.done();
     println!("{said}");
+    assert!(said.contains("Recovering from change 2."), "{said}");
     assert!(
         said.contains(&format!(
             "Could not read the personal channel at {down} to its end (not reached)."
@@ -1448,6 +1463,16 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let warned = said.find(&missing).unwrap_or_else(|| panic!("{said}"));
     let asked = said.find("Recover on this machine?").unwrap();
     assert!(warned < asked, "{said}");
+    // The generation before, by its change's number.
+    let before = format!(
+        "The personal channel of change 1, which is read for names, could not be read to its \
+         end at {down}: names that are listed only there may be missing."
+    );
+    let warned = said.find(&before).unwrap_or_else(|| panic!("{said}"));
+    assert!(warned < asked, "{said}");
+    // It was read to its end at one relay: what a read in part costs is
+    // not said.
+    assert!(!said.contains("A device that is missing"), "{said}");
     // What was read is carried.
     assert!(said.contains("1 name is carried: lab."), "{said}");
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
@@ -1536,12 +1561,13 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     // The new machine reaches both relays, and finds both changes.
     let new = device_at("new", &[&first, &second]);
 
-    // **Where the personal channel of the change recovered from is read
-    // to its end at no relay, the recovery is refused before anything is
-    // asked** (§9, step 3). The phrase's channel is read; then, while
-    // the command asks which change to recover from, both relays go
-    // down. It says at which relays it could not read, and makes
-    // nothing.
+    // **Where no relay handed an entry of the personal channel of the
+    // change recovered from, and none said that it holds none of it, the
+    // recovery is refused before anything is asked** (§9, step 3; §16).
+    // The phrase's channel is read; then, while the command asks which
+    // change to recover from, both relays go down. It names each relay
+    // at which nothing was read, says to run the command again, and
+    // makes nothing.
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
     at.says("The recovery phrase, twelve words").types(&words);
     at.says("Two changes were made apart")
@@ -1551,7 +1577,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     at.types("1");
     let refused = at.refused();
     assert!(
-        refused.contains("the personal channel of change 3 could not be read to its end at"),
+        refused.contains("nothing of the personal channel of change 3 was read at any relay: "),
         "{refused}"
     );
     for relay in [&first, &second] {
@@ -1561,10 +1587,16 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
         );
     }
     assert!(
-        refused.contains("and so at no relay: which devices were added since that change"),
+        refused.contains(
+            "No relay handed an entry of it, and none said that it holds none of it: which \
+             devices were added since that change, and which names they sync, is not known."
+        ),
         "{refused}"
     );
-    assert!(refused.contains("Nothing was done."), "{refused}");
+    assert!(
+        refused.contains("Run `cordelia recover` again. Nothing was done."),
+        "{refused}"
+    );
     assert!(
         !refused.contains("Type `have`, `lost` or `hands`"),
         "{refused}"

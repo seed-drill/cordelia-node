@@ -68,7 +68,7 @@ use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
 use cordelia_crypto::{derive, fingerprint};
 
-use crate::carry_cmd::{Sessions, read_with_secret};
+use crate::carry_cmd::{Sessions, entries_handed, read_with_secret};
 use crate::person_cmd::{
     NOT_A_YES, counted, default_label, file_shown, list, look, made_all_the_same, named,
     names_this_device, own_key, text, time_of, typed_phrase,
@@ -192,34 +192,27 @@ fn told(asked: anyhow::Result<Told>) -> anyhow::Result<Value> {
 /// node, and say of which relay it could not be read to its end. The
 /// proofs are made over `sessions`: where a connection has changed since
 /// those were said, they are asked for again, and the proofs are made
-/// again ([`read_with_secret`], decision 2026-10-04 §16).
+/// again ([`read_with_secret`], decision 2026-10-04 §16). Returns what
+/// was handed, and what the node says of each relay.
 fn read_channel(
     config_path: &str,
     secret: &[u8; 32],
     sessions: &mut Sessions,
     own: &[u8; 32],
     what: &str,
-) -> anyhow::Result<Vec<CheckedEntry>> {
-    Ok(read_and_not_read(config_path, secret, sessions, own, what)?.0)
-}
-
-/// [`read_channel`], with the relays at which the channel could not be
-/// read to its end, each by its name, and of how many relays the node
-/// said anything.
-fn read_and_not_read(
-    config_path: &str,
-    secret: &[u8; 32],
-    sessions: &mut Sessions,
-    own: &[u8; 32],
-    what: &str,
-) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>, usize)> {
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
     let (entries, relays) = read_with_secret(config_path, secret, sessions, own)?;
-    let not_read = not_read_to_its_end(&relays);
-    for (relay, read) in &not_read {
+    for (relay, read) in not_read_to_its_end(&relays) {
         println!("  Could not read {what} at {relay} to its end ({read}).");
     }
-    let not_read = not_read.into_iter().map(|(relay, _)| relay).collect();
-    Ok((entries, not_read, relays.len()))
+    Ok((entries, relays))
+}
+
+/// The relays at which a channel could not be read to its end, of what
+/// the node says of each relay: each by its name.
+fn not_read_at(relays: &[Value]) -> Vec<String> {
+    let not_read = not_read_to_its_end(relays);
+    not_read.into_iter().map(|(relay, _)| relay).collect()
 }
 
 /// Of what the node says of each relay, those at which a channel could
@@ -254,30 +247,231 @@ fn none_found_says(not_read: &[String]) -> String {
     )
 }
 
-/// What a recovery is refused with where the personal channel of the
-/// change it recovers from, numbered `number`, was read to its end at
-/// none of the `relays` that the node said anything of (decision
-/// 2026-10-04 §9, step 3): `not_read` names each at which it was not.
-/// Which devices were added since that change, and which names are
-/// listed, is then not known, and nothing is asked. `None` where it was
-/// read to its end at one relay at least: the command goes on, and says
-/// before its yes at which it was not ([`will_do_lines`]).
-fn personal_not_read_says(number: u64, relays: usize, not_read: &[String]) -> Option<String> {
-    if not_read.len() < relays {
+/// What a recovery knows of one relay for a personal channel that it
+/// read there (decision 2026-10-04 §16): one of four things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadAs {
+    /// The relay handed the channel to its end.
+    Whole,
+    /// The relay handed one entry of the channel at least, and the read
+    /// did not reach the channel's end.
+    Part,
+    /// The relay holds none of the channel.
+    NotHeld,
+    /// Nothing is known of what the relay holds: it was not reached, or
+    /// the read ended before any entry of the channel was handed.
+    Nothing,
+}
+
+/// Which of the four things the node's word of a relay is ([`ReadAs`]).
+/// **A read that the node calls `part` handed an entry only where the
+/// node says that it did:** it says how many entries of the channel
+/// each relay handed, and a read in part with none is one of which
+/// nothing is known. A relay that handed an entry at one reading, and
+/// was not read to its end, was read in part, whatever was said of it at
+/// a later reading.
+fn read_as(relay: &Value) -> ReadAs {
+    match (text(relay, "read"), entries_handed(relay)) {
+        ("whole", _) => ReadAs::Whole,
+        (_, 1..) => ReadAs::Part,
+        ("not held", _) => ReadAs::NotHeld,
+        _ => ReadAs::Nothing,
+    }
+}
+
+/// What a recovery read of the personal channel of the change that it
+/// recovers from, relay by relay (decision 2026-10-04 §16): each relay
+/// that the node said anything of, by its name, in the node's order,
+/// with which of the four things is known of it and what the node said
+/// of the read there.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PersonalRead {
+    relays: Vec<(String, ReadAs, String)>,
+}
+
+impl PersonalRead {
+    fn of(relays: &[Value]) -> Self {
+        let of = |relay: &Value| {
+            let (name, said) = (text(relay, "relay"), text(relay, "read"));
+            (name.to_string(), read_as(relay), said.to_string())
+        };
+        Self {
+            relays: relays.iter().map(of).collect(),
+        }
+    }
+
+    /// The relays of which `known` is what is known, each by its name.
+    fn at(&self, known: &[ReadAs]) -> Vec<String> {
+        let relays = self.relays.iter();
+        let of_those = relays.filter(|(_, read, _)| known.contains(read));
+        of_those.map(|(relay, _, _)| relay.clone()).collect()
+    }
+
+    /// Whether any relay is one of which `known` is what is known.
+    fn any(&self, known: ReadAs) -> bool {
+        self.relays.iter().any(|(_, read, _)| *read == known)
+    }
+}
+
+/// What a recovery is refused with, before it asks anything, where
+/// nothing is known of the personal channel of the change it recovers
+/// from, numbered `number` (decision 2026-10-04 §9, step 3; §16): **no
+/// relay handed an entry of it, and none said that it holds none of
+/// it.** Each relay was not reached, or its read ended with nothing: the
+/// refusal names each, with what was said of it, and says to run the
+/// command again.
+///
+/// `None` wherever something is known at one relay at least: the channel
+/// was read there to its end or in part, or the relay holds none of it.
+/// The command then goes on with what it could read, and says before its
+/// yes what it could not ([`WasRead::lines`]).
+fn personal_not_read_says(number: u64, read: &PersonalRead) -> Option<String> {
+    let known = [ReadAs::Whole, ReadAs::Part, ReadAs::NotHeld];
+    if known.iter().any(|known| read.any(*known)) {
         return None;
     }
-    let at = match not_read.is_empty() {
-        true => "was read at no relay".to_string(),
-        false => format!(
-            "could not be read to its end at {}, and so at no relay",
-            not_read.join(", ")
-        ),
+    let each: Vec<String> = read
+        .relays
+        .iter()
+        .map(|(relay, _, said)| match said.as_str() {
+            "part" => format!("{relay} (the read ended before any entry of it was handed)"),
+            said => format!("{relay} ({said})"),
+        })
+        .collect();
+    let at = match each.is_empty() {
+        true => "the node said nothing of any relay".to_string(),
+        false => each.join(", "),
     };
     Some(format!(
-        "the personal channel of change {number} {at}: which devices were added since that \
-         change, and which names they sync, is not known. Run `cordelia recover` again. Nothing \
-         was done."
+        "nothing of the personal channel of change {number} was read at any relay: {at}. No relay \
+         handed an entry of it, and none said that it holds none of it: which devices were added \
+         since that change, and which names they sync, is not known. Run `cordelia recover` \
+         again. Nothing was done."
     ))
+}
+
+/// What a recovery says before its yes of a device that is missing from
+/// what it read (decision 2026-10-04 §9, step 3; §16): it is not asked
+/// about, and nothing that it wrote is brought back until its key is
+/// removed. The key is written whole for both commands: `cordelia
+/// remove-device` takes a key that is in no list of the last change, and
+/// `cordelia sync carry --from` then names that removed key by it.
+const A_MISSING_DEVICE: &str = "A device that is missing is not asked about here, and nothing \
+    that it wrote is brought back until its key is removed: `cordelia remove-device <key>` on \
+    this machine, and then `cordelia sync carry <name> --from <key>`, with the phrase.";
+
+/// What a recovery says before its yes of a name that is missing from
+/// what it read (decision 2026-10-04 §9, step 5; §16). A carry that asks
+/// for no phrase takes what keys that count signed, and after a recovery
+/// this machine alone counts: so what a device that is gone wrote under
+/// the name comes in by the command that names its removed key, with the
+/// phrase, and what a device that the person still has holds of it comes
+/// once that device is added again.
+const A_MISSING_NAME: &str = "A name that is missing is not carried. What a device that is gone \
+    wrote under it comes in by `cordelia sync carry <name> --from <device>`, with the phrase; \
+    what a device that you still have holds of it comes once that device is added again and a \
+    folder here is mapped to the name.";
+
+/// What a recovery read of the personal channels, for what it says
+/// before its yes of what it could not read (decision 2026-10-04 §16).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WasRead {
+    /// The number of the change recovered from.
+    number: u64,
+    /// Its personal channel, relay by relay.
+    personal: PersonalRead,
+    /// The personal channels of the generations before, which are read
+    /// for names: each that was not read to its end at every relay, by
+    /// its change's number, with the relays at which it was not.
+    before: Vec<(u64, Vec<String>)>,
+}
+
+impl WasRead {
+    /// Whether everything that the recovery read for was read to its
+    /// end: the personal channel of the change recovered from at one
+    /// relay at least, with no relay at which it was read in part or
+    /// not at all, and each personal channel of a generation before.
+    /// Only then is a name that is not listed said to be listed nowhere.
+    fn to_the_end(&self) -> bool {
+        let of = &self.personal;
+        of.any(ReadAs::Whole)
+            && !of.any(ReadAs::Part)
+            && !of.any(ReadAs::Nothing)
+            && self.before.is_empty()
+    }
+
+    /// What is said before the yes of what could not be read (decision
+    /// 2026-10-04 §16), in lines. None where everything was read to its
+    /// end ([`Self::to_the_end`]).
+    ///
+    /// - **Read to its end at one relay, and not at every relay:** at
+    ///   which it was not, and that devices added since, and names, may
+    ///   be missing.
+    /// - **Read to its end at no relay, and in part at one at least:**
+    ///   at which relays in part, and at which not at all; that devices
+    ///   added since, and names, may be missing from what was read, and
+    ///   what a read in part may be a sign of; and what that costs, for
+    ///   a device and for a name, with the commands.
+    /// - **No relay that answered holds the channel:** that, and at
+    ///   which relays it was not read; and what that costs.
+    /// - **A personal channel of a generation before** that was not read
+    ///   to its end: at which relays, by the change's number.
+    fn lines(&self) -> Vec<String> {
+        let (number, of) = (self.number, &self.personal);
+        let mut lines = Vec::new();
+        let part = of.at(&[ReadAs::Part]);
+        let nothing = of.at(&[ReadAs::Nothing]);
+        if of.any(ReadAs::Whole) {
+            let not_to_the_end = of.at(&[ReadAs::Part, ReadAs::Nothing]);
+            if !not_to_the_end.is_empty() {
+                lines.push(format!(
+                    "The personal channel of the change recovered from could not be read to its \
+                     end at {}: devices added since that change, and names, may be missing here.",
+                    not_to_the_end.join(", ")
+                ));
+            }
+        } else if !part.is_empty() {
+            let not_at_all = match nothing.is_empty() {
+                true => String::new(),
+                false => format!(", and not at all at {}", nothing.join(", ")),
+            };
+            let none_held = match of.at(&[ReadAs::NotHeld]).as_slice() {
+                [] => String::new(),
+                [one] => format!(" {one} holds none of it."),
+                more => format!(" {} hold none of it.", more.join(", ")),
+            };
+            lines.push(format!(
+                "The personal channel of change {number} was read to its end at no relay: in part \
+                 at {}{not_at_all}.{none_held} Devices added since that change, and names, may be \
+                 missing from what was read. What a person's own devices write there is small: a \
+                 read that does not reach the end may be a sign that a device of that change \
+                 filled the channel.",
+                part.join(", ")
+            ));
+            lines.push(A_MISSING_DEVICE.to_string());
+            lines.push(A_MISSING_NAME.to_string());
+        } else {
+            let not_read = match nothing.is_empty() {
+                true => String::new(),
+                false => format!(" It was not read at {}.", nothing.join(", ")),
+            };
+            lines.push(format!(
+                "No relay that answered holds the personal channel of change {number}: which \
+                 devices were added since that change, and which names they sync, is not \
+                 known.{not_read}"
+            ));
+            lines.push(A_MISSING_DEVICE.to_string());
+            lines.push(A_MISSING_NAME.to_string());
+        }
+        for (before, not_read) in &self.before {
+            lines.push(format!(
+                "The personal channel of change {before}, which is read for names, could not be \
+                 read to its end at {}: names that are listed only there may be missing.",
+                not_read.join(", ")
+            ));
+        }
+        lines
+    }
 }
 
 /// What is said of two changes that were made apart, before the person
@@ -384,17 +578,17 @@ fn asks_of(at: &Terminal, says: &str) -> anyhow::Result<Answer> {
 /// §9): from whom the look takes and from whom it takes nothing; the
 /// names that are carried, and those that are left; and what stops.
 ///
-/// `not_read` names each relay at which the personal channel of the
-/// change recovered from could not be read to its end. Where there is
-/// one, no name is said to be listed nowhere: devices added since the
-/// change, and names, may be missing from what was read, and that is
-/// said, with the relay.
+/// `was_read` is what was read of the personal channels, relay by relay.
+/// **What could not be read is said here** ([`WasRead::lines`], decision
+/// 2026-10-04 §16): of the change recovered from, and of the generations
+/// before, which are read for names. Where anything could not, no name
+/// is said to be listed nowhere: none is listed in what was read.
 fn will_do_lines(
     generation: &Generation,
     answers: &[Answer],
     names: &recover::Names,
     own: &[u8; 32],
-    not_read: &[String],
+    was_read: &WasRead,
 ) -> Vec<String> {
     let rows = &generation.rows;
     let taken = recover::takes(rows, answers);
@@ -456,7 +650,7 @@ fn will_do_lines(
         all.join(", ")
     };
     match names.carried.is_empty() {
-        true => lines.push(match not_read.is_empty() {
+        true => lines.push(match was_read.to_the_end() {
             true => "No name is carried: none is listed.".to_string(),
             false => "No name is carried: none is listed in what was read.".to_string(),
         }),
@@ -469,13 +663,7 @@ fn will_do_lines(
             said(&names.carried)
         )),
     }
-    if !not_read.is_empty() {
-        lines.push(format!(
-            "The personal channel of the change recovered from could not be read to its end at \
-             {}: devices added since that change, and names, may be missing here.",
-            not_read.join(", ")
-        ));
-    }
+    lines.extend(was_read.lines());
     if !names.over_the_bound.is_empty() {
         lines.push(format!(
             "{} left, beyond the {RECOVERY_MAX_NAMES} that a recovery carries: {}.",
@@ -551,9 +739,10 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let (handed, not_read, _) = {
+    let (handed, not_read) = {
         let secret = phrase.channel_secret()?;
-        read_and_not_read(config_path, &secret, &mut sessions, &own, "it")?
+        let (handed, relays) = read_channel(config_path, &secret, &mut sessions, &own, "it")?;
+        (handed, not_read_at(&relays))
     };
 
     // 2. The change entry with the highest number, of those whose
@@ -607,19 +796,21 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "\nRecovering from change {}. Reading its personal channel at each relay...",
         statement.number
     );
-    let (generation, personal_not_read) = {
+    let (generation, personal_read) = {
         let personal = Zeroizing::new(derive::personal_secret(&for_phrase.secret)?);
         let what = "the personal channel";
-        let (handed, not_read, relays) =
-            read_and_not_read(config_path, &personal, &mut sessions, &own, what)?;
-        // Read to its end at no relay: nothing is asked.
-        if let Some(refusal) = personal_not_read_says(statement.number, relays, &not_read) {
+        let (handed, relays) = read_channel(config_path, &personal, &mut sessions, &own, what)?;
+        // It goes on with what it could read. Where no relay handed an
+        // entry of the channel, and none said that it holds none of it,
+        // nothing is known, and nothing is asked.
+        let personal_read = PersonalRead::of(&relays);
+        if let Some(refusal) = personal_not_read_says(statement.number, &personal_read) {
             anyhow::bail!("{refusal}");
         }
         let now = chrono::Utc::now().timestamp();
         let read =
             recover::read_generation(&from, &statement_key, &for_phrase.secret, &handed, now)?;
-        (read, not_read)
+        (read, personal_read)
     };
     let rows = &generation.rows;
     println!(
@@ -691,10 +882,21 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         .map(|at_row| rows[at_row].key)
         .collect();
     let mut before: Vec<Vec<String>> = Vec::new();
+    // What was read of the personal channels, for what is said before
+    // the yes: nothing refuses for a generation before.
+    let mut was_read = WasRead {
+        number: statement.number,
+        personal: personal_read,
+        before: Vec::new(),
+    };
     for earlier in &for_phrase.earlier {
         let personal = Zeroizing::new(derive::personal_secret(&earlier.secret)?);
         let what = format!("the personal channel of change {}", earlier.number);
-        let handed = read_channel(config_path, &personal, &mut sessions, &own, &what)?;
+        let (handed, relays) = read_channel(config_path, &personal, &mut sessions, &own, &what)?;
+        let not_read = not_read_at(&relays);
+        if !not_read.is_empty() {
+            was_read.before.push((earlier.number, not_read));
+        }
         before.push(recover::names_before(
             &handed,
             &earlier.secret,
@@ -721,7 +923,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     for line in lists_lines(&signs, &own)? {
         println!("{line}");
     }
-    for line in will_do_lines(&generation, &answers, &names, &own, &personal_not_read) {
+    for line in will_do_lines(&generation, &answers, &names, &own, &was_read) {
         println!("{line}");
     }
     if !at.yes("\nRecover on this machine?")? {
@@ -1310,7 +1512,7 @@ mod tests {
             Answer::NotAsked,
             Answer::Lost,
         ];
-        let all = will_do_lines(&generation, &lost, &names, &[9; 32], &[]).join("\n");
+        let all = will_do_lines(&generation, &lost, &names, &[9; 32], &read_whole()).join("\n");
         assert!(
             all.contains(&format!(
                 "It takes nothing from: ({}) \"watch\". What they wrote comes in only by \
@@ -1321,13 +1523,13 @@ mod tests {
         );
         let mut have = lost;
         have[4] = Answer::Have;
-        let all = will_do_lines(&generation, &have, &names, &[9; 32], &[]).join("\n");
+        let all = will_do_lines(&generation, &have, &names, &[9; 32], &read_whole()).join("\n");
         assert!(!all.contains("It takes nothing from"), "{all}");
         // Nor where each device that signed its record may be in someone
         // else's hands: nothing was asked of it, whatever stands there.
         let mut hands = lost;
         (hands[0], hands[1]) = (Answer::OtherHands, Answer::OtherHands);
-        let all = will_do_lines(&generation, &hands, &names, &[9; 32], &[]).join("\n");
+        let all = will_do_lines(&generation, &hands, &names, &[9; 32], &read_whole()).join("\n");
         assert!(!all.contains("\"watch\""), "{all}");
     }
 
@@ -1402,80 +1604,270 @@ mod tests {
         assert!(none.ends_with("Nothing was done."));
     }
 
-    /// Where the personal channel of the change recovered from was read
-    /// to its end at no relay, the recovery is refused before anything
-    /// is asked, and says at which relays it could not be read (decision
-    /// 2026-10-04 §9, step 3). Where it was read to its end at one relay
-    /// at least, the command goes on, and says before its yes that
-    /// devices added since and names may be missing, and at which relay:
-    /// no name is then said to be listed nowhere.
-    #[test]
-    fn test_a_personal_channel_that_was_not_read_is_never_said_to_list_nothing() {
-        let at = |relays: &[&str]| -> Vec<String> {
-            relays.iter().map(|relay| relay.to_string()).collect()
-        };
-        // Read to its end at each relay, or at one of two: it goes on.
-        assert_eq!(personal_not_read_says(3, 2, &[]), None);
-        assert_eq!(personal_not_read_says(3, 2, &at(&["two"])), None);
-        assert_eq!(personal_not_read_says(3, 1, &[]), None);
-        // At neither of two, and not at the only one: refused.
-        let refused = personal_not_read_says(3, 2, &at(&["one", "two"])).unwrap();
-        assert_eq!(
-            refused,
-            "the personal channel of change 3 could not be read to its end at one, two, and so \
-             at no relay: which devices were added since that change, and which names they \
-             sync, is not known. Run `cordelia recover` again. Nothing was done."
-        );
-        assert!(personal_not_read_says(3, 1, &at(&["one"])).is_some());
-        // The node said nothing of any relay: it was read nowhere.
-        let nowhere = personal_not_read_says(4, 0, &[]).unwrap();
-        assert!(
-            nowhere.starts_with("the personal channel of change 4 was read at no relay: which"),
-            "{nowhere}"
-        );
-        assert!(nowhere.ends_with("Nothing was done."));
+    /// What was read of the personal channels, for a test: the personal
+    /// channel of change 3 as the node says of each relay, and nothing
+    /// unread of a generation before.
+    fn was_read(relays: &[Value]) -> WasRead {
+        WasRead {
+            number: 3,
+            personal: PersonalRead::of(relays),
+            before: Vec::new(),
+        }
+    }
 
-        // Before the yes. Read to its end at every relay: as before.
+    /// Everything read to its end, at the one relay.
+    fn read_whole() -> WasRead {
+        was_read(&[json!({ "relay": "one", "read": "whole", "entries": 4 })])
+    }
+
+    /// **A recovery goes on with what it could read of the personal
+    /// channel of the change it recovers from, and says what it could
+    /// not** (decision 2026-10-04 §9, step 3; §16). Of each relay one of
+    /// four things is known: read to its end; read in part, with one
+    /// entry handed at least; the relay holds none of it; or nothing. It
+    /// is refused, before anything is asked, only where nothing is known
+    /// of any relay, and the refusal names each relay and says to run
+    /// the command again.
+    ///
+    /// Every combination of the four over two relays: the decision, and
+    /// each sentence before the yes. A relay whose read is said to be in
+    /// part with no entry handed is one of which nothing is known.
+    #[test]
+    fn test_a_recovery_goes_on_with_what_it_could_read_of_the_personal_channel() {
+        use ReadAs::{NotHeld, Nothing, Part, Whole};
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let said = |relay: &str, read: &str, entries: u64| json!({ "relay": relay, "read": read, "entries": entries });
+        // What the node says, and which of the four things it is.
+        for (read, entries, is) in [
+            ("whole", 4, Whole),
+            ("whole", 0, Whole),
+            ("part", 1, Part),
+            ("part", 0, Nothing),
+            ("not held", 0, NotHeld),
+            ("not reached", 0, Nothing),
+            (changed, 0, Nothing),
+            ("not read: the node is held up", 0, Nothing),
+            // Handed at an earlier reading, and not read to its end.
+            ("not reached", 2, Part),
+            (changed, 1, Part),
+        ] {
+            assert_eq!(read_as(&said("one", read, entries)), is, "{read} {entries}");
+        }
+        // A node that does not say how many entries a relay handed says
+        // of no read in part that an entry was handed.
+        assert_eq!(read_as(&json!({ "relay": "one", "read": "part" })), Nothing);
+
         let generation = Generation {
             rows: rows(),
             ..Default::default()
         };
         let answers = [Answer::Lost, Answer::Lost, Answer::Lost, Answer::NotAsked];
         let none = recover::Names::default();
-        let own = [9; 32];
-        let whole = will_do_lines(&generation, &answers, &none, &own, &[]).join("\n");
-        assert!(
-            whole.contains("No name is carried: none is listed.\n"),
-            "{whole}"
-        );
-        assert!(!whole.contains("could not be read"), "{whole}");
-        // Not at one relay: no name is said to be listed nowhere.
-        let part = will_do_lines(&generation, &answers, &none, &own, &at(&["two"])).join("\n");
-        assert!(
-            part.contains(
-                "No name is carried: none is listed in what was read.\nThe personal channel of \
-                 the change recovered from could not be read to its end at two: devices added \
-                 since that change, and names, may be missing here.\n"
-            ),
-            "{part}"
-        );
-        assert!(!part.contains("none is listed.\n"), "{part}");
-        // And where names are carried, that more may be missing is said
-        // all the same.
         let lab = recover::Names {
             carried: vec!["lab".into()],
             ..Default::default()
         };
-        let not_read = at(&["two", "three"]);
-        let part = will_do_lines(&generation, &answers, &lab, &own, &not_read).join("\n");
-        assert!(
-            part.contains(
-                "1 name is carried: lab.\nThe personal channel of the change recovered from \
-                 could not be read to its end at two, three: devices added since that change, \
-                 and names, may be missing here.\n"
-            ),
-            "{part}"
+        let own = [9; 32];
+        let of = |kind: ReadAs, relay: &str| match kind {
+            Whole => said(relay, "whole", 4),
+            Part => said(relay, "part", 2),
+            NotHeld => said(relay, "not held", 0),
+            // The read ended before any entry was handed.
+            Nothing => said(relay, "part", 0),
+        };
+        let missing_device = "A device that is missing is not asked about here, and nothing that \
+                              it wrote is brought back until its key is removed: `cordelia \
+                              remove-device <key>` on this machine, and then `cordelia sync carry \
+                              <name> --from <key>`, with the phrase.";
+        let missing_name = "A name that is missing is not carried. What a device that is gone \
+                            wrote under it comes in by `cordelia sync carry <name> --from \
+                            <device>`, with the phrase; what a device that you still have holds \
+                            of it comes once that device is added again and a folder here is \
+                            mapped to the name.";
+        let alone = "No name is carried: none is listed.\n";
+        let in_what_was_read = "No name is carried: none is listed in what was read.\n";
+        for first in [Whole, Part, NotHeld, Nothing] {
+            for second in [Whole, Part, NotHeld, Nothing] {
+                let relays = [of(first, "one"), of(second, "two")];
+                let read = was_read(&relays);
+                let refused = personal_not_read_says(3, &read.personal);
+                let both = [first, second];
+                let any = |kind: ReadAs| both.contains(&kind);
+                let at = |kind: ReadAs| -> String {
+                    let named = [(first, "one"), (second, "two")];
+                    let of_it: Vec<&str> = named
+                        .iter()
+                        .filter(|(is, _)| *is == kind)
+                        .map(|(_, relay)| *relay)
+                        .collect();
+                    of_it.join(", ")
+                };
+                // Refused only where nothing is known of either relay.
+                assert_eq!(refused.is_some(), both == [Nothing, Nothing], "{both:?}");
+                if refused.is_some() {
+                    continue;
+                }
+                let lines = will_do_lines(&generation, &answers, &none, &own, &read);
+                let all = lines.join("\n");
+                let with_a_name = will_do_lines(&generation, &answers, &lab, &own, &read);
+                let with_a_name = with_a_name.join("\n");
+                assert!(
+                    with_a_name.contains("1 name is carried: lab.\n"),
+                    "{both:?}"
+                );
+                let said_of_it = |all: &str, sentence: &str| all.contains(sentence);
+                if any(Whole) {
+                    // Read to its end at one relay. Where the other was
+                    // not, that is said, with the relay: and only then
+                    // is a name that is not listed said so of what was
+                    // read.
+                    let not_read = match (any(Part), any(Nothing)) {
+                        (true, _) => Some(at(Part)),
+                        (_, true) => Some(at(Nothing)),
+                        _ => None,
+                    };
+                    match not_read {
+                        None => {
+                            assert!(all.contains(alone), "{both:?}: {all}");
+                            assert!(!all.contains("personal channel"), "{both:?}: {all}");
+                        }
+                        Some(relay) => {
+                            let says = format!(
+                                "The personal channel of the change recovered from could not be \
+                                 read to its end at {relay}: devices added since that change, \
+                                 and names, may be missing here.\n"
+                            );
+                            assert!(
+                                all.contains(&format!("{in_what_was_read}{says}")),
+                                "{both:?}: {all}"
+                            );
+                            assert!(with_a_name.contains(&says), "{both:?}: {with_a_name}");
+                        }
+                    }
+                    for sentence in [missing_device, missing_name] {
+                        assert!(!said_of_it(&all, sentence), "{both:?}: {all}");
+                    }
+                    continue;
+                }
+                // Read to its end at no relay: no name is said to be
+                // listed nowhere, and what a missing device and a
+                // missing name cost is said, with the commands.
+                assert!(!all.contains(alone), "{both:?}: {all}");
+                assert!(all.contains(in_what_was_read), "{both:?}: {all}");
+                for all in [&all, &with_a_name] {
+                    for sentence in [missing_device, missing_name] {
+                        assert!(said_of_it(all, sentence), "{both:?}: {all}");
+                    }
+                }
+                let says = match any(Part) {
+                    // In part at one at least: at which in part, and at
+                    // which not at all.
+                    true => format!(
+                        "The personal channel of change 3 was read to its end at no relay: in \
+                         part at {}{}.{} Devices added since that change, and names, may be \
+                         missing from what was read. What a person's own devices write there is \
+                         small: a read that does not reach the end may be a sign that a device \
+                         of that change filled the channel.\n",
+                        at(Part),
+                        match any(Nothing) {
+                            true => format!(", and not at all at {}", at(Nothing)),
+                            false => String::new(),
+                        },
+                        match any(NotHeld) {
+                            true => format!(" {} holds none of it.", at(NotHeld)),
+                            false => String::new(),
+                        }
+                    ),
+                    // No relay that answered holds it.
+                    false => format!(
+                        "No relay that answered holds the personal channel of change 3: which \
+                         devices were added since that change, and which names they sync, is not \
+                         known.{}\n",
+                        match any(Nothing) {
+                            true => format!(" It was not read at {}.", at(Nothing)),
+                            false => String::new(),
+                        }
+                    ),
+                };
+                assert!(all.contains(&says), "{both:?}: {all}\n{says}");
+                assert!(with_a_name.contains(&says), "{both:?}: {with_a_name}");
+            }
+        }
+
+        // The refusal: each relay, with what was said of it, and to run
+        // the command again.
+        let nothing = [said("one", "not reached", 0), said("two", "part", 0)];
+        let refused = personal_not_read_says(3, &PersonalRead::of(&nothing)).unwrap();
+        assert_eq!(
+            refused,
+            "nothing of the personal channel of change 3 was read at any relay: one (not \
+             reached), two (the read ended before any entry of it was handed). No relay handed \
+             an entry of it, and none said that it holds none of it: which devices were added \
+             since that change, and which names they sync, is not known. Run `cordelia recover` \
+             again. Nothing was done."
         );
+        let one = personal_not_read_says(4, &PersonalRead::of(&[said("one", changed, 0)]));
+        assert!(one.unwrap().starts_with(&format!(
+            "nothing of the personal channel of change 4 was read at any relay: one \
+                 ({changed}). No relay"
+        )));
+        // The node said nothing of any relay: nothing is known.
+        let nowhere = personal_not_read_says(4, &PersonalRead::default()).unwrap();
+        assert!(
+            nowhere.starts_with(
+                "nothing of the personal channel of change 4 was read at any relay: the node \
+                 said nothing of any relay. No relay"
+            ),
+            "{nowhere}"
+        );
+        assert!(nowhere.ends_with("Run `cordelia recover` again. Nothing was done."));
+        // One relay that says anything else, and it goes on.
+        for known in [said("two", "part", 1), said("two", "not held", 0)] {
+            let read = PersonalRead::of(&[said("one", "not reached", 0), known]);
+            assert_eq!(personal_not_read_says(3, &read), None);
+        }
+
+        // Read in part at two relays, with a third that holds none.
+        let read = was_read(&[
+            said("one", "part", 1),
+            said("two", "not held", 0),
+            said("three", "part", 7),
+            said("four", "not held", 0),
+        ]);
+        assert_eq!(
+            read.lines()[0],
+            "The personal channel of change 3 was read to its end at no relay: in part at one, \
+             three. two, four hold none of it. Devices added since that change, and names, may \
+             be missing from what was read. What a person's own devices write there is small: a \
+             read that does not reach the end may be a sign that a device of that change filled \
+             the channel."
+        );
+        assert_eq!(read.lines()[1..], [missing_device, missing_name]);
+
+        // The personal channels of the generations before, which are
+        // read for names: the relays at which one was not read to its
+        // end are said too, by the change's number, and nothing is
+        // refused for them. No name is then said to be listed nowhere.
+        let mut before = read_whole();
+        assert!(before.to_the_end() && before.lines().is_empty());
+        before.before = vec![
+            (2, vec!["two".into()]),
+            (1, vec!["one".into(), "two".into()]),
+        ];
+        assert!(!before.to_the_end());
+        assert_eq!(personal_not_read_says(3, &before.personal), None);
+        let all = will_do_lines(&generation, &answers, &none, &own, &before).join("\n");
+        assert!(
+            all.contains(&format!(
+                "{in_what_was_read}The personal channel of change 2, which is read for names, \
+                 could not be read to its end at two: names that are listed only there may be \
+                 missing.\nThe personal channel of change 1, which is read for names, could not \
+                 be read to its end at one, two: names that are listed only there may be \
+                 missing.\n"
+            )),
+            "{all}"
+        );
+        assert!(!all.contains(missing_device), "{all}");
     }
 
     /// Where the answers could not all be kept, that is said before the
@@ -1550,7 +1942,7 @@ mod tests {
         // The laptop is lost; the desktop may be in someone else's
         // hands, and with it the phone it added.
         let answers = [Answer::Lost, Answer::OtherHands, Answer::Have, Answer::Have];
-        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &[]).join("\n");
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read_whole()).join("\n");
         assert!(
             all.contains(&format!(
                 "The look takes what these wrote, as the relays hold it now: ({}) \"laptop\".",
@@ -1601,7 +1993,7 @@ mod tests {
             Answer::Have,
         ];
         let empty = recover::Names::default();
-        let all = will_do_lines(&generation, &none, &empty, &[9; 32], &[]).join("\n");
+        let all = will_do_lines(&generation, &none, &empty, &[9; 32], &read_whole()).join("\n");
         assert!(
             all.contains("Nothing that those devices wrote is brought back by this recovery."),
             "{all}"
