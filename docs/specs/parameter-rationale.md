@@ -1613,7 +1613,8 @@ no measurement behind it yet.
 #### DEVICE_DELETE_SWEEP_INTERVAL_SECS = 86,400
 
 **Rationale:** A device sweeps the deletes that it has held for 90 days
-(`KEYED_TOMBSTONE_RETENTION_DAYS`) once a day, and at its start (decision §16).
+(`KEYED_TOMBSTONE_RETENTION_DAYS`) once a day, and at its start (decision §16). The time of a sweep is noted once
+it has succeeded: one that failed is tried at the next pass.
 Each sweep that takes a delete has that channel read again from its start at
 every relay, so a folder with steady deletes is read again once a day at most.
 A day is fine-grained enough for a bound of 90 days.
