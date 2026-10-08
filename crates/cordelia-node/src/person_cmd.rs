@@ -49,7 +49,9 @@ use cordelia_api::change::{Prepared, prepare_change, prepare_settlement};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
-use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS};
+use cordelia_core::protocol::{
+    CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS, STATUS_AMBER_WAIT_SECS,
+};
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -841,6 +843,35 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
 fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
+    devices_lines_at(seen, own, chrono::Utc::now().timestamp())
+}
+
+/// Whether it is too soon, at `now`, to say anything against `device`,
+/// which this device has not heard to have applied the change (decision
+/// 2026-10-04 §8). A device says that it has applied a change in the
+/// personal channel, and its word takes a moment to arrive. So for
+/// `STATUS_AMBER_WAIT_SECS`:
+///
+/// - **after this device joined** (it took what a typed key handed it,
+///   and has heard from nobody yet), of every device;
+/// - **after `device` was added** (its record says when), of that one.
+///
+/// A time that is ahead of this device's clock by less than that counts
+/// too, and one that is further ahead does not: another device's clock
+/// wrote it.
+fn too_soon_to_say(seen: &Value, device: &Value, now: i64) -> bool {
+    let just = |at: i64| now.abs_diff(at) < STATUS_AMBER_WAIT_SECS;
+    let joined = list(seen, "accepting")
+        .filter(|typed| typed["taken"] == true)
+        .filter_map(|typed| typed["taken_at"].as_i64())
+        .any(just);
+    joined || device["at"].as_i64().is_some_and(just)
+}
+
+/// [`devices_lines`], at `now`, in seconds: what is said of a device
+/// that has not been heard from goes by how long ago this device joined,
+/// or that one was added ([`too_soon_to_say`]).
+fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
     out.push(format!(
@@ -879,6 +910,10 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
                  in what it had sent before)"
             ),
         },
+        // Not heard to have applied it. Just after this device joined,
+        // or that one was added, that is all that is known: its word may
+        // not have arrived yet, and nothing is advised.
+        _ if too_soon_to_say(seen, device, now) => "not heard from yet".to_string(),
         _ => format!(
             "has not applied change {change} yet, as far as this device has heard: adding it \
              again from a device that has (`cordelia add-device`) hands it the change, and \
@@ -3563,6 +3598,99 @@ mod tests {
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
             "names": { "sent": ["lab"], "to_go": [] } });
         assert!(names_lines(&quiet).is_empty());
+    }
+
+    /// Right after a device is added, nothing is said against it that is
+    /// not known (decision 2026-10-04 §8). For the first five minutes
+    /// after this device joined, each device that it has not heard from
+    /// is said to be "not heard from yet", with no advice; and so is a
+    /// device for the first five minutes after it was added. After that,
+    /// the sentence with its advice is said. A device that has said it
+    /// applied the change is said to have, whenever it is asked.
+    #[test]
+    fn a_device_not_heard_from_just_after_it_was_added_is_said_to_be_only_that() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        let (now, wait) = (1_800_000_000_i64, STATUS_AMBER_WAIT_SECS as i64);
+        assert_eq!(wait, 300);
+        let advice = "has not applied change 1 yet, as far as this device has heard: adding it \
+                      again from a device that has (`cordelia add-device`)";
+        let says_of = |seen: &Value, own: u8, label: &str, at: i64| -> String {
+            let lines = devices_lines_at(seen, &key(own), at);
+            let of_it = format!("\"{label}\"");
+            let line = lines.iter().find(|line| line.contains(&of_it));
+            line.unwrap_or_else(|| panic!("no line for {label}: {lines:?}"))
+                .clone()
+        };
+
+        // On the device that added the other: the desktop was added at
+        // `now`, and has not been heard from.
+        let adder = json!({
+            "this_device": written(1),
+            "change": 1,
+            "devices": [
+                { "key": written(1), "label": "laptop", "words": "w", "applied": 1,
+                  "sent": true, "maker": true },
+            ],
+            "added": [
+                { "key": written(2), "label": "desktop", "words": "w", "counted": true,
+                  "by": { "key": written(1), "label": "laptop", "words": "w" },
+                  "at": now, "applied": null, "sent": false },
+            ],
+        });
+        for soon in [now, now + 1, now + wait - 1] {
+            let line = says_of(&adder, 1, "desktop", soon);
+            assert!(line.ends_with(": not heard from yet"), "{soon}: {line}");
+            assert!(!line.contains("add-device"), "{soon}: {line}");
+        }
+        for later in [now + wait, now + wait + 1, now + 86_400] {
+            let line = says_of(&adder, 1, "desktop", later);
+            assert!(line.contains(advice), "{later}: {line}");
+            assert!(!line.contains("not heard from yet"), "{later}: {line}");
+        }
+        // A time that another device's clock wrote, and that is far ahead
+        // of this one's, holds nothing back.
+        assert!(says_of(&adder, 1, "desktop", now - wait).contains(advice));
+        assert!(says_of(&adder, 1, "desktop", now - wait + 1).ends_with("not heard from yet"));
+
+        // On the device that joined: it took what the laptop's key handed
+        // it at `now`, and has not heard from the laptop, which is a
+        // device of the statement and has no time of its own.
+        let joined = |taken: bool| {
+            json!({
+                "this_device": written(2),
+                "change": 1,
+                "devices": [
+                    { "key": written(1), "label": "laptop", "words": "w", "applied": null,
+                      "sent": false, "maker": true },
+                ],
+                "added": [
+                    { "key": written(2), "label": "desktop", "words": "w", "counted": true,
+                      "by": { "key": written(1), "label": "laptop", "words": "w" },
+                      "at": now - 3000, "applied": 1, "sent": true },
+                ],
+                "accepting": [
+                    { "key": written(1), "words": "w", "typed_at": now - 60, "until": now + 3540,
+                      "taken": taken, "taken_at": if taken { json!(now) } else { json!(null) },
+                      "asking": !taken, "said": "this device has joined" },
+                ],
+            })
+        };
+        let line = says_of(&joined(true), 2, "laptop", now + wait - 1);
+        assert!(
+            line.ends_with(": not heard from yet; the change was made on it"),
+            "{line}"
+        );
+        assert!(says_of(&joined(true), 2, "laptop", now + wait).contains(advice));
+        // A key that was typed and not taken is no joining.
+        assert!(says_of(&joined(false), 2, "laptop", now + 1).contains(advice));
+
+        // What is known is said at once: a device that has said it
+        // applied the change has, however lately it was added.
+        let mut heard = adder.clone();
+        heard["added"][0]["applied"] = json!(1);
+        let line = says_of(&heard, 1, "desktop", now + 1);
+        assert!(line.contains("has applied change 1"), "{line}");
     }
 
     /// The twelve words are shown numbered, four to a row, with the
