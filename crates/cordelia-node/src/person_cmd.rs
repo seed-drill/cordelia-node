@@ -100,7 +100,32 @@ const ASKS_AGAIN: usize = 10;
 /// (it has no `state`): that is no look of a node of this version, and
 /// nothing is read from it (decision 2026-10-04 §16).
 pub(crate) fn look(config_path: &str) -> anyhow::Result<Value> {
-    let seen = api_post(config_path, "/api/v1/devices/list", json!({}))?;
+    looks(config_path, false)
+}
+
+/// [`look`], with how many versions the device holds that it has sent to
+/// no relay, and of how many names (decision 2026-10-04 §16): what a
+/// command that has this device begin again says before its yes
+/// ([`waits_says`]). The node works that count out only where a request
+/// asks for it, and only such a command asks: a status, which a status
+/// bar runs every few seconds, does not.
+fn look_with_what_waits(config_path: &str) -> anyhow::Result<Value> {
+    looks(config_path, true)
+}
+
+/// What a look asks the node for beside what every look says: the count
+/// of what the device has sent to no relay, where `what_waits`, and
+/// nothing otherwise.
+fn look_asks(what_waits: bool) -> Value {
+    match what_waits {
+        true => json!({ "sent_to_no_relay": true }),
+        false => json!({}),
+    }
+}
+
+/// [`look`], asking as [`look_asks`] says.
+fn looks(config_path: &str, what_waits: bool) -> anyhow::Result<Value> {
+    let seen = api_post(config_path, "/api/v1/devices/list", look_asks(what_waits))?;
     if seen["state"].as_str().is_none() {
         anyhow::bail!(
             "what answered at the node's address says nothing of where this device stands: it \
@@ -343,7 +368,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
     println!("{WHOSE_WORDS}\n");
@@ -542,7 +567,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
     let own = own_key(config_path)?;
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &own)?;
     let from = named("", &typed);
     // What the yes says goes by the row of §5.1 that the device stands
@@ -2051,7 +2076,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     if !key_path.exists() {
         anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
     }
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &NodeIdentity::from_file(&key_path)?.public_key())?;
     let leaves = match (text(&seen, "among"), seen["others"].as_u64().unwrap_or(0)) {
         ("several", others) => format!(
@@ -3142,7 +3167,12 @@ mod tests {
     fn beginning_again_says_what_the_device_has_sent_to_no_relay() {
         let seen = |versions: u64, names: u64| json!({ "sent_to_no_relay": { "versions": versions, "names": names } });
         assert_eq!(waits_says(&seen(0, 0)), None);
+        // A look that was not asked for the count carries none.
         assert_eq!(waits_says(&json!({ "among": "alone" })), None);
+        // Only a look for a command that has the device begin again
+        // asks for it.
+        assert_eq!(look_asks(false), json!({}));
+        assert_eq!(look_asks(true), json!({ "sent_to_no_relay": true }));
         assert_eq!(
             waits_says(&seen(1, 1)).unwrap(),
             "1 version of 1 name that this device holds has been sent to no relay yet: it is \

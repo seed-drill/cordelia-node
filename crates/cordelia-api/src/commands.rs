@@ -325,15 +325,35 @@ fn not_carried(applied: &person::Applied) -> Vec<serde_json::Value> {
 
 // ── POST /api/v1/devices/list ───────────────────────────────────────
 
+/// What a look is asked for beside what every look says. A request
+/// with no body, or with one that is not read as this, asks for nothing
+/// more.
+#[derive(Deserialize)]
+pub struct ListRequest {
+    /// Whether the answer says how many versions the device holds that
+    /// it has sent to no relay, and of how many names.
+    #[serde(default)]
+    pub sent_to_no_relay: bool,
+}
+
 /// Everything `cordelia devices` and `cordelia status` say of this device
 /// and its person ([`look::Look`]), with whether sync is on, how many
 /// folders the device maps, and what waits to be sent to each relay.
 ///
-/// **With how many versions the device holds that it has sent to no
-/// relay, and of how many names** ([`crate::names::waits_in_every_name`],
-/// decision 2026-10-04 §16): a command that has the device begin again
-/// asks here before its yes, and says what would be let go.
-pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
+/// **Where the request asks for it, with how many versions the device
+/// holds that it has sent to no relay, and of how many names**
+/// ([`crate::names::waits_in_every_name`], decision 2026-10-04 §16): a
+/// command that has the device begin again asks here before its yes,
+/// and says what would be let go. **It is worked out only where it is
+/// asked for** ([`ListRequest::sent_to_no_relay`]): it is a count for
+/// each name held, over every entry of the name's channel, under the
+/// store's lock, and a status asks this route each time it is run. The
+/// answer has no such field otherwise.
+pub async fn list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: Option<web::Json<ListRequest>>,
+) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
     let at = state.own_channels.read();
     let (seen, sync_on, folders) = {
@@ -355,8 +375,11 @@ pub async fn list(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
     }
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
-    let (versions, of_names) = crate::names::waits_in_every_name(&db(&state)).map_err(refused)?;
-    answer["sent_to_no_relay"] = json!({ "versions": versions, "names": of_names });
+    if body.is_some_and(|request| request.sent_to_no_relay) {
+        let (versions, of_names) =
+            crate::names::waits_in_every_name(&db(&state)).map_err(refused)?;
+        answer["sent_to_no_relay"] = json!({ "versions": versions, "names": of_names });
+    }
     answer["waiting"] = waiting(&state)?.into();
     answer["not_reached"] = not_reached(&state, &at).into();
     // What it has still to send, by name: a status says it in a line.

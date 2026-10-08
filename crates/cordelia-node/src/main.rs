@@ -1060,7 +1060,10 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.sync = Some(sync);
     }
     // What the node holds of this person's devices (decision 2026-10-04
-    // §8): a level goes by it.
+    // §8): a level goes by it. It is asked with a body that asks for
+    // nothing more: how much the device has sent to no relay is worked
+    // out by the node only where a request asks for it, and a status is
+    // run every few seconds (§16).
     if out.facts.role == "personal"
         && let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout)
     {
@@ -6370,6 +6373,66 @@ mod tests {
             message: "lab is not mapped on this device".into(),
         });
         assert!(not_mapped.is_none());
+    }
+
+    /// **A status asks the node for no count of what the device has sent
+    /// to no relay** (decision 2026-10-04 §16): the node works that count
+    /// out only where a request asks for it, and a status bar runs a
+    /// status every few seconds. What a status posts to the node, for
+    /// what it holds of its person, is a body that asks for nothing.
+    #[test]
+    fn test_a_status_asks_the_node_for_no_count_of_what_waits() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        // What stands in for the node, at a port of this machine: it
+        // keeps the one request that it is sent, and answers it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.node.http_port = listener.local_addr().unwrap().port();
+        config.node.data_dir = dir.path().display().to_string();
+        std::fs::write(config.token_path(), "a-token").unwrap();
+        let asked = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let answer = "{\"state\":\"no_phrase\"}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{answer}",
+                answer.len()
+            )
+            .unwrap();
+            (first, body)
+        });
+        // As a status asks: `gather_status` asks so, and so does the
+        // line that `cordelia status` prints of a person's devices.
+        let timeout = std::time::Duration::from_secs(30);
+        let answered = local_api(&config, true, "/api/v1/devices/list", timeout).unwrap();
+        assert_eq!(answered["state"], "no_phrase");
+        let (first, body) = asked.join().unwrap();
+        assert!(first.starts_with("POST /api/v1/devices/list "), "{first}");
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({}),
+            "a status asks for nothing more"
+        );
     }
 
     /// A command asks the node only at one of the two addresses that the

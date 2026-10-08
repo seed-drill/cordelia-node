@@ -3358,6 +3358,24 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
         (status_through(same.port)["sync"]["folders"] == 1).then_some(())
     });
     assert_eq!(whats(&status_through(same.port)), ["no_phrase"]);
+    // A status asks the node what it holds of its person, and asks for
+    // no count of what the device has sent to no relay: the node works
+    // that out only where a request asks for it (decision 2026-10-04
+    // §16).
+    let looks_asked = |of: &Answers, from: usize| -> Vec<Value> {
+        let asked = of.asked();
+        let looks = asked[from..]
+            .iter()
+            .filter(|(path, _)| path == "/api/v1/devices/list");
+        looks
+            .filter_map(|(_, body)| serde_json::from_slice(body).ok())
+            .collect()
+    };
+    let by_a_status = looks_asked(&same, 0);
+    assert!(!by_a_status.is_empty(), "a status asks for the look");
+    for sent in &by_a_status {
+        assert!(sent.get("sent_to_no_relay").is_none(), "{by_a_status:?}");
+    }
     let beside_another = status_through(another.port);
     assert_eq!(whats(&beside_another), ["no_phrase", "other_version"]);
     assert_eq!(beside_another["level"], "red", "{beside_another}");
@@ -3373,7 +3391,18 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
             look.remove("state");
         }
     });
-    for args in [&["devices"][..], &["accept", &other], &["phrase"]] {
+    //
+    // **Each command that has the device begin again asks the look for
+    // how much the device has sent to no relay,** which it says before
+    // its yes: `accept`, `phrase` and `init --new-key`. A command that
+    // only shows does not ask.
+    for (args, asks) in [
+        (&["devices"][..], false),
+        (&["accept", &other][..], true),
+        (&["phrase"][..], true),
+        (&["init", "--new-key"][..], true),
+    ] {
+        let before = no_state.asked().len();
         let said = laptop
             .at_terminal_through(no_state.port, args)
             .refused_within(soon);
@@ -3383,6 +3412,13 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
         );
         assert!(!said.contains("Type yes to go on"), "{args:?}: {said}");
         assert!(!said.contains("shown once"), "{args:?}: {said}");
+        let looks = looks_asked(&no_state, before);
+        assert_eq!(looks.len(), 1, "{args:?}: {looks:?}");
+        assert_eq!(
+            looks[0].get("sent_to_no_relay"),
+            asks.then_some(&json!(true)),
+            "{args:?}: {looks:?}"
+        );
     }
 }
 
