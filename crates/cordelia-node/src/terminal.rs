@@ -187,6 +187,34 @@ impl Drop for ReadsKeys {
     }
 }
 
+/// The terminal's other screen, up and cleared: what is shown once is
+/// shown there. **It is cleared, with the lines that scrolled off it, and
+/// put away when this is dropped,** whatever became of the showing: as
+/// [`ReadsKeys`] puts the terminal back. So a write that fails in the
+/// middle leaves no word on a screen that stays up.
+struct OtherScreen(());
+
+impl OtherScreen {
+    fn up() -> anyhow::Result<Self> {
+        // Held from before the first write: where one of the two fails,
+        // the screen is cleared and put away all the same.
+        let screen = Self(());
+        say("\x1b[?1049h")?;
+        say(CLEAR_SCREEN)?;
+        Ok(screen)
+    }
+}
+
+impl Drop for OtherScreen {
+    fn drop(&mut self) {
+        // Cleared before the other screen is left, and so before anything
+        // more is asked: on a terminal that has no other screen this is
+        // what takes the words away.
+        let _ = say(CLEAR_SCREEN);
+        let _ = say("\x1b[?1049l");
+    }
+}
+
 /// Say `asks`, with no line's end, and have it shown at once.
 fn say(asks: &str) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
@@ -534,27 +562,23 @@ impl Terminal {
     ///
     /// What was typed ahead is dropped first: an Enter that was pressed
     /// twice at the prompt before does not take the screen away. And
-    /// Ctrl-C is read as a key while it is up: the screen is cleared and
-    /// put away, the terminal is put back, and this fails with
+    /// Ctrl-C is read as a key while it is up: this fails with
     /// [`INTERRUPTED`].
+    ///
+    /// **On every way out the screen is cleared and put away, and then
+    /// the terminal is put back** ([`OtherScreen`], [`ReadsKeys`]): after
+    /// Enter, after Ctrl-C, and where a write fails in the middle.
     pub fn once(&self, says: &str, shown: &str, asks: &str) -> anyhow::Result<()> {
+        // Dropped in the order they are not made in: the screen first.
         #[cfg(unix)]
         let _reads = ReadsKeys::set()?;
-        say("\x1b[?1049h")?;
-        say(CLEAR_SCREEN)?;
+        let _screen = OtherScreen::up()?;
         say(says)?;
         say("\n\n")?;
         say_unbuffered(shown)?;
         say("\n\n")?;
         say(asks)?;
-        let read = enter();
-        // Cleared before the other screen is left, and so before anything
-        // more is asked: on a terminal that has no other screen this is
-        // what takes the words away.
-        say(CLEAR_SCREEN)?;
-        say("\x1b[?1049l")?;
-        read?;
-        Ok(())
+        enter()
     }
 
     /// Ask for the recovery phrase where it is to be proved: `asks` is
