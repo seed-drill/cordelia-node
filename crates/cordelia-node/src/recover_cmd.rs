@@ -25,10 +25,12 @@
 //!    has it, it is lost or broken, or it may be in someone else's
 //!    hands. No answer is suggested. A record that does not count is
 //!    shown as that, and nothing is asked of it: unless it fails only
-//!    for the bound of 64 counted devices, and a device of the statement
-//!    signed it that was not said to be in someone else's hands. Such a
-//!    key is asked about all the same: nothing is taken from it, and
-//!    said to be gone it is removed.
+//!    for the bound of 64 counted devices, and a key signed it that may
+//!    add and is not in someone else's hands, by what was said of it and
+//!    of the device that added it. Such a key is asked about all the
+//!    same: nothing is taken from it, and said to be gone it is removed.
+//!    Where it is not asked about, the command says how its key is
+//!    removed afterwards, if it is a device of the person's.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -68,7 +70,7 @@ use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
 use cordelia_crypto::{derive, fingerprint};
 
-use crate::carry_cmd::{Sessions, entries_handed, read_with_secret};
+use crate::carry_cmd::{Sessions, entries_handed, key_written, read_with_secret};
 use crate::person_cmd::{
     NOT_A_YES, counted, default_label, file_shown, list, look, made_all_the_same, named,
     names_this_device, own_key, text, time_of, typed_phrase,
@@ -110,43 +112,115 @@ Of each, say one of three things. No answer is suggested: each is typed.
 /// settles, lists the record's key as removed: a removed key stays
 /// removed in every change after, and in the one that this recovery
 /// makes.
-fn not_asked_says(removed: bool) -> &'static str {
-    match removed {
-        false => {
-            "  It is no device: nothing is asked of it, nothing that it wrote is brought \
-             back, and its key is not removed."
-        }
-        true => {
-            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
-             back. Its key was removed before this recovery, and stays removed."
-        }
+///
+/// **A key that fails only for the bound of 64 counted devices, and is
+/// not asked about, may be a device of the person's:** each key that
+/// added it may be in someone else's hands. The row says how its key is
+/// removed afterwards, and what then brings in what it wrote, with the
+/// key written whole, as both commands take it ([`removed_afterwards`]).
+fn not_asked_says(row: &Row, removed: bool) -> String {
+    match (removed, row.no_room.is_empty()) {
+        (true, _) => "  It is no device: nothing is asked of it, and nothing that it wrote is \
+                      brought back. Its key was removed before this recovery, and stays removed."
+            .to_string(),
+        (false, true) => NOT_ASKED.to_string(),
+        (false, false) => format!(
+            "{NOT_ASKED} If it is a device of yours that is gone, {}. One that you still have is \
+             added again by hand.",
+            removed_afterwards(&key_written(&row.key))
+        ),
     }
+}
+
+/// What is said of a record that does not count and whose key no change
+/// has removed.
+const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
+    brought back, and its key is not removed.";
+
+/// How the key of a device that a recovery asked nothing of is removed
+/// afterwards, on the machine that has recovered, and what then brings
+/// in what that device wrote (decision 2026-10-04 §9, step 3). `key` is
+/// the key written whole, or what stands for one.
+///
+/// `cordelia remove-device` takes a key that is in no list of the last
+/// change: it says that this is no device it knows of, and asks a typed
+/// word before the yes and the phrase. The key is then a removed key,
+/// which `cordelia sync carry --from` names by that same writing, and
+/// the machine still holds the secret of the generation recovered from.
+fn removed_afterwards(key: &str) -> String {
+    format!(
+        "its key is removed afterwards, on this machine, by `cordelia remove-device {key}`, and \
+         what it wrote then comes in by `cordelia sync carry <name> --from {key}`, with the phrase"
+    )
 }
 
 /// What is said, in the place of nothing, of a key that is asked about
 /// though it does not count (decision 2026-10-04 §9, step 3): its record
-/// fails only for the bound of 64 counted devices, and a device of the
-/// statement signed it that was not said to be in someone else's hands
+/// fails only for the bound of 64 counted devices, and a key signed it
+/// that may add and is not in someone else's hands
 /// ([`recover::asked_for_room`]). What each answer does is another thing
-/// for it than for a device that counts.
-const ASKED_FOR_ROOM: &str = "  That is the one thing its record fails for, so it is asked \
-    about all the same. Nothing that it wrote is brought back by this recovery, whatever is said \
-    of it: `lost` or `hands` removes its key, and what it wrote then comes in by `cordelia sync \
-    carry <name> --from <device>`, with the phrase; `have` leaves it to be added again by hand.";
+/// for it than for a device that counts. **Each key that is said to be
+/// gone takes one of the removals that the phrase has left,** and `left`
+/// is how many there are now.
+fn asked_for_room_says(left: usize) -> String {
+    format!(
+        "  That is the one thing its record fails for, so it is asked about all the same. \
+         Nothing that it wrote is brought back by this recovery, whatever is said of it: `lost` \
+         or `hands` removes its key, and what it wrote then comes in by `cordelia sync carry \
+         <name> --from <device>`, with the phrase; `have` leaves it to be added again by hand. \
+         Each key that is removed takes one of the removals that the recovery phrase has left: \
+         {left} of {MAX_STATEMENT_REMOVED}."
+    )
+}
 
 /// What is said of a key that is asked about for the bound of 64 alone,
 /// before its answer is asked: what is said of any row ([`row_says`]),
-/// and what the answers do for it ([`ASKED_FOR_ROOM`]). `under` is the
-/// device of the statement for whose record it is asked about: where
-/// the row shows another that added it, this one is named too.
-fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32]) -> String {
+/// and what the answers do for it ([`asked_for_room_says`]). `under` is
+/// the key for whose record it is asked about: where the row shows
+/// another that added it, this one is named too. `left` is how many
+/// removals the phrase has left.
+fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32], left: usize) -> String {
     let mut says = row_says(rows, at, number);
     if rows[at].added_by.is_some_and(|(shown, _)| shown != *under) {
         let label = rows.iter().find(|row| row.key == *under);
         let label = label.map(|row| row.label.as_str()).unwrap_or_default();
         says.push_str(&format!("\n  {} added it too.", named(label, under)));
     }
-    format!("{says}\n{ASKED_FOR_ROOM}")
+    format!("{says}\n{}", asked_for_room_says(left))
+}
+
+/// The key for whose record a row that does not count is asked about
+/// all the same ([`recover::asked_for_room`]): **none where a change has
+/// removed the row's key already** (decision 2026-10-04 §9, step 3).
+/// `removed` says whether one has: the change recovered from, or one
+/// made apart from it, which the recovery settles. Such a key stays
+/// removed whatever is said of it, so nothing is asked, and the row says
+/// what a removed key's row says.
+fn asked_though_it_does_not_count(
+    rows: &[Row],
+    answers: &[Answer],
+    at: usize,
+    removed: bool,
+) -> Option<([u8; 32], u64)> {
+    match removed {
+        true => None,
+        false => recover::asked_for_room(rows, answers, at),
+    }
+}
+
+/// How many removals the phrase has left, as a row is asked about
+/// (decision 2026-10-04 §9, step 3): what the change has room for
+/// ([`recover::Room::can_go`]), less each key that was said to be gone
+/// so far and that no change had removed.
+fn removals_left(
+    room: &recover::Room,
+    rows: &[Row],
+    answers: &[Answer],
+    removed: impl Fn(&[u8; 32]) -> bool,
+) -> usize {
+    let said_gone = recover::gone(rows, answers);
+    let taken = said_gone.iter().filter(|key| !removed(key)).count();
+    room.can_go.saturating_sub(taken)
 }
 
 /// What is said before the first question where the answers could not
@@ -170,6 +244,25 @@ fn room_says(room: &recover::Room) -> Option<String> {
             n => format!("{n} devices are"),
         },
         room.can_go
+    ))
+}
+
+/// What is said of the records beyond the rows that are shown, where
+/// there are any (decision 2026-10-04 §9, step 3): how many, and that
+/// nothing is asked of them. A device of the person's may be among
+/// them: the new machine keeps each key as left out, `cordelia devices`
+/// shows it there, and its key is removed afterwards as that of a row
+/// that was not asked about is ([`removed_afterwards`]).
+fn not_shown_says(not_shown: usize) -> Option<String> {
+    if not_shown == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} beyond the {RECOVERY_MAX_DEVICES_SHOWN} that are shown: nothing is asked of those. \
+         If one of them is a device of yours that is gone, `cordelia devices` on this machine \
+         shows each with its key: {}.",
+        counted(not_shown, "more record"),
+        removed_afterwards("<key>")
     ))
 }
 
@@ -821,9 +914,15 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     );
     // Before anything is asked: whether the answers could all be kept.
     let apart_statement = apart.as_ref().map(|other| &other.statement.statement);
-    if let Some(says) = room_says(&recover::room(&statement, apart_statement, rows, &own)) {
+    let room = recover::room(&statement, apart_statement, rows, &own);
+    if let Some(says) = room_says(&room) {
         println!("{says}");
     }
+    // Whether a change has removed a key already: the one recovered
+    // from, or the one made apart from it.
+    let removed_already = |key: &[u8; 32]| {
+        statement.removes(key) || apart_statement.is_some_and(|other| other.removes(key))
+    };
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
         let says = row_says(rows, at_row, statement.number);
@@ -833,19 +932,19 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             continue;
         }
         // A record that does not count is shown as that, and nothing is
-        // asked of it: unless only the bound of 64 kept its key out, and
-        // a device of the statement signed it that was not said to be
-        // in someone else's hands.
+        // asked of it: unless only the bound of 64 kept its key out, a
+        // key signed it that may add and is not in someone else's
+        // hands, and no change has removed its key already.
         if !rows[at_row].counts {
-            let Some((under, _)) = recover::asked_for_room(rows, &answers, at_row) else {
-                let key = &rows[at_row].key;
-                let removed = statement.removes(key)
-                    || apart_statement.is_some_and(|other| other.removes(key));
-                println!("{says}\n{}", not_asked_says(removed));
+            let removed = removed_already(&rows[at_row].key);
+            let under = asked_though_it_does_not_count(rows, &answers, at_row, removed);
+            let Some((under, _)) = under else {
+                println!("{says}\n{}", not_asked_says(&rows[at_row], removed));
                 answers.push(Answer::NotAsked);
                 continue;
             };
-            let says = for_room_says(rows, at_row, statement.number, &under);
+            let left = removals_left(&room, rows, &answers, removed_already);
+            let says = for_room_says(rows, at_row, statement.number, &under, left);
             answers.push(asks_of(&at, &says)?);
             continue;
         }
@@ -867,12 +966,8 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         }
         answers.push(asks_of(&at, &says)?);
     }
-    if !generation.not_shown.is_empty() {
-        println!(
-            "\n{} beyond the {RECOVERY_MAX_DEVICES_SHOWN} that are shown: nothing is asked of \
-             those.",
-            counted(generation.not_shown.len(), "more record")
-        );
+    if let Some(says) = not_shown_says(generation.not_shown.len()) {
+        println!("\n{says}");
     }
 
     // The names: those of this generation, and those of the generations
@@ -1452,9 +1547,11 @@ mod tests {
     /// with that reason (decision 2026-10-04 §9, step 3). Where it is
     /// asked about, what each answer does for it is said before the
     /// question: nothing that it wrote is brought back, `lost` or
-    /// `hands` removes its key, and `have` leaves it to be added again.
-    /// Before the yes it is named among those from whom the look takes
-    /// nothing, where it was said to be gone.
+    /// `hands` removes its key, and `have` leaves it to be added again;
+    /// and each key that is removed takes one of the removals that the
+    /// phrase has left, with how many are left. Before the yes it is
+    /// named among those from whom the look takes nothing, where it was
+    /// said to be gone.
     #[test]
     fn test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out() {
         let mut rows = rows();
@@ -1473,7 +1570,7 @@ mod tests {
             "{says}"
         );
         // Asked about for the record that the device shown signed.
-        let asked = for_room_says(&rows, 4, 7, &[1; 32]);
+        let asked = for_room_says(&rows, 4, 7, &[1; 32], 191);
         assert!(asked.starts_with(&says), "{asked}");
         assert!(!asked.contains("added it too"), "{asked}");
         assert!(
@@ -1482,13 +1579,33 @@ mod tests {
                  same. Nothing that it wrote is brought back by this recovery, whatever is said \
                  of it: `lost` or `hands` removes its key, and what it wrote then comes in by \
                  `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves it \
-                 to be added again by hand."
+                 to be added again by hand. Each key that is removed takes one of the removals \
+                 that the recovery phrase has left: 191 of 256."
             ),
             "{asked}"
         );
+        assert!(
+            for_room_says(&rows, 4, 7, &[1; 32], 0).ends_with("has left: 0 of 256."),
+            "the number that is left is said"
+        );
+        // How many are left, as the row is asked about: what the change
+        // has room for, less each key that was said to be gone so far.
+        // A key that a change had removed already takes none.
+        let room = recover::Room {
+            removed: 60,
+            asked: 4,
+            can_go: 196,
+        };
+        let so_far = [Answer::Lost, Answer::OtherHands, Answer::Have];
+        assert_eq!(removals_left(&room, &rows, &[], |_| false), 196);
+        assert_eq!(removals_left(&room, &rows, &so_far, |_| false), 194);
+        let was_removed = |key: &[u8; 32]| *key == [2; 32];
+        assert_eq!(removals_left(&room, &rows, &so_far, was_removed), 195);
+        let none = recover::Room { can_go: 1, ..room };
+        assert_eq!(removals_left(&none, &rows, &so_far, |_| false), 0);
         // Asked about for the record of another device than the one
         // shown: that one is named too.
-        let asked = for_room_says(&rows, 4, 7, &[2; 32]);
+        let asked = for_room_says(&rows, 4, 7, &[2; 32], 191);
         assert!(
             asked.contains(&format!(
                 "\n  ({}) \"desktop\" added it too.\n  That is the one thing",
@@ -2269,17 +2386,84 @@ mod tests {
     /// not removed by the recovery (decision 2026-10-04 §9, step 3):
     /// unless the change recovered from had removed that key already,
     /// and then it is said to stay removed.
+    ///
+    /// **A key that only the bound of 64 kept out, and that is not asked
+    /// about, may be a device of the person's.** Its row says how its
+    /// key is removed afterwards, and what then brings in what it wrote,
+    /// with the key written whole, as both commands take it. So does the
+    /// line for the records beyond the rows that are shown. And a key
+    /// that a change has removed already is not asked about, whatever
+    /// kept it out: its row says what a removed key's row says.
     #[test]
     fn test_what_is_said_of_a_record_of_which_nothing_is_asked() {
+        let rows = rows();
+        let no_device = "  It is no device: nothing is asked of it, nothing that it wrote is \
+                         brought back, and its key is not removed.";
+        let stays_removed = "  It is no device: nothing is asked of it, and nothing that it wrote \
+                             is brought back. Its key was removed before this recovery, and stays \
+                             removed.";
+        // The tablet: its record fails for another reason than the bound.
+        assert_eq!(not_asked_says(&rows[3], false), no_device);
+        assert_eq!(not_asked_says(&rows[3], true), stays_removed);
+
+        // A watch that only the bound kept out, which the laptop added.
+        let mut watch = row(5, "watch", Some(1), false);
+        watch.no_room = vec![([1; 32], 1_800_000_000)];
+        let key = cordelia_crypto::bech32::encode_public_key(&[5; 32]).unwrap();
         assert_eq!(
-            not_asked_says(false),
-            "  It is no device: nothing is asked of it, nothing that it wrote is brought back, \
-             and its key is not removed."
+            not_asked_says(&watch, false),
+            format!(
+                "{no_device} If it is a device of yours that is gone, its key is removed \
+                 afterwards, on this machine, by `cordelia remove-device {key}`, and what it \
+                 wrote then comes in by `cordelia sync carry <name> --from {key}`, with the \
+                 phrase. One that you still have is added again by hand."
+            )
         );
+        // The key is written as `cordelia remove-device` takes one, and
+        // as `cordelia sync carry --from` names a removed key.
         assert_eq!(
-            not_asked_says(true),
-            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
-             back. Its key was removed before this recovery, and stays removed."
+            cordelia_crypto::bech32::decode_public_key(&key).unwrap(),
+            [5; 32]
+        );
+        let removed = [carry::Removed {
+            key: [5; 32],
+            label: String::new(),
+        }];
+        assert_eq!(carry::named_key(&key, &removed), Ok([5; 32]));
+        // A change has removed its key already: it stays removed, and
+        // nothing is said of removing it.
+        assert_eq!(not_asked_says(&watch, true), stays_removed);
+
+        // Whether it is asked about. The laptop is lost: it is, for the
+        // laptop's record. Unless a change has removed its key already.
+        let mut with_the_watch = rows.clone();
+        with_the_watch.push(watch);
+        let so_far = [Answer::Lost, Answer::Lost, Answer::Lost, Answer::NotAsked];
+        let under = Some(([1; 32], 1_800_000_000));
+        let asked =
+            |removed: bool| asked_though_it_does_not_count(&with_the_watch, &so_far, 4, removed);
+        assert_eq!((asked(false), asked(true)), (under, None));
+        // The tablet is not, whether or not its key is removed.
+        for removed in [false, true] {
+            let of_the_tablet =
+                asked_though_it_does_not_count(&with_the_watch, &so_far, 3, removed);
+            assert_eq!(of_the_tablet, None);
+        }
+
+        // The records beyond the rows that are shown.
+        assert_eq!(not_shown_says(0), None);
+        assert_eq!(
+            not_shown_says(46).unwrap(),
+            "46 more records beyond the 256 that are shown: nothing is asked of those. If one of \
+             them is a device of yours that is gone, `cordelia devices` on this machine shows \
+             each with its key: its key is removed afterwards, on this machine, by `cordelia \
+             remove-device <key>`, and what it wrote then comes in by `cordelia sync carry <name> \
+             --from <key>`, with the phrase."
+        );
+        assert!(
+            not_shown_says(1)
+                .unwrap()
+                .starts_with("1 more record beyond the 256 that are shown: nothing is asked")
         );
     }
 }

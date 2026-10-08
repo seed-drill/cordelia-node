@@ -31,14 +31,15 @@
 //!   ([`Answer`]). **A record that does not count is shown as that and is
 //!   not asked about:** it is no device, nothing is taken from it, and it
 //!   is not made a removed key. **One that fails only for the bound of 64
-//!   counted devices, and that a device of the statement signed, is
-//!   asked about all the same** ([`asked_for_room`]), where that device
-//!   was not said to be in someone else's hands: no device can push
-//!   another out of a recovery by filling the 64. Nothing is taken from
-//!   it either way; said to be gone, its key is removed. [`takes`] is
-//!   then the keys that the look
-//!   takes from: a key that counts, and that the person still has or
-//!   that is lost or broken. **Nothing is taken from a device that may
+//!   counted devices is asked about all the same** ([`asked_for_room`]),
+//!   where a key that added it may add (a device of the statement, or a
+//!   key that counts and that such a device added) and is not in someone
+//!   else's hands, by what was said of it and of the device that added
+//!   it: no device can push another out of a recovery by filling the 64.
+//!   Nothing is taken from it either way; said to be gone, its key is
+//!   removed. [`takes`] is then the keys that the look takes from: a key
+//!   that counts, and that the person still has or that is lost or
+//!   broken. **Nothing is taken from a device that may
 //!   be in someone else's hands, nor from a key that it added, nor from a
 //!   key that such a key added.** [`room`] says, before anything is
 //!   asked, whether the answers could all be kept: a statement has room
@@ -214,12 +215,13 @@ pub struct Row {
     /// How many entries it signed in the personal channel, as the relays
     /// handed it.
     pub signed: usize,
-    /// The devices of the statement that signed a record of it which
-    /// fails for one thing only, that 64 devices counted already
-    /// (decision 2026-10-04 §9, step 3): each with when its record says
-    /// so, in order of key. None for a row that counts, and none for a
-    /// record that does not count for another reason. Such a key is
-    /// asked about all the same, where one of these was not said to be
+    /// The keys that signed a record of it which fails for one thing
+    /// only, that 64 devices counted already (decision 2026-10-04 §9,
+    /// step 3): each with when its record says so, in order of key. Each
+    /// of them may add: it is a device of the statement, or a key that
+    /// counts and that such a device added. None for a row that counts,
+    /// and none for a record that does not count for another reason.
+    /// Such a key is asked about all the same, where one of these is not
     /// in someone else's hands ([`asked_for_room`]).
     pub no_room: Vec<([u8; 32], u64)>,
 }
@@ -334,11 +336,10 @@ pub fn read_generation(
         *signed.entry(entry.author).or_default() += 1;
     }
     let kept = held_rows::additions(&conn)?;
-    // The records that fail only for the bound of 64 counted devices,
-    // and that a device of the statement signed: for each key, the
-    // devices that signed one, each with when its record says so. (A
-    // key that counts has none: its other records fail because it
-    // counts already.)
+    // The records that fail only for the bound of 64 counted devices:
+    // for each key, the keys that signed one, each with when its record
+    // says so. (A key that counts has none: its other records fail
+    // because it counts already.)
     let mut no_room: BTreeMap<[u8; 32], Vec<([u8; 32], u64)>> = BTreeMap::new();
     // One key has one row. A key counts by one record: that one is shown
     // for it. Where none counts, one that fails only for the bound is
@@ -347,8 +348,12 @@ pub fn read_generation(
     let mut records: Vec<(Row, [u8; 32])> = Vec::new();
     for record in &kept {
         let read = SignedAddition::from_bytes(&record.record)?.addition;
+        // The one rule says that a record fails for the bound only
+        // where nothing else keeps it out ([`Counting::why_not`]): its
+        // key is not removed and does not count, and **its adder may
+        // add,** being a device of the statement, or a key that counts
+        // and that such a device added. Whoever the adder is, of those.
         let only_for_room = !record.counted
-            && statement.lists(&record.adder)
             && counting.why_not(&record.key, &record.adder) == Some(NotCounted::NoRoom);
         if only_for_room {
             let by = no_room.entry(record.key).or_default();
@@ -503,19 +508,25 @@ pub fn takes(rows: &[Row], answers: &[Answer]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// The device of the statement for whose record the row at `at` is asked
-/// about though it does not count (decision 2026-10-04 §9, step 3), with
-/// when that record says it was added: the key fails only for the bound
-/// of 64 counted devices ([`Row::no_room`]), and this device signed a
-/// record of it and was said to be one that the person still has, or
-/// that is lost or broken. The first such, in order of key. `answers`
-/// are those given so far: every device of the statement is asked about
-/// before any other row.
+/// The key for whose record the row at `at` is asked about though it
+/// does not count (decision 2026-10-04 §9, step 3), with when that
+/// record says it was added: the row's key fails only for the bound of
+/// 64 counted devices ([`Row::no_room`]), and this key signed a record of
+/// it, **was said to be one that the person still has, or that is lost
+/// or broken, and is not in someone else's hands** ([`in_other_hands`]
+/// of its own row: by what was said of it, of the device that added it,
+/// and of the device that added that one). The first such, in order of
+/// key.
+///
+/// `answers` are those given so far. A key that signed such a record may
+/// add, so it counts: its row comes before every row that does not
+/// count, and it was asked about, with the device that added it, before
+/// this row is reached.
 ///
 /// `None` for a row that counts, which is asked about as that; for a
-/// record that does not count for another reason; and where each device
+/// record that does not count for another reason; and where each key
 /// that signed such a record may be in someone else's hands, or has no
-/// answer: what such a device added is not asked about, and nothing is
+/// answer: what such a key added is not asked about, and nothing is
 /// taken from it.
 ///
 /// **So no device pushes another out of a recovery by filling the 64.**
@@ -526,12 +537,13 @@ pub fn takes(rows: &[Row], answers: &[Answer]) -> Vec<[u8; 32]> {
 /// comes in by the command that names a removed key, with the phrase.
 pub fn asked_for_room(rows: &[Row], answers: &[Answer], at: usize) -> Option<([u8; 32], u64)> {
     let row = rows.get(at).filter(|row| !row.counts)?;
-    let said_of = |adder: &[u8; 32]| {
-        let place = rows.iter().position(|row| row.key == *adder)?;
-        answers.get(place).copied()
+    let not_in_other_hands = |(adder, _): &&([u8; 32], u64)| {
+        let Some(place) = rows.iter().position(|row| row.key == *adder) else {
+            return false;
+        };
+        let said = matches!(answers.get(place), Some(Answer::Have | Answer::Lost));
+        said && !in_other_hands(rows, answers, place)
     };
-    let not_in_other_hands =
-        |(adder, _): &&([u8; 32], u64)| matches!(said_of(adder), Some(Answer::Have | Answer::Lost));
     row.no_room.iter().find(not_in_other_hands).copied()
 }
 
@@ -2348,10 +2360,12 @@ mod tests {
     /// wrote comes in by the command that names its key, with the
     /// phrase.
     ///
-    /// Only such a record is asked about so: one that a device of the
-    /// statement signed, for a key that does not count for the bound
-    /// alone. A record that one of the 62 signed is shown as any that
-    /// does not count, after it, and nothing is asked of it.
+    /// A key that counts and that a device of the statement added may add
+    /// too. Two of the 62 signed records: one for the phone, and one for a
+    /// key of nobody's. Each fails for the bound alone, as the record of
+    /// device 1 does, and each is asked about under its adder only where
+    /// that adder, and device 0, which added it, are not in someone
+    /// else's hands.
     #[actix_web::test]
     async fn test_a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() {
         use Answer::{Have, Lost, OtherHands};
@@ -2393,8 +2407,12 @@ mod tests {
         personal.push(record_by(&s[1].identity, counted_twice, "added 0, again"));
         // And two of the 62, which device 0 added, signed records: one
         // for the phone, and one for a key of nobody's. Neither is a
-        // device of the statement.
+        // device of the statement, and each may add.
         let nobody = identity_of(600).public_key();
+        let (k1001, k1002) = (
+            identity_of(1_001).public_key(),
+            identity_of(1_002).public_key(),
+        );
         personal.push(record_by(&identity_of(1_001), phone_key, "their phone"));
         personal.push(record_by(&identity_of(1_002), nobody, "nobody"));
         // What the phone wrote in `lab`, as the relay holds it.
@@ -2406,30 +2424,44 @@ mod tests {
         let statement_key = *phrase().statement_key().unwrap();
         let read =
             read_generation(&from, &statement_key, &s[0].secret(), &personal, s.now).unwrap();
-        // The two devices, the 62 that count, and then the phone: with
-        // the device of the statement that added it, and that only the
-        // bound kept it out. One row for a key.
+        // The two devices, the 62 that count, and then the phone and
+        // the key of nobody's, in order of key: each with the keys that
+        // added it, and that only the bound kept it out. One row for a
+        // key: of the phone's two records, the one whose adder has the
+        // lower key is shown.
         let counted = cordelia_core::protocol::MAX_COUNTED_DEVICES;
         assert_eq!(counted, 64);
         assert_eq!(read.rows.len(), counted + 2);
         assert_eq!((read.rows[0].key, read.rows[1].key), (k0, k1));
         let all_count = |rows: &[Row]| rows.iter().all(|row| row.counts && row.no_room.is_empty());
         assert!(all_count(&read.rows[..counted]));
-        let last = &read.rows[counted];
-        assert_eq!((last.key, last.label.as_str()), (phone_key, "phone"));
-        assert!(!last.counts);
-        assert_eq!(last.added_by, Some((k1, AT)));
-        assert_eq!(last.no_room, [(k1, AT)]);
-        // After it, the record that no device of the statement signed:
-        // it does not count, and is no such record.
-        let other = &read.rows[counted + 1];
+        let place = |key: [u8; 32]| read.rows.iter().position(|row| row.key == key).unwrap();
+        let (phone_at, nobody_at) = (place(phone_key), place(nobody));
+        let mut after_those_that_count = [phone_at, nobody_at];
+        after_those_that_count.sort_unstable();
+        assert_eq!(after_those_that_count, [counted, counted + 1]);
+        assert_eq!(phone_at < nobody_at, phone_key < nobody);
+        let of_the_phone = &read.rows[phone_at];
+        let (shown_by, phone_label) = match k1 < k1001 {
+            true => (k1, "phone"),
+            false => (k1001, "their phone"),
+        };
+        assert_eq!(of_the_phone.label, phone_label);
+        assert!(!of_the_phone.counts);
+        assert_eq!(of_the_phone.added_by, Some((shown_by, AT)));
+        let mut by = vec![(k1, AT), (k1001, AT)];
+        by.sort_unstable();
+        assert_eq!(of_the_phone.no_room, by);
+        // The record that one of the 62 signed for a key of nobody's
+        // fails for the bound alone too: its adder may add.
+        let other = &read.rows[nobody_at];
         assert_eq!((other.key, other.counts), (nobody, false));
-        assert!(other.no_room.is_empty());
-        // The room for removed keys is worked out with it, before
+        assert_eq!(other.no_room, [(k1002, AT)]);
+        // The room for removed keys is worked out with both, before
         // anything is asked.
         assert_eq!(
             room(&statement, None, &read.rows, &[9; 32]).asked,
-            counted + 1
+            counted + 2
         );
 
         // What is said of the two devices, and of the 62: each of those
@@ -2440,31 +2472,62 @@ mod tests {
             answers
         };
         // The phone is asked about where device 1 was not said to be in
-        // someone else's hands, whatever was said of device 0.
+        // someone else's hands, whatever was said of device 0: the other
+        // key that added it, one of the 62, may be in someone else's
+        // hands here.
         for of_0 in [Have, Lost, OtherHands] {
             for (of_1, asked) in [(Have, true), (Lost, true), (OtherHands, false)] {
                 let so_far = said(of_0, of_1);
-                let under = asked_for_room(&read.rows, &so_far, counted);
+                let under = asked_for_room(&read.rows, &so_far, phone_at);
                 assert_eq!(under, asked.then_some((k1, AT)), "{of_0:?} {of_1:?}");
+                // Nothing is asked of what such a key added.
+                assert_eq!(asked_for_room(&read.rows, &so_far, nobody_at), None);
             }
         }
+        // Where device 1 may be in someone else's hands, the phone is
+        // asked about for the record of the other key that added it:
+        // where that key, and device 0, which added it, are not.
+        let with_the_62 = |of_0: Answer, of_1: Answer, of_the_62: Answer| -> Vec<Answer> {
+            let mut answers = vec![of_0, of_1];
+            answers.extend(vec![of_the_62; counted - 2]);
+            answers
+        };
+        for (of_0, of_the_62, asked) in [
+            (Lost, Lost, true),
+            (Have, Have, true),
+            (Lost, OtherHands, false),
+            (OtherHands, Lost, false),
+            (OtherHands, Have, false),
+        ] {
+            let so_far = with_the_62(of_0, OtherHands, of_the_62);
+            let (of_the_phone, of_nobody) = (
+                asked_for_room(&read.rows, &so_far, phone_at),
+                asked_for_room(&read.rows, &so_far, nobody_at),
+            );
+            let why = format!("{of_0:?} {of_the_62:?}");
+            assert_eq!(of_the_phone, asked.then_some((k1001, AT)), "{why}");
+            assert_eq!(of_nobody, asked.then_some((k1002, AT)), "{why}");
+        }
         // Not before its adder was asked about. A row that counts is
-        // asked about as that. And nothing is asked of a record that
-        // does not count for another reason, whatever was said.
-        assert_eq!(asked_for_room(&read.rows, &[], counted), None);
-        assert_eq!(asked_for_room(&read.rows, &[OtherHands], counted), None);
+        // asked about as that.
+        assert_eq!(asked_for_room(&read.rows, &[], phone_at), None);
+        assert_eq!(asked_for_room(&read.rows, &[OtherHands], phone_at), None);
         assert_eq!(asked_for_room(&read.rows, &said(Lost, Lost), 1), None);
         let all_lost = vec![Lost; counted + 2];
-        assert_eq!(asked_for_room(&read.rows, &all_lost, counted + 1), None);
+        assert_eq!(
+            asked_for_room(&read.rows, &all_lost, nobody_at),
+            Some((k1002, AT))
+        );
         assert_eq!(asked_for_room(&read.rows, &all_lost, counted + 2), None);
-        assert!(!gone(&read.rows, &all_lost).contains(&nobody));
-        assert_eq!(gone(&read.rows, &all_lost).len(), counted + 1);
+        assert!(gone(&read.rows, &all_lost).contains(&nobody));
+        assert_eq!(gone(&read.rows, &all_lost).len(), counted + 2);
 
         // As answered: gone removes it, and the look takes nothing from
         // it, whatever is said.
         let with = |of_1: Answer, of_the_phone: Answer| -> Vec<Answer> {
             let mut answers = said(OtherHands, of_1);
-            answers.push(of_the_phone);
+            answers.extend([Have, Have]);
+            answers[phone_at] = of_the_phone;
             answers
         };
         assert!(gone(&read.rows, &with(Lost, Lost)).contains(&phone_key));
@@ -2487,7 +2550,11 @@ mod tests {
             }
         });
         assert_eq!(made.shown.gone.len(), counted + 1);
-        assert!(made.shown.gone.contains(&(phone_key, "phone".to_string())));
+        assert!(
+            made.shown
+                .gone
+                .contains(&(phone_key, phone_label.to_string()))
+        );
         assert!(made.shown.still_have.is_empty());
         let (number, to_look) = follows(&node, &made).unwrap();
         assert_eq!(to_look.takes, [k1]);
@@ -2495,6 +2562,9 @@ mod tests {
             let conn = db(&node.state);
             let held = person::held(&conn).unwrap().unwrap();
             assert!(held.statement.statement.removes(&phone_key));
+            // The key of nobody's was not asked about: the key that
+            // added it may be in someone else's hands.
+            assert!(!held.statement.statement.removes(&nobody));
         }
         // The look takes what device 1 wrote, and nothing of the phone:
         // it says how much the phone signed that the new channels lack.
@@ -2509,13 +2579,13 @@ mod tests {
         let of_the_phone = of_the_phone.unwrap_or_else(|| panic!("{found}"));
         assert_eq!(
             (&of_the_phone["label"], &of_the_phone["versions"]),
-            (&json!("phone"), &json!(1))
+            (&json!(phone_label), &json!(1))
         );
         assert_eq!(of_the_phone["names"], json!([LAB]));
 
         // Its key is a removed key: what it wrote comes in by the
         // command that names it, with the phrase.
-        let said = carrying::look_from(&node.state, LAB, &["phone".to_string()])
+        let said = carrying::look_from(&node.state, LAB, &[phone_label.to_string()])
             .await
             .unwrap();
         assert_eq!(said["empty"], 1, "{said}");
@@ -2530,6 +2600,187 @@ mod tests {
         let done = carrying::take_from(&node.state, &word).await.unwrap();
         assert_eq!(done["carried"], 1, "{done}");
         assert_eq!(node.text(LAB, "p.md").as_deref(), Some("of the phone"));
+    }
+
+    /// **A device added since, kept out by the 64, is asked about where
+    /// its adder may add** (decision 2026-10-04 §9, step 3): also where
+    /// that adder is no device of the statement, but a key that counts
+    /// and that a device of the statement added. A chain is two long.
+    ///
+    /// A statement lists device 0 and device 1. Device 0 added 61 keys
+    /// since, a desktop among them, and all of them count. The desktop
+    /// added two: the first that is read counts, as the 64th, and the
+    /// other, a tablet, finds no room. The one that counts added a third
+    /// key: it may not add, and that record fails for that.
+    ///
+    /// The tablet is asked about under the desktop, where the desktop
+    /// was said to be one that the person still has, or that is lost or
+    /// broken, and neither it nor device 0, which added it, may be in
+    /// someone else's hands. In each case the look takes nothing from
+    /// the tablet, and it is a removed key only where it was asked about
+    /// and said to be gone. A name that only the tablet listed is not
+    /// carried, and is named among the names that are left.
+    #[test]
+    fn test_a_device_kept_out_by_the_64_is_asked_about_where_its_adder_may_add() {
+        use Answer::{Have, Lost, NotAsked, OtherHands};
+        const AT: u64 = 1_800_000_000;
+        let gone_two = two_gone();
+        let s = &gone_two.s;
+        let (k0, k1) = (s.key(0), s.key(1));
+        let from = candidate(&s[0].latest());
+        let statement = from.statement.statement.clone();
+        let listed: Vec<[u8; 32]> = statement.devices.iter().map(|one| one.key).collect();
+        assert_eq!(listed, [k0, k1]);
+        let band = 2u64 << cordelia_core::protocol::REV_COUNT_BITS;
+        let personal_secret = s[0].personal();
+        let record_by = |adder: &NodeIdentity, key: [u8; 32], label: &str| {
+            let device = Device::new(key, label).unwrap();
+            let record = Addition::under(&statement, device, adder.public_key(), AT)
+                .unwrap()
+                .sign(adder)
+                .unwrap();
+            entry_by(
+                adder,
+                &personal_secret,
+                band + 1,
+                &added_name(&key).unwrap(),
+                Value::Other(record.to_bytes().unwrap()),
+                &[],
+            )
+        };
+        let desktop = identity_of(700);
+        let kx = desktop.public_key();
+        let (one, other) = (identity_of(701), identity_of(702));
+        let third = identity_of(703).public_key();
+        let base = {
+            let mut personal = gone_two.at_the_relay[1].1.clone();
+            for n in 0..60u16 {
+                let key = identity_of(1_000 + n).public_key();
+                personal.push(record_by(&s[0].identity, key, &format!("added {n}")));
+            }
+            personal.push(record_by(&s[0].identity, kx, "desktop"));
+            personal.push(record_by(&desktop, one.public_key(), "one"));
+            personal.push(record_by(&desktop, other.public_key(), "another"));
+            personal
+        };
+        let statement_key = *phrase().statement_key().unwrap();
+        let reads = |handed: &[CheckedEntry]| {
+            read_generation(&from, &statement_key, &s[0].secret(), handed, s.now).unwrap()
+        };
+        // Of the two that the desktop added, the first that is read
+        // counts, and the other is the tablet.
+        let first = reads(&base);
+        let counts = |key: [u8; 32]| first.rows.iter().any(|row| row.key == key && row.counts);
+        let (counted_one, tablet) = match counts(one.public_key()) {
+            true => (&one, &other),
+            false => (&other, &one),
+        };
+        let (ky, kt) = (counted_one.public_key(), tablet.public_key());
+        assert!(counts(ky) && !counts(kt));
+        // The one that counts adds a third key, and the tablet says that
+        // it syncs a name of its own.
+        let mut personal = base.clone();
+        personal.push(record_by(counted_one, third, "third"));
+        let word = names::word_name("theirs");
+        let personal_channel = derive::personal_secret(&s[0].secret()).unwrap();
+        personal.push(entry_by(
+            tablet,
+            &personal_channel,
+            band + 1,
+            &word,
+            text("it syncs this"),
+            &[],
+        ));
+        let read = reads(&personal);
+
+        // Both devices, the 62 that count, the tablet, and the third.
+        let counted = cordelia_core::protocol::MAX_COUNTED_DEVICES;
+        assert_eq!(read.rows.len(), counted + 2);
+        assert!(read.rows[..counted].iter().all(|row| row.counts));
+        let place = |key: [u8; 32]| read.rows.iter().position(|row| row.key == key).unwrap();
+        let (x_at, t_at, third_at) = (place(kx), place(kt), place(third));
+        // The desktop is a row that counts, under device 0, and so comes
+        // before every row that does not count: it is asked about before
+        // the tablet is reached.
+        assert_eq!(read.rows[x_at].added_by, Some((k0, AT)));
+        assert!(x_at < counted && place(ky) == x_at + 1);
+        assert_eq!((t_at, third_at), (counted, counted + 1));
+        let of_the_tablet = &read.rows[t_at];
+        assert!(!of_the_tablet.counts);
+        assert_eq!(of_the_tablet.added_by, Some((kx, AT)));
+        assert_eq!(of_the_tablet.no_room, [(kx, AT)]);
+        // The third: its adder counts, and was added by a device added
+        // since, so it may not add. The record fails for that, and not
+        // for the bound: nothing is asked of it, whatever was said.
+        let of_the_third = &read.rows[third_at];
+        assert_eq!(of_the_third.added_by, Some((ky, AT)));
+        assert!(!of_the_third.counts && of_the_third.no_room.is_empty());
+        assert_eq!(
+            room(&statement, None, &read.rows, &[9; 32]).asked,
+            counted + 1
+        );
+
+        // What was said of device 0, of the desktop, and then of the
+        // tablet: every other row is lost.
+        let said = |of_0: Answer, of_x: Answer, of_t: Option<Answer>| -> Vec<Answer> {
+            let mut answers = vec![Lost; counted];
+            (answers[0], answers[x_at]) = (of_0, of_x);
+            answers.extend(of_t);
+            answers
+        };
+        let asked =
+            |of_0: Answer, of_x: Answer| asked_for_room(&read.rows, &said(of_0, of_x, None), t_at);
+        // Asked about: the desktop may add, and neither it nor the
+        // device that added it may be in someone else's hands.
+        for (of_0, of_x) in [(Lost, Lost), (Have, Lost), (Lost, Have), (Have, Have)] {
+            assert_eq!(asked(of_0, of_x), Some((kx, AT)), "{of_0:?} {of_x:?}");
+        }
+        // Its adder may be in someone else's hands: not asked.
+        for of_0 in [Have, Lost, OtherHands] {
+            assert_eq!(asked(of_0, OtherHands), None, "{of_0:?}");
+        }
+        // The device that added its adder may be: not asked.
+        for of_x in [Have, Lost] {
+            assert_eq!(asked(OtherHands, of_x), None, "{of_x:?}");
+        }
+        // Nor before its adder was asked about.
+        assert_eq!(asked_for_room(&read.rows, &[Lost, Lost], t_at), None);
+        // The third is asked about in none of them.
+        let all_lost = vec![Lost; counted + 2];
+        assert_eq!(asked_for_room(&read.rows, &all_lost, third_at), None);
+        assert!(!gone(&read.rows, &all_lost).contains(&third));
+
+        // In each of the three, the look takes nothing from the tablet,
+        // whatever is said of it: and it is a removed key only where it
+        // was asked about and said to be gone.
+        for (of_0, of_x, is_asked) in [
+            (Lost, Lost, true),
+            (Lost, OtherHands, false),
+            (OtherHands, Lost, false),
+        ] {
+            for of_t in [Have, Lost, OtherHands, NotAsked] {
+                let answers = said(of_0, of_x, Some(of_t));
+                let why = format!("{of_0:?} {of_x:?} {of_t:?}");
+                assert!(!takes(&read.rows, &answers).contains(&kt), "{why}");
+                let goes = is_asked && matches!(of_t, Lost | OtherHands);
+                assert_eq!(gone(&read.rows, &answers).contains(&kt), goes, "{why}");
+            }
+        }
+
+        // A name that only the tablet listed: its word is not taken,
+        // since its key does not count. The recovery does not carry the
+        // name, and names it among those it left: where the tablet was
+        // asked about and said to be lost, and where it was not asked.
+        assert!(read.names.contains(&("theirs".to_string(), Vec::new())));
+        assert!(!first.names.iter().any(|(name, _)| name == "theirs"));
+        for (of_x, of_t) in [(Lost, Lost), (Lost, Have), (OtherHands, NotAsked)] {
+            let mut answers = said(Lost, of_x, Some(of_t));
+            answers.push(NotAsked);
+            let names = names_in_order(&read, &answers, &[], RECOVERY_MAX_NAMES);
+            assert!(!names.carried.contains(&"theirs".to_string()), "{names:?}");
+            assert_eq!(names.only_other_hands, ["theirs"], "{of_x:?} {of_t:?}");
+            assert!(names.over_the_bound.is_empty());
+        }
     }
 
     /// Whether the answers of a recovery could all be kept is worked out
