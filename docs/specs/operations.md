@@ -96,12 +96,15 @@ cordelia init
 ### 1.5 Uninstall
 
 ```bash
-cordelia stop                          # stop the daemon
-rm -rf ~/.cordelia/bin/                # remove binary
-# Remove service:
+# Stop the node and remove its service:
 #   macOS: launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist
+#          rm ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist
 #   Linux: systemctl --user disable --now cordelia
+#          rm ~/.config/systemd/user/cordelia.service && systemctl --user daemon-reload
+rm -rf ~/.cordelia/bin/                # remove the binary
 ```
+
+`cordelia stop` is not implemented: the node is stopped through its service.
 
 Data directory (`~/.cordelia/`) is preserved by default. The user must explicitly delete it to remove keys and data.
 
