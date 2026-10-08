@@ -457,6 +457,13 @@ fn mapped_names(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
 ///   ([`crate::names::stop`]). What it kept of which relays had handed
 ///   the name's channel goes too: mapped again, the channel is fetched
 ///   before the folder's first cycle there (§6).
+/// - **But a name that a carry or a recovery holds is not let go with a
+///   folder that was mapped to it** ([`crate::names::carried`], decision
+///   2026-10-04 §16): what was brought in there, and no relay was sent,
+///   is nowhere else in the generation applied. The name is then held as
+///   it was before the folder was mapped, with everything its channel
+///   holds, and is let go by its name, where nothing of it waits to be
+///   sent ([`let_go_of_a_carried_name`]).
 /// - With sync on, it holds each name that is mapped, and says that it
 ///   syncs it ([`crate::names::hold_mapped`]).
 /// - With sync off, it says of no name that it syncs it
@@ -470,7 +477,11 @@ pub fn names_follow(state: &AppState, db: &rusqlite::Connection, before: &[Strin
     let now = chrono::Utc::now().timestamp();
     let done = || -> Result<(), crate::person::PersonError> {
         let mapped = mapped_names(db).unwrap_or_default();
-        for name in before.iter().filter(|name| !mapped.contains(name)) {
+        // A name that a carry or a recovery holds stays held when its
+        // folder is unmapped.
+        let carried = crate::names::carried(db)?;
+        let let_go = |name: &&String| !mapped.contains(name) && !carried.contains(*name);
+        for name in before.iter().filter(let_go) {
             if let Some(channel) = crate::names::stop(db, &state.identity, name, now)? {
                 state.own_channels.forget_fetched(&channel);
             }
@@ -2436,6 +2447,141 @@ mod tests {
         assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
         assert!(held(&db).is_empty());
         assert!(said(&alone, &db).is_empty());
+    }
+
+    /// **A folder's unmapping does not let go of a name that a carry or a
+    /// recovery holds** (decision 2026-10-04 §16). A name is held by a
+    /// carry, with versions that no relay was sent; a folder is mapped to
+    /// it, and unmapped before its first cycle. The name is then held as
+    /// it was before the folder was mapped: with every version it had,
+    /// said still, and by a carry. Unmapping the name is refused while a
+    /// version of it has been sent to no relay.
+    ///
+    /// Where nothing of the name waits, the folder's unmapping leaves it
+    /// held all the same: it is the unmapping of the name that lets it
+    /// go. A name that no carry holds goes with its folder, as it did.
+    #[test]
+    fn test_a_folders_unmapping_does_not_let_go_of_a_name_that_a_carry_holds() {
+        use crate::several::{Several, state_of};
+        use cordelia_storage::at_relays as kept_rows;
+        use cordelia_storage::person as held_rows;
+        let home = std::path::Path::new("/home/sam");
+        let mut s = Several::of_one_person(1);
+        let now = s.tick();
+        crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "lab", now).unwrap();
+        s.write(0, "lab", "a.md", "brought in by a carry");
+        s.write(0, "lab", "b.md", "and this");
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        let db = state.db.lock().unwrap();
+        let on: SyncClaudeRequest =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+        set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+
+        // One settings command, as its handler runs it.
+        let maps = |folder: &str, name: &str| {
+            let before = mapped_names(&db).unwrap();
+            let body = request(folder, name, false);
+            add_mapping(&state.sync_control, &db, &body, home).unwrap();
+            names_follow(&state, &db, &before);
+        };
+        let unmaps = |word: &str| {
+            let before = mapped_names(&db).unwrap();
+            let body = SyncUnmapRequest {
+                folder: word.to_string(),
+            };
+            remove_mapping(&state.sync_control, &db, &body).unwrap();
+            names_follow(&state, &db, &before);
+        };
+        let held = || -> Vec<String> {
+            let names = held_rows::names(&db).unwrap();
+            names.into_iter().map(|name| name.name).collect()
+        };
+        let said = || -> Vec<String> {
+            let said = crate::names::said_here(&db, &state.identity).unwrap();
+            said.into_iter().collect()
+        };
+        let by_a_carry =
+            || -> Vec<String> { crate::names::carried(&db).unwrap().into_iter().collect() };
+        let lab = held_rows::channel_of_name(&db, "lab").unwrap().unwrap();
+        // The entries that the store holds of the name's channel, each
+        // by what it is named by.
+        let of_lab = || -> Vec<[u8; 32]> {
+            let held = cordelia_storage::entries::channel_entries_after(&db, &lab, 0, 10).unwrap();
+            held.iter().map(|held| held.entry.id()).collect()
+        };
+        let waits = || crate::names::waits_to_be_sent(&db, "lab").unwrap();
+        // The name as the carry holds it, before any folder: with two
+        // versions, which no relay was sent.
+        let as_before_the_folder = || {
+            (
+                held(),
+                said(),
+                by_a_carry(),
+                held_rows::channel_of_name(&db, "lab").unwrap(),
+            )
+        };
+        let before_the_folder = as_before_the_folder();
+        let carried_in = of_lab();
+        let lab_alone = vec!["lab".to_string()];
+        assert_eq!(
+            before_the_folder,
+            (
+                lab_alone.clone(),
+                lab_alone.clone(),
+                lab_alone.clone(),
+                Some(lab)
+            )
+        );
+        assert_eq!((carried_in.len(), waits()), (2, 2));
+        let at = std::time::Instant::now();
+        state.own_channels.fetched_from(&lab, "relay", at);
+
+        // A folder is mapped to the name, and unmapped before its first
+        // cycle: by its folder, and by the name it is mapped to.
+        for unmapped_by in ["/home/sam/notes", "lab"] {
+            maps("/home/sam/notes", "lab");
+            assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
+            unmaps(unmapped_by);
+            assert!(mapped_names(&db).unwrap().is_empty());
+            // Held as it was before the folder, with every version.
+            assert_eq!(as_before_the_folder(), before_the_folder, "{unmapped_by}");
+            assert_eq!(of_lab(), carried_in, "{unmapped_by}");
+            assert_eq!(waits(), 2);
+            assert!(state.own_channels.first_fetch_done(&lab, at));
+        }
+        // Unmapping the name meets the check that is there: it is
+        // refused while a version of it has been sent to no relay.
+        let refusal = let_go_of_a_carried_name(&state, &db, "lab").unwrap_err();
+        let ApiError::Conflict(why) = &refusal else {
+            panic!("{refusal:?}");
+        };
+        assert_eq!(*why, not_let_go_says("lab", 2));
+        assert_eq!(of_lab(), carried_in);
+
+        // A relay is sent what was brought in: nothing of the name
+        // waits. The folder's unmapping leaves the name held all the
+        // same, and the unmapping of the name lets it go.
+        let last = kept_rows::last_taken(&db, &lab).unwrap();
+        kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
+        assert_eq!(waits(), 0);
+        maps("/home/sam/notes", "lab");
+        unmaps("/home/sam/notes");
+        assert_eq!(as_before_the_folder(), before_the_folder);
+        assert_eq!(of_lab(), carried_in);
+        assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+        assert!(held().is_empty() && said().is_empty() && by_a_carry().is_empty());
+        assert!(of_lab().is_empty());
+        assert!(!state.own_channels.first_fetch_done(&lab, at));
+
+        // A name that no carry holds is let go with its folder.
+        maps("/home/sam/work", "team");
+        assert_eq!(
+            (held(), said()),
+            (vec!["team".to_string()], vec!["team".to_string()])
+        );
+        unmaps("/home/sam/work");
+        assert!(held().is_empty() && said().is_empty());
     }
 
     /// A name that the device holds by a carry, with no folder mapped to
