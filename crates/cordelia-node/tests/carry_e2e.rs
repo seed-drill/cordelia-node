@@ -800,6 +800,7 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     let another = "legal winner thank year wave sausage worth useful legal winner thank yellow";
     let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
     at.says("the generations whose secret this device never held")
+        .says("it was off through two changes or more, or was added after a change")
         .says("Read those generations of lab")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")

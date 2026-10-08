@@ -602,6 +602,23 @@ fn not_read_lines(done: &Value) -> Vec<String> {
     lines
 }
 
+/// What `cordelia sync carry <name> --phrase` says before it asks its
+/// yes (decision 2026-10-04 §7.3): which generations it reads, and what
+/// it takes from them. **A device never held a generation's secret where
+/// it was off through two changes or more, or was added after a change.**
+/// One that was off through a single change held the secret before it,
+/// and takes the one after it: a change entry gives a device the new
+/// secret alone, and the earlier ones are in the part for the phrase.
+fn with_the_phrase_says(shown: &str) -> String {
+    format!(
+        "With the recovery phrase, this reads what the relays hold of {shown} in the generations \
+         whose secret this device never held: it was off through two changes or more, or was \
+         added after a change. From those it takes what your devices that count signed, as \
+         `cordelia sync carry {shown}` does from the generations that this device left: what \
+         your own devices wrote, as the relays hold it now."
+    )
+}
+
 /// `cordelia sync carry <name> --phrase`: what your devices that count
 /// signed in the name's channel, in the generations whose secret this
 /// device never held (decision 2026-10-04 §7.3). The part of the change
@@ -613,13 +630,7 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
     refuse_before_a_phrase(config_path)?;
     let own = own_key(config_path)?;
     let shown = file_shown(name);
-    println!(
-        "With the recovery phrase, this reads what the relays hold of {shown} in the generations \
-         whose secret this device never held: it was off through a change, or was added after \
-         one. From those it takes what your devices that count signed, as `cordelia sync carry \
-         {shown}` does from the generations that this device left: what your own devices wrote, \
-         as the relays hold it now."
-    );
+    println!("{}", with_the_phrase_says(&shown));
     if !at.yes(&format!(
         "\nRead those generations of {shown}, and bring in what the new channel lacks?"
     ))? {
@@ -1385,6 +1396,26 @@ mod tests {
             ["lab: nothing was carried: the new channel holds something for this name already."]
         );
         assert_eq!(lines[0].matches("nothing was carried").count(), 1);
+    }
+
+    /// `--phrase` says which devices never held a secret as the code has
+    /// it, and as its help says it (decision 2026-10-04 §7.3): one that
+    /// was off through two changes or more, or was added after a change.
+    /// A device that was off through one change held every secret.
+    #[test]
+    fn test_the_phrase_carry_says_which_devices_never_held_a_secret() {
+        let says = with_the_phrase_says("lab");
+        assert!(
+            says.contains(
+                "in the generations whose secret this device never held: it was off through \
+                 two changes or more, or was added after a change. From those"
+            ),
+            "{says}"
+        );
+        assert!(!says.contains("off through a change"), "{says}");
+        assert!(
+            says.starts_with("With the recovery phrase, this reads what the relays hold of lab ")
+        );
     }
 
     /// With no key, `--from` lists each removed key that signed there,
