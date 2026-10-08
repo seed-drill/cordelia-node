@@ -1411,12 +1411,28 @@ mod tests {
         };
         let after_other = made_after(&other);
         let apart_from_second = made_after(&first);
-        let both = of(&[&fourth, &after_other, &other]).unwrap();
+        // Each of the two at number 4 has a change behind it that is off
+        // the other's chain: the third is behind the fourth, and the
+        // other behind the one made after it. Which of the two is first
+        // goes by the hash of its statement, and a change is made with a
+        // new secret: it is the one in one run and the other in the
+        // next. Both of those behind are handed, so that whichever is
+        // the second, the one behind it is among those apart from the
+        // first, and is counted as nothing.
+        let both = of(&[&fourth, &after_other, &other, &third]).unwrap();
         let (second_of, on_neither) = both.second().unwrap();
         let two = [both.from.entry.id(), second_of.entry.id()];
         assert!(two.contains(&fourth.id()) && two.contains(&after_other.id()));
+        let behind_the_second = match second_of.entry.id() == fourth.id() {
+            true => third.id(),
+            false => other.id(),
+        };
+        let apart: Vec<[u8; 32]> = both.apart.iter().map(|c| c.entry.id()).collect();
+        assert_eq!(apart, [second_of.entry.id(), behind_the_second]);
         assert_eq!(on_neither, 0);
-        let three = of(&[&fourth, &after_other, &other, &apart_from_second]).unwrap();
+        let all = [&fourth, &after_other, &other, &third, &apart_from_second];
+        let three = of(&all).unwrap();
+        assert_eq!(three.apart.len(), 3);
         assert_eq!(three.second().unwrap().1, 1);
     }
 
@@ -2736,6 +2752,11 @@ mod tests {
         // it syncs a name of its own.
         let mut personal = base.clone();
         personal.push(record_by(counted_one, third, "third"));
+        // It signs a record for the tablet too. It may not add, so that
+        // record fails for that, and not for the bound: the tablet's row
+        // is by the record that fails only for the bound, which the
+        // desktop signed, whichever of the two keys is the lower.
+        personal.push(record_by(counted_one, kt, "the tablet, by another"));
         let word = names::word_name("theirs");
         let personal_channel = derive::personal_secret(&s[0].secret()).unwrap();
         personal.push(entry_by(
@@ -2763,6 +2784,7 @@ mod tests {
         let of_the_tablet = &read.rows[t_at];
         assert!(!of_the_tablet.counts);
         assert_eq!(of_the_tablet.added_by, Some((kx, AT)));
+        assert_ne!(of_the_tablet.label, "the tablet, by another");
         assert_eq!(of_the_tablet.no_room, [(kx, AT)]);
         // The third: its adder counts, and was added by a device added
         // since, so it may not add. The record fails for that, and not
