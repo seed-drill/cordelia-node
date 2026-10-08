@@ -1125,9 +1125,10 @@ of the device's own. Nothing of the older kind is read.
 | `POST /api/v1/devices/forget` | The device forgets what it holds of its person, and then follows no phrase: for a device that is given a new key |
 
 A refusal says the way on in its message: "this device follows no recovery
-phrase yet. Make one here (`cordelia phrase`), or add this device from one
-that has one", and so on. What a person did that is refused is `400`, and what
-changed under a prompt is `409`.
+phrase yet", with the three ways on that a status names, each on a line of
+its own (make a phrase here, add this machine from one that has the phrase,
+or recover here with `cordelia recover`), and so on. What a person did that
+is refused is `400`, and what changed under a prompt is `409`.
 
 **A carry that a person asks for, and recovery** (decision 2026-10-04 §7.3,
 §9). The command reads the recovery phrase, as the commands above do. What a

@@ -82,9 +82,15 @@ them where only you can read them.
     say that a word is not the one you were shown at that number. It says so
     after a short pause, and asks again. At the third such word in all the
     command stops and nothing is made: run it again.
-- Until a machine has a phrase, or is added from one that has, its memory
-  stays on it: sync can be on and folders mapped, and nothing is sent.
-  `cordelia status` says "no recovery phrase yet".
+- Until a machine follows a phrase its memory stays on it: sync can be on
+  and folders mapped, and nothing is sent. `cordelia status` says "no
+  recovery phrase yet", and names three ways on, in this order:
+  - **This is your first machine:** make a phrase here (`cordelia phrase`).
+  - **Another machine has the phrase:** add this one from it (`cordelia
+    add-device` there, `cordelia accept` here: see below).
+  - **Every device that has the phrase is lost:** recover here with it
+    (`cordelia recover`). Do not make a new phrase first: `cordelia recover`
+    refuses a machine that follows one.
 
 Make the phrase on the machine whose memory is the most up to date: what it
 holds becomes the first version of each file that your other machines meet.

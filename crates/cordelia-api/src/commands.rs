@@ -105,10 +105,13 @@ pub(crate) fn refused(e: PersonError) -> ApiError {
 /// A refusal in words that say the way on.
 fn says(e: &PersonError) -> String {
     match e {
-        PersonError::FollowsNoPhrase => "this device follows no recovery phrase yet. Make one \
-                                         here (`cordelia phrase`), or add this device from one \
-                                         that has one."
-            .into(),
+        // The three ways on, each on a line of its own: a person who
+        // has lost every device is pointed to `cordelia recover`, and
+        // not to a new phrase.
+        PersonError::FollowsNoPhrase => format!(
+            "this device follows no recovery phrase yet.\n{}",
+            crate::look::WAYS_ON
+        ),
         PersonError::Stopped(State::Fork) => "two changes were made apart, and this device has \
                                               seen both: settle it with the phrase first \
                                               (`cordelia settle`)."

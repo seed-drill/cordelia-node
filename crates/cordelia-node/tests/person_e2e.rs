@@ -114,10 +114,18 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
         status.contains("Devices:   no recovery phrase yet"),
         "{status}"
     );
+    // Where it stands, and then the three ways on, each on a line of
+    // its own and in this order: a person who has lost every device is
+    // pointed to `cordelia recover`, and told to make no new phrase
+    // first.
     assert!(
         status.contains(
-            "no recovery phrase yet: memory stays on this machine. Make one here (`cordelia \
-             phrase`), or add this machine from one that has one."
+            "    no recovery phrase yet: memory stays on this machine.\n      \
+             - This is your first machine: make a phrase here (`cordelia phrase`).\n      \
+             - Another machine has the phrase: add this one from it (`cordelia add-device` \
+             there, `cordelia accept` here).\n      \
+             - Every device that has the phrase is lost: recover here with it (`cordelia \
+             recover`). Do not make a new phrase first.\n"
         ),
         "{status}"
     );
@@ -129,8 +137,17 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     assert_eq!(json["sync"]["moved_on"], false, "{json}");
     let says = json["person"]["says"][0].as_str().unwrap();
     assert!(says.starts_with("no recovery phrase yet:"), "{json}");
+    assert_eq!(
+        json["person"]["says"].as_array().unwrap().len(),
+        4,
+        "{json}"
+    );
     let devices = laptop.cli(&["devices"]);
     assert!(devices.contains("no recovery phrase yet:"), "{devices}");
+    assert!(
+        devices.contains("\n  - Every device that has the phrase is lost: recover here"),
+        "{devices}"
+    );
 
     // The phrase, made at a terminal.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
@@ -151,6 +168,17 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
          - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's \
          words here.\r\n";
     assert!(said.starts_with(before_anything), "{said:?}");
+    // On a machine that follows no phrase: a person who has a phrase
+    // already, and has lost every device, is pointed to `cordelia
+    // recover` before any word of a new phrase is shown.
+    let has_one_already = "\r\nIf you have a recovery phrase already and every device is lost, \
+         do not make a new one.\r\nPress Ctrl-C, and recover with the phrase you have:\r\n  \
+         cordelia recover\r\n";
+    let pointed_at = said.find(has_one_already).expect("the way to recover");
+    assert!(
+        pointed_at < said.find("Your recovery phrase (shown once):").unwrap(),
+        "{said:?}"
+    );
     for says in [
         "Your recovery phrase (shown once):\r\n\r\n   1. ",
         "Write the twelve words down, in order. Keep them where only you can read them.\r\n\
@@ -597,7 +625,11 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // refusal says the way on.
     let said = laptop.at_terminal(&["add-device", &other]).refused();
     assert!(
-        said.contains("this device follows no recovery phrase yet. Make one here"),
+        said.contains("this device follows no recovery phrase yet.\r\n  - This is your first"),
+        "{said}"
+    );
+    assert!(
+        said.contains("recover here with it (`cordelia recover`). Do not make a new phrase first."),
         "{said}"
     );
     // Nor removed, renewed or settled.
