@@ -18,10 +18,11 @@
 //! is run by mistake, and nothing else.
 //!
 //! **The recovery phrase stays in this process** (§5). It is made here
-//! (`cordelia phrase`), or typed here with echo off (`remove-device`,
-//! `renew`, `settle`), and is in memory that is overwritten when it is
-//! dropped. It is never an argument, is never sent to the node, and is
-//! in no error and no file. A command that needs it:
+//! (`cordelia phrase`), or typed here with echo off, one word at a time
+//! (`remove-device`, `renew`, `settle`), and is in memory that is
+//! overwritten when it is dropped. It is never an argument, is never
+//! sent to the node, and is in no error and no file. A command that
+//! needs it:
 //!
 //! 1. is handed by the node what is to be signed over: the statement
 //!    that the device has applied and the change entry it keeps, as their
@@ -42,12 +43,13 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use cordelia_api::change::{Prepared, prepare_change, prepare_settlement};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
-use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS};
+use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS};
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -62,15 +64,15 @@ use crate::{
     refuse_before_a_phrase,
 };
 
-/// Whose words a recovery phrase is, and what it is for: said wherever
-/// one is made (decision 2026-10-04 §5).
+/// What a recovery phrase is for, who has it, and that it is no wallet's:
+/// said wherever one is made (decision 2026-10-04 §5).
 const WHOSE_WORDS: &str = "\
-A recovery phrase is twelve words. They are Cordelia's recovery phrase for your devices.
-The words are from the list that a wallet's seed phrase uses, and are no wallet's: never
-type these into a wallet, and never type a wallet's words here.
+Your recovery phrase is twelve words.
 
-Without the phrase a device can be added, and none can ever be removed or recovered.
-Nobody else holds it, and this device does not keep it: it is shown once, now.";
+  - You need it to remove a device, or to recover on a new machine.
+    (You can add a device without it.)
+  - Nobody else has it, and this device does not keep it. It is shown once, now.
+  - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's words here.";
 
 /// What is said where a person did not say yes.
 pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
@@ -373,9 +375,16 @@ fn alone_says(seen: &Value, from: &str) -> String {
 /// `cordelia phrase`: make the recovery phrase of this person's devices
 /// here (decision 2026-10-04 §5, §5.2).
 ///
-/// The phrase is made in this process, shown once, and typed back whole
-/// before anything is made. The node is handed the first statement's
-/// change entry and the statement key, and never the words.
+/// The phrase is made in this process, shown once with each word's
+/// number, and typed back whole, a word at a time, before anything is
+/// made. The node is handed the first statement's change entry and the
+/// statement key, and never the words.
+///
+/// **Each word typed back is held against the word that was shown at its
+/// number** (decision 2026-10-04 §16), here and at no other command: a
+/// phrase written down wrongly is found out word by word. The third
+/// word that is not the word shown stops the command, and nothing is
+/// made ([`Terminal::phrase_back`]).
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
     refuse_before_a_phrase(config_path)?;
@@ -424,28 +433,25 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 
     let phrase = Phrase::generate()?;
     at.once(
-        "The recovery phrase, shown once:",
-        phrase.words()?.as_str(),
-        "Write the twelve words down, in their order, and keep them where only you can \
-         read them.\nPress Enter when they are written down: they are then taken off the \
-         screen. ",
+        "Your recovery phrase (shown once):",
+        numbered(phrase.words()?.as_str()).as_str(),
+        "Write the twelve words down, in order. Keep them where only you can read them.\n\
+         Press Enter when you have. The words are then cleared from the screen. ",
     )?;
     let made = {
-        let typed = at.phrase(
-            "Type the twelve words back, from what you wrote (what you type is not shown): ",
+        // Each word is held against the word shown by its place in the
+        // list: the words themselves are not set beside each other.
+        let typed_back = at.phrase_back(
+            "Now type the words back, one at a time. What you type is not shown.",
+            &*phrase.places()?,
         )?;
-        // The same words give the same key: the words themselves are
-        // not set beside each other.
-        let same = Phrase::parse(&typed)
-            .ok()
-            .and_then(|typed| Some(typed.public_key().ok()? == phrase.public_key().ok()?));
-        if same != Some(true) {
+        if !typed_back {
             anyhow::bail!(
-                "the words typed are not the words that were shown. Nothing was made, and the \
-                 words that were shown are no phrase of anything: do not keep them. Run \
-                 `cordelia phrase` again."
+                "Three words did not match. Nothing was made, and the words you were shown are \
+                 not a recovery phrase: do not keep them. Run `cordelia phrase` again."
             );
         }
+        println!("\nAll twelve match.");
         first_entry(&phrase, &this_device, &label)?
     };
     // The phrase has signed and sealed: it is dropped here, and
@@ -495,6 +501,32 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          key>`."
     );
     Ok(())
+}
+
+/// The twelve `words` as they are shown: each with its number, four to a
+/// row, the columns lined up. So the numbers that a person writes down
+/// are the numbers that the words are asked for by.
+///
+/// The text is overwritten when it is dropped, and is never moved as it
+/// grows: it has room for sixteen bytes a word, which is a number, a full
+/// stop and a space, the eight letters of the longest word, and what
+/// parts it from the next.
+fn numbered(words: &str) -> Zeroizing<String> {
+    use std::fmt::Write;
+    let (in_a_row, longest, between) = (4, 8, 3);
+    let mut rows = Zeroizing::new(String::with_capacity(PHRASE_WORDS * 16));
+    let mut after_the_last = 0;
+    for (at, word) in words.split(' ').enumerate() {
+        match at % in_a_row {
+            0 if at == 0 => rows.push_str("  "),
+            0 => rows.push_str("\n  "),
+            _ => rows.extend(std::iter::repeat_n(' ', after_the_last)),
+        }
+        // Written where it is: no copy of a word is made on the way.
+        let _ = write!(rows, "{:>2}. {word}", at + 1);
+        after_the_last = longest.max(word.len()) - word.len() + between;
+    }
+    rows
 }
 
 // ── cordelia add-device ─────────────────────────────────────────────
@@ -1817,8 +1849,14 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
     Ok(out)
 }
 
-/// Ask for the recovery phrase at the terminal: twelve words, typed with
-/// echo off. It is the one way that a command reads a phrase.
+/// Ask for the recovery phrase at the terminal: twelve words, each asked
+/// for by its number and typed with echo off. It is the one way that a
+/// command reads a phrase that is to be proved.
+///
+/// **Nothing is said of any word but that it is a word of the list**
+/// (decision 2026-10-04 §16): this has nothing to hold a word against,
+/// and the phrase is judged only when all twelve are typed
+/// ([`Terminal::phrase`]).
 ///
 /// A mistyped phrase is told from a wrong one: words that are no
 /// recovery phrase fail its checksum, and may be typed again, three times
@@ -1827,8 +1865,9 @@ pub(crate) fn typed_phrase(at: &Terminal) -> anyhow::Result<Phrase> {
     let mut tries = 0;
     loop {
         tries += 1;
-        let typed =
-            at.phrase("\nThe recovery phrase, twelve words (what you type is not shown): ")?;
+        let typed = at.phrase(
+            "\nType your recovery phrase, one word at a time. What you type is not shown.",
+        )?;
         match Phrase::parse(&typed) {
             Ok(phrase) => return Ok(phrase),
             Err(e) if tries < PHRASE_TRIES => {
@@ -3403,5 +3442,73 @@ mod tests {
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
             "names": { "sent": ["lab"], "to_go": [] } });
         assert!(names_lines(&quiet).is_empty());
+    }
+
+    /// The twelve words are shown numbered, four to a row, with the
+    /// columns lined up and the numbers right-aligned (decision
+    /// 2026-10-04 §5): the number that a word is shown by is the number
+    /// that it is asked for by. No row ends in a space. And the text has
+    /// room for any twelve words of the list from the start: it is never
+    /// moved as it grows.
+    #[test]
+    fn the_words_are_shown_numbered_four_to_a_row_with_the_columns_lined_up() {
+        let legal = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        assert_eq!(
+            numbered(legal).as_str(),
+            "   1. legal       2. winner      3. thank       4. year\n   \
+             5. wave        6. sausage     7. worth       8. useful\n   \
+             9. legal      10. winner     11. thank      12. yellow"
+        );
+        // Twelve of the longest words, and twelve of the shortest: the
+        // numbers are in the same columns whatever the words are.
+        let longest = ["abstract"; 12].join(" ");
+        let shortest = ["zoo"; 12].join(" ");
+        let columns = |rows: &str| -> Vec<Vec<usize>> {
+            rows.lines()
+                .map(|row| row.match_indices(". ").map(|(at, _)| at).collect())
+                .collect()
+        };
+        let of_the_longest = numbered(&longest);
+        assert_eq!(columns(&of_the_longest), [[4, 19, 34, 49]; 3]);
+        for words in [legal, &longest, &shortest] {
+            let rows = numbered(words);
+            assert_eq!(columns(&rows), columns(&of_the_longest), "{words}");
+            assert_eq!(rows.lines().count(), 3);
+            assert!(rows.lines().all(|row| !row.ends_with(' ')), "{rows:?}");
+            // Each word after its number, in the order they were given.
+            let read: Vec<&str> = rows.split_whitespace().collect();
+            let numbers: Vec<String> = (1..=12).map(|number| format!("{number}.")).collect();
+            let shown: Vec<&str> = read.iter().skip(1).step_by(2).copied().collect();
+            assert_eq!(
+                read.iter().step_by(2).collect::<Vec<_>>(),
+                numbers.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(shown.join(" "), words);
+            // Within the room it was given, and so never moved.
+            assert!(rows.len() <= PHRASE_WORDS * 16, "{}", rows.len());
+            assert_eq!(rows.capacity(), numbered(legal).capacity());
+        }
+        // Two spaces, three columns of fifteen and one of twelve: and
+        // with the two ends of rows, within the room for sixteen a word.
+        assert_eq!(of_the_longest.lines().next().unwrap().len(), 59);
+        assert_eq!(of_the_longest.len(), 3 * 59 + 2);
+    }
+
+    /// What `cordelia phrase` says before anything is shown: what a
+    /// phrase is for, who has it, and that it is no wallet's (decision
+    /// 2026-10-04 §5).
+    #[test]
+    fn what_a_phrase_is_for_is_said_before_one_is_shown() {
+        for says in [
+            "Your recovery phrase is twelve words.",
+            "You need it to remove a device, or to recover on a new machine.",
+            "(You can add a device without it.)",
+            "Nobody else has it, and this device does not keep it. It is shown once, now.",
+            "It is not a wallet phrase. Never type it into a wallet, and never type a wallet's \
+             words here.",
+        ] {
+            assert!(WHOSE_WORDS.contains(says), "{says}");
+        }
+        assert_eq!(WHOSE_WORDS.lines().count(), 6);
     }
 }

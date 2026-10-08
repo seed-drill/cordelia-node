@@ -8,9 +8,23 @@
 //! through one.
 //!
 //! The recovery phrase is typed here and nowhere else: never as an
-//! argument, never over the local API. It is read with echo off
-//! ([`Terminal::phrase`]), into memory that is overwritten when it is
-//! dropped.
+//! argument, never over the local API. Its twelve words are asked for by
+//! number, one at a time, with echo off ([`Terminal::phrase`]). Nothing
+//! that is typed is shown: no letter, no star, no count of letters. Each
+//! word is read into memory that is overwritten as soon as the word has
+//! been looked up in the list.
+//!
+//! **After a word, a command says whether it is a word of the list: and
+//! where a phrase is proved, it says nothing more** (decision 2026-10-04
+//! §16). A tick beside a word's number means "a word of the list". A
+//! wrong word of the list is given it as the right one is, after the
+//! same work, and the phrase is judged only once the twelfth word is
+//! typed. A word that is not in the list gets a cross, and its number is
+//! asked again: that is no guess at a word, and has no bound. Only where
+//! the words were shown a moment ago and are typed back
+//! ([`Terminal::phrase_back`]) is a word held against the word shown at
+//! its number: a miss is said there after a pause, and the third stops
+//! the command.
 //!
 //! Whatever is typed is read from the terminal a byte at a time, and not
 //! through the buffer that the program's standard input otherwise has:
@@ -33,7 +47,10 @@
 //! nothing overwrites.
 
 use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
 
+use cordelia_core::protocol::{PHRASE_MISS_PAUSE_SECS, PHRASE_TYPED_BACK_MISSES, PHRASE_WORDS};
+use cordelia_crypto::phrase::{PhraseError, place_in_list};
 use zeroize::{Zeroize, Zeroizing};
 
 /// What a command that asks says where its input is no terminal.
@@ -50,8 +67,9 @@ pub const NOT_TO_A_TERMINAL: &str = "this command shows or reads a recovery phra
 /// and the lines that have scrolled off it cleared too.
 const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J\x1b[3J";
 
-/// The most that one line may hold: more than twelve of the longest words
-/// of a recovery phrase and the space between them, several times over.
+/// The most that one line may hold, and one word of a recovery phrase as
+/// it is typed: more than twelve of the longest words of the list and the
+/// space between them, several times over.
 const MAX_LINE: usize = 1024;
 
 /// The terminal that a command was run at. There is one only where the
@@ -104,6 +122,53 @@ impl ReadsKeys {
             anyhow::anyhow!("could not set the terminal for what is typed: {e}. Nothing was read.")
         })?;
         Ok(Self(was))
+    }
+
+    /// Wait out `long`, with nothing said and nothing taken. A key that
+    /// is pressed meanwhile is read at once, so that Ctrl-C ends the wait
+    /// then, with [`INTERRUPTED`], and not when the wait is over. Any
+    /// other key is dropped as it is read: it is no part of what is
+    /// typed next.
+    fn waits(&self, long: Duration) -> anyhow::Result<()> {
+        use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
+        // How long one read waits for a key: a tenth of a second, which
+        // is the terminal's own unit for it.
+        let a_read = Duration::from_millis(100);
+        let stdin = rustix::stdio::stdin();
+        let reads = tcgetattr(stdin)
+            .map_err(|e| anyhow::anyhow!("could not read how the terminal is set: {e}"))?;
+        let mut waits = reads.clone();
+        waits.special_codes[SpecialCodeIndex::VMIN] = 0;
+        waits.special_codes[SpecialCodeIndex::VTIME] = 1;
+        tcsetattr(stdin, OptionalActions::Now, &waits)
+            .map_err(|e| anyhow::anyhow!("could not set the terminal for a wait: {e}"))?;
+        let until = Instant::now() + long;
+        let mut key = Zeroizing::new([0u8; 1]);
+        let mut interrupted = false;
+        while !interrupted {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let asked = Instant::now();
+            if matches!(rustix::io::read(stdin, &mut *key), Ok(1..)) {
+                interrupted = INTERRUPT_KEYS.contains(&key[0]);
+            } else if asked.elapsed() < a_read / 2 {
+                // A read that comes back with no key sooner than it
+                // waits for one is of a terminal that is gone: the wait
+                // is waited out all the same, and not by asking it over
+                // and over.
+                std::thread::sleep(left.min(a_read));
+            }
+        }
+        // Each key is waited for again, as before the wait. Where this
+        // fails, the terminal is put back as it was when this is dropped.
+        tcsetattr(stdin, OptionalActions::Now, &reads)
+            .map_err(|e| anyhow::anyhow!("could not set the terminal for what is typed: {e}"))?;
+        if interrupted {
+            anyhow::bail!(INTERRUPTED);
+        }
+        Ok(())
     }
 }
 
@@ -204,14 +269,10 @@ const INTERRUPT_KEYS: [u8; 2] = [0x03, 0x1c];
 /// overwritten when it is dropped. The memory is never moved as the line
 /// grows. `None` where the input ended before a line did.
 ///
-/// `keys` says that the terminal hands on each key as it is pressed
-/// ([`ReadsKeys`]). The keys that a terminal would have acted on are then
-/// acted on here: the ones that take back a letter, a word or the line,
-/// and the one that ends the input at the start of a line. And Ctrl-C is
-/// read as a key: this fails with [`INTERRUPTED`], and whoever set the
-/// terminal puts it back on the way out.
+/// The terminal hands on whole lines here, and acts itself on the keys
+/// that take back what was typed.
 #[cfg(unix)]
-fn line(keys: bool) -> anyhow::Result<Option<Zeroizing<String>>> {
+fn line() -> anyhow::Result<Option<Zeroizing<String>>> {
     let stdin = rustix::stdio::stdin();
     let mut line = Zeroizing::new(String::with_capacity(MAX_LINE));
     let mut byte = [0u8; 1];
@@ -229,38 +290,6 @@ fn line(keys: bool) -> anyhow::Result<Option<Zeroizing<String>>> {
         if byte[0] == b'\n' {
             ended = true;
             break;
-        }
-        if keys {
-            match byte[0] {
-                interrupt if INTERRUPT_KEYS.contains(&interrupt) => {
-                    byte.zeroize();
-                    anyhow::bail!(INTERRUPTED);
-                }
-                // Backspace, in either of its codes.
-                0x7f | 0x08 => {
-                    line.pop();
-                    continue;
-                }
-                // Ctrl-W: the word before, and the space after it.
-                0x17 => {
-                    while line.ends_with(' ') {
-                        line.pop();
-                    }
-                    while line.chars().next_back().is_some_and(|c| c != ' ') {
-                        line.pop();
-                    }
-                    continue;
-                }
-                // Ctrl-U: the whole line.
-                0x15 => {
-                    line.zeroize();
-                    continue;
-                }
-                // Ctrl-D: the end of the input, at the start of a line.
-                0x04 if line.is_empty() => break,
-                0x04 => continue,
-                _ => {}
-            }
         }
         // A byte that is no letter of a word, a digit or a mark of a key
         // is kept as a mark that nothing is: what is asked for here is
@@ -282,8 +311,140 @@ fn line(keys: bool) -> anyhow::Result<Option<Zeroizing<String>>> {
 }
 
 #[cfg(not(unix))]
-fn line(_keys: bool) -> anyhow::Result<Option<Zeroizing<String>>> {
+fn line() -> anyhow::Result<Option<Zeroizing<String>>> {
     anyhow::bail!("this command asks at the terminal of a Unix system");
+}
+
+/// Wait for Enter, where the terminal hands on each key as it is pressed
+/// ([`ReadsKeys`]). Nothing that is typed meanwhile is kept. The end of
+/// the input ends the wait as Enter does. And Ctrl-C is read as a key:
+/// this fails with [`INTERRUPTED`], and whoever set the terminal puts it
+/// back on the way out.
+#[cfg(unix)]
+fn enter() -> anyhow::Result<()> {
+    let stdin = rustix::stdio::stdin();
+    let mut key = Zeroizing::new([0u8; 1]);
+    loop {
+        match rustix::io::read(stdin, &mut *key) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => anyhow::bail!("could not read from the terminal: {e}"),
+        }
+        match key[0] {
+            interrupt if INTERRUPT_KEYS.contains(&interrupt) => anyhow::bail!(INTERRUPTED),
+            // Enter, and Ctrl-D, which ends the input.
+            b'\n' | b'\r' | 0x04 => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn enter() -> anyhow::Result<()> {
+    anyhow::bail!("this command asks at the terminal of a Unix system");
+}
+
+/// Read one word from the terminal into `word`, which is empty: what is
+/// typed up to a space or Enter, with upper case taken as lower. A space
+/// or an Enter with nothing typed before it is passed over. `false` where
+/// the input ended before a word did.
+///
+/// The terminal hands on each key as it is pressed ([`ReadsKeys`]), and
+/// what is typed is not shown. The keys that a terminal would have acted
+/// on are acted on here, for the word that is being typed: the one that
+/// takes back a letter, and the ones that take back a word or a line,
+/// which here is the word. The key that ends the input ends it where
+/// `nothing_yet` says that nothing was typed at this prompt so far, as at
+/// the start of a line, and is passed over otherwise. And Ctrl-C is read
+/// as a key: this fails with [`INTERRUPTED`].
+///
+/// `word` is never moved as it grows: it has room for a line, and a word
+/// that is longer is refused. Whoever gave it overwrites it.
+#[cfg(unix)]
+fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result<bool> {
+    let stdin = rustix::stdio::stdin();
+    // Overwritten however this returns.
+    let mut byte = Zeroizing::new([0u8; 1]);
+    loop {
+        match rustix::io::read(stdin, &mut *byte) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => anyhow::bail!("could not read from the terminal: {e}"),
+        }
+        match byte[0] {
+            interrupt if INTERRUPT_KEYS.contains(&interrupt) => anyhow::bail!(INTERRUPTED),
+            // A space or Enter ends a word, and is passed over where
+            // nothing was typed before it.
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                if !word.is_empty() {
+                    return Ok(true);
+                }
+            }
+            // Backspace, in either of its codes: a letter.
+            0x7f | 0x08 => {
+                word.pop();
+            }
+            // Ctrl-W and Ctrl-U: the word that is being typed.
+            0x17 | 0x15 => word.zeroize(),
+            // Ctrl-D: the end of the input, before anything is typed.
+            0x04 if nothing_yet && word.is_empty() => return Ok(false),
+            0x04 => {}
+            typed => {
+                if word.len() + 1 >= MAX_LINE {
+                    anyhow::bail!("that line is longer than anything this command asks for");
+                }
+                // A byte that is no letter of a word, a digit or a mark
+                // of a key is kept as a mark that nothing is.
+                word.push(match typed {
+                    plain @ 0x20..=0x7e => char::from(plain.to_ascii_lowercase()),
+                    _ => '?',
+                });
+            }
+        }
+    }
+}
+
+/// Ask for word `number` of a recovery phrase until a word of the list is
+/// typed: its place in the list, with the word itself left in `word`,
+/// which whoever gave it overwrites.
+///
+/// The number is said, right-aligned, and nothing that is typed after
+/// it is shown. **A word that is not in the list gets a cross and a few
+/// words, at once, and the same number is asked again**, with no bound:
+/// it is no guess at a word (decision 2026-10-04 §16). What was typed
+/// ahead of that is dropped first, as before any prompt: the rest of a
+/// line that was pasted is not taken for the word that is asked again.
+///
+/// Where the input ends, this fails, and says how many words there were.
+#[cfg(unix)]
+fn word_of_the_list(number: usize, word: &mut Zeroizing<String>) -> anyhow::Result<Zeroizing<u16>> {
+    loop {
+        word.zeroize();
+        say(&format!("  {number:>2}. "))?;
+        let typed = word_typed(word, number == 1);
+        if !matches!(typed, Ok(true)) {
+            // No mark follows the number: what is said next starts on a
+            // line of its own.
+            say("\n")?;
+        }
+        if !typed? {
+            match number {
+                1 => anyhow::bail!("nothing was typed"),
+                _ => anyhow::bail!("{}", PhraseError::WordCount(number - 1)),
+            }
+        }
+        // The whole list is gone through, whatever the word.
+        if let Some(place) = place_in_list(word) {
+            return Ok(Zeroizing::new(place));
+        }
+        word.zeroize();
+        drop_what_was_typed_ahead();
+        say(&format!(
+            "✗  That is not a word from the list. Type word {number} again.\n"
+        ))?;
+    }
 }
 
 impl Terminal {
@@ -321,7 +482,7 @@ impl Terminal {
         say(&format!(
             "{says}\nType yes to go on, or anything else to stop: "
         ))?;
-        let typed = line(false)?;
+        let typed = line()?;
         Ok(typed.is_some_and(|typed| typed.trim() == "yes"))
     }
 
@@ -331,11 +492,12 @@ impl Terminal {
     pub fn answer(&self, asks: &str) -> anyhow::Result<Option<String>> {
         drop_what_was_typed_ahead();
         say(asks)?;
-        Ok(line(false)?.map(|typed| typed.trim().to_string()))
+        Ok(line()?.map(|typed| typed.trim().to_string()))
     }
 
     /// Show `shown` once, under the line `says`, until a person presses
-    /// Enter at `asks`: and then take it off the screen. It is shown on
+    /// Enter at `asks`: and then take it off the screen. `shown` is one
+    /// row or several, each with its own space before it. It is shown on
     /// the terminal's other screen, which is cleared and then put away
     /// when the person is done, and keeps no lines above what is typed
     /// next. A terminal that has no other screen shows it where it is,
@@ -355,11 +517,11 @@ impl Terminal {
         say("\x1b[?1049h")?;
         say(CLEAR_SCREEN)?;
         say(says)?;
-        say("\n\n    ")?;
+        say("\n\n")?;
         say_unbuffered(shown)?;
         say("\n\n")?;
         say(asks)?;
-        let read = line(true);
+        let read = enter();
         // Cleared before the other screen is left, and so before anything
         // more is asked: on a terminal that has no other screen this is
         // what takes the words away.
@@ -369,26 +531,124 @@ impl Terminal {
         Ok(())
     }
 
-    /// Ask for the recovery phrase: `asks` is the prompt. What is typed is
-    /// not shown, and is in memory that is overwritten when it is dropped.
+    /// Ask for the recovery phrase where it is to be proved: `asks` is
+    /// the line above the twelve numbers. Each word is asked for by its
+    /// number, and what is typed is not shown. A word ends at a space or
+    /// at Enter, so twelve words typed or pasted on one line are taken
+    /// in their order, each to the next number. What is given back is
+    /// the twelve words with one space between them, in memory that is
+    /// overwritten when it is dropped and was never moved as it grew.
+    ///
+    /// **A tick here says that a word is a word of the list, and nothing
+    /// more** (decision 2026-10-04 §16). This is given nothing to hold a
+    /// word against, and judges none: a wrong word of the list gets the
+    /// tick that the right one gets, after the same work and with no
+    /// wait, and all twelve are asked for whatever was typed. Whoever
+    /// asked judges the phrase, once it is whole.
     ///
     /// Ctrl-C is read as a key while what is typed is hidden: the terminal
     /// is put back as it was, and this fails with [`INTERRUPTED`].
     #[cfg(unix)]
     pub fn phrase(&self, asks: &str) -> anyhow::Result<Zeroizing<String>> {
-        // Echo goes off before the prompt is shown: nothing typed at the
-        // prompt is ever shown. What was typed before it is dropped.
+        // Echo goes off before anything is asked: nothing typed here is
+        // ever shown. What was typed before it is dropped.
         let _hidden = ReadsKeys::set()?;
-        say(asks)?;
-        let typed = line(true);
-        // The line's end is not shown by the terminal: what is said next
-        // starts on a line of its own.
-        say("\n")?;
-        typed?.ok_or_else(|| anyhow::anyhow!("nothing was typed"))
+        say(&format!("{asks}\n\n"))?;
+        // Room for twelve of the longest words, which are eight letters,
+        // and the spaces between them; and for a word as it is typed,
+        // room for a line. Neither is moved as it grows, so that no copy
+        // of what was typed is left behind.
+        let mut words = Zeroizing::new(String::with_capacity(PHRASE_WORDS * 9));
+        let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
+        for number in 1..=PHRASE_WORDS {
+            word_of_the_list(number, &mut word)?;
+            // A word of the list: that is all the tick says, and all
+            // that is known of the word here.
+            say("✓\n")?;
+            if number > 1 {
+                words.push(' ');
+            }
+            words.push_str(&word);
+            word.zeroize();
+        }
+        // What was typed after the twelfth word is not shown when the
+        // terminal is put back, and answers nothing that is asked next.
+        drop_what_was_typed_ahead();
+        Ok(words)
     }
 
     #[cfg(not(unix))]
     pub fn phrase(&self, _asks: &str) -> anyhow::Result<Zeroizing<String>> {
+        anyhow::bail!("the recovery phrase is typed at the terminal of a Unix system");
+    }
+
+    /// Ask for the twelve words that were shown a moment ago to be typed
+    /// back, as [`Self::phrase`] asks: `shown` is the place in the list
+    /// of each word that was shown. Whether all twelve were typed back.
+    ///
+    /// **Here, and nowhere else, a word is held against the word that
+    /// was shown at its number** (decision 2026-10-04 §16), by its place
+    /// in the list: the words that were typed and the words that were
+    /// shown are not set beside each other as text, and a word is
+    /// overwritten as soon as its place is known.
+    ///
+    /// - The word that was shown gets a tick, at once.
+    /// - A word of the list that is another is a miss. It is said after
+    ///   a pause, and the same number is asked again: the pause is
+    ///   `PHRASE_MISS_PAUSE_SECS`, and twice as long at each miss after
+    ///   the first. Nothing is said during it, and what is typed during
+    ///   it is dropped: it is not taken for the word that is asked
+    ///   again. So each answer costs time, and neither a key held down
+    ///   nor a line that was pasted spends every miss at once.
+    /// - At the miss numbered `PHRASE_TYPED_BACK_MISSES`, counted over
+    ///   the whole typing back and not for each word, this stops, at
+    ///   once, and gives back `false`.
+    /// - A word that is not in the list is no miss, and is asked again
+    ///   at once ([`word_of_the_list`]).
+    #[cfg(unix)]
+    pub fn phrase_back(&self, asks: &str, shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
+        let hidden = ReadsKeys::set()?;
+        say(&format!("{asks}\n\n"))?;
+        let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
+        let mut misses = 0;
+        let mut number = 1;
+        while number <= PHRASE_WORDS {
+            // What is kept of the word is its place in the list.
+            let place = word_of_the_list(number, &mut word)?;
+            word.zeroize();
+            if *place == shown[number - 1] {
+                say("✓\n")?;
+                number += 1;
+                continue;
+            }
+            // A miss. The last is said at once, and ends the typing
+            // back; one before it is said after its pause.
+            misses += 1;
+            if misses == PHRASE_TYPED_BACK_MISSES {
+                drop_what_was_typed_ahead();
+                say("✗\n")?;
+                return Ok(false);
+            }
+            let waited = hidden.waits(Duration::from_secs(PHRASE_MISS_PAUSE_SECS << (misses - 1)));
+            if waited.is_err() {
+                // No mark follows the number: what is said next starts
+                // on a line of its own.
+                say("\n")?;
+            }
+            waited?;
+            // Whatever was typed while it waited answers nothing.
+            drop_what_was_typed_ahead();
+            say(&format!(
+                "✗  That does not match word {number}. Check what you wrote, and type it \
+                 again.\n"
+            ))?;
+        }
+        drop_what_was_typed_ahead();
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    pub fn phrase_back(&self, _asks: &str, _shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
         anyhow::bail!("the recovery phrase is typed at the terminal of a Unix system");
     }
 }

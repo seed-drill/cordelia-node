@@ -237,7 +237,7 @@ fn recovers(new: &Node, port: Option<u16>, words: &str, answers: &[&str]) -> AtT
     at.says("Recovery is for when you have no device left that you trust.")
         .says("remove the device that is gone from it")
         .says("never type a wallet's words")
-        .says("The recovery phrase, twelve words")
+        .says("Type your recovery phrase, one word at a time")
         .types(words);
     answers_and_yes(&mut at, answers);
     at
@@ -470,7 +470,7 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
         "{again}"
     );
     assert!(
-        !again.contains("The recovery phrase, twelve words"),
+        !again.contains("Type your recovery phrase, one word at a time"),
         "{again}"
     );
 
@@ -561,7 +561,7 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
     let new = device_started("new", &relay);
     // Anything but a yes makes nothing: the machine follows no phrase.
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     answers_and(&mut at, &["lost", "hands"], "y");
     let said = at.done();
@@ -623,7 +623,7 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
         .says("say no unless you know it was not.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     let said = at.done();
     assert!(said.contains("lab: 1 version brought in"), "{said}");
@@ -1080,7 +1080,7 @@ fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() 
         .says("1 version would go into a slot where the new channel holds nothing.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     let said = at.done();
     assert!(said.contains("lab: 1 version brought in"), "{said}");
@@ -1157,7 +1157,7 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
         .says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     at.says("The change is made (change 4).");
     let said = at.done();
@@ -1177,7 +1177,7 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
         .says("1 version would go into a slot where the new channel holds nothing.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     let said = at.done();
     assert!(said.contains("lab: 1 version brought in"), "{said}");
@@ -1330,7 +1330,7 @@ fn a_recovery_reads_at_a_connection_that_changed_after_its_session_was_said() {
     };
     let through = PassesOn::to(new.http);
     let mut at = new.at_terminal_through(through.port, &["recover", "--name", "new"]);
-    at.says("The recovery phrase, twelve words");
+    at.says("Type your recovery phrase, one word at a time");
     // The command was told the session of the connection there is now.
     let before = session_now(&new).expect("the relay is connected");
 
@@ -1521,7 +1521,7 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
         .says("If one of them was in someone else's hands")
         .says("Bring in 2 versions into slots where the new channel holds nothing?")
         .types("yes");
-    at.says("The recovery phrase, twelve words")
+    at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
     let said = at.done();
     assert!(said.contains("lab: 2 versions brought in"), "{said}");
@@ -1695,7 +1695,8 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     // at which nothing was read, says to run the command again, and
     // makes nothing.
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     at.says("Two changes were made apart")
         .says("Type `1` or `2`, the one to recover from: ");
     first.stop();
@@ -1749,7 +1750,8 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     );
 
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     at.says("Two changes were made apart")
         .says("1. Change 3:")
         .says("2. Change 3:")

@@ -1127,19 +1127,72 @@ pub fn key_of(node: &Node) -> String {
 
 // ── Commands, as a person runs them ──────────────────────────────────
 
-/// The twelve words that `cordelia phrase` showed, read off its
-/// terminal.
-pub fn words_shown(said: &str) -> String {
+/// The line above the twelve numbers where a command asks for a recovery
+/// phrase that is to be proved (`remove-device`, `renew`, `settle`,
+/// `recover`, a carry), and the one where `cordelia phrase` asks for the
+/// words it showed to be typed back.
+pub const ASKS_THE_PHRASE: &str =
+    "Type your recovery phrase, one word at a time. What you type is not shown.";
+pub const ASKS_THE_WORDS_BACK: &str =
+    "Now type the words back, one at a time. What you type is not shown.";
+
+/// What a terminal shows where each number from `from` to `to` was
+/// answered with a word that got a tick, and nothing that was typed was
+/// shown: each number, right-aligned, with its tick, on a line of its
+/// own.
+pub fn ticks(from: usize, to: usize) -> String {
+    (from..=to)
+        .map(|number| format!("  {number:>2}. \u{2713}\r\n"))
+        .collect()
+}
+
+/// A word of the list that is not `word`: what a person who miswrote a
+/// word types in its place.
+pub fn another_word_than(word: &str) -> &'static str {
+    match word {
+        "zoo" => "abandon",
+        _ => "zoo",
+    }
+}
+
+/// The rows in which `cordelia phrase` showed the twelve words, as its
+/// terminal showed them: from the space before the first number to the
+/// last word.
+pub fn rows_shown(said: &str) -> &str {
     let after = said
-        .split("shown once:")
+        .split("(shown once):")
         .nth(1)
         .unwrap_or_else(|| panic!("no phrase was shown:\n{said}"));
-    let words = after
-        .lines()
-        .map(str::trim)
-        .find(|line| line.split_whitespace().count() == 12)
-        .unwrap_or_else(|| panic!("no twelve words were shown:\n{said}"));
-    words.to_string()
+    let rows = after
+        .split("Write the twelve words down")
+        .next()
+        .unwrap_or_default();
+    rows.trim_matches(['\r', '\n'])
+}
+
+/// The twelve words that `cordelia phrase` showed, read off its terminal
+/// as a person reads them: each after its number, the numbers in their
+/// order.
+pub fn words_shown(said: &str) -> String {
+    let read: Vec<&str> = rows_shown(said).split_whitespace().collect();
+    assert_eq!(
+        read.len(),
+        24,
+        "twelve numbers and twelve words were not shown:\n{said}"
+    );
+    let words: Vec<&str> = read
+        .chunks(2)
+        .enumerate()
+        .map(|(at, numbered)| {
+            assert_eq!(
+                numbered[0],
+                format!("{}.", at + 1),
+                "the words are not numbered in their order:\n{said}"
+            );
+            numbered[1]
+        })
+        .collect();
+    words.join(" ")
 }
 
 /// `cordelia phrase` on a device that follows none: the words are read
@@ -1147,10 +1200,10 @@ pub fn words_shown(said: &str) -> String {
 /// Returns the words.
 pub fn makes_a_phrase(device: &Node, label: &str) -> String {
     let mut at = device.at_terminal(&["phrase", "--name", label]);
-    at.says("Press Enter when they are written down");
+    at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
-    at.says("Type the twelve words back");
+    at.says("Now type the words back");
     at.types(&words);
     let said = at.done();
     assert!(said.contains("follows the new recovery phrase"), "{said}");
@@ -1236,7 +1289,7 @@ fn changes(at: &mut AtTerminal, answers: &[&str], words: &str) {
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
-    at.says("The recovery phrase, twelve words").types(words);
+    at.says(ASKS_THE_PHRASE).types(words);
 }
 
 /// What the node says of its device and its person

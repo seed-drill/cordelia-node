@@ -381,7 +381,8 @@ fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
     // the name and lists it.
     let mut at = laptop.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 2 versions into slots").types("yes");
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     let said = at.done();
     println!("{said}");
     assert!(said.contains("lab: 2 versions brought in"), "{said}");
@@ -591,7 +592,7 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         .says("first.md")
         .types("no");
     at.says("Those stay where they are.")
-        .says("The recovery phrase, twelve words")
+        .says("Type your recovery phrase, one word at a time")
         .types(another);
     let refused = at.refused();
     assert!(
@@ -621,7 +622,7 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         "{said}"
     );
     assert!(
-        !said.contains("The recovery phrase, twelve words"),
+        !said.contains("Type your recovery phrase, one word at a time"),
         "{said}"
     );
     assert_eq!(held(&laptop), before);
@@ -634,7 +635,8 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         laptop.at_terminal_through(through.port, &["sync", "carry", "lab", "--from", "desktop"]);
     at.says("Bring in 1 version into the slot").types("yes");
     at.says("Also bring in 1 version above").types("no");
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     let said = at.done();
     println!("{said}");
     assert!(
@@ -678,7 +680,8 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
     at.says("0 versions would go into slots where the new channel holds nothing.")
         .says("Also bring in 1 version above the version that the new channel holds?")
         .types("yes");
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     let said = at.done();
     assert!(said.contains("lab: 1 version brought in"), "{said}");
     wait_for("the folder takes the version", &all, 120, || {
@@ -697,7 +700,7 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
     let said = at.done();
     assert!(said.contains("Nothing was taken."), "{said}");
     assert!(
-        !said.contains("The recovery phrase, twelve words"),
+        !said.contains("Type your recovery phrase, one word at a time"),
         "{said}"
     );
 }
@@ -792,7 +795,8 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     at.says("the generations whose secret this device never held")
         .says("Read those generations of lab")
         .types("yes");
-    at.says("The recovery phrase, twelve words").types(another);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(another);
     let refused = at.refused();
     assert!(
         refused.contains("it is not the one that this device follows: nothing was taken."),
@@ -806,7 +810,8 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     let through = PassesOn::to(desktop.http);
     let mut at = desktop.at_terminal_through(through.port, &["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     let said = at.done();
     println!("{said}");
     assert!(
@@ -858,7 +863,8 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     // Run again, the new channel holds it.
     let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
     at.says("Read those generations of lab").types("yes");
-    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(&words);
     let said = at.done();
     assert!(said.contains("lab: nothing to bring in"), "{said}");
 }
