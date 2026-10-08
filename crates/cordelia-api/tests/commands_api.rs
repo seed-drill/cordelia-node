@@ -625,6 +625,14 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         let made = publish(&db, &state.identity, &write, 1_800_000_000).unwrap();
         assert!(matches!(made, Published::Made(_)), "{made:?}");
     }
+    // What a look says of it: a command that has the device begin again
+    // says before its yes how much it has sent to no relay.
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(
+        seen["sent_to_no_relay"],
+        json!({ "versions": 1, "names": 1 }),
+        "{seen}"
+    );
     let unmap = json!({ "folder": "lab" });
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
     assert_eq!(status, 409, "{said}");
@@ -648,6 +656,12 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         let last = kept_rows::last_taken(&db, &lab).unwrap();
         kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
     }
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(
+        seen["sent_to_no_relay"],
+        json!({ "versions": 0, "names": 0 }),
+        "{seen}"
+    );
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
     assert_eq!(status, 200, "{said}");
     assert_eq!(said["let_go"], "lab");
