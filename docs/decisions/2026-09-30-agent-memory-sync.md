@@ -7,6 +7,12 @@
 **Supersedes**: [`2026-03-09-architecture-simplification.md`](2026-03-09-architecture-simplification.md) (positioning and roadmap), and [`memory-model.md`](../archive/specs/memory-model.md) as the Phase 1 target.
 **Source**: This is the build-facing part of a decision record kept in Seed Drill's private strategy repository. Section 7 (network effect and traction) and the open questions stay there, and section 9 here lists known limits instead. The other section numbers match that record, because code comments cite them (for example "decision 2026-09-30 §4.3"). Where the build refined the design, the change is marked **As built**.
 
+> **Read this with [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md).** That record replaces this one's model of devices, membership and keys, and parts of 4.5 where it says so. Each section below that it replaces says so in a line at its head, with the section of that record which replaces it.
+>
+> **What stands:** the principles and the decision (0 to 2); that no infrastructure holds a key (4.2); the store's rule of one entry for each author in each slot (4.3); deletes (4.4); the adapter's cycle, names and mappings, ties, conflict copies, the merge of the index and the lines of memories that come back (4.5); local history (4.5b); the two relays, how a node knows them, and what one connection can cost (4.6); and that memory is not shared between people (4.7).
+>
+> **The channels this record describes are "the older kind"** in that one. A relay goes on carrying them for one version more, and a personal node carries none (that record, section 10). Code comments that cite a section of this record ("decision 2026-09-30 §4.5") still mean this record.
+
 ---
 
 ## 0. Principles
@@ -40,6 +46,8 @@ The node was solid: QUIC transport, governor, epidemic relay forwarding, invite-
 
 ## 3. The product
 
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), sections 5.2 and 6.** A device first needs a recovery phrase: `cordelia phrase` on one machine, and then `add-device` there and `accept` on each other, each at a terminal with its yes. Mapping, and what then syncs, is as below.
+
 ```
 laptop$  cordelia init                  desktop$ cordelia init
                                         desktop$ cordelia id
@@ -64,6 +72,8 @@ After that, a memory Claude Code writes for that project on one machine appears 
 Five changes to the node, plus one piece of infrastructure.
 
 ### 4.1 One key per device; devices are channel members
+
+> **Replaced by [the record of 2026-10-04](2026-10-04-a-persons-devices.md).** One key for each device stands. The rest of this section is replaced: the inbox and trust by the pair channel and by which phrase a device follows (2.2, 5.1, 6); sealed channel states, epochs and key rings by the person secret, the statement and the change entry (3, 4); the personal channel's member list by the statement's list of devices (2.2, 4.1, 4.4); revocation, and what a removed device wrote, by removal with the phrase and by carrying (7); a change offered until each member confirms it by the change entry that every device shows each relay (4.6, 8); and roles go (14, item 6). What is said here of a key that is not a usable public key stands: such a key is no device's (2.2 there).
 
 Each machine keeps the Ed25519 identity that `init` generates. A person's devices are members of that person's invite-only channels.
 
@@ -121,9 +131,13 @@ Without a trust check, anyone who knows your public key could add you to a chann
 
 ### 4.2 Invite-only channels only; no keepers
 
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), sections 2.1 and 2.2.** A channel of a person's own is a secret derived from the person secret, with no key wrapped for each member and no `grp_` ID. That no keeper and no infrastructure holds a key stands.
+
 v1 uses only invite-only channels, which it creates as `grp_` channels so relays never see a channel name. The creator wraps the channel key for each member, and no keeper ever holds it. Open channels, which hand their key to any peer that asks, and keepers, which hold keys for open channels, are **deferred**. In v1, no infrastructure holds a key.
 
 ### 4.3 Replaceable items
+
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 2.3,** which sets the two entries side by side: the slot key is derived from the channel's secret and changes with it, a revision is a band and a count, an entry has two signatures, and a tie goes to the higher hash of the text. What stands: a slot hides the name from a relay, a store keeps the newest revision for each author in each slot, and no storage rule compares one author's entries with another's (2.4 there).
 
 A memory file is edited, not appended to. Items gain an optional `slot` and `rev`:
 
@@ -148,6 +162,8 @@ This is the same idea as Nostr's addressable events (NIP-01, kinds 30000-39999).
 
 ### 4.4 Deletes that replicate
 
+> **This section stands.** Read "the channel's members" as the devices that count ([the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 4.4). A delete is a version, and is carried at a statement as a text is (7.3 there). What is swept once a delete has been held for 90 days, among the entries of a channel from its secret, at a relay and in a device's own store, is in section 2.3 there.
+
 A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`), so that a device that has been away for less than that learns that the file was deleted; after that, an hourly sweep drops the key's whole slot history. What counts as deleted depends on what the node can know:
 
 - A device knows the channel's members. A key is deleted when the newest rev among them is a delete.
@@ -156,6 +172,8 @@ A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept 
 `delete-item` now checks the item's channel and that the caller wrote it.
 
 ### 4.4a Fixes to sync and verification that 4.1-4.4 depend on
+
+> **Replaced for a person's devices by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), sections 2.4 and 4.6.** A device's own channels travel on streams of their own, a show comes before everything, and nothing is distributed through an inbox. What is below stands for the older kind of channel, as a relay carries it.
 
 - **Sync served only what the listen API shows,** which hides internal items and tombstones, so no key envelope or delete had ever reached another node by sync. Sync now has its own query that returns every item.
 - **Sync fetched only the newest 100 items per channel.** **As built:** items get an arrival sequence number, and sync pages by it (`after_seq` in the request, `last_seq` in the response) with a cursor per peer and channel, until `has_more` is false.
@@ -168,6 +186,8 @@ A delete is a new `rev` of the slot, marked as a tombstone. Tombstones are kept 
   - `cordelia status --json` lists the refused items under `outbox_refused`, and the status line asks for attention once relays have refused an item three times in a row.
 
 ### 4.5 `cordelia sync claude`: the Claude Code adapter
+
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md).** Of the bullets below: the scope of everything found (`--all`, in "What syncs is declared" and "With `--all`"), exclusions, and what is kept off a device, by section 10.1 (only what is mapped syncs: `--all` is refused, and there is nothing left to exclude); "Each name gets its own `grp_` channel", "Home memory has its own channel" and "devices join only what they map", with the personal channel's map from name to channel, its join requests and its lists of what each device syncs, by section 2.2 (a name's channel is derived from the person secret and the name; every device of the person can derive it, and says in the personal channel which names it syncs); "An entry says what it was written after" by sections 2.3 and 7.3 (the chain); and the size of an entry by section 2.3 (a text and its name may be 60 KB). **The rest stands:** the cycle, names and mappings, one memory for a repository, a folder that starts afresh, the merge of `MEMORY.md`, the line of a memory that comes back, an edit published only over what it was planned against, conflict files, and the rules under "Safety".
 
 It runs inside the node binary: one install, and the node stays the encryption boundary ([2026-03-10 decision](2026-03-10-phase1-design-decisions.md) §1). Every 5 seconds, and as soon as a setting changes, it syncs memory folders under `~/.claude/projects/*/memory/`:
 
@@ -208,6 +228,8 @@ It runs inside the node binary: one install, and the node stays the encryption b
 Other agents come later as further adapters that map their own memory locations onto the same channels.
 
 ### 4.5b Local history
+
+> **This section stands.** [the record of 2026-10-04](2026-10-04-a-persons-devices.md) rests on it (property 2, and section 7.1 there). For a version that a device carried, a record names the key that signed the entry it was carried from (16 there).
 
 Sync makes one device's mistake every device's. An edit or a delete, made by a person or by an agent, is taken by every other device within seconds, and a conflict file is kept only where two devices changed a file apart. A folder emptied by an agent syncs as deletes. Local history is the way back: on each device, the text of a memory file as it was just before sync replaced or removed it. It does not stop a mistake and it does not notice one. A person who notices can see what changed and put a version back.
 
@@ -261,6 +283,8 @@ Sync makes one device's mistake every device's. An edit or a delete, made by a p
 
 ### 4.6 Two relays
 
+> **Stands, with two parts replaced by [the record of 2026-10-04](2026-10-04-a-persons-devices.md).** How a node knows its relays, and what one connection can cost, stand. "A device stores only what belongs in its own channels" is replaced by sections 2.4 and 4.4 there (a device stores an entry only if its signer counts, and there is no inbox). "A relay is a cache with a cap" stands for the older kind; for a channel from its secret a relay's room is section 2.5 there, with a cap of its own.
+
 Personal nodes are outbound-only and there is no NAT traversal, so two devices always meet through a relay. **As built (0.2.0-alpha.3):** a personal node opens no listening socket at all. It dials out from a port the system picks, where earlier versions bound UDP 9474 and turned inbound peers away after the handshake. `listen = true` under `[network]` keeps a listener, for a node that others dial directly. We run two relays, each also serving as a bootnode, so that losing one doesn't stop sync:
 
 - **`relay1`** and **`relay2`** are Docker containers we operate, from the image and guide in [`deploy/relay/`](../../deploy/relay/): a pinned release checked against its sha256, run unprivileged on a read-only filesystem. **Changed 2026-09-30:** for the alpha we host both ourselves. Before any public announcement, the public relays move to a cloud provider (the Fly.io config is ready for that), and the storage cap and retention ship (section 9).
@@ -304,6 +328,8 @@ Personal nodes are outbound-only and there is no NAT traversal, so two devices a
 
 ### 4.7 Memory is the boundary (decided 2026-10-01)
 
+> **This section stands.** How it is enforced ("As built", and "Which personal channel a device belongs to") is replaced by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 5.1 and property 10: a device follows only a phrase that a person gave it.
+
 An agent's memory is who it is for one person: what it knows about them, how they like to work, what it has been corrected on, and what it is in the middle of. Cordelia treats it as it would a person. It has one owner, and it is not shared.
 
 - **Between one person's devices, memory moves whole.** That is what v1 is for: the same agent, with the same context, is there at the new vantage point. The one you talk to on the laptop is the one you were talking to on the desktop.
@@ -325,6 +351,8 @@ This decision is expected to stand. If people later want notes in common, the an
 
 ## 5. What we promise about security
 
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 2.4** ("What a relay still learns"): an entry of a channel from its secret has no type in clear, and the list of what a relay learns is the one there. The rest stands.
+
 - Relays and Seed Drill see channel IDs, device public keys, item sizes, types and timing. They never see content, file names, member lists or keys.
   - For usage counts (distinct peers per day and week), a relay keeps a keyed hash of each peer's key, made with a secret that stays on the relay, for 8 days after the peer was last seen. It reports counts, never keys.
 - Only devices you added can read your memory. It is never shared with another person (4.7).
@@ -333,6 +361,8 @@ This decision is expected to stand. If people later want notes in common, the an
 This replaces the v2.3 whitepaper's "no plaintext at rest on any node, ever", which the code did not meet and v1 doesn't need.
 
 ## 6. Why not Syncthing
+
+> **Stands, but for the last half of the last bullet.** Each device of a person can read every name of that person's, whether or not it maps it ([the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 12).
 
 v1 must beat plain file sync on things it can't do:
 
@@ -344,6 +374,8 @@ v1 must beat plain file sync on things it can't do:
 If dogfooding shows these differences don't matter in practice, that is our answer, and it is cheap to get.
 
 ## 8. Scope
+
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), section 14.** The rows for per-device keys, the inbox, trust and revocation (4.1), and for key distribution through inboxes (4.4a), are of the older kind of channel.
 
 | Area | v1 | Note |
 |---|---|---|
@@ -372,6 +404,8 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 | `memory-model.md`, `search-indexing.md`, `sdk-api-reference.md`, `architecture-overview.md`, `game-theory.md` | **Archived** | [`docs/archive/`](../archive/README.md) |
 
 ## 9. Known limits
+
+> **Replaced in part by [the record of 2026-10-04](2026-10-04-a-persons-devices.md), sections 1, 12 and 14,** which state the limits of a person's devices. Of the bullets below these are of the older kind and no longer describe a device: two devices changing membership at once; what a removing device publishes again; a device that waits for a key; a channel that listed a key that is no device's; a project channel rotated by the owner with the lowest key; when a removal changes a key; the older key-distribution endpoints; home memory in the personal channel; `--all` and session transcripts; a name left in the personal channel's map; and unmapping that leaves a device a member. The bullet on a version at a higher revision is replaced by the chain (7.3 there). **The other bullets stand:** the index, the line of a memory that comes back, file names and file systems, Claude Code's memory location, relays' retention for the older kind (a channel from its secret that nobody uses is dropped after 90 days: 2.5 there), and what local history does not cover.
 
 - Two devices changing the membership of the same channel at the same moment can lose one of the changes.
 - A file that is unchanged on a device since it last agreed with the channel is replaced by the channel's version when that version's revision is higher. What the file held is kept as a conflict file first, unless the version is known to have been written after it (4.5). It is not kept where nothing can be known, and is then lost as it was up to 0.2.0-alpha.5 (#79):
@@ -440,6 +474,8 @@ If dogfooding shows these differences don't matter in practice, that is our answ
   - The index line of a file that a restore brings back: a restore puts back the file it is asked for. Its line returns only if the index is restored too, or the file is listed again.
 
 ## 10. Done means
+
+> **Stands.** For "A removed device cannot read anything written after its removal" read property 1 of [the record of 2026-10-04](2026-10-04-a-persons-devices.md): it reads nothing that a device which has applied the removal writes afterwards.
 
 - A memory written on one machine appears on the other within 30 seconds when both are online. If the other is off, it appears within 30 seconds of it reconnecting.
 - Editing and deleting a memory propagates too, and a concurrent edit leaves a conflict file rather than losing either version (with the exceptions in section 9).

@@ -6,16 +6,36 @@
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Canonical for**: All `config.toml` parameters across all specs
 
-> **v1 status (2026-09-30).** The default bootnodes (`FALLBACK_PEERS`) are
+> **v1 status.** The default bootnodes (`FALLBACK_PEERS`) are
 > the two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`. QUIC binds
 > to the host part of `listen_addr` (a host name is resolved) on `p2p_port`.
 > A personal node does not listen: it dials out from a port the system picks
 > on that host address, and `p2p_port` is unused unless `listen` is set
 > (§2.2).
 > The sync adapter's settings are not in this file: `cordelia sync claude`
-> stores them in the node's database. The `[memory]` and `[search]` sections
-> (§2.7, §2.8) belong to archived specs ([`docs/archive/`](../archive/README.md)), and the
-> `keeper` role is deferred ([decision record](../decisions/2026-09-30-agent-memory-sync.md)).
+> and `cordelia sync map` store them in the node's database. The `[memory]`
+> and `[search]` sections (§2.7, §2.8) belong to archived specs
+> ([`docs/archive/`](../archive/README.md)), and the `keeper` role is deferred
+> ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)).
+>
+> Per the [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md):
+>
+> - **Nothing of a person's devices is in this file.** The recovery phrase is
+>   never stored anywhere. What a device follows, the person secret and the
+>   statement it has applied are in the node's database (data-formats.md
+>   §10.3), and the device's own key is in `identity.key`.
+> - **A personal node carries no channel of the older kind.** `push_policy`
+>   (§2.3) and `[replication]` (§2.5) are settings of that kind, and change
+>   nothing that a personal node does with its own channels. Those are
+>   fetched every 10 seconds and sent every 2, which are constants of
+>   `protocol.rs` and not settings.
+> - **A relay's `max_storage_bytes` bounds each kind of channel apart**
+>   (§2.2), and **a relay that lists another by `key` works together with
+>   it** (§2.3).
+> - **The data directory of a personal node** also holds, after its first
+>   start on this version, a folder `before-<version>`: a copy of the
+>   database and of the key files of the older channels, as they were
+>   (operations.md §10.5).
 
 ---
 
@@ -57,7 +77,7 @@ Core node settings: ports, storage location, storage quota.
 | `http_port` | integer | `9473` | 1-65535 | REST API port (TCP, localhost only). | operations.md SS5.1 |
 | `p2p_port` | integer | `9474` | 1-65535 | P2P transport port (UDP, QUIC). | operations.md SS5.1 |
 | `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700). | operations.md SS5.1 |
-| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay's database may hold. At the cap a relay takes no channel it does not already hold, and makes room for the ones it holds by dropping the newest (decision 2026-09-30 §4.6). Not applied on a personal node. | operations.md SS5.1 |
+| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of each kind of channel. The older kind and the channels from their secrets are each counted against a cap of this size, so for the one version that carries both a relay can hold twice this. Each is counted by what its entries are counted at (an entry's content and 1 KB), and not by the database's pages. At a cap a relay takes no channel of that kind which it does not already hold; over it, it drops the channels of that kind that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
 
 ### 2.3 `[network]`
 
@@ -87,7 +107,7 @@ key = "cordelia_pk1..."
 | Parameter | Type | Default | Description | Source |
 |-----------|------|---------|-------------|--------|
 | `addr` | string | (required) | The relay's address as `<hostname>:<port>`. With none configured, a personal node uses the two default relays. | decision 2026-09-30 §4.6 |
-| `key` | string | unset | The relay's public key (`cordelia_pk1...`, as `cordelia id` prints on the relay). When set, any other key answering at `addr` is refused. The default relays' keys are compiled in and need not be given. Without a key, whichever node answers is accepted, and the node warns at start. A key that does not parse stops the node from starting. | decision 2026-09-30 §4.6 |
+| `key` | string | unset | The relay's public key (`cordelia_pk1...`, as `cordelia id` prints on the relay). When set, any other key answering at `addr` is refused. The default relays' keys are compiled in and need not be given. Without a key, whichever node answers is accepted, and the node warns at start. A key that does not parse stops the node from starting. **On a relay, a relay listed with its key is one it works together with:** the two pass the entries of channels from their secrets between them without the proof, tell each other which channels they hold, and are not counted against each other's limits. A relay listed by address alone is not one for that: whoever came from that address would be handed every channel. | decision 2026-09-30 §4.6; decision 2026-10-04 §2.4, item 6 |
 
 **Contradiction resolved:** operations.md SS5.1 uses a flat string array (`bootnodes = ["host:port", ...]`) and places governor parameters under `[network]`. network-protocol.md SS12.2 uses `[[network.bootnodes]]` array-of-tables and places governor parameters under `[governor]`. This document follows network-protocol.md SS12.2 as canonical: bootnodes use array-of-tables (extensible for future fields like `role`, `priority`), and governor parameters live under `[governor]` (SS2.4 below).
 
@@ -126,11 +146,18 @@ Anti-entropy sync intervals, tombstone retention, and batch sizing for the Item-
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `sync_interval_realtime_secs` | integer | `60` | > 0 | Anti-entropy pull interval for realtime channels (seconds). Items also arrive via push, so this is a consistency backstop. | network-protocol.md SS12.3 |
+| `sync_interval_realtime_secs` | integer | `10` | > 0 | Anti-entropy pull interval for realtime channels (seconds): `REALTIME_SYNC_INTERVAL_SECS` in `protocol.rs`, twice the interval at which a relay passes on what it took. Items also arrive via push, so this is a consistency backstop. | network-protocol.md SS12.3 |
 | `sync_interval_batch_secs` | integer | `900` | > 0 | Anti-entropy pull interval for batch channels (seconds). 15 minutes default. | network-protocol.md SS12.3 |
 | `tombstone_retention_days` | integer | `7` | > 0 | Days to retain tombstoned items before physical deletion. Must be long enough for all peers to observe the tombstone. | network-protocol.md SS12.3 |
 | `max_batch_size` | integer | `100` | 1-10000 | Maximum items per FetchRequest/PushPayload message. | network-protocol.md SS9.2, SS12.3 |
 | `relay_ask_again_secs` | integer | `600` | 1-86400 (a value outside is taken as the nearest) | Relays only. How long a relay waits before it asks a device again which channels it holds, and before it takes again a channel it dropped to make room. | parameter-rationale.md SS4 |
+
+> **v1 status.** The defaults are those of `ReplicationConfig` in
+> `crates/cordelia-core/src/config.rs`, each a constant of `protocol.rs`. Of
+> this section a node acts on `relay_ask_again_secs` alone. Its pull runs
+> every `REALTIME_SYNC_INTERVAL_SECS` (10 seconds) whatever
+> `sync_interval_realtime_secs` is set to, and the other three keys are read
+> from the file and used by nothing.
 
 ### 2.6 `[limits]`
 
@@ -276,7 +303,7 @@ clear_failure_delay_secs = 120             # Clear failure count after being Hot
 
 # --- Replication ---
 [replication]
-sync_interval_realtime_secs = 60           # Anti-entropy interval for realtime channels
+sync_interval_realtime_secs = 10           # Anti-entropy interval for realtime channels
 sync_interval_batch_secs = 900             # Anti-entropy interval for batch channels (15 min)
 tombstone_retention_days = 7               # Days to keep tombstones
 max_batch_size = 100                       # Items per FetchRequest/PushPayload
@@ -426,6 +453,15 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 2. **Key file permissions**: Files at `~/.cordelia/identity.key`, `~/.cordelia/node-token`, and `~/.cordelia/channel-keys/*.key` MUST have mode 0600. The node warns on startup if permissions are too open and MUST refuse to start if key files are world-readable.
 
 3. **Data directory permissions**: `~/.cordelia` SHOULD have mode 0700.
+
+> **v1 status.** A personal node has no key file for each channel from its
+> first start on this version: the files under `channel-keys/` are of the
+> older kind, and are removed then, after a copy. What a device's channels
+> are derived from, the person secret, is in the database (`cordelia.db`,
+> mode 0600), so that it changes in one transaction with a statement
+> (decision 2026-10-04 §3). Whoever can read that file can read every name
+> of the person's. The copy folder `before-<version>` is mode 0700, and each
+> file in it 0600.
 
 ---
 

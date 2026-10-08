@@ -343,6 +343,9 @@ larger value is neither stored nor passed on.
 signed 64-bit column and as a JSON number, so the API can carry it. At one
 revision a second it lasts 285 million years.
 
+In a channel from its secret a revision has the same bound, and is read as
+a band and a count (§12.1). There is no epoch there.
+
 ### max_epoch_step = 2^20
 
 **Rationale:** A state carries the whole member list, so a device that was
@@ -435,6 +438,12 @@ the largest channel we expect. A person with a dozen projects makes a
 dozen channels the first time they sync; 16 an hour covers that. One
 address can then make a relay take at most 256MB an hour, so filling the
 default 1GB takes it four hours, or several addresses.
+
+These two are of the older kind of channel. A channel from its secret has
+a cap of the same size and an allowance of its own, 256 an hour (§12.7),
+and each kind is counted against a cap of its own: a relay's
+`max_storage_bytes` bounds each, so for the one version that carries both
+a relay can hold twice that.
 
 ### relay_ask_again_secs = 600
 
@@ -815,9 +824,927 @@ looks. Looks more than 30 seconds apart are not one run of looks: the
 machine slept, the clock was moved, or the cycles stopped, and what was
 found before says nothing of now.
 
+## 12. A Channel From Its Secret
+
+The constants of the [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md),
+which `protocol.rs` has under "A channel from its secret", grouped here by
+what they are for. "Decision" below is that record. Where a
+value is derived from another, `protocol.rs` computes it, and a compile-time
+assertion there checks each bound that has to hold with another. Where
+neither the code nor the record gives a reason for a number, this section
+says so.
+
+### 12.1 A Revision
+
+#### REV_BAND_BITS = 9, REV_COUNT_BITS = 44
+
+**Rationale:** A revision is one number, compared as one, and editing adds
+one to it (decision §2.3). Its top nine bits are its band and the 44 below
+them its count. A statement's band is its number, and band 0 is ordinary
+editing, so the bands 0 to 256 are needed: nine bits. The count is what is
+left of a revision, whose bound is 2^53 - 1 (`MAX_REV`, §4): a band and a
+count are the whole of it, which `protocol.rs` asserts.
+
+#### REV_BAND_SIZE = 2^44, REV_BAND_HALF = 2^43
+
+**Derivation:** Every count that fits in `REV_COUNT_BITS`, and half of that.
+
+**Rationale:** The top half of a band is where a revision is because a
+device jumped, or because devices edited on above a jump: editing does not
+reach it by itself, since it is 2^43 edits from the bottom. So a revision
+there can be moved to the bottom half of the next band at each statement,
+by a rule of the number alone, and a name that a device put out of reach
+comes back into reach.
+
+### 12.2 The Statement
+
+#### MAX_STATEMENT_NUMBER = 256
+
+**Rationale:** The highest number a statement may have, and so the highest
+band a revision may be in. A phrase makes at most this many statements in
+this format, and each command that makes one says how many are left once
+fewer than 16 are. Under statement 256 there is no next one: the way on is a
+new phrase (decision §4.1).
+
+**Why 256:** chosen with the nine bits of a band and with the change
+entry's one size (below): no measurement of how many changes a person makes
+is behind it yet. A later format lifts the bound.
+
+#### MAX_STATEMENT_DEVICES = 64
+
+**Rationale:** The most devices a statement may list. Each costs its key, a
+label of up to 64 bytes, and a secret sealed to it in the change entry: 190
+bytes at most.
+
+**Why 64:** chosen with the change entry's one size; no measurement behind
+it yet.
+
+#### MAX_STATEMENT_REMOVED = 256
+
+**Rationale:** The most removed keys a statement may list. A statement lists
+every key removed so far, so this is also the most keys one phrase removes.
+A statement that would list more is refused.
+
+**What it costs:** the bound can be used up. Every device that a person
+declines at a prompt is a removed key, and a device that counts can sign 63
+records of additions at a time. A phrase with no room left removes nobody
+more, and the way on is a new phrase (decision §4.1, §12).
+
+**Why 256:** chosen with the change entry's one size; no measurement behind
+it yet.
+
+#### MAX_STATEMENT_CHAIN = 256
+
+**Rationale:** The most statements a statement's chain may name: every
+statement it was made after, back to the first. A settlement's chain holds
+two branches, so a chain can name more statements than its own number.
+
+**Why 256:** chosen with `MAX_STATEMENT_NUMBER`; no measurement behind it
+yet.
+
+#### MAX_DEVICE_LABEL_BYTES = 64
+
+**Rationale:** A label is what a person calls a device, kept as it was
+typed: 1 to 64 bytes of printable ASCII.
+
+**Why 64:** chosen with the statement's size at its bounds; no measurement
+behind it yet.
+
+#### STATEMENT_HASH_BYTES = 16
+
+**Rationale:** How much of a statement's hash names it on a chain. Only the
+phrase signs a statement, so nothing is gained by forging one of these: 16
+bytes are enough to tell statements apart, and a chain of 256 is 6 KB and
+not 10.
+
+#### MAX_STATEMENT_BYTES = 20,784
+
+**Derivation:** From the bounds above and the widths of the form
+(data-formats.md §9.4): a number is eight bytes, a count or a length two, a
+key 32, a signature 64.
+
+### 12.3 The Change Entry
+
+#### CHANGE_ENTRY_BYTES = 32 KB
+
+**Rationale:** The size of a change entry's content, always. One size, so
+that the entry of one statement takes the room of the one before it at a
+relay, and its size says nothing: not even how many devices there are. A
+removal therefore needs no new room at a relay, and a relay at its cap
+still stores it (decision §2.5, §4.6).
+
+**Why 32 KB:** an entry's content is a power of two. At every bound
+together the part for the devices says 26,704 bytes and the part for the
+phrase 382, which 16 KB would not hold and 32 KB does. It is within the 64
+KB that every entry must fit in.
+
+**What it costs:** a device shows this entry to each relay on every pass.
+Whole each time, that is some 280 MB a day from each idle device to each
+relay, and a tenth of what a connection may push in a minute. That is why a
+show is short after the first on a connection (decision §2.4, item 5).
+
+#### CHANGE_ENTRY_PHRASE_PART_BYTES = 4 KB, CHANGE_ENTRY_DEVICES_PART_BYTES = 28 KB
+
+**Rationale:** The last 4 KB is the part for the phrase, and the rest is
+the part for the devices. Each part is one size whatever it says.
+
+**Why 4 KB:** chosen with `MAX_EARLIER_SECRETS`: at its bound the part says
+382 bytes. No measurement behind it yet. The other part is what it leaves.
+
+#### SEALED_SECRET_BYTES = 92
+
+**Derivation:** A secret sealed to one device's key, as the node seals to a
+key: an ephemeral key (32), a nonce (12), the 32 bytes and a tag (16).
+
+#### MAX_EARLIER_SECRETS = 8
+
+**Rationale:** The most secrets of earlier generations that a change entry
+carries for the phrase. They are for what the relays hold in a generation
+that was left and that nobody carried: a second change made soon after a
+first does not put it out of the phrase's reach (decision §9). A recovery
+reads back as far as these go.
+
+**What it costs:** a machine that recovered holds the secrets of up to
+eight earlier generations for 90 days, which no other device holds for a
+generation it was never in (decision §12).
+
+**Why 8:** chosen with the part's 4 KB; no measurement behind it yet.
+
+### 12.4 An Entry
+
+#### MIN_ENTRY_CONTENT_BYTES = 256
+
+**Rationale:** The smallest an entry's content may be. A content's length is
+a power of two from this up to `MAX_ITEM_BYTES`: what it holds is filled up
+inside the encryption, so that a relay sees a size class and no length.
+There are nine classes.
+
+**What the classes cost:** an entry is padded to a power of two, so a
+channel can hold as little as half of its 16 MB in text (decision §12).
+
+**Why 256:** chosen with the classes being powers of two; no measurement
+behind it yet.
+
+#### MAX_ENTRY_LINKS = 100
+
+**Rationale:** The most links an entry's chain may have: one for each
+version the entry descends from, the newest first. What is older than the
+hundredth is not said. A chain is what lets a device ask whether a version
+follows its own text, as git asks of a commit and its ancestors, with a
+window, because nothing here keeps a history (decision §7.3).
+
+**What it costs:** a device that is more than about a hundred versions of
+one file behind keeps a copy beside the file, with no change of devices at
+all. A merged index of two lines of versions written apart has about fifty
+links for each. For the index of a busy agent a hundred versions can be a
+few days' work.
+
+**Why 100:** chosen with the room it takes in every entry (3,202 bytes,
+below); no measurement of how far behind a device falls is behind it yet.
+
+#### ENTRY_LINK_HASH_BYTES = 16
+
+**Rationale:** How much of a hash a link holds: the first 16 bytes of the
+SHA-256 of a version's value. A link names a version to whoever holds its
+text, and a hash of this length is not met by another text by chance.
+
+#### ENTRY_LINK_SIGNER_BYTES = 16
+
+**Rationale:** How much of a key a link holds: the first 16 bytes of the key
+that signed the entry the version was taken from. It is asked of a reader's
+own devices, which are few, so the start of a key says which of them it is.
+
+#### MAX_ENTRY_CHAIN_BYTES = 3,202
+
+**Derivation:** A count of two bytes, and `MAX_ENTRY_LINKS` links of 32
+bytes.
+
+#### MAX_ENTRY_NAME_AND_VALUE_BYTES = 60 KB
+
+**Rationale:** The most an entry's name and its value may be together. The
+rest of the 64 KB is kept for the entry's chain, so that it always fits,
+whatever the value: no link is ever left out for room, and no entry says
+less in order to fit. At every bound together the content is 64,675 bytes
+of the 65,536 it may be.
+
+**What it costs:** a file of more than 60 KB does not sync, where the
+older kind's limit is 64 KB (decision §10, §12).
+
+#### ENTRY_CLEAR_BYTES = 233, ENTRY_WIRE_OVERHEAD_BYTES = 237, MAX_ENTRY_WIRE_BYTES = 65,773
+
+**Derivation:** What an entry takes in clear beside its content: the
+channel's ID, the slot and the author's key (32 each), the revision (8),
+whether it is a delete (1) and the two signatures (64 each). On the wire the
+content's length is four bytes more. The most an entry takes on the wire is
+that and the largest content.
+
+**Rationale:** The clear fields are within the 1 KB that every entry is
+counted with (`ENTRY_OVERHEAD_BYTES`), twice over: once as they are stored,
+and once for their place in each index. So an entry on the wire is within
+what it is counted at, and a limit on bytes that counts entries bounds what
+travels. `protocol.rs` asserts both.
+
+### 12.5 The Phrase, and the Labels
+
+#### PHRASE_WORDS = 12, PHRASE_BYTES = 16
+
+**Rationale:** Twelve words of the BIP39 English list encode 128 bits and a
+checksum, so a mistyped word is caught. Everything that comes from the
+phrase is derived from the 16 bytes that the words encode.
+
+**Why twelve:** chosen with BIP39's shortest form, which a person writes
+down and types back when the phrase is made; no measurement behind it yet.
+
+#### The labels (`LABEL_*`)
+
+**Rationale:** Everything that is derived, signed or sealed has a label of
+its own, and no label begins another (a test sets each against each). So no
+two things can ever be derived alike, an entry's signature is never taken
+for a proof, the author's signature is never taken for the channel's, and
+what was sealed to a device for one use opens for no other. The label of
+the value that is exported from a TLS session begins `EXPORTER`, as the
+labels of exporters do (RFC 5705 §4).
+
+| Constant | Label | What is under it |
+|---|---|---|
+| `LABEL_ENTRY_KEY` | `cordelia v2 entry` | A channel's entry key, from its secret |
+| `LABEL_SLOT_KEY` | `cordelia v2 slot` | A channel's slot key |
+| `LABEL_CHANNEL_SIGN` | `cordelia v2 sign` | A channel's signing key, whose public half is its ID |
+| `LABEL_PERSONAL` | `cordelia v2 personal` | The personal channel's secret, from the person secret |
+| `LABEL_OWN` | `cordelia v2 own` | The secret of a channel of the person's own, by name |
+| `LABEL_PAIR` | `cordelia v2 pair` | A pair channel's secret |
+| `LABEL_RECOVERY` | `cordelia v2 recovery` | The secret of the phrase's channel, from the phrase |
+| `LABEL_LOCKED` | `cordelia v2 locked` | A locked channel's secret (its derivation only, decision §11) |
+| `LABEL_PHRASE_SIGN` | `cordelia v2 phrase sign` | The phrase's signing key |
+| `LABEL_PHRASE_STATEMENT` | `cordelia v2 phrase statement` | The statement key |
+| `LABEL_PHRASE_SEAL` | `cordelia v2 phrase seal` | The key that seals the part of a change entry for the phrase |
+| `LABEL_COMMITMENT` | `cordelia v2 commitment` | A statement's commitment to its secret (a hash) |
+| `LABEL_STATEMENT` | `cordelia v2 statement` | The phrase's signature on a statement |
+| `LABEL_CHANGE_DEVICES` | `cordelia v2 change devices` | The seal of the part of a change entry for the devices |
+| `LABEL_CHANGE_PHRASE` | `cordelia v2 change phrase` | The seal of the part for the phrase |
+| `LABEL_CHANGE_SECRET` | `cordelia v2 change secret` | A secret sealed to one device in a change entry |
+| `LABEL_ENTRY_AUTHOR` | `cordelia v2 author` | The author's signature on an entry |
+| `LABEL_ENTRY_CHANNEL` | `cordelia v2 channel` | The channel's signature on an entry |
+| `LABEL_ENTRY_CONTENT` | `cordelia v2 content` | The seal of an entry's content |
+| `LABEL_ADDITION` | `cordelia v2 addition` | The adder's signature on a record of an addition |
+| `LABEL_CHANNEL_PROOF` | `cordelia v2 proof` | The proof that a connection holds a channel's key |
+| `LABEL_SESSION_VALUE` | `EXPORTER-cordelia v2 session` | The value both ends export from a TLS session |
+| `LABEL_FINGERPRINT` | `cordelia v2 fingerprint` | A key's fingerprint (a hash) |
+| `LABEL_CARRY_WORD` | `cordelia v2 carry word` | The phrase's signature on a person's word for a carry: which name, which keys that do not count, and which files above a version that is held (decision §7.3, §9). A signature under it is no statement and no entry |
+
+`LABELS` is all 25, for the test that sets one against another.
+
+#### FINGERPRINT_WORDS_SHOWN = 4
+
+**Rationale:** A label is whatever the device that added a key called it,
+and two keys can have one label. So wherever a device is shown for a
+decision, the first words of its key's fingerprint are shown beside its
+label: what a person can read aloud, or hold beside what another screen
+shows. Four words are 44 bits.
+
+**Why four:** chosen with the label it stands beside; no measurement behind
+it yet.
+
+### 12.6 Adding a Device
+
+#### MAX_ADDITION_BYTES = 226
+
+**Derivation:** From the widths of a record's form (data-formats.md §9.5),
+with a label at its longest and the signature.
+
+#### CHANGE_ENTRY_NAME = "change", HAND_OVER_NAME = "hand-over"
+
+**Rationale:** The phrase's channel holds one entry, and a pair channel is
+read for one. Each has one name, so that nothing else there is read. The
+change entry's slot is under the channel's ID and not under a key of the
+channel: a device holds no key of the phrase's channel, and has to know the
+change entry's slot from any other.
+
+#### PAIR_KEY_TYPED_SECS = 3600
+
+**Rationale:** How long a key that a person typed at `cordelia accept`
+opens the pair channel with that key. A device reads a pair channel only
+with a key that was typed on it within that time, so nothing that a removed
+device goes on writing there is read. And it takes only a hand-over that
+was made less than this long before or after the key was typed: a pair
+channel outlives a phrase, and what was handed long ago is not taken for
+what a person means now.
+
+**What it costs:** two devices whose clocks are more than an hour apart
+cannot be added to each other, and the command says so.
+
+**Why an hour:** chosen with the two commands, which a person runs on two
+machines one after the other; no measurement behind it yet.
+
+#### MAX_TYPED_KEYS = 8
+
+**Rationale:** The most keys typed at `accept` that are within their hour on
+a device at one time. A ninth is refused. Each is a pair channel that the
+device asks its relays for, for its hour, and a key with which a hand-over
+could be taken. A key whose hour has gone holds no place: it is kept only to
+say what became of it (`TYPED_KEY_KEPT_SECS`).
+
+**Why 8:** chosen as room to spare over the one key that adding a device
+takes; no measurement behind it yet.
+
+#### TYPED_KEY_KEPT_SECS = 86,400
+
+**Derivation:** 24 times `PAIR_KEY_TYPED_SECS`.
+
+**Rationale:** A typed key is kept after its hour to say what became of it.
+It reads nothing after its hour.
+
+**Why a day:** chosen with the hour it follows; no measurement behind it
+yet.
+
+#### HAND_OVER_KEPT_SECS = 7200
+
+**Derivation:** Twice `PAIR_KEY_TYPED_SECS`.
+
+**Rationale:** How long the device that adds keeps a hand-over in its
+store, from the time the hand-over says it was made. A hand-over holds the
+person secret. No device takes one that was made an hour or more before a
+key was typed, and a typed key opens the pair channel for an hour: after
+two hours nobody can take it. The device then writes a delete over it at
+each relay that it had sent it to, so that no relay goes on holding that
+generation's secret sealed to a key.
+
+#### MAX_HAND_OVER_RECORDS = 2
+
+**Rationale:** The record of the addition, and the record of the adder's
+own addition. A chain of additions is two long at most: a device added by
+one that was itself added since the last statement may not add until a
+statement lists it (decision §6).
+
+#### HAND_OVER_CHANGE_ENTRY_BYTES = 32,960, MAX_HAND_OVER_BYTES = 54,275
+
+**Derivation:** The change entry as a hand-over carries it: the channel's
+ID, the slot, the two signatures, and the content at its one size. And the
+hand-over at every bound together (data-formats.md §9.8). With its name it
+is within what one entry may hold, which `protocol.rs` asserts: a hand-over
+is the value of one entry.
+
+#### MAX_COUNTED_DEVICES = 64
+
+**Derivation:** What a statement may list (`MAX_STATEMENT_DEVICES`), so that
+the next statement can list every device that counts.
+
+**Rationale:** A reader counts the devices of the statement it has applied,
+and those added since in the order it saw their records. A record beyond
+the bound is kept as not counted, and a statement makes room.
+
+#### MAX_NOT_COUNTED_RECORDS = 256
+
+**Rationale:** A device that counts can sign any number of records, and
+every reader loads what it keeps each time it asks who counts. Over this
+bound the oldest record that is not counted goes when a new one is kept. A
+record that counts is never dropped for room.
+
+**Why 256:** chosen with the other bounds of 256 here; no measurement
+behind it yet.
+
+#### LEFT_SECRET_KEPT_DAYS = 90
+
+**Rationale:** How long a device keeps the secret of a generation it left,
+by its own clock: the secret, and nothing else of that generation. It is
+for a carry that a person asks for (`cordelia sync carry`, decision §7.3),
+which fetches from the relays.
+
+**Why 90:** it is as long as a relay keeps a channel that nobody uses
+(`ENTRY_CHANNEL_UNUSED_DAYS`). Chosen with that; no measurement behind it
+yet.
+
+#### The names in the personal channel
+
+`PERSONAL_NAME_PREFIX = "name/"`, `PERSONAL_ADDED_PREFIX = "added/"`,
+`PERSONAL_APPLIED_PREFIX = "applied/"`, `PERSONAL_LEFT_PREFIX = "left/"`,
+`PERSONAL_APPLIED_SENT = " sent"`.
+
+**Rationale:** Each kind of word has a first part of its own, and a
+device's word is under its own key or under the name it speaks of, so each
+device has a slot of its own and only its own entry there is its word. A
+word that a device has applied a statement is the number alone until it has
+sent what it carried, and the number and ` sent` after (decision §8).
+
+### 12.7 The Streams, and a Relay
+
+#### PROTOCOL_ENTRY_SHOW = 0x10, PROTOCOL_CHANNEL_PROVE = 0x11, PROTOCOL_ENTRY_PULL = 0x12, PROTOCOL_ENTRY_PUSH = 0x13, PROTOCOL_RELAY_ENTRIES = 0x14
+
+**Rationale:** The streams of entries begin at 0x10, apart from the eight
+of the older kind: a peer that does not know them refuses the stream, and
+reads none of them as one of its own.
+
+#### SESSION_VALUE_BYTES = 32
+
+**Rationale:** How long the value is that both ends of a connection export
+from its TLS session, for a proof to be made over. One length, so that
+where the value ends and what follows it begins is never in doubt.
+
+**Why 32:** chosen with the length of a key and of a hash, which is what
+follows it in what is signed; no measurement behind it yet.
+
+#### MAX_CHANNELS_PROVED_ON_A_CONNECTION = 1024
+
+**Derivation:** The most channels a relay asks one peer about in a pass,
+`MAX_CHANNELS_ASKED_OF_A_PEER` (§4).
+
+**Rationale:** Whoever holds a secret can prove its channel, held or not,
+and a secret costs nothing to make: without a bound one connection could
+have a relay remember any number of them. A person's device holds tens of
+channels.
+
+**What it costs:** a device proves, once a day, the channel of every name
+that its personal channel lists. A person with more names than this is
+past what that keeps alive at a relay (decision §2.5).
+
+#### MAX_SLOTS_SHOWN_ON_A_CONNECTION = 8
+
+**Rationale:** The most slots for which a relay remembers, for one
+connection, the last entry it was shown whole there. A device shows one
+entry, the change entry of the phrase it follows, so 8 is room to spare. A
+ninth is not remembered, and is shown whole each time.
+
+#### CHANNEL_MARK_BYTES = 8
+
+**Rationale:** A place in a channel is a count of what the relay stored in
+one holding of it. A relay that drops a channel and takes it again counts
+from 1 again, under another mark: so whoever kept a place from the earlier
+holding is handed the channel from the start, and not from a place that
+means something else now.
+
+**Why 8 bytes:** chosen with a mark being random, and compared only with
+the marks of one channel's holdings; no measurement behind it yet.
+
+#### ENTRY_PAGE_MAX_ENTRIES = 100
+
+**Derivation:** What one page of the older kind lists, `DEFAULT_SYNC_LIMIT`.
+
+**Rationale:** Whoever receives a message checks two signatures for each
+entry in it: one message makes it do so for no more entries than a page
+holds. A push, and the answer to one, have the same bound.
+
+#### ENTRY_PAGE_MAX_BYTES = 896 KB
+
+**Derivation:** `MAX_MESSAGE_BYTES` less 128 KB.
+
+**Rationale:** A page travels in one message, and 128 KB of the message is
+left for what is around the entries, as it is around a push of the older
+kind. A page always has room for one entry, whatever its size, so a channel
+is never stuck behind an entry that fits no page. And a full page, counted
+as entries are counted, is within what one connection may be handed in a
+minute. `protocol.rs` asserts both.
+
+#### RELAY_CHANNELS_PAGE_MAX = 1000
+
+**Rationale:** The most channels in one answer of a relay that tells a
+relay it works with which channels it holds. Each is its ID, its mark, two
+times and a count: a thousand of them are well within one message.
+
+#### MAX_ENTRY_CHANNEL_BYTES_AT_RELAY = 16 MB
+
+**Derivation:** What a channel of the older kind may hold,
+`MAX_CHANNEL_BYTES_AT_RELAY` (§4). The two kinds are counted apart, each
+against a cap of its own.
+
+**What it costs:** an entry is padded to a power of two, so a name with
+more than about half of a channel's cap in text may not fit (decision §10).
+
+#### NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR = 256
+
+**Rationale:** How many channels from their secrets one address may make a
+relay hold for the first time in an hour. After a removal every channel of
+a person's own is new: the personal channel, and one for each name. So is
+a pair channel, each time a device is added. At 16 an hour, which is what
+the older kind allows, a person with thirty names would wait two hours for
+the last of them, and a home with three devices shares one address. At 256
+a home of several people, each with tens of names, moves within the hour.
+
+**What it still bounds:** a channel costs nothing to make, so without an
+allowance one address could make a relay hold any number of them. A relay's
+cap is what bounds its storage, and it drops its newest channels first, so
+the channels that an address makes in an hour can push out only one another
+and what is newer still.
+
+#### ENTRY_CHANNEL_UNUSED_DAYS = 90
+
+**Rationale:** How long a relay keeps a channel from its secret that nobody
+uses: one whose key no connection has proved, and of which nobody has shown
+an entry that the relay holds, for that long is dropped. It is also the
+term of a recovery: the phrase brings back what the relays hold for 90 days
+after the last device of the person's was on, and no longer (decision §9).
+
+**Why 90:** it is as long as a node keeps a delete
+(`KEYED_TOMBSTONE_RETENTION_DAYS`). Chosen with that; no measurement behind
+it yet.
+
+#### ENTRY_CHANNEL_USED_STEP_SECS = 3600
+
+**Rationale:** How much later than the time a relay keeps for a channel a
+use of the channel must be, for the relay to write it down. A proof, or an
+entry shown that the relay holds, is use of a channel, and a device makes
+both on every pass: if each were written, every one would be a write to
+the relay's disk for whoever asks. Against the 90 days that an unused
+channel is kept, an hour is nothing.
+
+#### ENTRY_CHANNEL_SWEEP_INTERVAL_SECS = 3600
+
+**Derivation:** As often as expired deletes are collected,
+`TOMBSTONE_GC_INTERVAL_SECS`. Hourly is plenty against 90 days.
+
+#### KEYED_TOMBSTONE_RETENTION_DAYS = 90, for a delete among entries
+
+**Rationale:** The value is the one that the record of 2026-09-30 gives a
+deleted key (§4.4 there): a device that was offline for longer can bring a
+deleted file back with a stale edit, and 90 days covers a laptop left in a
+drawer for a season. It is also how long a delete is held among the entries
+of a channel from its secret, at a relay and in a device's own store
+(decision §2.3, §7.3), counted from when the node stored the entry. A delete
+that is carried at a statement is a new entry, and starts again.
+
+**The timer:** a relay and a device each look once in
+`TOMBSTONE_GC_INTERVAL_SECS`, an hour, which is plenty against 90 days. It
+is one timer, and one length of time, for both kinds of channel.
+
+#### ENTRY_OFFER_INTERVAL_SECS = 5, RELAY_ENTRY_PULL_INTERVAL_SECS = 10
+
+**Derivation:** A relay passes the entries it took on to the relays it
+works with as often as it passes on items of the older kind
+(`REPUSH_INTERVAL_SECS`). It asks each of them which channels it holds, and
+pulls what it lacks, as often as a node fetches items of the older kind
+from its hot peers (`REALTIME_SYNC_INTERVAL_SECS`).
+
+#### RELAY_ENTRY_PULL_PAGES = 10, RELAY_CHANNEL_PAGES_PER_PASS = 10
+
+**Rationale:** The most pages of one channel that a relay pulls from a
+relay it works with in one pass, and the most pages of that relay's list of
+channels that it reads in one. A longer channel, and a longer list, is gone
+on with in the next pass, from where this one stopped: one long channel
+does not keep every other waiting, and a list which never ends keeps a
+relay asking no longer than this. Ten pages of the list are ten thousand
+channels.
+
+**Why 10:** ten pages of a channel are a thousand entries in a pass. Chosen
+with that; no measurement behind it yet.
+
+### 12.8 The Limits on the Streams
+
+#### ENTRY_REQUESTS_PER_PEER_PER_MINUTE = 3000
+
+**Rationale:** How many requests one connection may make in a minute on the
+streams of entries, all of them counted together. A request beyond it is
+refused, and is a breach. All the connections from one address share
+`MAX_CONNECTIONS_PER_IP` times this. Without it a connection could ask
+without end: every proof is a signature for the relay to check, and every
+pull a look at its store.
+
+**Derivation:** It is sized for a device with 256 names, which is what an
+address may make a relay take in an hour: a pull of each every ten seconds,
+and of the personal channel (1,542 a minute); its day's proofs in one
+burst, as many as a relay remembers for a connection (1,024); a show for
+each pass and each time it sends; and what it pushes.
+
+#### OWN_ENTRY_REQUESTS_PER_MINUTE = 2250
+
+**Derivation:** Three quarters of `ENTRY_REQUESTS_PER_PEER_PER_MINUTE`, as
+what a device pushes in a minute (`OUTBOX_BYTES_PER_MINUTE`, §4) is three
+quarters of what a relay allows.
+
+**Rationale:** How many requests a device makes of one relay in a minute,
+at most, on the streams that prove, pull and push. A device paces itself,
+so that it is never the one refused for going over: a request over a
+relay's count is a breach, and a few of those cut a device off. What it
+does not ask in one minute, it asks in the next. Its shows are not held
+back by this, and are few: a device must still hear of a removal.
+
+#### SHOW_ANSWER_ROOM_BYTES = 66,560
+
+**Derivation:** What one entry of the largest size is counted at:
+`MAX_ITEM_BYTES` and `ENTRY_OVERHEAD_BYTES`.
+
+**Rationale:** The room that a pull leaves for the answer to a show, in
+the bytes that a key and its address may be handed in a minute. A relay
+sizes a page of a channel so that this much is left in both allowances, and
+only the entry that answers a show may use it: a device that pulls at its
+full rate, or shares its address with one that does, is still told of a
+removal. A whole page can still be handed beside it: `protocol.rs` asserts
+that the room is less than half of a minute's allowance and that a full
+page is within the allowance, and the two together are 1,086,464 bytes of
+the 2,097,152.
+
+**What is not defended:** whoever shows entries of its own from the same
+address can still use that room up (decision §2.5).
+
+#### SHOW_LEAVE_SECS = 10
+
+**Derivation:** The time between two passes, `REALTIME_SYNC_INTERVAL_SECS`.
+
+**Rationale:** How long the leave lasts that a relay's answer to a show
+gives a device on that connection (decision §4.6). A device opens a stream
+for a channel of its own, and takes what comes back on it, only with
+leave. So what a device sends on its own timer, at each publish and from
+what it sends again, comes after a show, and a pass that is long shows
+again as it goes.
+
+#### WAKE_WAIT_SECS = 30
+
+**Rationale:** How long a device that wakes waits for the relays it is set
+up with: when the node starts, or reaches a relay after having reached
+none, it neither takes from a channel of its own nor sends to one until
+each of them has answered a show, or this long has gone by. Connections
+come up one at a time: without the wait a device would take what the first
+relay held, and send it what waited, before a second, which had a change,
+had answered.
+
+**What it costs:** with one relay out of reach a device waits this long
+before it syncs.
+
+**Why 30:** chosen with that cost; no measurement behind it yet.
+
+#### LEAVING_SEND_WAIT_SECS = 30, FIRST_FETCH_WAIT_SECS = 30
+
+**Derivation:** Both are the wait of a device that wakes, `WAKE_WAIT_SECS`,
+which is how long a relay that answers at all has had to answer.
+
+**Rationale:** The first is how long a device that is given a new key
+waits for its relays to be sent the word that it has left, and the deletes
+over what it handed, before it forgets the secret they are written with.
+It says which relays were not sent them. The second is how long a folder's
+first cycle in a channel waits, once one relay has handed the whole of the
+name's channel, for each other relay to hand it too. A folder with no
+record in a channel yet waits for a relay, and never for a device: so a
+file that another device has already sent meets the folder's as on any
+first sync, and is not published a second time (decision §6).
+
+#### CHANNEL_PROOF_AGAIN_SECS = 86,400
+
+**Rationale:** How often a device proves again, on a connection that lasts,
+the key of each channel of its own and of each name that its personal
+channel lists. A relay drops a channel that nobody has used for
+`ENTRY_CHANNEL_UNUSED_DAYS`, and a proof is use. So a name whose only
+device is gone is not dropped while any device of the person's is on.
+
+**Why a day:** once a day is 90 uses in the time a relay keeps an unused
+channel. Chosen with that; no measurement behind it yet.
+
+### 12.9 The Commands
+
+#### CHANGE_FETCH_MAX_SECS = 120, CHANGE_FETCH_PASSES = 3
+
+**Rationale:** How long the fetch may take that a command makes before it
+prepares a change, and how many whole passes it asks for where a pass ends
+before it has read every channel to its end (decision §7.1, step 1).
+Nothing depends on its being whole: the command says what it could not
+fetch, and a removal is never held up by what another device goes on
+writing. A pass that found a relay at another turn, or a channel longer
+than one pass takes, is read on by the next. A relay that keeps giving no
+leave is so asked three times, and not for two minutes.
+
+**Why two minutes:** chosen with the command that waits for it; no
+measurement behind it yet.
+
+#### STATEMENTS_LEFT_SAID_BELOW = 16
+
+**Rationale:** A command that makes a statement says how many more the
+phrase can make once fewer than this are left, so that a person hears of
+the bound before it is reached.
+
+**Why 16:** chosen with `MAX_STATEMENT_NUMBER`; no measurement behind it
+yet.
+
+#### RECEIVED_LAST_DAY_SECS = 86,400, RECEIVED_LAST_WEEK_SECS = 604,800
+
+**Rationale:** The two spans over which a command that removes a device
+says how much that device wrote that this one received: a person who knows
+that a device was stolen on Tuesday wants to see what it wrote since
+(decision §7.1). Both are read from local history, and a week is within
+what local history keeps by default (`HISTORY_DAYS`, §10), which
+`protocol.rs` asserts.
+
+#### CARRY_READ_MAX_SECS = 120
+
+**Derivation:** `CHANGE_FETCH_MAX_SECS`: as long as the fetch before a
+change.
+
+**Rationale:** How long a carry by command reads one name at the relays, at
+most (decision §7.3): the fetch of the new channel, and then the name's
+channel in each generation that the device left. What was not read to its
+end by then is said, and the command can be run again.
+
+#### CARRY_FIRST_MAX_SECS = 180
+
+**Derivation:** `CARRY_READ_MAX_SECS` + 60: a little longer than the carry
+may read.
+
+**Rationale:** A device that comes to sync a name carries it first (decision
+§7.3). This is how long a channel that a carry is being made into holds back
+the first cycle of a folder that has just been mapped to its name, at most.
+A carry that never says it has ended holds nothing up for longer.
+
+#### CARRY_FROM_WORDS = 6
+
+**Rationale:** How many words of a key's fingerprint name a removed key at
+`cordelia sync carry --from` (decision §7.3). A statement lists removed keys
+bare, so a machine that never knew a device has no label for it. Six words
+are 66 bits. `protocol.rs` asserts that they are more than a device is shown
+by (`FINGERPRINT_WORDS_SHOWN`), and within the hash.
+
+**Why six:** chosen with the four that a device is shown by; no measurement
+behind it yet.
+
+#### CARRY_WORD_SECS = 600
+
+**Rationale:** How long a person's word for a carry stands (decision §7.3):
+ten minutes from when the phrase signed it. The command hands it to the node
+at once, and a word that is found later is no word.
+
+**Why ten minutes:** neither the code nor the record gives a reason for the
+number. It is longer than a carry may read a name (`CARRY_READ_MAX_SECS`);
+no measurement behind it yet.
+
+#### CARRY_PART_MAX_BYTES = 512 KB
+
+**Derivation:** Half of what one message of the wire holds,
+`MAX_MESSAGE_BYTES` / 2.
+
+**Rationale:** The most bytes of entries that the node hands a command in
+one answer (decision §7.3, §9), where the command reads a channel whose
+secret the node does not hold. A channel may hold more than one answer of
+the local API carries, so it is handed a part at a time. An entry over the
+bound is handed alone, and `protocol.rs` asserts that a part holds an entry
+of any size that a channel carries.
+
+#### RECOVERY_MAX_NAMES = 1,024
+
+**Rationale:** The most names a recovery carries (decision §9). A device
+that is gone listed names too, and can have listed any number of its own.
+The names that a recovery leaves are named.
+
+**Why 1,024:** neither the code nor the record gives a reason for the
+number; no measurement behind it yet.
+
+#### RECOVERY_MAX_DEVICES_SHOWN = 256
+
+**Rationale:** The most devices a recovery shows at its prompt, of the
+statement's and of those added since (decision §9). Beyond it the command
+says how many it could not show, and the look takes nothing from those.
+`protocol.rs` asserts that it is no fewer than a reader may count
+(`MAX_COUNTED_DEVICES`): a recovery shows every device that counts, and the
+records that it may keep as not counted beside them.
+
+#### RECOVERY_MAX_LEFT_SECRETS = 9
+
+**Derivation:** `MAX_EARLIER_SECRETS` + 1.
+
+**Rationale:** The most secrets of generations before its own that a machine
+which recovers is handed, and keeps as a device keeps a secret it left
+(decision §3, §9): the one of the generation it recovered from, and as many
+before it as a change entry gives the phrase.
+
+#### FILE_NAME_SHOWN_CHARS = 120
+
+**Rationale:** The most characters of a file's name that a command prints,
+and that the node puts in a line of its status. Another device may have
+written the name, and a name may be as long as an entry's text. What is cut
+is marked as cut.
+
+**Why 120:** neither the code nor the record gives a reason for the number;
+no measurement behind it yet.
+
+#### DEVICE_DELETE_SWEEP_INTERVAL_SECS = 86,400
+
+**Rationale:** A device sweeps the deletes that it has held for 90 days
+(`KEYED_TOMBSTONE_RETENTION_DAYS`) once a day, and at its start (decision §16). The time of a sweep is noted once
+it has succeeded: one that failed is tried at the next pass.
+Each sweep that takes a delete has that channel read again from its start at
+every relay, so a folder with steady deletes is read again once a day at most.
+A day is fine-grained enough for a bound of 90 days.
+
+#### LEFT_PROOFS_MARGIN_SHARE = 64
+
+**Rationale:** A relay remembers the proofs of 1,024 channels for one
+connection (`MAX_CHANNELS_PROVED_ON_A_CONNECTION`), and a read of a generation
+that was left spends one for each channel it reads there. The read keeps back
+as many places as the device has channels of its own that are not yet proved on
+that connection, and a margin of one place in sixty-four (16 of 1,024), for a
+name that the device comes to hold while the read goes on and for the pair
+channel of a device that is being added (decision §16).
+
+**Never more than half:** a device with more channels of its own than half a
+connection's places shares the connection half and half, and the read has the
+connection made again as often as it needs. Where no place is left, the
+connection is made again and the read goes on from where it was.
+
+**Why one in sixty-four:** chosen with the bound it divides; no measurement
+behind it yet.
+
+#### CARRY_PROOFS_MADE_AGAIN = 2
+
+**Rationale:** A proof holds on the connection whose session it was made over.
+Where the node says that a connection has changed since a command made its
+proofs, the command asks for the sessions again and makes the proofs anew, at
+most twice for one channel. After the second time it says which relay it could
+not read (decision §16). A relay that was not read is never said to hold
+nothing.
+
+**Why twice:** enough for a connection that was made again once while a person
+answered prompts, and once more; no measurement behind it yet.
+
+#### LABEL_CARRY_BATCH = `cordelia v2 carry batch`
+
+**Rationale:** The label under which the key of one run of a command signs a
+batch of versions that it hands the node on the phrase's word: the batch's
+number, and the hash of its versions as they are handed (decision §16). The
+word names that key, the command makes it for the one run, and the node takes
+each number once. A signature under this label is no word, no statement and no
+entry.
+
+#### LOCAL_API_BODY_MAX_BYTES = 2 MB
+
+**Rationale:** The most bytes of one request's body that the local API of a
+device reads as JSON. A body over it is refused and is not read.
+
+**Why 2 MB:** room for one version of the largest size that an entry holds,
+with every byte of its name and its text written as six (the most that JSON
+makes of one) and every byte of its chain as four, beside a batch at its bound
+(`CARRY_HANDED_MAX_BYTES`), the word and the batch's signature. A test in
+`protocol.rs` holds that sum under the bound.
+
+#### CARRY_HANDED_MAX_BYTES = 512 KB
+
+**Derivation:** A quarter of `LOCAL_API_BODY_MAX_BYTES`. The most bytes of
+versions that a command hands the node in one request, each counted as it is
+written in the request's body, with its chain and with its name and text as
+they are escaped there (decision §7.3). A version over the bound is handed
+alone.
+
+### 12.10 The Status Line
+
+#### STATUS_AMBER_WAIT_SECS = 300
+
+**Rationale:** How long a thing that will pass by itself has lasted before
+the status line shows it as amber (decision §10.1): no relay connected; a
+relay that is connected and does not hold the latest change; and, after a
+change, names that are not yet in the new generation or not yet sent.
+
+**Why five minutes:** a machine that wakes, a relay that restarts and a
+device that has just applied a change are each through it in less, and what
+lasts longer is worth a person's knowing. The first two are counted by the
+node's own clock, which does not run while the machine sleeps. `protocol.rs`
+asserts that a device that wakes has heard from its relays, or given them
+up, well within it (twice `WAKE_WAIT_SECS`).
+
+#### REMOVAL_NOT_APPLIED_SHOWN_DAYS = 7
+
+**Rationale:** For how many days after a device applied a removal the status
+line shows as amber that some device has not applied it (decision §8,
+§10.1). After that it is said in `cordelia devices` only: a device that lies
+in a drawer does not keep every status line amber for good. Names that no
+device lists yet in the new generation are shown for as long. `protocol.rs`
+asserts that it is shorter than a left secret is kept
+(`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
+known.
+
+**Why seven:** neither the code nor the record gives a reason for the
+number; no measurement behind it yet.
+
+#### NO_ROOM_STANDS_SECS = 1,200
+
+**Derivation:** 2 × `OUTBOX_REFUSED_RETRY_MAX_SECS`.
+
+**Rationale:** For how long after a relay refused something for room, or for
+the address's allowance, the status line takes it that the relay still
+refuses (decision §10.1). A device keeps the time of a relay's last refusal,
+and offers again what was refused after a wait that doubles up to
+`OUTBOX_REFUSED_RETRY_MAX_SECS`. So a relay that still refuses has refused
+again within twice that, and one that has not has taken what it was offered,
+or was offered nothing more.
+
+### 12.11 The First Start
+
+#### FIRST_START_RETRY_BASE_SECS = 5, FIRST_START_RETRY_MAX_SECS = 600
+
+**Derivation:** The maximum is `OUTBOX_REFUSED_RETRY_MAX_SECS`: ten minutes,
+the longest wait before anything a relay refused is offered again.
+
+**Rationale:** How long a personal node waits before it tries its first
+start on this version again, after a try that failed (decision §10.1): the
+sync cycle's five seconds after the first, and twice as long after each
+further one, up to the maximum. A start that cannot succeed (no room for the
+copy, no leave to write) does not write its copy again every five seconds.
+And a person who has made room is not kept waiting for longer than ten
+minutes, and need not restart the node.
+
+#### FIRST_START_RETRY_SLACK_SECS = 1
+
+**Rationale:** How much before its wait has passed a try at the first start
+is still made (decision §10.1). A try is made when a sync cycle would have
+run, and the first wait is a cycle long: without this, the timer's own
+jitter would put every try off by a whole cycle. `protocol.rs` asserts that
+it is less than the first wait.
+
 ---
 
 *Spec version: 1.4*
 *Created: 2026-03-16*
 *Updated: 2026-09-30*
-*Cross-refs: network-protocol.md §9, §12; network-behaviour.md §2.2, §5*
+*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md*
