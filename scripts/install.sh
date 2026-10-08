@@ -422,12 +422,20 @@ install_launchctl() {
 PLIST
 
     START_CMD="launchctl load ${PLIST_FILE}"
+    START_SAYS="                        # run the node as a background service"
     RESTART_CMD="launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Stop:   launchctl unload ${PLIST_FILE}"
     echo "  Logs:   tail -f ${DATA_DIR}/logs/cordelia.log"
+}
+
+# Whether a systemd user session answers on this machine. Only then can
+# the node be started as the service that this script writes: in a
+# container, or at a login that has no such session, none answers.
+systemd_user_answers() {
+    systemctl --user show-environment >/dev/null 2>&1
 }
 
 install_systemd() {
@@ -454,8 +462,22 @@ WantedBy=default.target
 SERVICE
 
     START_CMD="systemctl --user enable --now cordelia"
+    START_SAYS="                        # run the node as a background service"
     RESTART_CMD="systemctl --user daemon-reload && systemctl --user restart cordelia"
     LOGS_CMD="journalctl --user -u cordelia -n 50"
+
+    # With no service manager that the script can use, the node is run by
+    # hand: the closing words name that command, and not one that cannot
+    # work here. The service's file is written all the same.
+    if ! systemd_user_answers; then
+        START_CMD="cordelia start"
+        START_SAYS="                        # run the node yourself: you have no systemd user session here.
+                        # It runs until you close that terminal"
+        echo "systemd user service written: ${SERVICE_FILE}"
+        echo "  You have no systemd user session here, so the service cannot start."
+        return
+    fi
+
     echo "systemd user service installed: ${SERVICE_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Status: systemctl --user status cordelia"
@@ -492,13 +514,14 @@ maybe_init() {
 }
 
 # What a first install ends with, in this order: the one command that
-# starts the node as the service; the three ways on for a machine that
-# follows no recovery phrase, each with its command; and the two commands
-# that turn memory sync on and say what syncs.
+# starts the node, as the service or, where no service manager can be
+# used, by hand; the three ways on for a machine that follows no recovery
+# phrase, each with its command; and the two commands that turn memory
+# sync on and say what syncs.
 first_steps() {
     echo "Next steps:"
     echo "  ${START_CMD}"
-    echo "                        # run the node as a background service"
+    echo "${START_SAYS}"
     echo ""
     echo "Then one of these three:"
     echo "  cordelia phrase       # this is your first machine: make a phrase here"
@@ -518,7 +541,7 @@ first_steps() {
 next_steps() {
     echo "Next steps:"
     echo "  ${START_CMD}"
-    echo "                        # run the node as a background service"
+    echo "${START_SAYS}"
     echo "  cordelia status       # the node and its relays"
     echo "  cordelia id           # this device's key, to pair another device"
     echo "  cordelia sync claude  # turn on memory sync: lists what it found"

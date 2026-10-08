@@ -141,6 +141,8 @@ case "$*" in
             echo inactive; exit 3
         fi
         ;;
+    # A user session answers, unless the test says that none does.
+    *show-environment*) [ ! -f "$HOME/.fake/no_user_session" ] ;;
     *daemon-reload*) echo daemon-reload >> "$HOME/.fake/calls" ;;
     *restart*)       restarted ;;
 esac
@@ -494,6 +496,25 @@ check "the mode of the file that the link leads to" \
     "$(mode_of "$HOME_DIR/kept-elsewhere.toml")" "-rw-rw-r--"
 check "the configuration file is still a link" \
     "$(mode_of "$HOME_DIR/.cordelia/config.toml" | cut -c1)" "l"
+
+# A machine with no service manager that the script can use: Linux with
+# no systemd user session. The next steps name the command that runs the
+# node by hand, on a line of its own, and say that it runs until that
+# terminal is closed. The command that starts the service cannot work
+# there, and is not named.
+setup() { touch "$HOME/.fake/no_user_session"; }
+run "a-first-install-with-no-systemd-user-session"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the first of the next steps" \
+    "$(sed -n '/^Next steps:/,/^$/p' "$HOME_DIR/.fake/out")" \
+    "Next steps:
+  cordelia start
+                        # run the node yourself: you have no systemd user session here.
+                        # It runs until you close that terminal"
+has "You have no systemd user session here, so the service cannot start."
+has "Then one of these three:"
+has "  cordelia sync claude  # turn on memory sync: lists what it found"
+has_not "systemctl --user enable --now cordelia"
 
 # A first install whose set-up fails says so, and is no success.
 setup() { touch "$HOME/.fake/init_fails"; }

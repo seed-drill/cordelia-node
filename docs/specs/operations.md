@@ -49,7 +49,11 @@ The install script:
 > add-device` on a machine that has the phrase, `cordelia recover`); and
 > `cordelia sync claude` and `cordelia sync map <folder>`. A later run ends
 > as it did: with what became of the node that is running, and the line for
-> a program.
+> a program. On Linux with no systemd user session that answers (a
+> container, or a login that has none), the service's file is written and
+> cannot be started: the command that starts the node is then `cordelia
+> start`, run by hand, and the script says that it runs until that terminal
+> is closed.
 
 ### 1.2 Platform Matrix
 
