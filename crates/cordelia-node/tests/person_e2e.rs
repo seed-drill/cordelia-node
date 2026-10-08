@@ -1449,11 +1449,22 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&laptop_key)
     ));
     at.says("Type yes to go on").types("yes");
+    // Where the command itself says what became of the key, that is its
+    // last line, and it begins with a capital: read from what the command
+    // printed, and from nothing that the harness made of it.
+    let printed = at.done();
+    if !printed.contains("Nothing was taken yet") {
+        assert!(
+            printed.ends_with("\nThis device has applied change 2, which it was handed.\r\n"),
+            "{printed:?}"
+        );
+    }
     // The command stays a minute: where the hand-over is read later than
-    // that, the node says what became of the key.
-    let said = became_of_the_key(&tablet, &laptop_key, at.done());
+    // that, the node says what became of the key, in its own words.
+    let said = became_of_the_key(&tablet, &laptop_key, printed);
     assert!(
-        said.contains("\nThis device has applied change 2, which it was handed."),
+        said.to_lowercase()
+            .contains("this device has applied change 2, which it was handed"),
         "{said}"
     );
     let seen = look(&tablet);

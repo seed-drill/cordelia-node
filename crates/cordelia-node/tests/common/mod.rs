@@ -1347,11 +1347,11 @@ pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
 /// (it stays a minute, and the node goes on asking for the rest of the
 /// hour), this waits until the node says that a hand-over was read with
 /// the key, and gives back what the command said with what the node says
-/// became of it, as the command's last line says it: on a line of its
-/// own, with a capital. It waits for that state, and for no length of time: on
-/// a loaded machine a hand-over can arrive after the command has ended,
-/// and a test that went on at once would go on before the device stands
-/// where the test takes it to stand.
+/// became of it, in the node's own words: nothing here is made to look as
+/// the command prints it. It waits for that state, and for no length of
+/// time: on a loaded machine a hand-over can arrive after the command has
+/// ended, and a test that went on at once would go on before the device
+/// stands where the test takes it to stand.
 pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
     if !said.contains("Nothing was taken yet") {
         return said;
@@ -1371,11 +1371,6 @@ pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
             (of_the_key["taken"] == true || !became.is_empty()).then_some(became)
         },
     );
-    let mut letters = became.chars();
-    let became: String = match letters.next() {
-        Some(first) => first.to_uppercase().chain(letters).collect(),
-        None => String::new(),
-    };
     format!("{said}\n{became}.")
 }
 
