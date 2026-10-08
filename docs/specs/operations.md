@@ -381,6 +381,13 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   the exception. `cordelia status`, `cordelia sync status`, `cordelia
 >   devices` and `cordelia history` still answer beside such a node, with the
 >   note (decision 2026-10-04 §10.1, rule 6).
+> - **A command that opens the database itself opens none beside a running
+>   node of another version:** opening runs the schema's steps, and a later
+>   command would step the database under an earlier node. `cordelia stats`,
+>   `cordelia channels`, `cordelia swarm-init`, and `cordelia init` where it
+>   makes the database or is given `--force`, say the note that names the
+>   restart, and open nothing. `cordelia status` says the note, and reads
+>   nothing of the database. Where no node answers, each goes on.
 > - `cordelia sync exclude`, `cordelia sync include`, `cordelia sync claude
 >   --exclude` and `cordelia sync claude --all` are refused, before anything
 >   is sent to the node, with what to do instead: only what is mapped syncs,
