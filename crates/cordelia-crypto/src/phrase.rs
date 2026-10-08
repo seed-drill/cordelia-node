@@ -59,11 +59,15 @@ pub enum PhraseError {
 /// in the list. The word is as the list has it: in lower case, with
 /// nothing around it.
 ///
-/// **The whole list is gone through for every word,** and the search
-/// stops at none (decision 2026-10-04 §16): the same steps are taken
-/// whatever the word is, wherever in the list it stands, and whether or
-/// not it is there. What a command says after it, and when, is then the
-/// same for every word of the list.
+/// **Every word of the list is looked at, with no early stop** (decision
+/// 2026-10-04 §16): the search does not end sooner for a word that
+/// stands early in the list, nor for one that is found, and each word
+/// of the list is compared over the same eight bytes ([`same_word`]).
+///
+/// That is what the code does, and all that is claimed for it. **It is
+/// not a proof against timing:** how long these steps take on a given
+/// processor, and what a compiler makes of them, is not measured here
+/// or held equal.
 pub fn place_in_list(word: &str) -> Option<u16> {
     let mut place = None;
     for (at, listed) in Language::English.word_list().iter().enumerate() {
@@ -78,7 +82,8 @@ pub fn place_in_list(word: &str) -> Option<u16> {
 /// Whether what was typed is the listed word, byte for byte. The two are
 /// compared over the eight bytes of the longest word of the list,
 /// whatever their lengths and wherever they first differ: one that is
-/// shorter counts as nothing from its end on.
+/// shorter counts as nothing from its end on. (No early stop is written
+/// here: that is not a proof against timing.)
 fn same_word(listed: &[u8], typed: &[u8]) -> bool {
     let byte = |word: &[u8], at: usize| word.get(at).copied().unwrap_or(0);
     let mut differ = listed.len() ^ typed.len();

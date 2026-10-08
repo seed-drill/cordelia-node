@@ -17,9 +17,10 @@
 //! **After a word, a command says whether it is a word of the list: and
 //! where a phrase is proved, it says nothing more** (decision 2026-10-04
 //! §16). A tick beside a word's number means "a word of the list". A
-//! wrong word of the list is given it as the right one is, after the
-//! same work, and the phrase is judged only once the twelfth word is
-//! typed. A word that is not in the list gets a cross, and its number is
+//! wrong word of the list is given it as the right one is: nothing here
+//! knows which it is, the same code runs for both, and the phrase is
+//! judged only once the twelfth word is typed. (That is no proof against
+//! timing: no step here is measured.) A word that is not in the list gets a cross, and its number is
 //! asked again: that is no guess at a word, and has no bound. Only where
 //! the words were shown a moment ago and are typed back
 //! ([`Terminal::phrase_back`]) is a word held against the word shown at
@@ -698,9 +699,9 @@ impl Terminal {
     /// **A tick here says that a word is a word of the list, and nothing
     /// more** (decision 2026-10-04 §16). This is given nothing to hold a
     /// word against, and judges none: a wrong word of the list gets the
-    /// tick that the right one gets, after the same work and with no
-    /// wait, and all twelve are asked for whatever was typed. Whoever
-    /// asked judges the phrase, once it is whole.
+    /// tick that the right one gets, by the same code and with no wait,
+    /// and all twelve are asked for whatever was typed. Whoever asked
+    /// judges the phrase, once it is whole.
     ///
     /// Ctrl-C is read as a key while what is typed is hidden: the terminal
     /// is put back as it was, and this fails with [`INTERRUPTED`].
