@@ -321,7 +321,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 | `cordelia peers` | List connected peers | Yes |
 | `cordelia channels` | List subscribed channels | Yes |
 | `cordelia stats` | Detailed metrics | Yes |
-| `cordelia stop` | Stop the daemon | Yes |
+| `cordelia stop` | Not built: a node is stopped through its service (§7), or by a signal | - |
 | `cordelia start` | Start the daemon (see §7 for service integration) | No |
 | `cordelia export` | Export channel data (§9.3) | Yes |
 | `cordelia version` | Print version and build info | No |
@@ -964,13 +964,11 @@ The node does not auto-update. Operators choose when to upgrade.
 ### 10.2 Upgrade Procedure
 
 ```bash
-cordelia stop
-curl -sSL https://install.seeddrill.ai | sh    # downloads latest, verifies checksum
-cordelia start
+curl -sSL https://install.seeddrill.ai | sh    # downloads latest, verifies checksum, restarts the service
 cordelia status                                  # verify
 ```
 
-The install script detects an existing installation and performs an in-place binary replacement. Configuration and data are preserved.
+The install script detects an existing installation and performs an in-place binary replacement. Configuration and data are preserved. The node is not stopped first: the script puts the new binary beside the old one, renames it into place, and restarts a node that runs as the service it set up.
 
 ### 10.3 Version Compatibility
 
@@ -997,11 +995,18 @@ The install script detects an existing installation and performs an in-place bin
 If an upgrade causes issues:
 
 ```bash
-cordelia stop
+# Stop the service
+systemctl --user stop cordelia                                        # Linux
+launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
 # Restore previous binary (kept as ~/.cordelia/bin/cordelia.prev by install script)
 mv ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia
-cordelia start
+# Start the service
+systemctl --user start cordelia                                       # Linux
+launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
 ```
+
+> **v1 status.** Going back from this version to the one before puts the
+> database back as well: §10.5 has each step.
 
 **Database rollback caveat:** If the new version applied a schema migration, rolling back the binary may fail if the old version doesn't understand the new schema. Schema migrations are designed to be forward-compatible where possible (additive columns, not destructive). If a migration is not forward-compatible, the release notes will state this explicitly.
 
@@ -1100,17 +1105,89 @@ before makes a copy and then one step, when it starts (data-formats.md §12):
   the same, and stops. A command that opens the database itself is refused
   likewise.
 
-**Going back:**
+**Going back.** Eight steps, in this order. Each is a command for Linux
+(systemd) and for macOS (launchd), with why. The paths are those of a node
+that the install script set up: its data directory is `~/.cordelia`.
+`<version>` is the version that made the copy: `ls ~/.cordelia` shows the
+folder, `before-<version>`.
 
-1. Stop the node.
-2. Install the version before, with the installer told to leave the node as
-   it is (`CORDELIA_NO_RESTART=1`).
-3. Remove the database, `cordelia.db`, and the two files that the store
-   keeps beside it, whose names end `-wal` and `-shm`. Left there, they
-   would be replayed over what is put back.
-4. Put the copy's database and key files where they were.
-5. Move the `before-<version>` folder away.
-6. Start the node.
+1. **Stop the service.** The database is replaced below, and a node that
+   runs would write to it meanwhile.
+
+   ```bash
+   systemctl --user stop cordelia                                        # Linux
+   launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
+   ```
+
+2. **Put the older binary back.** The install script kept it beside the new
+   one, as `cordelia.prev`, when it installed this version.
+
+   ```bash
+   ~/.cordelia/bin/cordelia.prev --version      # the version before?
+   cp ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia
+   ```
+
+   Where `cordelia.prev` is another version, install the one before by its
+   number instead:
+
+   ```bash
+   curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v<the version before> sh
+   ```
+
+   **Do not run the "Next steps" that it prints.** They would start the older
+   version on the database that this version stepped, and it would stop with
+   an error. Go on with step 3.
+
+3. **Remove the database and its two side files,** where they are there.
+   Left there, the side files would be replayed over what is put back. (A
+   node that stopped cleanly leaves neither of the two, so `rm -f`.)
+
+   ```bash
+   rm -f ~/.cordelia/cordelia.db ~/.cordelia/cordelia.db-wal ~/.cordelia/cordelia.db-shm
+   ```
+
+4. **Copy the database and the older channels' key files back from the
+   copy,** each to where the node keeps it: the database to
+   `~/.cordelia/cordelia.db`, and the key files into
+   `~/.cordelia/channel-keys/`. The older version reads both.
+
+   ```bash
+   cp -p ~/.cordelia/before-<version>/cordelia.db ~/.cordelia/cordelia.db
+   cp -p ~/.cordelia/before-<version>/channel-keys/* ~/.cordelia/channel-keys/
+   ```
+
+   Run the second command only where the copy has a `channel-keys` folder:
+   it has one only where the device held key files.
+
+5. **Move the copy out of the data directory,** to your home directory, say.
+   It is what you went back by. A later upgrade then makes a fresh copy, and
+   does not rename this one or put another in its place.
+
+   ```bash
+   mv ~/.cordelia/before-<version> ~/cordelia-before-<version>
+   ```
+
+6. **Have the service manager read the service's file again,** on Linux: the
+   install script writes that file anew each time it runs. (launchd reads it
+   at the next step.)
+
+   ```bash
+   systemctl --user daemon-reload                                        # Linux
+   ```
+
+7. **Start the service.** It runs the older binary, on the database that
+   was put back.
+
+   ```bash
+   systemctl --user start cordelia                                       # Linux
+   launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
+   ```
+
+8. **Check.** The status names the version, and says whether the node runs.
+
+   ```bash
+   cordelia status
+   ```
 
 What that does not give back: the device's key and its configuration file
 were never in the copy, so a device that was given a new key since cannot go
