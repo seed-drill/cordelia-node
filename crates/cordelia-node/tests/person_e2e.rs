@@ -2315,9 +2315,15 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
     at.says("Interrupted: the terminal is as it was, and nothing was made.");
     assert_eq!(at.is_as_it_was(), (true, true));
     let said = at.refused();
-    assert!(!said.contains("lega"), "{said}");
-    // The number's line was ended before that was said.
-    assert!(said.contains("   1. \r\nError: Interrupted"), "{said:?}");
+    // Nothing of what was typed was shown, and the number's line was
+    // ended before the command said that it was interrupted. (What the
+    // terminal showed before the words were asked for is not looked at:
+    // one of the words that were shown may hold these letters.)
+    let from_the_asking = format!(
+        "{ASKS_THE_WORDS_BACK}\r\n\r\n   1. \r\nError: Interrupted: the terminal is as it was, \
+         and nothing was made.\r\n"
+    );
+    assert!(said.ends_with(&from_the_asking), "{said:?}");
     assert_eq!(text(&look(&laptop), "state"), "no_phrase");
 
     // The keys that take back what was typed are acted on, where each
